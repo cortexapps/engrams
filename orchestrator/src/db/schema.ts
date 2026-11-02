@@ -1155,6 +1155,7 @@ export interface ProfileIntegrationGrant {
    * while programmatic sessions always compile the org credential. Rides the
    * grant array through launch_policy and the task_session snapshot. */
   credentialScope?: "org" | "user";
+  mcp?: import("../mcp/types.ts").McpToolGrant;
 }
 
 /** A parsed forge remote — enough to join against the GitHub integration. */
@@ -1175,6 +1176,7 @@ export interface ProfileRepo {
 
 /** Immutable non-secret connection configuration stamped onto a session. */
 export interface IntegrationConnectionSnapshot {
+  mcp?: import("../mcp/types.ts").McpBinding;
   id: string;
   alias: string;
   provider: string;
@@ -1743,6 +1745,11 @@ export const integrationConnection = pgTable(
   {
     id: text("id").primaryKey(),
     alias: text("alias").notNull().unique(),
+    configRevision: integer("config_revision").notNull().default(1),
+    authGeneration: integer("auth_generation").notNull().default(1),
+    credentialIdentity: text("credential_identity").notNull().default(""),
+    catalogRevision: integer("catalog_revision").notNull().default(0),
+    revoked: boolean("revoked").notNull().default(false),
     provider: text("provider").notNull(),
     displayName: text("display_name").notNull(),
     isDefault: boolean("is_default").notNull().default(false),
@@ -2155,3 +2162,176 @@ export const accountRelations = relations(account, ({ one }) => ({
     references: [user.id],
   }),
 }));
+
+/** Immutable discovery and review records. Published revisions never change. */
+export const mcpCatalog = pgTable(
+  "mcp_catalog",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    kind: text("kind").$type<"draft" | "published">().notNull(),
+    revision: integer("revision").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    credentialIdentity: text("credential_identity").notNull(),
+    tools: jsonb("tools")
+      .$type<
+        import("../mcp/types.ts").McpDiscoveredTool[] | import("../mcp/types.ts").McpReviewedTool[]
+      >()
+      .notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    actorId: text("actor_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    index("mcp_catalog_connection_idx").on(t.connectionId, t.createdAt),
+    uniqueIndex("mcp_catalog_published_revision_idx")
+      .on(t.connectionId, t.revision)
+      .where(sql`kind = 'published'`),
+    check(
+      "mcp_catalog_kind_check",
+      sql`${t.kind} IN ('draft','published') AND ((${t.kind} = 'draft' AND ${t.revision} = 0) OR (${t.kind} = 'published' AND ${t.revision} > 0))`,
+    ),
+  ],
+);
+
+/** Authoritative upstream outcome. Guest completion is a separate projection. */
+export const mcpExecution = pgTable(
+  "mcp_execution",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    runId: text("run_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    catalogId: text("catalog_id")
+      .notNull()
+      .references(() => mcpCatalog.id),
+    principalId: text("principal_id").notNull(),
+    bindingHash: text("binding_hash").notNull(),
+    requestDigest: text("request_digest").notNull(),
+    argumentHash: text("argument_hash").notNull(),
+    upstreamName: text("upstream_name").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    classification: text("classification").$type<"read" | "write">().notNull(),
+    authorizationKind: text("authorization_kind")
+      .$type<"read" | "approval" | "automation">()
+      .notNull(),
+    automationGrantHash: text("automation_grant_hash"),
+    state: text("state").$type<import("../mcp/types.ts").McpExecutionState>().notNull(),
+    version: integer("version").notNull().default(1),
+    bootId: text("boot_id"),
+    intentId: text("intent_id"),
+    intentExpiresAt: timestamp("intent_expires_at", { withTimezone: true }),
+    deadline: timestamp("deadline", { withTimezone: true }).notNull(),
+    result: jsonb("result").$type<Record<string, unknown>>(),
+    resultUnavailable: boolean("result_unavailable").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    foreignKey({
+      columns: [t.taskId, t.sessionId],
+      foreignColumns: [taskSession.taskId, taskSession.sessionId],
+    }).onDelete("cascade"),
+    index("mcp_execution_task_session_idx").on(t.taskId, t.sessionId),
+    uniqueIndex("mcp_execution_call_idx").on(t.sessionId, t.toolCallId),
+    index("mcp_execution_connection_state_idx").on(t.connectionId, t.sessionId, t.state),
+    index("mcp_execution_catalog_idx").on(t.catalogId),
+    index("mcp_execution_pending_idx").on(t.state, t.deadline),
+    uniqueIndex("mcp_execution_intent_idx").on(t.intentId),
+    check(
+      "mcp_execution_state_check",
+      sql`${t.state} IN ('waiting_approval','authorized','dispatching','succeeded','failed','canceled','outcome_unknown')`,
+    ),
+    check("mcp_execution_classification_check", sql`${t.classification} IN ('read','write')`),
+    check(
+      "mcp_execution_authorization_check",
+      sql`(${t.authorizationKind} = 'read' AND ${t.classification} = 'read' AND ${t.automationGrantHash} IS NULL) OR (${t.authorizationKind} = 'approval' AND ${t.automationGrantHash} IS NULL) OR (${t.authorizationKind} = 'automation' AND ${t.classification} = 'write' AND ${t.automationGrantHash} IS NOT NULL)`,
+    ),
+    check(
+      "mcp_execution_dispatch_check",
+      sql`${t.state} NOT IN ('dispatching','outcome_unknown','succeeded') OR (${t.bootId} IS NOT NULL AND ${t.intentId} IS NOT NULL AND ${t.intentExpiresAt} IS NOT NULL)`,
+    ),
+  ],
+);
+
+export const mcpApproval = pgTable(
+  "mcp_approval",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    deploymentId: text("deployment_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    requestDigest: text("request_digest").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    decision: text("decision").$type<"pending" | "approved" | "denied" | "expired">().notNull(),
+    actorId: text("actor_id"),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("mcp_approval_pending_idx").on(t.deploymentId, t.decision, t.expiresAt),
+    index("mcp_approval_session_idx").on(t.sessionId, t.decision),
+    check(
+      "mcp_approval_decision_check",
+      sql`${t.decision} IN ('pending','approved','denied','expired')`,
+    ),
+    check(
+      "mcp_approval_consumed_check",
+      sql`${t.consumedAt} IS NULL OR (${t.decision} = 'approved' AND ${t.actorId} IS NOT NULL)`,
+    ),
+  ],
+);
+
+export const mcpResolution = pgTable(
+  "mcp_resolution",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    actorId: text("actor_id").notNull(),
+    outcome: text("outcome").$type<"succeeded" | "failed" | "acknowledged">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    check(
+      "mcp_resolution_outcome_check",
+      sql`${t.outcome} IN ('succeeded','failed','acknowledged')`,
+    ),
+  ],
+);
+
+/** Durable row locks serialize short admission decisions across replicas. */
+export const mcpAdmissionScope = pgTable("mcp_admission_scope", { id: text("id").primaryKey() });
+export const mcpAdmission = pgTable(
+  "mcp_admission",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    deploymentId: text("deployment_id")
+      .notNull()
+      .references(() => mcpAdmissionScope.id),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    sessionId: text("session_id").notNull(),
+    state: text("state").$type<"queued" | "admitted">().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    index("mcp_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
+    index("mcp_admission_connection_idx").on(t.connectionId, t.state),
+    index("mcp_admission_session_idx").on(t.sessionId, t.state),
+    check("mcp_admission_state_check", sql`${t.state} IN ('queued','admitted')`),
+  ],
+);

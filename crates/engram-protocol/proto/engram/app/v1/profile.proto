@@ -144,6 +144,7 @@ message ProfileIntegrationGrant {
   // user's personal credential (human launches then require it; programmatic
   // sessions always use the org credential).
   string credential_scope = 4;
+  McpToolGrant mcp = 5;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for
@@ -276,3 +277,10 @@ message DeleteProfileRequest {
 }
 
 message DeleteProfileResponse {}
+
+message McpToolGrant {
+  string upstream_name = 1;
+  bool automation_write = 2;
+  string argument_constraints_json = 3;
+  bool unrestricted = 4;
+}

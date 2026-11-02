@@ -132,6 +132,12 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
       operation: grant.operation,
       resourceConstraints: grant.resourceConstraints,
       credentialScope: grant.credentialScope ?? "",
+      mcp: grant.mcp ? {
+        upstreamName: grant.mcp.upstreamName,
+        automationWrite: grant.mcp.automationWrite,
+        argumentConstraintsJson: JSON.stringify(grant.mcp.argumentConstraints),
+        unrestricted: grant.mcp.unrestricted,
+      } : undefined,
     })),
     // ADR 0057: network + secrets describe access/config (the secret VALUES
     // live in the org store, never here), so they're member-visible like skills.
@@ -486,6 +492,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       operation?: string;
       resourceConstraints?: string[];
       credentialScope?: string;
+      mcp?: { upstreamName: string; automationWrite: boolean; argumentConstraintsJson: string; unrestricted: boolean };
     }>,
   ): ProfileIntegrationGrant[] {
     return grants.map((grant) => {
@@ -496,12 +503,21 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
           Code.InvalidArgument,
         );
       }
+      let mcp: ProfileIntegrationGrant["mcp"];
+      if (grant.mcp) {
+        let constraints: unknown;
+        try { constraints = JSON.parse(grant.mcp.argumentConstraintsJson); }
+        catch { throw new ConnectError("MCP constraints must be valid JSON", Code.InvalidArgument); }
+        if (!constraints || typeof constraints !== "object" || Array.isArray(constraints)) throw new ConnectError("MCP constraints must be a JSON object", Code.InvalidArgument);
+        mcp = { upstreamName: grant.mcp.upstreamName, automationWrite: grant.mcp.automationWrite, argumentConstraints: constraints as Record<string, unknown>, unrestricted: grant.mcp.unrestricted };
+      }
       return {
+        ...(mcp ? { mcp } : {}),
         connectionId: (grant.connectionId ?? "").trim(),
         operation: (grant.operation ?? "").trim(),
         resourceConstraints: [...new Set(grant.resourceConstraints ?? [])].sort(),
         // Stored only when user-scoped; absent means org (the default).
-        ...(scope === "user" ? { credentialScope: "user" as const } : {}),
+        ...(scope === "user" ? { credentialScope: "user" as const } : scope === "org" ? { credentialScope: "org" as const } : {}),
       };
     });
   }

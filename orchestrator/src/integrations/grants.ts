@@ -1,5 +1,6 @@
 /** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
+import { validateMcpGrant } from "../mcp/types.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 
@@ -106,6 +107,15 @@ export async function resolveIntegrationGrants(
         Code.InvalidArgument,
       );
     }
+    if (connection.provider === "mcp") {
+      try {
+        validateMcpGrant(grant);
+      } catch (error) {
+        throw new ConnectError((error as Error).message, Code.InvalidArgument);
+      }
+    } else if (grant.mcp) {
+      throw new ConnectError("MCP tool grants require an MCP connection", Code.InvalidArgument);
+    }
     if (!OPERATION_RE.test(grant.operation)) {
       throw new ConnectError(
         `invalid integration operation "${grant.operation}"`,
@@ -141,6 +151,8 @@ export function grantsToCapabilities(
 ): string[] {
   const capabilities = new Set<string>();
   for (const { grant, connection } of resolved) {
+    // MCP authority cannot become a generic guest credential or egress grant.
+    if (connection.provider === "mcp") continue;
     if (grant.resourceConstraints.length === 0) {
       capabilities.add(`${connection.provider}:${grant.operation}`);
       continue;

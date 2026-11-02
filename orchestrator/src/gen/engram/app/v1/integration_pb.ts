@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration.proto.
  */
 export const file_engram_app_v1_integration: GenFile = /*@__PURE__*/
-  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxIpgBChtHb29nbGVDbG91ZENvbm5lY3Rpb25Db25maWcSIgoad29ya2xvYWRfaWRlbnRpdHlfcHJvdmlkZXIYASABKAkSHQoVc2VydmljZV9hY2NvdW50X2VtYWlsGAIgASgJEhEKCWVuZHBvaW50cxgDIAMoCRIjChtjbG91ZF9zcWxfcG9zdGdyZXNfaW5zdGFuY2UYBCABKAki/AEKFUludGVncmF0aW9uQ29ubmVjdGlvbhIKCgJpZBgBIAEoCRINCgVhbGlhcxgCIAEoCRIQCghwcm92aWRlchgDIAEoCRIUCgxkaXNwbGF5X25hbWUYBCABKAkSDwoHZW5hYmxlZBgFIAEoCBIRCgl0ZXN0ZWRfYXQYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRISCgp1cGRhdGVkX2F0GAggASgJEkAKDGdvb2dsZV9jbG91ZBgJIAEoCzIqLmVuZ3JhbS5hcHAudjEuR29vZ2xlQ2xvdWRDb25uZWN0aW9uQ29uZmlnEhIKCmlzX2RlZmF1bHQYCiABKAgiGAoWTGlzdENvbm5lY3Rpb25zUmVxdWVzdCJUChdMaXN0Q29ubmVjdGlvbnNSZXNwb25zZRI5Cgtjb25uZWN0aW9ucxgBIAMoCzIkLmVuZ3JhbS5hcHAudjEuSW50ZWdyYXRpb25Db25uZWN0aW9uIpIBChdDcmVhdGVDb25uZWN0aW9uUmVxdWVzdBINCgVhbGlhcxgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSQAoMZ29vZ2xlX2Nsb3VkGAQgASgLMiouZW5ncmFtLmFwcC52MS5Hb29nbGVDbG91ZENvbm5lY3Rpb25Db25maWciVAoYQ3JlYXRlQ29ubmVjdGlvblJlc3BvbnNlEjgKCmNvbm5lY3Rpb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkludGVncmF0aW9uQ29ubmVjdGlvbiKMAQoXVXBkYXRlQ29ubmVjdGlvblJlcXVlc3QSCgoCaWQYASABKAkSDQoFYWxpYXMYAiABKAkSFAoMZGlzcGxheV9uYW1lGAMgASgJEkAKDGdvb2dsZV9jbG91ZBgEIAEoCzIqLmVuZ3JhbS5hcHAudjEuR29vZ2xlQ2xvdWRDb25uZWN0aW9uQ29uZmlnIlQKGFVwZGF0ZUNvbm5lY3Rpb25SZXNwb25zZRI4Cgpjb25uZWN0aW9uGAEgASgLMiQuZW5ncmFtLmFwcC52MS5JbnRlZ3JhdGlvbkNvbm5lY3Rpb24iJQoXRGVsZXRlQ29ubmVjdGlvblJlcXVlc3QSCgoCaWQYASABKAkiKwoYRGVsZXRlQ29ubmVjdGlvblJlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgiIwoVVGVzdENvbm5lY3Rpb25SZXF1ZXN0EgoKAmlkGAEgASgJIjUKFlRlc3RDb25uZWN0aW9uUmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCSI6ChtTZXRDb25uZWN0aW9uRW5hYmxlZFJlcXVlc3QSCgoCaWQYASABKAkSDwoHZW5hYmxlZBgCIAEoCCJYChxTZXRDb25uZWN0aW9uRW5hYmxlZFJlc3BvbnNlEjgKCmNvbm5lY3Rpb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkludGVncmF0aW9uQ29ubmVjdGlvbiIoChpHZXRHb29nbGVDbG91ZFNldHVwUmVxdWVzdBIKCgJpZBgBIAEoCSKiAQobR2V0R29vZ2xlQ2xvdWRTZXR1cFJlc3BvbnNlEg4KBmlzc3VlchgBIAEoCRIQCghhdWRpZW5jZRgCIAEoCRIZChFzdWJqZWN0X2F0dHJpYnV0ZRgDIAEoCRIcChRjb25uZWN0aW9uX2F0dHJpYnV0ZRgEIAEoCRIVCg1nY2xvdWRfc2NyaXB0GAUgASgJEhEKCXRlcnJhZm9ybRgGIAEoCSLmAQoJQ29ubmVjdG9yEhAKCHByb3ZpZGVyGAEgASgJEhMKC2NvbmZpZ19qc29uGAIgASgJEg8KB2J1aWx0aW4YAyABKAgSEgoKY3JlYXRlZF9hdBgEIAEoCRISCgp1cGRhdGVkX2F0GAUgASgJEg4KBnN0YXR1cxgGIAEoCRI4CghzZXR0aW5ncxgHIAMoCzImLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yLlNldHRpbmdzRW50cnkaLwoNU2V0dGluZ3NFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIhcKFUxpc3RDb25uZWN0b3JzUmVxdWVzdCJGChZMaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEiwKCmNvbm5lY3RvcnMYASADKAsyGC5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvciItChZVcHNlcnRDb25uZWN0b3JSZXF1ZXN0EhMKC2NvbmZpZ19qc29uGAEgASgJIkYKF1Vwc2VydENvbm5lY3RvclJlc3BvbnNlEisKCWNvbm5lY3RvchgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIioKFkRlbGV0ZUNvbm5lY3RvclJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkiKgoXRGVsZXRlQ29ubmVjdG9yUmVzcG9uc2USDwoHZGVsZXRlZBgBIAEoCCI6Cg1Db25uZWN0b3JJY29uEgwKBG1vbm8YASABKAkSDQoFY29sb3IYAiABKAkSDAoEbG9nbxgDIAEoCSJ/ChBDb25uZWN0b3JEaXNwbGF5EgwKBG5hbWUYASABKAkSEAoIY2F0ZWdvcnkYAiABKAkSDQoFYmx1cmIYAyABKAkSKgoEaWNvbhgEIAEoCzIcLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9ySWNvbhIQCghmZWF0dXJlZBgFIAEoCCJ2ChFDYXRhbG9nQ2FwYWJpbGl0eRIOCgZhY3Rpb24YASABKAkSDgoGYWNjZXNzGAIgASgJEg0KBWFzc2V0GAMgASgJEg0KBWxhYmVsGAQgASgJEgwKBGhvc3QYBSABKAkSFQoNZW5kcG9pbnRfcnVsZRgGIAEoCSK0AgoUUHJvdmlkZXJDYXRhbG9nRW50cnkSEAoIcHJvdmlkZXIYASABKAkSMAoHZGlzcGxheRgCIAEoCzIfLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yRGlzcGxheRIZChFjcmVkZW50aWFsX3NvdXJjZRgDIAEoCRINCgVob3N0cxgEIAMoCRI2CgxjYXBhYmlsaXRpZXMYBSADKAsyIC5lbmdyYW0uYXBwLnYxLkNhdGFsb2dDYXBhYmlsaXR5Eh0KFWRlZmF1bHRfY29ubmVjdGlvbl9pZBgGIAEoCRIYChBjb25uZWN0aW9uX21vZGVsGAcgASgJEj0KD3VzZXJfY3JlZGVudGlhbBgIIAEoCzIkLmVuZ3JhbS5hcHAudjEuVXNlckNyZWRlbnRpYWxTdXBwb3J0IkkKFVVzZXJDcmVkZW50aWFsU3VwcG9ydBINCgVvYXV0aBgBIAEoCBINCgV0b2tlbhgCIAEoCBISCgp0b2tlbl9oaW50GAMgASgJIh4KHEdldEludGVncmF0aW9uQ2F0YWxvZ1JlcXVlc3QiVwodR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVzcG9uc2USNgoJcHJvdmlkZXJzGAEgAygLMiMuZW5ncmFtLmFwcC52MS5Qcm92aWRlckNhdGFsb2dFbnRyeSKuAQoYU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEgwKBGtpbmQYAiABKAkSQwoGdmFsdWVzGAMgAygLMjMuZW5ncmFtLmFwcC52MS5TZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QuVmFsdWVzRW50cnkaLQoLVmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASIxChlTZXRNaW50Q3JlZGVudGlhbFJlc3BvbnNlEhQKDHNlY3JldF9uYW1lcxgBIAMoCSJQChpVcGxvYWRDb25uZWN0b3JMb2dvUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRkYXRhGAIgASgMEhIKCm1lZGlhX3R5cGUYAyABKAkiLwobVXBsb2FkQ29ubmVjdG9yTG9nb1Jlc3BvbnNlEhAKCGxvZ29fdXJsGAEgASgJIq4CChRUZXN0Q29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRJKCgxkcmFmdF92YWx1ZXMYAiADKAsyNC5lbmdyYW0uYXBwLnYxLlRlc3RDb25uZWN0b3JSZXF1ZXN0LkRyYWZ0VmFsdWVzRW50cnkSTgoOZHJhZnRfc2V0dGluZ3MYAyADKAsyNi5lbmdyYW0uYXBwLnYxLlRlc3RDb25uZWN0b3JSZXF1ZXN0LkRyYWZ0U2V0dGluZ3NFbnRyeRoyChBEcmFmdFZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEaNAoSRHJhZnRTZXR0aW5nc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiNAoVVGVzdENvbm5lY3RvclJlc3BvbnNlEgoKAm9rGAEgASgIEg8KB21lc3NhZ2UYAiABKAkirAEKG1NldENvbm5lY3RvclNldHRpbmdzUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRJKCghzZXR0aW5ncxgCIAMoCzI4LmVuZ3JhbS5hcHAudjEuU2V0Q29ubmVjdG9yU2V0dGluZ3NSZXF1ZXN0LlNldHRpbmdzRW50cnkaLwoNU2V0dGluZ3NFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIksKHFNldENvbm5lY3RvclNldHRpbmdzUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IynQwKEkludGVncmF0aW9uU2VydmljZRJdCg5MaXN0Q29ubmVjdG9ycxIkLmVuZ3JhbS5hcHAudjEuTGlzdENvbm5lY3RvcnNSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEmAKD1Vwc2VydENvbm5lY3RvchIlLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USYAoPRGVsZXRlQ29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXNwb25zZRJyChVHZXRJbnRlZ3JhdGlvbkNhdGFsb2cSKy5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1JlcXVlc3QaLC5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEmYKEVNldE1pbnRDcmVkZW50aWFsEicuZW5ncmFtLmFwcC52MS5TZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVzcG9uc2USbAoTVXBsb2FkQ29ubmVjdG9yTG9nbxIpLmVuZ3JhbS5hcHAudjEuVXBsb2FkQ29ubmVjdG9yTG9nb1JlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLlVwbG9hZENvbm5lY3RvckxvZ29SZXNwb25zZRJaCg1UZXN0Q29ubmVjdG9yEiMuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3RvclJlc3BvbnNlEm8KFFNldENvbm5lY3RvclNldHRpbmdzEiouZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0b3JTZXR0aW5nc1JlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLlNldENvbm5lY3RvclNldHRpbmdzUmVzcG9uc2USYAoPTGlzdENvbm5lY3Rpb25zEiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXNwb25zZRJjChBDcmVhdGVDb25uZWN0aW9uEiYuZW5ncmFtLmFwcC52MS5DcmVhdGVDb25uZWN0aW9uUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ29ubmVjdGlvblJlc3BvbnNlEmMKEFVwZGF0ZUNvbm5lY3Rpb24SJi5lbmdyYW0uYXBwLnYxLlVwZGF0ZUNvbm5lY3Rpb25SZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5VcGRhdGVDb25uZWN0aW9uUmVzcG9uc2USYwoQRGVsZXRlQ29ubmVjdGlvbhImLmVuZ3JhbS5hcHAudjEuRGVsZXRlQ29ubmVjdGlvblJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3Rpb25SZXNwb25zZRJdCg5UZXN0Q29ubmVjdGlvbhIkLmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3Rpb25SZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdGlvblJlc3BvbnNlEm8KFFNldENvbm5lY3Rpb25FbmFibGVkEiouZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0aW9uRW5hYmxlZFJlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLlNldENvbm5lY3Rpb25FbmFibGVkUmVzcG9uc2USbAoTR2V0R29vZ2xlQ2xvdWRTZXR1cBIpLmVuZ3JhbS5hcHAudjEuR2V0R29vZ2xlQ2xvdWRTZXR1cFJlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLkdldEdvb2dsZUNsb3VkU2V0dXBSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxIpgBChtHb29nbGVDbG91ZENvbm5lY3Rpb25Db25maWcSIgoad29ya2xvYWRfaWRlbnRpdHlfcHJvdmlkZXIYASABKAkSHQoVc2VydmljZV9hY2NvdW50X2VtYWlsGAIgASgJEhEKCWVuZHBvaW50cxgDIAMoCRIjChtjbG91ZF9zcWxfcG9zdGdyZXNfaW5zdGFuY2UYBCABKAkipwMKFUludGVncmF0aW9uQ29ubmVjdGlvbhIKCgJpZBgBIAEoCRINCgVhbGlhcxgCIAEoCRIQCghwcm92aWRlchgDIAEoCRIUCgxkaXNwbGF5X25hbWUYBCABKAkSDwoHZW5hYmxlZBgFIAEoCBIRCgl0ZXN0ZWRfYXQYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRISCgp1cGRhdGVkX2F0GAggASgJEkAKDGdvb2dsZV9jbG91ZBgJIAEoCzIqLmVuZ3JhbS5hcHAudjEuR29vZ2xlQ2xvdWRDb25uZWN0aW9uQ29uZmlnEhIKCmlzX2RlZmF1bHQYCiABKAgSLwoDbWNwGAsgASgLMiIuZW5ncmFtLmFwcC52MS5NY3BDb25uZWN0aW9uQ29uZmlnEhcKD2NvbmZpZ19yZXZpc2lvbhgMIAEoDRIXCg9hdXRoX2dlbmVyYXRpb24YDSABKA0SGwoTY3JlZGVudGlhbF9pZGVudGl0eRgOIAEoCRIYChBjYXRhbG9nX3JldmlzaW9uGA8gASgNEg8KB3Jldm9rZWQYECABKAgiGAoWTGlzdENvbm5lY3Rpb25zUmVxdWVzdCJUChdMaXN0Q29ubmVjdGlvbnNSZXNwb25zZRI5Cgtjb25uZWN0aW9ucxgBIAMoCzIkLmVuZ3JhbS5hcHAudjEuSW50ZWdyYXRpb25Db25uZWN0aW9uIsMBChdDcmVhdGVDb25uZWN0aW9uUmVxdWVzdBINCgVhbGlhcxgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSQAoMZ29vZ2xlX2Nsb3VkGAQgASgLMiouZW5ncmFtLmFwcC52MS5Hb29nbGVDbG91ZENvbm5lY3Rpb25Db25maWcSLwoDbWNwGAUgASgLMiIuZW5ncmFtLmFwcC52MS5NY3BDb25uZWN0aW9uQ29uZmlnIlQKGENyZWF0ZUNvbm5lY3Rpb25SZXNwb25zZRI4Cgpjb25uZWN0aW9uGAEgASgLMiQuZW5ncmFtLmFwcC52MS5JbnRlZ3JhdGlvbkNvbm5lY3Rpb24i2AEKF1VwZGF0ZUNvbm5lY3Rpb25SZXF1ZXN0EhkKEWV4cGVjdGVkX3JldmlzaW9uGAYgASgNEgoKAmlkGAEgASgJEg0KBWFsaWFzGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRJACgxnb29nbGVfY2xvdWQYBCABKAsyKi5lbmdyYW0uYXBwLnYxLkdvb2dsZUNsb3VkQ29ubmVjdGlvbkNvbmZpZxIvCgNtY3AYBSABKAsyIi5lbmdyYW0uYXBwLnYxLk1jcENvbm5lY3Rpb25Db25maWciVAoYVXBkYXRlQ29ubmVjdGlvblJlc3BvbnNlEjgKCmNvbm5lY3Rpb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkludGVncmF0aW9uQ29ubmVjdGlvbiIlChdEZWxldGVDb25uZWN0aW9uUmVxdWVzdBIKCgJpZBgBIAEoCSIrChhEZWxldGVDb25uZWN0aW9uUmVzcG9uc2USDwoHZGVsZXRlZBgBIAEoCCIjChVUZXN0Q29ubmVjdGlvblJlcXVlc3QSCgoCaWQYASABKAkiNQoWVGVzdENvbm5lY3Rpb25SZXNwb25zZRIKCgJvaxgBIAEoCBIPCgdtZXNzYWdlGAIgASgJIlUKG1NldENvbm5lY3Rpb25FbmFibGVkUmVxdWVzdBIKCgJpZBgBIAEoCRIPCgdlbmFibGVkGAIgASgIEhkKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgNIlgKHFNldENvbm5lY3Rpb25FbmFibGVkUmVzcG9uc2USOAoKY29ubmVjdGlvbhgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuSW50ZWdyYXRpb25Db25uZWN0aW9uIigKGkdldEdvb2dsZUNsb3VkU2V0dXBSZXF1ZXN0EgoKAmlkGAEgASgJIqIBChtHZXRHb29nbGVDbG91ZFNldHVwUmVzcG9uc2USDgoGaXNzdWVyGAEgASgJEhAKCGF1ZGllbmNlGAIgASgJEhkKEXN1YmplY3RfYXR0cmlidXRlGAMgASgJEhwKFGNvbm5lY3Rpb25fYXR0cmlidXRlGAQgASgJEhUKDWdjbG91ZF9zY3JpcHQYBSABKAkSEQoJdGVycmFmb3JtGAYgASgJIuYBCglDb25uZWN0b3ISEAoIcHJvdmlkZXIYASABKAkSEwoLY29uZmlnX2pzb24YAiABKAkSDwoHYnVpbHRpbhgDIAEoCBISCgpjcmVhdGVkX2F0GAQgASgJEhIKCnVwZGF0ZWRfYXQYBSABKAkSDgoGc3RhdHVzGAYgASgJEjgKCHNldHRpbmdzGAcgAygLMiYuZW5ncmFtLmFwcC52MS5Db25uZWN0b3IuU2V0dGluZ3NFbnRyeRovCg1TZXR0aW5nc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiFwoVTGlzdENvbm5lY3RvcnNSZXF1ZXN0IkYKFkxpc3RDb25uZWN0b3JzUmVzcG9uc2USLAoKY29ubmVjdG9ycxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIi0KFlVwc2VydENvbm5lY3RvclJlcXVlc3QSEwoLY29uZmlnX2pzb24YASABKAkiRgoXVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiKgoWRGVsZXRlQ29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCSIqChdEZWxldGVDb25uZWN0b3JSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIjoKDUNvbm5lY3Rvckljb24SDAoEbW9ubxgBIAEoCRINCgVjb2xvchgCIAEoCRIMCgRsb2dvGAMgASgJIn8KEENvbm5lY3RvckRpc3BsYXkSDAoEbmFtZRgBIAEoCRIQCghjYXRlZ29yeRgCIAEoCRINCgVibHVyYhgDIAEoCRIqCgRpY29uGAQgASgLMhwuZW5ncmFtLmFwcC52MS5Db25uZWN0b3JJY29uEhAKCGZlYXR1cmVkGAUgASgIInYKEUNhdGFsb2dDYXBhYmlsaXR5Eg4KBmFjdGlvbhgBIAEoCRIOCgZhY2Nlc3MYAiABKAkSDQoFYXNzZXQYAyABKAkSDQoFbGFiZWwYBCABKAkSDAoEaG9zdBgFIAEoCRIVCg1lbmRwb2ludF9ydWxlGAYgASgJIrQCChRQcm92aWRlckNhdGFsb2dFbnRyeRIQCghwcm92aWRlchgBIAEoCRIwCgdkaXNwbGF5GAIgASgLMh8uZW5ncmFtLmFwcC52MS5Db25uZWN0b3JEaXNwbGF5EhkKEWNyZWRlbnRpYWxfc291cmNlGAMgASgJEg0KBWhvc3RzGAQgAygJEjYKDGNhcGFiaWxpdGllcxgFIAMoCzIgLmVuZ3JhbS5hcHAudjEuQ2F0YWxvZ0NhcGFiaWxpdHkSHQoVZGVmYXVsdF9jb25uZWN0aW9uX2lkGAYgASgJEhgKEGNvbm5lY3Rpb25fbW9kZWwYByABKAkSPQoPdXNlcl9jcmVkZW50aWFsGAggASgLMiQuZW5ncmFtLmFwcC52MS5Vc2VyQ3JlZGVudGlhbFN1cHBvcnQiSQoVVXNlckNyZWRlbnRpYWxTdXBwb3J0Eg0KBW9hdXRoGAEgASgIEg0KBXRva2VuGAIgASgIEhIKCnRva2VuX2hpbnQYAyABKAkiHgocR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVxdWVzdCJXCh1HZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXNwb25zZRI2Cglwcm92aWRlcnMYASADKAsyIy5lbmdyYW0uYXBwLnYxLlByb3ZpZGVyQ2F0YWxvZ0VudHJ5Iq4BChhTZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEa2luZBgCIAEoCRJDCgZ2YWx1ZXMYAyADKAsyMy5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVxdWVzdC5WYWx1ZXNFbnRyeRotCgtWYWx1ZXNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIjEKGVNldE1pbnRDcmVkZW50aWFsUmVzcG9uc2USFAoMc2VjcmV0X25hbWVzGAEgAygJIlAKGlVwbG9hZENvbm5lY3RvckxvZ29SZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEgwKBGRhdGEYAiABKAwSEgoKbWVkaWFfdHlwZRgDIAEoCSIvChtVcGxvYWRDb25uZWN0b3JMb2dvUmVzcG9uc2USEAoIbG9nb191cmwYASABKAkirgIKFFRlc3RDb25uZWN0b3JSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEkoKDGRyYWZ0X3ZhbHVlcxgCIAMoCzI0LmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3RvclJlcXVlc3QuRHJhZnRWYWx1ZXNFbnRyeRJOCg5kcmFmdF9zZXR0aW5ncxgDIAMoCzI2LmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3RvclJlcXVlc3QuRHJhZnRTZXR0aW5nc0VudHJ5GjIKEERyYWZ0VmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ARo0ChJEcmFmdFNldHRpbmdzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASI0ChVUZXN0Q29ubmVjdG9yUmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCSKsAQobU2V0Q29ubmVjdG9yU2V0dGluZ3NSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEkoKCHNldHRpbmdzGAIgAygLMjguZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0b3JTZXR0aW5nc1JlcXVlc3QuU2V0dGluZ3NFbnRyeRovCg1TZXR0aW5nc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiSwocU2V0Q29ubmVjdG9yU2V0dGluZ3NSZXNwb25zZRIrCgljb25uZWN0b3IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvciKrAQoTTWNwQ29ubmVjdGlvbkNvbmZpZxIQCghlbmRwb2ludBgBIAEoCRIMCgR6b25lGAIgASgJEhEKCWF1dGhfa2luZBgDIAEoCRIaChJhcGlfa2V5X3NlY3JldF9yZWYYBCABKAkSJAocb2F1dGhfY2xpZW50X3JlZ2lzdHJhdGlvbl9pZBgFIAEoCRIfChdzaGFyZV93aXRoX29yZ19zZXNzaW9ucxgGIAEoCCKqAQoHTWNwVG9vbBIVCg11cHN0cmVhbV9uYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEhkKEWlucHV0X3NjaGVtYV9qc29uGAMgASgJEhoKEm91dHB1dF9zY2hlbWFfanNvbhgEIAEoCRIWCg5jbGFzc2lmaWNhdGlvbhgFIAEoCRIPCgdlbmFibGVkGAYgASgIEhMKC2ZpbmdlcnByaW50GAcgASgJIr0BCgpNY3BDYXRhbG9nEgoKAmlkGAEgASgJEhUKDWNvbm5lY3Rpb25faWQYAiABKAkSDAoEa2luZBgDIAEoCRIQCghyZXZpc2lvbhgEIAEoDRIXCg9jb25maWdfcmV2aXNpb24YBSABKA0SFwoPYXV0aF9nZW5lcmF0aW9uGAYgASgNEiUKBXRvb2xzGAcgAygLMhYuZW5ncmFtLmFwcC52MS5NY3BUb29sEhMKC2ZpbmdlcnByaW50GAggASgJIkYKEkRpc2NvdmVyTWNwUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEhkKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgNIkEKE0Rpc2NvdmVyTWNwUmVzcG9uc2USKgoHY2F0YWxvZxgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuTWNwQ2F0YWxvZyJ+ChFQdWJsaXNoTWNwUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEhAKCGRyYWZ0X2lkGAIgASgJEhkKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgNEiUKBXRvb2xzGAQgAygLMhYuZW5ncmFtLmFwcC52MS5NY3BUb29sIkAKElB1Ymxpc2hNY3BSZXNwb25zZRIqCgdjYXRhbG9nGAEgASgLMhkuZW5ncmFtLmFwcC52MS5NY3BDYXRhbG9nImoKE0F1dGhvcml6ZU1jcFJlcXVlc3QSFQoNY29ubmVjdGlvbl9pZBgBIAEoCRIbChNleHBlY3RlZF9nZW5lcmF0aW9uGAIgASgNEh8KF3NoYXJlX3dpdGhfb3JnX3Nlc3Npb25zGAMgASgIIjEKFEF1dGhvcml6ZU1jcFJlc3BvbnNlEhkKEWF1dGhvcml6YXRpb25fdXJsGAEgASgJIkoKFERpc2Nvbm5lY3RNY3BSZXF1ZXN0EhUKDWNvbm5lY3Rpb25faWQYASABKAkSGwoTZXhwZWN0ZWRfZ2VuZXJhdGlvbhgCIAEoDSJRChVEaXNjb25uZWN0TWNwUmVzcG9uc2USOAoKY29ubmVjdGlvbhgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuSW50ZWdyYXRpb25Db25uZWN0aW9uIs4BCgtNY3BBcHByb3ZhbBIUCgxleGVjdXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIOCgZydW5faWQYAyABKAkSFAoMdG9vbF9jYWxsX2lkGAQgASgJEhUKDWNvbm5lY3Rpb25faWQYBSABKAkSFQoNdXBzdHJlYW1fbmFtZRgGIAEoCRIWCg5yZXF1ZXN0X2RpZ2VzdBgHIAEoCRIVCg1hcmd1bWVudF9oYXNoGAggASgJEhIKCmV4cGlyZXNfYXQYCSABKAkiLQoXTGlzdE1jcEFwcHJvdmFsc1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJJChhMaXN0TWNwQXBwcm92YWxzUmVzcG9uc2USLQoJYXBwcm92YWxzGAEgAygLMhouZW5ncmFtLmFwcC52MS5NY3BBcHByb3ZhbCJBChhEZWNpZGVNY3BBcHByb3ZhbFJlcXVlc3QSFAoMZXhlY3V0aW9uX2lkGAEgASgJEg8KB2FwcHJvdmUYAiABKAgiKgoZRGVjaWRlTWNwQXBwcm92YWxSZXNwb25zZRINCgVzdGF0ZRgBIAEoCSIsChRDYW5jZWxNY3BDYWxsUmVxdWVzdBIUCgxleGVjdXRpb25faWQYASABKAkiJgoVQ2FuY2VsTWNwQ2FsbFJlc3BvbnNlEg0KBXN0YXRlGAEgASgJIkEKGFJlc29sdmVNY3BPdXRjb21lUmVxdWVzdBIUCgxleGVjdXRpb25faWQYASABKAkSDwoHb3V0Y29tZRgCIAEoCSIsChlSZXNvbHZlTWNwT3V0Y29tZVJlc3BvbnNlEg8KB291dGNvbWUYASABKAkiRQoQUmViaW5kTWNwUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEh0KFWV4cGVjdGVkX2JpbmRpbmdfaGFzaBgCIAEoCSIpChFSZWJpbmRNY3BSZXNwb25zZRIUCgxiaW5kaW5nX2hhc2gYASABKAky3BIKEkludGVncmF0aW9uU2VydmljZRJdCg5MaXN0Q29ubmVjdG9ycxIkLmVuZ3JhbS5hcHAudjEuTGlzdENvbm5lY3RvcnNSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEmAKD1Vwc2VydENvbm5lY3RvchIlLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USYAoPRGVsZXRlQ29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXNwb25zZRJyChVHZXRJbnRlZ3JhdGlvbkNhdGFsb2cSKy5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1JlcXVlc3QaLC5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEmYKEVNldE1pbnRDcmVkZW50aWFsEicuZW5ncmFtLmFwcC52MS5TZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVzcG9uc2USbAoTVXBsb2FkQ29ubmVjdG9yTG9nbxIpLmVuZ3JhbS5hcHAudjEuVXBsb2FkQ29ubmVjdG9yTG9nb1JlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLlVwbG9hZENvbm5lY3RvckxvZ29SZXNwb25zZRJaCg1UZXN0Q29ubmVjdG9yEiMuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3RvclJlc3BvbnNlEm8KFFNldENvbm5lY3RvclNldHRpbmdzEiouZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0b3JTZXR0aW5nc1JlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLlNldENvbm5lY3RvclNldHRpbmdzUmVzcG9uc2USYAoPTGlzdENvbm5lY3Rpb25zEiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXNwb25zZRJjChBDcmVhdGVDb25uZWN0aW9uEiYuZW5ncmFtLmFwcC52MS5DcmVhdGVDb25uZWN0aW9uUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ29ubmVjdGlvblJlc3BvbnNlEmMKEFVwZGF0ZUNvbm5lY3Rpb24SJi5lbmdyYW0uYXBwLnYxLlVwZGF0ZUNvbm5lY3Rpb25SZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5VcGRhdGVDb25uZWN0aW9uUmVzcG9uc2USYwoQRGVsZXRlQ29ubmVjdGlvbhImLmVuZ3JhbS5hcHAudjEuRGVsZXRlQ29ubmVjdGlvblJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3Rpb25SZXNwb25zZRJdCg5UZXN0Q29ubmVjdGlvbhIkLmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3Rpb25SZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdGlvblJlc3BvbnNlEm8KFFNldENvbm5lY3Rpb25FbmFibGVkEiouZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0aW9uRW5hYmxlZFJlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLlNldENvbm5lY3Rpb25FbmFibGVkUmVzcG9uc2USbAoTR2V0R29vZ2xlQ2xvdWRTZXR1cBIpLmVuZ3JhbS5hcHAudjEuR2V0R29vZ2xlQ2xvdWRTZXR1cFJlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLkdldEdvb2dsZUNsb3VkU2V0dXBSZXNwb25zZRJUCgtEaXNjb3Zlck1jcBIhLmVuZ3JhbS5hcHAudjEuRGlzY292ZXJNY3BSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5EaXNjb3Zlck1jcFJlc3BvbnNlElEKClB1Ymxpc2hNY3ASIC5lbmdyYW0uYXBwLnYxLlB1Ymxpc2hNY3BSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5QdWJsaXNoTWNwUmVzcG9uc2USVwoMQXV0aG9yaXplTWNwEiIuZW5ncmFtLmFwcC52MS5BdXRob3JpemVNY3BSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5BdXRob3JpemVNY3BSZXNwb25zZRJaCg1EaXNjb25uZWN0TWNwEiMuZW5ncmFtLmFwcC52MS5EaXNjb25uZWN0TWNwUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuRGlzY29ubmVjdE1jcFJlc3BvbnNlEmMKEExpc3RNY3BBcHByb3ZhbHMSJi5lbmdyYW0uYXBwLnYxLkxpc3RNY3BBcHByb3ZhbHNSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5MaXN0TWNwQXBwcm92YWxzUmVzcG9uc2USZgoRRGVjaWRlTWNwQXBwcm92YWwSJy5lbmdyYW0uYXBwLnYxLkRlY2lkZU1jcEFwcHJvdmFsUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuRGVjaWRlTWNwQXBwcm92YWxSZXNwb25zZRJaCg1DYW5jZWxNY3BDYWxsEiMuZW5ncmFtLmFwcC52MS5DYW5jZWxNY3BDYWxsUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuQ2FuY2VsTWNwQ2FsbFJlc3BvbnNlEmYKEVJlc29sdmVNY3BPdXRjb21lEicuZW5ncmFtLmFwcC52MS5SZXNvbHZlTWNwT3V0Y29tZVJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLlJlc29sdmVNY3BPdXRjb21lUmVzcG9uc2USTgoJUmViaW5kTWNwEh8uZW5ncmFtLmFwcC52MS5SZWJpbmRNY3BSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5SZWJpbmRNY3BSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * @generated from message engram.app.v1.GoogleCloudConnectionConfig
@@ -106,6 +106,36 @@ export type IntegrationConnection = Message<"engram.app.v1.IntegrationConnection
    * @generated from field: bool is_default = 10;
    */
   isDefault: boolean;
+
+  /**
+   * @generated from field: engram.app.v1.McpConnectionConfig mcp = 11;
+   */
+  mcp?: McpConnectionConfig;
+
+  /**
+   * @generated from field: uint32 config_revision = 12;
+   */
+  configRevision: number;
+
+  /**
+   * @generated from field: uint32 auth_generation = 13;
+   */
+  authGeneration: number;
+
+  /**
+   * @generated from field: string credential_identity = 14;
+   */
+  credentialIdentity: string;
+
+  /**
+   * @generated from field: uint32 catalog_revision = 15;
+   */
+  catalogRevision: number;
+
+  /**
+   * @generated from field: bool revoked = 16;
+   */
+  revoked: boolean;
 };
 
 /**
@@ -168,6 +198,11 @@ export type CreateConnectionRequest = Message<"engram.app.v1.CreateConnectionReq
    * @generated from field: engram.app.v1.GoogleCloudConnectionConfig google_cloud = 4;
    */
   googleCloud?: GoogleCloudConnectionConfig;
+
+  /**
+   * @generated from field: engram.app.v1.McpConnectionConfig mcp = 5;
+   */
+  mcp?: McpConnectionConfig;
 };
 
 /**
@@ -199,6 +234,11 @@ export const CreateConnectionResponseSchema: GenMessage<CreateConnectionResponse
  */
 export type UpdateConnectionRequest = Message<"engram.app.v1.UpdateConnectionRequest"> & {
   /**
+   * @generated from field: uint32 expected_revision = 6;
+   */
+  expectedRevision: number;
+
+  /**
    * @generated from field: string id = 1;
    */
   id: string;
@@ -217,6 +257,11 @@ export type UpdateConnectionRequest = Message<"engram.app.v1.UpdateConnectionReq
    * @generated from field: engram.app.v1.GoogleCloudConnectionConfig google_cloud = 4;
    */
   googleCloud?: GoogleCloudConnectionConfig;
+
+  /**
+   * @generated from field: engram.app.v1.McpConnectionConfig mcp = 5;
+   */
+  mcp?: McpConnectionConfig;
 };
 
 /**
@@ -329,6 +374,11 @@ export type SetConnectionEnabledRequest = Message<"engram.app.v1.SetConnectionEn
    * @generated from field: bool enabled = 2;
    */
   enabled: boolean;
+
+  /**
+   * @generated from field: uint32 expected_revision = 3;
+   */
+  expectedRevision: number;
 };
 
 /**
@@ -1035,6 +1085,564 @@ export const SetConnectorSettingsResponseSchema: GenMessage<SetConnectorSettings
   messageDesc(file_engram_app_v1_integration, 37);
 
 /**
+ * Organization credential references only. Secret values never enter this contract.
+ *
+ * @generated from message engram.app.v1.McpConnectionConfig
+ */
+export type McpConnectionConfig = Message<"engram.app.v1.McpConnectionConfig"> & {
+  /**
+   * @generated from field: string endpoint = 1;
+   */
+  endpoint: string;
+
+  /**
+   * @generated from field: string zone = 2;
+   */
+  zone: string;
+
+  /**
+   * @generated from field: string auth_kind = 3;
+   */
+  authKind: string;
+
+  /**
+   * @generated from field: string api_key_secret_ref = 4;
+   */
+  apiKeySecretRef: string;
+
+  /**
+   * @generated from field: string oauth_client_registration_id = 5;
+   */
+  oauthClientRegistrationId: string;
+
+  /**
+   * @generated from field: bool share_with_org_sessions = 6;
+   */
+  shareWithOrgSessions: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.McpConnectionConfig.
+ * Use `create(McpConnectionConfigSchema)` to create a new message.
+ */
+export const McpConnectionConfigSchema: GenMessage<McpConnectionConfig> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 38);
+
+/**
+ * @generated from message engram.app.v1.McpTool
+ */
+export type McpTool = Message<"engram.app.v1.McpTool"> & {
+  /**
+   * @generated from field: string upstream_name = 1;
+   */
+  upstreamName: string;
+
+  /**
+   * @generated from field: string description = 2;
+   */
+  description: string;
+
+  /**
+   * @generated from field: string input_schema_json = 3;
+   */
+  inputSchemaJson: string;
+
+  /**
+   * @generated from field: string output_schema_json = 4;
+   */
+  outputSchemaJson: string;
+
+  /**
+   * Empty in discovery drafts. Publication requires explicit read or write.
+   *
+   * @generated from field: string classification = 5;
+   */
+  classification: string;
+
+  /**
+   * @generated from field: bool enabled = 6;
+   */
+  enabled: boolean;
+
+  /**
+   * @generated from field: string fingerprint = 7;
+   */
+  fingerprint: string;
+};
+
+/**
+ * Describes the message engram.app.v1.McpTool.
+ * Use `create(McpToolSchema)` to create a new message.
+ */
+export const McpToolSchema: GenMessage<McpTool> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 39);
+
+/**
+ * @generated from message engram.app.v1.McpCatalog
+ */
+export type McpCatalog = Message<"engram.app.v1.McpCatalog"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string connection_id = 2;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: string kind = 3;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: uint32 revision = 4;
+   */
+  revision: number;
+
+  /**
+   * @generated from field: uint32 config_revision = 5;
+   */
+  configRevision: number;
+
+  /**
+   * @generated from field: uint32 auth_generation = 6;
+   */
+  authGeneration: number;
+
+  /**
+   * @generated from field: repeated engram.app.v1.McpTool tools = 7;
+   */
+  tools: McpTool[];
+
+  /**
+   * @generated from field: string fingerprint = 8;
+   */
+  fingerprint: string;
+};
+
+/**
+ * Describes the message engram.app.v1.McpCatalog.
+ * Use `create(McpCatalogSchema)` to create a new message.
+ */
+export const McpCatalogSchema: GenMessage<McpCatalog> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 40);
+
+/**
+ * @generated from message engram.app.v1.DiscoverMcpRequest
+ */
+export type DiscoverMcpRequest = Message<"engram.app.v1.DiscoverMcpRequest"> & {
+  /**
+   * @generated from field: string connection_id = 1;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: uint32 expected_revision = 2;
+   */
+  expectedRevision: number;
+};
+
+/**
+ * Describes the message engram.app.v1.DiscoverMcpRequest.
+ * Use `create(DiscoverMcpRequestSchema)` to create a new message.
+ */
+export const DiscoverMcpRequestSchema: GenMessage<DiscoverMcpRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 41);
+
+/**
+ * @generated from message engram.app.v1.DiscoverMcpResponse
+ */
+export type DiscoverMcpResponse = Message<"engram.app.v1.DiscoverMcpResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.McpCatalog catalog = 1;
+   */
+  catalog?: McpCatalog;
+};
+
+/**
+ * Describes the message engram.app.v1.DiscoverMcpResponse.
+ * Use `create(DiscoverMcpResponseSchema)` to create a new message.
+ */
+export const DiscoverMcpResponseSchema: GenMessage<DiscoverMcpResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 42);
+
+/**
+ * @generated from message engram.app.v1.PublishMcpRequest
+ */
+export type PublishMcpRequest = Message<"engram.app.v1.PublishMcpRequest"> & {
+  /**
+   * @generated from field: string connection_id = 1;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: string draft_id = 2;
+   */
+  draftId: string;
+
+  /**
+   * @generated from field: uint32 expected_revision = 3;
+   */
+  expectedRevision: number;
+
+  /**
+   * @generated from field: repeated engram.app.v1.McpTool tools = 4;
+   */
+  tools: McpTool[];
+};
+
+/**
+ * Describes the message engram.app.v1.PublishMcpRequest.
+ * Use `create(PublishMcpRequestSchema)` to create a new message.
+ */
+export const PublishMcpRequestSchema: GenMessage<PublishMcpRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 43);
+
+/**
+ * @generated from message engram.app.v1.PublishMcpResponse
+ */
+export type PublishMcpResponse = Message<"engram.app.v1.PublishMcpResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.McpCatalog catalog = 1;
+   */
+  catalog?: McpCatalog;
+};
+
+/**
+ * Describes the message engram.app.v1.PublishMcpResponse.
+ * Use `create(PublishMcpResponseSchema)` to create a new message.
+ */
+export const PublishMcpResponseSchema: GenMessage<PublishMcpResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 44);
+
+/**
+ * @generated from message engram.app.v1.AuthorizeMcpRequest
+ */
+export type AuthorizeMcpRequest = Message<"engram.app.v1.AuthorizeMcpRequest"> & {
+  /**
+   * @generated from field: string connection_id = 1;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: uint32 expected_generation = 2;
+   */
+  expectedGeneration: number;
+
+  /**
+   * @generated from field: bool share_with_org_sessions = 3;
+   */
+  shareWithOrgSessions: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.AuthorizeMcpRequest.
+ * Use `create(AuthorizeMcpRequestSchema)` to create a new message.
+ */
+export const AuthorizeMcpRequestSchema: GenMessage<AuthorizeMcpRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 45);
+
+/**
+ * @generated from message engram.app.v1.AuthorizeMcpResponse
+ */
+export type AuthorizeMcpResponse = Message<"engram.app.v1.AuthorizeMcpResponse"> & {
+  /**
+   * @generated from field: string authorization_url = 1;
+   */
+  authorizationUrl: string;
+};
+
+/**
+ * Describes the message engram.app.v1.AuthorizeMcpResponse.
+ * Use `create(AuthorizeMcpResponseSchema)` to create a new message.
+ */
+export const AuthorizeMcpResponseSchema: GenMessage<AuthorizeMcpResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 46);
+
+/**
+ * @generated from message engram.app.v1.DisconnectMcpRequest
+ */
+export type DisconnectMcpRequest = Message<"engram.app.v1.DisconnectMcpRequest"> & {
+  /**
+   * @generated from field: string connection_id = 1;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: uint32 expected_generation = 2;
+   */
+  expectedGeneration: number;
+};
+
+/**
+ * Describes the message engram.app.v1.DisconnectMcpRequest.
+ * Use `create(DisconnectMcpRequestSchema)` to create a new message.
+ */
+export const DisconnectMcpRequestSchema: GenMessage<DisconnectMcpRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 47);
+
+/**
+ * @generated from message engram.app.v1.DisconnectMcpResponse
+ */
+export type DisconnectMcpResponse = Message<"engram.app.v1.DisconnectMcpResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.IntegrationConnection connection = 1;
+   */
+  connection?: IntegrationConnection;
+};
+
+/**
+ * Describes the message engram.app.v1.DisconnectMcpResponse.
+ * Use `create(DisconnectMcpResponseSchema)` to create a new message.
+ */
+export const DisconnectMcpResponseSchema: GenMessage<DisconnectMcpResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 48);
+
+/**
+ * @generated from message engram.app.v1.McpApproval
+ */
+export type McpApproval = Message<"engram.app.v1.McpApproval"> & {
+  /**
+   * @generated from field: string execution_id = 1;
+   */
+  executionId: string;
+
+  /**
+   * @generated from field: string session_id = 2;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string run_id = 3;
+   */
+  runId: string;
+
+  /**
+   * @generated from field: string tool_call_id = 4;
+   */
+  toolCallId: string;
+
+  /**
+   * @generated from field: string connection_id = 5;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: string upstream_name = 6;
+   */
+  upstreamName: string;
+
+  /**
+   * @generated from field: string request_digest = 7;
+   */
+  requestDigest: string;
+
+  /**
+   * @generated from field: string argument_hash = 8;
+   */
+  argumentHash: string;
+
+  /**
+   * @generated from field: string expires_at = 9;
+   */
+  expiresAt: string;
+};
+
+/**
+ * Describes the message engram.app.v1.McpApproval.
+ * Use `create(McpApprovalSchema)` to create a new message.
+ */
+export const McpApprovalSchema: GenMessage<McpApproval> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 49);
+
+/**
+ * @generated from message engram.app.v1.ListMcpApprovalsRequest
+ */
+export type ListMcpApprovalsRequest = Message<"engram.app.v1.ListMcpApprovalsRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ListMcpApprovalsRequest.
+ * Use `create(ListMcpApprovalsRequestSchema)` to create a new message.
+ */
+export const ListMcpApprovalsRequestSchema: GenMessage<ListMcpApprovalsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 50);
+
+/**
+ * @generated from message engram.app.v1.ListMcpApprovalsResponse
+ */
+export type ListMcpApprovalsResponse = Message<"engram.app.v1.ListMcpApprovalsResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.McpApproval approvals = 1;
+   */
+  approvals: McpApproval[];
+};
+
+/**
+ * Describes the message engram.app.v1.ListMcpApprovalsResponse.
+ * Use `create(ListMcpApprovalsResponseSchema)` to create a new message.
+ */
+export const ListMcpApprovalsResponseSchema: GenMessage<ListMcpApprovalsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 51);
+
+/**
+ * @generated from message engram.app.v1.DecideMcpApprovalRequest
+ */
+export type DecideMcpApprovalRequest = Message<"engram.app.v1.DecideMcpApprovalRequest"> & {
+  /**
+   * @generated from field: string execution_id = 1;
+   */
+  executionId: string;
+
+  /**
+   * @generated from field: bool approve = 2;
+   */
+  approve: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.DecideMcpApprovalRequest.
+ * Use `create(DecideMcpApprovalRequestSchema)` to create a new message.
+ */
+export const DecideMcpApprovalRequestSchema: GenMessage<DecideMcpApprovalRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 52);
+
+/**
+ * @generated from message engram.app.v1.DecideMcpApprovalResponse
+ */
+export type DecideMcpApprovalResponse = Message<"engram.app.v1.DecideMcpApprovalResponse"> & {
+  /**
+   * @generated from field: string state = 1;
+   */
+  state: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DecideMcpApprovalResponse.
+ * Use `create(DecideMcpApprovalResponseSchema)` to create a new message.
+ */
+export const DecideMcpApprovalResponseSchema: GenMessage<DecideMcpApprovalResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 53);
+
+/**
+ * @generated from message engram.app.v1.CancelMcpCallRequest
+ */
+export type CancelMcpCallRequest = Message<"engram.app.v1.CancelMcpCallRequest"> & {
+  /**
+   * @generated from field: string execution_id = 1;
+   */
+  executionId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.CancelMcpCallRequest.
+ * Use `create(CancelMcpCallRequestSchema)` to create a new message.
+ */
+export const CancelMcpCallRequestSchema: GenMessage<CancelMcpCallRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 54);
+
+/**
+ * @generated from message engram.app.v1.CancelMcpCallResponse
+ */
+export type CancelMcpCallResponse = Message<"engram.app.v1.CancelMcpCallResponse"> & {
+  /**
+   * @generated from field: string state = 1;
+   */
+  state: string;
+};
+
+/**
+ * Describes the message engram.app.v1.CancelMcpCallResponse.
+ * Use `create(CancelMcpCallResponseSchema)` to create a new message.
+ */
+export const CancelMcpCallResponseSchema: GenMessage<CancelMcpCallResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 55);
+
+/**
+ * @generated from message engram.app.v1.ResolveMcpOutcomeRequest
+ */
+export type ResolveMcpOutcomeRequest = Message<"engram.app.v1.ResolveMcpOutcomeRequest"> & {
+  /**
+   * @generated from field: string execution_id = 1;
+   */
+  executionId: string;
+
+  /**
+   * @generated from field: string outcome = 2;
+   */
+  outcome: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ResolveMcpOutcomeRequest.
+ * Use `create(ResolveMcpOutcomeRequestSchema)` to create a new message.
+ */
+export const ResolveMcpOutcomeRequestSchema: GenMessage<ResolveMcpOutcomeRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 56);
+
+/**
+ * @generated from message engram.app.v1.ResolveMcpOutcomeResponse
+ */
+export type ResolveMcpOutcomeResponse = Message<"engram.app.v1.ResolveMcpOutcomeResponse"> & {
+  /**
+   * @generated from field: string outcome = 1;
+   */
+  outcome: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ResolveMcpOutcomeResponse.
+ * Use `create(ResolveMcpOutcomeResponseSchema)` to create a new message.
+ */
+export const ResolveMcpOutcomeResponseSchema: GenMessage<ResolveMcpOutcomeResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 57);
+
+/**
+ * @generated from message engram.app.v1.RebindMcpRequest
+ */
+export type RebindMcpRequest = Message<"engram.app.v1.RebindMcpRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string expected_binding_hash = 2;
+   */
+  expectedBindingHash: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RebindMcpRequest.
+ * Use `create(RebindMcpRequestSchema)` to create a new message.
+ */
+export const RebindMcpRequestSchema: GenMessage<RebindMcpRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 58);
+
+/**
+ * @generated from message engram.app.v1.RebindMcpResponse
+ */
+export type RebindMcpResponse = Message<"engram.app.v1.RebindMcpResponse"> & {
+  /**
+   * @generated from field: string binding_hash = 1;
+   */
+  bindingHash: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RebindMcpResponse.
+ * Use `create(RebindMcpResponseSchema)` to create a new message.
+ */
+export const RebindMcpResponseSchema: GenMessage<RebindMcpResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 59);
+
+/**
  * ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
  * live in the orchestrator DB (the `connector` table, C1); the built-ins
  * (github/datadog) are read-only file seeds surfaced alongside custom ones.
@@ -1201,6 +1809,78 @@ export const IntegrationService: GenService<{
     methodKind: "unary";
     input: typeof GetGoogleCloudSetupRequestSchema;
     output: typeof GetGoogleCloudSetupResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.DiscoverMcp
+   */
+  discoverMcp: {
+    methodKind: "unary";
+    input: typeof DiscoverMcpRequestSchema;
+    output: typeof DiscoverMcpResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.PublishMcp
+   */
+  publishMcp: {
+    methodKind: "unary";
+    input: typeof PublishMcpRequestSchema;
+    output: typeof PublishMcpResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.AuthorizeMcp
+   */
+  authorizeMcp: {
+    methodKind: "unary";
+    input: typeof AuthorizeMcpRequestSchema;
+    output: typeof AuthorizeMcpResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.DisconnectMcp
+   */
+  disconnectMcp: {
+    methodKind: "unary";
+    input: typeof DisconnectMcpRequestSchema;
+    output: typeof DisconnectMcpResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.ListMcpApprovals
+   */
+  listMcpApprovals: {
+    methodKind: "unary";
+    input: typeof ListMcpApprovalsRequestSchema;
+    output: typeof ListMcpApprovalsResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.DecideMcpApproval
+   */
+  decideMcpApproval: {
+    methodKind: "unary";
+    input: typeof DecideMcpApprovalRequestSchema;
+    output: typeof DecideMcpApprovalResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.CancelMcpCall
+   */
+  cancelMcpCall: {
+    methodKind: "unary";
+    input: typeof CancelMcpCallRequestSchema;
+    output: typeof CancelMcpCallResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.ResolveMcpOutcome
+   */
+  resolveMcpOutcome: {
+    methodKind: "unary";
+    input: typeof ResolveMcpOutcomeRequestSchema;
+    output: typeof ResolveMcpOutcomeResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.RebindMcp
+   */
+  rebindMcp: {
+    methodKind: "unary";
+    input: typeof RebindMcpRequestSchema;
+    output: typeof RebindMcpResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_integration, 0);

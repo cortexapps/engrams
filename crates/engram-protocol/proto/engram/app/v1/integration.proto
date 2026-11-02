@@ -52,6 +52,15 @@ service IntegrationService {
   rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
   rpc SetConnectionEnabled(SetConnectionEnabledRequest) returns (SetConnectionEnabledResponse);
   rpc GetGoogleCloudSetup(GetGoogleCloudSetupRequest) returns (GetGoogleCloudSetupResponse);
+  rpc DiscoverMcp(DiscoverMcpRequest) returns (DiscoverMcpResponse);
+  rpc PublishMcp(PublishMcpRequest) returns (PublishMcpResponse);
+  rpc AuthorizeMcp(AuthorizeMcpRequest) returns (AuthorizeMcpResponse);
+  rpc DisconnectMcp(DisconnectMcpRequest) returns (DisconnectMcpResponse);
+  rpc ListMcpApprovals(ListMcpApprovalsRequest) returns (ListMcpApprovalsResponse);
+  rpc DecideMcpApproval(DecideMcpApprovalRequest) returns (DecideMcpApprovalResponse);
+  rpc CancelMcpCall(CancelMcpCallRequest) returns (CancelMcpCallResponse);
+  rpc ResolveMcpOutcome(ResolveMcpOutcomeRequest) returns (ResolveMcpOutcomeResponse);
+  rpc RebindMcp(RebindMcpRequest) returns (RebindMcpResponse);
 }
 
 message GoogleCloudConnectionConfig {
@@ -78,37 +87,69 @@ message IntegrationConnection {
   string updated_at = 8;
   GoogleCloudConnectionConfig google_cloud = 9;
   bool is_default = 10;
+  McpConnectionConfig mcp = 11;
+  uint32 config_revision = 12;
+  uint32 auth_generation = 13;
+  string credential_identity = 14;
+  uint32 catalog_revision = 15;
+  bool revoked = 16;
 }
 
 message ListConnectionsRequest {}
-message ListConnectionsResponse { repeated IntegrationConnection connections = 1; }
+message ListConnectionsResponse {
+  repeated IntegrationConnection connections = 1;
+}
 
 message CreateConnectionRequest {
   string alias = 1;
   string provider = 2;
   string display_name = 3;
   GoogleCloudConnectionConfig google_cloud = 4;
+  McpConnectionConfig mcp = 5;
 }
-message CreateConnectionResponse { IntegrationConnection connection = 1; }
+message CreateConnectionResponse {
+  IntegrationConnection connection = 1;
+}
 
 message UpdateConnectionRequest {
+  uint32 expected_revision = 6;
   string id = 1;
   string alias = 2;
   string display_name = 3;
   GoogleCloudConnectionConfig google_cloud = 4;
+  McpConnectionConfig mcp = 5;
 }
-message UpdateConnectionResponse { IntegrationConnection connection = 1; }
+message UpdateConnectionResponse {
+  IntegrationConnection connection = 1;
+}
 
-message DeleteConnectionRequest { string id = 1; }
-message DeleteConnectionResponse { bool deleted = 1; }
+message DeleteConnectionRequest {
+  string id = 1;
+}
+message DeleteConnectionResponse {
+  bool deleted = 1;
+}
 
-message TestConnectionRequest { string id = 1; }
-message TestConnectionResponse { bool ok = 1; string message = 2; }
+message TestConnectionRequest {
+  string id = 1;
+}
+message TestConnectionResponse {
+  bool ok = 1;
+  string message = 2;
+}
 
-message SetConnectionEnabledRequest { string id = 1; bool enabled = 2; }
-message SetConnectionEnabledResponse { IntegrationConnection connection = 1; }
+message SetConnectionEnabledRequest {
+  string id = 1;
+  bool enabled = 2;
+  uint32 expected_revision = 3;
+}
+message SetConnectionEnabledResponse {
+  IntegrationConnection connection = 1;
+}
 
-message GetGoogleCloudSetupRequest { string id = 1; }
+message GetGoogleCloudSetupRequest {
+  string id = 1;
+}
 message GetGoogleCloudSetupResponse {
   string issuer = 1;
   string audience = 2;
@@ -184,9 +225,9 @@ message ConnectorDisplay {
 
 // One grantable power, derived for display (the slug stays canonical).
 message CatalogCapability {
-  string action = 1;  // e.g. "issues:write"
-  string access = 2;  // "read" | "write" (derived from the op's HTTP method)
-  string asset = 3;   // asset kind this op surfaces, or "" when none
+  string action = 1; // e.g. "issues:write"
+  string access = 2; // "read" | "write" (derived from the op's HTTP method)
+  string asset = 3; // asset kind this op surfaces, or "" when none
   // ADR 0109 seam: operator-facing name. A named-connection provider serves
   // its operation list here so the web renders from the SAME table the
   // orchestrator compiles policy from — two hand-maintained copies drift, and
@@ -239,7 +280,7 @@ message GetIntegrationCatalogResponse {
 
 message SetMintCredentialRequest {
   string provider = 1; // e.g. "github"
-  string kind = 2;     // e.g. "github_app"
+  string kind = 2; // e.g. "github_app"
   // field name → value (e.g. app_id, private_key_pem). Each non-empty value is
   // sealed as the org secret `<kind>.<field>`; values are never returned.
   map<string, string> values = 3;
@@ -290,4 +331,109 @@ message SetConnectorSettingsRequest {
 
 message SetConnectorSettingsResponse {
   Connector connector = 1;
+}
+
+// Organization credential references only. Secret values never enter this contract.
+message McpConnectionConfig {
+  string endpoint = 1;
+  string zone = 2;
+  string auth_kind = 3;
+  string api_key_secret_ref = 4;
+  string oauth_client_registration_id = 5;
+  bool share_with_org_sessions = 6;
+}
+message McpTool {
+  string upstream_name = 1;
+  string description = 2;
+  string input_schema_json = 3;
+  string output_schema_json = 4;
+  // Empty in discovery drafts. Publication requires explicit read or write.
+  string classification = 5;
+  bool enabled = 6;
+  string fingerprint = 7;
+}
+message McpCatalog {
+  string id = 1;
+  string connection_id = 2;
+  string kind = 3;
+  uint32 revision = 4;
+  uint32 config_revision = 5;
+  uint32 auth_generation = 6;
+  repeated McpTool tools = 7;
+  string fingerprint = 8;
+}
+message DiscoverMcpRequest {
+  string connection_id = 1;
+  uint32 expected_revision = 2;
+}
+message DiscoverMcpResponse {
+  McpCatalog catalog = 1;
+}
+message PublishMcpRequest {
+  string connection_id = 1;
+  string draft_id = 2;
+  uint32 expected_revision = 3;
+  repeated McpTool tools = 4;
+}
+message PublishMcpResponse {
+  McpCatalog catalog = 1;
+}
+message AuthorizeMcpRequest {
+  string connection_id = 1;
+  uint32 expected_generation = 2;
+  bool share_with_org_sessions = 3;
+}
+message AuthorizeMcpResponse {
+  string authorization_url = 1;
+}
+message DisconnectMcpRequest {
+  string connection_id = 1;
+  uint32 expected_generation = 2;
+}
+message DisconnectMcpResponse {
+  IntegrationConnection connection = 1;
+}
+message McpApproval {
+  string execution_id = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  string connection_id = 5;
+  string upstream_name = 6;
+  string request_digest = 7;
+  string argument_hash = 8;
+  string expires_at = 9;
+}
+message ListMcpApprovalsRequest {
+  string session_id = 1;
+}
+message ListMcpApprovalsResponse {
+  repeated McpApproval approvals = 1;
+}
+message DecideMcpApprovalRequest {
+  string execution_id = 1;
+  bool approve = 2;
+}
+message DecideMcpApprovalResponse {
+  string state = 1;
+}
+message CancelMcpCallRequest {
+  string execution_id = 1;
+}
+message CancelMcpCallResponse {
+  string state = 1;
+}
+message ResolveMcpOutcomeRequest {
+  string execution_id = 1;
+  string outcome = 2;
+}
+message ResolveMcpOutcomeResponse {
+  string outcome = 1;
+}
+message RebindMcpRequest {
+  string session_id = 1;
+  string expected_binding_hash = 2;
+}
+message RebindMcpResponse {
+  string binding_hash = 1;
 }

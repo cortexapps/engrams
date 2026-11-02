@@ -708,6 +708,27 @@
       "when": 1793241391817,
       "tag": "0100_profile_programmatic_only",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1793585018303,
+      "tag": "0101_mcp_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1793585413259,
+      "tag": "0102_mcp_authorization_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1793585592275,
+      "tag": "0103_mcp_session_retention",
+      "breakpoints": true
     }
   ]
 }

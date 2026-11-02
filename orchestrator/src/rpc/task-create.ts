@@ -490,6 +490,11 @@ export async function compileSessionCreateInput(
       ? overrideGrants
       : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(effectiveGrants, connections);
+  // The runtime must install managed-host denies and session-local tool bindings
+  // before any MCP authority is exposed. That activation is not configured yet.
+  if (resolvedEffectiveGrants.some(({ connection }) => connection.provider === "mcp")) {
+    throw new ConnectError("external MCP session activation is not configured", Code.FailedPrecondition);
+  }
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
     throw new ConnectError(

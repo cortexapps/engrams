@@ -1,6 +1,7 @@
 /** Named integration connection store (ADR 0109). */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { validateMcpConfig } from "../mcp/config.ts";
+import { and, asc, eq, inArray, ne } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import { integrationConnection as connectionTable } from "./schema.ts";
@@ -14,6 +15,7 @@ export interface GoogleCloudConnectionConfig {
 }
 
 export interface IntegrationConnectionRow {
+  mcp?: import("../mcp/types.ts").McpConnectionState;
   id: string;
   alias: string;
   provider: string;
@@ -53,6 +55,15 @@ export interface IntegrationConnectionStore {
 
 function toRow(r: typeof connectionTable.$inferSelect): IntegrationConnectionRow {
   return {
+    ...(r.provider === "mcp" ? {
+      mcp: {
+        configRevision: r.configRevision,
+        authGeneration: r.authGeneration,
+        credentialIdentity: r.credentialIdentity,
+        catalogRevision: r.catalogRevision,
+        revoked: r.revoked,
+      },
+    } : {}),
     id: r.id,
     alias: r.alias,
     provider: r.provider,
@@ -107,6 +118,7 @@ export function makeIntegrationConnectionStore(
     getDefault,
 
     async create(input) {
+      if (input.provider === "mcp") input = { ...input, config: validateMcpConfig(input.config) };
       const rows = await db
         .insert(connectionTable)
         .values({ id: crypto.randomUUID(), ...input, enabled: false })
@@ -118,7 +130,7 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .update(connectionTable)
         .set({ ...input, enabled: false, testedAt: null, updatedAt: new Date() })
-        .where(eq(connectionTable.id, id))
+        .where(and(eq(connectionTable.id, id), ne(connectionTable.provider, "mcp")))
         .returning();
       return rows[0] ? toRow(rows[0]) : null;
     },
@@ -135,7 +147,7 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .update(connectionTable)
         .set({ testedAt, updatedAt: testedAt })
-        .where(eq(connectionTable.id, id))
+        .where(and(eq(connectionTable.id, id), ne(connectionTable.provider, "mcp")))
         .returning();
       return rows[0] ? toRow(rows[0]) : null;
     },
@@ -144,7 +156,7 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .update(connectionTable)
         .set({ enabled, updatedAt: new Date() })
-        .where(eq(connectionTable.id, id))
+        .where(and(eq(connectionTable.id, id), ne(connectionTable.provider, "mcp")))
         .returning();
       return rows[0] ? toRow(rows[0]) : null;
     },
@@ -153,12 +165,13 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .update(connectionTable)
         .set({ config, updatedAt: new Date() })
-        .where(eq(connectionTable.id, id))
+        .where(and(eq(connectionTable.id, id), ne(connectionTable.provider, "mcp")))
         .returning();
       return rows[0] ? toRow(rows[0]) : null;
     },
 
     async ensureDefault(provider, displayName) {
+      if (provider === "mcp") throw new Error("MCP requires an explicit named connection");
       const existing = await getDefault(provider);
       if (existing) return existing;
       await db.insert(connectionTable).values({

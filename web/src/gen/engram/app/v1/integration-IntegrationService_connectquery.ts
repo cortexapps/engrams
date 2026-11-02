@@ -115,3 +115,48 @@ export const setConnectionEnabled = IntegrationService.method.setConnectionEnabl
  * @generated from rpc engram.app.v1.IntegrationService.GetGoogleCloudSetup
  */
 export const getGoogleCloudSetup = IntegrationService.method.getGoogleCloudSetup;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.DiscoverMcp
+ */
+export const discoverMcp = IntegrationService.method.discoverMcp;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.PublishMcp
+ */
+export const publishMcp = IntegrationService.method.publishMcp;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.AuthorizeMcp
+ */
+export const authorizeMcp = IntegrationService.method.authorizeMcp;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.DisconnectMcp
+ */
+export const disconnectMcp = IntegrationService.method.disconnectMcp;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.ListMcpApprovals
+ */
+export const listMcpApprovals = IntegrationService.method.listMcpApprovals;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.DecideMcpApproval
+ */
+export const decideMcpApproval = IntegrationService.method.decideMcpApproval;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.CancelMcpCall
+ */
+export const cancelMcpCall = IntegrationService.method.cancelMcpCall;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.ResolveMcpOutcome
+ */
+export const resolveMcpOutcome = IntegrationService.method.resolveMcpOutcome;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.RebindMcp
+ */
+export const rebindMcp = IntegrationService.method.rebindMcp;

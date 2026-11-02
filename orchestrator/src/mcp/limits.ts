@@ -1,0 +1,22 @@
+/** Operator ceilings. Per-zone policy can reduce these values. */
+export const MCP_LIMITS = Object.freeze({
+  connectionsPerSession: 16,
+  toolsPerSession: 128,
+  manifestBytes: 1024 * 1024,
+  argumentBytes: 256 * 1024,
+  resultBytes: 1024 * 1024,
+  responseBytes: 2 * 1024 * 1024,
+  connectMs: 5000,
+  toolMs: 60_000,
+  maxToolMs: 300_000,
+  sessionConcurrency: 4,
+  connectionConcurrency: 8,
+  deploymentConcurrency: 32,
+  queueSize: 128,
+  queueMs: 30_000,
+  sessionApprovals: 16,
+  deploymentApprovals: 128,
+  approvalMs: 600_000,
+  schemaMs: 1000,
+  schemaHeapMiB: 128,
+});
