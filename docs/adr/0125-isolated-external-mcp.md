@@ -91,6 +91,15 @@ the desired state before proxy application, drains existing session connections,
 then saves an applied marker before ACK. Read and compare-and-apply bind the exact
 session, sandbox, physical epoch, host and proxy incarnations, binding hash,
 operator identity, revision and digest. A lost ACK cannot remove retained hosts.
+
+The trusted read returns retained coordinator state separately from the exact
+host receipt. A required wrapper carries the checked physical read target and
+an optional canonical retained policy; a missing wrapper is unsupported, not an
+empty union. Consumers retain both policies and choose a revision above both.
+Coordinator persistence is not proof of host application. Reads check placement
+before host I/O and after reading the retained policy, without a transaction
+across that I/O.
+
 Managed host mode requires mTLS for the whole host mutation listener, exact
 coordinator certificate pins, and host-specific server identity verification.
 There is no simultaneous plaintext mutation listener or downgrade fallback.
@@ -105,6 +114,12 @@ capability before it produces a new receipt for the successor incarnation.
 Managed control requests use separate local proxy streams; a session drain does
 not hold a global network lock. Directory ownership requires a persistent host
 volume and one managed host generation per directory in deployment.
+
+Generic start checks all durable managed session associations for the actual
+sandbox before any bind or policy write. A duplicate ordinary binding cannot
+hide a managed record, including one retained after unbind. Supplied fence and
+policy identities must agree with the requested sandbox; the explicit unfenced
+sentinel remains available to ordinary legacy callers.
 
 Until the strict restore producer exists, known managed sessions reject restore,
 base restore, resume, and agent start. The management marker is trusted host

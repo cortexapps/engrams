@@ -113,6 +113,14 @@ message ReadManagedPolicyRequest {
 message ReadManagedPolicyResponse {
   uint32 protocol = 1;
   optional ManagedAppliedState applied = 2;
+  // Required presence: absence means an unsupported read contract, not no policy.
+  ManagedRetainedDesired retained_desired = 3;
+}
+// Coordinator persistence at the checked read target. This is never an applied ACK.
+message ManagedRetainedDesired {
+  ManagedPolicyTarget target = 1;
+  // Absence inside a present wrapper means no retained policy at this read.
+  optional ManagedDenyPolicy policy = 2;
 }
 message ApplyManagedPolicyRequest {
   uint32 protocol = 1;

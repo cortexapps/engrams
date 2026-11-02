@@ -124,24 +124,7 @@ impl SessionPolicyService for PolicyControl {
             .state
             .as_ref()
             .ok_or_else(|| Status::unavailable("managed policy unavailable"))?;
-        check_managed_target(state, &target).await?;
-        let applied = state
-            .services
-            .host
-            .read_managed_policy(target.clone())
-            .await
-            .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
-        check_managed_target(state, &target).await?;
-        if let Some(receipt) = &applied {
-            receipt.validate().map_err(Status::failed_precondition)?;
-            if receipt.context.target != target {
-                return Err(Status::failed_precondition("host policy identity changed"));
-            }
-        }
-        Ok(Response::new(wire::ReadManagedPolicyResponse {
-            protocol: wire::PROTOCOL,
-            applied: applied.map(Into::into),
-        }))
+        read_managed_policy(state, &target).await
     }
     async fn apply_managed_policy(
         &self,
@@ -168,58 +151,7 @@ impl SessionPolicyService for PolicyControl {
             .state
             .as_ref()
             .ok_or_else(|| Status::unavailable("managed policy unavailable"))?;
-        let target = &context.target;
-        check_managed_target(state, target).await?;
-        // The desired union commits before any host call. A lost ACK cannot discard it on migration.
-        state
-            .services
-            .meta
-            .retain_managed_deny(target, &policy)
-            .await
-            .map_err(err)?;
-        let session = state
-            .services
-            .meta
-            .get_session(target.session_id)
-            .await
-            .map_err(err)?;
-        let egress = crate::api::sessions::build_resume_egress_policy(
-            state,
-            target.session_id,
-            target.sandbox_id,
-            &session.image.to_string(),
-        )
-        .await
-        .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
-        .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?;
-        if !egress.tunnels.is_empty() {
-            return Err(Status::failed_precondition(
-                "managed policy does not support tunnels",
-            ));
-        }
-        if egress.managed_deny.as_ref() != Some(&policy) {
-            return Err(Status::failed_precondition("desired policy changed"));
-        }
-        check_managed_target(state, target).await?;
-        let applied = state
-            .services
-            .host
-            .apply_managed_policy(engram_core::types::managed_deny::ManagedPolicyApply {
-                expected,
-                context: context.clone(),
-                egress,
-            })
-            .await
-            .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
-        check_managed_target(state, target).await?;
-        applied.validate().map_err(Status::failed_precondition)?;
-        if applied.context != context || applied.policy != policy {
-            return Err(Status::failed_precondition("host acknowledgement mismatch"));
-        }
-        Ok(Response::new(wire::ApplyManagedPolicyResponse {
-            protocol: wire::PROTOCOL,
-            applied: Some(applied.into()),
-        }))
+        apply_managed_policy(state, context, policy, expected).await
     }
     async fn create_policy_session(
         &self,
@@ -422,6 +354,98 @@ impl SessionPolicyService for PolicyControl {
     }
 }
 
+async fn read_managed_policy(
+    state: &SharedState,
+    target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+) -> Result<Response<wire::ReadManagedPolicyResponse>, Status> {
+    check_managed_target(state, target).await?;
+    let applied = state
+        .services
+        .host
+        .read_managed_policy(target.clone())
+        .await
+        .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
+    // Read after host I/O so a concurrent desired commit is retained. No SQL
+    // transaction crosses host I/O, and persisted bytes never become an ACK.
+    let retained = crate::api::sessions::load_session_policy(state, target.session_id)
+        .await
+        .map_err(|_| Status::failed_precondition("retained policy unavailable"))?
+        .and_then(|policy| policy.managed_deny);
+    check_managed_target(state, target).await?;
+    let response = wire::ReadManagedPolicyResponse {
+        protocol: wire::PROTOCOL,
+        applied: applied.map(Into::into),
+        retained_desired: Some(wire::ManagedRetainedDesired {
+            target: Some(target.clone().into()),
+            policy: retained.map(Into::into),
+        }),
+    };
+    response
+        .validate_for(target)
+        .map_err(Status::failed_precondition)?;
+    Ok(Response::new(response))
+}
+
+async fn apply_managed_policy(
+    state: &SharedState,
+    context: engram_core::types::managed_deny::ManagedPolicyContext,
+    policy: engram_core::types::managed_deny::ManagedDenyPolicy,
+    expected: Option<engram_core::types::managed_deny::ManagedAppliedState>,
+) -> Result<Response<wire::ApplyManagedPolicyResponse>, Status> {
+    let target = &context.target;
+    check_managed_target(state, target).await?;
+    // The desired union commits before any host call. A lost ACK cannot discard it on migration.
+    state
+        .services
+        .meta
+        .retain_managed_deny(target, &policy)
+        .await
+        .map_err(err)?;
+    let session = state
+        .services
+        .meta
+        .get_session(target.session_id)
+        .await
+        .map_err(err)?;
+    let egress = crate::api::sessions::build_resume_egress_policy(
+        state,
+        target.session_id,
+        target.sandbox_id,
+        &session.image.to_string(),
+    )
+    .await
+    .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
+    .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?;
+    if !egress.tunnels.is_empty() {
+        return Err(Status::failed_precondition(
+            "managed policy does not support tunnels",
+        ));
+    }
+    if egress.managed_deny.as_ref() != Some(&policy) {
+        return Err(Status::failed_precondition("desired policy changed"));
+    }
+    check_managed_target(state, target).await?;
+    let applied = state
+        .services
+        .host
+        .apply_managed_policy(engram_core::types::managed_deny::ManagedPolicyApply {
+            expected,
+            context: context.clone(),
+            egress,
+        })
+        .await
+        .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
+    check_managed_target(state, target).await?;
+    applied.validate().map_err(Status::failed_precondition)?;
+    if applied.context != context || applied.policy != policy {
+        return Err(Status::failed_precondition("host acknowledgement mismatch"));
+    }
+    Ok(Response::new(wire::ApplyManagedPolicyResponse {
+        protocol: wire::PROTOCOL,
+        applied: Some(applied.into()),
+    }))
+}
+
 async fn check_managed_target(
     state: &SharedState,
     target: &engram_core::types::managed_deny::ManagedPolicyTarget,
@@ -466,3 +490,7 @@ mod tests {
         assert!(creation(&r).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod recovery_tests;

@@ -20,6 +20,8 @@ proptest! {
     #[test]
     fn policy_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(),0..=4096)) {
         let _=mcp::CreatePolicySessionRequest::decode(bytes.as_slice());
+        let _=mcp::ReadManagedPolicyResponse::decode(bytes.as_slice());
+        let _=mcp::ManagedRetainedDesired::decode(bytes.as_slice());
         let _=mcp::ReadWritePolicyRequest::decode(bytes.as_slice());
         let _=mcp::AcceptPlanExitRequest::decode(bytes.as_slice());
         let _=mcp::ValidateDispatchFenceRequest::decode(bytes.as_slice());
@@ -30,4 +32,67 @@ proptest! {
         let _=mcp::GetStatusResponse::decode(bytes.as_slice());
         let _=mcp::RevokeResponse::decode(bytes.as_slice());
     }
+}
+
+#[test]
+fn managed_read_requires_explicit_canonical_retention_and_exact_target() {
+    use engram_core::{types::managed_deny::*, HostId, SandboxId, SessionId};
+    let target = ManagedPolicyTarget {
+        session_id: SessionId::new(),
+        sandbox_id: SandboxId::new(),
+        host_id: HostId::new(),
+        binding_epoch: 1,
+    };
+    let mut response = mcp::ReadManagedPolicyResponse {
+        protocol: mcp::PROTOCOL,
+        applied: None,
+        retained_desired: None,
+    };
+    assert!(
+        response.validate_for(&target).is_err(),
+        "old server omission must fail closed"
+    );
+    response.retained_desired = Some(mcp::ManagedRetainedDesired {
+        target: Some(target.clone().into()),
+        policy: None,
+    });
+    response.validate_for(&target).unwrap(); // Explicit absence, with no fabricated ACK.
+    let policy = ManagedDenyPolicy::new(3, ["orphan.example".into()]).unwrap();
+    response.retained_desired.as_mut().unwrap().policy = Some(policy.clone().into());
+    let roundtrip =
+        mcp::ReadManagedPolicyResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+    roundtrip.validate_for(&target).unwrap();
+    assert!(roundtrip.applied.is_none());
+    let mut wrong = target.clone();
+    wrong.binding_epoch += 1;
+    assert!(response.validate_for(&wrong).is_err());
+    response
+        .retained_desired
+        .as_mut()
+        .unwrap()
+        .policy
+        .as_mut()
+        .unwrap()
+        .hosts
+        .push("UPPER.EXAMPLE".into());
+    assert!(
+        response.validate_for(&target).is_err(),
+        "noncanonical retained bytes rejected"
+    );
+    response.retained_desired.as_mut().unwrap().policy = Some(policy.clone().into());
+    let context = ManagedPolicyContext {
+        target: wrong,
+        operator_generation: 1,
+        operator_identity: format!("sha256:{}", "a".repeat(64)),
+        binding_hash: None,
+    };
+    response.applied = Some(
+        ManagedAppliedState::new(context, policy, "host".into(), "proxy".into(), None)
+            .unwrap()
+            .into(),
+    );
+    assert!(
+        response.validate_for(&target).is_err(),
+        "applied target must agree independently"
+    );
 }

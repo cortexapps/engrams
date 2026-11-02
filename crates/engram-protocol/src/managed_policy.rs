@@ -143,6 +143,32 @@ impl From<core::ManagedNetworkProof> for wire::ManagedNetworkProof {
     }
 }
 
+impl wire::ReadManagedPolicyResponse {
+    /// Validate the complete trusted read, including explicit authoritative absence.
+    /// Retained desired state is a revision/union floor, never proof of application.
+    pub fn validate_for(&self, target: &core::ManagedPolicyTarget) -> Result<(), String> {
+        if self.protocol != wire::PROTOCOL {
+            return Err("unsupported managed read protocol".into());
+        }
+        let retained = self.retained_desired.as_ref().ok_or_else(missing)?;
+        let actual: core::ManagedPolicyTarget =
+            retained.target.clone().ok_or_else(missing)?.try_into()?;
+        if actual != *target {
+            return Err("retained policy identity changed".into());
+        }
+        if let Some(policy) = &retained.policy {
+            core::ManagedDenyPolicy::try_from(policy.clone())?;
+        }
+        if let Some(applied) = &self.applied {
+            let applied: core::ManagedAppliedState = applied.clone().try_into()?;
+            if applied.context.target != *target {
+                return Err("host policy identity changed".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The managed bincode surface is bounded and rejects unknown trailing fields.
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
     use bincode::Options;
