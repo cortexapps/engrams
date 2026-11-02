@@ -391,6 +391,43 @@ fn build_nxdomain(query: &Message) -> Message {
     resp
 }
 
+/// Bounded private DNS exchange. Uses the ordinary name policy and codec;
+/// no detached demux/reaper can deliver after the allocation lease ends.
+pub async fn resolve_private(
+    bytes: &[u8],
+    state: &SessionState,
+    upstream: SocketAddr,
+) -> std::io::Result<Vec<u8>> {
+    if bytes.len() > MAX_DGRAM {
+        return Err(std::io::Error::other("DNS query too large"));
+    }
+    let query = Message::from_bytes(bytes).map_err(std::io::Error::other)?;
+    if query.message_type() != MessageType::Query || query.queries().len() != 1 {
+        return Err(std::io::Error::other("invalid DNS query"));
+    }
+    let name = query.queries()[0]
+        .name()
+        .to_utf8()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !name_allowed(state, &name) {
+        return build_nxdomain(&query)
+            .to_vec()
+            .map_err(std::io::Error::other);
+    }
+    let response = tokio::time::timeout(TCP_UPSTREAM_TIMEOUT, forward_tcp(bytes, upstream))
+        .await
+        .map_err(|_| std::io::Error::other("DNS exchange timeout"))??;
+    let parsed = Message::from_bytes(&response).map_err(std::io::Error::other)?;
+    if parsed.id() != query.id()
+        || parsed.message_type() != MessageType::Response
+        || parsed.queries() != query.queries()
+    {
+        return Err(std::io::Error::other("invalid DNS reply"));
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

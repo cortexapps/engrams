@@ -10,6 +10,7 @@ pub(crate) struct Connections {
 }
 struct State {
     open: bool,
+    poisoned: bool,
     active: usize,
     cancel: watch::Sender<u64>,
 }
@@ -18,6 +19,7 @@ impl Default for Connections {
         Self {
             state: Mutex::new(State {
                 open: true,
+                poisoned: false,
                 active: 0,
                 cancel: watch::channel(0).0,
             }),
@@ -57,8 +59,14 @@ impl Connections {
             notified.await;
         }
     }
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.state.lock().poisoned
+    }
     pub(crate) fn open(&self) {
-        self.state.lock().open = true;
+        let mut state = self.state.lock();
+        if !state.poisoned {
+            state.open = true;
+        }
     }
 }
 
@@ -67,6 +75,21 @@ pub struct ConnectionLease {
     cancel: watch::Receiver<u64>,
 }
 impl ConnectionLease {
+    /// A failed private cleanup barrier cannot be repaired by policy replay
+    /// in this proxy incarnation. Retain the closed session gate.
+    pub fn poison(&self) {
+        let mut state = self.control.state.lock();
+        state.poisoned = true;
+        state.open = false;
+        state.cancel.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Allocation owners observe cancellation, close admission, then join all
+    /// child work before dropping this lease and releasing a policy drain.
+    pub async fn cancelled(&mut self) {
+        let _ = self.cancel.changed().await;
+    }
+
     /// Drop the complete socket future before releasing the drain guard.
     pub async fn run<F: Future>(mut self, future: F) -> Option<F::Output> {
         tokio::select! { biased;

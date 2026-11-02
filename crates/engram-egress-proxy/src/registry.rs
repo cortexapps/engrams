@@ -532,6 +532,22 @@ impl Registry {
         Some((state, lease))
     }
 
+    /// Trusted host identity only. Enroll before cloning the policy snapshot.
+    /// Holding this lease makes replacement wait for allocation cleanup.
+    pub fn enroll_session(
+        &self,
+        session: SessionId,
+    ) -> Option<(Arc<SessionState>, crate::connections::ConnectionLease)> {
+        let g = self.inner.read();
+        let lease = g.controls.get(&session)?.enroll()?;
+        let ip = g.by_session.get(&session)?;
+        let state = g.by_guest_ip.get(ip)?;
+        if state.session_id != session {
+            return None;
+        }
+        Some((state.clone(), lease))
+    }
+
     pub async fn apply(&self, state: SessionState) -> Result<(), String> {
         if let Some(policy) = &state.managed_deny {
             policy.validate()?;
@@ -573,6 +589,9 @@ impl Registry {
             control.close();
             control.drain().await;
         }
+        if control.is_poisoned() {
+            return Err("private network cleanup failed; replace proxy before replay".into());
+        }
         Self::publish(&mut self.inner.write(), state);
         control.open();
         Ok(())
@@ -589,6 +608,13 @@ impl Registry {
         let _apply = control.apply.lock().await;
         control.close();
         control.drain().await;
+    }
+    pub fn is_poisoned(&self, session_id: SessionId) -> bool {
+        self.inner
+            .read()
+            .controls
+            .get(&session_id)
+            .is_some_and(|control| control.is_poisoned())
     }
     pub fn lookup_session(&self, session_id: SessionId) -> Option<Arc<SessionState>> {
         let g = self.inner.read();

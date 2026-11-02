@@ -356,3 +356,38 @@ slice must install pre-execution host controls for all TCP ports and close
 unobserved UDP paths, including restore. Bootstrap receipts have no final
 binding hash and cannot authorize tool exposure. Local socket tests do not
 establish Firecracker, VZ, or harness compatibility acceptance.
+
+### Private network transport
+
+The selected VZ producer uses one bounded gVisor stack per VM. The helper owns
+no host IP listener and cannot dial an external destination. The host passes
+three owned descriptors: the Ethernet datagram channel, a reliable parent
+control stream, and a registered private proxy stream. A private flow carries
+its original IPv4 address and port and an SCM_RIGHTS stream. The Rust proxy
+uses the existing session lease, TLS interceptor, and DNS policy. The private
+stream is the allocation capability; no bearer credential is stored or logged.
+Registration starts closed. An exact placement epoch must be bound before
+packet admission. Replacement, policy change, or loss of either reliable
+channel closes admission and joins owned work. A transport-ready response is
+not a network proof or a final binding acknowledgement.
+
+The helper pins gvisor.dev/gvisor at
+`v0.0.0-20260413194555-9680d69bf798` and Go 1.26.2. Ethernet MTU is 1500.
+The host selects the exact source MAC, guest IPv4 address, and gateway.
+Only IPv4 TCP and DNS at that gateway can reach the private proxy. Established
+stack and DNS parsers own protocol decoding. There is no NAT fallback.
+Firecracker will use an owned per-interface early fence, all-TCP redirection,
+controlled DNS, and drops for other UDP; installed rule ordering still needs
+Linux acceptance. Managed recovery will cold-boot from eligible disk-only
+artifacts. Saved session RAM and device state are not eligible. Backend
+activation, durable boot permits, packaging, and platform acceptance remain
+separate work. This decision remains Proposed.
+
+A policy drain retains its session lease until the helper returns cleanup EOF
+on the reliable private stream. The helper first closes packet admission and
+joins its stack, packet, flow, DNS, and control work. The proxy drains pending
+descriptor carriers while it waits, with a five-second limit. A failed barrier
+poisons the stable session gate; policy replay or a fresh allocation cannot
+reopen it in that proxy incarnation. Recovery needs a fresh proxy incarnation
+and full policy replay with quarantine checks. Other sessions remain usable.
+This barrier cannot revoke bytes that were delivered before it completed.

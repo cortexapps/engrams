@@ -17,6 +17,9 @@ use engram_egress_proxy::{GuestGatewayRegistry, Listeners, Proxy, Registry};
 
 pub(crate) struct ControlState {
     pub registry: Arc<Registry>,
+    pub private: Arc<crate::private::Ingress>,
+    pub proxy: Arc<Proxy>,
+    pub host_id: engram_core::HostId,
     pub gateway: Arc<GuestGatewayRegistry>,
     pub hello: HelloInfo,
     /// Flipped by the `Shutdown` op; [`crate::run`] selects on it and
@@ -57,10 +60,31 @@ async fn serve_conn(
     loop {
         let msg: ToProxyd = engram_egress_proto::read_frame(&mut stream).await?;
         let reply = match msg {
+            ToProxyd::PrivateNetwork => {
+                let allocation = engram_egress_proto::private::read(&mut stream).await?;
+                let proxy = state.proxy.clone();
+                return state
+                    .private
+                    .serve(
+                        stream,
+                        allocation,
+                        state.registry.clone(),
+                        proxy,
+                        state.host_id,
+                        &state.hello.incarnation,
+                    )
+                    .await;
+            }
             ToProxyd::ListManaged => FromProxyd::ManagedSessions(state.registry.managed_sessions()),
             ToProxyd::QuarantineManaged(session) => {
                 state.registry.quarantine_and_drain(session).await;
-                FromProxyd::Ok
+                if state.registry.is_poisoned(session) {
+                    FromProxyd::Err(
+                        "private network cleanup failed; replace proxy before replay".into(),
+                    )
+                } else {
+                    FromProxyd::Ok
+                }
             }
             ToProxyd::ReadManaged(session) => {
                 FromProxyd::ManagedState(state.registry.lookup_session(session).and_then(|s| {
@@ -96,8 +120,10 @@ async fn serve_conn(
                 }
             }
             ToProxyd::RemoveSession(session_id) => {
-                unregister_session(&state, session_id);
-                FromProxyd::Ok
+                match unregister_session(&state, session_id).await {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
             }
             ToProxyd::Health => FromProxyd::HealthReport {
                 sessions: state.registry.live_count(),
@@ -122,6 +148,7 @@ async fn serve_conn(
                 }))
             }
             ToProxyd::Shutdown => {
+                state.private.shutdown().await;
                 tracing::info!("shutdown requested over control socket; exiting");
                 let _ = engram_egress_proto::write_frame(&mut stream, &FromProxyd::Ok).await;
                 let _ = state.shutdown.send(true);
@@ -135,9 +162,17 @@ async fn serve_conn(
 /// The single session-teardown entry point (the `HostEgress::
 /// unregister_session` contract): drop the registration AND fan
 /// `session_closed` to every tunnel upstream, or pooled state leaks.
-fn unregister_session(state: &ControlState, session_id: engram_core::SessionId) {
+async fn unregister_session(
+    state: &ControlState,
+    session_id: engram_core::SessionId,
+) -> Result<(), String> {
+    state.registry.quarantine_and_drain(session_id).await;
+    if state.registry.is_poisoned(session_id) {
+        return Err("private network cleanup failed; replace proxy before replay".into());
+    }
     state.registry.unregister(session_id);
     state.gateway.session_closed(session_id);
+    Ok(())
 }
 
 /// Full replace: register everything in the set, then drop any
@@ -170,7 +205,7 @@ async fn sync_policies(
             Ok(()) => applied += 1,
             Err(e) => {
                 failed += 1;
-                managed_failed |= managed;
+                managed_failed |= managed || state.registry.is_poisoned(session_id);
                 tracing::error!(
                     %session_id,
                     error = %e,
@@ -187,8 +222,11 @@ async fn sync_policies(
         .into_iter()
         .filter(|sid| !keep.contains(sid))
     {
-        unregister_session(state, stale);
-        pruned += 1;
+        if unregister_session(state, stale).await.is_err() {
+            managed_failed = true;
+        } else {
+            pruned += 1;
+        }
     }
     tracing::info!(applied, failed, pruned, total, "policies synced");
     if managed_failed {
@@ -413,8 +451,19 @@ mod tests {
     }
 
     fn state() -> ControlState {
+        let registry = Arc::new(Registry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(engram_egress_proxy::Ca::load_or_generate(dir.path()).unwrap());
+        let proxy = Arc::new(Proxy::new(engram_egress_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            registry.clone(),
+            Arc::new(engram_egress_proxy::CertMint::new(ca)),
+        )));
         ControlState {
-            registry: Arc::new(Registry::new()),
+            private: Arc::new(crate::private::Ingress::default()),
+            proxy,
+            host_id: engram_core::HostId::new(),
+            registry,
             gateway: Arc::new(GuestGatewayRegistry::default()),
             shutdown: tokio::sync::watch::channel(false).0,
             hello: HelloInfo {
@@ -428,6 +477,36 @@ mod tests {
                 coord_url: "http://coord".into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn sync_cannot_acknowledge_a_poisoned_session_as_ordinary_or_removed() {
+        let state = state();
+        let session = SessionId::new();
+        let mut p = policy(session, "192.0.2.2".parse().unwrap());
+        p.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap(),
+        );
+        register_policy(&state.registry, p.clone()).await.unwrap();
+        let (_, lease) = state.registry.enroll_session(session).unwrap();
+        lease.poison();
+        drop(lease);
+        assert!(matches!(
+            sync_policies(&state, vec![p.clone()]).await,
+            FromProxyd::Err(_)
+        ));
+        p.managed_deny = None;
+        assert!(matches!(
+            sync_policies(&state, vec![p]).await,
+            FromProxyd::Err(_)
+        ));
+        assert!(matches!(
+            sync_policies(&state, vec![]).await,
+            FromProxyd::Err(_)
+        ));
+        assert!(unregister_session(&state, session).await.is_err());
+        assert!(state.registry.is_poisoned(session));
     }
 
     #[tokio::test]
@@ -546,5 +625,70 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+    #[tokio::test]
+    async fn private_upgrade_uses_dedicated_host_uds_and_never_returns_final_receipt() {
+        use engram_egress_proto::private::{
+            self as wire, Allocation, Operation, Reply, Request, VERSION,
+        };
+        let state = Arc::new(state());
+        let session = SessionId::new();
+        let mut p = policy(session, "192.0.2.2".parse().unwrap());
+        let managed =
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap();
+        p.managed_deny = Some(managed.clone());
+        let a = Allocation {
+            version: VERSION,
+            host_id: state.host_id,
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: state.hello.incarnation.clone(),
+            session_id: session,
+            sandbox_id: p.sandbox_id,
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: p.guest_ip,
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: managed.digest,
+        };
+        register_policy(&state.registry, p).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_conn(stream, state).await
+        });
+        let client = tokio::net::UnixStream::connect(path).await.unwrap();
+        let mut capability = wire::register(client, &a).await.unwrap();
+        wire::write(
+            &mut capability,
+            &Request {
+                version: VERSION,
+                sequence: 1,
+                epoch: 7,
+                operation: Operation::Bind,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: Reply = wire::read(&mut capability).await.unwrap();
+        assert_eq!(ready.state, "ready");
+        wire::write(
+            &mut capability,
+            &Request {
+                version: VERSION,
+                sequence: 2,
+                epoch: 7,
+                operation: Operation::Close,
+            },
+        )
+        .await
+        .unwrap();
+        let closed: Reply = wire::read(&mut capability).await.unwrap();
+        assert_eq!(closed.state, "closed");
+        drop(capability);
+        task.await.unwrap().unwrap();
     }
 }

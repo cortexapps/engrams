@@ -37,6 +37,7 @@ const SNI_PEEK_BUDGET: Duration = Duration::from_secs(5);
 /// Max bytes we'll buffer of the ClientHello.
 const SNI_PEEK_BYTES: usize = 16 * 1024;
 
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Where to listen for REDIRECTed traffic. Typically
     /// `0.0.0.0:9443` with iptables redirecting VM TAP traffic to
@@ -112,6 +113,7 @@ impl ProxyConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Proxy {
     cfg: ProxyConfig,
     server_cfg: Arc<rustls::ServerConfig>,
@@ -130,6 +132,42 @@ impl Proxy {
             server_cfg,
             client_cfg,
         }
+    }
+
+    /// Dispatch a host-private stream with its mandatory original destination.
+    /// The caller must own a registry lease until this future has been dropped.
+    pub async fn dispatch_private(
+        &self,
+        stream: tokio::net::UnixStream,
+        session: Arc<crate::SessionState>,
+        destination: std::net::SocketAddrV4,
+    ) -> std::io::Result<()> {
+        if destination.port() == 0 {
+            return Err(std::io::Error::other("missing original destination port"));
+        }
+        handle(
+            Some((IpAddr::V4(*destination.ip()), destination.port())),
+            stream,
+            session,
+            self.cfg.resolver.clone(),
+            self.server_cfg.clone(),
+            self.client_cfg.clone(),
+            self.cfg.observe_sink.clone(),
+            self.cfg.inject_refresher.clone(),
+            self.cfg.guest_port_dialer.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    /// One controlled DNS request. The allocation owner holds the same lease
+    /// as TCP and owns cancellation through response delivery.
+    pub async fn resolve_private(
+        &self,
+        query: &[u8],
+        session: &crate::SessionState,
+    ) -> std::io::Result<Vec<u8>> {
+        dns::resolve_private(query, session, self.cfg.dns_upstream).await
     }
 
     /// Bind the 443 listener and (when configured) the DNS sockets,
@@ -233,8 +271,8 @@ impl Proxy {
             tokio::spawn(async move {
                 if let Some(Err(e)) = lease
                     .run(handle(
+                        original_destination(&stream).ok(),
                         stream,
-                        peer,
                         session,
                         resolver,
                         server_cfg,
@@ -262,9 +300,9 @@ pub struct Listeners {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle(
-    mut stream: TcpStream,
-    _peer: SocketAddr,
+async fn handle<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    original_dst: Option<(IpAddr, u16)>,
+    mut stream: C,
     session: Arc<crate::SessionState>,
     resolver: Arc<dyn UpstreamResolver>,
     server_cfg: Arc<rustls::ServerConfig>,
@@ -277,7 +315,6 @@ async fn handle(
     // dial it; the upstream is resolved fresh by SNI on the host.
     // On non-Linux this errors (no SO_ORIGINAL_DST) — fine, we
     // just log "unknown".
-    let original_dst = original_destination(&stream).ok();
 
     let (sni, peeked) = sni::peek_sni(&mut stream, SNI_PEEK_BYTES, SNI_PEEK_BUDGET)
         .await
