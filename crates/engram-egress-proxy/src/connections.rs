@@ -44,9 +44,14 @@ impl Connections {
         self.state.lock().open
     }
     pub(crate) fn close(&self) {
+        self.close_generation();
+    }
+    pub(crate) fn close_generation(&self) -> u64 {
         let mut state = self.state.lock();
         state.open = false;
         state.cancel.send_modify(|v| *v = v.wrapping_add(1));
+        let generation = *state.cancel.borrow();
+        generation
     }
     pub(crate) async fn drain(&self) {
         loop {
@@ -58,6 +63,30 @@ impl Connections {
             }
             notified.await;
         }
+    }
+    pub(crate) fn handoff_publish(
+        self: &Arc<Self>,
+        generation: u64,
+        publish: impl FnOnce(),
+    ) -> Option<ConnectionLease> {
+        let mut state = self.state.lock();
+        if state.poisoned || state.open || state.active != 0 || *state.cancel.borrow() != generation
+        {
+            return None;
+        }
+        publish();
+        state.open = true;
+        state.active = 1;
+        Some(ConnectionLease {
+            control: self.clone(),
+            cancel: state.cancel.subscribe(),
+        })
+    }
+    pub(crate) fn poison(&self) {
+        let mut state = self.state.lock();
+        state.poisoned = true;
+        state.open = false;
+        state.cancel.send_modify(|v| *v = v.wrapping_add(1));
     }
     pub(crate) fn is_poisoned(&self) -> bool {
         self.state.lock().poisoned
@@ -75,6 +104,12 @@ pub struct ConnectionLease {
     cancel: watch::Receiver<u64>,
 }
 impl ConnectionLease {
+    pub(crate) fn current_for(&self, control: &Arc<Connections>) -> bool {
+        Arc::ptr_eq(&self.control, control)
+            && !self.cancel.has_changed().unwrap_or(true)
+            && control.is_open()
+    }
+
     /// A failed private cleanup barrier cannot be repaired by policy replay
     /// in this proxy incarnation. Retain the closed session gate.
     pub fn poison(&self) {

@@ -458,3 +458,11 @@ mod tests {
         }
     }
 }
+
+/// Authenticated host control only. It cannot replace a bound allocation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedPolicyHandoff {
+    pub allocation: Allocation,
+    pub policy: engram_core::types::egress::SessionEgressPolicy,
+}

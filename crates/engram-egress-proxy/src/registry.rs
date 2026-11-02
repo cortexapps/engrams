@@ -548,6 +548,82 @@ impl Registry {
         Some((state.clone(), lease))
     }
 
+    /// Transfer a NEVER-BOUND private allocation lease. The ingress owns the
+    /// no-flow proof; all other old leases must drain before the new Arc exists.
+    pub async fn handoff_closed_private(
+        &self,
+        expected: &Arc<SessionState>,
+        lease: &mut Option<crate::connections::ConnectionLease>,
+        state: SessionState,
+    ) -> Result<Arc<SessionState>, String> {
+        let invalid = || "closed private policy handoff changed".to_string();
+        let new = state.managed_deny.as_ref().ok_or_else(invalid)?;
+        new.validate()?;
+        let old = expected.managed_deny.as_ref().ok_or_else(invalid)?;
+        if state.session_id != expected.session_id
+            || state.sandbox_id != expected.sandbox_id
+            || state.guest_ip != expected.guest_ip
+            || !state.tunnels.is_empty()
+            || new.revision < old.revision
+            || !new.contains(old)
+            || (new.revision == old.revision && new != old)
+        {
+            return Err(invalid());
+        }
+        let control = self
+            .inner
+            .read()
+            .controls
+            .get(&state.session_id)
+            .cloned()
+            .ok_or_else(invalid)?;
+        let _apply = control.apply.lock().await;
+        {
+            let g = self.inner.read();
+            if !g
+                .by_guest_ip
+                .get(&state.guest_ip)
+                .is_some_and(|s| Arc::ptr_eq(s, expected))
+                || !lease.as_ref().is_some_and(|l| l.current_for(&control))
+            {
+                return Err(invalid());
+            }
+        }
+        struct PoisonOnDrop {
+            control: Arc<crate::connections::Connections>,
+            armed: bool,
+        }
+        impl Drop for PoisonOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.control.poison();
+                }
+            }
+        }
+        let mut guard = PoisonOnDrop {
+            control: control.clone(),
+            armed: true,
+        };
+        let generation = control.close_generation();
+        drop(lease.take());
+        control.drain().await;
+        let mut g = self.inner.write();
+        let sid = state.session_id;
+        let ip = state.guest_ip;
+        let next = control
+            .handoff_publish(generation, || Self::publish(&mut g, state))
+            .ok_or_else(invalid)?;
+        let current = g
+            .by_guest_ip
+            .get(&ip)
+            .filter(|s| s.session_id == sid)
+            .cloned()
+            .ok_or_else(invalid)?;
+        *lease = Some(next);
+        guard.armed = false;
+        Ok(current)
+    }
+
     pub async fn apply(&self, state: SessionState) -> Result<(), String> {
         if let Some(policy) = &state.managed_deny {
             policy.validate()?;
@@ -912,6 +988,130 @@ mod tests {
         })
         .await
         .expect("per-session drain has no global wait");
+    }
+
+    fn closed_state() -> SessionState {
+        let mut s = state();
+        s.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap(),
+        );
+        s
+    }
+
+    #[tokio::test]
+    async fn closed_handoff_drains_other_leases_and_reacquires_current_arc() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let registry = Arc::new(Registry::new());
+            let initial = closed_state();
+            let ip = initial.guest_ip;
+            registry.apply(initial.clone()).await.unwrap();
+            let (old, owned) = registry.enroll(ip).unwrap();
+            let (_, mut other) = registry.enroll(ip).unwrap();
+            let task_registry = registry.clone();
+            let task = tokio::spawn(async move {
+                let mut lease = Some(owned);
+                let mut next = initial;
+                next.allow_all = true;
+                let current = task_registry
+                    .handoff_closed_private(&old, &mut lease, next)
+                    .await
+                    .unwrap();
+                assert!(!Arc::ptr_eq(&old, &current));
+                (current, lease.unwrap())
+            });
+            other.cancelled().await;
+            assert!(registry.lookup(ip).is_none());
+            assert!(!task.is_finished());
+            drop(other);
+            let (current, lease) = task.await.unwrap();
+            assert!(current.allow_all);
+            assert!(Arc::ptr_eq(&current, &registry.lookup(ip).unwrap()));
+            assert!(lease.current_for(&registry.inner.read().controls[&current.session_id]));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_handoff_cancellation_poison_is_terminal() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let registry = Arc::new(Registry::new());
+            let initial = closed_state();
+            registry.apply(initial.clone()).await.unwrap();
+            let (old, owned) = registry.enroll(initial.guest_ip).unwrap();
+            let (_, mut other) = registry.enroll(initial.guest_ip).unwrap();
+            let worker = registry.clone();
+            let candidate = initial.clone();
+            let task = tokio::spawn(async move {
+                worker
+                    .handoff_closed_private(&old, &mut Some(owned), candidate)
+                    .await
+            });
+            other.cancelled().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(other);
+            assert!(registry.is_poisoned(initial.session_id));
+            assert!(registry.apply(initial.clone()).await.is_err());
+            assert!(registry.lookup(initial.guest_ip).is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_handoff_rejects_unrelated_close_and_stale_arc() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let registry = Arc::new(Registry::new());
+            let initial = closed_state();
+            registry.apply(initial.clone()).await.unwrap();
+            let (old, owned) = registry.enroll(initial.guest_ip).unwrap();
+            let (_, mut other) = registry.enroll(initial.guest_ip).unwrap();
+            let worker = registry.clone();
+            let candidate = initial.clone();
+            let task = tokio::spawn(async move {
+                worker
+                    .handoff_closed_private(&old, &mut Some(owned), candidate)
+                    .await
+            });
+            other.cancelled().await;
+            registry.inner.read().controls[&initial.session_id].close();
+            drop(other);
+            assert!(task.await.unwrap().is_err());
+            assert!(registry.is_poisoned(initial.session_id));
+            assert!(registry.lookup(initial.guest_ip).is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_apply_after_closed_handoff_cancels_the_new_lease() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let registry = Arc::new(Registry::new());
+            let initial = closed_state();
+            registry.apply(initial.clone()).await.unwrap();
+            let (old, owned) = registry.enroll(initial.guest_ip).unwrap();
+            let mut lease = Some(owned);
+            let current = registry
+                .handoff_closed_private(&old, &mut lease, initial.clone())
+                .await
+                .unwrap();
+            let worker = registry.clone();
+            let apply = tokio::spawn(async move { worker.apply(initial).await });
+            lease.as_mut().unwrap().cancelled().await;
+            assert!(!apply.is_finished());
+            assert!(registry.lookup(current.guest_ip).is_none());
+            drop(lease);
+            apply.await.unwrap().unwrap();
+            assert!(!Arc::ptr_eq(
+                &current,
+                &registry.lookup(current.guest_ip).unwrap()
+            ));
+        })
+        .await
+        .unwrap();
     }
 
     fn state() -> SessionState {

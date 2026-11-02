@@ -75,6 +75,12 @@ async fn serve_conn(
                     )
                     .await;
             }
+            ToProxyd::HandoffClosedPrivate(request) => {
+                match state.private.handoff_closed(*request).await {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
+            }
             ToProxyd::ListManaged => FromProxyd::ManagedSessions(state.registry.managed_sessions()),
             ToProxyd::QuarantineManaged(session) => {
                 state.registry.quarantine_and_drain(session).await;
@@ -304,6 +310,12 @@ pub(crate) async fn register_policy(
     if policy.managed_deny.is_some() {
         registry.quarantine(policy.session_id);
     }
+    registry.apply(translate_policy(policy)?).await
+}
+
+pub(crate) fn translate_policy(
+    policy: engram_core::types::egress::SessionEgressPolicy,
+) -> Result<engram_egress_proxy::SessionState, String> {
     let network_allow = engram_egress_proxy::HostList::from_manifest(
         &policy.network_allow_hosts,
         &policy.network_allow_host_patterns,
@@ -404,23 +416,21 @@ pub(crate) async fn register_policy(
             }),
         });
     }
-    registry
-        .apply(engram_egress_proxy::SessionState {
-            managed_deny: policy.managed_deny,
-            session_id: policy.session_id,
-            sandbox_id: policy.sandbox_id,
-            guest_ip: policy.guest_ip,
-            network_allow,
-            allow_all,
-            secrets,
-            injects,
-            observes,
-            guest_services: policy.guest_services,
-            tunnels: policy.tunnels,
-            // ADR 0118: the session's own app hostnames, for the SNI short circuit.
-            apps: policy.apps,
-        })
-        .await
+    Ok(engram_egress_proxy::SessionState {
+        managed_deny: policy.managed_deny,
+        session_id: policy.session_id,
+        sandbox_id: policy.sandbox_id,
+        guest_ip: policy.guest_ip,
+        network_allow,
+        allow_all,
+        secrets,
+        injects,
+        observes,
+        guest_services: policy.guest_services,
+        tunnels: policy.tunnels,
+        // ADR 0118: the session's own app hostnames, for the SNI short circuit.
+        apps: policy.apps,
+    })
 }
 
 #[cfg(test)]
@@ -661,7 +671,7 @@ mod tests {
             serve_conn(stream, state).await
         });
         let client = tokio::net::UnixStream::connect(path).await.unwrap();
-        let mut capability = wire::register(client, &a).await.unwrap();
+        let mut capability = wire::register(client, &a).await.unwrap().into_stream();
         wire::write(
             &mut capability,
             &Request {

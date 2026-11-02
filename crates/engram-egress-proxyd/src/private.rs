@@ -21,6 +21,12 @@ struct SlotState {
 struct Live {
     cancel: watch::Sender<bool>,
     done: watch::Receiver<bool>,
+    allocation: Allocation,
+    handoff: tokio::sync::mpsc::Sender<Handoff>,
+}
+struct Handoff {
+    request: wire::ClosedPolicyHandoff,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 #[derive(Default)]
 pub(crate) struct Ingress {
@@ -29,6 +35,38 @@ pub(crate) struct Ingress {
     used: Mutex<HashSet<(String, String, u64)>>,
 }
 impl Ingress {
+    pub(crate) async fn handoff_closed(
+        &self,
+        request: wire::ClosedPolicyHandoff,
+    ) -> Result<(), String> {
+        request
+            .allocation
+            .validate()
+            .map_err(|_| "invalid closed allocation")?;
+        let slot = self
+            .slots
+            .lock()
+            .await
+            .get(&request.allocation.session_id)
+            .cloned()
+            .ok_or("closed allocation missing")?;
+        let sender = {
+            let slot = slot.lock().await;
+            let live = slot.live.as_ref().ok_or("closed allocation missing")?;
+            if live.allocation != request.allocation || *live.done.borrow() || *live.cancel.borrow()
+            {
+                return Err("closed allocation changed".into());
+            }
+            live.handoff.clone()
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        sender
+            .send(Handoff { request, reply })
+            .await
+            .map_err(|_| "closed allocation stopped")?;
+        result.await.map_err(|_| "closed policy handoff stopped")?
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
@@ -104,7 +142,7 @@ impl Ingress {
         }
         // The session lease precedes all policy reads. Policy replacement
         // cancels this allocation and waits for every task below to be joined.
-        let (session, mut lease) = registry
+        let (mut session, lease) = registry
             .enroll_session(allocation.session_id)
             .ok_or_else(wire::invalid)?;
         let policy = session.managed_deny.as_ref().ok_or_else(wire::invalid)?;
@@ -115,6 +153,8 @@ impl Ingress {
         {
             return Err(wire::invalid());
         }
+        let mut lease = Some(lease);
+        let (handoff, mut handoffs) = tokio::sync::mpsc::channel::<Handoff>(1);
         let (cancel, mut cancelled) = watch::channel(false);
         let (done, done_rx) = watch::channel(false);
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
@@ -129,6 +169,8 @@ impl Ingress {
         slot.live = Some(Live {
             cancel,
             done: done_rx,
+            allocation: allocation.clone(),
+            handoff,
         });
         drop(slot);
         let mut tasks = tokio::task::JoinSet::new();
@@ -146,12 +188,54 @@ impl Ingress {
             .await?;
             let mut sequence = 0u64;
             let mut bound_epoch = None;
+            let mut final_policy_digest: Option<String> = None;
             loop {
                 // A frame read must not be canceled when an unrelated flow
                 // completes: it may already have consumed part of the header.
-                let request: Request = match wire::read(&mut stream).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                    other => other?,
+                let request: Request = {
+                    let read = wire::read::<_, Request>(&mut stream);
+                    tokio::pin!(read);
+                    loop {
+                        let current_lease = lease.as_mut().ok_or_else(wire::invalid)?;
+                        tokio::select! { biased;
+                            _ = current_lease.cancelled() => return Ok(None),
+                            _ = cancelled.changed() => return Ok(None),
+                            command = handoffs.recv() => {
+                                let command = command.ok_or_else(wire::invalid)?;
+                                if bound_epoch.is_some() || !tasks.is_empty() || command.request.allocation != allocation {
+                                    let _ = command.reply.send(Err("allocation is not closed".into()));
+                                    continue;
+                                }
+                                let digest = engram_core::types::managed_create::digest(&serde_json::to_vec(&command.request).map_err(|_| wire::invalid())?);
+                                if let Some(prior) = &final_policy_digest {
+                                    let _ = command.reply.send(if prior == &digest { Ok(()) } else { Err("closed handoff changed".into()) });
+                                    continue;
+                                }
+                                let candidate = crate::control::translate_policy(command.request.policy).map_err(|_| wire::invalid())?;
+                                let outcome = tokio::select! { biased;
+                                    _ = cancelled.changed() => return Ok(None),
+                                    result = registry.handoff_closed_private(&session, &mut lease, candidate) => result,
+                                };
+                                match outcome {
+                                    Ok(current) => {
+                                        session = current;
+                                        final_policy_digest = Some(digest);
+                                        let _ = command.reply.send(Ok(()));
+                                    }
+                                    Err(_) => {
+                                        let _ = command.reply.send(Err("closed policy handoff failed".into()));
+                                        return Err(wire::invalid());
+                                    }
+                                }
+                            }
+                            request = &mut read => {
+                                match request {
+                                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                                    other => break other?,
+                                }
+                            }
+                        }
+                    }
                 };
                 while tasks.try_join_next().is_some() {}
                 if request.version != VERSION
@@ -258,11 +342,7 @@ impl Ingress {
                 .await?;
             }
         };
-        let result = tokio::select! { biased;
-            _ = lease.cancelled() => Ok(None),
-            _ = cancelled.changed() => Ok(None),
-            result = operation => result,
-        };
+        let result = operation.await;
         // No task outlives the stable session lease. This includes TLS peeks,
         // HTTP/2 pumps, DNS upstream sockets, and response writes.
         tasks.shutdown().await;
@@ -283,7 +363,9 @@ impl Ingress {
         let barrier_failed =
             !matches!(barrier, Ok(Ok(()))) || shutdown.is_err() || closed_reply.is_err();
         if barrier_failed {
-            lease.poison();
+            if let Some(lease) = &lease {
+                lease.poison();
+            }
         }
         drop(stream);
         drop(lease);
@@ -405,6 +487,85 @@ mod tests {
         a.set_nonblocking(true).unwrap();
         UnixStream::from_std(a).unwrap()
     }
+    fn final_policy(f: &Fixture) -> wire::ClosedPolicyHandoff {
+        use engram_core::types::{egress::SessionEgressPolicy, image::SecretMode};
+        wire::ClosedPolicyHandoff {
+            allocation: f.allocation.clone(),
+            policy: SessionEgressPolicy {
+                session_id: f.allocation.session_id,
+                sandbox_id: f.allocation.sandbox_id,
+                guest_ip: f.allocation.guest_ip,
+                allow_all: false,
+                network_allow_hosts: vec!["allowed.example".into()],
+                network_allow_host_patterns: vec![],
+                secrets: vec![],
+                injects: vec![],
+                observes: vec![],
+                guest_services: vec![],
+                tunnels: vec![],
+                secret_mode: SecretMode::Literal,
+                apps: vec![],
+                managed_deny: Some(
+                    ManagedDenyPolicy::new(2, ["mcp.example".into(), "new.example".into()])
+                        .unwrap(),
+                ),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_policy_handoff_keeps_socket_and_requires_never_bound_identity() {
+        let f = Fixture::new().await;
+        let (mut c, server) = f.start(f.allocation.clone());
+        assert_eq!(reply(&mut c).await.state, "closed");
+        let original = f.registry.lookup(f.allocation.guest_ip).unwrap();
+        let candidate = final_policy(&f);
+        let mut wrong = candidate.clone();
+        wrong.allocation.boot_attempt = "other".into();
+        assert!(f.ingress.handoff_closed(wrong).await.is_err());
+        f.ingress.handoff_closed(candidate.clone()).await.unwrap();
+        f.ingress.handoff_closed(candidate.clone()).await.unwrap();
+        let current = f.registry.lookup(f.allocation.guest_ip).unwrap();
+        assert!(!Arc::ptr_eq(&original, &current));
+        assert!(!current.allow_all);
+        assert_eq!(
+            current.managed_deny.as_ref(),
+            candidate.policy.managed_deny.as_ref()
+        );
+        request(&mut c, 1, Operation::Bind).await;
+        assert_eq!(reply(&mut c).await.state, "ready");
+        assert!(f.ingress.handoff_closed(candidate).await.is_err());
+        drop(c);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_policy_handoff_shutdown_poison_prevents_ack_or_reopen() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let f = Fixture::new().await;
+            let (mut c, server) = f.start(f.allocation.clone());
+            reply(&mut c).await;
+            let (_, mut retained) = f.registry.enroll(f.allocation.guest_ip).unwrap();
+            let ingress = f.ingress.clone();
+            let candidate = final_policy(&f);
+            let handoff = tokio::spawn(async move { ingress.handoff_closed(candidate).await });
+            retained.cancelled().await;
+            assert!(!handoff.is_finished());
+            let ingress = f.ingress.clone();
+            let shutdown = tokio::spawn(async move { ingress.shutdown().await });
+            assert_eq!(c.read(&mut [0]).await.unwrap(), 0);
+            drop(c);
+            drop(retained);
+            shutdown.await.unwrap();
+            assert!(handoff.await.unwrap().is_err());
+            server.await.unwrap().unwrap();
+            assert!(f.registry.is_poisoned(f.allocation.session_id));
+            assert!(f.registry.lookup(f.allocation.guest_ip).is_none());
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn private_replacement_drains_pending_tls_before_ack_and_rejects_replay() {
         let f = Fixture::new().await;
@@ -452,9 +613,9 @@ mod tests {
         request(
             &mut c,
             2,
-            Operation::Tcp {
-                destination: "198.51.100.7".parse().unwrap(),
-                port: 80,
+            Operation::Dns {
+                destination: f.allocation.gateway_ip,
+                port: 53,
             },
         )
         .await;
@@ -470,9 +631,9 @@ mod tests {
         let frame = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
         c.write_all(&frame[..2]).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        flow.write_all(b"GET / HTTP/1.1\r\nHost: api.example\r\n\r\n")
-            .await
-            .unwrap();
+        // Zero length completes the owned DNS decoder without a TLS peek
+        // deadline or an upstream dial. Complete it after the partial header.
+        flow.write_u16(0).await.unwrap();
         flow.shutdown().await.unwrap();
         let mut byte = [0];
         assert!(matches!(flow.read(&mut byte).await, Ok(0) | Err(_)));
