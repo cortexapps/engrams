@@ -64,6 +64,7 @@ service IntegrationService {
   rpc AuthorizeMcp(AuthorizeMcpRequest) returns (AuthorizeMcpResponse);
   rpc DisconnectMcp(DisconnectMcpRequest) returns (DisconnectMcpResponse);
   rpc GetSessionMcpState(GetSessionMcpStateRequest) returns (GetSessionMcpStateResponse);
+  rpc GetMcpExecutionResult(GetMcpExecutionResultRequest) returns (GetMcpExecutionResultResponse);
   rpc ListMcpApprovals(ListMcpApprovalsRequest) returns (ListMcpApprovalsResponse);
   rpc DecideMcpApproval(DecideMcpApprovalRequest) returns (DecideMcpApprovalResponse);
   rpc CancelMcpCall(CancelMcpCallRequest) returns (CancelMcpCallResponse);
@@ -694,6 +695,25 @@ message GetSessionMcpStateResponse {
   string next_binding_tool_name = 11;
   bool has_more_binding_tools = 12;
   bool has_more_executions = 13;
+}
+
+message GetMcpExecutionResultRequest {
+  string session_id = 1;
+  string execution_id = 2;
+}
+
+// Settlement does not establish guest delivery or an upstream outcome.
+enum McpCompletionSettlement {
+  MCP_COMPLETION_SETTLEMENT_UNSPECIFIED = 0;
+  MCP_COMPLETION_SETTLEMENT_PENDING = 1;
+  MCP_COMPLETION_SETTLEMENT_SETTLED_OR_TARGET_GONE = 2;
+  MCP_COMPLETION_SETTLEMENT_NOT_APPLICABLE = 3;
+}
+message GetMcpExecutionResultResponse {
+  string state = 1;
+  bool result_unavailable = 2;
+  optional string result_json = 3;
+  McpCompletionSettlement settlement = 4;
 }
 
 // Immutable session grant. Schemas remain independent documents with their own roots.

@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { getSessionMcpState } from "@/gen/engram/app/v1/integration-IntegrationService_connectquery";
 import {
   IntegrationService,
+  McpCompletionSettlement,
+  type GetMcpExecutionResultResponse,
   type McpBoundToolSummary,
   type PrepareMcpRebindResponse,
 } from "@/gen/engram/app/v1/integration_pb";
@@ -33,6 +35,55 @@ function Tools({ tools }: { tools: McpBoundToolSummary[] }) {
       ))}
     </div>
   ));
+}
+
+function ExecutionResult({ sessionId, executionId }: { sessionId: string; executionId: string }) {
+  const client = createClient(IntegrationService, useTransport());
+  const [result, setResult] = useState<GetMcpExecutionResultResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+  async function load() {
+    setBusy(true);
+    setError(false);
+    setResult(null);
+    try {
+      setResult(await client.getMcpExecutionResult({ sessionId, executionId }));
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <Button size="sm" variant="outline" disabled={busy} onClick={() => void load()}>
+        {result ? "Refresh result" : "Show result"}
+      </Button>
+      {error && (
+        <p role="alert">Result is unavailable. The session or permission may have changed.</p>
+      )}
+      {result && (
+        <>
+          <p>Execution state: {result.state}</p>
+          {result.resultUnavailable && <p>Result unavailable.</p>}
+          <p>
+            {result.settlement === McpCompletionSettlement.PENDING
+              ? "Completion settlement is pending."
+              : result.settlement === McpCompletionSettlement.SETTLED_OR_TARGET_GONE
+                ? "Completion was settled or the target was unavailable. This does not confirm guest delivery."
+                : result.settlement === McpCompletionSettlement.NOT_APPLICABLE
+                  ? "Completion settlement is not applicable yet."
+                  : "Completion settlement is unavailable."}
+          </p>
+          {result.resultJson !== undefined ? (
+            <pre className="whitespace-pre-wrap break-all">{result.resultJson}</pre>
+          ) : (
+            <p>No stored result.</p>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 export function McpSessionPanel({ sessionId }: { sessionId: string }) {
@@ -156,6 +207,11 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                     <strong>{execution.upstreamName}</strong> · connection {execution.connectionId}{" "}
                     · {execution.state}
                   </p>
+                  <ExecutionResult
+                    key={`${execution.executionId}:${execution.journalRevision}`}
+                    sessionId={sessionId}
+                    executionId={execution.executionId}
+                  />
                   {execution.reason && <p>{execution.reason}</p>}
                   {execution.approvalDecision && <p>Decision: {execution.approvalDecision}</p>}
                   {!review && execution.originalArguments && (

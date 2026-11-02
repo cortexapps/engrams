@@ -11,6 +11,8 @@ import { schemaVerifiedFixture as reviewFixture } from "./mcp-review-fixture.ts"
 import { buildServer } from "../server.ts";
 import {
   IntegrationService,
+  McpCompletionSettlement,
+  GetMcpExecutionResultResponseSchema,
   GetSessionMcpStateResponseSchema,
 } from "../gen/engram/app/v1/integration_pb.ts";
 import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
@@ -501,4 +503,211 @@ test.skipIf(!reachable)(
     }
   },
   20000,
+);
+
+test.skipIf(!reachable)(
+  "registered result read enforces session association and current human ownership",
+  async () => {
+    const f = await reviewFixture(),
+      s = await wire(f);
+    const { mcpExecution } = await import("../db/schema.ts");
+    const other = await reviewFixture();
+    try {
+      await f.db.update(task).set({ createdByUserId: f.actorId }).where(eq(task.id, other.taskId));
+      const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      const result = {
+        outcome: "failed",
+        delivery: "available",
+        output: {
+          content: [{ type: "text", text: "<img src=https://example.test>" }],
+          structuredContent: { x: 1 },
+          isError: true,
+        },
+      };
+      await f.db
+        .update(mcpExecution)
+        .set({ state: "failed", result, version: 2 })
+        .where(eq(mcpExecution.id, call.id));
+      await f.db
+        .update(mcpExecution)
+        .set({ completionEnqueuedVersion: 2 })
+        .where(eq(mcpExecution.id, call.id));
+      const response = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: call.id,
+      });
+      expect(JSON.parse(response.resultJson!)).toEqual(result);
+      expect(response.state).toBe("failed");
+      expect(response.settlement).toBe(McpCompletionSettlement.SETTLED_OR_TARGET_GONE);
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: "missing" }),
+        Code.FailedPrecondition,
+      );
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: "other", executionId: call.id }),
+        Code.PermissionDenied,
+      );
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: other.sessionId, executionId: call.id }),
+        Code.FailedPrecondition,
+      );
+      await f.db.update(task).set({ createdByUserId: "other-owner" }).where(eq(task.id, f.taskId));
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }),
+        Code.PermissionDenied,
+      );
+    } finally {
+      await s.close();
+      await other.cleanup();
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "result reader bounds data and preserves absent and pending settlement",
+  async () => {
+    const f = await reviewFixture(),
+      s = await wire(f);
+    const { mcpExecution } = await import("../db/schema.ts");
+    const { canonicalJson } = await import("../mcp/hash.ts");
+    async function make(name: string, result: Record<string, unknown>) {
+      const call = await f.journal.create(
+        {
+          ...f.input,
+          toolCallId: name,
+          requestPolicyContext: { ...f.input.requestPolicyContext, toolCallId: name },
+        },
+        { kind: "approval" },
+        f.now,
+      );
+      await f.db
+        .update(mcpExecution)
+        .set({ state: "failed", result, version: 2 })
+        .where(eq(mcpExecution.id, call.id));
+      return call;
+    }
+    try {
+      const active = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      const absent = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: active.id,
+      });
+      expect(absent.resultJson).toBeUndefined();
+      expect(absent.settlement).toBe(McpCompletionSettlement.NOT_APPLICABLE);
+      const envelope = (text: string) => ({
+        outcome: "failed",
+        delivery: "available",
+        output: { content: [{ type: "text", text }], isError: true },
+      });
+      const overhead = Buffer.byteLength(canonicalJson(envelope("")));
+      const max = await make("max", envelope("x".repeat(1024 * 1024 - overhead)));
+      const response = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: max.id,
+      });
+      expect(Buffer.byteLength(response.resultJson!)).toBe(1024 * 1024);
+      expect(response.settlement).toBe(McpCompletionSettlement.PENDING);
+      const oversized = await make("oversized", envelope("x".repeat(1024 * 1024 - overhead + 1)));
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: oversized.id }),
+        Code.FailedPrecondition,
+      );
+      const escaped = await make(
+        "escaped",
+        envelope("\\".repeat(Math.floor((1024 * 1024 - overhead) / 2))),
+      );
+      const escapedResult = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: escaped.id,
+      });
+      expect(
+        Buffer.byteLength(
+          JSON.stringify(toJson(GetMcpExecutionResultResponseSchema, escapedResult)),
+        ),
+      ).toBeLessThanOrEqual(2 * 1024 * 1024);
+      const unavailable = await f.journal.create(
+        {
+          ...f.input,
+          toolCallId: "unavailable",
+          requestPolicyContext: { ...f.input.requestPolicyContext, toolCallId: "unavailable" },
+        },
+        { kind: "approval" },
+        f.now,
+      );
+      await f.db
+        .update(mcpExecution)
+        .set({ state: "authorized", version: 2 })
+        .where(eq(mcpExecution.id, unavailable.id));
+      await f.db
+        .update(mcpExecution)
+        .set({
+          state: "dispatching",
+          version: 3,
+          bootId: "boot",
+          intentId: "intent-unavailable",
+          intentExpiresAt: f.now,
+        })
+        .where(eq(mcpExecution.id, unavailable.id));
+      await f.db
+        .update(mcpExecution)
+        .set({ state: "succeeded", version: 4, resultUnavailable: true })
+        .where(eq(mcpExecution.id, unavailable.id));
+      const noResult = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: unavailable.id,
+      });
+      expect(noResult.resultUnavailable).toBe(true);
+      expect(noResult.resultJson).toBeUndefined();
+      const malformed = await make("malformed", {
+        outcome: "failed",
+        delivery: "available",
+        output: { content: [{ type: "image" }], isError: true },
+      });
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: malformed.id }),
+        Code.FailedPrecondition,
+      );
+    } finally {
+      await s.close();
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "result read checks current admin, banned and service identities",
+  async () => {
+    const f = await reviewFixture(),
+      s = await wire(f);
+    try {
+      const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      await f.db.update(task).set({ createdByUserId: "other-owner" }).where(eq(task.id, f.taskId));
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }),
+        Code.PermissionDenied,
+      );
+      await f.db.update(user).set({ role: "admin" }).where(eq(user.id, f.actorId));
+      expect(
+        (await s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }))
+          .state,
+      ).toBe("waiting_approval");
+      await f.db.update(user).set({ banned: true }).where(eq(user.id, f.actorId));
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }),
+        Code.PermissionDenied,
+      );
+      await f.db
+        .update(user)
+        .set({ banned: false, email: `apikey+${f.actorId}@service.local` })
+        .where(eq(user.id, f.actorId));
+      await code(
+        s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }),
+        Code.PermissionDenied,
+      );
+    } finally {
+      await s.close();
+      await f.cleanup();
+    }
+  },
 );

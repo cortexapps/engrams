@@ -1,12 +1,15 @@
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
-import { IntegrationService } from "@/gen/engram/app/v1/integration_pb";
+import { IntegrationService, McpCompletionSettlement } from "@/gen/engram/app/v1/integration_pb";
 import { renderWithProviders } from "@/test-utils";
 import { McpSessionPanel } from "./McpSessionPanel";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 test("approval uses the original arguments and exact server review context", async () => {
   let request: unknown;
@@ -304,4 +307,38 @@ test("a late result prevents stale resolution and refreshes the execution", asyn
   expect(await screen.findByText(/Result unavailable/)).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Record observation" })).toBeNull();
   expect(resolutions).toBe(1);
+});
+
+test("result expansion shows persisted JSON as inert text and reports ambiguous settlement", async () => {
+  let requests = 0;
+  const fetch = vi.spyOn(globalThis, "fetch");
+  const json =
+    '{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"<img src=https://example.test/x>"}],"structuredContent":{"value":1},"isError":true}}';
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: () => ({
+        availability: "available",
+        executions: [{ executionId: "e1", state: "failed", upstreamName: "write" }],
+      }),
+      getMcpExecutionResult: (req) => {
+        expect(req.sessionId).toBe("s1");
+        expect(req.executionId).toBe("e1");
+        requests++;
+        return {
+          state: "failed",
+          resultJson: json,
+          settlement: McpCompletionSettlement.SETTLED_OR_TARGET_GONE,
+        };
+      },
+    }),
+  );
+  const { container } = renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  expect(requests).toBe(0);
+  await userEvent.click(await screen.findByRole("button", { name: "Show result" }));
+  expect(await screen.findByText(json)).toBeTruthy();
+  expect(screen.getByText(/settled or the target was unavailable/)).toBeTruthy();
+  expect(container.querySelector("img, iframe, a[href^='https://example.test']")).toBeNull();
+  expect(requests).toBe(1);
+  expect(fetch).not.toHaveBeenCalled();
 });

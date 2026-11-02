@@ -1,7 +1,9 @@
 import { sessionMcpState, type McpReviewProducers } from "./review-state.ts";
-import { toJson } from "@bufbuild/protobuf";
+import { create, toBinary, toJson } from "@bufbuild/protobuf";
 import {
   McpApprovalReviewContextSchema,
+  McpCompletionSettlement,
+  GetMcpExecutionResultResponseSchema,
   McpRebindDrainSchema,
   McpRebindDrainReason,
 } from "../gen/engram/app/v1/integration_pb.ts";
@@ -22,6 +24,8 @@ import type { McpJournal, McpUnknownContext } from "./journal.ts";
 import type { McpDiscoveredTool, McpReviewedTool } from "./types.ts";
 import { assertSchemaShape } from "./catalog.ts";
 import { MCP_LIMITS } from "./limits.ts";
+import { canonicalJson } from "./hash.ts";
+import { verifiedExecutionResult } from "./effect-driver.ts";
 
 /** Internal services use trusted connection identities, never guest destinations. */
 export interface McpServices {
@@ -199,6 +203,7 @@ type Methods =
   | "authorizeMcp"
   | "disconnectMcp"
   | "getSessionMcpState"
+  | "getMcpExecutionResult"
   | "listMcpApprovals"
   | "decideMcpApproval"
   | "cancelMcpCall"
@@ -292,6 +297,68 @@ export function mcpHandlers(deps: {
             ),
           ),
         };
+      });
+    },
+    async getMcpExecutionResult(req, ctx) {
+      const actor = await requireUser(ctx, deps.getSession);
+      const service = services();
+      return mcpOperation(async () => {
+        const call = await service.journal.readExecutionResult(
+          req.sessionId,
+          req.executionId,
+          actor.id,
+        );
+        let resultJson: string | undefined;
+        if (call.result !== null) {
+          resultJson = canonicalJson(call.result);
+          if (Buffer.byteLength(resultJson) > MCP_LIMITS.resultBytes)
+            throw new Error("result exceeds limit");
+          if (call.result.source === "local_validation") {
+            const expected = {
+              source: "local_validation",
+              delivery: "available",
+              output: {
+                content: [
+                  { type: "text", text: "Tool arguments do not satisfy the approved schemas." },
+                ],
+                isError: true,
+              },
+            };
+            if (
+              resultJson !== canonicalJson(expected) ||
+              call.state !== "failed" ||
+              call.resultUnavailable
+            )
+              throw new Error("invalid local result");
+          } else {
+            const verified = verifiedExecutionResult(call.result);
+            if (
+              verified.state !== call.state ||
+              verified.resultUnavailable !== call.resultUnavailable
+            )
+              throw new Error("invalid result state");
+          }
+        }
+        const terminal = ["succeeded", "failed", "canceled", "outcome_unknown"].includes(
+          call.state,
+        );
+        const response = {
+          state: call.state,
+          resultUnavailable: call.resultUnavailable,
+          resultJson,
+          settlement: !terminal
+            ? McpCompletionSettlement.NOT_APPLICABLE
+            : call.completionEnqueuedVersion >= call.version
+              ? McpCompletionSettlement.SETTLED_OR_TARGET_GONE
+              : McpCompletionSettlement.PENDING,
+        };
+        const message = create(GetMcpExecutionResultResponseSchema, response);
+        const size = Math.max(
+          toBinary(GetMcpExecutionResultResponseSchema, message).byteLength,
+          Buffer.byteLength(JSON.stringify(toJson(GetMcpExecutionResultResponseSchema, message))),
+        );
+        if (size > MCP_LIMITS.responseBytes) throw new Error("result response exceeds limit");
+        return response;
       });
     },
     async getSessionMcpState(req, ctx) {

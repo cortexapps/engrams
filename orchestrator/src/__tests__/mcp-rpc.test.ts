@@ -67,6 +67,7 @@ function services(): McpServices {
     journal: {
       get: unavailable,
       readSession: unavailable,
+      readExecutionResult: unavailable,
       getAdmission: unavailable,
       hasUnknown: unavailable,
       create: unavailable,
@@ -142,6 +143,7 @@ describe("MCP native wire contract", () => {
       await code(s.client.publishMcp({}), Code.FailedPrecondition);
       await code(s.client.authorizeMcp({}), Code.FailedPrecondition);
       await code(s.client.disconnectMcp({}), Code.FailedPrecondition);
+      await code(s.client.getMcpExecutionResult({}), Code.FailedPrecondition);
       await code(s.client.listMcpApprovals({}), Code.FailedPrecondition);
       await code(s.client.decideMcpApproval({}), Code.FailedPrecondition);
       await code(s.client.cancelMcpCall({}), Code.FailedPrecondition);
