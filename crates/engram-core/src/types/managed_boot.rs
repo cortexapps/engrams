@@ -225,13 +225,30 @@ impl ManagedBootStart {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedBootHostState {
-    Missing { key: ManagedBootKey },
-    Prepared { receipt: ManagedBootPreparedReceipt },
-    Finalized { receipt: ManagedBootFinalReceipt },
-    StartPending { intent: ManagedBootStart },
-    Started { intent: ManagedBootStart },
-    Failed { key: ManagedBootKey },
-    Captured { authority: ManagedCaptureAuthority },
+    Missing {
+        key: ManagedBootKey,
+    },
+    Prepared {
+        receipt: Box<ManagedBootPreparedReceipt>,
+    },
+    Finalized {
+        receipt: ManagedBootFinalReceipt,
+    },
+    StartPending {
+        intent: ManagedBootStart,
+    },
+    Started {
+        intent: ManagedBootStart,
+    },
+    Failed {
+        key: ManagedBootKey,
+    },
+    Captured {
+        authority: ManagedCaptureAuthority,
+    },
+    Retired {
+        receipt: Box<ManagedBootRetiredReceipt>,
+    },
 }
 
 pub fn validate_combined_manifest(
@@ -313,11 +330,12 @@ pub struct ManagedBootRecord {
     pub write_policy: Option<super::mcp_policy::TrustedWritePolicy>,
     pub receipt: Option<ManagedBootFinalReceipt>,
     pub start: Option<ManagedBootStart>,
+    pub retired: Option<ManagedBootRetiredReceipt>,
 }
 /// Transactional events; no caller can assign arbitrary state or mutate a claim.
 #[derive(Clone)]
 pub enum ManagedBootAdvance {
-    Prepared(ManagedBootPreparedReceipt),
+    Prepared(Box<ManagedBootPreparedReceipt>),
     Finalize {
         finalization: Box<ManagedBootFinalization>,
         sealed_agent: ManagedBootSealedAgent,
@@ -327,6 +345,7 @@ pub enum ManagedBootAdvance {
     IssueStart(ManagedBootStart),
     Started(ManagedBootStart),
     Interrupt,
+    Retired(Box<ManagedBootRetiredReceipt>),
 }
 impl ManagedBootRecord {
     pub fn claimed(request: ManagedBootPrepare) -> Self {
@@ -340,6 +359,7 @@ impl ManagedBootRecord {
             write_policy: None,
             receipt: None,
             start: None,
+            retired: None,
         }
     }
     pub fn advance(
@@ -354,7 +374,7 @@ impl ManagedBootRecord {
                 if self.phase != ManagedBootPhase::Claimed || r.request != self.request {
                     return Err(conflict());
                 }
-                next.prepared = Some(r);
+                next.prepared = Some(*r);
                 next.phase = ManagedBootPhase::Prepared;
             }
             ManagedBootAdvance::Finalize {
@@ -400,6 +420,20 @@ impl ManagedBootRecord {
                     return Err(conflict());
                 }
                 next.phase = ManagedBootPhase::Started;
+            }
+            ManagedBootAdvance::Retired(receipt) => {
+                let prepared = self.prepared.as_ref().ok_or_else(conflict)?;
+                let minimum = self
+                    .finalization
+                    .as_ref()
+                    .map(|f| &f.policy.policy)
+                    .unwrap_or(&self.request.bootstrap_policy);
+                receipt.validate_for(prepared, minimum)?;
+                if self.retired.is_some() {
+                    return Err(conflict());
+                }
+                next.retired = Some(*receipt);
+                next.phase = ManagedBootPhase::Interrupted;
             }
             ManagedBootAdvance::Interrupt => {
                 if self.phase == ManagedBootPhase::Interrupted {
@@ -571,4 +605,37 @@ pub struct ManagedBootFinalizeInput {
     pub native_version: u32,
     pub combined_manifest: Vec<u8>,
     pub combined_manifest_digest: String,
+}
+
+/// Authenticated source retirement, not a capture or an applied-policy ACK.
+/// The source VM and network are nonrunning and the exact private disk remains
+/// owned for a later explicitly pinned capture. Missing state cannot produce this.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBootRetiredReceipt {
+    pub prepared: ManagedBootPreparedReceipt,
+    pub retained_policy: super::managed_deny::ManagedDenyPolicy,
+    pub receipt_id: String,
+}
+impl ManagedBootRetiredReceipt {
+    pub fn validate_for(
+        &self,
+        prepared: &ManagedBootPreparedReceipt,
+        minimum: &super::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        self.prepared.validate()?;
+        self.retained_policy
+            .validate()
+            .map_err(MetaError::Conflict)?;
+        if &self.prepared != prepared
+            || !is_digest(&self.receipt_id)
+            || self.retained_policy.revision < minimum.revision
+            || !self.retained_policy.contains(minimum)
+            || (self.retained_policy.revision == minimum.revision
+                && &self.retained_policy != minimum)
+        {
+            return Err(conflict());
+        }
+        Ok(())
+    }
 }
