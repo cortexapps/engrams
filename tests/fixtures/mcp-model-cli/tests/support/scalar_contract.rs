@@ -80,7 +80,7 @@ pub(super) fn finish(child: &mut Child) {
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(stderr.is_empty());
 }
-fn exercise(
+pub(super) fn exercise(
     claude: bool,
     mode: &str,
     args: Value,
@@ -278,7 +278,7 @@ fn invalid_scalar_configuration_fails_closed_without_payload_output() {
 // covers limits larger than the operating system's environment limit.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[path = "../../src/scalar.rs"]
-mod config_parser;
+pub(super) mod config_parser;
 
 #[test]
 fn parser_exact_utf8_size_depth_and_canonical_hash_boundaries() {

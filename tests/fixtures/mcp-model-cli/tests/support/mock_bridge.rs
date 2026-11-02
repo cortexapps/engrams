@@ -1,3 +1,7 @@
+#[path = "../../src/scalar.rs"]
+mod scalar;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 
@@ -143,13 +147,14 @@ fn main() {
 }
 
 fn active_step() -> Option<Value> {
-    let raw = std::env::var("ENGRAM_FIXTURE_CALL_PLAN_JSON").ok()?;
-    let plan: Value = serde_json::from_str(&raw).unwrap();
+    let plan =
+        scalar::configured_object("ENGRAM_FIXTURE_CALL_PLAN_JSON", 65536, 128 + 3).unwrap()?;
     let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
     let receipt: Value = serde_json::from_slice(
         &std::fs::read(std::path::Path::new(&root).join("plan-selection.json")).unwrap(),
     )
     .unwrap();
+    assert!(receipt["planSha256"] == scalar::digest(&plan).unwrap());
     Some(
         plan["steps"]
             .as_array()

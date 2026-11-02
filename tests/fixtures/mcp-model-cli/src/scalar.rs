@@ -77,6 +77,9 @@ pub fn parse_object(raw: &str, limit: usize, depth: usize) -> super::Result<Valu
         return Err("JSON configuration exceeds size limit".into());
     }
     let mut deserializer = serde_json::Deserializer::from_str(raw);
+    // JsonSeed bounds every container. The decoder's separate recursion cap
+    // must not reject valid fields when a plan adds its enclosing containers.
+    deserializer.disable_recursion_limit();
     let value = JsonSeed(depth).deserialize(&mut deserializer)?;
     deserializer.end()?;
     if !value.is_object() {

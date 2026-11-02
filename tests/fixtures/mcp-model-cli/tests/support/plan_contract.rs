@@ -445,3 +445,113 @@ fn actual_exposed_mcp_alias_set_is_sorted_bounded_and_validated() {
         }
     }
 }
+
+fn nested_object(depth: usize) -> Value {
+    let mut value = json!(0);
+    for _ in 0..depth {
+        value = json!({"nested":value});
+    }
+    value
+}
+
+#[test]
+fn expected_result_nested_native_object_matches_in_scalar_and_plan_modes() {
+    // Claude delivers structuredContent as a nested object. Codex delivers it
+    // as a literal text string, so it does not have this native nesting depth.
+    for depth in [34, 126] {
+        let mut actual = native(true, false);
+        actual["structuredContent"] = nested_object(depth - 1);
+        let scalar = super::scalar_contract::exercise(
+            true,
+            "read",
+            json!({}),
+            "nested-read",
+            actual.clone(),
+            actual.clone(),
+            false,
+        );
+        assert_eq!(scalar["resultMatchesExpected"], true);
+        let state = State::new("nested-expected-plan");
+        let plan = json!({"steps":[{
+            "marker":"nested","tool":"mcp_read_counter","arguments":{},
+            "callId":"nested-read","resultFormat":"mcp","expectedResult":actual
+        }]});
+        std::fs::write(
+            state.0.join("native-response.json"),
+            json!({"jsonrpc":"2.0","result":actual}).to_string(),
+        )
+        .unwrap();
+        let mut child = Fixture(plan_command(&state, true, &plan, "read").spawn().unwrap());
+        let rx = output(&mut child.0);
+        initialize(&mut child.0, &rx, true, tools());
+        prompt(&mut child.0, true, "[[fixture:nested]]");
+        assert_eq!(call(&rx, true)["id"], "nested-read");
+        complete(&mut child.0, &rx, true, Value::Null);
+        finish(&mut child.0);
+        let planned = &proof(&state)[0];
+        assert_eq!(planned["resultMatchesExpected"], true);
+        assert_eq!(planned["resultSha256"], scalar["resultSha256"]);
+        assert_eq!(
+            planned["expectedResultSha256"],
+            scalar["expectedResultSha256"]
+        );
+    }
+}
+
+fn assert_plan_configuration(plan: &Value, valid: bool) {
+    let state = State::new("expected-result-plan-boundary");
+    let mut child = Fixture(plan_command(&state, false, plan, "read").spawn().unwrap());
+    let rx = output(&mut child.0);
+    if valid {
+        send(&mut child.0, json!({"id":1,"method":"initialize"}));
+        assert_eq!(receive(&rx)["id"], 1);
+        finish(&mut child.0);
+    } else {
+        wait_for_failure(&mut child.0);
+        assert!(!state.0.join("proof.json").exists());
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+}
+
+#[test]
+fn expected_result_plan_depth_and_byte_boundaries_preserve_argument_limits() {
+    let base = json!({"steps":[{
+        "marker":"nested","tool":"mcp_read_counter","arguments":{},
+        "callId":"nested-read","resultFormat":"mcp","expectedResult":{}
+    }]});
+    for depth in [127, 128, 129] {
+        let expected = nested_object(depth);
+        let scalar = super::scalar_contract::config_parser::parse_object(
+            &expected.to_string(),
+            1024 * 1024,
+            128,
+        );
+        assert_eq!(scalar.is_ok(), depth <= 128);
+        let mut plan = base.clone();
+        plan["steps"][0]["expectedResult"] = expected;
+        assert_plan_configuration(&plan, depth <= 128);
+    }
+    for depth in [16, 17] {
+        let mut plan = base.clone();
+        plan["steps"][0]["expectedResult"] = nested_object(128);
+        plan["steps"][0]["arguments"] = nested_object(depth);
+        assert_plan_configuration(&plan, depth == 16);
+    }
+    for bytes in [4096, 4097] {
+        let mut plan = base.clone();
+        plan["steps"][0]["arguments"] = json!({"a":"x".repeat(bytes - 8)});
+        assert_eq!(plan["steps"][0]["arguments"].to_string().len(), bytes);
+        assert_plan_configuration(&plan, bytes == 4096);
+    }
+    let mut plan = base;
+    plan["steps"][0]["expectedResult"] = json!({"padding":""});
+    let padding = 65536 - plan.to_string().len();
+    for extra in [0, 1] {
+        plan["steps"][0]["expectedResult"]["padding"] = json!("x".repeat(padding + extra));
+        assert_eq!(plan.to_string().len(), 65536 + extra);
+        assert_plan_configuration(&plan, extra == 0);
+    }
+}

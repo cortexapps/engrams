@@ -69,7 +69,9 @@ impl Plan {
                 return Err("plan conflicts with scalar configuration".into());
             }
         }
-        let value = parse_object(&raw, 65536, 32)?;
+        // The root object, steps array and step object enclose each field.
+        // Preserve the expected-result depth bound through those three levels.
+        let value = parse_object(&raw, 65536, 128 + 3)?;
         exact_keys(&value, &["steps"], &[])?;
         let steps = value["steps"].as_array().ok_or("invalid plan steps")?;
         if steps.is_empty() || steps.len() > 16 {
