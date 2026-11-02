@@ -43,12 +43,16 @@ impl ManagedBootKey {
 pub struct ManagedBootPrepare {
     pub key: ManagedBootKey,
     pub cold: ManagedColdPrepare,
+    pub bootstrap_policy: super::managed_deny::ManagedDenyPolicy,
     /// Exact, non-secret SandboxSpec JSON. Decode through `spec`, never a profile.
     pub sandbox_spec_json: String,
 }
 impl ManagedBootPrepare {
     pub fn spec(&self) -> Result<SandboxSpec, MetaError> {
         self.key.validate()?;
+        self.bootstrap_policy
+            .validate()
+            .map_err(MetaError::Conflict)?;
         if self.sandbox_spec_json.len() > 1024 * 1024 {
             return Err(conflict());
         }
@@ -213,6 +217,7 @@ pub enum ManagedBootHostState {
     StartPending { intent: ManagedBootStart },
     Started { intent: ManagedBootStart },
     Failed { key: ManagedBootKey },
+    Captured { authority: ManagedCaptureAuthority },
 }
 
 pub fn validate_combined_manifest(
@@ -426,5 +431,104 @@ mod tests {
 impl std::fmt::Debug for ManagedBootSealedAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ManagedBootSealedAgent([sealed])")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCaptureRequest {
+    pub key: ManagedBootKey,
+    pub capture_id: crate::SnapshotId,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDiskConsistency {
+    CrashConsistentDiskCutV1,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedCapturedSourceState {
+    Destroyed,
+}
+/// Returned only by the authenticated host capture owner. A digest is an integrity
+/// check, not provenance. The coordinator persists this under the registered source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCaptureAuthority {
+    pub version: u32,
+    pub request: ManagedCaptureRequest,
+    pub host_incarnation: String,
+    pub disk_manifest: super::manifest::ManifestRef,
+    pub disk_sha256: String,
+    pub disk_size_bytes: u64,
+    pub image: String,
+    pub kernel_sha256: String,
+    pub aux_ro_drives: Vec<super::sandbox::AuxRoDrive>,
+    pub consistency: ManagedDiskConsistency,
+    pub source_state: ManagedCapturedSourceState,
+    pub record_digest: String,
+}
+impl ManagedCaptureAuthority {
+    pub fn digest(&self) -> Result<String, MetaError> {
+        let mut value = self.clone();
+        value.record_digest.clear();
+        serde_json::to_vec(&value)
+            .map(|v| digest(&v))
+            .map_err(|_| conflict())
+    }
+    pub fn validate(&self) -> Result<(), MetaError> {
+        self.request.key.validate()?;
+        if self.version != 1
+            || self.request.capture_id.as_uuid().is_nil()
+            || self.host_incarnation.is_empty()
+            || self.host_incarnation.len() > 128
+            || self.disk_manifest.manifest_id.is_nil()
+            || self.disk_manifest.version == 0
+            || self.disk_size_bytes == 0
+            || !super::managed_cold::is_sha256(&self.disk_sha256)
+            || !super::managed_cold::is_sha256(&self.kernel_sha256)
+            || self.image.is_empty()
+            || self.image.len() > 256
+            || self.record_digest != self.digest()?
+        {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+    pub fn validate_recovery(&self, next: &ManagedBootPrepare) -> Result<(), MetaError> {
+        self.validate()?;
+        next.spec()?;
+        let old = &self.request.key;
+        let key = &next.key;
+        let cold = &next.cold;
+        if key.creation != old.creation
+            || key.native_digest != old.native_digest
+            || key.context.target.binding_epoch
+                != old
+                    .context
+                    .target
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or_else(conflict)?
+            || key.boot_attempt == old.boot_attempt
+            || key.context.target.sandbox_id == old.context.target.sandbox_id
+            || cold.image != self.image
+            || cold.disk.manifest != self.disk_manifest
+            || cold.disk.sha256 != self.disk_sha256
+            || cold.disk.size_bytes != self.disk_size_bytes
+            || cold.kernel_sha256 != self.kernel_sha256
+            || cold.aux_ro_drives != self.aux_ro_drives
+            || cold.disk.source
+                != (super::managed_cold::ManagedColdSource::Capture {
+                    capture_id: self.request.capture_id,
+                    session_id: old.creation.session_id,
+                    sandbox_id: old.context.target.sandbox_id,
+                    binding_epoch: old.context.target.binding_epoch,
+                    record_digest: self.record_digest.clone(),
+                })
+        {
+            return Err(conflict());
+        }
+        Ok(())
     }
 }

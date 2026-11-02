@@ -382,6 +382,14 @@ pub trait HostClient: Send + Sync {
     /// stateless transport can't honour. Local impl applies in-proc;
     /// the gRPC impl ships both fields in a single `StartAgent` RPC.
     /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn capture_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<crate::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "managed capture unavailable".into(),
+        ))
+    }
     async fn prepare_managed_boot(
         &self,
         _request: crate::types::managed_boot::ManagedBootPrepare,
