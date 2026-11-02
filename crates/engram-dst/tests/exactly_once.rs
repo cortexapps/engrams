@@ -44,6 +44,7 @@ async fn reserve_session(sim: &mut Sim) -> (engram_coordinator::state::SharedSta
         .expect("replica 0 is up");
     let session_id = SessionId::from(sim.world.entropy.uuid());
     let ws = SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,

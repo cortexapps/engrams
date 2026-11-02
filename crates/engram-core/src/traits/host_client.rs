@@ -382,6 +382,15 @@ pub trait HostClient: Send + Sync {
     /// stateless transport can't honour. Local impl applies in-proc;
     /// the gRPC impl ships both fields in a single `StartAgent` RPC.
     /// Exact managed authority only. Unsupported hosts remain closed.
+    /// Read actual immutable disk, kernel and ordered bundle identities without creating a VM.
+    async fn read_managed_cold_assets(
+        &self,
+        _request: crate::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<crate::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "managed cold assets unavailable".into(),
+        ))
+    }
     async fn capture_managed_boot(
         &self,
         _request: crate::types::managed_boot::ManagedCaptureRequest,

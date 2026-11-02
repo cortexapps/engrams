@@ -66,3 +66,7 @@ pub mod managed_create;
 pub mod managed_boot;
 
 pub mod managed_operator;
+
+pub mod managed_assets;
+
+pub mod managed_bridge;

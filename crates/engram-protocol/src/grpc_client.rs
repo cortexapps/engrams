@@ -1686,6 +1686,35 @@ impl HostClient for GrpcHostClient {
         Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        request
+            .validate()
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_cold_assets(crate::grpc::ReadManagedColdAssetsRequest { payload_json })
+            .await
+            .map_err(|status| {
+                // An older host can share the wire version but lack this RPC.
+                if status.code() == tonic::Code::Unimplemented {
+                    SandboxError::Unsupported(status.message().to_string())
+                } else {
+                    grpc_to_sandbox_err(status)
+                }
+            })?
+            .into_inner();
+        let receipt: engram_core::types::managed_assets::ManagedColdAssetsReceipt =
+            crate::managed_boot::decode(&response.payload_json)?;
+        receipt
+            .validate_for(&request)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        Ok(receipt)
+    }
     async fn capture_managed_boot(
         &self,
         request: engram_core::types::managed_boot::ManagedCaptureRequest,
@@ -1982,6 +2011,134 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
 #[cfg(test)]
 mod grpc_err_tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct ColdAssetsStatusHost(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tonic::server::NamedService for ColdAssetsStatusHost {
+        const NAME: &'static str = "engram.host.v1.HostService";
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
+        for ColdAssetsStatusHost
+    {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(
+            &mut self,
+            request: tonic::codegen::http::Request<tonic::body::Body>,
+        ) -> Self::Future {
+            assert_eq!(
+                request.uri().path(),
+                "/engram.host.v1.HostService/ReadManagedColdAssets"
+            );
+            assert_eq!(
+                request.headers()[crate::wire::WIRE_VERSION_METADATA_KEY],
+                crate::WIRE_VERSION.to_string()
+            );
+            let status = match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => tonic::Status::unimplemented("cold asset inspection unavailable"),
+                1 => tonic::Status::invalid_argument("invalid cold asset request"),
+                2 => tonic::Status::unavailable("host unavailable"),
+                _ => panic!("unexpected cold asset request"),
+            };
+            std::future::ready(Ok(status.into_http()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_assets_client_preserves_missing_capability_and_other_statuses() {
+        use engram_core::types::{managed_assets::ManagedColdAssetsRequest, manifest::ManifestRef};
+        use futures::FutureExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let next = listener.accept().await.map(|(stream, _)| stream);
+            Some((next, listener))
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ColdAssetsStatusHost(calls.clone()))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                }),
+        );
+        let exercise = async {
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let client = GrpcHostClient::new(channel);
+            let request = ManagedColdAssetsRequest {
+                version: 1,
+                host_id: engram_core::HostId::new(),
+                session_id: SessionId::new(),
+                intent_id: "intent-a".into(),
+                image: "test.invalid/image:v1".into(),
+                image_digest: format!("sha256:{}", "a".repeat(64)),
+                disk_manifest: ManifestRef::new(),
+                aux_ro_drives: (0..3)
+                    .map(|i| AuxRoDrive {
+                        drive_id: AuxRoDrive::slot_drive_id(i),
+                        guest_mount: AuxRoDrive::slot_guest_mount(i),
+                        fs_type: "squashfs".into(),
+                        sha256: Some("b".repeat(64)),
+                    })
+                    .collect(),
+            };
+            let error = client
+                .read_managed_cold_assets(request.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SandboxError::Unsupported(ref message) if message == "cold asset inspection unavailable"),
+                "{error:?}"
+            );
+            let error = client
+                .read_managed_cold_assets(request.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, SandboxError::InvalidSpec(ref message) if message == "invalid cold asset request"),
+                "{error:?}"
+            );
+            let error = client.read_managed_cold_assets(request).await.unwrap_err();
+            assert!(
+                matches!(error, SandboxError::Unavailable(ref message) if message == "host unavailable"),
+                "{error:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            // The legacy snapshot fallback must retain its existing mapping.
+            assert!(
+                matches!(grpc_to_sandbox_err(tonic::Status::unimplemented("legacy")), SandboxError::InvalidSpec(message) if message == "legacy")
+            );
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            std::panic::AssertUnwindSafe(exercise).catch_unwind(),
+        )
+        .await;
+        let _ = stop.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        joined.unwrap().unwrap().unwrap();
+        outcome.unwrap().unwrap();
+    }
 
     #[test]
     fn migration_client_interceptor_stamps_wire_version() {

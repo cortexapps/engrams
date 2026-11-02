@@ -1057,17 +1057,32 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    /// ADR 0013: bundled policy + start. One trait call applies the
-    /// `SessionEgressPolicy` to the host's egress proxy registry
-    /// BEFORE spawning the agent process. Atomic by construction.
-    ///
-    /// This entry-point serves the **cold-create** path: coord
-    /// calls `StartAgent` after `Create` returns, the in-guest
-    /// bootstrap may not be accept()'ing yet, and the dial blocks
-    /// until kernel + engram-init + ext4 mount complete. The
-    /// warm-lease path doesn't reach here — it goes through
-    /// `WarmPool::launch` (which has its own histogram emission
-    /// labelled `kind="warm"`).
+    /// Read physical cold-boot inputs through the authenticated host boundary.
+    /// This operation cannot allocate a VM, policy lease or network owner.
+    async fn read_managed_cold_assets(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ReadManagedColdAssetsRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ReadManagedColdAssetsResponse>, tonic::Status>
+    {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed cold assets require authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .read_managed_cold_assets(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ReadManagedColdAssetsResponse { payload_json },
+        ))
+    }
     async fn capture_managed_boot(
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
@@ -2182,6 +2197,57 @@ mod wire_version_tests {
                 .insert(WIRE_VERSION_METADATA_KEY, v.to_string().parse().unwrap());
         }
         req
+    }
+
+    #[tokio::test]
+    async fn cold_assets_route_requires_authenticated_mode_and_wire_match() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let mut service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        let req = || {
+            let mut request = Request::new(engram_protocol::grpc::ReadManagedColdAssetsRequest {
+                payload_json: b"null".to_vec(),
+            });
+            request.metadata_mut().insert(
+                WIRE_VERSION_METADATA_KEY,
+                engram_protocol::WIRE_VERSION.to_string().parse().unwrap(),
+            );
+            request
+        };
+        assert_eq!(
+            service
+                .read_managed_cold_assets(req())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        service.managed_tls = true;
+        let mut skew = req();
+        skew.metadata_mut().insert(
+            WIRE_VERSION_METADATA_KEY,
+            (engram_protocol::WIRE_VERSION + 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            service
+                .read_managed_cold_assets(skew)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            service
+                .read_managed_cold_assets(req())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test]

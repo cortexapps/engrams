@@ -637,3 +637,89 @@ record cannot become authority. `CrashConsistentDiskCutV1` does not promise that
 guest page-cache or application writes were flushed. Recovery uses a fresh
 kernel, device context and empty swap; it never restores old RAM. Physical FC
 and VZ acceptance remains required before activation.
+
+### Managed cold asset inspection
+
+The coordinator selects an immutable approved disk manifest and ordered bundle
+hashes before asking the authenticated host for cold asset inspection. The
+version-one JSON request binds host, session and durable preparation intent.
+The reply reports the actual backend and host incarnation plus verified logical
+disk byte hash/size and kernel hash. Inspection creates no VM or policy lease.
+Preparation checks the same bytes again. An unsupported host remains closed.
+This additive gRPC method does not change the bincode wire layout.
+
+The host implementation reads the immutable manifest and content-addressed
+chunks from its configured blob store. The enabled-image materializer publishes
+all chunks before the manifest; the coordinator checks capture recoverability
+before it selects a base. The managed path does not use the ordinary restore
+path's OCI resolver. A missing chunk fails inspection. The reader validates
+chunk lengths and hashes and hashes every logical disk byte, including sparse
+zero ranges and a short final chunk. A manifest digest is not a disk digest.
+
+The host uses the same configured kernel path and bundle directory that managed
+preparation uses. It checks all ordered bundle contents and reports the kernel
+content hash. Preparation copies and checks the disk, kernel and bundles again
+before it constructs a VM. Inspection creates no sandbox, network, helper or
+policy owner. A receipt binds the exact request and current host incarnation.
+The image digest in that request is an association with coordinator approval;
+it is not independent host proof of catalog lineage.
+
+Only the pinned mutual-TLS host service exposes this operation. One bounded
+inspection runs at a time without a lifecycle or inventory lock. Disk chunks
+and files are read as streams; hashing yields between 64 KiB blocks. The
+manifest is bounded to 8 MiB and decoded off the async executor. Cancellation
+stops the read future; a pending bounded manifest decode retains the slot until
+it exits. An inspection has a five-minute read deadline. File reads reject
+symlinks and special files and check identity, length and modification metadata
+before returning a hash. Local file and TLS tests do not prove physical VM
+boot or network isolation; those acceptance gates remain separate.
+
+### Identity-only managed preparation and recovery bridge
+
+The internal policy service exposes `ReadManagedCreationState`, `PrepareManagedBoot`,
+and `RecoverManagedBoot`. Each method has its own response envelope. Requests bind
+only the immutable creation identity and native manifest version/digest; recovery
+also binds an exact previously read source key and a bounded recovery ID. The
+coordinator selects and pins approved physical inputs. Callers cannot provide a
+host, disk path, kernel hash, or replacement epoch.
+
+The sanitized state distinguishes absent, held, preparing, boot, recovering, and
+terminal. It includes the exact current boot and operation identity, but excludes
+sealed agent ciphertext. Absence does not fence an in-flight reserve. Recovery
+retries retain their original operation identity even when a newer boot exists.
+The JSON contracts are versioned by their existing nested authorities; additive
+protobuf methods preserve protocol and WIRE versions. These contracts alone do
+not enable creation or prove physical host execution.
+
+The coordinator now commits approved image digest, base manifest, ordered bundle
+hashes, and resource selection with the held reservation. Migration 0135 stores
+these immutable inputs and one pending boot intent per session. Initial and
+recovery operation keys are unique; revision CAS preserves the chosen sandbox,
+epoch, capture ID, and private manifest reference across retries. The shared
+operator gate is locked before the session. Blob and host I/O occur outside
+transactions. Selection, private fork, capture, and bundle references are GC roots.
+
+The scanner forks the complete approved disk manifest under the pinned reference,
+checks an authenticated cold-assets receipt, and claims the physical target through
+the existing capacity transaction. Prepared receipts must match the inspected host
+incarnation. Explicit recovery captures the exact old source before claiming a new
+epoch. A detached source remains captureable only with its exact permanent Retired
+receipt and unchanged host/epoch; it cannot acknowledge or replace a newer target.
+Old run interruption and prompt delivery continue through the existing atomic event
+and Started gates. Test fixtures exercise coordinator retry ordering and paired
+metadata semantics; physical backend qualification remains a separate requirement.
+
+Pre-claim placement checks capacity before it saves a candidate. If that host loses
+capacity or eligibility, a revision CAS can select another host and discard the old
+asset receipt. The intent, sandbox, epoch, capture ID, and private manifest stay
+unchanged. The store serializes this transition with claim under the session lock;
+any claimed target prevents relocation, including after a lost claim reply.
+
+The immutable selection also stores the original nonsecret harness descriptor and
+workdir with the ordered bundle hashes. Managed reservation seals the complete
+original session environment in the existing session-secrets row. Finalization and
+explicit recovery use those saved launch inputs, without resolving a newer image,
+harness catalog generation, or creation secret. Live write authorization, operator
+generation, retained denies, and exact applied binding still gate finalization and
+start. Frozen launch metadata grants no permission. Migration 0135 is unchanged;
+selection records without the required launch authority remain closed.

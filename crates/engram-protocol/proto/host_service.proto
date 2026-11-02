@@ -19,6 +19,7 @@ package engram.host.v1;
 
 service HostService {
   rpc CaptureManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc ReadManagedColdAssets(ReadManagedColdAssetsRequest) returns (ReadManagedColdAssetsResponse);
   rpc PrepareManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
   rpc ReadManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
   rpc FinalizeManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
@@ -884,3 +885,6 @@ message ApplyManagedPolicyResponse { bytes state_bincode = 1; }
 // Finalize contains plaintext environment only on authenticated host transport.
 message ManagedBootRequest { bytes payload_json = 1; }
 message ManagedBootResponse { bytes payload_json = 1; }
+
+message ReadManagedColdAssetsRequest { bytes payload_json = 1; }
+message ReadManagedColdAssetsResponse { bytes payload_json = 1; }

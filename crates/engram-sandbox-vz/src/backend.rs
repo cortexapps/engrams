@@ -217,6 +217,11 @@ pub struct VzBackend {
 }
 
 impl VzBackend {
+    /// The same configured kernel that managed preparation copies and verifies.
+    pub fn managed_kernel_path(&self) -> &Path {
+        &self.cfg.kernel_path
+    }
+
     pub fn new(work_dir: impl Into<PathBuf>, cfg: VzConfig) -> Result<Self, SandboxError> {
         let work_dir = work_dir.into();
         // Validate the kernel exists up-front so misconfiguration

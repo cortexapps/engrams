@@ -54,6 +54,14 @@ proptest! {
         let _=mcp::OperatorPublicationServiceStageResponse::decode(bytes.as_slice());
         let _=mcp::ReadPublishedOperatorRequest::decode(bytes.as_slice());
         let _=mcp::ReadPublishedOperatorResponse::decode(bytes.as_slice());
+        let _=mcp::ReadManagedCreationStateRequest::decode(bytes.as_slice());
+        let _=mcp::ReadManagedCreationStateResponse::decode(bytes.as_slice());
+        let _=mcp::PrepareManagedBootRequest::decode(bytes.as_slice());
+        let _=mcp::PrepareManagedBootResponse::decode(bytes.as_slice());
+        let _=mcp::RecoverManagedBootRequest::decode(bytes.as_slice());
+        let _=mcp::RecoverManagedBootResponse::decode(bytes.as_slice());
+        let _=serde_json::from_slice::<engram_core::types::managed_bridge::ManagedCreationState>(&bytes);
+        let _=serde_json::from_slice::<engram_core::types::managed_bridge::ManagedRecoveryInput>(&bytes);
         let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorCandidate>(&bytes);
         let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorPublication>(&bytes);
     }
@@ -171,4 +179,58 @@ fn managed_capture_json_golden_roundtrip() {
         request.capture_id.as_uuid()
     );
     assert_eq!(request.disk_manifest().version, 1);
+}
+
+#[test]
+fn managed_creation_bridge_envelopes_preserve_identity_and_operation() {
+    let identity = mcp::ManagedCreateIdentity {
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        task_id: "task-one".into(),
+        input_id: "input-one".into(),
+        actor_id: "actor-one".into(),
+        parent_session_id: None,
+        write_eligibility: "read_only".into(),
+        input_digest: format!("sha256:{}", "a".repeat(64)),
+    };
+    let read = mcp::ReadManagedCreationStateRequest {
+        protocol: mcp::PROTOCOL,
+        identity: Some(identity.clone()),
+        native_version: 1,
+        native_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let prepare = mcp::PrepareManagedBootRequest {
+        protocol: read.protocol,
+        identity: read.identity.clone(),
+        native_version: read.native_version,
+        native_digest: read.native_digest.clone(),
+    };
+    assert_eq!(read.encode_to_vec(), prepare.encode_to_vec());
+    let recovery = mcp::RecoverManagedBootRequest {
+        protocol: read.protocol,
+        identity: Some(identity),
+        native_version: read.native_version,
+        native_digest: read.native_digest,
+        expected_source_key_json: b"exact-source".to_vec(),
+        recovery_id: "recovery-one".into(),
+    };
+    assert_eq!(
+        mcp::RecoverManagedBootRequest::decode(recovery.encode_to_vec().as_slice()).unwrap(),
+        recovery
+    );
+    let response = mcp::ReadManagedCreationStateResponse {
+        protocol: mcp::PROTOCOL,
+        state_json: b"explicit-state".to_vec(),
+    };
+    assert_eq!(
+        mcp::PrepareManagedBootResponse::decode(response.encode_to_vec().as_slice())
+            .unwrap()
+            .state_json,
+        response.state_json
+    );
+    assert_eq!(
+        mcp::RecoverManagedBootResponse::decode(response.encode_to_vec().as_slice())
+            .unwrap()
+            .state_json,
+        response.state_json
+    );
 }
