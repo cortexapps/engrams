@@ -104,6 +104,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub mod client;
+pub mod managed;
 pub mod net;
 pub mod paths;
 pub mod pidfd;

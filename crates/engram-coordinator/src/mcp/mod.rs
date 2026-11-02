@@ -367,3 +367,5 @@ impl McpAuthority {
         Ok(credential)
     }
 }
+
+pub mod operator;

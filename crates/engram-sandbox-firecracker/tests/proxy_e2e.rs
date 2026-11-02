@@ -438,6 +438,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     let network_allow =
         engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip,

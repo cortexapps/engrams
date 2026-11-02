@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "proto/engram/mcp/v1/control.proto",
+                "proto/engram/mcp/v1/operator.proto",
                 "proto/engram/mcp/v1/session_policy.proto",
             ],
             &includes,

@@ -8923,6 +8923,7 @@ fn managed_creation_ws(id: SessionId) -> engram_core::traits::SessionCreateWrite
 }
 
 async fn managed_creation_exact_retry_and_held_queue(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     use engram_core::traits::CreateDisposition;
     let ws = managed_creation_ws(SessionId::new());
     let frozen = ws.managed_creation.clone().unwrap();
@@ -9022,6 +9023,7 @@ conformance!(
 );
 
 async fn managed_creation_rejects_changes_and_rolls_back(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     use engram_core::types::managed_create::digest;
     let ws = managed_creation_ws(SessionId::new());
     let original = ws.managed_creation.clone().unwrap();
@@ -9126,6 +9128,7 @@ conformance!(
 );
 
 async fn managed_creation_race_parent_and_late_rollback(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     use engram_core::types::{managed_create::digest, mcp_policy::WriteEligibility, oauth::*};
     let parent = SessionId::new();
     mcp_write_policy_create(ctx, parent, None, WriteEligibility::ReadOnly).await;
@@ -9211,6 +9214,7 @@ conformance!(
 );
 
 async fn managed_creation_denies_stale_session(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     let ws = managed_creation_ws(SessionId::new());
     let identity = ws.managed_creation.as_ref().unwrap().identity.clone();
     ctx.meta
@@ -9238,6 +9242,7 @@ conformance!(
 );
 
 async fn managed_creation_held_retry_denies_requeued_epoch(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     let ws = managed_creation_ws(SessionId::new());
     let frozen = ws.managed_creation.clone().unwrap();
     let id = ws.session_id;
@@ -9355,7 +9360,7 @@ fn managed_boot_request(
                     binding_epoch: 1,
                 },
                 operator_generation: 1,
-                operator_identity: engram_core::types::managed_create::digest(b"operator"),
+                operator_identity: engram_testkit::operator::candidate().identity().unwrap(),
                 binding_hash: None,
             },
             boot_attempt: format!("boot-{}", ws.session_id),
@@ -9382,6 +9387,7 @@ fn managed_boot_request(
     }
 }
 async fn managed_boot_claim_is_atomic_and_exact(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     use engram_core::types::managed_boot::*;
     let ws = managed_creation_ws(SessionId::new());
     let host = HostId::new();
@@ -9398,6 +9404,7 @@ async fn managed_boot_claim_is_atomic_and_exact(ctx: &Ctx) {
         Some(false)
     );
     let request = managed_boot_request(&ws, host);
+    managed_operator_gate_fixture(ctx, &request.key, false).await;
     assert!(ctx.meta.claim_managed_boot(request.clone()).await.is_err());
     managed_operator_gate_fixture(ctx, &request.key, true).await;
     for field in ["image", "cpu", "memory"] {
@@ -9499,6 +9506,7 @@ async fn managed_boot_prepared_fixture(
     engram_core::types::managed_boot::ManagedBootRecord,
 ) {
     use engram_core::types::{managed_boot::*, managed_create::digest};
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     let ws = managed_creation_ws(SessionId::new());
     let host = HostId::new();
     ctx.meta
@@ -9967,6 +9975,7 @@ conformance!(
 );
 
 async fn managed_boot_initial_prompt_is_atomic(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     use engram_core::{
         traits::metadata::ManagedInitialPrompt,
         types::outbox::{OutboxKind, OutboxRow},
@@ -10344,4 +10353,740 @@ async fn managed_boot_ingestion_is_serialized_with_interruption(ctx: &Ctx) {
 conformance!(
     t_managed_boot_ingestion_is_serialized_with_interruption,
     super::managed_boot_ingestion_is_serialized_with_interruption
+);
+
+fn operator_candidate() -> engram_core::types::managed_operator::OperatorCandidate {
+    use engram_core::types::managed_operator::*;
+    let d = engram_core::types::managed_create::digest(b"operator fixture");
+    OperatorCandidate { version:1, deployment_identity:d.clone(),network_identity:d.clone(),trust_identity:d.clone(),ca_content_digests:[("fixture-root".into(),d.clone())].into(),zones:[("unused-zone".into(),OperatorZone { revision:"1".into(),worker_digest:d,authorities:vec!["api.example".into(),"unused.example:8443".into()],aliases:vec!["alias.example".into()],configuration:serde_json::json!({"id":"unused-zone","revision":"1","authorities":["api.example","unused.example:8443"],"aliases":["alias.example"],"mode":"public","cidrs":[],"denyCidrs":["127.0.0.0/8"]}) })].into() }
+}
+async fn operator_stage_retry_publish(ctx: &Ctx) {
+    let candidate = operator_candidate();
+    assert!(
+        !ctx.meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    let staged = ctx
+        .meta
+        .stage_operator_publication(None, candidate.clone())
+        .await
+        .unwrap();
+    assert!(!staged.admission_open);
+    assert_eq!(
+        staged,
+        ctx.meta
+            .stage_operator_publication(None, candidate.clone())
+            .await
+            .unwrap()
+    );
+    let mut wrong = candidate.clone();
+    wrong.network_identity = engram_core::types::managed_create::digest(b"different network");
+    assert!(ctx
+        .meta
+        .stage_operator_publication(None, wrong)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .is_err());
+    assert_eq!(staged, ctx.meta.read_operator_publication().await.unwrap());
+    let g = staged.pending.unwrap();
+    assert_eq!(
+        g.candidate.hosts().unwrap(),
+        ["alias.example", "api.example", "unused.example"]
+    );
+    let published = ctx.meta.publish_operator_generation(&g).await.unwrap();
+    assert!(published.admission_open);
+    assert_eq!(
+        published,
+        ctx.meta
+            .stage_operator_publication(None, candidate)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        published,
+        ctx.meta.publish_operator_generation(&g).await.unwrap()
+    );
+}
+conformance!(
+    t_operator_stage_retry_publish,
+    super::operator_stage_retry_publish
+);
+
+async fn operator_all_sessions_retired_and_dormant(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let (owned, row) = managed_boot_prepared_fixture(ctx).await;
+    let held = managed_creation_ws(SessionId::new());
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    let next = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap();
+    let g = next.pending.unwrap();
+    assert!(
+        !ctx.meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(managed_creation_ws(SessionId::new()), &[], 0)
+        .await
+        .is_err());
+    // Lost reservation replies still reconcile while fresh admission is closed.
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    let mut ids = vec![held.session_id, owned.session_id];
+    ids.sort();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 1).await.unwrap(),
+        ids[..1]
+    );
+    assert_eq!(
+        ctx.meta
+            .list_operator_participants(Some(ids[0]), 1)
+            .await
+            .unwrap(),
+        ids[1..]
+    );
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        ids
+    );
+    let dormant = ctx
+        .meta
+        .retain_operator_participant(&g, held.session_id)
+        .await
+        .unwrap();
+    assert!(dormant.dormant());
+    assert!(dormant.policy.denies("unused.example"));
+    assert!(dormant.policy.denies("tools.example"));
+    ctx.meta
+        .record_operator_readiness(&g, &dormant, OperatorReadiness::NeverAllocated)
+        .await
+        .unwrap();
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, owned.session_id)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    // A permanent retirement can predate the candidate expansion. It proves
+    // nonrunning only; the next-boot union is the newer durable policy above.
+    let receipt = ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"retired source"),
+    };
+    // Even before the prepared reply is stored, the full registered source is immutable.
+    let mut claimed = p.clone();
+    claimed.boot.as_mut().unwrap().2 = None;
+    let mut different_source = receipt.clone();
+    different_source
+        .prepared
+        .request
+        .sandbox_spec_json
+        .push(' ');
+    different_source.prepared.validate().unwrap();
+    assert!(OperatorReadiness::Retired(Box::new(different_source))
+        .validate(&g, &claimed)
+        .is_err());
+    let mut wrong = receipt.clone();
+    wrong.prepared.host_incarnation = "other-incarnation".into();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Retired(Box::new(wrong)))
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(
+            &g,
+            &p,
+            OperatorReadiness::Retired(Box::new(receipt.clone())),
+        )
+        .await
+        .unwrap();
+    // A boot transition after the observation invalidates the exact snapshot.
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            ManagedBootAdvance::Retired(Box::new(receipt.clone())),
+        )
+        .await
+        .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let fresh = ctx
+        .meta
+        .retain_operator_participant(&g, owned.session_id)
+        .await
+        .unwrap();
+    ctx.meta
+        .record_operator_readiness(&g, &fresh, OperatorReadiness::Retired(Box::new(receipt)))
+        .await
+        .unwrap();
+    let published = ctx.meta.publish_operator_generation(&g).await.unwrap();
+    assert!(published.admission_open);
+    // Publication does not authorize the retired old-generation guest to restart.
+    assert_eq!(
+        ctx.meta.managed_boot_open(owned.session_id).await.unwrap(),
+        Some(false)
+    );
+    assert!(ctx.meta.claim_managed_boot(row.request).await.is_err());
+    let retained: serde_json::Value = serde_json::from_str(
+        &ctx.meta
+            .get_session_integration_policy(owned.session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(retained["managed_deny"]["hosts"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("tools.example")));
+}
+conformance!(
+    t_operator_all_sessions_retired_and_dormant,
+    super::operator_all_sessions_retired_and_dormant
+);
+
+async fn operator_stage_races_registered_claim(ctx: &Ctx) {
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "claim-race", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let request = managed_boot_request(&ws, host);
+    let (staged, claim) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.claim_managed_boot(request.clone())
+    );
+    let g = staged.unwrap().pending.unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![ws.session_id]
+    );
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, ws.session_id)
+        .await
+        .unwrap();
+    assert_eq!(p.boot.is_some(), claim.is_ok());
+    assert_eq!(p.dormant(), claim.is_err());
+    assert!(ctx.meta.claim_managed_boot(request).await.is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_registered_claim,
+    super::operator_stage_races_registered_claim
+);
+
+async fn operator_stage_races_start_and_terminal_owner(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let intent = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"operator race start"),
+    };
+    let (staged, issued) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(intent.clone())
+        )
+    );
+    let g = staged.unwrap().pending.unwrap();
+    if let Ok(issued) = issued {
+        assert!(ctx
+            .meta
+            .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(intent))
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    // A terminal SQL label cannot remove the physical owner from the scan.
+    ctx.meta
+        .transition_session(
+            key.creation.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![key.creation.session_id]
+    );
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, key.creation.session_id)
+        .await
+        .unwrap();
+    assert!(!p.dormant());
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_start_and_terminal_owner,
+    super::operator_stage_races_start_and_terminal_owner
+);
+
+async fn operator_stage_races_started(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let start = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"delayed started"),
+    };
+    let issued = ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone()),
+        )
+        .await
+        .unwrap();
+    let (stage, started) = tokio::join!(
+        ctx.meta
+            .stage_operator_publication(Some(1), operator_candidate()),
+        ctx.meta.advance_managed_boot(
+            key,
+            issued.revision,
+            ManagedBootAdvance::Started(start.clone())
+        )
+    );
+    let g = stage.unwrap().pending.unwrap();
+    let current = ctx.meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(
+        current.phase,
+        if started.is_ok() {
+            ManagedBootPhase::Started
+        } else {
+            ManagedBootPhase::StartIssued
+        }
+    );
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![key.creation.session_id]
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(ctx
+        .meta
+        .advance_managed_boot(key, current.revision, ManagedBootAdvance::Started(start))
+        .await
+        .is_err());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_stage_races_started,
+    super::operator_stage_races_started
+);
+
+async fn operator_readiness_invalidates_policy_and_recovers_restart(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_boot::*, managed_create::digest, managed_deny::*, managed_operator::*,
+    };
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let mut candidate = engram_testkit::operator::candidate();
+    candidate.network_identity = digest(b"same hosts new route");
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let sid = row.request.key.creation.session_id;
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(p.policy.revision, 2);
+    assert_eq!(
+        ctx.meta
+            .retain_operator_participant(&g, sid)
+            .await
+            .unwrap()
+            .policy,
+        p.policy,
+        "restart/retry keeps one durable required revision"
+    );
+    let retired = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy,
+        receipt_id: digest(b"permanent retirement"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, retired.clone())
+        .await
+        .unwrap();
+    let expanded =
+        ManagedDenyPolicy::new(3, ["tools.example".into(), "orphan.example".into()]).unwrap();
+    let raw = serde_json::json!({"managed_deny":expanded,"observes":[]}).to_string();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ctx.meta.bind_session_integration_policy(sid, &raw),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let fresh = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(fresh.policy, expanded);
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, retired.clone())
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(&g, &fresh, retired)
+        .await
+        .unwrap();
+    if let Some(db) = &ctx._pg {
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.read_operator_publication().await.unwrap().pending,
+            Some(g.clone())
+        );
+        assert!(
+            reopened
+                .publish_operator_generation(&g)
+                .await
+                .unwrap()
+                .admission_open
+        );
+    } else {
+        assert!(
+            ctx.meta
+                .publish_operator_generation(&g)
+                .await
+                .unwrap()
+                .admission_open
+        );
+    }
+    assert!(
+        ctx.meta
+            .stage_operator_publication(Some(1), candidate)
+            .await
+            .unwrap()
+            .admission_open,
+        "exact retry after restart returns original publication"
+    );
+}
+conformance!(
+    t_operator_readiness_invalidates_policy_and_recovers_restart,
+    super::operator_readiness_invalidates_policy_and_recovers_restart
+);
+
+async fn operator_new_legacy_registration_requires_complete_published_set(ctx: &Ctx) {
+    use engram_core::types::managed_deny::ManagedDenyPolicy;
+    let candidate = operator_candidate();
+    let staged = ctx
+        .meta
+        .stage_operator_publication(None, candidate.clone())
+        .await
+        .unwrap();
+    ctx.meta
+        .publish_operator_generation(&staged.pending.unwrap())
+        .await
+        .unwrap();
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/operator:latest"))
+        .await
+        .unwrap();
+    let incomplete = ManagedDenyPolicy::new(1, ["api.example".into()]).unwrap();
+    assert!(ctx
+        .meta
+        .bind_session_integration_policy(
+            sid,
+            &serde_json::json!({"managed_deny":incomplete}).to_string()
+        )
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .list_operator_participants(None, 64)
+        .await
+        .unwrap()
+        .is_empty());
+    let complete = ManagedDenyPolicy::new(1, candidate.hosts().unwrap()).unwrap();
+    let raw = serde_json::json!({"managed_deny":complete}).to_string();
+    ctx.meta
+        .bind_session_integration_policy(sid, &raw)
+        .await
+        .unwrap();
+    let second = ctx
+        .meta
+        .create_session(spec("test.invalid/operator:latest"))
+        .await
+        .unwrap();
+    ctx.meta
+        .stage_operator_publication(Some(1), candidate)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .bind_session_integration_policy(second, &raw)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![sid]
+    );
+}
+conformance!(
+    t_operator_new_legacy_registration_requires_complete_published_set,
+    super::operator_new_legacy_registration_requires_complete_published_set
+);
+
+async fn operator_placement_change_invalidates_readiness(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let sid = row.request.key.creation.session_id;
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    let proof = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy,
+        receipt_id: digest(b"permanent source"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, proof.clone())
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, proof.clone())
+        .await
+        .is_err());
+    let next = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(next.target().unwrap(), p.target().unwrap());
+    assert_ne!(next, p);
+    ctx.meta
+        .record_operator_readiness(&g, &next, proof)
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+}
+conformance!(
+    t_operator_placement_change_invalidates_readiness,
+    super::operator_placement_change_invalidates_readiness
+);
+
+async fn operator_captured_source_requires_exact_destroyed_owner(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_operator::*};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let sid = row.request.key.creation.session_id;
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    let request = ManagedCaptureRequest {
+        key: row.request.key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: row.request.cold.image,
+        kernel_sha256: row.request.cold.kernel_sha256,
+        aux_ro_drives: row.request.cold.aux_ro_drives,
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    let mut wrong = authority.clone();
+    wrong.host_incarnation = "other-owner".into();
+    wrong.record_digest = wrong.digest().unwrap();
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Captured(Box::new(wrong)))
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Captured(Box::new(authority)))
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+    // Publication consumes destruction evidence; it does not invent a pinned recovery artifact.
+    assert!(ctx.meta.reserve_managed_capture(&request).await.is_err());
+}
+conformance!(
+    t_operator_captured_source_requires_exact_destroyed_owner,
+    super::operator_captured_source_requires_exact_destroyed_owner
+);
+
+async fn operator_legacy_idle_owner_needs_exact_applied_network_receipt(ctx: &Ctx) {
+    use engram_core::types::{managed_deny::*, managed_operator::*};
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    let hid = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(hid, "legacy-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = ctx
+        .meta
+        .transition_session_created(sid, sandbox)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(sid, SessionState::Idle, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        host_id: hid,
+        sandbox_id: sandbox,
+        binding_epoch: epoch,
+    };
+    ctx.meta
+        .retain_managed_deny(
+            &target,
+            &ManagedDenyPolicy::new(1, ["history.example".into()]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let g = ctx
+        .meta
+        .stage_operator_publication(None, operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert_eq!(p.status, "idle");
+    assert!(p.boot.is_none());
+    let receipt = ManagedAppliedState::new(
+        ManagedPolicyContext {
+            target: target.clone(),
+            operator_generation: g.generation,
+            operator_identity: g.identity.clone(),
+            binding_hash: None,
+        },
+        p.policy.clone(),
+        "host-incarnation".into(),
+        "proxy-incarnation".into(),
+        Some(ManagedNetworkProof {
+            target,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            network_identity: engram_core::types::managed_create::digest(b"actual network proof"),
+        }),
+    )
+    .unwrap();
+    let mut wrong = receipt.clone();
+    wrong.context.operator_generation += 1;
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(wrong)))
+        .await
+        .is_err());
+    let mut missing = receipt.clone();
+    missing.network_proof = None;
+    assert!(ctx
+        .meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(missing)))
+        .await
+        .is_err());
+    ctx.meta
+        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(receipt)))
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .publish_operator_generation(&g)
+            .await
+            .unwrap()
+            .admission_open
+    );
+}
+conformance!(
+    t_operator_legacy_idle_owner_needs_exact_applied_network_receipt,
+    super::operator_legacy_idle_owner_needs_exact_applied_network_receipt
 );

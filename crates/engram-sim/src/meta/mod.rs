@@ -42,6 +42,7 @@ use engram_core::traits::{Clock, Entropy};
 use engram_core::MetaError;
 use parking_lot::Mutex;
 
+mod managed_operator;
 mod mcp_policy;
 mod store_impl;
 
@@ -294,6 +295,14 @@ pub struct SimDb {
         std::collections::BTreeMap<SessionId, engram_core::types::managed_boot::ManagedBootRecord>,
     /// Actual published gate state; only explicit test fixtures seed this before a publisher exists.
     pub managed_operator_gate: Option<(u64, String, bool)>,
+    pub operator_publication: engram_core::types::managed_operator::OperatorPublication,
+    pub operator_readiness: std::collections::BTreeMap<
+        (u64, SessionId),
+        (
+            engram_core::types::managed_operator::OperatorParticipant,
+            Option<engram_core::types::managed_operator::OperatorReadiness>,
+        ),
+    >,
     pub managed_interrupted_floors: std::collections::BTreeMap<SessionId, i64>,
     pub managed_interrupted: std::collections::BTreeSet<(SessionId, u64)>,
     pub managed_creations:

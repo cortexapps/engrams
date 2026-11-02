@@ -16,6 +16,7 @@ import {
   assertOriginalArguments,
   freezeRequestContext,
   lockHumanSession,
+  lockSessionChain,
   assertLocalReviewCurrent,
   reviewContext,
   requestPolicyContext,
@@ -23,7 +24,6 @@ import {
 } from "./journal-review.ts";
 import type { RequestPolicyContext } from "./session-policy.ts";
 import type { ResolvedBoundTool } from "./session-resolver.ts";
-import { restoreBindingSnapshot } from "./binding-store.ts";
 import { canonicalDigest, canonicalJson } from "./hash.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import { validateMcpGrant, type McpToolGrant, type McpExecutionState } from "./types.ts";
@@ -66,7 +66,7 @@ function unknownBlocks(now: Date) {
 }
 async function unknown(
   tx: Tx | Db,
-  sessionId: string,
+  sessionIds: string[],
   connectionId: string,
   now: Date,
 ): Promise<boolean> {
@@ -76,7 +76,7 @@ async function unknown(
     .leftJoin(resolution, eq(resolution.executionId, execution.id))
     .where(
       and(
-        eq(execution.sessionId, sessionId),
+        inArray(execution.sessionId, sessionIds),
         eq(execution.connectionId, connectionId),
         eq(execution.classification, "write"),
         eq(execution.state, "outcome_unknown"),
@@ -85,6 +85,31 @@ async function unknown(
     )
     .limit(1);
   return rows.length > 0;
+}
+
+export class McpUnknownWrite extends Error {
+  constructor() {
+    super("unknown write outcome blocks this connection");
+  }
+}
+
+/** Only the chain revalidated under the runtime locks can extend the write restriction. */
+async function assertNoUnknownWrite(
+  tx: Tx,
+  call: Pick<typeof execution.$inferSelect, "classification"> & { connectionId: string },
+  authority: Awaited<ReturnType<typeof lockRuntimeAuthority>>,
+  now: Date,
+) {
+  if (
+    call.classification === "write" &&
+    (await unknown(
+      tx,
+      [authority.session.sessionId, ...authority.ancestors.map(({ session }) => session.sessionId)],
+      call.connectionId,
+      now,
+    ))
+  )
+    throw new McpUnknownWrite();
 }
 
 /** Internal runtime proof; no public or guest route accepts this value. The runtime obtains it
@@ -201,7 +226,13 @@ export function makeMcpJournal(db = getDb()) {
       return (await db.select().from(admission).where(eq(admission.executionId, id)))[0] ?? null;
     },
     hasUnknown(sessionId: string, connectionId: string, now: Date = new Date()) {
-      return unknown(db, sessionId, connectionId, now);
+      return unknown(db, [sessionId], connectionId, now);
+    },
+    async assertCurrent(call: typeof execution.$inferSelect, now: Date) {
+      return db.transaction(async (tx) => {
+        const authority = await lockRuntimeAuthority(tx, call, "share");
+        await assertNoUnknownWrite(tx, call, authority, now);
+      });
     },
     async create(input: McpCallInput, authorization: McpCallAuthorization, now: Date) {
       input = structuredClone(input);
@@ -281,30 +312,36 @@ export function makeMcpJournal(db = getDb()) {
         automationGrantHash,
       });
       return db.transaction(async (tx) => {
-        const [session] = await tx
-          .select()
-          .from(taskSession)
-          .where(
-            and(eq(taskSession.sessionId, input.sessionId), eq(taskSession.taskId, input.taskId)),
-          )
-          .for("share");
-        if (!session?.mcpBindingEnvelope) throw new Error("stored binding unavailable");
-        const snapshot = restoreBindingSnapshot(
-          session.mcpBindingEnvelope,
-          session.integrationConnections ?? [],
+        async function existing() {
+          const [row] = await tx
+            .select()
+            .from(execution)
+            .where(
+              and(
+                eq(execution.sessionId, input.sessionId),
+                eq(execution.toolCallId, input.toolCallId),
+              ),
+            );
+          if (row && row.requestDigest !== requestDigest) throw new Error("call digest mismatch");
+          return row;
+        }
+        // Duplicates retain the original request and outcome even after authority changes.
+        const prior = await existing();
+        if (prior) return prior;
+        const authority = await lockSessionChain(tx, input.sessionId);
+        if (authority.session.taskId !== input.taskId)
+          throw new Error("stored binding unavailable");
+        await assertLocalReviewCurrent(
+          tx,
+          { ...storedInput, requestContext: context },
+          authority.session,
+          authority.ancestors,
+          "update",
         );
-        if (
-          snapshot.bindingHash !== input.bindingHash ||
-          canonicalDigest(snapshot.profilePublication ?? null) !==
-            canonicalDigest(resolvedTool.profilePublication ?? null) ||
-          BigInt(snapshot.bindingEpoch) !== policy.acceptedPolicyRef.bindingEpoch ||
-          !snapshot.immutableBindings.some(
-            (binding) => canonicalDigest(binding) === canonicalDigest(bound),
-          ) ||
-          canonicalDigest(snapshot.ancestorAuthorityRefs) !==
-            canonicalDigest(resolvedTool.ancestorAuthorityRefs)
-        )
-          throw new Error("stale request binding");
+        // A concurrent acceptance can commit while this request waits for the connection.
+        const winner = await existing();
+        if (winner) return winner;
+        await assertNoUnknownWrite(tx, input, authority, now);
         await tx
           .insert(execution)
           .values({
@@ -562,7 +599,7 @@ export function makeMcpJournal(db = getDb()) {
           const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
           if (!identity) throw new Error("call not found");
           // Scope -> principal -> tasks/sessions -> profiles -> sorted connections -> call.
-          await lockRuntimeAuthority(tx, identity);
+          const authority = await lockRuntimeAuthority(tx, identity);
           const [live] = await tx
             .select()
             .from(connection)
@@ -618,11 +655,7 @@ export function makeMcpJournal(db = getDb()) {
             !reviewedTool.enabled
           )
             throw new Error("tool is not approved for this operation");
-          if (
-            call.classification === "write" &&
-            (await unknown(tx, call.sessionId, call.connectionId, now))
-          )
-            throw new Error("unknown write outcome blocks this connection");
+          await assertNoUnknownWrite(tx, call, authority, now);
           const [lease] = await tx
             .select()
             .from(admission)
@@ -715,7 +748,7 @@ export function makeMcpJournal(db = getDb()) {
         await lockScope(tx, observed.deploymentId);
         const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
         if (!identity) throw new Error("call not found");
-        await lockRuntimeAuthority(tx, identity, "share");
+        const authority = await lockRuntimeAuthority(tx, identity, "share");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("share");
         const [lease] = await tx
           .select()
@@ -757,11 +790,7 @@ export function makeMcpJournal(db = getDb()) {
           )
             throw new Error("dispatch approval unavailable");
         }
-        if (
-          call.classification === "write" &&
-          (await unknown(tx, call.sessionId, call.connectionId, now))
-        )
-          throw new Error("unknown write outcome blocks this connection");
+        await assertNoUnknownWrite(tx, call, authority, now);
         return call;
       });
     },
