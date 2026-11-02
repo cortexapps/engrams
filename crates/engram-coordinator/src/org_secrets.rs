@@ -72,12 +72,17 @@ impl SecretStore for OrgSecretBackend {
         schema: &SecretSchema,
     ) -> Result<Option<String>, SecretError> {
         self.check_access(name, schema).await?;
-        let Some(sealed) = self
+        let sealed = self
             .meta
             .get_org_secret_sealed(name)
             .await
-            .map_err(|e| SecretError::Backend(Box::new(e)))?
-        else {
+            .map_err(|e| SecretError::Backend(Box::new(e)))?;
+        // A fresh name can be reserved and published after the first check.
+        // Purpose is permanent, and these are current reads from the same
+        // store: any MCP payload observed above must have a reservation here.
+        // Check absent payloads too, before allowing a deployment fallback.
+        self.check_access(name, schema).await?;
+        let Some(sealed) = sealed else {
             return Ok(None);
         };
         let cred = to_sealed_cred(&sealed)?;
