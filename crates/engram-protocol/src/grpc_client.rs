@@ -1686,6 +1686,28 @@ impl HostClient for GrpcHostClient {
         Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        request
+            .validate()
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_cold_assets(crate::grpc::ReadManagedColdAssetsRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let receipt: engram_core::types::managed_assets::ManagedColdAssetsReceipt =
+            crate::managed_boot::decode(&response.payload_json)?;
+        receipt
+            .validate_for(&request)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        Ok(receipt)
+    }
     async fn capture_managed_boot(
         &self,
         request: engram_core::types::managed_boot::ManagedCaptureRequest,
