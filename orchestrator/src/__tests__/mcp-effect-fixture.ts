@@ -10,7 +10,7 @@ import { workerTls } from "../../../mcp-worker/test/fixtures/worker-tls.ts";
 import type { WorkerIdentity } from "../../../mcp-worker/src/contracts.ts";
 import { reviewFixture } from "./mcp-review-fixture.ts";
 import { makeProfileStore } from "../db/profiles.ts";
-import { user, taskSession, integrationConnection } from "../db/schema.ts";
+import { user, taskSession, integrationConnection, profile } from "../db/schema.ts";
 import { compileSessionBindings } from "../mcp/session-bindings.ts";
 import {
   bindingSnapshotColumns,
@@ -40,6 +40,7 @@ export async function effectFixture(
     eligibility?: string;
     published?: boolean;
     bindingEpoch?: number;
+    automationWrite?: boolean;
   } = {},
 ) {
   const tls = await workerTls("localhost");
@@ -96,6 +97,14 @@ export async function effectFixture(
     );
     await f.repository.setEnabled(current.id, 1, true, new Date());
     const profiles = makeProfileStore(f.db);
+    if (options.automationWrite !== undefined) {
+      for (const grant of f.authority.profileGrants)
+        grant.mcp.automationWrite = options.automationWrite;
+      await f.db
+        .update(profile)
+        .set({ integrationGrants: f.authority.profileGrants })
+        .where(eq(profile.id, f.profileId));
+    }
     await f.db.update(user).set({ role: "admin" }).where(eq(user.id, f.actorId));
     if (options.published !== false)
       await profiles.update(f.profileId, (await profiles.get(f.profileId))!, {
