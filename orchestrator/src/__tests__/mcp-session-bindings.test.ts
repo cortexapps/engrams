@@ -218,3 +218,39 @@ test("publication revision and publisher are frozen and cannot silently rebase a
     }),
   ).toThrow("publication");
 });
+
+test("complete operator publication denies unused zones and invalidates their changes", () => {
+  const authority = bindingAuthority();
+  authority.operatorPolicies.push({
+    ...authority.operatorPolicies[0]!,
+    zoneId: "internal",
+    authorities: ["unused.example.test", "unused.example.test:8443"],
+    aliases: ["unused-alias.example.test"],
+  });
+  const snapshot = compile(authority);
+  expect(snapshot.managedDenyPolicy.hosts).toEqual([
+    "alias.example.test",
+    "tools.example.test",
+    "unused-alias.example.test",
+    "unused.example.test",
+  ]);
+  authority.operatorPolicies[1]!.policyRevision = "2";
+  expect(checkBindingCurrent({ snapshot, liveAuthority: authority }).current).toBe(false);
+});
+
+test("binding retains exact publication and distinct infrastructure trust identity", () => {
+  const authority = bindingAuthority();
+  const publication = {
+    generation: 1,
+    identity: `sha256:${"b".repeat(64)}`,
+    deploymentIdentity: `sha256:${"c".repeat(64)}`,
+    networkIdentity: `sha256:${"d".repeat(64)}`,
+    trustIdentity: `sha256:${"e".repeat(64)}`,
+    caContentDigests: { control: `sha256:${"f".repeat(64)}` },
+  };
+  Object.assign(authority.operatorPolicies[0]!, { publication });
+  const snapshot = compile(authority);
+  expect(snapshot.immutableBindings[0]!.operatorPolicy).toMatchObject({ publication });
+  publication.caContentDigests.control = `sha256:${"0".repeat(64)}`;
+  expect(checkBindingCurrent({ snapshot, liveAuthority: authority }).current).toBe(false);
+});

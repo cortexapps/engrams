@@ -267,3 +267,46 @@ test("MCP requests persist the exact event reference before cursor success", asy
     }),
   );
 });
+
+test("authenticated MCP cancel event reaches durable cancellation before cursor success", async () => {
+  const pending = pendingRecorder(),
+    requests: unknown[] = [];
+  let fail = true;
+  const consumer = makeToolConsumer({
+    registry: registryFixture(),
+    pendingCalls: pending.store,
+    now: () => new Date(0),
+    startWorkflow: async () => {
+      throw Error("generic execution used");
+    },
+    cancelMcpRequest: async (input: unknown) => {
+      requests.push(input);
+      if (fail) throw Error("unavailable");
+    },
+  });
+  const event = {
+    idx: 8n,
+    kind: "tool_call_cancel_requested",
+    payloadJson: JSON.stringify({
+      run_id: "run-1",
+      tool_call_id: "call-1",
+      name: "mcp_bound",
+    }),
+  };
+  expect(consumer.interestedIn(event.kind)).toBe(true);
+  await expect(consumer.handle(event, { sessionId: "s1" })).rejects.toThrow(
+    "MCP cancellation unavailable",
+  );
+  fail = false;
+  await consumer.handle(event, { sessionId: "s1" });
+  expect(requests).toEqual(
+    Array(2).fill({
+      sessionId: "s1",
+      runId: "run-1",
+      toolCallId: "call-1",
+      modelToolName: "mcp_bound",
+    }),
+  );
+  expect(pending.completed).toEqual([]);
+  expect(pending.submitted).toEqual([]);
+});

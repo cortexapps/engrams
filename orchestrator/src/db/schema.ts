@@ -177,6 +177,10 @@ export const taskSession = pgTable(
     // Candidate metadata only. The host must separately acknowledge deny enforcement.
     mcpBindingEnvelope:
       jsonb("mcp_binding_envelope").$type<import("../mcp/binding-store.ts").McpBindingEnvelope>(),
+    mcpManagedLifecycle:
+      jsonb("mcp_managed_lifecycle").$type<
+        import("../mcp/managed-lifecycle.ts").ManagedLifecycle
+      >(),
     // ADR 0109: content-hash of the compiled authorization snapshot
     // (profileId + grants + connections). The broker emits it as the
     // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
@@ -2421,6 +2425,10 @@ export const mcpDiscoveryAdmission = pgTable(
       .$type<import("../../../mcp-worker/src/contracts.ts").WorkerIdentity>()
       .notNull(),
     destination: text("destination").notNull(),
+    operation: jsonb("operation")
+      .$type<import("../mcp/discovery-admission.ts").McpAdministrativeOperation>()
+      .notNull()
+      .default({ kind: "discover" }),
     requestDigest: text("request_digest").notNull(),
     statusDigest: text("status_digest").notNull(),
     state: text("state").$type<"reserved" | "dispatched" | "finished">().notNull(),
@@ -2431,6 +2439,15 @@ export const mcpDiscoveryAdmission = pgTable(
     uniqueIndex("mcp_discovery_admission_intent_idx").on(t.intentId),
     index("mcp_discovery_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
     index("mcp_discovery_admission_connection_idx").on(t.connectionId, t.state, t.expiresAt),
+    check(
+      "mcp_administrative_operation_check",
+      sql`coalesce(
+      ${t.operation} = '{"kind":"discover"}'::jsonb OR (
+        ${t.operation}->>'kind' = 'validateSchemas' AND
+        ${t.operation}->>'documentsDigest' ~ '^sha256:[0-9a-f]{64}$' AND
+        ${t.operation} - 'kind' - 'documentsDigest' = '{}'::jsonb AND ${t.destination} = ''
+      ), false)`,
+    ),
     check(
       "mcp_discovery_admission_state_check",
       sql`${t.state} IN ('reserved','dispatched','finished')`,

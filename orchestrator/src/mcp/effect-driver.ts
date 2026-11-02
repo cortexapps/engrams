@@ -183,7 +183,7 @@ export async function persistVerifiedOutcome(
  * Task 6 supplies operator/host enforcement and trusted zone TLS configuration. */
 export function makeMcpEffectDriver(deps: {
   db?: ReturnType<typeof getDb>;
-  deploymentId: string;
+  deploymentId: string | ((zoneId: string) => string);
   control: CredentialControlClient;
   policy: SessionPolicyControlClient;
   resolver: SessionBindingResolver;
@@ -198,6 +198,14 @@ export function makeMcpEffectDriver(deps: {
   function enabled(resolved: ResolvedBoundTool, signal?: AbortSignal) {
     signal?.throwIfAborted();
     if (!deps.enabled?.(resolved.binding.config.zone)) throw new McpRequestDenied("disabled");
+  }
+  function deployment(resolved: ResolvedBoundTool): string {
+    const id =
+      typeof deps.deploymentId === "function"
+        ? deps.deploymentId(resolved.binding.config.zone)
+        : deps.deploymentId;
+    if (!id || id.length > 256) throw Error("MCP worker deployment unavailable");
+    return id;
   }
   async function lookup(input: McpToolRequest) {
     const [call] = await db
@@ -296,7 +304,7 @@ export function makeMcpEffectDriver(deps: {
       },
     ];
     for (let i = 0; i < operations.length; i++) {
-      if ((await journal.admitSchema(call.id, deps.deploymentId, deps.now())) === "queued")
+      if ((await journal.admitSchema(call.id, deployment(resolved), deps.now())) === "queued")
         return false;
       const lease = (await journal.getAdmission(call.id))!;
       const worker = client(resolved, signal);
@@ -476,7 +484,7 @@ export function makeMcpEffectDriver(deps: {
           );
         }
         if (call.state === "waiting_approval") {
-          await journal.requestApproval(id, deps.deploymentId, deps.now());
+          await journal.requestApproval(id, deployment(resolved), deps.now());
           return (await journal.get(id))!;
         }
         await current(call, signal);
@@ -489,7 +497,7 @@ export function makeMcpEffectDriver(deps: {
         const status = fromJson(CredentialStatusSchema, connection.mcpCredential.status);
         if (status.context?.authorizationGeneration !== BigInt(call.authGeneration))
           throw Error("MCP credential authority changed");
-        if ((await journal.admit(id, deps.deploymentId, deps.now())) === "queued")
+        if ((await journal.admit(id, deployment(resolved), deps.now())) === "queued")
           return (await journal.get(id))!;
         const lease = (await journal.getAdmission(id))!;
         const worker = client(resolved, signal);

@@ -8,9 +8,27 @@ import { isServiceAccountEmail } from "../rpc/api-key.ts";
 import { lockAdmissionScope } from "./admission.ts";
 import { validateMcpConfig } from "./config.ts";
 import type { AdmittedCredentialOperation } from "./credential-broker.ts";
-import { canonicalDigest } from "./hash.ts";
+import { canonicalDigest, canonicalJson } from "./hash.ts";
+import { assertSchemaShape } from "./catalog.ts";
 import type { JournalTx } from "./journal-review.ts";
 
+export type McpAdministrativeOperation =
+  | { kind: "discover" }
+  | { kind: "validateSchemas"; documentsDigest: string };
+export interface McpSchemaReservation extends Omit<McpDiscoveryReservation, "destination"> {
+  documents: Record<string, unknown>[];
+}
+export interface AdmittedSchemaOperation {
+  identity: WorkerIdentity;
+  intent: Omit<WorkerIntent, "operationDigest">;
+  documents: Record<string, unknown>[];
+}
+function schemaOperation(documents: Record<string, unknown>[]): McpAdministrativeOperation {
+  if (documents.length > 384 || Buffer.byteLength(canonicalJson({ documents })) > 1024 * 1024)
+    throw Error("MCP schema limit");
+  for (const document of documents) assertSchemaShape(document);
+  return { kind: "validateSchemas", documentsDigest: canonicalDigest(documents) };
+}
 export interface McpDiscoveryReservation {
   requestId: string;
   actorId: string;
@@ -33,7 +51,7 @@ function intentFor(row: Row): Omit<WorkerIntent, "operationDigest"> {
     connectionRevision: row.configRevision,
     credentialIdentity: row.credentialIdentity,
     scope: { kind: "administration", requestId: row.requestId, actorId: row.actorId },
-    operation: "discover",
+    operation: row.operation.kind,
     destination: row.destination,
     requestDigest: row.requestDigest,
     expiresAt: row.expiresAt.getTime(),
@@ -42,7 +60,10 @@ function intentFor(row: Row): Omit<WorkerIntent, "operationDigest"> {
 }
 /** Uses existing human, connection and credential authority; no credential values are stored. */
 export function makeMcpDiscoveryAdmission(db = getDb()) {
-  async function live(tx: JournalTx, input: McpDiscoveryReservation) {
+  async function live(
+    tx: JournalTx,
+    input: McpDiscoveryReservation & { operation?: McpAdministrativeOperation },
+  ) {
     // Scope -> human -> connection -> discovery row. No lock survives a network operation.
     const [actor] = await tx.select().from(user).where(eq(user.id, input.actorId)).for("share");
     if (!actor || actor.role !== "admin" || actor.banned || isServiceAccountEmail(actor.email))
@@ -76,11 +97,13 @@ export function makeMcpDiscoveryAdmission(db = getDb()) {
       context.configRevision !== BigInt(input.configRevision) ||
       context.authorizationGeneration !== BigInt(input.authGeneration) ||
       context.credentialIdentity !== input.credentialIdentity ||
-      context.resource?.endpoint !== input.destination ||
+      context.resource?.endpoint !== config.endpoint ||
       context.resource.zoneId !== input.identity.zoneId ||
       context.policyDigest !== input.identity.policyDigest ||
       context.policyRevision !== input.identity.policyRevision ||
-      config.endpoint !== input.destination ||
+      (input.operation?.kind === "validateSchemas"
+        ? input.destination !== ""
+        : config.endpoint !== input.destination) ||
       config.zone !== input.identity.zoneId ||
       input.identity.protocol !== 1 ||
       !input.identity.bootId ||
@@ -125,68 +148,111 @@ export function makeMcpDiscoveryAdmission(db = getDb()) {
         .where(eq(admission.requestId, requestId));
     });
   }
-  return {
-    async reserve(
-      input: McpDiscoveryReservation,
-      now: Date,
-    ): Promise<Omit<WorkerIntent, "operationDigest">> {
-      input = structuredClone(input);
-      now = new Date(now.getTime());
-      if (
-        ![
-          input.requestId,
-          input.actorId,
-          input.connectionId,
-          input.deploymentId,
-          input.credentialIdentity,
-        ].every(Boolean) ||
-        !Number.isSafeInteger(input.configRevision) ||
-        input.configRevision < 1 ||
-        !Number.isSafeInteger(input.authGeneration) ||
-        input.authGeneration < 1 ||
-        !Number.isFinite(now.getTime())
-      )
-        throw new Error("invalid discovery request");
-      return db.transaction(async (tx) => {
-        await lockAdmissionScope(tx, input.deploymentId);
-        const statusDigest = await live(tx, input);
-        const [prior] = await tx
-          .select()
-          .from(admission)
-          .where(eq(admission.requestId, input.requestId));
-        if (prior) throw new Error("discovery request already consumed");
-        // Expired rows retain their identity forever; only their fixed lease stops owning capacity.
-        const active = await tx
-          .select()
-          .from(admission)
-          .where(
-            and(
-              inArray(admission.state, ["reserved", "dispatched"]),
-              gt(admission.expiresAt, now),
-              or(
-                eq(admission.deploymentId, input.deploymentId),
-                eq(admission.connectionId, input.connectionId),
-              ),
+  async function reserve(
+    input: McpDiscoveryReservation & { operation: McpAdministrativeOperation },
+    now: Date,
+  ): Promise<Omit<WorkerIntent, "operationDigest">> {
+    input = structuredClone(input);
+    now = new Date(now.getTime());
+    if (
+      ![
+        input.requestId,
+        input.actorId,
+        input.connectionId,
+        input.deploymentId,
+        input.credentialIdentity,
+      ].every(Boolean) ||
+      !Number.isSafeInteger(input.configRevision) ||
+      input.configRevision < 1 ||
+      !Number.isSafeInteger(input.authGeneration) ||
+      input.authGeneration < 1 ||
+      !Number.isFinite(now.getTime())
+    )
+      throw new Error("invalid discovery request");
+    return db.transaction(async (tx) => {
+      await lockAdmissionScope(tx, input.deploymentId);
+      const statusDigest = await live(tx, input);
+      const [prior] = await tx
+        .select()
+        .from(admission)
+        .where(eq(admission.requestId, input.requestId));
+      if (prior) throw new Error("discovery request already consumed");
+      // Expired rows retain their identity forever; only their fixed lease stops owning capacity.
+      const active = await tx
+        .select()
+        .from(admission)
+        .where(
+          and(
+            inArray(admission.state, ["reserved", "dispatched"]),
+            gt(admission.expiresAt, now),
+            or(
+              eq(admission.deploymentId, input.deploymentId),
+              eq(admission.connectionId, input.connectionId),
             ),
-          );
-        if (
-          active.filter((row) => row.deploymentId === input.deploymentId).length >= 4 ||
-          active.some((row) => row.connectionId === input.connectionId)
-        )
-          throw new Error("discovery capacity unavailable");
-        const row: Row = {
-          ...input,
-          intentId: crypto.randomUUID(),
-          statusDigest,
-          requestDigest: canonicalDigest({ ...input, operation: "discover", statusDigest }),
-          state: "reserved",
-          createdAt: now,
-          expiresAt: new Date(now.getTime() + 30_000),
-        };
-        await tx.insert(admission).values(row);
-        return intentFor(row);
-      });
+          ),
+        );
+      if (
+        active.filter(
+          (row) =>
+            row.operation.kind === input.operation.kind && row.deploymentId === input.deploymentId,
+        ).length >= 4 ||
+        (input.operation.kind === "discover" &&
+          active.some(
+            (row) => row.operation.kind === "discover" && row.connectionId === input.connectionId,
+          ))
+      )
+        throw new Error("discovery capacity unavailable");
+      const row: Row = {
+        ...input,
+        intentId: crypto.randomUUID(),
+        statusDigest,
+        requestDigest: canonicalDigest({ ...input, statusDigest }),
+        state: "reserved",
+        createdAt: now,
+        expiresAt: new Date(now.getTime() + 30_000),
+      };
+      await tx.insert(admission).values(row);
+      return intentFor(row);
+    });
+  }
+  async function assertSchemaAdmitted(operation: AdmittedSchemaOperation, now: Date) {
+    operation = structuredClone(operation);
+    const purpose = schemaOperation(operation.documents),
+      scope = operation.intent.scope;
+    if (scope.kind !== "administration") throw Error("MCP schema scope required");
+    const [observed] = await db
+      .select()
+      .from(admission)
+      .where(eq(admission.requestId, scope.requestId));
+    if (!observed) throw Error("MCP schema admission unavailable");
+    await db.transaction(async (tx) => {
+      await lockAdmissionScope(tx, observed.deploymentId);
+      const statusDigest = await live(tx, observed);
+      const [row] = await tx
+        .select()
+        .from(admission)
+        .where(eq(admission.requestId, scope.requestId))
+        .for("share");
+      if (
+        !row ||
+        row.state !== "dispatched" ||
+        row.expiresAt <= now ||
+        row.statusDigest !== statusDigest ||
+        canonicalDigest(row.operation) !== canonicalDigest(purpose) ||
+        canonicalDigest(operation.identity) !== canonicalDigest(row.identity) ||
+        canonicalDigest(operation.intent) !== canonicalDigest(intentFor(row))
+      )
+        throw Error("stale MCP schema admission");
+    });
+  }
+  return {
+    reserve: (input: McpDiscoveryReservation, now: Date) =>
+      reserve({ ...input, operation: { kind: "discover" } }, now),
+    reserveSchema: (input: McpSchemaReservation, now: Date) => {
+      const { documents, ...identity } = input;
+      return reserve({ ...identity, destination: "", operation: schemaOperation(documents) }, now);
     },
+    assertSchemaAdmitted,
     beginDispatch: (requestId: string, intentId: string, now: Date) =>
       locked(requestId, intentId, now, "dispatch"),
     finish: (requestId: string, intentId: string, now: Date) =>
@@ -212,6 +278,7 @@ export function makeMcpDiscoveryAdmission(db = getDb()) {
         if (
           !row ||
           row.state !== "dispatched" ||
+          row.operation.kind !== "discover" ||
           row.expiresAt <= now ||
           row.statusDigest !== statusDigest ||
           canonicalDigest(operation.identity) !== canonicalDigest(row.identity) ||

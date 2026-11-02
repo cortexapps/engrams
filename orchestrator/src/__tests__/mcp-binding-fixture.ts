@@ -1,5 +1,13 @@
 import { reviewCatalog } from "../mcp/catalog.ts";
 import type { ProfileIntegrationGrant } from "../db/schema.ts";
+export const operatorPublication = {
+  generation: 1,
+  identity: `sha256:${"b".repeat(64)}`,
+  deploymentIdentity: `sha256:${"c".repeat(64)}`,
+  networkIdentity: `sha256:${"d".repeat(64)}`,
+  trustIdentity: `sha256:${"e".repeat(64)}`,
+  caContentDigests: { control: `sha256:${"f".repeat(64)}` },
+};
 export const schema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
   $defs: { name: { type: "string" } },
@@ -53,6 +61,7 @@ export function bindingAuthority() {
     ],
     operatorPolicies: [
       {
+        publication: structuredClone(operatorPublication),
         zoneId: "public",
         policyRevision: "1",
         policyDigest: `sha256:${"a".repeat(64)}`,

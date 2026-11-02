@@ -23,6 +23,7 @@ const log = rootLog.child({ component: "tool-consumer" });
 export type ToolWorkflowStarter = (input: ToolExecInput, workflowId: string) => Promise<void>;
 
 export interface ToolConsumerDeps {
+  cancelMcpRequest?: (input: import("../mcp/recovery.ts").McpCancelRequest) => Promise<void>;
   /** Persist the exact request-event reference before the listener cursor advances. */
   startMcpRequest?: (input: import("../mcp/recovery.ts").McpRequestMarker) => Promise<void>;
   registry: ToolRegistry;
@@ -120,10 +121,48 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
     name: "tool-dispatch",
     appliesTo: async () => true,
     interestedIn: (kind) =>
+      kind === "tool_call_cancel_requested" ||
       kind === "tool_call_requested" ||
       kind === "tool_result_submitted" ||
       kind === "tool_call_completed",
     async handle(event, ctx) {
+      if (event.kind === "tool_call_cancel_requested") {
+        const payload: unknown = JSON.parse(event.payloadJson);
+        if (
+          !payload ||
+          typeof payload !== "object" ||
+          !("name" in payload) ||
+          typeof payload.name !== "string" ||
+          !payload.name.startsWith("mcp_")
+        )
+          return;
+        if (
+          !("run_id" in payload) ||
+          !("tool_call_id" in payload) ||
+          ![payload.name, payload.run_id, payload.tool_call_id].every(
+            (value) =>
+              typeof value === "string" &&
+              value.length > 0 &&
+              value.length <= 256 &&
+              !/[\x00-\x1f]/.test(value),
+          ) ||
+          typeof payload.run_id !== "string" ||
+          typeof payload.tool_call_id !== "string"
+        )
+          throw Error("MCP cancellation identity invalid");
+        try {
+          if (!deps.cancelMcpRequest) throw Error("unavailable");
+          await deps.cancelMcpRequest({
+            sessionId: ctx.sessionId,
+            runId: payload.run_id,
+            toolCallId: payload.tool_call_id,
+            modelToolName: payload.name,
+          });
+        } catch {
+          throw Error("MCP cancellation unavailable");
+        }
+        return;
+      }
       await bookkeepToolEvent(ctx.sessionId, event, deps);
       const requested = parseToolCallRequested(event);
       if (!requested) return;
@@ -209,6 +248,11 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
 export function makeProductionToolConsumer(): SessionConsumer {
   const pendingCalls = makePendingToolCallStore();
   return makeToolConsumer({
+    cancelMcpRequest: async (input) => {
+      const runtime = mcpRecovery();
+      if (!runtime) throw Error("MCP runtime unavailable");
+      await runtime.cancelRequest(input);
+    },
     startMcpRequest: async (input) => {
       if (!mcpRecovery()) throw Error("MCP runtime unavailable");
       await startMcpRequestWorkflow(input);

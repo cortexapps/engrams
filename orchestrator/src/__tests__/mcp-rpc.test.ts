@@ -88,6 +88,7 @@ function services(): McpServices {
       resolveUnknown: unavailable,
       expire: unavailable,
       expireUnadmitted: unavailable,
+      expiryScopes: unavailable,
     },
   };
 }

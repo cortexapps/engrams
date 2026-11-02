@@ -45,7 +45,8 @@ export function makeCredentialControlClient(tls: CredentialControlTls): Credenti
 export function makeSessionPolicyControlClient(
   tls: CredentialControlTls,
 ): Client<typeof SessionPolicyService> {
-  return createClient(SessionPolicyService, makeControlTransport(tls, 4 * 1024 * 1024));
+  // Match the coordinator policy service: bounded JSON commands can occupy 8 MiB.
+  return createClient(SessionPolicyService, makeControlTransport(tls, 9 * 1024 * 1024));
 }
 function makeControlTransport(tls: CredentialControlTls, maximumBytes: number) {
   const url = new URL(tls.url);

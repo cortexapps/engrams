@@ -17,7 +17,7 @@ import type {
   IntegrationConnectionRow,
   IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
-import { requireAdmin, requireUser, type GetSession } from "../rpc/require.ts";
+import { requireUser, type GetSession } from "../rpc/require.ts";
 import { validateMcpConfig, type McpConfig } from "./config.ts";
 import type { McpRepository } from "./repository.ts";
 import type { McpJournal, McpUnknownContext } from "./journal.ts";
@@ -35,8 +35,14 @@ export interface McpServices {
   reviewProducers?: McpReviewProducers;
   sessionOwner?: (sessionId: string) => Promise<string | null>;
   validateDestination?: (config: McpConfig) => Promise<void>;
-  validateSchemas?: (tools: readonly McpReviewedTool[]) => Promise<void>;
-  discovery?: { discover(connection: IntegrationConnectionRow): Promise<McpDiscoveredTool[]> };
+  validateSchemas?: (
+    tools: readonly McpReviewedTool[],
+    connection: IntegrationConnectionRow,
+    actorId: string,
+  ) => Promise<void>;
+  discovery?: {
+    discover(connection: IntegrationConnectionRow, actorId: string): Promise<McpDiscoveredTool[]>;
+  };
   credentials?: CredentialAdmin;
   destinations?: { zoneId: string; endpoint: string }[];
   runtime?: {
@@ -251,7 +257,7 @@ export function mcpHandlers(deps: {
       });
     },
     async discoverMcp(req, ctx) {
-      const actor = await requireAdmin(ctx, deps.getSession);
+      const actor = await requireMcpHumanAdmin(ctx, deps.getSession);
       const service = services();
       const discover = requireMcpHook(service.discovery);
       return mcpOperation(async () => {
@@ -259,7 +265,7 @@ export function mcpHandlers(deps: {
         if (row.mcp!.configRevision !== req.expectedRevision) throw new Error("stale connection");
         if (row.mcp!.revoked || !row.mcp!.credentialIdentity)
           throw new Error("credential setup required");
-        const tools = await discover.discover(row);
+        const tools = await discover.discover(row, actor.id);
         return {
           catalog: catalogToProto(
             await service.repository.saveDraft(row.id, row.mcp!, tools, actor.id, deps.now()),
@@ -268,7 +274,7 @@ export function mcpHandlers(deps: {
       });
     },
     async publishMcp(req, ctx) {
-      const actor = await requireAdmin(ctx, deps.getSession);
+      const actor = await requireMcpHumanAdmin(ctx, deps.getSession);
       const service = services();
       const validate = requireMcpHook(service.validateSchemas);
       const { reviewCatalog } = await import("./catalog.ts");
@@ -288,7 +294,7 @@ export function mcpHandlers(deps: {
         throw new ConnectError("invalid reviewed tools", Code.InvalidArgument);
       }
       return mcpOperation(async () => {
-        await validate(tools);
+        await validate(tools, await connection(req.connectionId), actor.id);
         return {
           catalog: catalogToProto(
             await service.repository.publish(
