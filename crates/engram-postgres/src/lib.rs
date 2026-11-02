@@ -35,6 +35,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 mod managed_boot;
+mod managed_bridge;
 mod managed_create;
 mod managed_operator;
 mod managed_operator_gate;
@@ -1654,6 +1655,46 @@ impl MetadataStore for PostgresStore {
         self.operator_publish(generation).await
     }
 
+    async fn read_managed_creation_state(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<engram_core::types::managed_bridge::ManagedCreationState, MetaError> {
+        self.bridge_state(q).await
+    }
+    async fn read_managed_boot_selection(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootSelection, MetaError> {
+        self.bridge_selection(q).await
+    }
+    async fn begin_managed_boot_intent(
+        &self,
+        i: engram_core::types::managed_bridge::ManagedBootIntent,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootIntent, MetaError> {
+        self.bridge_begin(i).await
+    }
+    async fn read_managed_boot_intent(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+        op: &str,
+    ) -> Result<Option<engram_core::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        self.bridge_intent(q, op).await
+    }
+    async fn advance_managed_boot_intent(
+        &self,
+        id: &str,
+        r: u64,
+        c: engram_core::types::managed_bridge::ManagedIntentAdvance,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootIntent, MetaError> {
+        self.bridge_advance(id, r, c).await
+    }
+    async fn list_managed_boot_intents(
+        &self,
+        a: Option<SessionId>,
+        l: u32,
+    ) -> Result<Vec<engram_core::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        self.bridge_list(a, l).await
+    }
     async fn get_managed_boot(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
@@ -1753,6 +1794,16 @@ impl MetadataStore for PostgresStore {
         if let Some(initial) = &ws.managed_initial_prompt {
             initial.validate(&ws)?;
         }
+        if let Some(selection) = &ws.managed_boot_selection {
+            selection.validate()?;
+            if ws.managed_creation.is_none()
+                || selection.image != ws.spec.image
+                || i64::from(selection.memory_mib) > ws.mem_budget_mib
+                || i64::from(selection.vcpus) > i64::from(ws.cpu_budget_vcpus)
+            {
+                return Err(engram_core::types::managed_bridge::conflict());
+            }
+        }
 
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
@@ -1760,6 +1811,22 @@ impl MetadataStore for PostgresStore {
 
         if let Some(creation) = &ws.managed_creation {
             if !managed_create::reserve(&mut tx, creation).await? {
+                let selection: Option<serde_json::Value> = sqlx::query_scalar(
+                    "SELECT selection FROM session_managed_boot_selections WHERE session_id=$1",
+                )
+                .bind(ws.session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let expected = ws
+                    .managed_boot_selection
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|_| engram_core::types::managed_bridge::conflict())?;
+                if selection != expected {
+                    return Err(engram_core::types::managed_bridge::conflict());
+                }
                 let prior: Option<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM session_outbox WHERE prompt_id=$1 AND session_id=$2 AND kind='prompt'")
                     .bind(format!("create:{}",ws.session_id)).bind(ws.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?;
                 if prior.as_ref() != ws.managed_initial_prompt.as_ref().map(|p| &p.row.payload) {
@@ -1999,6 +2066,23 @@ impl MetadataStore for PostgresStore {
             }
         }
 
+        if let Some(selection) = &ws.managed_boot_selection {
+            sqlx::query(
+                "INSERT INTO session_managed_boot_selections(session_id,selection) VALUES($1,$2)",
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(
+                serde_json::to_value(selection)
+                    .map_err(|_| engram_core::types::managed_bridge::conflict())?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query("UPDATE chunk_generation SET generation=generation+1 WHERE id=TRUE")
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
         if let Some(initial) = &ws.managed_initial_prompt {
             outbox_accept::accept(&mut tx, now, ws.session_id, &initial.events, &initial.row)
                 .await?;
@@ -5729,6 +5813,8 @@ impl MetadataStore for PostgresStore {
             WHERE disk_manifest_id IS NOT NULL
             UNION SELECT (record->'request'->'cold'->'disk'->'manifest'->>'manifest_id')::UUID FROM session_managed_boots
             UNION SELECT capture_id FROM session_managed_captures
+            UNION SELECT (selection->'base_manifest'->>'manifest_id')::UUID FROM session_managed_boot_selections
+            UNION SELECT (record->'disk_manifest'->>'manifest_id')::UUID FROM session_managed_boot_intents
             "#,
         )
         .fetch_all(&self.pool)
@@ -9461,7 +9547,9 @@ impl MetadataStore for PostgresStore {
               WHERE live_disk_manifest_id IS NOT NULL
                 AND live_disk_manifest_version IS NOT NULL
             UNION SELECT (record->'request'->'cold'->'disk'->'manifest'->>'manifest_id')::UUID, (record->'request'->'cold'->'disk'->'manifest'->>'version')::BIGINT FROM session_managed_boots
-            UNION SELECT capture_id, 1 FROM session_managed_captures",
+            UNION SELECT capture_id, 1 FROM session_managed_captures
+            UNION SELECT (selection->'base_manifest'->>'manifest_id')::UUID,(selection->'base_manifest'->>'version')::BIGINT FROM session_managed_boot_selections
+            UNION SELECT (record->'disk_manifest'->>'manifest_id')::UUID,(record->'disk_manifest'->>'version')::BIGINT FROM session_managed_boot_intents",
         )
         .fetch_all(&self.pool)
         .await
@@ -9757,7 +9845,9 @@ impl MetadataStore for PostgresStore {
              UNION
              SELECT b->>'drive_id', b->>'sha256'
                FROM hosts h, jsonb_array_elements(h.current_bundles) AS b
-              WHERE h.status IN ('ready','draining')",
+              WHERE h.status IN ('ready','draining')
+             UNION SELECT b->>'drive_id',b->>'sha256' FROM session_managed_boot_selections,jsonb_array_elements(selection->'aux_ro_drives') AS b
+             UNION SELECT b->>'drive_id',b->>'sha256' FROM session_managed_boot_intents,jsonb_array_elements(record->'selection'->'aux_ro_drives') AS b",
         )
         .fetch_all(&self.pool)
         .await

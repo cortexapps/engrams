@@ -16,6 +16,8 @@ use std::sync::{
     Arc, Mutex,
 };
 struct LossyHost {
+    chunks: engram_chunk_store::ChunkStore,
+    captures: AtomicUsize,
     state: Mutex<Option<ManagedBootHostState>>,
     starts: AtomicUsize,
     policy_calls: AtomicUsize,
@@ -27,6 +29,95 @@ struct LossyHost {
 }
 #[async_trait]
 impl HostClient for LossyHost {
+    async fn capture_managed_boot(
+        &self,
+        request: ManagedCaptureRequest,
+    ) -> Result<ManagedCaptureAuthority, SandboxError> {
+        let prepared = match self.state.lock().unwrap().clone() {
+            Some(ManagedBootHostState::Captured { authority }) if authority.request == request => {
+                return Ok(authority)
+            }
+            Some(ManagedBootHostState::Prepared { receipt })
+                if receipt.request.key == request.key =>
+            {
+                *receipt
+            }
+            _ => return Err(SandboxError::Unavailable("source unavailable".into())),
+        };
+        let manifest = self
+            .chunks
+            .get_manifest(prepared.request.cold.disk.manifest)
+            .await
+            .map_err(|e| SandboxError::Vm(e.to_string().into()))?;
+        self.chunks
+            .put_manifest(request.disk_manifest(), &manifest)
+            .await
+            .map_err(|e| SandboxError::Vm(e.to_string().into()))?;
+        let mut authority = ManagedCaptureAuthority {
+            version: 1,
+            disk_manifest: request.disk_manifest(),
+            request,
+            host_incarnation: prepared.host_incarnation,
+            disk_sha256: prepared.request.cold.disk.sha256,
+            disk_size_bytes: prepared.request.cold.disk.size_bytes,
+            image: prepared.request.cold.image,
+            kernel_sha256: prepared.request.cold.kernel_sha256,
+            aux_ro_drives: prepared.request.cold.aux_ro_drives,
+            consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+            source_state: ManagedCapturedSourceState::Destroyed,
+            record_digest: String::new(),
+        };
+        authority.record_digest = authority.digest().unwrap();
+        self.captures.fetch_add(1, Ordering::SeqCst);
+        *self.state.lock().unwrap() = Some(ManagedBootHostState::Captured { authority });
+        Err(SandboxError::Unavailable(
+            "capture reply lost after artifact commit".into(),
+        ))
+    }
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        request
+            .validate()
+            .map_err(|e| SandboxError::Vm(e.to_string().into()))?;
+        Ok(
+            engram_core::types::managed_assets::ManagedColdAssetsReceipt {
+                request,
+                host_incarnation: "host".into(),
+                backend: engram_core::types::managed_assets::ManagedColdBackend::Firecracker,
+                kernel_sha256: "c".repeat(64),
+                disk_sha256: "b".repeat(64),
+                disk_size_bytes: 4096,
+            },
+        )
+    }
+    async fn prepare_managed_boot(
+        &self,
+        request: ManagedBootPrepare,
+    ) -> Result<ManagedBootPreparedReceipt, SandboxError> {
+        if let Some(ManagedBootHostState::Prepared { receipt }) =
+            self.state.lock().unwrap().as_ref()
+        {
+            if receipt.request == request {
+                return Ok(*receipt.clone());
+            }
+        }
+        request
+            .spec()
+            .map_err(|e| SandboxError::Vm(e.to_string().into()))?;
+        let receipt = ManagedBootPreparedReceipt {
+            request,
+            host_incarnation: "host".into(),
+            network_identity: digest(b"network"),
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            receipt_id: digest(b"prepared"),
+        };
+        *self.state.lock().unwrap() = Some(ManagedBootHostState::Prepared {
+            receipt: Box::new(receipt),
+        });
+        Err(SandboxError::Unavailable("reply lost after prepare".into()))
+    }
     async fn read_managed_policy(
         &self,
         _: ManagedPolicyTarget,
@@ -200,6 +291,7 @@ async fn fixture() -> (
         },
     };
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_creation: Some(creation.clone()),
         managed_initial_prompt: None,
         mcp_policy: Some(policy),
@@ -370,7 +462,10 @@ async fn fixture() -> (
         .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Finalized(receipt))
         .await
         .unwrap();
+    let blob = Arc::new(MemBlobStorage::new());
     let host = Arc::new(LossyHost {
+        chunks: engram_chunk_store::ChunkStore::new(blob.clone()),
+        captures: AtomicUsize::new(0),
         state: Mutex::new(Some(ManagedBootHostState::Finalized {
             receipt: row.receipt.clone().unwrap(),
         })),
@@ -382,7 +477,6 @@ async fn fixture() -> (
         entered: Default::default(),
         release: tokio::sync::Semaphore::new(0),
     });
-    let blob = Arc::new(MemBlobStorage::new());
     let services = crate::Services {
         meta: meta.clone(),
         host: host.clone(),
@@ -781,6 +875,7 @@ async fn managed_boot_interruption_publishes_through_pg_listener() {
     let creation = sim.read_managed_creation(&key.creation).await.unwrap();
     meta.reserve_and_persist_create(
         engram_core::traits::SessionCreateWriteSet {
+            managed_boot_selection: None,
             session_id: sid,
             spec: engram_core::types::SessionSpec {
                 image: row.request.cold.image.clone(),
@@ -1123,5 +1218,307 @@ async fn operator_scanner_keeps_policy_only_lineage_blocked_without_host_calls()
             assert!(participant.policy.denies("tools.example"));
             assert!(participant.boot.is_none());
         });
+    }
+}
+
+#[tokio::test]
+async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() {
+    use engram_core::types::{host::*, managed_bridge::*};
+    let (mut state, meta, host, row) = fixture().await;
+    let sid = row.request.key.creation.session_id;
+    let host_id = row.request.key.context.target.host_id;
+    let base = match row.request.cold.disk.source {
+        ManagedColdSource::FreshImage { base_manifest } => base_manifest,
+        _ => unreachable!(),
+    };
+    let selection = ManagedBootSelection {
+        image: row.request.cold.image.clone(),
+        image_digest: digest(b"approved image"),
+        base_manifest: base,
+        aux_ro_drives: row.request.cold.aux_ro_drives.clone(),
+        vcpus: 1,
+        memory_mib: 128,
+        disk_gib: 1,
+    };
+    // Explicit held-reservation fixture. The test drives actual coordinator selection,
+    // blob fork, claim and prepare code; its host is controlled, not physical proof.
+    meta.with_db_mut(|db| {
+        db.managed_boots.remove(&sid);
+        let s = db.sessions.get_mut(&sid).unwrap();
+        s.session.status = engram_core::types::SessionState::Queued;
+        s.session.host_id = None;
+        s.session.sandbox_id = None;
+        s.binding_epoch = 0;
+        db.managed_boot_selections.insert(sid, selection.clone());
+    });
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Missing {
+        key: row.request.key.clone(),
+    });
+    meta.upsert_host(HostRecord {
+        id: host_id,
+        hostname: "bridge-host".into(),
+        cloud_metadata: Default::default(),
+        capacity: HostCapacity {
+            total_gb: 10,
+            used_gb: 0,
+            total_mib: 8192,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: state.services.clock.now_utc(),
+        host_addr: None,
+        ready_images: vec![selection.image_digest.clone()],
+        current_bundles: vec![],
+        sandbox_bundles: vec![],
+        cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
+        total_vcpus: 4,
+        wire_version: engram_protocol::WIRE_VERSION,
+        stages_images: true,
+        capabilities: HostCapabilities {
+            backend: "firecracker".into(),
+            ..Default::default()
+        },
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
+    })
+    .await
+    .unwrap();
+    let registered = meta.get_host(host_id).await.unwrap().unwrap();
+    meta.touch_host_heartbeat(
+        host_id,
+        HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: registered.capacity,
+            utilization: Default::default(),
+            ready_images: vec![selection.image_digest.clone()],
+            current_bundles: vec![],
+            sandbox_bundles: vec![],
+            total_vcpus: 4,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: true,
+            capabilities: registered.capabilities,
+            lease_renew_until: None,
+        },
+    )
+    .await
+    .unwrap();
+    let manifest = engram_chunk_store::Manifest {
+        schema_version: 1,
+        kind: engram_chunk_store::ManifestKind::Disk,
+        chunk_size: engram_chunk_store::ChunkSize::bytes(4096),
+        total_bytes: 4096,
+        chunks: vec![],
+        parent: None,
+        working_set_trace: None,
+        annotations: serde_json::Value::Null,
+    };
+    state
+        .services
+        .chunk_store
+        .put_manifest(base, &manifest)
+        .await
+        .unwrap();
+    let creation = meta
+        .read_managed_creation(&row.request.key.creation)
+        .await
+        .unwrap();
+    let q = ManagedCreationQuery {
+        identity: creation.identity,
+        native_version: creation.native.version,
+        native_digest: creation.native.digest,
+    };
+    let first = crate::managed_bridge::prepare(&state, q.clone())
+        .await
+        .unwrap();
+    let retry = crate::managed_bridge::prepare(&state, q.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.operation, retry.operation);
+    let initial = meta
+        .read_managed_boot_intent(&q, "initial")
+        .await
+        .unwrap()
+        .unwrap();
+    let lost = Arc::new(LostManifestReply {
+        inner: state.services.blob.clone(),
+        target: initial.disk_manifest.storage_key(),
+        lost: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut state).unwrap().services.chunk_store =
+        engram_chunk_store::ChunkStore::new(lost.clone());
+    // Accepted prompts remain queued during preparation; no Deliver op may exist.
+    crate::api::prompt::send_prompt_core(
+        &state,
+        sid,
+        "held-prompt".into(),
+        "queued".into(),
+        None,
+        crate::api::prompt::PromptDelivery::Enqueue,
+    )
+    .await
+    .unwrap();
+    assert!(!meta
+        .op_pending_exists(sid, engram_core::types::session_op::OpKind::Deliver)
+        .await
+        .unwrap());
+    for step in 0..3 {
+        let current = meta
+            .read_managed_boot_intent(&q, "initial")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::managed_bridge::drive(&state, current)
+            .await
+            .unwrap_or_else(|e| panic!("initial phase {step}: {e:?}"));
+    }
+    crate::managed_bridge::run_once(&state).await.unwrap();
+    let claimed = meta.get_managed_boot(&q.identity).await.unwrap().unwrap();
+    assert_eq!(claimed.request.key.boot_attempt, initial.intent_id);
+    assert_eq!(
+        claimed.request.key.context.target.sandbox_id,
+        initial.sandbox_id
+    );
+    assert_eq!(claimed.phase, ManagedBootPhase::Claimed);
+    let fork = state
+        .services
+        .chunk_store
+        .get_manifest(initial.disk_manifest)
+        .await
+        .unwrap();
+    assert_eq!(
+        lost.lost.load(Ordering::SeqCst),
+        1,
+        "one committed private manifest despite a lost PUT reply"
+    );
+    assert_eq!(fork.parent, Some(base));
+    assert_eq!(fork.total_bytes, manifest.total_bytes);
+    // Replaying the old intent after a lost claim reply does not allocate or fork again.
+    let committed = meta
+        .read_managed_boot_intent(&q, "initial")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed.completed);
+    crate::managed_bridge::drive(&state, committed)
+        .await
+        .unwrap();
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Missing {
+        key: claimed.request.key.clone(),
+    });
+    assert!(drive(&state, &claimed.request.key).await.is_err());
+    drive(&state, &claimed.request.key).await.unwrap();
+    let prepared = meta.read_managed_boot(&claimed.request.key).await.unwrap();
+    assert_eq!(prepared.phase, ManagedBootPhase::Prepared);
+    assert!(prepared.sealed_agent.is_none());
+    assert!(meta
+        .outbox_get("held-prompt")
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+    let input = ManagedRecoveryInput {
+        query: q.clone(),
+        expected_source_key: claimed.request.key.clone(),
+        recovery_id: "recover-one".into(),
+    };
+    let recovering = crate::managed_bridge::recover(&state, input.clone())
+        .await
+        .unwrap();
+    let retry = crate::managed_bridge::recover(&state, input.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovering.operation, retry.operation);
+    let recovery = meta
+        .read_managed_boot_intent(&q, "recover:recover-one")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::managed_bridge::drive(&state, recovery.clone())
+            .await
+            .is_err(),
+        "lost capture reply"
+    );
+    assert_eq!(host.captures.load(Ordering::SeqCst), 1);
+    assert!(meta
+        .list_live_session_disk_manifest_ids()
+        .await
+        .unwrap()
+        .contains(&recovery.disk_manifest));
+    for _ in 0..3 {
+        crate::managed_bridge::run_once(&state).await.unwrap();
+    }
+    let next = meta.get_managed_boot(&q.identity).await.unwrap().unwrap();
+    assert_eq!(next.request.key.context.target.binding_epoch, 2);
+    assert_eq!(next.request.cold.disk.manifest, recovery.disk_manifest);
+    assert!(next.request.capture_authority.is_some());
+    assert_eq!(host.captures.load(Ordering::SeqCst), 1);
+    assert!(meta.read_managed_boot(&claimed.request.key).await.is_err());
+    let reconciled = crate::managed_bridge::recover(&state, input).await.unwrap();
+    assert!(reconciled.operation.unwrap().completed);
+    assert_eq!(reconciled.boot.unwrap().request.key, next.request.key);
+    assert!(meta
+        .outbox_get("held-prompt")
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+}
+
+struct LostManifestReply {
+    inner: Arc<dyn engram_core::traits::BlobStorage>,
+    target: String,
+    lost: AtomicUsize,
+}
+#[async_trait]
+impl engram_core::traits::BlobStorage for LostManifestReply {
+    async fn put_streaming(
+        &self,
+        key: &str,
+        body: engram_core::traits::ByteStream,
+    ) -> Result<u64, engram_core::BlobError> {
+        let size = self.inner.put_streaming(key, body).await?;
+        if key == self.target && self.lost.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(engram_core::BlobError::Protocol(
+                "reply lost after manifest commit".into(),
+            ));
+        }
+        Ok(size)
+    }
+    async fn get_streaming(
+        &self,
+        key: &str,
+    ) -> Result<engram_core::traits::ByteStream, engram_core::BlobError> {
+        self.inner.get_streaming(key).await
+    }
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), engram_core::BlobError> {
+        self.inner.delete(key).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, engram_core::BlobError> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<engram_core::traits::ListPage, engram_core::BlobError> {
+        self.inner.list_prefix_page(prefix, cursor, limit).await
     }
 }

@@ -79,6 +79,8 @@ impl ManagedInitialPrompt {
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    /// Approved immutable cold input selection, committed with a managed reservation.
+    pub managed_boot_selection: Option<crate::types::managed_bridge::ManagedBootSelection>,
     /// Held managed reservation; ordinary placement must never consume it.
     pub managed_creation: Option<crate::types::managed_create::ManagedCreation>,
     /// Initial prompt and visible events commit with a held managed creation.
@@ -316,8 +318,49 @@ pub trait MetadataStore: Send + Sync {
         unimplemented!("publish_operator_generation")
     }
 
-    /// Read the current boot under the complete immutable creation association.
-    /// A held creation has no boot; a missing creation authority is an error.
+    /// Read sanitized state under the immutable creation and native association.
+    /// Explicit absence does not fence an in-flight reserve. Terminal rows remain readable.
+    async fn read_managed_creation_state(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<crate::types::managed_bridge::ManagedCreationState, MetaError> {
+        panic!("read_managed_creation_state not implemented")
+    }
+    async fn read_managed_boot_selection(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<crate::types::managed_bridge::ManagedBootSelection, MetaError> {
+        panic!("read_managed_boot_selection not implemented")
+    }
+    async fn begin_managed_boot_intent(
+        &self,
+        _intent: crate::types::managed_bridge::ManagedBootIntent,
+    ) -> Result<crate::types::managed_bridge::ManagedBootIntent, MetaError> {
+        panic!("begin_managed_boot_intent not implemented")
+    }
+    async fn read_managed_boot_intent(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+        _operation: &str,
+    ) -> Result<Option<crate::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        panic!("read_managed_boot_intent not implemented")
+    }
+    async fn advance_managed_boot_intent(
+        &self,
+        _intent_id: &str,
+        _revision: u64,
+        _change: crate::types::managed_bridge::ManagedIntentAdvance,
+    ) -> Result<crate::types::managed_bridge::ManagedBootIntent, MetaError> {
+        panic!("advance_managed_boot_intent not implemented")
+    }
+    async fn list_managed_boot_intents(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<crate::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        panic!("list_managed_boot_intents not implemented")
+    }
+
     async fn get_managed_boot(
         &self,
         _identity: &crate::types::managed_create::ManagedCreateIdentity,

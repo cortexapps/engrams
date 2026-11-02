@@ -27,6 +27,10 @@ use engram_core::types::event::{ArtifactRow, EventCursor, PersistedEvent};
 use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::ids::CaptureJobId;
 use engram_core::types::managed_boot::*;
+use engram_core::types::managed_bridge::{
+    ManagedBootIntent, ManagedBootSelection, ManagedCreationQuery, ManagedCreationState,
+    ManagedIntentAdvance,
+};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::registry::{EnableJob, EnableJobState};
 use engram_core::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
@@ -370,10 +374,19 @@ fn managed_boot_read_locked(
     let t = &key.context.target;
     if r.request.key != *key
         || s.session.host_id != Some(t.host_id)
-        || s.session.sandbox_id != Some(t.sandbox_id)
+        || s.session.sandbox_id.is_some_and(|id| id != t.sandbox_id)
         || s.binding_epoch != t.binding_epoch as i64
     {
         return Err(conflict());
+    }
+    if s.session.sandbox_id.is_none() {
+        if r.phase != ManagedBootPhase::Interrupted {
+            return Err(conflict());
+        }
+        r.retired.as_ref().ok_or_else(conflict)?.validate_for(
+            r.prepared.as_ref().ok_or_else(conflict)?,
+            &r.request.bootstrap_policy,
+        )?;
     }
     Ok(r.clone())
 }
@@ -1030,6 +1043,205 @@ impl MetadataStore for SimMetadataStore {
         Ok(db.operator_publication.clone())
     }
 
+    async fn read_managed_creation_state(
+        &self,
+        q: &ManagedCreationQuery,
+    ) -> Result<ManagedCreationState, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let session = db.sessions.get(&q.identity.session_id);
+        let c = db.managed_creations.get(&q.identity.session_id);
+        if session
+            .zip(c)
+            .is_some_and(|(s, c)| s.mcp_policy_parent_id != c.identity.policy.parent_session_id)
+        {
+            return Err(conflict());
+        }
+        let i = db
+            .managed_boot_intents
+            .values()
+            .filter(|i| i.query.identity.session_id == q.identity.session_id)
+            .max_by_key(|i| i.binding_epoch);
+        if session.is_some_and(|s| !s.session.status.is_terminal()) {
+            if let Some(b) = db.managed_boots.get(&q.identity.session_id) {
+                managed_boot_read_locked(&db, &b.request.key)?;
+            }
+        }
+        ManagedCreationState::from_parts(
+            q.clone(),
+            session.map(|r| r.session.status),
+            c,
+            db.managed_boots.get(&q.identity.session_id).cloned(),
+            i,
+        )
+    }
+    async fn read_managed_boot_selection(
+        &self,
+        q: &ManagedCreationQuery,
+    ) -> Result<ManagedBootSelection, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        q.matches(
+            db.managed_creations
+                .get(&q.identity.session_id)
+                .ok_or(MetaError::NotFound)?,
+        )?;
+        let s = db
+            .managed_boot_selections
+            .get(&q.identity.session_id)
+            .ok_or_else(conflict)?
+            .clone();
+        s.validate()?;
+        Ok(s)
+    }
+    async fn read_managed_boot_intent(
+        &self,
+        q: &ManagedCreationQuery,
+        op: &str,
+    ) -> Result<Option<ManagedBootIntent>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        q.matches(
+            db.managed_creations
+                .get(&q.identity.session_id)
+                .ok_or(MetaError::NotFound)?,
+        )?;
+        Ok(db
+            .managed_boot_intents
+            .values()
+            .find(|i| {
+                i.query.identity.session_id == q.identity.session_id && i.operation_key() == op
+            })
+            .cloned())
+    }
+    async fn begin_managed_boot_intent(
+        &self,
+        i: ManagedBootIntent,
+    ) -> Result<ManagedBootIntent, MetaError> {
+        self.gate()?;
+        i.validate()?;
+        if i.revision != 1 || i.host_id.is_some() || i.assets.is_some() || i.completed {
+            return Err(conflict());
+        }
+        let mut db = self.db.lock();
+        bridge_gate(&db)?;
+        q_match(&db, &i.query)?;
+        let original = db
+            .managed_boot_selections
+            .get(&i.query.identity.session_id)
+            .ok_or_else(conflict)?;
+        if let Some(old) = db.managed_boot_intents.values().find(|o| {
+            o.query.identity.session_id == i.query.identity.session_id
+                && o.operation_key() == i.operation_key()
+        }) {
+            if old.recovery.as_ref().map(|r| (&r.recovery_id, &r.source))
+                != i.recovery.as_ref().map(|r| (&r.recovery_id, &r.source))
+            {
+                return Err(conflict());
+            }
+            return Ok(old.clone());
+        }
+        managed_creation_source(&db, &i.query.identity, false)?;
+        if db
+            .managed_boot_intents
+            .values()
+            .any(|o| o.query.identity.session_id == i.query.identity.session_id && !o.completed)
+        {
+            return Err(conflict());
+        }
+        let b = db.managed_boots.get(&i.query.identity.session_id);
+        if let Some(r) = &i.recovery {
+            let old = b.ok_or_else(conflict)?;
+            if old.request.key != r.source
+                || old.prepared.is_none()
+                || i.selection.image != old.request.cold.image
+                || i.selection.aux_ro_drives != old.request.cold.aux_ro_drives
+                || i.selection.image_digest != original.image_digest
+                || i.selection.base_manifest != original.base_manifest
+                || i.selection.vcpus != old.request.spec()?.cpu.vcpus
+                || i.selection.memory_mib != old.request.spec()?.memory.max_mib
+                || i.selection.disk_gib != old.request.spec()?.disk.max_gib
+            {
+                return Err(conflict());
+            }
+        } else {
+            managed_creation_source(&db, &i.query.identity, true)?;
+            if b.is_some() || &i.selection != original {
+                return Err(conflict());
+            }
+        }
+        if db.managed_boot_intents.contains_key(&i.intent_id)
+            || db.managed_boot_intents.values().any(|o| {
+                o.query.identity.session_id == i.query.identity.session_id
+                    && o.binding_epoch == i.binding_epoch
+            })
+        {
+            return Err(conflict());
+        }
+        db.managed_boot_intents
+            .insert(i.intent_id.clone(), i.clone());
+        db.chunk_generation += 1;
+        Ok(i)
+    }
+    async fn advance_managed_boot_intent(
+        &self,
+        id: &str,
+        r: u64,
+        c: ManagedIntentAdvance,
+    ) -> Result<ManagedBootIntent, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        bridge_gate(&db)?;
+        let old = db
+            .managed_boot_intents
+            .get(id)
+            .ok_or_else(conflict)?
+            .clone();
+        old.query
+            .matches(&managed_creation_source(&db, &old.query.identity, false)?)?;
+        if old.revision != r {
+            return Err(conflict());
+        }
+        if matches!(c, ManagedIntentAdvance::Complete) {
+            let b = db
+                .managed_boots
+                .get(&old.query.identity.session_id)
+                .ok_or_else(conflict)?;
+            old.validate_claim(&b.request)?;
+        }
+        let next = old.advance(c)?;
+        db.managed_boot_intents.insert(id.into(), next.clone());
+        Ok(next)
+    }
+    async fn list_managed_boot_intents(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<ManagedBootIntent>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let mut rows: Vec<_> = db
+            .managed_boot_intents
+            .values()
+            .filter(|i| {
+                !i.completed
+                    && after.is_none_or(|a| i.query.identity.session_id > a)
+                    && db
+                        .sessions
+                        .get(&i.query.identity.session_id)
+                        .is_some_and(|s| {
+                            !matches!(
+                                s.session.status,
+                                SessionState::Dead | SessionState::Failed | SessionState::Completed
+                            )
+                        })
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|i| i.query.identity.session_id);
+        rows.truncate(limit.min(128) as usize);
+        Ok(rows)
+    }
     async fn get_managed_boot(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
@@ -1147,6 +1359,14 @@ impl MetadataStore for SimMetadataStore {
         let spec = request.spec()?;
         let mut db = self.db.lock();
         managed_operator_gate(&db, &request.key)?;
+        if let Some(i) = db.managed_boot_intents.get(&request.key.boot_attempt) {
+            i.validate_claim(&request)?;
+        } else if db
+            .managed_boot_selections
+            .contains_key(&request.key.creation.session_id)
+        {
+            return Err(conflict());
+        }
         let k = &request.key;
         let t = &k.context.target;
         let session = db.sessions.get(&t.session_id).ok_or(MetaError::NotFound)?;
@@ -1279,6 +1499,15 @@ impl MetadataStore for SimMetadataStore {
                 return Err(conflict())
             }
             _ => {}
+        }
+        if let ManagedBootAdvance::Prepared(receipt) = &event {
+            if let Some(i) = db.managed_boot_intents.get(&key.boot_attempt) {
+                i.validate_claim(&receipt.request)?;
+                if i.assets.as_ref().map(|a| &a.host_incarnation) != Some(&receipt.host_incarnation)
+                {
+                    return Err(conflict());
+                }
+            }
         }
         let next = old.advance(event, &source.native)?;
         let sid = key.creation.session_id;
@@ -1463,6 +1692,16 @@ impl MetadataStore for SimMetadataStore {
         if let Some(creation) = &ws.managed_creation {
             creation.validate_for(&ws)?;
         }
+        if let Some(selection) = &ws.managed_boot_selection {
+            selection.validate()?;
+            if ws.managed_creation.is_none()
+                || selection.image != ws.spec.image
+                || i64::from(selection.memory_mib) > ws.mem_budget_mib
+                || i64::from(selection.vcpus) > i64::from(ws.cpu_budget_vcpus)
+            {
+                return Err(conflict());
+            }
+        }
         self.gate()?;
         if let Some(initial) = &ws.managed_initial_prompt {
             initial.validate(&ws)?;
@@ -1475,6 +1714,11 @@ impl MetadataStore for SimMetadataStore {
                     return Err(MetaError::Conflict(
                         "managed creation association changed".into(),
                     ));
+                }
+                if db.managed_boot_selections.get(&ws.session_id)
+                    != ws.managed_boot_selection.as_ref()
+                {
+                    return Err(conflict());
                 }
                 let prior = db.outbox.get(&format!("create:{}", ws.session_id));
                 if prior.map(|p| &p.payload)
@@ -1629,6 +1873,10 @@ impl MetadataStore for SimMetadataStore {
         }
         if let Some(binding) = ws.oauth_binding {
             db.session_oauth_bindings.insert(ws.session_id, binding);
+        }
+        if let Some(selection) = ws.managed_boot_selection {
+            db.managed_boot_selections.insert(ws.session_id, selection);
+            db.chunk_generation += 1;
         }
         if let Some(initial) = ws.managed_initial_prompt {
             if initial.row.payload["mode"] == "plan" {
@@ -4821,6 +5069,16 @@ impl MetadataStore for SimMetadataStore {
                 .values()
                 .map(|r| r.request.cold.disk.manifest.manifest_id),
         );
+        refs.extend(
+            db.managed_boot_selections
+                .values()
+                .map(|s| s.base_manifest.manifest_id),
+        );
+        refs.extend(
+            db.managed_boot_intents
+                .values()
+                .map(|i| i.disk_manifest.manifest_id),
+        );
         refs.extend(db.managed_captures.keys().map(|id| id.as_uuid()));
         Ok(refs.into_iter().collect())
     }
@@ -5219,6 +5477,23 @@ impl MetadataStore for SimMetadataStore {
             }
             for b in &host.current_bundles {
                 push(b);
+            }
+        }
+        for d in db
+            .managed_boot_selections
+            .values()
+            .flat_map(|s| s.aux_ro_drives.iter())
+            .chain(
+                db.managed_boot_intents
+                    .values()
+                    .flat_map(|i| i.selection.aux_ro_drives.iter()),
+            )
+        {
+            if let Some(sha256) = &d.sha256 {
+                push(&engram_core::types::sandbox::AuxBundleRef {
+                    drive_id: d.drive_id.clone(),
+                    sha256: sha256.clone(),
+                });
             }
         }
         drop(db);
@@ -5778,6 +6053,16 @@ impl MetadataStore for SimMetadataStore {
             let m = r.request.cold.disk.manifest;
             (m.manifest_id, m.version)
         }));
+        refs.extend(
+            db.managed_boot_selections
+                .values()
+                .map(|s| (s.base_manifest.manifest_id, s.base_manifest.version)),
+        );
+        refs.extend(
+            db.managed_boot_intents
+                .values()
+                .map(|i| (i.disk_manifest.manifest_id, i.disk_manifest.version)),
+        );
         refs.extend(db.managed_captures.values().map(|(r, _)| {
             let m = r.disk_manifest();
             (m.manifest_id, m.version)
@@ -7222,4 +7507,23 @@ fn require_tool_result_target(
         }
     }
     Ok(())
+}
+
+fn bridge_gate(db: &SimDb) -> Result<(), MetaError> {
+    if db
+        .managed_operator_gate
+        .as_ref()
+        .is_some_and(|(_, _, open)| *open)
+    {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
+}
+fn q_match(db: &SimDb, q: &ManagedCreationQuery) -> Result<(), MetaError> {
+    q.matches(
+        db.managed_creations
+            .get(&q.identity.session_id)
+            .ok_or(MetaError::NotFound)?,
+    )
 }

@@ -612,3 +612,21 @@ retries retain their original operation identity even when a newer boot exists.
 The JSON contracts are versioned by their existing nested authorities; additive
 protobuf methods preserve protocol and WIRE versions. These contracts alone do
 not enable creation or prove physical host execution.
+
+The coordinator now commits approved image digest, base manifest, ordered bundle
+hashes, and resource selection with the held reservation. Migration 0135 stores
+these immutable inputs and one pending boot intent per session. Initial and
+recovery operation keys are unique; revision CAS preserves the chosen sandbox,
+epoch, capture ID, and private manifest reference across retries. The shared
+operator gate is locked before the session. Blob and host I/O occur outside
+transactions. Selection, private fork, capture, and bundle references are GC roots.
+
+The scanner forks the complete approved disk manifest under the pinned reference,
+checks an authenticated cold-assets receipt, and claims the physical target through
+the existing capacity transaction. Prepared receipts must match the inspected host
+incarnation. Explicit recovery captures the exact old source before claiming a new
+epoch. A detached source remains captureable only with its exact permanent Retired
+receipt and unchanged host/epoch; it cannot acknowledge or replace a newer target.
+Old run interruption and prompt delivery continue through the existing atomic event
+and Started gates. Test fixtures exercise coordinator retry ordering and paired
+metadata semantics; physical backend qualification remains a separate requirement.

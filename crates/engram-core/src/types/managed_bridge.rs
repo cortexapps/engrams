@@ -198,7 +198,7 @@ impl ManagedBootIntent {
             }
             ManagedIntentAdvance::Assets(a) if self.assets.is_none() => {
                 a.validate_for(&self.assets_request()?)?;
-                next.assets = Some(a);
+                next.assets = Some(*a);
             }
             ManagedIntentAdvance::Complete if self.assets.is_some() => next.completed = true,
             _ => return Err(conflict()),
@@ -211,7 +211,7 @@ impl ManagedBootIntent {
 #[derive(Clone, Debug)]
 pub enum ManagedIntentAdvance {
     SelectHost(HostId),
-    Assets(ManagedColdAssetsReceipt),
+    Assets(Box<ManagedColdAssetsReceipt>),
     Complete,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,7 +18,7 @@ pub(crate) async fn gate(
         )),
     }
 }
-/// Called only by the trusted admission/placement producer. Public admission is closed.
+/// Called by the trusted durable preparation driver after physical input verification.
 pub async fn register(
     state: &SharedState,
     request: ManagedBootPrepare,
@@ -333,6 +333,7 @@ async fn confirm_started(
     }
 }
 pub async fn run_once(state: &SharedState) -> Result<(), ApiError> {
+    crate::managed_bridge::run_once(state).await?;
     let mut after = None;
     loop {
         let keys = state.services.meta.list_managed_boots(after, 128).await?;

@@ -279,6 +279,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
 
         meta.reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
+                managed_boot_selection: None,
                 managed_initial_prompt: None,
                 managed_creation: Some(ManagedCreation {
                     identity: identity.clone(),
@@ -364,6 +365,95 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                 tonic::Code::PermissionDenied
             }
         );
+        let bridge_request = wire::ReadManagedCreationStateRequest {
+            protocol: 1,
+            identity: Some(native_identity.clone()),
+            native_version: 1,
+            native_digest: reserve.native_digest.clone(),
+        };
+        let observed = policy_client
+            .read_managed_creation_state(bridge_request.clone())
+            .await;
+        if pinned {
+            let bytes = observed.unwrap().into_inner().state_json;
+            let view: engram_core::types::managed_bridge::ManagedCreationState =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                view.state,
+                engram_core::types::managed_bridge::ManagedCreationPhase::Held
+            );
+            assert!(view.boot.is_none());
+            assert!(view.operation.is_none());
+            let mut absent = bridge_request.clone();
+            absent.identity.as_mut().unwrap().session_id = uuid::Uuid::from_u128(1499).to_string();
+            let absent = policy_client
+                .read_managed_creation_state(absent)
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&absent.state_json).unwrap()["state"],
+                "absent"
+            );
+            let mut wrong = bridge_request.clone();
+            wrong.native_digest = digest(b"changed native");
+            assert_eq!(
+                policy_client
+                    .read_managed_creation_state(wrong)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut wrong = bridge_request.clone();
+            wrong.protocol = 0;
+            assert_eq!(
+                policy_client
+                    .read_managed_creation_state(wrong)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        } else {
+            assert_eq!(observed.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
+        let prepare = policy_client
+            .prepare_managed_boot(wire::PrepareManagedBootRequest {
+                protocol: 1,
+                identity: Some(native_identity.clone()),
+                native_version: 1,
+                native_digest: reserve.native_digest.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            prepare.code(),
+            if pinned {
+                tonic::Code::Unavailable
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        ); // This transport fixture has no runtime AppState.
+        let recovery = policy_client
+            .recover_managed_boot(wire::RecoverManagedBootRequest {
+                protocol: 1,
+                identity: Some(native_identity.clone()),
+                native_version: 1,
+                native_digest: reserve.native_digest.clone(),
+                expected_source_key_json: br#"{"host_id":"caller-selected"}"#.to_vec(),
+                recovery_id: "recovery-one".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            recovery.code(),
+            if pinned {
+                tonic::Code::InvalidArgument
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        );
         let request = wire::ReadNativeManifestRequest {
             protocol: 1,
             identity: Some(native_identity.clone()),
@@ -415,6 +505,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             let policy_sid = engram_core::SessionId(uuid::Uuid::from_u128(1200));
             meta.reserve_and_persist_create(
                 engram_core::traits::SessionCreateWriteSet {
+                    managed_boot_selection: None,
                     managed_initial_prompt: None,
                     managed_creation: None,
                     mcp_policy: Some(McpPolicyCreation {

@@ -1027,6 +1027,7 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -4161,6 +4162,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -5838,6 +5840,7 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -6334,6 +6337,7 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -7116,6 +7120,7 @@ async fn nbd_host_placement(ctx: &Ctx) {
     assert_eq!(read.utilization.nbd_slots_total, 4);
     assert_eq!(read.utilization.nbd_slots_in_use, 1);
     let ws = |need| SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -7558,6 +7563,7 @@ async fn mcp_guest_binding_rejected(ctx: &Ctx) {
         .unwrap();
     let sid = SessionId::from(uuid::Uuid::from_u128(4));
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -8140,6 +8146,7 @@ async fn mcp_write_policy_create(
     ctx.meta
         .reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
+                managed_boot_selection: None,
                 managed_initial_prompt: None,
                 managed_creation: None,
                 mcp_policy: Some(McpPolicyCreation {
@@ -8894,6 +8901,7 @@ fn managed_creation_ws(id: SessionId) -> engram_core::traits::SessionCreateWrite
     };
     let bytes = br#" [ {"name":"native","description":"all fields","inputSchema":{},"execution":"sync","nativeBindings":{"codex":"native"},"extra":true} ] "#.to_vec();
     engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: Some(ManagedCreation {
             identity: ManagedCreateIdentity {
@@ -11190,4 +11198,601 @@ async fn operator_started_owner_progresses_after_permanent_retirement(ctx: &Ctx)
 conformance!(
     t_operator_started_owner_progresses_after_permanent_retirement,
     super::operator_started_owner_progresses_after_permanent_retirement
+);
+
+async fn managed_bridge_identity_state(ctx: &Ctx) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let ws = managed_creation_ws(SessionId::new());
+    let c = ws.managed_creation.clone().unwrap();
+    let q = ManagedCreationQuery {
+        identity: c.identity,
+        native_version: c.native.version,
+        native_digest: c.native.digest,
+    };
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&q)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Absent
+    );
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&q)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Held
+    );
+    let mut wrong = q.clone();
+    wrong.native_digest = engram_core::types::managed_create::digest(b"wrong");
+    assert!(matches!(
+        ctx.meta.read_managed_creation_state(&wrong).await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            engram_core::types::BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    let terminal = ctx.meta.read_managed_creation_state(&q).await.unwrap();
+    assert_eq!(terminal.state, ManagedCreationPhase::Terminal);
+    assert_eq!(terminal.terminal_reason.as_deref(), Some("failed"));
+    let finalized = managed_boot_finalized_fixture(ctx).await;
+    assert!(finalized.sealed_agent.is_some());
+    let query = ManagedCreationQuery {
+        identity: finalized.request.key.creation.clone(),
+        native_version: 1,
+        native_digest: finalized.request.key.native_digest.clone(),
+    };
+    let view = ctx.meta.read_managed_creation_state(&query).await.unwrap();
+    assert!(view.boot.as_ref().unwrap().sealed_agent.is_none());
+    assert_eq!(
+        view.boot
+            .as_ref()
+            .unwrap()
+            .finalization
+            .as_ref()
+            .unwrap()
+            .combined_manifest_digest,
+        finalized.finalization.unwrap().combined_manifest_digest
+    );
+    assert!(!serde_json::to_string(&view).unwrap().contains("ciphertext"));
+}
+conformance!(
+    t_managed_bridge_identity_state,
+    managed_bridge_identity_state
+);
+
+fn bridge_intent(
+    ws: &engram_core::traits::SessionCreateWriteSet,
+) -> engram_core::types::managed_bridge::ManagedBootIntent {
+    use engram_core::types::{managed_bridge::*, managed_create::digest};
+    let c = ws.managed_creation.as_ref().unwrap();
+    let request = managed_boot_request(ws, HostId::new());
+    let base = match request.cold.disk.source {
+        engram_core::types::managed_cold::ManagedColdSource::FreshImage { base_manifest } => {
+            base_manifest
+        }
+        _ => unreachable!(),
+    };
+    ManagedBootIntent {
+        query: ManagedCreationQuery {
+            identity: c.identity.clone(),
+            native_version: c.native.version,
+            native_digest: c.native.digest.clone(),
+        },
+        intent_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        selection: ManagedBootSelection {
+            image: ws.spec.image.clone(),
+            image_digest: digest(b"approved image"),
+            base_manifest: base,
+            aux_ro_drives: request.cold.aux_ro_drives,
+            vcpus: 1,
+            memory_mib: 128,
+            disk_gib: 1,
+        },
+        sandbox_id: engram_core::SandboxId::new(),
+        binding_epoch: 1,
+        disk_manifest: engram_core::types::ManifestRef::new(),
+        recovery: None,
+        host_id: None,
+        assets: None,
+        completed: false,
+    }
+}
+async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    let i = bridge_intent(&ws);
+    ws.managed_boot_selection = Some(i.selection.clone());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_selection(&i.query)
+            .await
+            .unwrap(),
+        i.selection
+    );
+    // Lost reserve reply uses the immutable selected inputs; a new catalog value cannot replace them.
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let mut changed_selection = ws.clone();
+    changed_selection
+        .managed_boot_selection
+        .as_mut()
+        .unwrap()
+        .base_manifest = engram_core::types::ManifestRef::new();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(changed_selection, &[], 0)
+        .await
+        .is_err());
+    let mut changed = i.clone();
+    changed.intent_id = uuid::Uuid::new_v4().to_string();
+    changed.disk_manifest = engram_core::types::ManifestRef::new();
+    changed.sandbox_id = engram_core::SandboxId::new();
+    let (a, b) = tokio::join!(
+        ctx.meta.begin_managed_boot_intent(i.clone()),
+        ctx.meta.begin_managed_boot_intent(changed)
+    );
+    let a = a.unwrap();
+    assert_eq!(a, b.unwrap());
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_intent(&i.query, "initial")
+            .await
+            .unwrap(),
+        Some(a.clone())
+    );
+    assert_eq!(
+        ctx.meta.list_managed_boot_intents(None, 10).await.unwrap(),
+        vec![a.clone()]
+    );
+    let refs = ctx
+        .meta
+        .list_live_session_disk_manifest_ids()
+        .await
+        .unwrap();
+    assert!(refs.contains(&a.selection.base_manifest));
+    assert!(refs.contains(&a.disk_manifest));
+    let ids = ctx.meta.list_live_disk_manifest_ids().await.unwrap();
+    assert!(ids.contains(&a.disk_manifest.manifest_id));
+    assert!(ids.contains(&a.selection.base_manifest.manifest_id));
+    let pins = ctx.meta.bundle_pin_set().await.unwrap();
+    for d in &a.selection.aux_ro_drives {
+        assert!(pins
+            .iter()
+            .any(|p| p.drive_id == d.drive_id && Some(&p.sha256) == d.sha256.as_ref()));
+    }
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Preparing
+    );
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(&a.intent_id, a.revision, ManagedIntentAdvance::Complete)
+        .await
+        .is_err());
+    let host = HostId::new();
+    let (x, y) = tokio::join!(
+        ctx.meta.advance_managed_boot_intent(
+            &a.intent_id,
+            a.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        ),
+        ctx.meta.advance_managed_boot_intent(
+            &a.intent_id,
+            a.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        )
+    );
+    assert_eq!(usize::from(x.is_ok()) + usize::from(y.is_ok()), 1);
+    let mut next = ctx
+        .meta
+        .read_managed_boot_intent(&i.query, "initial")
+        .await
+        .unwrap()
+        .unwrap();
+    let req = next.assets_request().unwrap();
+    let receipt = engram_core::types::managed_assets::ManagedColdAssetsReceipt {
+        request: req.clone(),
+        host_incarnation: "fixture-incarnation".into(),
+        backend: engram_core::types::managed_assets::ManagedColdBackend::Firecracker,
+        kernel_sha256: "c".repeat(64),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+    };
+    let mut wrong = receipt.clone();
+    wrong.request.disk_manifest = engram_core::types::ManifestRef::new();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(wrong))
+        )
+        .await
+        .is_err());
+    next = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt)),
+        )
+        .await
+        .unwrap();
+    // Actual publication stage closes the shared gate before any further intent CAS.
+    let p = ctx.meta.read_operator_publication().await.unwrap();
+    let g = p.published.unwrap();
+    ctx.meta
+        .stage_operator_publication(Some(g.generation), operator_candidate())
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Complete
+        )
+        .await
+        .is_err());
+    let mut another = bridge_intent(&ws);
+    another.query = i.query.clone();
+    assert!(ctx.meta.begin_managed_boot_intent(another).await.is_err());
+}
+conformance!(
+    t_managed_bridge_intent_cas_pins_and_gate,
+    managed_bridge_intent_cas_pins_and_gate
+);
+
+async fn managed_bridge_detached_retired_source_can_capture(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let key = &row.request.key;
+    let receipt = ManagedBootRetiredReceipt {
+        prepared: row.prepared.clone().unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"retained source"),
+    };
+    ctx.meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::Retired(Box::new(receipt)),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            key.creation.session_id,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    let retained = ctx
+        .meta
+        .read_managed_boot(key)
+        .await
+        .expect("permanent exact source retirement survives detach");
+    assert_eq!(retained.phase, ManagedBootPhase::Interrupted);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    let request = ManagedCaptureRequest {
+        key: key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    assert!(ctx
+        .meta
+        .reserve_managed_capture(&request)
+        .await
+        .unwrap()
+        .is_none());
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: row.request.cold.image.clone(),
+        kernel_sha256: row.request.cold.kernel_sha256.clone(),
+        aux_ro_drives: row.request.cold.aux_ro_drives.clone(),
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority.clone())
+    );
+    let mut next = row.request.clone();
+    next.key.context.target.binding_epoch = 2;
+    next.key.context.target.sandbox_id = engram_core::SandboxId::new();
+    next.key.boot_attempt.push_str("-recovered");
+    next.cold.boot_attempt = next.key.boot_attempt.clone();
+    next.cold.sandbox_id = next.key.context.target.sandbox_id;
+    next.cold.disk.manifest = authority.disk_manifest;
+    next.cold.disk.sha256 = authority.disk_sha256.clone();
+    next.cold.disk.source = engram_core::types::managed_cold::ManagedColdSource::Capture {
+        capture_id: request.capture_id,
+        session_id: key.creation.session_id,
+        sandbox_id: key.context.target.sandbox_id,
+        binding_epoch: 1,
+        record_digest: authority.record_digest.clone(),
+    };
+    let mut spec: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&next.sandbox_spec_json).unwrap();
+    spec.rootfs_manifest = Some(authority.disk_manifest);
+    next.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+    next.capture_authority = Some(authority.clone());
+    ctx.meta.claim_managed_boot(next.clone()).await.unwrap();
+    assert!(
+        ctx.meta.read_managed_boot(key).await.is_err(),
+        "retained old proof cannot become current target authority"
+    );
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority)
+    );
+    assert_eq!(
+        ctx.meta.read_managed_boot(&next.key).await.unwrap().phase,
+        ManagedBootPhase::Claimed
+    );
+    let (_, unknown) = managed_boot_prepared_fixture(ctx).await;
+    ctx.meta
+        .advance_managed_boot(
+            &unknown.request.key,
+            unknown.revision,
+            ManagedBootAdvance::Interrupt,
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            unknown.request.key.creation.session_id,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .read_managed_boot(&unknown.request.key)
+            .await
+            .is_err(),
+        "interruption alone is not permanent source proof"
+    );
+}
+conformance!(
+    t_managed_bridge_detached_retired_source_can_capture,
+    managed_bridge_detached_retired_source_can_capture
+);
+
+async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_assets::*, managed_boot::*, managed_bridge::*, managed_cold::ManagedColdSource,
+        managed_create::digest,
+    };
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    let mut i = bridge_intent(&ws);
+    ws.managed_boot_selection = Some(i.selection.clone());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "bridge-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let mut request = managed_boot_request(&ws, host);
+    assert!(
+        ctx.meta.claim_managed_boot(request.clone()).await.is_err(),
+        "selected creation cannot bypass durable intent"
+    );
+    i = ctx.meta.begin_managed_boot_intent(i).await.unwrap();
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &i.intent_id,
+            i.revision,
+            ManagedIntentAdvance::SelectHost(host),
+        )
+        .await
+        .unwrap();
+    let assets = ManagedColdAssetsReceipt {
+        request: i.assets_request().unwrap(),
+        host_incarnation: "asset-owner".into(),
+        backend: ManagedColdBackend::Firecracker,
+        kernel_sha256: "c".repeat(64),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+    };
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &i.intent_id,
+            i.revision,
+            ManagedIntentAdvance::Assets(Box::new(assets.clone())),
+        )
+        .await
+        .unwrap();
+    request.key.boot_attempt = i.intent_id.clone();
+    request.key.context.target.sandbox_id = i.sandbox_id;
+    request.cold.boot_attempt = i.intent_id.clone();
+    request.cold.sandbox_id = i.sandbox_id;
+    request.cold.disk.manifest = i.disk_manifest;
+    request.cold.disk.sha256 = assets.disk_sha256;
+    request.cold.disk.source = ManagedColdSource::FreshImage {
+        base_manifest: i.selection.base_manifest,
+    };
+    let mut spec: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&request.sandbox_spec_json).unwrap();
+    spec.rootfs_manifest = Some(i.disk_manifest);
+    spec.memory.max_mib = i.selection.memory_mib;
+    request.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+    let mut wrong = request.clone();
+    wrong.cold.disk.sha256 = "e".repeat(64);
+    assert!(ctx.meta.claim_managed_boot(wrong).await.is_err());
+    let row = ctx.meta.claim_managed_boot(request.clone()).await.unwrap();
+    // Commit succeeded but the caller lost its reply: exact retry returns the same owner.
+    assert_eq!(
+        serde_json::to_value(ctx.meta.claim_managed_boot(request.clone()).await.unwrap()).unwrap(),
+        serde_json::to_value(&row).unwrap()
+    );
+    let prepared = ManagedBootPreparedReceipt {
+        request: request.clone(),
+        host_incarnation: "asset-owner".into(),
+        network_identity: digest(b"network"),
+        guest_ip: "192.0.2.2".parse().unwrap(),
+        receipt_id: digest(b"prepared"),
+    };
+    let mut wrong = prepared.clone();
+    wrong.host_incarnation = "restarted-host".into();
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            &request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(wrong))
+        )
+        .await
+        .is_err());
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(prepared)),
+        )
+        .await
+        .unwrap();
+    i = ctx
+        .meta
+        .advance_managed_boot_intent(&i.intent_id, i.revision, ManagedIntentAdvance::Complete)
+        .await
+        .unwrap();
+    assert!(i.completed);
+    assert!(ctx
+        .meta
+        .list_managed_boot_intents(None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let capture_id = SnapshotId::new();
+    let mut recovery = ManagedBootIntent {
+        query: i.query.clone(),
+        intent_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        selection: i.selection.clone(),
+        sandbox_id: engram_core::SandboxId::new(),
+        binding_epoch: 2,
+        disk_manifest: engram_core::types::ManifestRef {
+            manifest_id: capture_id.as_uuid(),
+            version: 1,
+        },
+        recovery: Some(ManagedRecoveryIntent {
+            recovery_id: "recovery-one".into(),
+            source: request.key.clone(),
+            capture_id,
+        }),
+        host_id: None,
+        assets: None,
+        completed: false,
+    };
+    recovery = ctx.meta.begin_managed_boot_intent(recovery).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Recovering
+    );
+    let mut retry = recovery.clone();
+    retry.intent_id = uuid::Uuid::new_v4().to_string();
+    retry.sandbox_id = engram_core::SandboxId::new();
+    assert_eq!(
+        ctx.meta.begin_managed_boot_intent(retry).await.unwrap(),
+        recovery
+    );
+    let mut competing = recovery.clone();
+    competing.intent_id = uuid::Uuid::new_v4().to_string();
+    competing.recovery.as_mut().unwrap().recovery_id = "other-recovery".into();
+    assert!(matches!(
+        ctx.meta.begin_managed_boot_intent(competing).await,
+        Err(engram_core::MetaError::Conflict(_))
+    ));
+    assert!(ctx
+        .meta
+        .list_live_session_disk_manifest_ids()
+        .await
+        .unwrap()
+        .contains(&recovery.disk_manifest));
+    assert_eq!(
+        serde_json::to_value(ctx.meta.read_managed_boot(&request.key).await.unwrap()).unwrap(),
+        serde_json::to_value(&row).unwrap(),
+        "intent does not itself interrupt a guest"
+    );
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &recovery.intent_id,
+            recovery.revision,
+            ManagedIntentAdvance::SelectHost(host)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation_state(&i.query)
+            .await
+            .unwrap()
+            .state,
+        ManagedCreationPhase::Terminal
+    );
+}
+conformance!(
+    t_managed_bridge_claim_reconcile_and_recovery,
+    managed_bridge_claim_reconcile_and_recovery
 );

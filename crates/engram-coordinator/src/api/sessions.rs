@@ -664,6 +664,7 @@ async fn boot_prepared(
     managed_creation: Option<engram_core::types::managed_create::ManagedCreation>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
+        managed_selection,
         nbd_slot_need,
         inputs,
         memory_mib,
@@ -778,6 +779,15 @@ async fn boot_prepared(
         ));
     }
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: if managed_creation.is_some() {
+            let selection = managed_selection.ok_or_else(|| {
+                ApiError::Unavailable("approved cold boot inputs unavailable".into())
+            })?;
+            selection.validate()?;
+            Some(selection)
+        } else {
+            None
+        },
         managed_initial_prompt: if managed_creation.is_some() {
             crate::api::prompt::managed_initial_prompt(
                 state,
@@ -1551,7 +1561,30 @@ async fn prepare_inner(
     // the reserve-side `ScheduleContext` on `required_image_digest`.
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
+    let managed_selection = bundle.base_snapshot.disk_manifest.map(|base_manifest| {
+        let mut mounts = selected_mounts.clone();
+        mounts.sort_by_key(|d| {
+            (0..engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS)
+                .position(|i| {
+                    d.drive_id == engram_core::types::sandbox::AuxRoDrive::slot_drive_id(i)
+                })
+                .unwrap_or(usize::MAX)
+        });
+        engram_core::types::managed_bridge::ManagedBootSelection {
+            image: image_uri.into(),
+            image_digest: manifest_digest.clone(),
+            base_manifest,
+            aux_ro_drives: mounts,
+            vcpus: cpu_budget_vcpus,
+            memory_mib,
+            disk_gib: config
+                .resources
+                .suggested_disk_gib
+                .unwrap_or(DEFAULT_DISK_GIB),
+        }
+    });
     Ok(crate::session_boot::PreparedBoot {
+        managed_selection,
         nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
         inputs: crate::session_boot::BootInputs {
             session_id,

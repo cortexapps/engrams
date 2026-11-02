@@ -6,18 +6,30 @@ use engram_core::{
 };
 use sqlx::{PgConnection, Row};
 
-async fn read(
+pub(crate) async fn read(
     conn: &mut PgConnection,
     key: &ManagedBootKey,
 ) -> Result<ManagedBootRecord, MetaError> {
     key.validate()?;
     managed_create::read(conn, &key.creation, false).await?;
-    let r = sqlx::query("SELECT b.record FROM session_managed_boots b JOIN sessions s ON s.id=b.session_id WHERE b.session_id=$1 AND s.host_id=b.host_id AND s.sandbox_id=b.sandbox_id AND s.binding_epoch=b.binding_epoch AND s.status NOT IN ('dead','failed','completed')")
+    let r = sqlx::query("SELECT b.record,s.sandbox_id AS current_sandbox FROM session_managed_boots b JOIN sessions s ON s.id=b.session_id WHERE b.session_id=$1 AND s.host_id=b.host_id AND (s.sandbox_id=b.sandbox_id OR s.sandbox_id IS NULL) AND s.binding_epoch=b.binding_epoch AND s.status NOT IN ('dead','failed','completed')")
         .bind(key.creation.session_id.as_uuid()).fetch_optional(&mut *conn).await.map_err(db_err)?.ok_or_else(conflict)?;
     let record: ManagedBootRecord =
         serde_json::from_value(r.try_get("record").map_err(db_err)?).map_err(|_| conflict())?;
     if &record.request.key != key {
         return Err(conflict());
+    }
+    if r.try_get::<Option<uuid::Uuid>, _>("current_sandbox")
+        .map_err(db_err)?
+        .is_none()
+    {
+        if record.phase != ManagedBootPhase::Interrupted {
+            return Err(conflict());
+        }
+        record.retired.as_ref().ok_or_else(conflict)?.validate_for(
+            record.prepared.as_ref().ok_or_else(conflict)?,
+            &record.request.bootstrap_policy,
+        )?;
     }
     Ok(record)
 }
@@ -50,6 +62,30 @@ impl PostgresStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        let intent: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT record FROM session_managed_boot_intents WHERE session_id=$1 AND intent_id=$2",
+        )
+        .bind(t.session_id.as_uuid())
+        .bind(&k.boot_attempt)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(v) = intent {
+            let i: engram_core::types::managed_bridge::ManagedBootIntent =
+                serde_json::from_value(v).map_err(|_| conflict())?;
+            i.validate_claim(&request)?;
+        } else {
+            let selected: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM session_managed_boot_selections WHERE session_id=$1)",
+            )
+            .bind(t.session_id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if selected {
+                return Err(conflict());
+            }
+        }
         let old = if exists {
             let value: serde_json::Value =
                 sqlx::query_scalar("SELECT record FROM session_managed_boots WHERE session_id=$1")
@@ -166,6 +202,18 @@ impl PostgresStore {
         let old = read(&mut tx, key).await?;
         if old.revision != revision {
             return Err(conflict());
+        }
+        if let ManagedBootAdvance::Prepared(receipt) = &event {
+            let v:Option<serde_json::Value>=sqlx::query_scalar("SELECT record FROM session_managed_boot_intents WHERE intent_id=$1 AND session_id=$2").bind(&key.boot_attempt).bind(sid.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+            if let Some(v) = v {
+                let i: engram_core::types::managed_bridge::ManagedBootIntent =
+                    serde_json::from_value(v).map_err(|_| conflict())?;
+                i.validate_claim(&receipt.request)?;
+                if i.assets.as_ref().map(|a| &a.host_incarnation) != Some(&receipt.host_incarnation)
+                {
+                    return Err(conflict());
+                }
+            }
         }
         let source = managed_create::read(&mut tx, &key.creation, false).await?;
         match &event {

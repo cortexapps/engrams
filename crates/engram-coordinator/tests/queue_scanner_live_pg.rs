@@ -69,6 +69,7 @@ async fn enqueue(
     cpu_budget_vcpus: i32,
 ) {
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
@@ -114,6 +115,7 @@ async fn reserve(
     affinity_len: usize,
 ) -> Option<HostId> {
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,

@@ -15,6 +15,14 @@ pub(crate) async fn read(
     identity: &ManagedCreateIdentity,
     require_held: bool,
 ) -> Result<ManagedCreation, MetaError> {
+    read_with_terminal(conn, identity, require_held, false).await
+}
+pub(crate) async fn read_with_terminal(
+    conn: &mut PgConnection,
+    identity: &ManagedCreateIdentity,
+    require_held: bool,
+    allow_terminal: bool,
+) -> Result<ManagedCreation, MetaError> {
     identity.validate()?;
     let row = sqlx::query(
         "SELECT c.*, s.status AS session_status,
@@ -33,10 +41,11 @@ pub(crate) async fn read(
         return Err(conflict());
     }
     if !row.try_get::<bool, _>("parent_matches").map_err(db_err)?
-        || matches!(
-            row.try_get::<&str, _>("session_status").map_err(db_err)?,
-            "dead" | "completed" | "failed"
-        )
+        || (!allow_terminal
+            && matches!(
+                row.try_get::<&str, _>("session_status").map_err(db_err)?,
+                "dead" | "completed" | "failed"
+            ))
     {
         return Err(if require_held {
             conflict()
