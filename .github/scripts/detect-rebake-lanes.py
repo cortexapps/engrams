@@ -267,7 +267,8 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  # ci.yml; its old entry here was a dead path).
                  ".github/actions/",
                  ".github/scripts/detect-rebake-lanes.py",
-                 ".github/scripts/tests/"]
+                 ".github/scripts/tests/",
+                 ".github/scripts/mcp-acceptance-"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # The public docs + landing site (site/, Astro + Starlight). Its content is
@@ -556,8 +557,10 @@ def main():
     # lint + tests(linux) + the two macOS lanes build/test the whole workspace:
     # any workspace crate (cc — protos included via engram-protocol), a
     # lockfile/toolchain bump, or a CI-definition change.
+    fixture_changed = any_path(changed, ["tests/fixtures/mcp-model-cli/"])
     test_rust = (
-        ci_self
+        fixture_changed
+        or ci_self
         or bool(cc)
         or any_path(changed, RUST_COMMON)
         or any_path(changed, HARNESS_PATHS)
@@ -566,7 +569,7 @@ def main():
     test_mcp_worker = ci_self or proto or any_path(changed, ["mcp-worker/", "docker/mcp-worker.Dockerfile"])
     test_netstack = test_rust
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
-    test_cross = ci_self or host_binaries
+    test_cross = ci_self or host_binaries or fixture_changed or harness_changed
     # Firecracker integration lane. Gated on the e2e binary CLOSURE (the FC
     # backend + host-agent + their deps — the Rust the FC integration tests
     # exercise; engram-sandbox-firecracker is in host-agent's closure, and the

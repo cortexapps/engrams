@@ -553,6 +553,16 @@ jobs:
       # `--no-fail-fast` reports every failing test instead of stopping
       # at the first; `if: always()` keeps the ha_listener steps below
       # running even if this one fails.
+      - name: Run native MCP fixture and adapter gates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-native.sh
+
+      - name: Run production Linux MCP wrapper entrypoints
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-linux.sh
+
       - name: cargo nextest run --workspace
         if: always()
         run: cargo nextest run --workspace --no-fail-fast
@@ -711,6 +721,22 @@ jobs:
             --target x86_64-unknown-linux-musl \
             --release \
             -p engram-agentd
+
+      - name: Build x86_64 static MCP model fixture
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
+          mkdir -p var/mcp-fixture-x86_64
+          cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/engram-mcp-model-fixture" var/mcp-fixture-x86_64/
+          file var/mcp-fixture-x86_64/engram-mcp-model-fixture | grep -E 'ELF 64-bit.*x86-64.*static(ally|-pie)? linked'
+          cd var/mcp-fixture-x86_64
+          shasum -a 256 engram-mcp-model-fixture > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mcp-fixture-x86_64-linux-musl
+          path: var/mcp-fixture-x86_64/
+          if-no-files-found: error
 
       - name: build harness wrappers (musl)
         run: |
@@ -1240,6 +1266,14 @@ jobs:
         with:
           gh-token: ${{ secrets.GITHUB_TOKEN }}
           rust-cache-shared-key: fc-nbd-net
+
+      - name: Install CLOSED namespace test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends iproute2 nftables procps
+
+      - name: CLOSED namespace installed-state test (root)
+        run: bash .github/scripts/mcp-acceptance-fc-closed.sh
 
       # ADR 0007 Phase 4: NBD daemon serves chunked disks. The
       # `nbd_chunked_disk` integration test boots a real FC microVM
@@ -2362,7 +2396,27 @@ jobs:
         run: touch /tmp/engram-vz-rootfs.ext4
       - name: Run ignored VZ tests (config validation; e2e_vz runs live below)
         if: always()
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz)'
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz) and not test(actual_helper_closed_lifetime_and_descriptor_isolation)'
+      - name: Run verified packaged helper test
+        if: always()
+        run: bash .github/scripts/mcp-acceptance-helper.sh
+      - name: Build arm64 static MCP model fixture
+        run: |
+          brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+          export CARGO_TARGET_DIR="$PWD/target"
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+          cargo build --locked --release --target aarch64-unknown-linux-musl --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
+          mkdir -p var/mcp-fixture-aarch64
+          cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture" var/mcp-fixture-aarch64/
+          file var/mcp-fixture-aarch64/engram-mcp-model-fixture | grep -E 'ELF 64-bit.*ARM aarch64.*static(ally|-pie)? linked'
+          cd var/mcp-fixture-aarch64
+          shasum -a 256 engram-mcp-model-fixture > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mcp-fixture-aarch64-linux-musl
+          path: var/mcp-fixture-aarch64/
+          if-no-files-found: error
       - name: Probe nested virtualization
         id: hv
         if: always()
@@ -2418,7 +2472,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # Same default set as Linux minus engram-sandbox-vz (the `vz` job runs that
       # codesigned) — catches macOS-only regressions in cross-platform crates.
+      - name: Run native MCP fixture and adapter gates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-native.sh
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
+        if: always()
         run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
 
   # The SINGLE required status check. Because the lanes above are path-gated (and
