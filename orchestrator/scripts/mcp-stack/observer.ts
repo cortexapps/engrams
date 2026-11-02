@@ -66,6 +66,7 @@ const FixtureObservationSchema = z.strictObject({
     exchanges: count,
     rotations: count,
     rejections: count,
+    expiresInSeconds: z.number().int().min(1).max(3600),
   }),
 });
 export class FixtureObserver {
@@ -145,6 +146,7 @@ export class FixtureObserver {
     account?: "account-one" | "account-two";
     scope?: "tools:read" | "tools:write" | "tools:read tools:write";
     issuer?: "configured" | "mismatch";
+    expiresInSeconds?: number;
   }) {
     const checked = z
       .strictObject({
@@ -153,6 +155,7 @@ export class FixtureObserver {
           .enum(["tools:read", "tools:write", "tools:read tools:write"])
           .optional(),
         issuer: z.enum(["configured", "mismatch"]).optional(),
+        expiresInSeconds: z.number().int().min(1).max(3600).optional(),
       })
       .parse(input);
     await this.request("POST", "/v1/oauth", checked);

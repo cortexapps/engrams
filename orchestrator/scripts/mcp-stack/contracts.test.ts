@@ -417,3 +417,47 @@ test("protocol fixtures and restart variants stay explicit", () => {
     }).success,
   ).toBe(false);
 });
+
+test("fixed plans reject duplicate IDs, deep or large arguments and unknown fields", async () => {
+  const { encodeCallPlan } = await import("./call-plan.ts");
+  const step = {
+    marker: "read",
+    tool: "mcp_counter",
+    arguments: {},
+    callId: "read-1",
+    resultFormat: "mcp" as const,
+  };
+  expect(JSON.parse(encodeCallPlan({ steps: [step] })).steps).toHaveLength(1);
+  expect(() => encodeCallPlan({ steps: [step, step] })).toThrow();
+  expect(() =>
+    encodeCallPlan({
+      steps: [{ ...step, arguments: { text: "x".repeat(4096) } }],
+    }),
+  ).toThrow();
+  let deep: Record<string, unknown> = {};
+  for (let i = 0; i < 16; i++) deep = { child: deep };
+  expect(() =>
+    encodeCallPlan({ steps: [{ ...step, arguments: deep }] }),
+  ).toThrow();
+});
+test("guest JSONL preserves each flushed completion and does not invent partial output", async () => {
+  const { parseGuestProofRecords } = await import("./guest.ts");
+  const first = { callId: "call-1", tool: "mcp_counter", resultReceived: true };
+  const second = {
+    callId: "call-2",
+    tool: "mcp_counter",
+    resultReceived: true,
+  };
+  const records = parseGuestProofRecords(
+    Buffer.from(JSON.stringify(first) + "\n" + JSON.stringify(second) + "\n"),
+  );
+  expect(records.map((value) => value.proof.callId)).toEqual([
+    "call-1",
+    "call-2",
+  ]);
+  expect(records[0]?.sha256).not.toBe(records[1]?.sha256);
+  expect(parseGuestProofRecords(Buffer.from(JSON.stringify(first)))).toEqual(
+    [],
+  );
+  expect(() => parseGuestProofRecords(Buffer.from("bad\n"))).toThrow();
+});

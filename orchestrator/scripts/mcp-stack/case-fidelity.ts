@@ -8,9 +8,10 @@ import {
   canonicalJson,
   expectedCounterNative,
   proofPaths,
-  readGuestProof,
+  readGuestProofRecords,
 } from "./guest.ts";
 import type { Harness } from "./manifest.ts";
+import { bindingTools } from "./bootstrap.ts";
 import { DatabaseObserver, FixtureObserver } from "./observer.ts";
 import {
   closeScenario,
@@ -81,11 +82,16 @@ export async function catalogFidelity(
           );
           const proofs = await Promise.all(
             paths.map((path) =>
-              readGuestProof(ctx, scenario.client, scenario.sessionId, path),
+              readGuestProofRecords(
+                ctx,
+                scenario.client,
+                scenario.sessionId,
+                path,
+              ),
             ),
           );
           const selected = proofs
-            .filter((value) => value !== null)
+            .flat()
             .filter((value) => value.proof.resultReceived);
           const reviewed = scenario.catalog.tools.find(
             (tool) => tool.upstreamName === "read_counter",
@@ -94,12 +100,19 @@ export async function catalogFidelity(
             reviewed && selected.length > 0,
             "fidelity_selected_tool",
           );
+          const bound = await bindingTools(scenario.client, scenario.sessionId);
+          requireThat(
+            bound.length === 1 && bound[0]?.modelToolName === scenario.alias,
+            "reviewed_only_binding_set",
+          );
           const expectedHash = `sha256:${sha256(canonicalJson(expectedNative))}`;
           const schemaHash = `sha256:${sha256(canonicalJson(JSON.parse(reviewed.inputSchemaJson)))}`;
           requireThat(
             selected.every(
               ({ proof }) =>
                 proof.selectedToolName === scenario.alias &&
+                proof.exposedMcpToolNamesSha256 ===
+                  `sha256:${sha256(canonicalJson([scenario.alias]))}` &&
                 proof.selectedSchemaSha256 === schemaHash &&
                 proof.delivery === "available" &&
                 proof.resultMatchesExpected === true &&
@@ -133,6 +146,54 @@ export async function catalogFidelity(
       }
   }
   requireThat(observations.length === 8, "all_fidelity_variants");
-  // The caller must still verify actual complete tool exposure before assigning this case PASS.
   return observations;
 }
+
+/** All five assertions derive from the eight completed real transport/protocol variants above. */
+export const catalogFidelityDriver: import("./driver.ts").CaseDriver = async ({
+  ctx,
+  principals,
+  database,
+  harness,
+}) => {
+  const { completeAssertions } = await import("./driver.ts");
+  const rows = await catalogFidelity(ctx, principals, database, harness);
+  const publicViews = rows.map((row) => ({
+    source: "public-rpc" as const,
+    identitySha256: sha256(
+      canonicalJson({
+        protocol: row.protocol,
+        reply: row.reply,
+        isError: row.isError,
+      }),
+    ),
+    state: "current" as const,
+    contentSha256: sha256(
+      canonicalJson({ schemaHash: row.schemaHash, resultHash: row.resultHash }),
+    ),
+  }));
+  const guestViews = rows.flatMap((row) =>
+    row.proofHashes.map((hash) => ({
+      source: "guest-proof" as const,
+      identitySha256: sha256(
+        canonicalJson({
+          protocol: row.protocol,
+          reply: row.reply,
+          isError: row.isError,
+        }),
+      ),
+      state: row.isError ? ("failed" as const) : ("succeeded" as const),
+      contentSha256: hash,
+    })),
+  );
+  return completeAssertions("catalog-fidelity", [
+    { assertion: "reviewed-tool-only-exposure", observations: guestViews },
+    {
+      assertion: "actual-alias-schema",
+      observations: [...publicViews, ...guestViews],
+    },
+    { assertion: "http-json-sse", observations: publicViews },
+    { assertion: "modern-legacy", observations: publicViews },
+    { assertion: "exact-text-structured-is-error", observations: guestViews },
+  ]);
+};

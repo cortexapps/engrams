@@ -16,6 +16,7 @@ import {
   type PublicClient,
 } from "./transport.ts";
 import type { Harness } from "./manifest.ts";
+import { encodeCallPlan, type CallPlan } from "./call-plan.ts";
 
 export async function waitFor<T>(
   ctx: Context,
@@ -294,15 +295,10 @@ export function modelToolName(
   );
   return `mcp_${alias.replaceAll("-", "_").slice(0, 24)}_${sha256(JSON.stringify([connectionId, upstreamName])).slice(0, 20)}`;
 }
-export async function bindingTool(
-  client: PublicClient,
-  sessionId: string,
-  connectionId: string,
-  upstreamName: string,
-) {
+export async function bindingTools(client: PublicClient, sessionId: string) {
   let cursor = "";
   const seen = new Set<string>();
-  const matches = [];
+  const tools = [];
   for (let page = 0; page < 32; page++) {
     const state = await client.integration.getSessionMcpState({
       sessionId,
@@ -312,17 +308,13 @@ export async function bindingTool(
       afterBindingToolName: cursor,
     });
     requireThat(state.bindingReceipt?.current, "current_binding");
-    matches.push(
-      ...state.bindingTools.filter(
-        (tool) =>
-          tool.connectionId === connectionId &&
-          tool.reviewedTool?.upstreamName === upstreamName,
-      ),
+    tools.push(...state.bindingTools);
+    requireThat(
+      tools.length <= 128 &&
+        new Set(tools.map((tool) => tool.modelToolName)).size === tools.length,
+      "binding_tool_set_bound",
     );
-    if (!state.hasMoreBindingTools) {
-      requireThat(matches.length === 1, "exact_public_binding");
-      return matches[0]!;
-    }
+    if (!state.hasMoreBindingTools) return tools;
     requireThat(
       state.nextBindingToolName && !seen.has(state.nextBindingToolName),
       "binding_cursor",
@@ -331,6 +323,20 @@ export async function bindingTool(
     cursor = state.nextBindingToolName;
   }
   throw new RunnerFailure("ASSERTION_FAILED", "binding_page_limit");
+}
+export async function bindingTool(
+  client: PublicClient,
+  sessionId: string,
+  connectionId: string,
+  upstreamName: string,
+) {
+  const matches = (await bindingTools(client, sessionId)).filter(
+    (tool) =>
+      tool.connectionId === connectionId &&
+      tool.reviewedTool?.upstreamName === upstreamName,
+  );
+  requireThat(matches.length === 1, "exact_public_binding");
+  return matches[0]!;
 }
 export async function createHumanTask(
   ctx: Context,
@@ -375,7 +381,7 @@ export async function expectRejected(
       error instanceof ConnectError && codes.includes(error.code),
       "expected_public_rejection",
     );
-    return;
+    return error.code;
   }
   throw new RunnerFailure("ASSERTION_FAILED", "unexpected_public_success");
 }
@@ -476,6 +482,7 @@ export async function createFixtureProfile(
     arguments: Record<string, unknown>;
     callId: string;
     expectedNativeResult?: Record<string, unknown>;
+    callPlan?: CallPlan;
     grant: boolean;
     automationWrite: boolean;
     constraints: object[];
@@ -512,13 +519,17 @@ export async function createFixtureProfile(
     model: "z-ai/glm-5.2",
     expectedMcpGrantRevision: 0n,
     envVars: {
-      ENGRAM_FIXTURE_TOOL: alias,
       ENGRAM_FIXTURE_MODE: input.mode,
-      ENGRAM_FIXTURE_ARGUMENTS_JSON: argumentsJson,
-      ENGRAM_FIXTURE_CALL_ID: input.callId,
-      ...(expectedJson === undefined
-        ? {}
-        : { ENGRAM_FIXTURE_EXPECTED_RESULT_JSON: expectedJson }),
+      ...(input.callPlan
+        ? { ENGRAM_FIXTURE_CALL_PLAN_JSON: encodeCallPlan(input.callPlan) }
+        : {
+            ENGRAM_FIXTURE_TOOL: alias,
+            ENGRAM_FIXTURE_ARGUMENTS_JSON: argumentsJson,
+            ENGRAM_FIXTURE_CALL_ID: input.callId,
+            ...(expectedJson === undefined
+              ? {}
+              : { ENGRAM_FIXTURE_EXPECTED_RESULT_JSON: expectedJson }),
+          }),
       ENGRAM_FIXTURE_STATE_DIR: ctx.guest.stateDirectory,
       ENGRAM_FIXTURE_PROOF: proof,
       [input.harness === "claude" ? "ENGRAM_CLAUDE_BIN" : "ENGRAM_CODEX_BIN"]:

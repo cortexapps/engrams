@@ -2,6 +2,8 @@ import { Code } from "@connectrpc/connect";
 import { z } from "zod";
 import {
   bindingTool,
+  bindingTools,
+  modelToolName,
   createCatalog,
   createFixtureProfile,
   createHumanTask,
@@ -19,10 +21,11 @@ import {
   canonicalJson,
   guestReady,
   proofPaths,
-  readGuestProof,
+  readGuestProofRecords,
 } from "./guest.ts";
 import type { Harness } from "./manifest.ts";
 import { DatabaseObserver, FixtureObserver } from "./observer.ts";
+import type { CallPlan } from "./call-plan.ts";
 import type { PublicClient } from "./transport.ts";
 
 export type Principals = Awaited<ReturnType<typeof bootstrapHumans>>;
@@ -43,6 +46,8 @@ export async function startScenario(
     constraints: object[];
     callId: string;
     defaultAllow?: boolean;
+    grant?: boolean;
+    callPlan?: (alias: string) => CallPlan;
     expectedNativeResult?: Record<string, unknown>;
   },
 ) {
@@ -58,7 +63,10 @@ export async function startScenario(
     ...input,
     connectionId: connection.id,
     connectionAlias: connection.alias,
-    grant: true,
+    grant: input.grant ?? true,
+    callPlan: input.callPlan?.(
+      modelToolName(connection.id, connection.alias, input.upstreamName),
+    ),
     defaultAllow: input.defaultAllow ?? false,
   });
   const client = principals[input.caller];
@@ -88,23 +96,30 @@ export async function startScenario(
     () => database.managedLifecycle(task.sessionId, coordinator),
     (state) => state.phase === "started",
   );
-  const bound = await bindingTool(
-    client,
-    task.sessionId,
-    connection.id,
-    input.upstreamName,
-  );
-  const reviewed = catalog.tools.find(
-    (tool) => tool.upstreamName === input.upstreamName,
-  );
-  requireThat(
-    bound.modelToolName === profile.alias &&
-      bound.reviewedTool &&
-      reviewed &&
-      canonicalJson(JSON.parse(bound.reviewedTool.inputSchemaJson)) ===
-        canonicalJson(JSON.parse(reviewed.inputSchemaJson)),
-    "exact_delivered_binding_schema",
-  );
+  if (input.grant !== false) {
+    const bound = await bindingTool(
+      client,
+      task.sessionId,
+      connection.id,
+      input.upstreamName,
+    );
+    const reviewed = catalog.tools.find(
+      (tool) => tool.upstreamName === input.upstreamName,
+    );
+    requireThat(
+      bound.modelToolName === profile.alias &&
+        bound.reviewedTool &&
+        reviewed &&
+        canonicalJson(JSON.parse(bound.reviewedTool.inputSchemaJson)) ===
+          canonicalJson(JSON.parse(reviewed.inputSchemaJson)),
+      "exact_delivered_binding_schema",
+    );
+  } else {
+    requireThat(
+      (await bindingTools(client, task.sessionId)).length === 0,
+      "missing_grant_empty_binding",
+    );
+  }
   await guestReady(ctx, client, task.sessionId);
   return {
     ...task,
@@ -121,11 +136,23 @@ export async function startScenario(
 export async function sendScenarioPrompt(
   scenario: StartedScenario,
   plan = false,
+  marker?: string,
+  promptAttempt = 1,
 ) {
+  requireThat(
+    Number.isInteger(promptAttempt) &&
+      promptAttempt >= 1 &&
+      promptAttempt <= 16,
+    "prompt_attempt_bound",
+  );
+  requireThat(
+    marker === undefined || /^[A-Za-z0-9_-]{1,64}$/.test(marker),
+    "call_plan_marker",
+  );
   await scenario.client.sessions.sendPrompt({
     sessionId: scenario.sessionId,
-    text: "Run the neutral fixture call.",
-    promptId: `fixture-${scenario.input.suffix}`,
+    text: marker ? `[[fixture:${marker}]]` : "Run the neutral fixture call.",
+    promptId: `fixture-${scenario.input.suffix}${marker ? "-" + marker : ""}-${promptAttempt}`,
     ...(plan ? { harnessMode: "plan" } : {}),
   });
 }
@@ -194,11 +221,11 @@ export async function approveOnce(
     approve: true,
     expectedReviewContext: reviewContext,
   };
-  await expectRejected(
+  const otherDenied = await expectRejected(
     () => principals.other.integration.decideMcpApproval(request),
     [Code.PermissionDenied, Code.NotFound],
   );
-  await expectRejected(
+  const changedDenied = await expectRejected(
     () =>
       principals[actor].integration.decideMcpApproval({
         ...request,
@@ -216,7 +243,7 @@ export async function approveOnce(
       approved.receipt.decision === "approved",
     "owner_admin_approval_receipt",
   );
-  await expectRejected(
+  const reversedDenied = await expectRejected(
     () =>
       principals[actor].integration.decideMcpApproval({
         ...request,
@@ -224,13 +251,14 @@ export async function approveOnce(
       }),
     [Code.Aborted, Code.FailedPrecondition],
   );
-  await expectRejected(
+  const replayDenied = await expectRejected(
     () => principals[actor].integration.decideMcpApproval(request),
     [Code.Aborted, Code.FailedPrecondition],
   );
   return {
     executionId: pending.executionId,
     contextHash: sha256(canonicalJson(pending.expectedReviewContext)),
+    rejections: { otherDenied, changedDenied, reversedDenied, replayDenied },
   };
 }
 export async function verifiedCounterResult(
@@ -310,11 +338,11 @@ export async function delivered(
       requireThat(currentPaths.length <= 4, "bounded_cli_launches");
       const proofs = await Promise.all(
         currentPaths.map((path) =>
-          readGuestProof(ctx, scenario.client, scenario.sessionId, path),
+          readGuestProofRecords(ctx, scenario.client, scenario.sessionId, path),
         ),
       );
       return proofs
-        .filter((value) => value !== null)
+        .flat()
         .filter(
           (value) =>
             value.proof.resultReceived &&

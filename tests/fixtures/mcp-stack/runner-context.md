@@ -134,12 +134,15 @@ It does not print exceptions, credentials, cookies, codes, arguments or results.
 
 ## Required unresolved seams
 
-1. The accepted model CLI always sends `{fixture:mode}`; the standalone counter
-   schema forbids this field. Write also needs an integer `delta`. The CLI's
-   current sentinel proof cannot establish exact `count=N`/`{count:N}` fidelity.
-   A bounded test-only CLI argument/result observation extension is required.
-2. The CLI always uses `fixture-call`; unresolved writes require distinct-ID as
-   well as repeated-ID probes. A bounded configurable call ID is required.
+1. The runner consumes the separately owned additive CLI contract: bounded
+   scalar arguments/call IDs/native expected result, or an immutable fixed call
+   plan with explicit prompt markers. Plans exclude scalar settings. Actual
+   exposure name-set hashes and native response hashes are verified. The CLI
+   source must be integrated before physical runs.
+2. Guest proof files are JSONL, one flushed completion per line, including
+   multiple turns in one process. Each record is validated and hashed separately.
+   Repeated markers retain call IDs; each prompt attempt uses a distinct prompt
+   ID so the public prompt deduplication layer cannot replace the replay probe.
 3. The compiled alias can be derived from the actual public connection ID/alias
    and upstream name, then must match paginated public GetSessionMcpState before
    prompting. No description-based selector or guessed alias prefix is needed.
@@ -150,8 +153,14 @@ It does not print exceptions, credentials, cookies, codes, arguments or results.
    Stage reads only its configured candidate. The fixed configuration/candidate
    variant contract above is approved; the adapters must implement and verify it.
 6. Child grant intersection needs an actual native child-task invocation.
-   The accepted deterministic CLI only issues MCP calls with no native binding.
+   The separately owned fixed plan supports an exact native spawn step and a
+   child message marker. Its implementation must be integrated first.
    Forged guest completion and direct bypass probes need actual guest transport,
    not a human owner's public call labeled as guest traffic.
-7. Coherent production startup and both physical adapters remain external work.
+7. The fixture OAuth control contract adds future-issued `expiresInSeconds`
+   (integer 1–3600; default 3600), observed under `oauth.expiresInSeconds`. The
+   runner uses 2 seconds and the actual coordinator clock. Existing token
+   deadlines do not change when the configuration changes. This separately
+   owned fixture extension must be integrated before a run.
+8. Coherent production startup and both physical adapters remain external work.
    No helper module or unit test in this directory establishes physical proof.

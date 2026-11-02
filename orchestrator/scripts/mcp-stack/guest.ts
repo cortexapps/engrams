@@ -89,6 +89,14 @@ export const NativeProofSchema = z.object({
     .string()
     .regex(/^sha256:[a-f0-9]{64}$/)
     .optional(),
+  exposedMcpToolNamesSha256: z
+    .string()
+    .regex(/^sha256:[a-f0-9]{64}$/)
+    .optional(),
+  planSha256: z
+    .string()
+    .regex(/^sha256:[a-f0-9]{64}$/)
+    .optional(),
   resultMatchesExpected: z.boolean().optional(),
   resultSha256: z
     .string()
@@ -100,23 +108,44 @@ export const NativeProofSchema = z.object({
     .optional(),
 });
 
+export function parseGuestProofRecords(bytes: Buffer) {
+  requireThat(bytes.length <= 1024 * 1024, "guest_proof_size");
+  const text = bytes.toString("utf8");
+  // Each flushed record is one line. A writer may currently be appending the final line.
+  const lines = text.split("\n");
+  lines.pop();
+  requireThat(lines.length <= 128, "guest_proof_record_bound");
+  return lines.map((line) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      throw new RunnerFailure("ASSERTION_FAILED", "guest_proof_json");
+    }
+    const proof = NativeProofSchema.safeParse(raw);
+    requireThat(proof.success, "guest_proof_shape");
+    return { proof: proof.data, sha256: sha256(line + "\n") };
+  });
+}
+export async function readGuestProofRecords(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  path: string,
+) {
+  return parseGuestProofRecords(
+    await readGuestFile(ctx, client, sessionId, path),
+  );
+}
 export async function readGuestProof(
   ctx: Context,
   client: PublicClient,
   sessionId: string,
   path: string,
 ) {
-  const bytes = await readGuestFile(ctx, client, sessionId, path);
-  if (bytes.length === 0) return null;
-  let raw: unknown;
-  try {
-    raw = JSON.parse(bytes.toString("utf8"));
-  } catch {
-    throw new RunnerFailure("ASSERTION_FAILED", "guest_proof_json");
-  }
-  const proof = NativeProofSchema.safeParse(raw);
-  requireThat(proof.success, "guest_proof_shape");
-  return { proof: proof.data, sha256: sha256(bytes) };
+  return (
+    (await readGuestProofRecords(ctx, client, sessionId, path)).at(-1) ?? null
+  );
 }
 
 export async function guestExec(

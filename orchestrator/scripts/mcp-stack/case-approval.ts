@@ -78,6 +78,7 @@ export async function interactiveApproval(
         protocol: ctx.protocolFixtures.modern.protocol,
         actor,
         approvalContextHash: approval.contextHash,
+        rejections: approval.rejections,
         resultHash: result.resultHash,
         proofHashes: completion.proofHashes,
         acknowledged: completion.outbox.acknowledged,
@@ -91,3 +92,49 @@ export async function interactiveApproval(
   requireThat(observations.length === 2, "owner_and_admin_approvals");
   return observations;
 }
+
+export const interactiveApprovalDriver: import("./driver.ts").CaseDriver =
+  async ({ ctx, principals, database, harness }) => {
+    const { completeAssertions } = await import("./driver.ts");
+    const rows = await interactiveApproval(ctx, principals, database, harness);
+    const views = rows.map((row) => ({
+      source: "public-rpc" as const,
+      identitySha256: row.approvalContextHash,
+      state: "authorized" as const,
+      contentSha256: sha256(
+        canonicalJson({ actor: row.actor, resultHash: row.resultHash }),
+      ),
+    }));
+    const effects = rows.map((row) => ({
+      source: "fixture-observer" as const,
+      identitySha256: row.approvalContextHash,
+      state: "succeeded" as const,
+      contentSha256: sha256(
+        canonicalJson({ before: row.beforeHash, after: row.afterHash }),
+      ),
+      count: 1,
+    }));
+    const denied = (field: "otherDenied" | "changedDenied" | "replayDenied") =>
+      rows.map((row) => ({
+        source: "public-rpc" as const,
+        identitySha256: row.approvalContextHash,
+        state: "denied" as const,
+        contentSha256: sha256(
+          canonicalJson({ field, code: row.rejections[field] }),
+        ),
+      }));
+    return completeAssertions("interactive-approval", [
+      { assertion: "owner-one-use", observations: [views[0]!] },
+      { assertion: "admin-one-use", observations: [views[1]!] },
+      { assertion: "other-member-denied", observations: denied("otherDenied") },
+      {
+        assertion: "changed-context-denied",
+        observations: denied("changedDenied"),
+      },
+      {
+        assertion: "replayed-decision-denied",
+        observations: denied("replayDenied"),
+      },
+      { assertion: "one-effect", observations: effects },
+    ]);
+  };
