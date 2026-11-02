@@ -78,8 +78,8 @@ pub fn server_with_policy(
                     state,
                 },
             )
-            .max_decoding_message_size(4 * 1024 * 1024)
-            .max_encoding_message_size(4 * 1024 * 1024),
+            .max_decoding_message_size(9 * 1024 * 1024)
+            .max_encoding_message_size(9 * 1024 * 1024),
         ))
 }
 impl Control {

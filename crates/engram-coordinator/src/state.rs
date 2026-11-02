@@ -1400,9 +1400,29 @@ impl HarnessEventWriter {
     /// withholds the acknowledgement and drops the connection, so the
     /// harness replays the event (ADR 0123 C4).
     fn sink(self: Arc<Self>) -> EventSink {
-        Arc::new(move |session, _sandbox, event, delivery| {
+        Arc::new(move |session, sandbox, event, delivery| {
             let writer = self.clone();
             Box::pin(async move {
+                if let Some(open) = writer
+                    .meta
+                    .managed_boot_open(session)
+                    .await
+                    .map_err(|e| engram_host_agent::harness::SinkError(e.to_string()))?
+                {
+                    let target = writer
+                        .meta
+                        .managed_policy_target(session)
+                        .await
+                        .map_err(|e| engram_host_agent::harness::SinkError(e.to_string()))?;
+                    if !open
+                        || target.sandbox_id != sandbox
+                        || delivery.as_ref().map(|d| d.binding_epoch) != Some(target.binding_epoch)
+                    {
+                        return Err(engram_host_agent::harness::SinkError(
+                            "managed event authority is closed".into(),
+                        ));
+                    }
+                }
                 writer
                     .emit(session, event, delivery)
                     .await
@@ -2551,6 +2571,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl MetadataStore for MiniMeta {
+        async fn managed_boot_open(&self, _: SessionId) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_sandbox_open(
+            &self,
+            _: engram_core::SandboxId,
+        ) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_tool_target_gone(&self, _: SessionId, _: &str) -> Result<bool, MetaError> {
+            Ok(false)
+        }
+
         /// ADR 0073: derive the idle-scan candidate from the mock's own
         /// session + event rows — the same "newest event" semantics the
         /// PG lateral implements, so idle_detector tests exercise real

@@ -200,6 +200,10 @@ pub(crate) async fn boot_on_reserved_host(
     // passes `SessionFence::unfenced()`.
     fence: SessionFence,
 ) -> Result<(), BootError> {
+    crate::managed_boot::gate(state, inputs.session_id, false)
+        .await
+        .map_err(BootError::NotStarted)?;
+
     let BootInputs {
         session_id,
         spec,

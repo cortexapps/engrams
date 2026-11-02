@@ -42,6 +42,13 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// `pub` so the DST harness (engram-dst, ADR 0098 D6) drives outbox
 /// delivery like the spawn loop does.
 pub async fn enqueue_deliver_op(state: &SharedState, session_id: engram_core::SessionId) {
+    if crate::managed_boot::gate(state, session_id, true)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
     match state
         .services
         .meta

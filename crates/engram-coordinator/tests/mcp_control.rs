@@ -234,6 +234,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
         };
         meta.reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
+                managed_initial_prompt: None,
                 managed_creation: Some(ManagedCreation {
                     identity: identity.clone(),
                     native: FrozenNativeManifest {
@@ -271,6 +272,53 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             write_eligibility: "read_only".into(),
             input_digest: identity.input_digest,
         };
+        let boot = policy_client
+            .read_managed_boot(wire::ReadManagedBootRequest {
+                protocol: 1,
+                identity: Some(native_identity.clone()),
+            })
+            .await;
+        if pinned {
+            assert!(boot.unwrap().into_inner().boot_json.is_none());
+        } else {
+            assert_eq!(boot.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
+        for protocol in [0, 1] {
+            let code = policy_client
+                .finalize_managed_boot(wire::FinalizeManagedBootRequest {
+                    protocol,
+                    input_json: b"{}".to_vec(),
+                })
+                .await
+                .unwrap_err()
+                .code();
+            assert_eq!(
+                code,
+                if pinned {
+                    tonic::Code::InvalidArgument
+                } else {
+                    tonic::Code::PermissionDenied
+                }
+            );
+        }
+        // A valid one-MiB manifest expands when encoded as JSON bytes. The
+        // service envelope must reach the bounded typed decoder above four MiB.
+        let large = policy_client
+            .finalize_managed_boot(wire::FinalizeManagedBootRequest {
+                protocol: 1,
+                input_json: vec![b' '; 5 * 1024 * 1024],
+            })
+            .await
+            .unwrap_err()
+            .code();
+        assert_eq!(
+            large,
+            if pinned {
+                tonic::Code::InvalidArgument
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        );
         let request = wire::ReadNativeManifestRequest {
             protocol: 1,
             identity: Some(native_identity.clone()),
@@ -322,6 +370,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             let policy_sid = engram_core::SessionId(uuid::Uuid::from_u128(1200));
             meta.reserve_and_persist_create(
                 engram_core::traits::SessionCreateWriteSet {
+                    managed_initial_prompt: None,
                     managed_creation: None,
                     mcp_policy: Some(McpPolicyCreation {
                         actor_id: "owner-a".into(),

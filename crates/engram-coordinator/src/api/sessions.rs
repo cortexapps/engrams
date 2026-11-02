@@ -778,6 +778,16 @@ async fn boot_prepared(
         ));
     }
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        managed_initial_prompt: if managed_creation.is_some() {
+            crate::api::prompt::managed_initial_prompt(
+                state,
+                session_id,
+                inputs.prompt.clone(),
+                inputs.harness_mode.clone(),
+            )?
+        } else {
+            None
+        },
         managed_creation: managed_creation.clone(),
         mcp_policy: mcp_creation,
         nbd_slot_need,

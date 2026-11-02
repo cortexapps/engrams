@@ -26,6 +26,7 @@ use engram_core::types::capture_job::{
 use engram_core::types::event::{ArtifactRow, EventCursor, PersistedEvent};
 use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::ids::CaptureJobId;
+use engram_core::types::managed_boot::*;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::registry::{EnableJob, EnableJobState};
 use engram_core::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
@@ -350,6 +351,31 @@ impl SimMetadataStore {
                 .map(|h| h.id)
         })
     }
+}
+
+fn managed_boot_read_locked(
+    db: &SimDb,
+    key: &ManagedBootKey,
+) -> Result<ManagedBootRecord, MetaError> {
+    key.validate()?;
+    managed_creation_source(db, &key.creation, false)?;
+    let r = db
+        .managed_boots
+        .get(&key.creation.session_id)
+        .ok_or_else(conflict)?;
+    let s = db
+        .sessions
+        .get(&key.creation.session_id)
+        .ok_or(MetaError::NotFound)?;
+    let t = &key.context.target;
+    if r.request.key != *key
+        || s.session.host_id != Some(t.host_id)
+        || s.session.sandbox_id != Some(t.sandbox_id)
+        || s.binding_epoch != t.binding_epoch as i64
+    {
+        return Err(conflict());
+    }
+    Ok(r.clone())
 }
 
 fn managed_creation_source(
@@ -887,6 +913,396 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    async fn get_managed_boot(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<Option<ManagedBootRecord>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        managed_creation_source(&db, identity, false)?;
+        db.managed_boots
+            .get(&identity.session_id)
+            .map(|r| managed_boot_read_locked(&db, &r.request.key))
+            .transpose()
+    }
+    async fn reserve_managed_capture(
+        &self,
+        request: &ManagedCaptureRequest,
+    ) -> Result<Option<ManagedCaptureAuthority>, MetaError> {
+        self.gate()?;
+        request.key.validate()?;
+        if request.capture_id.as_uuid().is_nil() {
+            return Err(conflict());
+        }
+        let mut db = self.db.lock();
+        if let Some((original, Some(authority))) = db.managed_captures.get(&request.capture_id) {
+            if original != request {
+                return Err(conflict());
+            }
+            managed_creation_source(&db, &request.key.creation, false)?;
+            return Ok(Some(authority.clone()));
+        }
+        let boot = managed_boot_read_locked(&db, &request.key)?;
+        if boot.phase != ManagedBootPhase::Interrupted || boot.prepared.is_none() {
+            return Err(conflict());
+        }
+        if let Some((old, authority)) = db.managed_captures.get(&request.capture_id) {
+            if old != request {
+                return Err(conflict());
+            }
+            return Ok(authority.clone());
+        }
+        if db.managed_captures.values().any(|(r, _)| {
+            r.key.creation.session_id == request.key.creation.session_id
+                && r.key.context.target.binding_epoch == request.key.context.target.binding_epoch
+        }) {
+            return Err(conflict());
+        }
+        db.managed_captures
+            .insert(request.capture_id, (request.clone(), None));
+        db.chunk_generation += 1;
+        Ok(None)
+    }
+    async fn record_managed_capture(
+        &self,
+        authority: &ManagedCaptureAuthority,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        authority.validate()?;
+        let mut db = self.db.lock();
+        let request = &authority.request;
+        let boot = managed_boot_read_locked(&db, &request.key)?;
+        if boot.phase != ManagedBootPhase::Interrupted
+            || boot.prepared.as_ref().map(|r| &r.host_incarnation)
+                != Some(&authority.host_incarnation)
+            || boot.request.cold.image != authority.image
+            || boot.request.cold.kernel_sha256 != authority.kernel_sha256
+            || boot.request.cold.aux_ro_drives != authority.aux_ro_drives
+        {
+            return Err(conflict());
+        }
+        let (original, prior) = db
+            .managed_captures
+            .get_mut(&request.capture_id)
+            .ok_or_else(conflict)?;
+        if original != request || prior.as_ref().is_some_and(|p| p != authority) {
+            return Err(conflict());
+        }
+        *prior = Some(authority.clone());
+        let s = db
+            .sessions
+            .get_mut(&request.key.creation.session_id)
+            .ok_or(MetaError::NotFound)?;
+        s.session.status = SessionState::Idle;
+        s.session.last_active_at = self.now();
+        s.updated_at = self.now();
+        Ok(())
+    }
+    async fn managed_sandbox_open(&self, sandbox: SandboxId) -> Result<Option<bool>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        if let Some(r) = db
+            .managed_boots
+            .values()
+            .find(|r| r.request.key.context.target.sandbox_id == sandbox)
+        {
+            return Ok(Some(
+                r.phase == ManagedBootPhase::Started
+                    && managed_operator_gate(&db, &r.request.key).is_ok()
+                    && db
+                        .sessions
+                        .get(&r.request.key.creation.session_id)
+                        .is_some_and(|s| s.session.status == SessionState::Active)
+                    && managed_boot_read_locked(&db, &r.request.key).is_ok(),
+            ));
+        }
+        Ok(db
+            .managed_captures
+            .values()
+            .any(|(r, _)| r.key.context.target.sandbox_id == sandbox)
+            .then_some(false))
+    }
+    async fn claim_managed_boot(
+        &self,
+        request: ManagedBootPrepare,
+    ) -> Result<ManagedBootRecord, MetaError> {
+        self.gate()?;
+        let spec = request.spec()?;
+        let mut db = self.db.lock();
+        managed_operator_gate(&db, &request.key)?;
+        let k = &request.key;
+        let t = &k.context.target;
+        let session = db.sessions.get(&t.session_id).ok_or(MetaError::NotFound)?;
+        if spec.image != session.session.image
+            || spec.cpu.vcpus == 0
+            || i64::from(spec.cpu.vcpus) > i64::from(session.cpu_budget_vcpus)
+            || spec.memory.max_mib == 0
+            || i64::from(spec.memory.max_mib) > session.mem_budget_mib
+        {
+            return Err(conflict());
+        }
+        let old = if let Some(prior) = db.managed_boots.get(&t.session_id) {
+            let prior = managed_boot_read_locked(&db, &prior.request.key)?;
+            if prior.request == request && prior.phase != ManagedBootPhase::Interrupted {
+                return Ok(prior);
+            }
+            if prior.phase != ManagedBootPhase::Interrupted {
+                return Err(conflict());
+            }
+            let engram_core::types::managed_cold::ManagedColdSource::Capture { capture_id, .. } =
+                request.cold.disk.source
+            else {
+                return Err(conflict());
+            };
+            let (_, capture) = db.managed_captures.get(&capture_id).ok_or_else(conflict)?;
+            let capture = capture.as_ref().ok_or_else(conflict)?;
+            if capture.request.key != prior.request.key {
+                return Err(conflict());
+            }
+            capture.validate_recovery(&request)?;
+            if request.capture_authority.as_ref() != Some(capture) {
+                return Err(MetaError::Conflict("capture authority mismatch".into()));
+            }
+            Some(prior)
+        } else {
+            None
+        };
+        let source = managed_creation_source(&db, &k.creation, old.is_none())?;
+        if source.native.digest != k.native_digest
+            || (old.is_none()
+                && (t.binding_epoch != 1
+                    || !matches!(
+                        request.cold.disk.source,
+                        engram_core::types::managed_cold::ManagedColdSource::FreshImage { .. }
+                    )))
+        {
+            return Err(conflict());
+        }
+        let retained = engram_core::types::managed_deny::retain_in_policy_json(
+            db.session_integration_policy
+                .get(&t.session_id)
+                .map(String::as_str),
+            &request.bootstrap_policy,
+        )
+        .map_err(MetaError::Conflict)?;
+        let s = db.sessions.get(&t.session_id).ok_or(MetaError::NotFound)?;
+        if Self::pick_host_2d(
+            &db,
+            &[t.host_id],
+            0,
+            s.mem_budget_mib,
+            i64::from(s.cpu_budget_vcpus),
+            s.nbd_slot_need,
+        ) != Some(t.host_id)
+            || db.managed_boots.values().any(|r| {
+                r.request.key.boot_attempt == k.boot_attempt
+                    || r.request.key.context.target.sandbox_id == t.sandbox_id
+            })
+        {
+            return Err(conflict());
+        }
+        let s = db
+            .sessions
+            .get_mut(&t.session_id)
+            .ok_or(MetaError::NotFound)?;
+        s.session.status = SessionState::Created;
+        s.session.host_id = Some(t.host_id);
+        s.session.sandbox_id = Some(t.sandbox_id);
+        s.binding_epoch = t.binding_epoch as i64;
+        s.queued_at = None;
+        s.queue_origin = None;
+        s.updated_at = self.now();
+        s.session.last_active_at = self.now();
+        db.session_integration_policy.insert(t.session_id, retained);
+        db.chunk_generation += 1;
+        let record = ManagedBootRecord::claimed(request);
+        db.managed_boots
+            .insert(record.request.key.creation.session_id, record.clone());
+        Ok(record)
+    }
+    async fn read_managed_boot(
+        &self,
+        key: &ManagedBootKey,
+    ) -> Result<ManagedBootRecord, MetaError> {
+        self.gate()?;
+        managed_boot_read_locked(&self.db.lock(), key)
+    }
+    async fn advance_managed_boot(
+        &self,
+        key: &ManagedBootKey,
+        revision: u64,
+        event: ManagedBootAdvance,
+    ) -> Result<ManagedBootRecord, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        if matches!(
+            &event,
+            ManagedBootAdvance::Finalize { .. }
+                | ManagedBootAdvance::IssueStart(_)
+                | ManagedBootAdvance::Started(_)
+        ) {
+            managed_operator_gate(&db, key)?;
+        }
+        let old = managed_boot_read_locked(&db, key)?;
+        if old.revision != revision {
+            return Err(conflict());
+        }
+        let source = managed_creation_source(&db, &key.creation, false)?;
+        let policy = engram_core::types::mcp_policy::compose_policy(&super::mcp_policy::nodes(
+            &db,
+            key.creation.session_id,
+        )?)?;
+        match &event {
+            ManagedBootAdvance::Finalize { write_policy, .. } if write_policy != &policy => {
+                return Err(conflict())
+            }
+            ManagedBootAdvance::IssueStart(_) | ManagedBootAdvance::Started(_)
+                if old.write_policy.as_ref() != Some(&policy) =>
+            {
+                return Err(conflict())
+            }
+            _ => {}
+        }
+        let next = old.advance(event, &source.native)?;
+        let sid = key.creation.session_id;
+        if let Some(retired) = &next.retired {
+            let retained = engram_core::types::managed_deny::retain_retired_in_policy_json(
+                db.session_integration_policy.get(&sid).map(String::as_str),
+                &retired.retained_policy,
+            )
+            .map_err(MetaError::Conflict)?;
+            db.session_integration_policy.insert(sid, retained);
+        }
+        if next.phase == ManagedBootPhase::Interrupted && old.phase != ManagedBootPhase::Interrupted
+        {
+            let session = db.sessions.get_mut(&sid).ok_or(MetaError::NotFound)?;
+            let floor = session.next_event_idx;
+            session.mcp_write_policy =
+                Some(engram_core::types::mcp_policy::StoredWritePolicy::restrict(
+                    session.mcp_write_policy.as_ref(),
+                    &format!("cold:{}", key.boot_attempt),
+                    floor,
+                )?);
+            db.managed_interrupted_floors.insert(sid, floor);
+            let run = db
+                .session_events
+                .get(&sid)
+                .and_then(|events| {
+                    events.iter().rev().find(|e| {
+                        e.rewound_at.is_none()
+                            && matches!(
+                                e.kind.as_str(),
+                                "run_started" | "run_completed" | "run_interrupted"
+                            )
+                    })
+                })
+                .filter(|e| e.kind == "run_started")
+                .and_then(|e| e.payload.get("run_id").and_then(|v| v.as_str()))
+                .map(str::to_string);
+            if let Some(run) = run {
+                super::mcp_policy::append(
+                    &mut db,
+                    sid,
+                    "run_interrupted",
+                    serde_json::json!({"type":"run_interrupted","run_id":run,"at":self.now()}),
+                    self.now(),
+                )?;
+            }
+            db.managed_interrupted
+                .insert((sid, key.context.target.binding_epoch));
+            for row in db.outbox.values_mut().filter(|r| {
+                r.session_id == sid
+                    && r.kind == engram_core::types::outbox::OutboxKind::ToolResult
+                    && r.acked_at.is_none()
+            }) {
+                row.acked_at = Some(self.now());
+            }
+        }
+        if next.phase == ManagedBootPhase::Started {
+            let s = db.sessions.get_mut(&sid).ok_or(MetaError::NotFound)?;
+            s.session.status = SessionState::Active;
+            s.session.last_active_at = self.now();
+            s.updated_at = self.now();
+        }
+        db.managed_boots.insert(sid, next.clone());
+        Ok(next)
+    }
+    async fn list_managed_boots(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<ManagedBootKey>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .managed_boots
+            .values()
+            .filter(|r| after.is_none_or(|id| r.request.key.creation.session_id > id))
+            .filter(|r| {
+                matches!(
+                    r.phase,
+                    ManagedBootPhase::Claimed
+                        | ManagedBootPhase::Prepared
+                        | ManagedBootPhase::Finalizing
+                        | ManagedBootPhase::Finalized
+                        | ManagedBootPhase::StartIssued
+                        | ManagedBootPhase::Started
+                )
+            })
+            .take(limit.min(128) as usize)
+            .map(|r| r.request.key.clone())
+            .collect())
+    }
+    async fn managed_boot_open(&self, sid: SessionId) -> Result<Option<bool>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        if !db.managed_creations.contains_key(&sid) {
+            return Ok(None);
+        }
+        Ok(Some(db.managed_boots.get(&sid).is_some_and(|r| {
+            r.phase == ManagedBootPhase::Started
+                && managed_operator_gate(&db, &r.request.key).is_ok()
+                && db
+                    .sessions
+                    .get(&sid)
+                    .is_some_and(|s| s.session.status == SessionState::Active)
+                && managed_boot_read_locked(&db, &r.request.key).is_ok()
+        })))
+    }
+    async fn managed_tool_target_gone(
+        &self,
+        sid: SessionId,
+        call: &str,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let floor = db
+            .managed_interrupted_floors
+            .get(&sid)
+            .copied()
+            .unwrap_or(0);
+        Ok(db.managed_creations.contains_key(&sid)
+            && !db.session_events.get(&sid).is_some_and(|events| {
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.kind == "tool_call_requested" && e.payload["tool_call_id"] == call
+                    })
+                    .map(|e| e.idx)
+                    .min()
+                    .is_some_and(|idx| idx >= floor)
+            }))
+    }
+    async fn managed_delivery_target_gone(
+        &self,
+        sid: SessionId,
+        epoch: u64,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().managed_interrupted.contains(&(sid, epoch)))
+    }
+
     async fn read_managed_creation(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
@@ -922,6 +1338,9 @@ impl MetadataStore for SimMetadataStore {
             creation.validate_for(&ws)?;
         }
         self.gate()?;
+        if let Some(initial) = &ws.managed_initial_prompt {
+            initial.validate(&ws)?;
+        }
         let now = self.now();
         let mut db = self.db.lock();
         if let Some(creation) = &ws.managed_creation {
@@ -930,6 +1349,12 @@ impl MetadataStore for SimMetadataStore {
                     return Err(MetaError::Conflict(
                         "managed creation association changed".into(),
                     ));
+                }
+                let prior = db.outbox.get(&format!("create:{}", ws.session_id));
+                if prior.map(|p| &p.payload)
+                    != ws.managed_initial_prompt.as_ref().map(|p| &p.row.payload)
+                {
+                    return Err(MetaError::Conflict("managed initial prompt changed".into()));
                 }
                 return Ok(CreateDisposition::Queued);
             }
@@ -1050,6 +1475,24 @@ impl MetadataStore for SimMetadataStore {
         }
         if let Some(binding) = ws.oauth_binding {
             db.session_oauth_bindings.insert(ws.session_id, binding);
+        }
+        if let Some(initial) = ws.managed_initial_prompt {
+            if initial.row.payload["mode"] == "plan" {
+                let session = db
+                    .sessions
+                    .get_mut(&ws.session_id)
+                    .ok_or(MetaError::NotFound)?;
+                session.mcp_write_policy =
+                    Some(engram_core::types::mcp_policy::StoredWritePolicy::restrict(
+                        session.mcp_write_policy.as_ref(),
+                        &initial.row.prompt_id,
+                        session.next_event_idx,
+                    )?);
+            }
+            db.outbox.insert(initial.row.prompt_id.clone(), initial.row);
+            for (kind, payload) in initial.events {
+                super::mcp_policy::append(&mut db, ws.session_id, &kind, payload, now)?;
+            }
         }
         drop(db);
         match picked {
@@ -4155,12 +4598,18 @@ impl MetadataStore for SimMetadataStore {
     async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        Ok(db
-            .sessions
+        let mut refs: std::collections::BTreeSet<_> = db
+            .snapshots
             .values()
-            .filter_map(|r| r.session.live_disk_manifest.as_ref())
-            .map(|m| m.manifest_id)
-            .collect())
+            .filter_map(|s| s.disk_manifest.map(|m| m.manifest_id))
+            .collect();
+        refs.extend(
+            db.managed_boots
+                .values()
+                .map(|r| r.request.cold.disk.manifest.manifest_id),
+        );
+        refs.extend(db.managed_captures.keys().map(|id| id.as_uuid()));
+        Ok(refs.into_iter().collect())
     }
 
     /// Queued totals: count + Σ budgets.
@@ -4215,6 +4664,7 @@ impl MetadataStore for SimMetadataStore {
             ));
         }
         let mut db = self.db.lock();
+        require_tool_result_target(&db, row)?;
         if !db.sessions.contains_key(&session_id) {
             return Err(MetaError::NotFound);
         }
@@ -4254,6 +4704,7 @@ impl MetadataStore for SimMetadataStore {
             ));
         }
         let mut db = self.db.lock();
+        require_tool_result_target(&db, row)?;
         let session = db.sessions.get(&session_id).ok_or(MetaError::NotFound)?;
         if let Some(existing) = db.outbox.get(&row.prompt_id) {
             if existing.session_id != row.session_id
@@ -5090,7 +5541,29 @@ impl MetadataStore for SimMetadataStore {
     }
 
     async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
-        panic!("SimMeta: list_live_session_disk_manifest_ids not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let db = self.db.lock();
+        let mut refs: std::collections::BTreeSet<_> = db
+            .sessions
+            .values()
+            .filter_map(|s| s.session.live_disk_manifest)
+            .map(|m| (m.manifest_id, m.version))
+            .collect();
+        refs.extend(db.managed_boots.values().map(|r| {
+            let m = r.request.cold.disk.manifest;
+            (m.manifest_id, m.version)
+        }));
+        refs.extend(db.managed_captures.values().map(|(r, _)| {
+            let m = r.disk_manifest();
+            (m.manifest_id, m.version)
+        }));
+        Ok(refs
+            .into_iter()
+            .map(|(manifest_id, version)| ManifestRef {
+                manifest_id,
+                version,
+            })
+            .collect())
     }
 
     async fn list_org_secrets(
@@ -6469,4 +6942,59 @@ fn put_oauth_credential_in(
     db.oauth_refresh_claims.remove(&credential.key);
     db.oauth_credentials.insert(credential.key, row.clone());
     Ok(row)
+}
+
+fn managed_operator_gate(db: &super::SimDb, key: &ManagedBootKey) -> Result<(), MetaError> {
+    if db
+        .managed_operator_gate
+        .as_ref()
+        .is_some_and(|(generation, identity, open)| {
+            *open
+                && *generation == key.context.operator_generation
+                && identity == &key.context.operator_identity
+        })
+    {
+        Ok(())
+    } else {
+        Err(MetaError::Conflict(
+            "managed operator generation is closed".into(),
+        ))
+    }
+}
+
+fn require_tool_result_target(
+    db: &SimDb,
+    row: &engram_core::types::outbox::OutboxRow,
+) -> Result<(), MetaError> {
+    if row.kind == engram_core::types::outbox::OutboxKind::ToolResult
+        && db.managed_creations.contains_key(&row.session_id)
+    {
+        let call = row
+            .payload
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let idx = db
+            .session_events
+            .get(&row.session_id)
+            .and_then(|events| {
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.kind == "tool_call_requested" && e.payload["tool_call_id"] == call
+                    })
+                    .map(|e| e.idx)
+                    .min()
+            })
+            .unwrap_or(-1);
+        if idx
+            < db.managed_interrupted_floors
+                .get(&row.session_id)
+                .copied()
+                .unwrap_or(0)
+        {
+            return Err(MetaError::Conflict("delivery target gone".into()));
+        }
+    }
+    Ok(())
 }

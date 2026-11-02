@@ -1027,6 +1027,7 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
@@ -4160,6 +4161,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
@@ -5836,6 +5838,7 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
@@ -6331,6 +6334,7 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
@@ -7112,6 +7116,7 @@ async fn nbd_host_placement(ctx: &Ctx) {
     assert_eq!(read.utilization.nbd_slots_total, 4);
     assert_eq!(read.utilization.nbd_slots_in_use, 1);
     let ws = |need| SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: need,
@@ -7553,6 +7558,7 @@ async fn mcp_guest_binding_rejected(ctx: &Ctx) {
         .unwrap();
     let sid = SessionId::from(uuid::Uuid::from_u128(4));
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 0,
@@ -8134,6 +8140,7 @@ async fn mcp_write_policy_create(
     ctx.meta
         .reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
+                managed_initial_prompt: None,
                 managed_creation: None,
                 mcp_policy: Some(McpPolicyCreation {
                     actor_id: "owner-a".into(),
@@ -8887,6 +8894,7 @@ fn managed_creation_ws(id: SessionId) -> engram_core::traits::SessionCreateWrite
     };
     let bytes = br#" [ {"name":"native","description":"all fields","inputSchema":{},"execution":"sync","nativeBindings":{"codex":"native"},"extra":true} ] "#.to_vec();
     engram_core::traits::SessionCreateWriteSet {
+        managed_initial_prompt: None,
         managed_creation: Some(ManagedCreation {
             identity: ManagedCreateIdentity {
                 session_id: id,
@@ -9299,4 +9307,825 @@ async fn managed_creation_held_retry_denies_requeued_epoch(ctx: &Ctx) {
 conformance!(
     t_managed_creation_held_retry_denies_requeued_epoch,
     super::managed_creation_held_retry_denies_requeued_epoch
+);
+
+fn managed_boot_request(
+    ws: &engram_core::traits::SessionCreateWriteSet,
+    host: HostId,
+) -> engram_core::types::managed_boot::ManagedBootPrepare {
+    use engram_core::types::{managed_boot::*, managed_cold::*, managed_deny::*, sandbox::*};
+    let creation = ws.managed_creation.as_ref().unwrap();
+    let sandbox_id = engram_core::SandboxId::new();
+    let disk = engram_core::types::manifest::ManifestRef::new();
+    let drives: Vec<_> = (0..3)
+        .map(|i| AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(i),
+            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            fs_type: "squashfs".into(),
+            sha256: Some("a".repeat(64)),
+        })
+        .collect();
+    let spec = SandboxSpec {
+        image: ws.spec.image.clone(),
+        rootfs_source: Some("disk.ext4".into()),
+        image_uri: None,
+        rootfs_manifest: Some(disk),
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: Default::default(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: drives.clone(),
+        swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
+    };
+    ManagedBootPrepare {
+        capture_authority: None,
+        bootstrap_policy: ManagedDenyPolicy::new(1, ["tools.example".into()]).unwrap(),
+        key: ManagedBootKey {
+            creation: creation.identity.clone(),
+            context: ManagedPolicyContext {
+                target: ManagedPolicyTarget {
+                    session_id: ws.session_id,
+                    host_id: host,
+                    sandbox_id,
+                    binding_epoch: 1,
+                },
+                operator_generation: 1,
+                operator_identity: engram_core::types::managed_create::digest(b"operator"),
+                binding_hash: None,
+            },
+            boot_attempt: format!("boot-{}", ws.session_id),
+            native_digest: creation.native.digest.clone(),
+        },
+        cold: ManagedColdPrepare {
+            version: 1,
+            session_id: ws.session_id,
+            sandbox_id,
+            boot_attempt: format!("boot-{}", ws.session_id),
+            image: spec.image.clone(),
+            disk: ManagedColdDisk {
+                manifest: disk,
+                sha256: "b".repeat(64),
+                size_bytes: 4096,
+                source: ManagedColdSource::FreshImage {
+                    base_manifest: engram_core::types::manifest::ManifestRef::new(),
+                },
+            },
+            kernel_sha256: "c".repeat(64),
+            aux_ro_drives: drives,
+        },
+        sandbox_spec_json: serde_json::to_string(&spec).unwrap(),
+    }
+}
+async fn managed_boot_claim_is_atomic_and_exact(ctx: &Ctx) {
+    use engram_core::types::managed_boot::*;
+    let ws = managed_creation_ws(SessionId::new());
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.managed_boot_open(ws.session_id).await.unwrap(),
+        Some(false)
+    );
+    let request = managed_boot_request(&ws, host);
+    assert!(ctx.meta.claim_managed_boot(request.clone()).await.is_err());
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    for field in ["image", "cpu", "memory"] {
+        let mut invalid = request.clone();
+        let mut spec = invalid.spec().unwrap();
+        match field {
+            "image" => {
+                spec.image = "test.invalid/another:latest".into();
+                invalid.cold.image = spec.image.clone();
+            }
+            "cpu" => spec.cpu.vcpus = u32::try_from(ws.cpu_budget_vcpus).unwrap() + 1,
+            _ => spec.memory.max_mib = u32::try_from(ws.mem_budget_mib).unwrap() + 1,
+        }
+        invalid.sandbox_spec_json = serde_json::to_string(&spec).unwrap();
+        assert!(ctx.meta.claim_managed_boot(invalid).await.is_err());
+        assert!(ctx
+            .meta
+            .get_managed_boot(&request.key.creation)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let (a, b) = tokio::join!(
+        ctx.meta.claim_managed_boot(request.clone()),
+        ctx.meta.claim_managed_boot(request.clone())
+    );
+    assert_eq!(a.unwrap().revision, 1);
+    assert_eq!(b.unwrap().revision, 1);
+    let row = ctx.meta.read_managed_boot(&request.key).await.unwrap();
+    assert_eq!(row.phase, ManagedBootPhase::Claimed);
+    assert_eq!(
+        ctx.meta.managed_policy_target(ws.session_id).await.unwrap(),
+        request.key.context.target
+    );
+    assert!(ctx
+        .meta
+        .read_held_managed_creation(&request.key.creation)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.list_managed_boots(None, 10).await.unwrap(),
+        vec![request.key.clone()]
+    );
+    for n in 0..8 {
+        let mut wrong = request.clone();
+        match n {
+            0 => wrong.key.boot_attempt.push('x'),
+            1 => wrong.key.context.target.binding_epoch += 1,
+            2 => wrong.key.context.operator_generation += 1,
+            3 => wrong.key.native_digest = engram_core::types::managed_create::digest(b"wrong"),
+            4 => wrong.key.creation.task_id.push('x'),
+            5 => wrong.key.context.target.host_id = HostId::new(),
+            6 => wrong.key.context.target.sandbox_id = engram_core::SandboxId::new(),
+            _ => wrong.key.creation.policy.parent_session_id = Some(SessionId::new()),
+        }
+        assert!(ctx.meta.claim_managed_boot(wrong.clone()).await.is_err());
+        assert!(ctx.meta.read_managed_boot(&wrong.key).await.is_err());
+    }
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot(&request.key)
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+}
+conformance!(
+    t_managed_boot_claim_is_atomic_and_exact,
+    super::managed_boot_claim_is_atomic_and_exact
+);
+
+// Fixture only: this exercises the real transactional predicate, not the
+// authenticated publisher or public admission (which remain closed).
+async fn managed_operator_gate_fixture(
+    ctx: &Ctx,
+    key: &engram_core::types::managed_boot::ManagedBootKey,
+    open: bool,
+) {
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.managed_operator_gate = Some((
+                key.context.operator_generation,
+                key.context.operator_identity.clone(),
+                open,
+            ))
+        });
+    } else {
+        sqlx::query("UPDATE managed_operator_generation_gate SET published_generation=$1,published_identity=$2,admission_open=$3 WHERE singleton")
+            .bind(key.context.operator_generation as i64).bind(&key.context.operator_identity).bind(open)
+            .execute(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap();
+    }
+}
+
+async fn managed_boot_prepared_fixture(
+    ctx: &Ctx,
+) -> (
+    engram_core::traits::SessionCreateWriteSet,
+    engram_core::types::managed_boot::ManagedBootRecord,
+) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let ws = managed_creation_ws(SessionId::new());
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let request = managed_boot_request(&ws, host);
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    let row = ctx.meta.claim_managed_boot(request.clone()).await.unwrap();
+    let prepared = ManagedBootPreparedReceipt {
+        request,
+        host_incarnation: "host-incarnation".into(),
+        network_identity: digest(b"network"),
+        guest_ip: "192.0.2.2".parse().unwrap(),
+        receipt_id: digest(b"prepared"),
+    };
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            ManagedBootAdvance::Prepared(Box::new(prepared)),
+        )
+        .await
+        .unwrap();
+    (ws, row)
+}
+async fn managed_boot_finalized_fixture(
+    ctx: &Ctx,
+) -> engram_core::types::managed_boot::ManagedBootRecord {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_deny::*};
+    let (ws, row) = managed_boot_prepared_fixture(ctx).await;
+    let prepared = row.prepared.clone().unwrap();
+    let mut context = row.request.key.context.clone();
+    context.binding_hash = Some(digest(b"binding"));
+    let policy = ManagedAppliedState::new(
+        context.clone(),
+        row.request.bootstrap_policy.clone(),
+        prepared.host_incarnation.clone(),
+        "proxy-incarnation".into(),
+        Some(ManagedNetworkProof {
+            target: context.target,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            network_identity: prepared.network_identity.clone(),
+        }),
+    )
+    .unwrap();
+    let bytes = ws.managed_creation.unwrap().native.bytes;
+    let f = ManagedBootFinalization {
+        prepared,
+        policy,
+        native_version: 1,
+        combined_manifest_digest: digest(&bytes),
+        combined_manifest: bytes,
+        agent_digest: digest(b"sealed fixture agent"),
+    };
+    let sealed_agent = ManagedBootSealedAgent {
+        wrapped_dek: vec![1],
+        nonce: vec![2; 12],
+        ciphertext: vec![3],
+        key_id: "fixture".into(),
+    };
+    let write_policy = ctx.meta.read_mcp_write_policy(ws.session_id).await.unwrap();
+    for bad_policy in [
+        ManagedDenyPolicy::new(2, []).unwrap(),
+        ManagedDenyPolicy::new(0, ["tools.example".into()]).unwrap(),
+    ] {
+        let mut wrong = f.clone();
+        wrong.policy = ManagedAppliedState::new(
+            wrong.policy.context.clone(),
+            bad_policy,
+            wrong.policy.host_incarnation.clone(),
+            wrong.policy.proxy_incarnation.clone(),
+            wrong.policy.network_proof.clone(),
+        )
+        .unwrap();
+        assert!(ctx
+            .meta
+            .advance_managed_boot(
+                &row.request.key,
+                row.revision,
+                ManagedBootAdvance::Finalize {
+                    finalization: Box::new(wrong),
+                    sealed_agent: sealed_agent.clone(),
+                    write_policy: write_policy.clone(),
+                }
+            )
+            .await
+            .is_err());
+    }
+    let command = ManagedBootAdvance::Finalize {
+        finalization: Box::new(f.clone()),
+        sealed_agent,
+        write_policy,
+    };
+    managed_operator_gate_fixture(ctx, &row.request.key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(&row.request.key, row.revision, command.clone())
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, &row.request.key, true).await;
+    let finalized = ctx
+        .meta
+        .advance_managed_boot(&row.request.key, row.revision, command)
+        .await
+        .unwrap();
+    let receipt = ManagedBootFinalReceipt {
+        key: row.request.key.clone(),
+        prepared_receipt_id: f.prepared.receipt_id.clone(),
+        finalization_digest: f.digest().unwrap(),
+        host_incarnation: f.prepared.host_incarnation,
+        network_identity: f.prepared.network_identity,
+        receipt_id: digest(b"final"),
+    };
+    let mut wrong = receipt.clone();
+    wrong.finalization_digest = digest(b"wrong");
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            &row.request.key,
+            finalized.revision,
+            ManagedBootAdvance::Finalized(wrong)
+        )
+        .await
+        .is_err());
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            finalized.revision,
+            ManagedBootAdvance::Finalized(receipt),
+        )
+        .await
+        .unwrap()
+}
+async fn managed_boot_start_is_single_cas_and_generation_gated(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let start = ManagedBootStart {
+        receipt: row.receipt.clone().unwrap(),
+        start_id: digest(b"start"),
+    };
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        )
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, true).await;
+    let (a, b) = tokio::join!(
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        ),
+        ctx.meta.advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone())
+        )
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let issued = ctx.meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(issued.phase, ManagedBootPhase::StartIssued);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    let mut wrong = start.clone();
+    wrong.start_id = digest(b"other start");
+    assert!(ctx
+        .meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(wrong))
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert!(ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            issued.revision,
+            ManagedBootAdvance::Started(start.clone())
+        )
+        .await
+        .is_err());
+    managed_operator_gate_fixture(ctx, key, true).await;
+    let started = ctx
+        .meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(start))
+        .await
+        .unwrap();
+    assert_eq!(started.phase, ManagedBootPhase::Started);
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    managed_operator_gate_fixture(ctx, key, false).await;
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        ctx.meta.list_managed_boots(None, 128).await.unwrap(),
+        vec![key.clone()]
+    );
+    assert!(ctx
+        .meta
+        .list_managed_boots(Some(key.creation.session_id), 128)
+        .await
+        .unwrap()
+        .is_empty());
+}
+conformance!(
+    t_managed_boot_start_is_single_cas_and_generation_gated,
+    super::managed_boot_start_is_single_cas_and_generation_gated
+);
+
+async fn managed_boot_interrupt_capture_and_recovery(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_cold::ManagedColdSource};
+    let (_, row) = managed_boot_prepared_fixture(ctx).await;
+    let key = &row.request.key;
+    let sid = key.creation.session_id;
+    let request = ManagedCaptureRequest {
+        key: key.clone(),
+        capture_id: SnapshotId::new(),
+    };
+    assert!(ctx.meta.reserve_managed_capture(&request).await.is_err());
+    ctx.meta
+        .append_session_event(sid, "run_started", serde_json::json!({"run_id":"run-old"}))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_requested",
+            serde_json::json!({"tool_call_id":"call-old","run_id":"run-old"}),
+        )
+        .await
+        .unwrap();
+    assert!(!ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    let now = ctx.clock.now_utc();
+    let result = engram_core::types::outbox::OutboxRow {
+        prompt_id: format!("tool_result:{sid}:call-old"),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({"tool_call_id":"call-old","result_json":"{}"}),
+        created_at: now,
+        not_before: now,
+        attempts: 0,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id":"call-old"}),
+            &result,
+        )
+        .await
+        .unwrap();
+    let mut pending = result.clone();
+    pending.prompt_id = format!("pending:{sid}");
+    pending.kind = engram_core::types::outbox::OutboxKind::Prompt;
+    pending.payload = serde_json::json!({"text":"next"});
+    ctx.meta.outbox_enqueue(&pending).await.unwrap();
+    ctx.meta
+        .advance_managed_boot(key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .outbox_get(&result.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_some());
+    assert!(ctx
+        .meta
+        .outbox_get(&pending.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    assert!(ctx
+        .meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id":"call-old"}),
+            &result
+        )
+        .await
+        .is_err());
+    let events = ctx
+        .meta
+        .list_session_events_since(sid, -1, 20)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "run_interrupted" && e.payload["run_id"] == "run-old"));
+    assert!(ctx.meta.managed_delivery_target_gone(sid, 1).await.unwrap());
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    assert!(!ctx.meta.managed_delivery_target_gone(sid, 2).await.unwrap());
+    assert!(ctx
+        .meta
+        .reserve_managed_capture(&request)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .meta
+        .list_live_session_disk_manifest_ids()
+        .await
+        .unwrap()
+        .contains(&request.disk_manifest()));
+    assert!(ctx
+        .meta
+        .list_live_disk_manifest_ids()
+        .await
+        .unwrap()
+        .contains(&request.disk_manifest().manifest_id));
+    let mut competing = request.clone();
+    competing.capture_id = SnapshotId::new();
+    assert!(ctx.meta.reserve_managed_capture(&competing).await.is_err());
+    let cold = &row.request.cold;
+    let mut authority = ManagedCaptureAuthority {
+        version: 1,
+        request: request.clone(),
+        host_incarnation: row.prepared.unwrap().host_incarnation,
+        disk_manifest: request.disk_manifest(),
+        disk_sha256: "d".repeat(64),
+        disk_size_bytes: 4096,
+        image: cold.image.clone(),
+        kernel_sha256: cold.kernel_sha256.clone(),
+        aux_ro_drives: cold.aux_ro_drives.clone(),
+        consistency: ManagedDiskConsistency::CrashConsistentDiskCutV1,
+        source_state: ManagedCapturedSourceState::Destroyed,
+        record_digest: String::new(),
+    };
+    authority.record_digest = authority.digest().unwrap();
+    let mut wrong = authority.clone();
+    wrong.host_incarnation = "unknown".into();
+    wrong.record_digest = wrong.digest().unwrap();
+    assert!(ctx.meta.record_managed_capture(&wrong).await.is_err());
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    ctx.meta.record_managed_capture(&authority).await.unwrap();
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority.clone())
+    );
+    let mut next = row.request.clone();
+    next.key.context.target.binding_epoch += 1;
+    next.key.context.target.sandbox_id = engram_core::SandboxId::new();
+    next.key.boot_attempt.push_str("-next");
+    next.cold.boot_attempt = next.key.boot_attempt.clone();
+    next.cold.sandbox_id = next.key.context.target.sandbox_id;
+    next.cold.disk.manifest = authority.disk_manifest;
+    next.cold.disk.sha256 = authority.disk_sha256.clone();
+    next.cold.disk.source = ManagedColdSource::Capture {
+        capture_id: request.capture_id,
+        session_id: sid,
+        sandbox_id: key.context.target.sandbox_id,
+        binding_epoch: 1,
+        record_digest: authority.record_digest.clone(),
+    };
+    let mut spec = next.spec().err();
+    assert!(
+        spec.take().is_some(),
+        "capture-shaped input without authority is rejected"
+    );
+    let mut sandbox: engram_core::types::sandbox::SandboxSpec =
+        serde_json::from_str(&next.sandbox_spec_json).unwrap();
+    sandbox.rootfs_manifest = Some(authority.disk_manifest);
+    next.sandbox_spec_json = serde_json::to_string(&sandbox).unwrap();
+    next.capture_authority = Some(authority.clone());
+    next.spec().unwrap();
+    let recovered = ctx.meta.claim_managed_boot(next.clone()).await.unwrap();
+    assert_eq!(recovered.phase, ManagedBootPhase::Claimed);
+    assert_eq!(recovered.request.key.context.target.binding_epoch, 2);
+    assert_eq!(
+        ctx.meta.reserve_managed_capture(&request).await.unwrap(),
+        Some(authority)
+    );
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_requested",
+            serde_json::json!({"tool_call_id":"call-old","run_id":"run-new"}),
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+    assert!(ctx.meta.read_managed_boot(key).await.is_err());
+    assert_eq!(
+        ctx.meta
+            .managed_sandbox_open(key.context.target.sandbox_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "call-old")
+        .await
+        .unwrap());
+}
+conformance!(
+    t_managed_boot_interrupt_capture_and_recovery,
+    super::managed_boot_interrupt_capture_and_recovery
+);
+
+async fn managed_boot_initial_prompt_is_atomic(ctx: &Ctx) {
+    use engram_core::{
+        traits::metadata::ManagedInitialPrompt,
+        types::outbox::{OutboxKind, OutboxRow},
+    };
+    let mut ws = managed_creation_ws(SessionId::new());
+    let now = ctx.clock.now_utc();
+    let prompt_id = format!("create:{}", ws.session_id);
+    ws.managed_initial_prompt = Some(ManagedInitialPrompt {
+        row: OutboxRow {
+            session_id: ws.session_id,
+            prompt_id: prompt_id.clone(),
+            kind: OutboxKind::Prompt,
+            payload: serde_json::json!({"text":"first prompt","mode":"plan"}),
+            created_at: now,
+            not_before: now,
+            attempts: 0,
+            delivered_at: None,
+            acked_at: None,
+        },
+        events: vec![(
+            "prompt_received".into(),
+            serde_json::json!({"prompt_id":prompt_id}),
+        )],
+    });
+    let mut bad = ws.clone();
+    bad.managed_initial_prompt.as_mut().unwrap().row.session_id = SessionId::new();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(bad, &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(ws.session_id).await.is_err());
+    assert!(ctx.meta.outbox_get(&prompt_id).await.unwrap().is_none());
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    let row = ctx.meta.outbox_get(&prompt_id).await.unwrap().unwrap();
+    assert_eq!(row.payload["text"], "first prompt");
+    assert!(row.acked_at.is_none() && row.delivered_at.is_none());
+    assert_eq!(
+        ctx.meta
+            .list_session_events_since(ws.session_id, -1, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut changed = ws.clone();
+    changed.managed_initial_prompt.as_mut().unwrap().row.payload["text"] =
+        serde_json::json!("changed");
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(changed, &[], 0)
+        .await
+        .is_err());
+    let mut absent = ws.clone();
+    absent.managed_initial_prompt = None;
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(absent, &[], 0)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta.managed_boot_open(ws.session_id).await.unwrap(),
+        Some(false)
+    );
+}
+conformance!(
+    t_managed_boot_initial_prompt_is_atomic,
+    super::managed_boot_initial_prompt_is_atomic
+);
+
+async fn managed_boot_retirement_preserves_source_and_next_deny(ctx: &Ctx) {
+    use engram_core::types::{
+        managed_boot::*, managed_create::digest, managed_deny::ManagedDenyPolicy,
+    };
+    for newer_desired in [false, true] {
+        let (_, row) = managed_boot_prepared_fixture(ctx).await;
+        let key = &row.request.key;
+        let receipt = ManagedBootRetiredReceipt {
+            prepared: row.prepared.clone().unwrap(),
+            retained_policy: ManagedDenyPolicy::new(
+                2,
+                ["tools.example".into(), "next.example".into()],
+            )
+            .unwrap(),
+            receipt_id: digest(b"retired"),
+        };
+        let mut wrong = receipt.clone();
+        wrong.prepared.host_incarnation = "different".into();
+        assert!(ctx
+            .meta
+            .advance_managed_boot(
+                key,
+                row.revision,
+                ManagedBootAdvance::Retired(Box::new(wrong))
+            )
+            .await
+            .is_err());
+        let expected_policy = if newer_desired {
+            let newer = ManagedDenyPolicy::new(
+                3,
+                [
+                    "tools.example".into(),
+                    "next.example".into(),
+                    "later.example".into(),
+                ],
+            )
+            .unwrap();
+            ctx.meta
+                .bind_session_integration_policy(
+                    key.creation.session_id,
+                    &serde_json::json!({"managed_deny":newer}).to_string(),
+                )
+                .await
+                .unwrap();
+            newer
+        } else {
+            receipt.retained_policy.clone()
+        };
+        let closed = ctx
+            .meta
+            .advance_managed_boot(
+                key,
+                row.revision,
+                ManagedBootAdvance::Retired(Box::new(receipt.clone())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.phase, ManagedBootPhase::Interrupted);
+        assert_eq!(closed.retired, Some(receipt.clone()));
+        let retained: serde_json::Value = serde_json::from_str(
+            &ctx.meta
+                .get_session_integration_policy(key.creation.session_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retained["managed_deny"],
+            serde_json::to_value(expected_policy).unwrap()
+        );
+        assert!(ctx
+            .meta
+            .reserve_managed_capture(&ManagedCaptureRequest {
+                key: key.clone(),
+                capture_id: SnapshotId::new()
+            })
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ctx.meta
+                .managed_boot_open(key.creation.session_id)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+    }
+}
+conformance!(
+    t_managed_boot_retirement_preserves_source_and_next_deny,
+    super::managed_boot_retirement_preserves_source_and_next_deny
 );

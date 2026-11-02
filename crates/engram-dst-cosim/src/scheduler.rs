@@ -120,6 +120,7 @@ impl Cosim {
         use engram_core::traits::Entropy as _;
         let session_id = SessionId::from(self.world.entropy.uuid());
         let ws = SessionCreateWriteSet {
+            managed_initial_prompt: None,
             managed_creation: None,
             mcp_policy: None,
             nbd_slot_need: 1,

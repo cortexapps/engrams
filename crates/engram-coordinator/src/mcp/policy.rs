@@ -210,6 +210,54 @@ fn require_managed_create_admission() -> Result<(), Status> {
 
 #[tonic::async_trait]
 impl SessionPolicyService for PolicyControl {
+    async fn read_managed_boot(
+        &self,
+        req: Request<wire::ReadManagedBootRequest>,
+    ) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        if req.get_ref().protocol != wire::PROTOCOL {
+            return Err(Status::invalid_argument("unsupported protocol"));
+        }
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let identity = managed_identity(required(req.into_inner().identity)?)?;
+        let row = self
+            .control
+            .authority
+            .manager
+            .meta
+            .get_managed_boot(&identity)
+            .await
+            .map_err(err)?;
+        boot_response(row)
+    }
+    async fn finalize_managed_boot(
+        &self,
+        req: Request<wire::FinalizeManagedBootRequest>,
+    ) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        if req.get_ref().protocol != wire::PROTOCOL {
+            return Err(Status::invalid_argument("unsupported protocol"));
+        }
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let input = engram_protocol::managed_boot::decode(&req.into_inner().input_json)
+            .map_err(|_| Status::invalid_argument("invalid managed finalization"))?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed boot unavailable"))?;
+        let row = crate::managed_boot::finalize(state, input)
+            .await
+            .map_err(|_| {
+                Status::failed_precondition("managed boot authority changed or unavailable")
+            })?;
+        boot_response(Some(row))
+    }
     async fn reserve_managed_create(
         &self,
         req: Request<wire::ReserveManagedCreateRequest>,
@@ -445,6 +493,18 @@ impl SessionPolicyService for PolicyControl {
                 .map(from_ref)
                 .collect::<Result<_, _>>()?,
         };
+        if self
+            .control
+            .authority
+            .manager
+            .meta
+            .managed_boot_open(ctx.session_id)
+            .await
+            .map_err(err)?
+            == Some(false)
+        {
+            return Err(Status::failed_precondition("managed execution gate closed"));
+        }
         let answer = self
             .control
             .authority
@@ -491,6 +551,18 @@ impl SessionPolicyService for PolicyControl {
                 .map(from_ref)
                 .collect::<Result<_, _>>()?,
         };
+        if self
+            .control
+            .authority
+            .manager
+            .meta
+            .managed_boot_open(ctx.session_id)
+            .await
+            .map_err(err)?
+            == Some(false)
+        {
+            return Err(Status::failed_precondition("managed execution gate closed"));
+        }
         let answer = self
             .control
             .authority
@@ -712,3 +784,19 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_tests.rs"]
 mod recovery_tests;
+
+fn boot_response(
+    row: Option<engram_core::types::managed_boot::ManagedBootRecord>,
+) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+    let boot_json = row
+        .map(|mut r| {
+            r.sealed_agent = None;
+            engram_protocol::managed_boot::encode(&r)
+                .map_err(|_| Status::internal("managed boot encoding failed"))
+        })
+        .transpose()?;
+    Ok(Response::new(wire::ReadManagedBootResponse {
+        protocol: wire::PROTOCOL,
+        boot_json,
+    }))
+}

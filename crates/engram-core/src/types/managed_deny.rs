@@ -230,6 +230,27 @@ pub fn retain_in_policy_json(
     );
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
+/// A retirement observation can arrive after a newer desired policy was stored.
+/// Keep that newer superset; the receipt proves source retirement, not policy ACK.
+pub fn retain_retired_in_policy_json(
+    old: Option<&str>,
+    observed: &ManagedDenyPolicy,
+) -> Result<String, String> {
+    observed.validate()?;
+    if let Some(raw) = old {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        if let Some(prior) = value.get("managed_deny").filter(|v| !v.is_null()) {
+            let prior: ManagedDenyPolicy =
+                serde_json::from_value(prior.clone()).map_err(|e| e.to_string())?;
+            prior.validate()?;
+            if prior.revision > observed.revision && prior.contains(observed) {
+                return Ok(raw.to_owned());
+            }
+        }
+    }
+    retain_in_policy_json(old, observed)
+}
+
 pub fn validate_policy_replacement(old: Option<&str>, next: &str) -> Result<(), String> {
     let old: serde_json::Value = old
         .map(serde_json::from_str)

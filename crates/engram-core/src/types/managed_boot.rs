@@ -125,6 +125,13 @@ impl ManagedBootFinalization {
         if context.binding_hash.is_none()
             || context != self.policy.context
             || self.policy.host_incarnation != self.prepared.host_incarnation
+            || self.policy.policy.revision < self.prepared.request.bootstrap_policy.revision
+            || !self
+                .policy
+                .policy
+                .contains(&self.prepared.request.bootstrap_policy)
+            || (self.policy.policy.revision == self.prepared.request.bootstrap_policy.revision
+                && self.policy.policy != self.prepared.request.bootstrap_policy)
             || self
                 .policy
                 .network_proof
