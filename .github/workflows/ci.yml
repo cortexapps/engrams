@@ -126,6 +126,8 @@ jobs:
       # detector change sets all of these (see detect-rebake-lanes.py), so a
       # change to how CI runs re-runs everything.
       test_rust: ${{ steps.lanes.outputs.test_rust }}
+      test_mcp_worker: ${{ steps.lanes.outputs.test_mcp_worker }}
+      test_netstack: ${{ steps.lanes.outputs.test_netstack }}
       test_cross: ${{ steps.lanes.outputs.test_cross }}
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
@@ -148,6 +150,8 @@ jobs:
           # Full history so the PR base SHA is present for the diff.
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test MCP path selection
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_mcp_lanes.py'
       - name: Detect changed lanes
         id: lanes
         run: |
@@ -425,6 +429,19 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        run: |
+          node --version
+          openssl version
       - uses: dtolnay/rust-toolchain@stable
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
       # version *still* called the GH releases API to validate and
@@ -808,6 +825,65 @@ jobs:
   # and (b) the ADR 0060 DBOS engine — DBOS keeps its system tables in a `dbos`
   # schema of this same database. The .live smoke test still self-skips without a
   # live coordinator.
+  mcp-worker:
+    name: MCP worker (Node 24)
+    needs: detect
+    if: needs.detect.outputs.test_mcp_worker == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: mcp-worker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  netstack:
+    name: sandbox netstack (${{ matrix.platform }})
+    needs: detect
+    if: needs.detect.outputs.test_netstack == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - platform: macos
+            runner: blacksmith-6vcpu-macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.2'
+          cache: false
+      - name: Test, vet, verify modules, and race
+        run: |
+          mkdir -p var
+          sandbox-netstack/build.sh test
+          sandbox-netstack/build.sh race
+      - name: Build and stamp current helper
+        run: |
+          sandbox-netstack/build.sh build
+          cd var/mcp-netstack-build
+          test -s engram-sandbox-netstack
+          shasum -a 256 engram-sandbox-netstack > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sandbox-netstack-${{ matrix.platform }}
+          path: |
+            var/mcp-netstack-build/engram-sandbox-netstack
+            var/mcp-netstack-build/SHA256SUMS
+          if-no-files-found: error
+
+  # Postgres backs live tests and the isolated DBOS restart fixtures.
   orchestrator:
     name: orchestrator (bun)
     needs: detect
@@ -818,8 +894,8 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: engram
-          POSTGRES_DB: engram_orchestrator_test
-        ports: ["5432:5432"]
+          POSTGRES_DB: engram_mcp_1_1_1
+        ports: ["5435:5432"]
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -835,10 +911,23 @@ jobs:
       CONTROL_PLANE_BEARER: ci-test-token
       # Reachable Postgres → the DB-gated tests + the DBOS smoke test run here
       # (instead of self-skipping). `bun run migrate` below applies the Drizzle
-      # schema before the suite; DBOS creates its own `dbos` schema on launch.
-      ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_orchestrator_test
+      # schema before the suite; DBOS restart fixtures use a second database.
+      ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@127.0.0.1:5435/engram_mcp_1_1_1
+      MCP_TEST_DATABASE_NAME: engram_mcp_1_1_1
+      MCP_TEST_DBOS_DATABASE_URL: postgres://postgres:engram@127.0.0.1:5435/engram_mcp_dbos_test_ci
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        working-directory: ${{ github.workspace }}
+        run: |
+          node --version
+          openssl version
       - uses: oven-sh/setup-bun@v2
         with:
           # `.bun-version` is the ONE place the runtime version lives; the
@@ -880,6 +969,8 @@ jobs:
             exit 1
           fi
           echo "Bun pinned to $want in both."
+      - name: Create isolated DBOS test database
+        run: docker exec ${{ job.services.postgres.id }} createdb -U postgres engram_mcp_dbos_test_ci
       - name: bun install
         run: bun install --frozen-lockfile
       - name: DBOS workflow hash warning (non-blocking, ADR 0104)
@@ -2174,11 +2265,21 @@ jobs:
   # surface; Linux/FC remains the canonical production gate.
   vz:
     name: engram-sandbox-vz unit tests
-    needs: detect
+    needs: [detect, netstack]
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sandbox-netstack-macos
+          path: var/mcp-netstack-artifact
+      - name: Verify current helper artifact
+        run: |
+          cd var/mcp-netstack-artifact
+          test -s engram-sandbox-netstack
+          shasum -a 256 -c SHA256SUMS
+          chmod +x engram-sandbox-netstack
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -2274,6 +2375,19 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install worker test dependencies
+        working-directory: mcp-worker
+        run: npm ci --ignore-scripts
+      - name: Check TLS fixture prerequisites
+        run: |
+          node --version
+          openssl version
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
@@ -2283,7 +2397,6 @@ jobs:
       # Same default set as Linux minus engram-sandbox-vz (the `vz` job runs that
       # codesigned) — catches macOS-only regressions in cross-platform crates.
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
-        if: always()
         run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
 
   # The SINGLE required status check. Because the lanes above are path-gated (and
@@ -2470,6 +2583,8 @@ jobs:
       - web
       - site
       - orchestrator
+      - mcp-worker
+      - netstack
       - buf
       - test-fc-unprivileged
       - test-fc-pooled

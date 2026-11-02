@@ -97,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           args=""
-          for image in coordinator host-agent host-operator web orchestrator; do
+          for image in coordinator host-agent host-operator web orchestrator mcp-worker; do
             versions="/orgs/${{ github.repository_owner }}/packages/container/engrams%2F$image/versions?per_page=100"
             sha=$(gh api "$versions" \
               --jq 'first(.[] | .metadata.container.tags[]? | select(test("^[0-9a-f]{40}$")))' \
@@ -137,8 +137,8 @@ jobs:
       fail-fast: false
       matrix:
         # Only the affected images (from the detector), EXCEPT a manual dispatch
-        # bakes all five. `if:` above guarantees this is never the empty array.
-        image: ${{ (github.event_name == 'workflow_dispatch' && fromJSON('["coordinator","host-agent","host-operator","web","orchestrator"]')) || fromJSON(needs.detect.outputs.images_matrix) }}
+        # bakes all images. `if:` above guarantees this is never the empty array.
+        image: ${{ (github.event_name == 'workflow_dispatch' && fromJSON('["coordinator","host-agent","host-operator","web","orchestrator","mcp-worker"]')) || fromJSON(needs.detect.outputs.images_matrix) }}
 
     steps:
       - uses: actions/checkout@v7
