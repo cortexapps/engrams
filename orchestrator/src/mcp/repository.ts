@@ -291,13 +291,14 @@ export function makeMcpRepository(db = getDb()) {
         )[0] ?? null
       );
     },
-    async listCatalogs(id: string) {
-      return db
+    async getLatestDraft(id: string) {
+      const [draft] = await db
         .select()
         .from(catalog)
-        .where(eq(catalog.connectionId, id))
-        .orderBy(desc(catalog.createdAt))
-        .limit(100);
+        .where(and(eq(catalog.connectionId, id), eq(catalog.kind, "draft")))
+        .orderBy(desc(catalog.createdAt), desc(catalog.id))
+        .limit(1);
+      return draft ?? null;
     },
   };
 }

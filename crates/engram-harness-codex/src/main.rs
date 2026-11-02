@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use engram_core::SessionId;
+use engram_harness_proto::tool_result::{McpToolResult, ResultFormat};
 use engram_harness_proto::{
     read_msg, write_msg, AgentRole, FileChange, ForgeOp, ForgeRequest, ForgeResponse,
     HarnessCommand, HarnessEvent, FORGE_VSOCK_PORT,
@@ -31,6 +32,7 @@ struct ManifestTool {
     description: String,
     input_schema: Value,
     execution: ToolExecution,
+    result_format: ResultFormat,
     codex_native_binding: Option<String>,
 }
 
@@ -82,6 +84,12 @@ fn parse_tool_manifest(raw: &str) -> Result<ToolManifest, String> {
                     .cloned()
                     .ok_or("ENGRAM_TOOLS entry missing inputSchema")?,
                 execution,
+                result_format: object
+                    .get("resultFormat")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default(),
                 codex_native_binding,
             })
         })
@@ -113,6 +121,7 @@ fn with_browser_view(mut manifest: ToolManifest, enabled: bool) -> ToolManifest 
             description: browser_view::TOOL_DESCRIPTION.into(),
             input_schema: browser_view::input_schema(),
             execution: ToolExecution::Sync,
+            result_format: ResultFormat::Json,
             codex_native_binding: None,
         });
     }
@@ -487,6 +496,7 @@ enum FollowUpCompletion {
     Tool {
         name: String,
         result_summary: String,
+        ok: bool,
     },
 }
 
@@ -1092,6 +1102,7 @@ async fn drive(
                             summary: Some(engram_harness_sdk::truncate_utf8(&prompt.text, 1024)),
                         }).await;
                         queued.push_back(prompt);
+                        request_tool_cancellations(parked, events, Some(&turn_id)).await;
                         interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "mode change").await;
                     } else if let Some(turn_id) = active.as_deref() {
                         let id = server.send_request("turn/steer", json!({
@@ -1130,6 +1141,7 @@ async fn drive(
                     }
                 }
                 Some(HarnessCommand::Interrupt) => {
+                    request_tool_cancellations(parked, events, active.as_deref()).await;
                     if let Some(turn_id) = active.clone() {
                         interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "operator interrupt").await;
                     }
@@ -1150,7 +1162,10 @@ async fn drive(
                     )
                     .await;
                 }
-                Some(HarnessCommand::Shutdown { .. }) => return DriveOutcome::Shutdown,
+                Some(HarnessCommand::Shutdown { .. }) => {
+                    request_tool_cancellations(parked, events, None).await;
+                    return DriveOutcome::Shutdown;
+                },
                 Some(HarnessCommand::Checkpoint { .. }) => {}
                 None => {
                     if let Some(run_id) = active.take() {
@@ -1408,7 +1423,7 @@ async fn handle_dynamic_tool_call(
         request_id,
         tool_name,
         server.generation,
-        json!({"execution":execution}),
+        json!({"execution":execution,"resultFormat":tool.result_format,"runId":params.get("turnId").and_then(Value::as_str).or(active.as_deref()).unwrap_or("")}),
     );
     if let Err(error) = parked.record(call) {
         tracing::error!(%error, %call_id, "could not durably park Codex dynamic tool call");
@@ -1483,7 +1498,41 @@ impl InterruptWatchdog {
     }
 }
 
-/// Ask codex to end `turn_id` and start the clock. The ONLY way to interrupt.
+/// A whole-turn interrupt is the only confirmed native cancellation signal.
+/// Retain the parked record so a late journal result can still be delivered.
+async fn request_tool_cancellations(
+    parked: &ParkedCallStore,
+    events: &mpsc::Sender<HarnessEvent>,
+    run_id: Option<&str>,
+) {
+    for call in parked.all() {
+        if call.context.get("resultFormat").and_then(Value::as_str) != Some("mcp") {
+            continue;
+        }
+        let Some(original_run) = call
+            .context
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|run| !run.is_empty())
+        else {
+            continue;
+        };
+        if run_id.is_some_and(|run| run != original_run) {
+            continue;
+        }
+        emit(
+            events,
+            HarnessEvent::ToolCallCancelRequested {
+                run_id: original_run.into(),
+                call_id: call.tool_call_id,
+                name: call.tool_name,
+            },
+        )
+        .await;
+    }
+}
+
+/// Ask Codex to end `turn_id` and start the interrupt clock.
 async fn interrupt_turn(
     server: &mut AppServer,
     pending: &mut HashMap<i64, Pending>,
@@ -1528,11 +1577,16 @@ async fn route_tool_result(
         tracing::error!(%call_id, kind = ?call.kind, "ToolResult does not match a dynamic tool call");
         return;
     }
+    let is_mcp = call.context.get("resultFormat").and_then(Value::as_str) == Some("mcp");
+    let mcp_result = is_mcp.then(|| McpToolResult::parse(&result_json));
+    let result_ok = mcp_result
+        .as_ref()
+        .is_none_or(|result| result.as_ref().is_ok_and(McpToolResult::success));
     // ADR 0107: an approved plan flips the stamp FIRST, so every turn that
     // starts after this point (the live build turn below, or the
     // stale-generation follow-up) reads full access. A reject leaves the plan
     // stamp in place, so its revision turn stays read-only.
-    let plan_decision = (call.tool_name == "exit_plan_mode")
+    let plan_decision = (call.tool_name == "exit_plan_mode" && !is_mcp)
         .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
         .flatten();
     // ADR 0107: a REJECT ends the plan turn and starts a new one carrying the
@@ -1592,6 +1646,7 @@ async fn route_tool_result(
         let completion = FollowUpCompletion::Tool {
             name: call.tool_name.clone(),
             result_summary: result_json,
+            ok: false,
         };
         if let Err(error) = send_follow_up(server, active, pending, call_id, text, completion).await
         {
@@ -1662,6 +1717,7 @@ async fn route_tool_result(
         let completion = FollowUpCompletion::Tool {
             name: call.tool_name.clone(),
             result_summary: result_json,
+            ok: true,
         };
         if let Err(error) = send_follow_up(
             server,
@@ -1677,8 +1733,8 @@ async fn route_tool_result(
         }
         return;
     }
-    let native_question =
-        call.context.get("nativeBinding").and_then(Value::as_str) == Some("requestUserInput");
+    let native_question = !is_mcp
+        && call.context.get("nativeBinding").and_then(Value::as_str) == Some("requestUserInput");
     let answers = if native_question {
         match serde_json::from_str::<Answers>(&result_json) {
             Ok(answers) => Some(answers),
@@ -1691,7 +1747,16 @@ async fn route_tool_result(
         None
     };
     if call.request_generation != server.generation || call.request_id.is_null() {
-        let message = if native_question {
+        let message = if let Some(result) = &mcp_result {
+            let text = match result {
+                Ok(result) => result.text_items().join("\n\n"),
+                Err(message) => (*message).to_string(),
+            };
+            format!(
+                "Result of the earlier external tool call `{}` ({call_id}):\n{text}",
+                call.tool_name
+            )
+        } else if native_question {
             format!(
                 "Answer to the earlier question ({call_id}) after Codex restarted: {result_json}"
             )
@@ -1704,6 +1769,7 @@ async fn route_tool_result(
         let completion = FollowUpCompletion::Tool {
             name: call.tool_name.clone(),
             result_summary: result_json,
+            ok: result_ok,
         };
         if let Err(error) =
             send_follow_up(server, active, pending, call_id, message, completion).await
@@ -1724,10 +1790,14 @@ async fn route_tool_result(
     } else if let Err(error) = server
         .respond(
             call.request_id,
-            json!({
-                "success":true,
-                "contentItems":[{"type":"inputText","text":result_json}]
-            }),
+            if let Some(result) = &mcp_result {
+                result
+                    .as_ref()
+                    .map(|result| result.codex_response())
+                    .unwrap_or_else(|_| engram_harness_proto::tool_result::invalid_codex_result())
+            } else {
+                json!({"success":true,"contentItems":[{"type":"inputText","text":result_json}]})
+            },
         )
         .await
     {
@@ -1970,6 +2040,7 @@ async fn handle_message(
                         FollowUpCompletion::Tool {
                             name,
                             result_summary,
+                            ok,
                         } => {
                             emit(
                                 events,
@@ -1977,7 +2048,7 @@ async fn handle_message(
                                     run_id: active.clone().unwrap_or_default(),
                                     tool_call_id: call_id,
                                     tool_name: name,
-                                    ok: true,
+                                    ok,
                                     duration_ms: 0,
                                     result_summary: Some(engram_harness_sdk::truncate_utf8(
                                         &result_summary,
@@ -2082,6 +2153,7 @@ async fn handle_message(
                 .await;
             }
             if status == "interrupted" {
+                request_tool_cancellations(tools.parked, events, Some(&completed)).await;
                 emit(
                     events,
                     HarnessEvent::RunInterrupted {
@@ -3063,7 +3135,8 @@ done
         let manifest = r#"[
             {"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"execution":"sync","nativeBindings":{}},
             {"name":"ask_user_question","description":"Ask the user","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"codex":"requestUserInput"}},
-            {"name":"claude_native","description":"Only native on Claude","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{"claude":"Example"}}
+            {"name":"claude_native","description":"Only native on Claude","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{"claude":"Example"}},
+            {"name":"remote_inventory","description":"Inventory","inputSchema":{"type":"object","properties":{"code":{"type":"string","enum":["a","b"]}},"required":["code"],"additionalProperties":false},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}
         ]"#;
         std::env::set_var("ENGRAM_TOOLS", manifest);
         let (script, record) = write_fake_codex(&[]).await;
@@ -3095,6 +3168,11 @@ done
                     "name":"claude_native",
                     "description":"Only native on Claude",
                     "inputSchema":{"type":"object"}
+                },
+                {
+                    "name":"remote_inventory",
+                    "description":"Inventory",
+                    "inputSchema":{"type":"object","properties":{"code":{"type":"string","enum":["a","b"]}},"required":["code"],"additionalProperties":false}
                 }
             ]))
         );
@@ -3520,6 +3598,201 @@ done
         engine.abort();
     }
 
+    async fn assert_external_mcp_dynamic_result(
+        result_json: &str,
+        native_result: Value,
+        deferred: bool,
+    ) {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"mcp_inventory_01234567890123456789","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let mut cli = test_cli(script);
+        let stamp = cli.state().mode_stamp();
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"mcp_inventory_01234567890123456789","description":"Save a memory","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#,
+        )
+        .unwrap();
+        if deferred {
+            cli.tool_manifest[0].execution = ToolExecution::Deferred;
+        }
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id,
+                    name,
+                    args_json,
+                }) = event_rx.recv().await
+                {
+                    break (run_id, call_id, name, args_json);
+                }
+            }
+        })
+        .await
+        .expect("dynamic tool request timed out");
+        assert_eq!(
+            event,
+            (
+                "turn-1".into(),
+                "call-1".into(),
+                "mcp_inventory_01234567890123456789".into(),
+                r#"{"text":"remember this"}"#.into(),
+            )
+        );
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Parked)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert_eq!(parked.is_ok(), deferred, "only deferred tools emit Parked");
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "call-1".into(),
+                result_json: result_json.into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if requests.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":77,
+                            "result":native_result
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dynamic tool result response timed out");
+        assert_eq!(
+            engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+            "plan"
+        );
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn external_mcp_dynamic_result_preserves_fields_and_failure() {
+        assert_external_mcp_dynamic_result(
+            r#"{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}],"structuredContent":{"count":2},"isError":true},"resultUnavailable":false}"#,
+            json!({"success":false,"contentItems":[
+                {"type":"inputText","text":"first"},
+                {"type":"inputText","text":"second"},
+                {"type":"inputText","text":r#"{"structuredContent":{"count":2}}"#},
+                {"type":"inputText","text":r#"{"delivery":"available","isError":true,"outcome":"failed","resultUnavailable":false}"#}
+            ]}), false,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_structured_only_decision_cannot_relax_plan() {
+        assert_external_mcp_dynamic_result(
+            r#"{"outcome":"succeeded","delivery":"available","output":{"content":[],"structuredContent":{"decision":"approve"}},"resultUnavailable":false}"#,
+            json!({"success":true,"contentItems":[
+                {"type":"inputText","text":r#"{"structuredContent":{"decision":"approve"}}"#},
+                {"type":"inputText","text":r#"{"delivery":"available","outcome":"succeeded","resultUnavailable":false}"#}
+            ]}), false,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_delivery_failure_keeps_established_success() {
+        assert_external_mcp_dynamic_result(
+            r#"{"outcome":"succeeded","delivery":"unavailable","reason":"unsupported_content","resultUnavailable":true}"#,
+            json!({"success":false,"contentItems":[
+                {"type":"inputText","text":r#"{"delivery":"unavailable","outcome":"succeeded","reason":"unsupported_content","resultUnavailable":true}"#}
+            ]}), false,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_deferred_write_denial_keeps_plan_mode() {
+        assert_external_mcp_dynamic_result(
+            r#"{"source":"runtime","denial":"write_not_allowed","delivery":"available","output":{"content":[{"type":"text","text":"External tool request denied."}],"isError":true}}"#,
+            json!({"success":false,"contentItems":[
+                {"type":"inputText","text":"External tool request denied."},
+                {"type":"inputText","text":r#"{"delivery":"available","denial":"write_not_allowed","isError":true,"source":"runtime"}"#}
+            ]}), true,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_interrupt_requests_cancel_without_completing_parked_call() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-cancel","tool":"remote_inventory","arguments":{},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _record) = write_fake_codex(&[tool_call]).await;
+        let mut cli = test_cli(script);
+        cli.tool_manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Inventory","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+        let parked_path = cli.parked_calls_file();
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, mut received) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(cli, receiver, Arc::new(Notify::new()), events));
+        commands
+            .send(HarnessCommand::Prompt {
+                prompt_id: "p-cancel".into(),
+                text: "read".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                if event.kind() == "tool_call_requested" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        commands.send(HarnessCommand::Interrupt).await.unwrap();
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                assert_ne!(
+                    event.kind(),
+                    "tool_call_completed",
+                    "interrupt cannot claim completion"
+                );
+                if event.kind() == "tool_call_cancel_requested" {
+                    return event;
+                }
+            }
+            panic!("event stream ended");
+        })
+        .await
+        .expect("interrupt must request cancellation");
+        assert_eq!(cancel.run_id(), Some("turn-1"));
+        assert_eq!(cancel.tool_call_id(), Some("call-cancel"));
+        assert!(ParkedCallStore::open(parked_path)
+            .unwrap()
+            .get("call-cancel")
+            .is_some());
+        engine.abort();
+    }
+
     #[tokio::test]
     async fn native_request_user_input_uses_generic_frames_and_is_parked_durably() {
         let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
@@ -3766,6 +4039,111 @@ done
             .expect("shutdown waited on the open JSON-RPC tool call")
             .expect("engine task panicked");
         assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_cold_reopen_preserves_failed_result_and_plan_latch() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"cold-call","tool":"remote_inventory","arguments":{},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let mut cli = test_cli(script);
+        cli.tool_manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+        let manifest = cli.tool_manifest.clone();
+        let state_dir = cli.state_dir.clone();
+        let parked_path = cli.parked_calls_file();
+        let stamp = cli.state().mode_stamp();
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, mut received) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(cli, receiver, Arc::new(Notify::new()), events));
+        commands
+            .send(HarnessCommand::Prompt {
+                prompt_id: "cold-prompt".into(),
+                text: "read".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                if event.kind() == "tool_call_requested" {
+                    return;
+                }
+            }
+            panic!("missing original call");
+        })
+        .await
+        .unwrap();
+        engine.abort();
+        let _ = engine.await;
+        let persisted = ParkedCallStore::open(&parked_path).unwrap();
+        let call = persisted.get("cold-call").unwrap();
+        assert_eq!(call.tool_name, "remote_inventory");
+        assert_eq!(call.context["resultFormat"], "mcp");
+        assert_eq!(call.context["runId"], "turn-1");
+        drop(persisted);
+        let (script, record) = write_fake_codex(&[]).await;
+        let mut restored = test_cli(script);
+        restored.state_dir = state_dir;
+        restored.tool_manifest = manifest;
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, mut received) = mpsc::channel(32);
+        let engine = tokio::spawn(run_engine(
+            restored,
+            receiver,
+            Arc::new(Notify::new()),
+            events,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                if event.kind() == "harness_idle" {
+                    return;
+                }
+            }
+            panic!("restored engine did not start");
+        })
+        .await
+        .unwrap();
+        commands.send(HarnessCommand::ToolResult { call_id:"cold-call".into(), result_json:r#"{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"denied"}],"structuredContent":{"decision":"approve"},"isError":true},"resultUnavailable":false}"#.into() }).await.unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                if let HarnessEvent::ToolCallCompleted {
+                    tool_call_id, ok, ..
+                } = event
+                {
+                    if tool_call_id == "cold-call" {
+                        return ok;
+                    }
+                }
+            }
+            panic!("no result projection");
+        })
+        .await
+        .unwrap();
+        assert!(
+            !completed,
+            "delivery must not turn an upstream failure into success"
+        );
+        let requests = recorded_requests(&record).await;
+        assert!(requests
+            .iter()
+            .any(|request| request["method"] == "thread/resume"));
+        let text = requests
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .unwrap()["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains(r#"{"structuredContent":{"decision":"approve"}}"#));
+        assert!(text.contains(r#""isError":true"#));
+        assert!(
+            !text.contains(r#""output":"#),
+            "present fields separately instead of an opaque envelope"
+        );
+        assert_eq!(
+            engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+            "plan"
+        );
+        engine.abort();
     }
 
     #[tokio::test]

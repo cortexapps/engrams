@@ -394,6 +394,17 @@ export function makeMcpJournal(db = getDb()) {
         return rows.filter((row) => row.call.requestContext && row.call.originalArguments !== null);
       });
     },
+    async readExecutionResult(sessionId: string, executionId: string, actorId: string) {
+      return db.transaction(async (tx) => {
+        await lockHumanSession(tx, sessionId, actorId);
+        const [call] = await tx
+          .select()
+          .from(execution)
+          .where(and(eq(execution.sessionId, sessionId), eq(execution.id, executionId)));
+        if (!call) throw new Error("call not found");
+        return call;
+      });
+    },
     async readSession(
       sessionId: string,
       actorId: string,

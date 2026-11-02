@@ -142,7 +142,9 @@ web:
       # IDE, /events); 3600 matches the nginx proxy_read_timeout and
       # the GCP deployment's socket-lifetime fix — the 60 s default
       # would cut every quiet session leg.
-      alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+      # Explicit false also disables access logs on an existing ALB. Omitting
+      # the attribute does not undo an earlier logging configuration.
+      alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600,access_logs.s3.enabled=false
       alb.ingress.kubernetes.io/healthcheck-path: /healthz
     hosts:
       - host: engrams.REPLACE_DOMAIN

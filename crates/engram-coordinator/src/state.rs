@@ -199,6 +199,12 @@ pub enum SessionEvent {
         args_json: String,
         at: DateTime<Utc>,
     },
+    HarnessToolCallCancelRequested {
+        run_id: String,
+        tool_call_id: String,
+        name: String,
+        at: DateTime<Utc>,
+    },
     HarnessRunCompleted {
         run_id: String,
         ok: bool,
@@ -541,6 +547,7 @@ impl SessionEvent {
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
             Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
+            Self::HarnessToolCallCancelRequested { .. } => "tool_call_cancel_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessRunContinued { .. } => "run_continued",
@@ -642,6 +649,16 @@ impl SessionEvent {
                 tool_call_id: call_id,
                 name,
                 args_json,
+                at,
+            },
+            HarnessEvent::ToolCallCancelRequested {
+                run_id,
+                call_id,
+                name,
+            } => Self::HarnessToolCallCancelRequested {
+                run_id,
+                tool_call_id: call_id,
+                name,
                 at,
             },
             HarnessEvent::RunCompleted { run_id, ok } => {
@@ -1774,6 +1791,26 @@ fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn tool_cancel_requested_keeps_original_identity_without_completion() {
+        let event = SessionEvent::from_harness(
+            HarnessEvent::ToolCallCancelRequested {
+                run_id: "r1".into(),
+                call_id: "c1".into(),
+                name: "remote_inventory".into(),
+            },
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        assert_eq!(event.kind(), "tool_call_cancel_requested");
+        assert_eq!(outbox_ack_id(SessionId::new(), &event), None);
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["run_id"], "r1");
+        assert_eq!(json["tool_call_id"], "c1");
+        assert_eq!(json["name"], "remote_inventory");
+        assert!(json.get("ok").is_none());
+        assert!(json.get("result_json").is_none());
+    }
 
     /// Incident 2026-07-10: PG jsonb rejects U+0000, so a
     /// `tool_call_completed` whose `result_summary` carried raw binary

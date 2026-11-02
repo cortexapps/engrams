@@ -2,6 +2,31 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SessionProfileEditor } from "./SessionProfileEditor";
+import { useEffect } from "react";
+vi.mock("../../components/profiles/McpGrantEditor", () => ({
+  McpGrantEditor: ({
+    connection,
+    onAvailability,
+  }: {
+    connection: {
+      id: string;
+      configRevision?: number;
+      authGeneration?: number;
+      catalogRevision?: number;
+    };
+    onAvailability: (id: string, value: boolean) => void;
+  }) => {
+    useEffect(
+      () =>
+        onAvailability(
+          `${connection.id}:${connection.configRevision}:${connection.authGeneration}:${connection.catalogRevision}`,
+          true,
+        ),
+      [connection, onAvailability],
+    );
+    return null;
+  },
+}));
 
 const profileHolder = vi.hoisted(() => ({ value: undefined as undefined | { profile: unknown } }));
 const paramsHolder = vi.hoisted(() => ({ value: {} as { id?: string } }));
@@ -524,6 +549,53 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
 });
 
 describe("SessionProfileEditor (edit)", () => {
+  it("preserves MCP grant documents and scope on unrelated edits", async () => {
+    paramsHolder.value = { id: "p1" };
+    connectionsHolder.value = [{ id: "mcp-1", provider: "mcp", displayName: "Tools" }];
+    const grant = {
+      connectionId: "mcp-1",
+      operation: "invoke",
+      resourceConstraints: [],
+      credentialScope: "org",
+      mcp: {
+        upstreamName: "a:tool",
+        automationWrite: true,
+        unrestricted: false,
+        argumentConstraintDocumentsJson: ['{"type":"object"}', '{"$defs":{"x":{"type":"string"}}}'],
+      },
+    };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Agent",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: "opus",
+        effort: "high",
+        programmaticOnly: false,
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [grant],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowPatterns: [] },
+        secrets: [],
+        apps: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Agent");
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0].integrationGrants).toEqual([grant]);
+    expect(update.mock.calls[0][0]).not.toHaveProperty("expectedMcpGrantRevision");
+    fireEvent.click(screen.getByLabelText("Review and publish MCP grants with this save"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(update.mock.calls[1][0].expectedMcpGrantRevision).toBe(0n);
+  });
+
   it("loads the programmatic restriction and can make the profile available again", async () => {
     paramsHolder.value = { id: "p1" };
     profileHolder.value = {

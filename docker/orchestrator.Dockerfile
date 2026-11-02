@@ -42,6 +42,8 @@ WORKDIR /app/orchestrator
 # step), so the runtime needs the production node_modules + the full source.
 COPY --from=deps /app/orchestrator/node_modules ./node_modules
 COPY orchestrator/ ./
+# Runtime imports these dependency-free modules through their repository path.
+COPY mcp-worker/src/ /app/mcp-worker/src/
 
 # The Google credential denylist is ONE checked-in table shared with the Rust
 # egress proxy, which is the enforcement point and owns the file (ADR 0109).

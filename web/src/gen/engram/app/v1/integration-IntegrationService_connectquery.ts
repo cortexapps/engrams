@@ -117,6 +117,11 @@ export const setConnectionEnabled = IntegrationService.method.setConnectionEnabl
 export const getGoogleCloudSetup = IntegrationService.method.getGoogleCloudSetup;
 
 /**
+ * @generated from rpc engram.app.v1.IntegrationService.GetMcpCatalogs
+ */
+export const getMcpCatalogs = IntegrationService.method.getMcpCatalogs;
+
+/**
  * @generated from rpc engram.app.v1.IntegrationService.DiscoverMcp
  */
 export const discoverMcp = IntegrationService.method.discoverMcp;
@@ -160,6 +165,11 @@ export const disconnectMcp = IntegrationService.method.disconnectMcp;
  * @generated from rpc engram.app.v1.IntegrationService.GetSessionMcpState
  */
 export const getSessionMcpState = IntegrationService.method.getSessionMcpState;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.GetMcpExecutionResult
+ */
+export const getMcpExecutionResult = IntegrationService.method.getMcpExecutionResult;
 
 /**
  * @generated from rpc engram.app.v1.IntegrationService.ListMcpApprovals

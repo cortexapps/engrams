@@ -336,6 +336,7 @@ export function compileMcpManifest(snapshot: McpSessionBindingSnapshot): ToolMan
       inputSchema: structuredClone(bound.tool.inputSchema),
       execution: bound.tool.classification === "write" ? ("deferred" as const) : ("sync" as const),
       nativeBindings: {},
+      resultFormat: "mcp" as const,
     })),
   );
   if (

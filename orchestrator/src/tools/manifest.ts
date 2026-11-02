@@ -14,6 +14,7 @@ export interface ToolManifestEntry {
   inputSchema: object;
   execution: "sync" | "deferred";
   nativeBindings: NativeBindings;
+  resultFormat?: "mcp";
 }
 
 /** Compile the model-facing manifest from a registry without side effects. */

@@ -62,11 +62,12 @@ function services(): McpServices {
       saveDraft: unavailable,
       publish: unavailable,
       getCatalog: unavailable,
-      listCatalogs: unavailable,
+      getLatestDraft: unavailable,
     },
     journal: {
       get: unavailable,
       readSession: unavailable,
+      readExecutionResult: unavailable,
       getAdmission: unavailable,
       hasUnknown: unavailable,
       create: unavailable,
@@ -89,13 +90,16 @@ function services(): McpServices {
     },
   };
 }
-async function spawn(service?: McpServices, role = "admin", email?: string) {
+async function spawn(service?: McpServices, role = "admin", email?: string, connection = row) {
   const server = buildServer(new Hono(), (router) =>
     router.service(
       IntegrationService,
       mcpHandlers({
         services: service,
-        connections,
+        connections: {
+          ...connections,
+          get: async (id) => (id === connection.id ? connection : null),
+        },
         getSession: async () => ({ user: { id: "owner", role, email } }),
         now: () => new Date(0),
         connectionToProto: (c) => ({ id: c.id }),
@@ -139,6 +143,7 @@ describe("MCP native wire contract", () => {
       await code(s.client.publishMcp({}), Code.FailedPrecondition);
       await code(s.client.authorizeMcp({}), Code.FailedPrecondition);
       await code(s.client.disconnectMcp({}), Code.FailedPrecondition);
+      await code(s.client.getMcpExecutionResult({}), Code.FailedPrecondition);
       await code(s.client.listMcpApprovals({}), Code.FailedPrecondition);
       await code(s.client.decideMcpApproval({}), Code.FailedPrecondition);
       await code(s.client.cancelMcpCall({}), Code.FailedPrecondition);
@@ -162,6 +167,97 @@ describe("MCP native wire contract", () => {
       );
     } finally {
       await member.close();
+      await admin.close();
+    }
+  });
+  test("setup reports only a registered enabled discovery hook", async () => {
+    const service = services();
+    const admin = await spawn(service);
+    try {
+      expect((await admin.client.getMcpSetup({})).discoveryAvailable).toBe(false);
+      service.discovery = { discover: unavailable };
+      expect((await admin.client.getMcpSetup({})).discoveryAvailable).toBe(true);
+      service.enabled = false;
+      expect((await admin.client.getMcpSetup({})).discoveryAvailable).toBe(false);
+    } finally {
+      await admin.close();
+    }
+  });
+  test("catalog read requires an admin and returns the persisted draft and current publication", async () => {
+    const service = services();
+    const base = {
+      connectionId: row.id,
+      configRevision: 1,
+      authGeneration: 1,
+      credentialIdentity: "account-a",
+      actorId: "owner",
+      createdAt: new Date(0),
+      fingerprint: "hash",
+    };
+    service.repository.getLatestDraft = async () => ({
+      ...base,
+      id: "draft",
+      kind: "draft",
+      revision: 0,
+      tools: [
+        {
+          upstreamName: "read.item",
+          description: "<script>untrusted</script>",
+          inputSchema: { type: "object" },
+        },
+      ],
+    });
+    service.repository.getCatalog = async (_id, revision) => ({
+      ...base,
+      id: "published",
+      kind: "published",
+      revision,
+      tools: [
+        {
+          upstreamName: "read.item",
+          description: "old",
+          inputSchema: { type: "object" },
+          classification: "read",
+          enabled: true,
+          fingerprint: "tool",
+        },
+      ],
+    });
+    const current = { ...row, mcp: { ...row.mcp!, catalogRevision: 2 } };
+    const admin = await spawn(service, "admin", undefined, current);
+    const member = await spawn(service, "user");
+    const serviceAccount = await spawn(service, "admin", "apikey+agent@service.local");
+    try {
+      await code(
+        serviceAccount.client.getMcpCatalogs({ connectionId: row.id }),
+        Code.PermissionDenied,
+      );
+      await code(member.client.getMcpCatalogs({ connectionId: row.id }), Code.PermissionDenied);
+      const result = await admin.client.getMcpCatalogs({ connectionId: row.id });
+      expect(result.draft?.tools[0]?.classification).toBe("");
+      expect(result.draft?.tools[0]?.description).toBe("<script>untrusted</script>");
+      expect(result.published?.revision).toBe(2);
+      expect(result.published?.tools[0]?.classification).toBe("read");
+      expect(result.catalogRevision).toBe(2);
+      service.enabled = false;
+      expect(
+        (await admin.client.getMcpCatalogs({ connectionId: row.id })).published?.revision,
+      ).toBe(2);
+      service.repository.getLatestDraft = async () => ({
+        ...base,
+        id: "oversized",
+        kind: "draft",
+        revision: 0,
+        tools: Array.from({ length: 129 }, (_, i) => ({
+          upstreamName: `tool-${i}`,
+          description: "",
+          inputSchema: { type: "object" },
+        })),
+      });
+      await code(admin.client.getMcpCatalogs({ connectionId: row.id }), Code.FailedPrecondition);
+    } finally {
+      await member.close();
+      await serviceAccount.close();
       await admin.close();
     }
   });

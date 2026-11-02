@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import type { McpPlanReview } from "@/gen/engram/app/v1/session_pb";
 
 /**
  * ADR 0089: the interactive-question actions, provided by `SessionThread`
@@ -22,7 +23,13 @@ export interface QuestionActions {
    * result (the PlanCard's approve/reject decision). `submitAnswer` is the
    * question-shaped wrapper over the same CompleteToolCall mutation.
    */
-  completeTool: (toolCallId: string, result: unknown) => void;
+  completeTool: (
+    toolCallId: string,
+    result: unknown,
+    review?: McpPlanReview,
+    onFailure?: () => void,
+  ) => void;
+  sessionId: string;
   /**
    * tool_call_ids the user has answered this session but whose authoritative
    * resolving event hasn't landed yet — the card shows its receipt
@@ -36,6 +43,7 @@ export interface QuestionActions {
 }
 
 export const QuestionActionsContext = createContext<QuestionActions>({
+  sessionId: "",
   submitAnswer: () => {},
   completeTool: () => {},
   answeredToolCallIds: new Set(),

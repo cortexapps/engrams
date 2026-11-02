@@ -1,13 +1,15 @@
 import { sessionMcpState, type McpReviewProducers } from "./review-state.ts";
-import { toJson } from "@bufbuild/protobuf";
+import { create, toBinary, toJson } from "@bufbuild/protobuf";
 import {
   McpApprovalReviewContextSchema,
+  McpCompletionSettlement,
+  GetMcpExecutionResultResponseSchema,
   McpRebindDrainSchema,
   McpRebindDrainReason,
 } from "../gen/engram/app/v1/integration_pb.ts";
 import { McpPublicationRequired, McpRebindDraining, type McpRebindDrain } from "./rebind.ts";
 import { policyReviewCurrent, type JournalReviewContext } from "./journal-review.ts";
-import { credentialHandlers } from "./credential-rpc.ts";
+import { credentialHandlers, requireMcpHumanAdmin } from "./credential-rpc.ts";
 import type { CredentialAdmin } from "./credential-admin.ts";
 import { Code, ConnectError, type ServiceImpl } from "@connectrpc/connect";
 import type { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
@@ -20,6 +22,10 @@ import { validateMcpConfig, type McpConfig } from "./config.ts";
 import type { McpRepository } from "./repository.ts";
 import type { McpJournal, McpUnknownContext } from "./journal.ts";
 import type { McpDiscoveredTool, McpReviewedTool } from "./types.ts";
+import { assertSchemaShape } from "./catalog.ts";
+import { MCP_LIMITS } from "./limits.ts";
+import { canonicalJson } from "./hash.ts";
+import { verifiedExecutionResult } from "./effect-driver.ts";
 
 /** Internal services use trusted connection identities, never guest destinations. */
 export interface McpServices {
@@ -146,8 +152,26 @@ export function mcpConfigToProto(raw: unknown): McpProtoConfig {
   };
 }
 function catalogToProto(value: Awaited<ReturnType<McpRepository["saveDraft"]>>) {
+  if (
+    !Array.isArray(value.tools) ||
+    value.tools.length > MCP_LIMITS.toolsPerSession ||
+    Buffer.byteLength(JSON.stringify(value.tools)) > MCP_LIMITS.manifestBytes
+  )
+    throw new Error("catalog is too large");
+  for (const tool of value.tools) {
+    if (typeof tool.upstreamName !== "string" || typeof tool.description !== "string")
+      throw new Error("invalid catalog");
+    assertSchemaShape(tool.inputSchema);
+    if (tool.outputSchema !== undefined) assertSchemaShape(tool.outputSchema);
+  }
   return {
-    ...value,
+    id: value.id,
+    connectionId: value.connectionId,
+    kind: value.kind,
+    revision: value.revision,
+    configRevision: value.configRevision,
+    authGeneration: value.authGeneration,
+    fingerprint: value.fingerprint,
     tools: value.tools.map((t) => ({
       upstreamName: t.upstreamName,
       description: t.description,
@@ -173,11 +197,13 @@ type Methods =
   | "getMcpSetup"
   | "completeMcpAuthorization"
   | "recoverMcpCredential"
+  | "getMcpCatalogs"
   | "discoverMcp"
   | "publishMcp"
   | "authorizeMcp"
   | "disconnectMcp"
   | "getSessionMcpState"
+  | "getMcpExecutionResult"
   | "listMcpApprovals"
   | "decideMcpApproval"
   | "cancelMcpCall"
@@ -200,6 +226,26 @@ export function mcpHandlers(deps: {
   }
   return {
     ...credentialHandlers(deps),
+    async getMcpCatalogs(req, ctx) {
+      await requireMcpHumanAdmin(ctx, deps.getSession);
+      const repository = requireMcpHook(deps.services?.repository);
+      return mcpOperation(async () => {
+        const row = await connection(req.connectionId);
+        const [draft, published] = await Promise.all([
+          repository.getLatestDraft(row.id),
+          row.mcp!.catalogRevision ? repository.getCatalog(row.id, row.mcp!.catalogRevision) : null,
+        ]);
+        const result = {
+          configRevision: row.mcp!.configRevision,
+          catalogRevision: row.mcp!.catalogRevision,
+          ...(draft ? { draft: catalogToProto(draft) } : {}),
+          ...(published ? { published: catalogToProto(published) } : {}),
+        };
+        if (Buffer.byteLength(JSON.stringify(result)) > MCP_LIMITS.responseBytes)
+          throw new Error("catalog response is too large");
+        return result;
+      });
+    },
     async discoverMcp(req, ctx) {
       const actor = await requireAdmin(ctx, deps.getSession);
       const service = services();
@@ -251,6 +297,68 @@ export function mcpHandlers(deps: {
             ),
           ),
         };
+      });
+    },
+    async getMcpExecutionResult(req, ctx) {
+      const actor = await requireUser(ctx, deps.getSession);
+      const service = services();
+      return mcpOperation(async () => {
+        const call = await service.journal.readExecutionResult(
+          req.sessionId,
+          req.executionId,
+          actor.id,
+        );
+        let resultJson: string | undefined;
+        if (call.result !== null) {
+          resultJson = canonicalJson(call.result);
+          if (Buffer.byteLength(resultJson) > MCP_LIMITS.resultBytes)
+            throw new Error("result exceeds limit");
+          if (call.result.source === "local_validation") {
+            const expected = {
+              source: "local_validation",
+              delivery: "available",
+              output: {
+                content: [
+                  { type: "text", text: "Tool arguments do not satisfy the approved schemas." },
+                ],
+                isError: true,
+              },
+            };
+            if (
+              resultJson !== canonicalJson(expected) ||
+              call.state !== "failed" ||
+              call.resultUnavailable
+            )
+              throw new Error("invalid local result");
+          } else {
+            const verified = verifiedExecutionResult(call.result);
+            if (
+              verified.state !== call.state ||
+              verified.resultUnavailable !== call.resultUnavailable
+            )
+              throw new Error("invalid result state");
+          }
+        }
+        const terminal = ["succeeded", "failed", "canceled", "outcome_unknown"].includes(
+          call.state,
+        );
+        const response = {
+          state: call.state,
+          resultUnavailable: call.resultUnavailable,
+          resultJson,
+          settlement: !terminal
+            ? McpCompletionSettlement.NOT_APPLICABLE
+            : call.completionEnqueuedVersion >= call.version
+              ? McpCompletionSettlement.SETTLED_OR_TARGET_GONE
+              : McpCompletionSettlement.PENDING,
+        };
+        const message = create(GetMcpExecutionResultResponseSchema, response);
+        const size = Math.max(
+          toBinary(GetMcpExecutionResultResponseSchema, message).byteLength,
+          Buffer.byteLength(JSON.stringify(toJson(GetMcpExecutionResultResponseSchema, message))),
+        );
+        if (size > MCP_LIMITS.responseBytes) throw new Error("result response exceeds limit");
+        return response;
       });
     },
     async getSessionMcpState(req, ctx) {

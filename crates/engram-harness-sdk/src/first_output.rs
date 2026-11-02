@@ -107,7 +107,8 @@ fn output_run_id(event: &HarnessEvent) -> Option<&str> {
         | HarnessEvent::Parked
         | HarnessEvent::BrowserActivity { .. }
         | HarnessEvent::Busy
-        | HarnessEvent::RunCost { .. } => None,
+        | HarnessEvent::RunCost { .. }
+        | HarnessEvent::ToolCallCancelRequested { .. } => None,
     }
 }
 

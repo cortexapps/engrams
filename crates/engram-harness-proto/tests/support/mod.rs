@@ -66,6 +66,13 @@ pub fn file_change() -> impl Strategy<Value = FileChange> {
 
 pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
     prop_oneof![
+        (s(), s(), s()).prop_map(
+            |(run_id, call_id, name)| HarnessEvent::ToolCallCancelRequested {
+                run_id,
+                call_id,
+                name
+            }
+        ),
         (s(), opt_s(), opt_s()).prop_map(|(run_id, prompt_summary, prompt_id)| {
             HarnessEvent::RunStarted {
                 run_id,
@@ -389,6 +396,7 @@ fn _exhaustiveness_harness_event(e: &HarnessEvent) {
         HarnessEvent::TitleSuggested { .. } => {}
         HarnessEvent::PromptSteered { .. } => {}
         HarnessEvent::ToolCallRequested { .. } => {}
+        HarnessEvent::ToolCallCancelRequested { .. } => {}
         HarnessEvent::Parked => {}
         HarnessEvent::BrowserActivity { .. } => {}
         HarnessEvent::Busy => {}
