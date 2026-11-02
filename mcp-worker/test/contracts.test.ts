@@ -38,21 +38,51 @@ test("wire contract has distinct administration and execution scopes", () => {
       },
     }),
   );
-  assert.throws(() =>
-    parseWorkerRequest({
-      ...request,
-      intent: {
-        ...request.intent,
-        scope: {
-          kind: "execution",
-          sessionId: "session",
-          runId: "run",
-          toolCallId: "call",
-          bindingHash: "d".repeat(64),
-        },
+  const execution = {
+    ...request,
+    intent: {
+      ...request.intent,
+      scope: {
+        kind: "execution" as const,
+        sessionId: "session",
+        runId: "run",
+        toolCallId: "call",
+        bindingHash: "d".repeat(64),
       },
-    }),
-  );
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(execution), execution);
+  for (const field of ["sessionId", "runId", "toolCallId", "bindingHash"]) {
+    assert.throws(() =>
+      parseWorkerRequest({
+        ...execution,
+        intent: {
+          ...execution.intent,
+          scope: { ...execution.intent.scope, [field]: "" },
+        },
+      }),
+    );
+  }
+  for (const extra of [
+    { credential: { header: "authorization", value: "Bearer private" } },
+    { endpoint: "https://tools.example/mcp" },
+  ]) {
+    assert.throws(() =>
+      parseWorkerRequest({
+        ...execution,
+        operation: { ...execution.operation, ...extra },
+      }),
+    );
+  }
+  for (const kind of ["discover", "validateDestination", "metadata"]) {
+    assert.throws(() =>
+      parseWorkerRequest({
+        ...execution,
+        intent: { ...execution.intent, operation: kind },
+        operation: { kind, endpoint: "https://tools.example/mcp" },
+      }),
+    );
+  }
   assert.throws(() =>
     parseWorkerRequest({
       ...request,

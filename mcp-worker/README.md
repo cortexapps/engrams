@@ -41,12 +41,26 @@ bearer fallback, generic proxy, or guest listener is provided.
   is forwarded to a provider.
 - Execution scope contains the real session, run, tool-call, and immutable
   binding hash. Administration scope contains the trusted request and actor
-  identities. Execute requires execution scope. Discovery, schema validation,
-  destination validation, and OAuth require administration scope. Cancel must
+  identities. Execute requires execution scope. Schema validation accepts either
+  scope, has no credential or destination field, and requires the orchestrator
+  caller role. Discovery, destination validation, and OAuth require administration scope. Cancel must
   match the original scope, caller, connection revision, and credential identity.
 
 Before acquiring or sending a provider credential, the trusted client must
 verify the worker identity against the approved zone and frozen policy digest.
+The resource client in `orchestrator/src/mcp/worker-client.ts` retains that exact
+TLS socket for one RPC. Create one client per operation with its cancellation
+signal, and dispose it after use. An unused identity check can be replaced only
+before credential acquisition. A closed socket cannot reconnect for dispatch.
+The server permits two requests per socket and at most 35 seconds of idle time.
+The client verifies the server CA, hostname, certificate pin, protocol, zone,
+policy, and boot identity. It does not use a proxy, follow redirects, or retry.
+
+The session binding uses `sha256:` digests. The worker scope uses bare hexadecimal
+for its binding hash. Use the strict conversion in `worker-encoding.ts`; do not
+change the frozen binding or journal digest. Worker policy digests and coordinator
+credential receipts stay in their original bare hexadecimal form.
+
 It must authorize current platform state and acquire durable global admission.
 Then it creates a new intent bound to that worker boot, policy, connection
 revision, credential identity, operation, exact destination, scope, expiry,
@@ -92,7 +106,7 @@ Limits include 256 KiB arguments, 1 MiB catalog and normalized output, 2 MiB
 60 seconds per tool by default, and a 300-second ceiling. Outer deadlines and
 abort signals cover all I/O. Local active caps are 4 per session, 8 per
 connection, and 32 executions per worker. Discovery has two slots, OAuth four,
-and schema/destination administration four. Schema compilation also has a
+and schema/destination checks four. Schema compilation also has a
 shared four-child cap, including children started by execute/discover. These
 local caps supplement durable admission across replicas; they do not replace it.
 

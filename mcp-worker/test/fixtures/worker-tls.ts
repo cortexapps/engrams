@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { request } from "node:https";
-export async function workerTls() {
+export async function workerTls(hostname = "tools.example") {
   const dir = await mkdtemp(join(tmpdir(), "mcp-worker-tls-"));
   try {
     execFileSync(
@@ -22,9 +22,9 @@ export async function workerTls() {
         "-days",
         "1",
         "-subj",
-        "/CN=tools.example",
+        `/CN=${hostname}`,
         "-addext",
-        "subjectAltName=DNS:tools.example",
+        `subjectAltName=DNS:${hostname}${hostname === "localhost" ? ",IP:127.0.0.1" : ""}`,
         "-addext",
         "extendedKeyUsage=serverAuth,clientAuth",
       ],

@@ -46,7 +46,12 @@ function operationValid(value: unknown): value is WorkerOperation {
     case "cancel":
       return text(value.targetIntentId);
     case "validateSchemas":
-      return schemas(value.documents);
+      return (
+        schemas(value.documents) &&
+        Object.keys(value).every((key) =>
+          ["kind", "documents", "value"].includes(key),
+        )
+      );
     case "execute":
       return (
         text(value.tool) &&
@@ -128,7 +133,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
   )
     throw Error("execution_scope_required");
   if (
-    !["execute", "cancel"].includes(value.operation.kind) &&
+    !["execute", "cancel", "validateSchemas"].includes(value.operation.kind) &&
     value.intent.scope.kind !== "administration"
   )
     throw Error("administration_scope_required");

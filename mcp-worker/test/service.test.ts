@@ -146,6 +146,64 @@ test("disabled worker and unknown client identity cannot dispatch", async (t) =>
   t.after(() => unknown.close());
   assert.equal((await localRpc(other, tls, "/identity")).status, 403);
 });
+test("execution schema validation keeps the orchestrator role and exact bound scope", async (t) => {
+  const tls = await workerTls();
+  for (const role of ["orchestrator", "coordinator"] as const) {
+    let dials = 0;
+    const worker = createWorker({
+      zone: zone(),
+      tls,
+      callers: [{ fingerprint: tls.fingerprint, role }],
+      enabled: true,
+      network: {
+        resolve: async () => {
+          dials++;
+          throw Error("unexpected provider lookup");
+        },
+        request: () => {
+          dials++;
+          throw Error("unexpected provider request");
+        },
+      },
+    });
+    const port = await worker.listen(0, "127.0.0.1");
+    t.after(() => worker.close());
+    const request = envelope(worker.identity, {
+      kind: "validateSchemas",
+      documents: [{ type: "integer" }],
+      value: 2,
+    });
+    request.intent.scope = {
+      kind: "execution",
+      sessionId: "session",
+      runId: "run",
+      toolCallId: "call",
+      bindingHash: "b".repeat(64),
+    };
+    const result = await localRpc(port, tls, "/rpc", request);
+    assert.equal(result.status, role === "orchestrator" ? 200 : 403);
+    if (role === "orchestrator") {
+      assert.ok(
+        typeof result.body === "object" &&
+          result.body !== null &&
+          "intent" in result.body,
+      );
+      assert.deepEqual(result.body.intent, request.intent);
+      assert.equal((await localRpc(port, tls, "/rpc", request)).status, 403);
+      const credential = { header: "authorization", value: "Bearer private" };
+      const secretRequest = envelope(worker.identity, {
+        kind: "validateSchemas",
+        documents: [{}],
+      });
+      const invalid = {
+        ...secretRequest,
+        operation: { ...secretRequest.operation, credential },
+      };
+      assert.equal((await localRpc(port, tls, "/rpc", invalid)).status, 400);
+    }
+    assert.equal(dials, 0);
+  }
+});
 test("OAuth admission is separate, destination validation does not dial, and scoped cancel aborts I/O", async (t) => {
   const { createServer, request } = await import("node:https");
   const tls = await workerTls();

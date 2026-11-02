@@ -73,7 +73,11 @@ export function createWorker(options: WorkerOptions) {
   server.requestTimeout = 5000;
   server.headersTimeout = 5000;
   server.timeout = 305000;
-  server.maxRequestsPerSocket = 1;
+  // A resource client verifies identity, then sends one RPC on that same TLS socket.
+  // This keeps credentials on the verified worker boot, including during a roll.
+  server.maxRequestsPerSocket = 2;
+  server.keepAliveTimeout = 35000;
+  server.keepAliveTimeoutBuffer = 0;
   async function handle(
     req: IncomingMessage,
   ): Promise<{ status: number; body: unknown }> {
