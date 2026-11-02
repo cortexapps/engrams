@@ -50,6 +50,27 @@ class McpLanes(unittest.TestCase):
                 self.assertEqual(result['test_rust'], 'true')
                 self.assertEqual(result['test_cross'], 'true')
 
+    def test_linux_wrapper_target_and_gate_select_linux_lane(self):
+        result = detect('crates/engram-harness-claude/tests/linux_mcp_entrypoint.rs',
+                        {'engram-harness-claude'}, {'engram-harness-claude'})
+        self.assertEqual(result['test_rust'], 'true')
+        self.assertEqual(result['test_cross'], 'true')
+        self.assertEqual(detect('.github/scripts/mcp-acceptance-linux.sh')['test_rust'], 'true')
+
+    def test_closed_namespace_source_and_gate_select_firecracker_lane(self):
+        source = 'crates/engram-sandbox-firecracker/src/managed/network/linux.rs'
+        result = detect(source, {'engram-sandbox-firecracker'}, {'engram-sandbox-firecracker'})
+        self.assertEqual(result['test_fc'], 'true')
+        self.assertEqual(detect('.github/scripts/mcp-acceptance-fc-closed.sh')['test_fc'], 'true')
+
+    def test_closed_namespace_gate_is_required_and_unconditional(self):
+        workflow = (SCRIPT.parents[1] / 'workflows/ci.yml').read_text()
+        lane = workflow.split('  test-fc-nbd-net:', 1)[1].split('  test-fc-e2e:', 1)[0]
+        step = lane.split('      - name: CLOSED namespace installed-state test (root)', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('run: bash .github/scripts/mcp-acceptance-fc-closed.sh', step)
+        self.assertNotIn('        if:', step)
+        self.assertIn('      - test-fc-nbd-net', workflow.split('  ci-gate:', 1)[1])
+
     def test_helper_runs_native_gate(self):
         result = detect('sandbox-netstack/go.sum')
         self.assertEqual(result['test_netstack'], 'true')
@@ -57,6 +78,17 @@ class McpLanes(unittest.TestCase):
         self.assertEqual(result['test_fc'], 'true')
         self.assertEqual(result['e2e'], 'true')
         self.assertEqual(result['node_assets'], 'false')
+
+    def test_helper_source_and_gate_select_artifact_and_vz_lanes(self):
+        for path, crates in [
+            ('crates/engram-sandbox-vz/src/managed/helper.rs', {'engram-sandbox-vz'}),
+            ('.github/scripts/mcp-acceptance-helper.sh', set()),
+            ('.github/workflows/ci.yml', set()),
+        ]:
+            with self.subTest(path=path):
+                result = detect(path, crates, crates)
+                self.assertEqual(result['test_rust'], 'true')
+                self.assertEqual(result['test_netstack'], 'true')
 
     def test_unrelated_path_does_not_run_new_lanes(self):
         result = detect('README.md')

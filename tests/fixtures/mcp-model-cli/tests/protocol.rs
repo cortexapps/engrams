@@ -250,6 +250,7 @@ fn claude_reads_generated_config_and_exchanges_mcp_and_hook_messages() {
                 .unwrap()
         };
         assert_eq!(receive()["subtype"], "init");
+        assert_eq!(receive()["type"], "assistant");
         assert_eq!(receive()["type"], "result");
         let recorded: Value = serde_json::from_slice(&std::fs::read(proof).unwrap()).unwrap();
         if mode == "forged" {
@@ -436,6 +437,7 @@ fn claude_interrupts_an_inflight_bridge_call() {
         &mut child.0,
         json!({"type":"control_request","request_id":"interrupt-1","request":{"subtype":"interrupt"}}),
     );
+    assert_eq!(receive()["type"], "assistant");
     assert_eq!(receive()["type"], "control_response");
     assert_eq!(receive()["subtype"], "error_during_execution");
     assert!(std::fs::read(state.0.join("proof.json"))
@@ -471,6 +473,11 @@ fn claude_refires_the_same_call_after_process_death() {
             .arg(&config)
             .arg("--settings")
             .arg(&settings)
+            .args(if attempt == 1 {
+                vec!["--resume", "fixture-session"]
+            } else {
+                vec![]
+            })
             .env("ENGRAM_FIXTURE_TOOL", "remote_inventory")
             .env("ENGRAM_FIXTURE_MODE", "refire")
             .env("ENGRAM_FIXTURE_STATE_DIR", &state.0)
@@ -493,11 +500,14 @@ fn claude_refires_the_same_call_after_process_death() {
             serde_json::from_str(&rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap())
                 .unwrap()
         };
-        send(
-            &mut child.0,
-            json!({"type":"user","message":{"role":"user","content":"fixture"}}),
-        );
+        if attempt == 0 {
+            send(
+                &mut child.0,
+                json!({"type":"user","message":{"role":"user","content":"fixture"}}),
+            );
+        }
         assert_eq!(receive()["subtype"], "init");
+        assert_eq!(receive()["type"], "assistant");
         assert_eq!(receive()["type"], "result");
         if attempt == 0 {
             assert!(std::fs::read(&proof).unwrap().is_empty());
@@ -601,4 +611,29 @@ fn codex_write_denied_and_unavailable_calls_keep_the_native_result() {
             }
         );
     }
+}
+
+#[test]
+fn proof_pid_token_is_expanded_only_in_the_direct_child_basename() {
+    let state = State::new("proof-pid");
+    for _ in 0..2 {
+        let mut child = Fixture(
+            Command::new(env!("CARGO_BIN_EXE_engram-mcp-model-fixture"))
+                .arg("app-server")
+                .env_clear()
+                .env("ENGRAM_FIXTURE_TOOL", "remote_inventory")
+                .env("ENGRAM_FIXTURE_MODE", "read")
+                .env("ENGRAM_FIXTURE_STATE_DIR", &state.0)
+                .env("ENGRAM_FIXTURE_PROOF", state.0.join("proof-{pid}.json"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        assert!(child.0.wait().unwrap().success());
+        assert!(state.0.join(format!("proof-{pid}.json")).is_file());
+    }
+    assert_eq!(std::fs::read_dir(&state.0).unwrap().count(), 2);
+    assert!(!state.0.join("proof-{pid}.json").exists());
 }

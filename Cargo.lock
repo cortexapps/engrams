@@ -2983,6 +2983,7 @@ dependencies = [
  "engram-agentd",
  "engram-chunk-store",
  "engram-core",
+ "engram-egress-proto",
  "engram-egress-proxy",
  "engram-harness-proto",
  "engram-oci",
