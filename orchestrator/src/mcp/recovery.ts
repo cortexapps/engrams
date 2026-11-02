@@ -62,7 +62,9 @@ type CompletionDisposition = "enqueued" | "target_gone";
 /** Plain runtime operations: effects and completion must never run in a DBOS step. */
 export function makeMcpRecovery(deps: {
   db?: ReturnType<typeof getDb>;
-  driver: ReturnType<typeof makeMcpEffectDriver>;
+  /** Durable completion remains available when dispatch configuration is absent. */
+  driver?: ReturnType<typeof makeMcpEffectDriver>;
+  dispatchEnabled?: () => boolean;
   deploymentId: string;
   completer?: ToolCallCompleter;
   now(): Date;
@@ -71,9 +73,26 @@ export function makeMcpRecovery(deps: {
 }) {
   const db = deps.db ?? getDb();
   const journal = makeMcpJournal(db);
+  const dispatchEnabled = () => Boolean(deps.driver) && (deps.dispatchEnabled?.() ?? true);
+  function requireDispatch() {
+    if (!dispatchEnabled() || !deps.driver) throw new McpRequestDenied("disabled");
+    return deps.driver;
+  }
+  async function reconcile(id: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (!dispatchEnabled()) {
+      deps.driver?.cancel(id);
+      await journal.cancelInternal(id, "kill", deps.now());
+      return;
+    }
+    await requireDispatch().reconcile(id, signal);
+  }
   const reconciler = makeMcpLifecycleReconciler({
     db,
-    driver: deps.driver,
+    driver: {
+      reconcile,
+      cancel: (id) => deps.driver?.cancel(id),
+    },
     onSession: (id) => lifecycle.runOnce(id),
   });
   const lifecycle = makeMcpLifecycleEvents({
@@ -112,12 +131,16 @@ export function makeMcpRecovery(deps: {
     async reconcileAuthorityChange() {
       await reconciler.reconcileAuthorityChange();
     },
-    abortExecution: (id: string) => deps.driver.cancel(id),
+    abortExecution: (id: string) => {
+      if (!deps.driver) throw Error("MCP cancellation unavailable");
+      deps.driver.cancel(id);
+    },
     /** The durable step records only this decision. It never runs a provider operation. */
     async decideRequest(ref: McpRequestMarker): Promise<McpRequestDecision> {
       try {
         const first = await existing(ref);
         if (first) return { kind: "accepted", execution: marker(first) };
+        if (!dispatchEnabled()) return { kind: "denied", code: "disabled" };
         if (!Number.isSafeInteger(ref.deadlineMs) || ref.deadlineMs <= deps.now().getTime())
           return { kind: "denied", code: "deadline_expired" };
         if (!/^[1-9][0-9]{0,18}$/.test(ref.requestEventIdx)) throw Error("invalid event reference");
@@ -150,7 +173,7 @@ export function makeMcpRecovery(deps: {
         )
           throw Error("request reference unavailable");
         try {
-          const call = await deps.driver.acceptToolRequest(
+          const call = await requireDispatch().acceptToolRequest(
             {
               sessionId: ref.sessionId,
               runId: ref.runId,
@@ -198,7 +221,7 @@ export function makeMcpRecovery(deps: {
       );
     },
     async accept(input: McpToolRequest): Promise<McpExecutionMarker> {
-      return marker(await deps.driver.acceptToolRequest(input));
+      return marker(await requireDispatch().acceptToolRequest(input));
     },
     async expire() {
       await journal.expire(deps.deploymentId, deps.now());
@@ -239,8 +262,13 @@ export function makeMcpRecovery(deps: {
         call.toolCallId !== ref.toolCallId
       )
         throw Error("MCP execution reference changed");
-      if (call.state === "waiting_approval" || call.state === "authorized")
-        call = await deps.driver.driveOnce(call.id, signal);
+      if (active.has(call.state) && !dispatchEnabled()) {
+        await reconcile(call.id, signal);
+        const retained = await journal.get(call.id);
+        if (!retained) return "done";
+        call = retained;
+      } else if (call.state === "waiting_approval" || call.state === "authorized")
+        call = await requireDispatch().driveOnce(call.id, signal);
       if (active.has(call.state)) return "pending";
       if (call.completionEnqueuedVersion >= call.version) return "done";
       // A scanner can prove interruption, not an upstream outcome. Preserve that distinction.

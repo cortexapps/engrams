@@ -73,6 +73,9 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // tool-execution workflows.
 import "./workflows/mcp-exec.ts";
 import { makeMcpRecoveryScanner } from "./mcp/recovery-scanner.ts";
+import { installMcpRecovery, makeMcpRecovery } from "./mcp/recovery.ts";
+import { makeMcpJournal } from "./mcp/journal.ts";
+import { makeMcpRepository } from "./mcp/repository.ts";
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
@@ -469,6 +472,14 @@ app.route("/", ideApp);
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
+// Durable bookkeeping is installed even when new external dispatch is disabled.
+// Dispatch composition must retain these stores and completion recovery on rollback.
+const mcpServices = {
+  enabled: false,
+  repository: makeMcpRepository(),
+  journal: makeMcpJournal(),
+};
+installMcpRecovery(makeMcpRecovery({ deploymentId: config.deploymentId, now: () => new Date() }));
 const server = buildServer(
   app,
   (router: ConnectRouter) => {
@@ -516,7 +527,7 @@ const server = buildServer(
 
     // Native IntegrationService (ADR 0057 C3): admin-gated connector catalog CRUD
     // (Plane B) over the orchestrator's own DB; built-ins are read-only seeds.
-    registerIntegration(router);
+    registerIntegration(router, { mcp: mcpServices });
 
     // Native AutomationService + WebhookRegistrationService (ADR 0102):
     // admin-authored triggers, render preview, run/sample history, and sealed

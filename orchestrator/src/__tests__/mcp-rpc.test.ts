@@ -179,7 +179,11 @@ describe("MCP native wire contract", () => {
       service.discovery = { discover: unavailable };
       expect((await admin.client.getMcpSetup({})).discoveryAvailable).toBe(true);
       service.enabled = false;
-      expect((await admin.client.getMcpSetup({})).discoveryAvailable).toBe(false);
+      const disabled = await admin.client.getMcpSetup({});
+      expect(disabled.discoveryAvailable).toBe(false);
+      expect(disabled.recoveryAvailable).toBe(false);
+      await code(admin.client.recoverMcpCredential({}), Code.FailedPrecondition);
+      await code(admin.client.disconnectMcp({}), Code.FailedPrecondition);
     } finally {
       await admin.close();
     }

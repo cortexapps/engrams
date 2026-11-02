@@ -170,6 +170,56 @@ describe("external MCP connections", () => {
     expect((screen.getByRole("button", { name: "Recover" }) as HTMLButtonElement).disabled).toBe(
       true,
     );
-    expect(screen.getByText(/actions and recovery are unavailable/i)).toBeTruthy();
+    expect(screen.getByText(/new external tool dispatch is disabled/i)).toBeTruthy();
+    expect(screen.getByText(/credential recovery is unavailable/i)).toBeTruthy();
   });
+});
+
+it("keeps configured recovery and disconnect available while new dispatch is disabled", async () => {
+  const connection = {
+    id: "c1",
+    provider: "mcp",
+    alias: "tools",
+    displayName: "Tools",
+    configRevision: 1,
+    authGeneration: 1,
+    mcp: { endpoint: "https://tools.example/mcp", zone: "public", authKind: "api_key" },
+  };
+  const calls: string[] = [];
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      listConnections: () => ({ connections: [connection] }),
+      getMcpSetup: () => ({ enabled: false, recoveryAvailable: true, current: { connection } }),
+      getMcpCatalogs: () => ({}),
+      recoverMcpCredential: () => {
+        calls.push("recover");
+        return {};
+      },
+      disconnectMcp: () => {
+        calls.push("disconnect");
+        return {};
+      },
+    }),
+  );
+  renderWithProviders(
+    <McpConnections
+      setup={create(GetMcpSetupResponseSchema, { enabled: false, recoveryAvailable: true })}
+    />,
+    { transport },
+  );
+  const user = userEvent.setup();
+  expect(
+    ((await screen.findByRole("button", { name: "Recover" })) as HTMLButtonElement).disabled,
+  ).toBe(false);
+  expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(
+    false,
+  );
+  expect((screen.getByRole("button", { name: "Save key" }) as HTMLButtonElement).disabled).toBe(
+    true,
+  );
+  expect((screen.getByRole("button", { name: "Enable" }) as HTMLButtonElement).disabled).toBe(true);
+  await user.click(screen.getByRole("button", { name: "Recover" }));
+  await waitFor(() => expect(calls).toEqual(["recover"]));
+  await user.click(screen.getByRole("button", { name: "Disconnect" }));
+  await waitFor(() => expect(calls).toEqual(["recover", "disconnect"]));
 });

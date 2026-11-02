@@ -572,6 +572,8 @@ message GetMcpSetupResponse {
   string flow_expires_at = 7;
   bool client_secret_configured = 8;
   bool discovery_available = 9;
+  // Credential reconciliation and disconnect, independent of new dispatch.
+  bool recovery_available = 10;
 }
 message CompleteMcpAuthorizationRequest {
   string connection_id = 1;

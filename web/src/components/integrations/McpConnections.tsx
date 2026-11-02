@@ -255,9 +255,10 @@ function McpConnection({
         {status.data?.current?.credential?.reference ?? ""}
       </p>
       {!setup.enabled && (
-        <p className="text-xs text-muted-foreground">
-          Connection actions and recovery are unavailable while this service is disabled.
-        </p>
+        <p className="text-xs text-muted-foreground">New external tool dispatch is disabled.</p>
+      )}
+      {!setup.recoveryAvailable && (
+        <p className="text-xs text-muted-foreground">Credential recovery is unavailable.</p>
       )}
       {!editing ? (
         <Button
@@ -509,7 +510,7 @@ function McpConnection({
         <Button
           size="sm"
           variant="outline"
-          disabled={busy || !setup.enabled}
+          disabled={busy || !setup.recoveryAvailable}
           onClick={() =>
             void run(() =>
               client
@@ -523,7 +524,7 @@ function McpConnection({
         <Button
           size="sm"
           variant="outline"
-          disabled={busy || !setup.enabled}
+          disabled={busy || !setup.recoveryAvailable}
           onClick={() => void run(() => client.disconnectMcp(request))}
         >
           Disconnect

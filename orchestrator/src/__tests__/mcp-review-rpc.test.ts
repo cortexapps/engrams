@@ -506,12 +506,13 @@ test.skipIf(!reachable)(
 );
 
 test.skipIf(!reachable)(
-  "registered result read enforces session association and current human ownership",
+  "registered result read enforces session association and current human ownership with dispatch disabled",
   async () => {
     const f = await reviewFixture(),
       s = await wire(f);
     const { mcpExecution } = await import("../db/schema.ts");
     const other = await reviewFixture();
+    s.service.enabled = false;
     try {
       await f.db.update(task).set({ createdByUserId: f.actorId }).where(eq(task.id, other.taskId));
       const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
@@ -705,6 +706,158 @@ test.skipIf(!reachable)(
         s.client.getMcpExecutionResult({ sessionId: f.sessionId, executionId: call.id }),
         Code.PermissionDenied,
       );
+    } finally {
+      await s.close();
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "disabled dispatch keeps registered history, pending reviews and exact cancellation",
+  async () => {
+    const f = await reviewFixture(),
+      s = await wire(f);
+    try {
+      const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      await f.journal.requestApproval(call.id, f.deploymentId, f.now);
+      const enabled = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      const expected = enabled.approvals[0]!.expectedReviewContext!;
+      let cancels = 0;
+      const runtime = {
+        cancel: async () => {
+          cancels++;
+        },
+        prepareRebind: async () => {
+          throw Error("must not rebind");
+        },
+        rebind: async () => {
+          throw Error("must not rebind");
+        },
+      };
+      s.service.runtime = runtime;
+      s.service.enabled = false;
+      const state = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      expect(state.availability).toBe("unavailable");
+      expect(state.executions[0]!.review!.originalArguments).toBe(f.input.originalArguments);
+      expect(state.executions[0]!.allowedActions).toEqual(["cancel"]);
+      expect(state.bindingReceipt!.allowedActions).toEqual([]);
+      expect(state.writePolicy?.allowedActions).toEqual(["approve_current_plan"]);
+      expect((await s.client.listMcpApprovals({ sessionId: f.sessionId })).approvals).toHaveLength(
+        1,
+      );
+      await code(
+        s.client.decideMcpApproval({
+          executionId: call.id,
+          approve: true,
+          expectedReviewContext: expected,
+        }),
+        Code.FailedPrecondition,
+      );
+      await code(
+        s.client.prepareMcpRebind({
+          sessionId: f.sessionId,
+          expectedBindingHash: f.snapshot.bindingHash,
+        }),
+        Code.FailedPrecondition,
+      );
+      await code(s.client.discoverMcp({}), Code.FailedPrecondition);
+      await code(s.client.publishMcp({}), Code.FailedPrecondition);
+      await code(s.client.rebindMcp({}), Code.FailedPrecondition);
+      await code(
+        s.client.cancelMcpCall({
+          executionId: call.id,
+          expectedJournalRevision: call.version + 100,
+        }),
+        Code.Aborted,
+      );
+      const current = (await f.journal.get(call.id))!;
+      const canceled = await s.client.cancelMcpCall({
+        executionId: call.id,
+        expectedJournalRevision: current.version,
+      });
+      expect(canceled.state).toBe("canceled");
+      expect(cancels).toBe(1);
+      await f.db.update(task).set({ createdByUserId: "other-owner" }).where(eq(task.id, f.taskId));
+      await code(s.client.getSessionMcpState({ sessionId: f.sessionId }), Code.PermissionDenied);
+    } finally {
+      await s.close();
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "disabled dispatch preserves exact unknown resolution and journal-only cancellation authority",
+  async () => {
+    const f = await reviewFixture(),
+      s = await wire(f);
+    try {
+      const { reviewContext } = await import("../mcp/journal-review.ts");
+      const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      const approval = await f.journal.requestApproval(call.id, f.deploymentId, f.now);
+      const approved = (
+        await f.journal.decide(call.id, f.actorId, true, reviewContext(call, approval), f.now)
+      ).call;
+      await f.journal.admit(call.id, f.deploymentId, f.now);
+      const lease = (await f.journal.getAdmission(call.id))!;
+      const dispatched = await f.journal.dispatch(
+        call.id,
+        { bootId: "boot", intentId: crypto.randomUUID(), expiresAt: lease.expiresAt },
+        f.now,
+        {
+          executionId: call.id,
+          requestDigest: call.requestDigest,
+          bindingHash: call.bindingHash,
+          principalId: call.principalId,
+          expectedJournalRevision: approved.version,
+          reservationId: lease.reservationId,
+          reservationExpiresAt: lease.expiresAt,
+        },
+      );
+      s.service.enabled = false;
+      expect(s.service.runtime).toBeUndefined();
+      const canceled = await s.client.cancelMcpCall({
+        executionId: call.id,
+        expectedJournalRevision: dispatched.version,
+      });
+      expect(canceled.state).toBe("outcome_unknown");
+      expect(canceled.receipt!.state).toBe("outcome_unknown");
+      const state = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      expect(state.unknownWriteBlocks).toContain(f.connection.id);
+      const expected = state.executions[0]!.expectedUnknownContext!;
+      const request = {
+        executionId: call.id,
+        outcome: "acknowledged",
+        expectedUnknownContext: expected,
+      };
+      await code(
+        s.client.resolveMcpOutcome({
+          ...request,
+          expectedUnknownContext: { ...expected, intentId: "other" },
+        }),
+        Code.Aborted,
+      );
+      await f.db
+        .update(user)
+        .set({ email: "apikey+fixture@service.local" })
+        .where(eq(user.id, f.actorId));
+      await code(s.client.getSessionMcpState({ sessionId: f.sessionId }), Code.PermissionDenied);
+      await code(s.client.resolveMcpOutcome(request), Code.PermissionDenied);
+      await f.db
+        .update(user)
+        .set({ email: `${f.actorId}@example.test` })
+        .where(eq(user.id, f.actorId));
+      await f.db.update(task).set({ createdByUserId: "other-owner" }).where(eq(task.id, f.taskId));
+      await code(s.client.resolveMcpOutcome(request), Code.PermissionDenied);
+      await f.db.update(user).set({ role: "admin" }).where(eq(user.id, f.actorId));
+      const resolved = await s.client.resolveMcpOutcome(request);
+      expect(resolved.receipt!.expectedContext).toEqual(expected);
+      expect((await f.journal.get(call.id))!.state).toBe("outcome_unknown");
+      expect((await f.journal.get(call.id))!.result).toBeNull();
+      expect(
+        (await s.client.getSessionMcpState({ sessionId: f.sessionId })).resolutionReceipts,
+      ).toHaveLength(1);
     } finally {
       await s.close();
       await f.cleanup();

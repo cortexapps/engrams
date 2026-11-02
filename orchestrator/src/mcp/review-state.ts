@@ -63,6 +63,8 @@ export async function sessionMcpState(input: {
   limit?: number;
   planToolCallId?: string;
   producers?: McpReviewProducers;
+  /** Dispatch availability is independent of access to persisted history. */
+  dispatchEnabled?: boolean;
   canCancel?: boolean;
   canRebind?: boolean;
   afterBindingToolName?: string;
@@ -131,13 +133,13 @@ export async function sessionMcpState(input: {
       current = true;
       response.bindingReceipt.current = true;
       response.bindingReceipt.staleReasons = [];
-      response.availability = "available";
+      response.availability = input.dispatchEnabled === false ? "unavailable" : "available";
     } catch (error) {
       if (!(error instanceof PublicationRequired))
         response.bindingReceipt.staleReasons = ["binding_or_policy_unavailable"];
     }
   }
-  if (input.canRebind && snapshot && response.bindingReceipt)
+  if (input.dispatchEnabled !== false && input.canRebind && snapshot && response.bindingReceipt)
     response.bindingReceipt.allowedActions = ["rebind"];
   let last = input.after ?? "";
   for (const row of input.omitExecutions ? [] : data.rows) {
@@ -149,6 +151,7 @@ export async function sessionMcpState(input: {
         : undefined;
     let reason = call.requestContext ? "" : "original_request_unavailable";
     if (
+      input.dispatchEnabled !== false &&
       current &&
       review &&
       call.requestContext &&
@@ -227,7 +230,13 @@ export async function sessionMcpState(input: {
       executions: [...response.executions!, entry],
       approvals: [
         ...response.approvals!,
-        ...(review && actions.includes("approve") ? [review] : []),
+        ...(review &&
+        (actions.includes("approve") ||
+          (input.dispatchEnabled === false &&
+            approval?.decision === "pending" &&
+            call.state === "waiting_approval"))
+          ? [review]
+          : []),
       ],
       resolutionReceipts: [
         ...response.resolutionReceipts!,

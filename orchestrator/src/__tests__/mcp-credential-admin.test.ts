@@ -1,7 +1,7 @@
 import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { create } from "@bufbuild/protobuf";
+import { create, toJson } from "@bufbuild/protobuf";
 import { checkDb } from "../db/client.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
@@ -88,15 +88,19 @@ async function fixture() {
       ),
     ),
   );
-  const admin = makeCredentialAdmin({ store, control, registrations: [], now: () => new Date() });
+  let now = new Date();
+  const admin = makeCredentialAdmin({ store, control, registrations: [], now: () => now });
   return {
     connections,
     store,
     row,
     admin,
     calls,
-    setFailure() {
-      failRevoke = true;
+    advance(milliseconds: number) {
+      now = new Date(now.getTime() + milliseconds);
+    },
+    setFailure(value = true) {
+      failRevoke = value;
     },
     setLost() {
       lostRevoke = true;
@@ -334,6 +338,102 @@ test.skipIf(!reachable)(
       ).rejects.toThrow();
     } finally {
       if (createdId) await f.connections.delete(createdId);
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "disabled dispatch preserves registered credential recovery and disconnect with exact admin context",
+  async () => {
+    const f = await fixture();
+    try {
+      const { credentialHandlers } = await import("../mcp/credential-rpc.ts");
+      const { makeMcpRepository } = await import("../mcp/repository.ts");
+      const { makeMcpJournal } = await import("../mcp/journal.ts");
+      const { IntegrationService, GetMcpSetupResponseSchema } =
+        await import("../gen/engram/app/v1/integration_pb.ts");
+      await f.admin.putSecret(
+        f.row.id,
+        1,
+        1,
+        "admin",
+        CredentialKind.API_KEY,
+        "x-api-key",
+        "entered-secret",
+      );
+      f.setFailure();
+      await expect(f.admin.disconnect(f.row.id, 2, 3, "admin")).rejects.toThrow();
+      f.advance(35001);
+      const pending = await f.store.get(f.row.id);
+      const services = {
+        enabled: false,
+        credentials: f.admin,
+        repository: makeMcpRepository(),
+        journal: makeMcpJournal(),
+      };
+      let email = "admin@example.test";
+      const client = createClient(
+        IntegrationService,
+        createRouterTransport((router) =>
+          router.service(
+            IntegrationService,
+            credentialHandlers({
+              services,
+              connections: f.connections,
+              getSession: async () => ({ user: { id: "admin", role: "admin", email } }),
+              connectionToProto: (row) => ({ id: row.id }),
+            }),
+          ),
+        ),
+      );
+      const setup = await client.getMcpSetup({ connectionId: f.row.id });
+      expect(setup.enabled).toBe(false);
+      expect(setup.recoveryAvailable).toBe(true);
+      expect(setup.transitionPending).toBe(true);
+      expect(JSON.stringify(toJson(GetMcpSetupResponseSchema, setup))).not.toContain(
+        "entered-secret",
+      );
+      const request = {
+        connectionId: f.row.id,
+        expectedRevision: pending.configRevision,
+        expectedGeneration: pending.authGeneration,
+      };
+      await expect(
+        client.putMcpCredential({
+          ...request,
+          kind: "api_key",
+          header: "x-api-key",
+          value: "forbidden",
+        }),
+      ).rejects.toThrow("disabled");
+      await expect(client.authorizeMcp(request)).rejects.toThrow("disabled");
+      await expect(client.completeMcpAuthorization(request)).rejects.toThrow("disabled");
+      email = "apikey+agent@service.local";
+      await expect(client.recoverMcpCredential(request)).rejects.toThrow("human administrator");
+      await expect(client.disconnectMcp(request)).rejects.toThrow("human administrator");
+      email = "admin@example.test";
+      await expect(
+        client.recoverMcpCredential({
+          ...request,
+          expectedGeneration: request.expectedGeneration + 1,
+        }),
+      ).rejects.toThrow("state changed");
+      await expect(client.recoverMcpCredential(request)).rejects.toThrow("state changed");
+      expect((await f.store.get(f.row.id)).mcpCredential.transition).toBeDefined();
+      f.setFailure(false);
+      f.advance(35001);
+      const recovered = await client.recoverMcpCredential(request);
+      expect(recovered.credential!.status).toBe("disconnected");
+      const ready = await f.store.get(f.row.id);
+      expect(ready.mcpCredential.transition).toBeUndefined();
+      await client.disconnectMcp({
+        connectionId: f.row.id,
+        expectedRevision: ready.configRevision,
+        expectedGeneration: ready.authGeneration,
+      });
+      expect(f.calls.filter((x) => x === "put")).toHaveLength(1);
+    } finally {
       await f.cleanup();
     }
   },

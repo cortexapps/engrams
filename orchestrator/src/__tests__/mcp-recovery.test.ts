@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { eq } from "drizzle-orm";
 import { effectFixture } from "./mcp-effect-fixture.ts";
-import { mcpExecution } from "../db/schema.ts";
+import { mcpExecution, mcpAdmissionScope } from "../db/schema.ts";
 import { makeMcpRecovery } from "../mcp/recovery.ts";
 
 import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
@@ -494,3 +494,153 @@ for (const disposition of ["missing", "terminal", "host_lost", "conflict", "tran
       await f.cleanup();
     }
   }, 20000);
+
+test("disabled dispatch construction drains persisted calls without any dispatch dependency", async () => {
+  const { schemaVerifiedFixture } = await import("./mcp-review-fixture.ts");
+  const { makeMcpRecoveryScanner } = await import("../mcp/recovery-scanner.ts");
+  const f = await schemaVerifiedFixture();
+  const recoveryDeploymentId = crypto.randomUUID();
+  try {
+    const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+    const delivered: string[] = [];
+    const runtime = makeMcpRecovery({
+      db: f.db,
+      deploymentId: recoveryDeploymentId,
+      now: () => f.now,
+      completer: {
+        async completeToolCall(input) {
+          delivered.push(input.resultJson);
+        },
+      },
+      listLifecycleEvents: async () => [],
+    });
+    const scanner = makeMcpRecoveryScanner({
+      journal: f.journal,
+      deploymentId: recoveryDeploymentId,
+      runtime: () => runtime,
+      now: () => f.now,
+      startWorkflow: async (ref) => {
+        if (ref.sessionId === f.sessionId) await runtime.runOnce(ref);
+      },
+    });
+    await scanner.runLifecycleOnce();
+    await scanner.runOnce();
+    const retained = (await f.journal.get(call.id))!;
+    expect(retained.state).toBe("canceled");
+    expect(retained.intentId).toBeNull();
+    expect(retained.completionEnqueuedVersion).toBe(retained.version);
+    expect(JSON.parse(delivered[0]!)).toMatchObject({
+      source: "runtime",
+      outcome: "canceled",
+      delivery: "unavailable",
+    });
+    await expect(
+      runtime.accept({ ...f.input, modelToolName: f.input.resolvedTool.modelToolName }),
+    ).rejects.toMatchObject({ code: "disabled" });
+    expect(
+      await runtime.decideRequest({
+        sessionId: f.sessionId,
+        runId: f.input.runId,
+        toolCallId: "new-call",
+        requestEventIdx: "1",
+        deadlineMs: f.now.getTime() + 1000,
+      }),
+    ).toEqual({ kind: "denied", code: "disabled" });
+    await expect(Promise.resolve().then(() => runtime.abortExecution(call.id))).rejects.toThrow(
+      "MCP cancellation unavailable",
+    );
+    expect(delivered).toHaveLength(1);
+  } finally {
+    await f.db.delete(mcpAdmissionScope).where(eq(mcpAdmissionScope.id, recoveryDeploymentId));
+    await f.cleanup();
+  }
+});
+
+test("disabled recovery scanner settles committed results across deployment identities without another effect", async () => {
+  const f = await effectFixture();
+  const recoveryDeploymentId = crypto.randomUUID();
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    const committed = await f.driver.driveOnce(call.id);
+    const leases = f.leases,
+      events = [...f.events];
+    f.setEnabled(false);
+    let attempts = 0;
+    const deliveries: string[] = [];
+    const { makeMcpRecoveryScanner } = await import("../mcp/recovery-scanner.ts");
+    const runtime = makeMcpRecovery({
+      db: f.db,
+      deploymentId: recoveryDeploymentId,
+      now: () => new Date(),
+      completer: {
+        async completeToolCall(input) {
+          attempts++;
+          deliveries.push(input.resultJson);
+          if (attempts === 1) throw Error("private-transport-error");
+        },
+      },
+    });
+    const scanner = makeMcpRecoveryScanner({
+      journal: f.journal,
+      deploymentId: recoveryDeploymentId,
+      runtime: () => runtime,
+      startWorkflow: async (ref) => {
+        if (ref.sessionId === f.sessionId) await runtime.runOnce(ref);
+      },
+    });
+    await expect(scanner.runOnce()).rejects.toThrow("MCP completion unavailable");
+    expect((await f.journal.get(call.id))!.completionEnqueuedVersion).toBe(0);
+    await scanner.runOnce();
+    expect((await f.journal.get(call.id))!.completionEnqueuedVersion).toBe(committed.version);
+    expect((await f.journal.get(call.id))!.result).toEqual(committed.result);
+    expect(f.leases).toBe(leases);
+    expect(f.events).toEqual(events);
+    expect((await f.command("stats")).calls).toBe(1);
+    expect(attempts).toBe(2);
+    expect(JSON.parse(deliveries[1]!)).toEqual({
+      ...committed.result,
+      resultUnavailable: committed.resultUnavailable,
+    });
+  } finally {
+    await f.db.delete(mcpAdmissionScope).where(eq(mcpAdmissionScope.id, recoveryDeploymentId));
+    await f.cleanup();
+  }
+}, 20000);
+
+test("live dispatch disable drains an accepted call without driving or leasing it", async () => {
+  const f = await effectFixture();
+  try {
+    let enabled = true,
+      drives = 0,
+      aborts = 0;
+    const runtime = makeMcpRecovery({
+      db: f.db,
+      deploymentId: f.deploymentId,
+      now: () => new Date(),
+      dispatchEnabled: () => enabled,
+      driver: {
+        ...f.driver,
+        async driveOnce(...args) {
+          drives++;
+          return f.driver.driveOnce(...args);
+        },
+        cancel(id) {
+          aborts++;
+          f.driver.cancel(id);
+        },
+      },
+      completer: { async completeToolCall() {} },
+    });
+    const ref = await runtime.accept(f.request),
+      leases = f.leases;
+    enabled = false;
+    expect(await runtime.runOnce(ref)).toBe("done");
+    expect((await f.journal.get(ref.executionId))!.state).toBe("canceled");
+    expect(drives).toBe(0);
+    expect(aborts).toBe(1);
+    expect(f.leases).toBe(leases);
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);

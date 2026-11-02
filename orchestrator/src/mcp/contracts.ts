@@ -57,6 +57,9 @@ export interface McpServices {
     ): Promise<{ bindingHash: string }>;
   };
 }
+export function requireMcpServices(services: McpServices | undefined): McpServices {
+  return requireMcpHook(services);
+}
 export function requireMcp(services: McpServices | undefined): McpServices {
   if (!services?.enabled)
     throw new ConnectError("external MCP is disabled", Code.FailedPrecondition);
@@ -218,6 +221,7 @@ export function mcpHandlers(deps: {
   connectionToProto: (row: IntegrationConnectionRow) => { id: string };
 }): Pick<ServiceImpl<typeof IntegrationService>, Methods> {
   const services = () => requireMcp(deps.services);
+  const durableServices = () => requireMcpServices(deps.services);
   async function connection(id: string) {
     const row = await deps.connections.get(id);
     if (!row || row.provider !== "mcp" || !row.mcp)
@@ -301,7 +305,7 @@ export function mcpHandlers(deps: {
     },
     async getMcpExecutionResult(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
+      const service = durableServices();
       return mcpOperation(async () => {
         const call = await service.journal.readExecutionResult(
           req.sessionId,
@@ -363,7 +367,7 @@ export function mcpHandlers(deps: {
     },
     async getSessionMcpState(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
+      const service = durableServices();
       return mcpOperation(() =>
         sessionMcpState({
           journal: service.journal,
@@ -374,8 +378,10 @@ export function mcpHandlers(deps: {
           limit: req.pageSize || undefined,
           planToolCallId: req.planToolCallId,
           producers: service.reviewProducers,
-          canCancel: Boolean(service.runtime?.cancel),
-          canRebind: Boolean(service.runtime?.prepareRebind && service.runtime?.rebind),
+          dispatchEnabled: service.enabled,
+          canCancel: true,
+          canRebind:
+            service.enabled && Boolean(service.runtime?.prepareRebind && service.runtime?.rebind),
           afterBindingToolName: req.afterBindingToolName || undefined,
           bindingPageSize: req.bindingPageSize || undefined,
           omitBindings: req.omitBindings,
@@ -385,7 +391,7 @@ export function mcpHandlers(deps: {
     },
     async listMcpApprovals(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
+      const service = durableServices();
       // Use the same bounded read; a continuation is available from GetSessionMcpState.
       return mcpOperation(async () => {
         const state = await sessionMcpState({
@@ -395,7 +401,8 @@ export function mcpHandlers(deps: {
           now: deps.now(),
           after: req.afterExecutionId || undefined,
           producers: service.reviewProducers,
-          canCancel: Boolean(service.runtime?.cancel),
+          dispatchEnabled: service.enabled,
+          canCancel: true,
           omitBindings: true,
         });
         return { approvals: state.approvals, nextExecutionId: state.nextExecutionId };
@@ -457,8 +464,7 @@ export function mcpHandlers(deps: {
     },
     async cancelMcpCall(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
-      const runtime = requireMcpHook(service.runtime);
+      const service = durableServices();
       return mcpOperation(async () => {
         if (!req.expectedJournalRevision)
           throw new ConnectError("expected journal revision is required", Code.InvalidArgument);
@@ -469,7 +475,8 @@ export function mcpHandlers(deps: {
           req.expectedJournalRevision,
         );
         // The committed cancellation fences other replicas even if local I/O already ended.
-        await runtime.cancel(call.id);
+        // This receipt proves durable cancellation only. Local I/O abort is best effort.
+        await service.runtime?.cancel(call.id);
         const receipt = await service.journal.cancellationReceipt(call.id);
         if (!receipt) throw Error("cancellation receipt unavailable");
         return {
@@ -484,7 +491,7 @@ export function mcpHandlers(deps: {
     },
     async resolveMcpOutcome(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
+      const service = durableServices();
       if (actor.serviceAccount)
         throw new ConnectError("a human decision is required", Code.PermissionDenied);
       if (req.outcome !== "succeeded" && req.outcome !== "failed" && req.outcome !== "acknowledged")

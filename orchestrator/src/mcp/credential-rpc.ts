@@ -11,7 +11,13 @@ import type {
   IntegrationConnectionRow,
   IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
-import { mcpOperation, requireMcp, requireMcpHook, type McpServices } from "./contracts.ts";
+import {
+  mcpOperation,
+  requireMcp,
+  requireMcpHook,
+  requireMcpServices,
+  type McpServices,
+} from "./contracts.ts";
 
 export async function requireMcpHumanAdmin(ctx: HandlerContext, getSession: GetSession) {
   const actor = await requireAdmin(ctx, getSession);
@@ -50,11 +56,14 @@ export function credentialHandlers(deps: {
   function admin() {
     return requireMcpHook(requireMcp(deps.services).credentials);
   }
+  function recoveryAdmin() {
+    return requireMcpHook(requireMcpServices(deps.services).credentials);
+  }
   async function result(id: string) {
     const row = await deps.connections.get(id);
     if (!row || row.provider !== "mcp")
       throw new ConnectError("MCP connection not found", Code.NotFound);
-    const { status } = await admin().status(id);
+    const { status } = await recoveryAdmin().status(id);
     return {
       connection: deps.connectionToProto(row),
       credential: statusToProto(status, row.mcp?.revoked ?? true),
@@ -118,7 +127,7 @@ export function credentialHandlers(deps: {
     },
     async disconnectMcp(req, ctx) {
       const actor = await requireMcpHumanAdmin(ctx, deps.getSession);
-      const service = admin();
+      const service = recoveryAdmin();
       return mcpOperation(async () => {
         await service.disconnect(
           req.connectionId,
@@ -131,7 +140,7 @@ export function credentialHandlers(deps: {
     },
     async recoverMcpCredential(req, ctx) {
       const actor = await requireMcpHumanAdmin(ctx, deps.getSession);
-      const service = admin();
+      const service = recoveryAdmin();
       return mcpOperation(async () => {
         await service.recover(
           req.connectionId,
@@ -148,6 +157,7 @@ export function credentialHandlers(deps: {
       return mcpOperation(async () => {
         const base = {
           enabled: service?.enabled ?? false,
+          recoveryAvailable: !!service?.credentials,
           discoveryAvailable: !!service?.enabled && !!service.discovery,
           registrations: service?.credentials?.registrations() ?? [],
           destinations: service?.destinations ?? [],
