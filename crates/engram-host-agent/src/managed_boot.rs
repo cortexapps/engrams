@@ -201,6 +201,52 @@ impl ManagedBootHost {
             entries: Default::default(),
         })
     }
+    pub async fn read_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        use engram_core::types::managed_assets::{ManagedColdAssetsReceipt, ManagedColdBackend};
+        request.validate().map_err(invalid)?;
+        if request.host_id != self.host_id
+            || self.incarnation.is_empty()
+            || self.incarnation.len() > 128
+        {
+            return Err(invalid("host identity"));
+        }
+        let (backend, kernel, bundles) = match &self.backend {
+            #[cfg(target_os = "linux")]
+            ManagedBackend::Firecracker(backend) => (
+                ManagedColdBackend::Firecracker,
+                backend.config().kernel_image_path.as_path(),
+                backend.bundle_dir(),
+            ),
+            #[cfg(target_os = "macos")]
+            ManagedBackend::Vz { backend, .. } => (
+                ManagedColdBackend::Vz,
+                backend.managed_kernel_path(),
+                backend.bundle_dir(),
+            ),
+        };
+        let (kernel_sha256, disk_sha256, disk_size_bytes) = crate::managed_assets::inspect(
+            &self.chunks,
+            request.disk_manifest,
+            kernel,
+            bundles,
+            &request.aux_ro_drives,
+        )
+        .await?;
+        let receipt = ManagedColdAssetsReceipt {
+            request,
+            host_incarnation: self.incarnation.clone(),
+            backend,
+            kernel_sha256,
+            disk_sha256,
+            disk_size_bytes,
+        };
+        receipt.validate_for(&receipt.request).map_err(invalid)?;
+        Ok(receipt)
+    }
+
     fn path(&self, id: SandboxId) -> PathBuf {
         self.directory.join(format!("{id}.boot"))
     }
@@ -1498,7 +1544,8 @@ mod tests {
             backend: Arc::new(
                 engram_sandbox_vz::VzBackend::new(
                     path.join("native"),
-                    engram_sandbox_vz::VzConfig::with_kernel(path.join("kernel")),
+                    engram_sandbox_vz::VzConfig::with_kernel(path.join("kernel"))
+                        .with_bundle_dir(path),
                 )
                 .unwrap(),
             ),
@@ -1509,10 +1556,12 @@ mod tests {
         };
         #[cfg(target_os = "linux")]
         let backend = ManagedBackend::Firecracker(Arc::new(
-            engram_sandbox_firecracker::FirecrackerBackend::new(
-                path.join("native"),
-                engram_sandbox_firecracker::FirecrackerConfig::with_kernel(path.join("kernel")),
-            ),
+            engram_sandbox_firecracker::FirecrackerBackend::new(path.join("native"), {
+                let mut config =
+                    engram_sandbox_firecracker::FirecrackerConfig::with_kernel(path.join("kernel"));
+                config.bundle_dir = path.to_owned();
+                config
+            }),
         ));
         let ordinary = Arc::new(engram_sandbox_process::ProcessBackend::new(
             path.join("ordinary"),
@@ -1549,6 +1598,113 @@ mod tests {
         );
         (host, request)
     }
+    #[tokio::test]
+    async fn cold_assets_hash_exact_sparse_disk_and_configured_files_without_owner() {
+        use engram_chunk_store::{ChunkRef, ChunkSize, Manifest, ManifestKind};
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let (host, boot) = fixture(temp.path());
+        let mut drives = boot.cold.aux_ro_drives.clone();
+        for (i, drive) in drives.iter_mut().enumerate() {
+            let bytes = vec![i as u8 + 1; 17];
+            let hash = hex::encode(Sha256::digest(&bytes));
+            std::fs::write(temp.path().join(AuxRoDrive::staged_file_name(&hash)), bytes).unwrap();
+            drive.sha256 = Some(hash);
+        }
+        let mut manifest = Manifest::empty(ManifestKind::Disk, 15);
+        manifest.chunk_size = ChunkSize::bytes(4);
+        manifest.chunks = vec![
+            ChunkRef {
+                offset: 4,
+                hash: host.chunks.put_chunk(b"abcd").await.unwrap(),
+            },
+            ChunkRef {
+                offset: 12,
+                hash: host.chunks.put_chunk(b"xyz").await.unwrap(),
+            },
+        ];
+        host.chunks
+            .put_manifest(boot.cold.disk.manifest, &manifest)
+            .await
+            .unwrap();
+        let request = engram_core::types::managed_assets::ManagedColdAssetsRequest {
+            version: 1,
+            host_id: host.host_id,
+            session_id: boot.cold.session_id,
+            intent_id: "intent-a".into(),
+            image: boot.cold.image,
+            image_digest: format!("sha256:{}", "e".repeat(64)),
+            disk_manifest: boot.cold.disk.manifest,
+            aux_ro_drives: drives,
+        };
+        let client =
+            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                .with_managed_boot(host.clone());
+        let receipt = client
+            .read_managed_cold_assets(request.clone())
+            .await
+            .unwrap();
+        receipt.validate_for(&request).unwrap();
+        assert_eq!(
+            receipt.disk_sha256,
+            hex::encode(Sha256::digest(b"\0\0\0\0abcd\0\0\0\0xyz"))
+        );
+        assert_eq!(receipt.disk_size_bytes, 15);
+        assert_eq!(
+            receipt.kernel_sha256,
+            hex::encode(Sha256::digest(b"kernel"))
+        );
+        assert_eq!(receipt.host_incarnation, "current-host");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            receipt.backend,
+            engram_core::types::managed_assets::ManagedColdBackend::Vz
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            receipt.backend,
+            engram_core::types::managed_assets::ManagedColdBackend::Firecracker
+        );
+        assert!(host.entries.is_empty());
+        assert_eq!(host.next_network.load(Ordering::SeqCst), 0);
+        assert!(host.ordinary.list().await.unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&host.directory).unwrap().count(), 0);
+        std::fs::write(temp.path().join("kernel"), b"changed kernel").unwrap();
+        let changed = client
+            .read_managed_cold_assets(request.clone())
+            .await
+            .unwrap();
+        assert_ne!(changed.kernel_sha256, receipt.kernel_sha256);
+        let mut wrong_host = request.clone();
+        wrong_host.host_id = HostId::new();
+        assert!(client.read_managed_cold_assets(wrong_host).await.is_err());
+        let mut reordered = request.clone();
+        reordered.aux_ro_drives.swap(0, 1);
+        assert!(client.read_managed_cold_assets(reordered).await.is_err());
+        for field in 0..6 {
+            let mut invalid = request.clone();
+            match field {
+                0 => invalid.version = 2,
+                1 => invalid.intent_id = "i".repeat(129),
+                2 => invalid.image = "i".repeat(257),
+                3 => invalid.aux_ro_drives.pop().map(|_| ()).unwrap(),
+                4 => invalid.aux_ro_drives[0].sha256 = Some("../kernel".into()),
+                _ => invalid.disk_manifest.version = 0,
+            }
+            assert!(client.read_managed_cold_assets(invalid).await.is_err());
+        }
+        let bundle = temp.path().join(AuxRoDrive::staged_file_name(
+            request.aux_ro_drives[1].sha256.as_ref().unwrap(),
+        ));
+        std::fs::write(&bundle, b"corrupt").unwrap();
+        assert!(client
+            .read_managed_cold_assets(request.clone())
+            .await
+            .is_err());
+        std::fs::remove_file(bundle).unwrap();
+        assert!(client.read_managed_cold_assets(request).await.is_err());
+    }
+
     fn failed(request: ManagedBootPrepare) -> Record {
         Record {
             version: 1,

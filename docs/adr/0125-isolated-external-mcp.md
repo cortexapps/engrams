@@ -647,3 +647,29 @@ The reply reports the actual backend and host incarnation plus verified logical
 disk byte hash/size and kernel hash. Inspection creates no VM or policy lease.
 Preparation checks the same bytes again. An unsupported host remains closed.
 This additive gRPC method does not change the bincode wire layout.
+
+The host implementation reads the immutable manifest and content-addressed
+chunks from its configured blob store. The enabled-image materializer publishes
+all chunks before the manifest; the coordinator checks capture recoverability
+before it selects a base. The managed path does not use the ordinary restore
+path's OCI resolver. A missing chunk fails inspection. The reader validates
+chunk lengths and hashes and hashes every logical disk byte, including sparse
+zero ranges and a short final chunk. A manifest digest is not a disk digest.
+
+The host uses the same configured kernel path and bundle directory that managed
+preparation uses. It checks all ordered bundle contents and reports the kernel
+content hash. Preparation copies and checks the disk, kernel and bundles again
+before it constructs a VM. Inspection creates no sandbox, network, helper or
+policy owner. A receipt binds the exact request and current host incarnation.
+The image digest in that request is an association with coordinator approval;
+it is not independent host proof of catalog lineage.
+
+Only the pinned mutual-TLS host service exposes this operation. One bounded
+inspection runs at a time without a lifecycle or inventory lock. Disk chunks
+and files are read as streams; hashing yields between 64 KiB blocks. The
+manifest is bounded to 8 MiB and decoded off the async executor. Cancellation
+stops the read future; a pending bounded manifest decode retains the slot until
+it exits. An inspection has a five-minute read deadline. File reads reject
+symlinks and special files and check identity, length and modification metadata
+before returning a hash. Local file and TLS tests do not prove physical VM
+boot or network isolation; those acceptance gates remain separate.

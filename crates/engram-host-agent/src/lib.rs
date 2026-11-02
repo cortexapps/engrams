@@ -2557,4 +2557,5 @@ pub mod managed_policy;
 
 pub mod managed_tls;
 
+mod managed_assets;
 pub mod managed_boot;
