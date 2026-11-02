@@ -163,6 +163,20 @@ impl ManagedBootFinalize {
         let bytes = serde_json::to_vec(&value).map_err(|_| conflict())?;
         if digest(&bytes) != f.agent_digest
             || self.agent.binding_epoch != f.prepared.request.key.context.target.binding_epoch
+            || self.agent.env.get("ENGRAM_SANDBOX_ID")
+                != Some(&f.prepared.request.key.context.target.sandbox_id.to_string())
+            || self.agent.env.get("ENGRAM_BINDING_EPOCH")
+                != Some(
+                    &f.prepared
+                        .request
+                        .key
+                        .context
+                        .target
+                        .binding_epoch
+                        .to_string(),
+                )
+            || self.agent.session_env.contains_key("ENGRAM_SANDBOX_ID")
+            || self.agent.session_env.contains_key("ENGRAM_BINDING_EPOCH")
             || self.agent.argv.is_empty()
             || self.agent.env.get("ENGRAM_TOOLS").map(String::as_bytes)
                 != Some(f.combined_manifest.as_slice())
