@@ -1957,7 +1957,11 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // io::ErrorKind for the resume re-plan. A `failed_precondition`
         // with NEITHER marker falls through to the generic mapping.
         Code::FailedPrecondition => {
-            if let Some((host, coord)) = crate::wire::parse_wire_skew_message(status.message()) {
+            if status.message() == crate::wire::MANAGED_RECOVERY_REQUIRED_STATUS {
+                SandboxError::ManagedRecoveryRequired
+            } else if let Some((host, coord)) =
+                crate::wire::parse_wire_skew_message(status.message())
+            {
                 SandboxError::WireSkew { host, coord }
             } else if let Some((kind, message)) =
                 crate::wire::parse_harness_spawn_message(status.message())
@@ -2049,6 +2053,26 @@ mod grpc_err_tests {
             "some other precondition",
         ));
         assert!(matches!(err, SandboxError::Vm(_)));
+    }
+
+    #[test]
+    fn managed_recovery_requires_exact_status_marker() {
+        let marker = crate::wire::MANAGED_RECOVERY_REQUIRED_STATUS;
+        assert!(matches!(
+            grpc_to_sandbox_err(tonic::Status::failed_precondition(marker)),
+            SandboxError::ManagedRecoveryRequired
+        ));
+        for status in [
+            tonic::Status::failed_precondition(format!("{marker}: extra")),
+            tonic::Status::failed_precondition("managed sandbox requires cold recovery"),
+            tonic::Status::invalid_argument(marker),
+            tonic::Status::unavailable(marker),
+        ] {
+            assert!(!matches!(
+                grpc_to_sandbox_err(status),
+                SandboxError::ManagedRecoveryRequired
+            ));
+        }
     }
 
     #[test]

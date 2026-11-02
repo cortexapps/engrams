@@ -1954,6 +1954,9 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         ),
         // Same marker shape: the coordinator reads the typed variant and
         // recovers the session from its disk instead of retrying.
+        SandboxError::ManagedRecoveryRequired => {
+            Status::failed_precondition(engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS)
+        }
         SandboxError::MemoryImageUnusable(message) => Status::failed_precondition(
             engram_protocol::wire::memory_image_unusable_message(&message),
         ),
@@ -2203,6 +2206,16 @@ mod wire_version_tests {
                 "NotFound".to_string(),
                 "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn managed_recovery_maps_to_exact_failed_precondition_marker() {
+        let status = sandbox_to_status(SandboxError::ManagedRecoveryRequired);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS
         );
     }
 
