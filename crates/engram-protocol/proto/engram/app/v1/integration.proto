@@ -54,6 +54,7 @@ service IntegrationService {
   rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
   rpc SetConnectionEnabled(SetConnectionEnabledRequest) returns (SetConnectionEnabledResponse);
   rpc GetGoogleCloudSetup(GetGoogleCloudSetupRequest) returns (GetGoogleCloudSetupResponse);
+  rpc GetMcpCatalogs(GetMcpCatalogsRequest) returns (GetMcpCatalogsResponse);
   rpc DiscoverMcp(DiscoverMcpRequest) returns (DiscoverMcpResponse);
   rpc PublishMcp(PublishMcpRequest) returns (PublishMcpResponse);
   rpc PutMcpCredential(PutMcpCredentialRequest) returns (PutMcpCredentialResponse);
@@ -373,6 +374,15 @@ message McpCatalog {
   repeated McpTool tools = 7;
   string fingerprint = 8;
 }
+message GetMcpCatalogsRequest {
+  string connection_id = 1;
+}
+message GetMcpCatalogsResponse {
+  uint32 config_revision = 1;
+  uint32 catalog_revision = 2;
+  McpCatalog draft = 3;
+  McpCatalog published = 4;
+}
 message DiscoverMcpRequest {
   string connection_id = 1;
   uint32 expected_revision = 2;
@@ -560,6 +570,7 @@ message GetMcpSetupResponse {
   string flow_id = 6;
   string flow_expires_at = 7;
   bool client_secret_configured = 8;
+  bool discovery_available = 9;
 }
 message CompleteMcpAuthorizationRequest {
   string connection_id = 1;

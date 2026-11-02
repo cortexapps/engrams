@@ -7,7 +7,7 @@ import {
 } from "../gen/engram/app/v1/integration_pb.ts";
 import { McpPublicationRequired, McpRebindDraining, type McpRebindDrain } from "./rebind.ts";
 import { policyReviewCurrent, type JournalReviewContext } from "./journal-review.ts";
-import { credentialHandlers } from "./credential-rpc.ts";
+import { credentialHandlers, requireMcpHumanAdmin } from "./credential-rpc.ts";
 import type { CredentialAdmin } from "./credential-admin.ts";
 import { Code, ConnectError, type ServiceImpl } from "@connectrpc/connect";
 import type { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
@@ -20,6 +20,8 @@ import { validateMcpConfig, type McpConfig } from "./config.ts";
 import type { McpRepository } from "./repository.ts";
 import type { McpJournal, McpUnknownContext } from "./journal.ts";
 import type { McpDiscoveredTool, McpReviewedTool } from "./types.ts";
+import { assertSchemaShape } from "./catalog.ts";
+import { MCP_LIMITS } from "./limits.ts";
 
 /** Internal services use trusted connection identities, never guest destinations. */
 export interface McpServices {
@@ -146,8 +148,26 @@ export function mcpConfigToProto(raw: unknown): McpProtoConfig {
   };
 }
 function catalogToProto(value: Awaited<ReturnType<McpRepository["saveDraft"]>>) {
+  if (
+    !Array.isArray(value.tools) ||
+    value.tools.length > MCP_LIMITS.toolsPerSession ||
+    Buffer.byteLength(JSON.stringify(value.tools)) > MCP_LIMITS.manifestBytes
+  )
+    throw new Error("catalog is too large");
+  for (const tool of value.tools) {
+    if (typeof tool.upstreamName !== "string" || typeof tool.description !== "string")
+      throw new Error("invalid catalog");
+    assertSchemaShape(tool.inputSchema);
+    if (tool.outputSchema !== undefined) assertSchemaShape(tool.outputSchema);
+  }
   return {
-    ...value,
+    id: value.id,
+    connectionId: value.connectionId,
+    kind: value.kind,
+    revision: value.revision,
+    configRevision: value.configRevision,
+    authGeneration: value.authGeneration,
+    fingerprint: value.fingerprint,
     tools: value.tools.map((t) => ({
       upstreamName: t.upstreamName,
       description: t.description,
@@ -173,6 +193,7 @@ type Methods =
   | "getMcpSetup"
   | "completeMcpAuthorization"
   | "recoverMcpCredential"
+  | "getMcpCatalogs"
   | "discoverMcp"
   | "publishMcp"
   | "authorizeMcp"
@@ -200,6 +221,26 @@ export function mcpHandlers(deps: {
   }
   return {
     ...credentialHandlers(deps),
+    async getMcpCatalogs(req, ctx) {
+      await requireMcpHumanAdmin(ctx, deps.getSession);
+      const repository = requireMcpHook(deps.services?.repository);
+      return mcpOperation(async () => {
+        const row = await connection(req.connectionId);
+        const [draft, published] = await Promise.all([
+          repository.getLatestDraft(row.id),
+          row.mcp!.catalogRevision ? repository.getCatalog(row.id, row.mcp!.catalogRevision) : null,
+        ]);
+        const result = {
+          configRevision: row.mcp!.configRevision,
+          catalogRevision: row.mcp!.catalogRevision,
+          ...(draft ? { draft: catalogToProto(draft) } : {}),
+          ...(published ? { published: catalogToProto(published) } : {}),
+        };
+        if (Buffer.byteLength(JSON.stringify(result)) > MCP_LIMITS.responseBytes)
+          throw new Error("catalog response is too large");
+        return result;
+      });
+    },
     async discoverMcp(req, ctx) {
       const actor = await requireAdmin(ctx, deps.getSession);
       const service = services();

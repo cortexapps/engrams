@@ -148,6 +148,7 @@ export function credentialHandlers(deps: {
       return mcpOperation(async () => {
         const base = {
           enabled: service?.enabled ?? false,
+          discoveryAvailable: !!service?.enabled && !!service.discovery,
           registrations: service?.credentials?.registrations() ?? [],
           destinations: service?.destinations ?? [],
         };
