@@ -20,6 +20,12 @@ afterEach(() => {
 });
 
 describe("MCP callback", () => {
+  it("clears callback values even when the page root is missing", async () => {
+    const callback = { code: "code-secret", state: "state-secret", issuer: "issuer-secret" };
+    const { completeCallback } = await import("./mcp-callback");
+    await completeCallback(callback);
+    expect(callback).toEqual({ code: "", state: "", issuer: undefined });
+  });
   it("posts once with the configured transport and consumes metadata", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     saveMcpFlow(sessionStorage, flow);
@@ -27,7 +33,13 @@ describe("MCP callback", () => {
       .spyOn(window, "fetch")
       .mockResolvedValue(new Response("{}", { headers: { "content-type": "application/json" } }));
     const { completeCallback } = await import("./mcp-callback");
-    await completeCallback({ code: "code-secret", state: "state-secret" });
+    const callback = {
+      code: "code-secret",
+      state: "state-secret",
+      issuer: "https://issuer.example.test",
+    };
+    await completeCallback(callback);
+    expect(callback).toEqual({ code: "", state: "", issuer: undefined });
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [url, options] = fetchSpy.mock.calls[0];
     expect(String(url)).toContain("/rpc/engram.app.v1.IntegrationService/CompleteMcpAuthorization");
@@ -53,11 +65,13 @@ describe("MCP callback", () => {
         );
       vi.resetModules();
       const { completeCallback } = await import("./mcp-callback");
-      await completeCallback({
+      const callback = {
         code: "code-secret",
         state: "state-secret",
         issuer: "https://issuer.example.test",
-      });
+      };
+      await completeCallback(callback);
+      expect(callback).toEqual({ code: "", state: "", issuer: undefined });
       expect(fetchSpy).toHaveBeenCalledOnce();
       expect(String(fetchSpy.mock.calls[0][0])).toMatch(/^https:\/\/api\.example\.test\/rpc\//);
       expect(fetchSpy.mock.calls[0][1]?.credentials).toBe("include");

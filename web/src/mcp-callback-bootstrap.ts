@@ -10,6 +10,15 @@ export type McpFlow = {
   expiresAt: string;
 };
 
+export function clearMcpCallback(
+  callback: { code: string; state: string; issuer?: string } | null,
+) {
+  if (!callback) return;
+  callback.code = "";
+  callback.state = "";
+  callback.issuer = undefined;
+}
+
 export function captureMcpCallback(url: URL, history: Pick<History, "replaceState">) {
   if (url.pathname !== MCP_CALLBACK_PATH) return undefined;
   const params = url.searchParams;
