@@ -3793,6 +3793,131 @@ done
         engine.abort();
     }
 
+    // Explicit fixture gate: the caller builds the test-only CLI and supplies
+    // a private, empty state directory and a new proof path for each run.
+    #[tokio::test]
+    #[ignore = "requires the separately built MCP model fixture"]
+    async fn external_mcp_static_fixture_adapter_gate() {
+        let binary = PathBuf::from(std::env::var_os("ENGRAM_FIXTURE_BIN").expect("fixture binary"));
+        let mode = std::env::var("ENGRAM_FIXTURE_MODE").expect("fixture mode");
+        assert!(["read", "held-call"].contains(&mode.as_str()));
+        assert_eq!(
+            std::env::var("ENGRAM_FIXTURE_TOOL").as_deref(),
+            Ok("remote_inventory")
+        );
+        let state =
+            PathBuf::from(std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").expect("fixture state"));
+        let proof = PathBuf::from(std::env::var_os("ENGRAM_FIXTURE_PROOF").expect("fixture proof"));
+        assert!(binary.is_absolute() && binary.is_file() && state.is_absolute());
+        assert_eq!(proof.parent(), Some(state.as_path()));
+        assert!(!proof.exists());
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::process::Command::new(&binary)
+                .arg("--fixture-version")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("fixture version timed out")
+        .expect("fixture version process");
+        assert!(version.status.success());
+        assert_eq!(version.stdout, b"engram-mcp-model-fixture 1\n");
+        let mut cli = test_cli(binary);
+        cli.tool_manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Fixture tool","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+        let harness_state = cli.state_dir.clone();
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, mut received) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(cli, receiver, Arc::new(Notify::new()), events));
+        commands
+            .send(HarnessCommand::Prompt {
+                prompt_id: "fixture-prompt".into(),
+                text: "fixture".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = received.recv().await.expect("fixture event stream");
+                if let HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id,
+                    name,
+                    args_json,
+                } = event
+                {
+                    break (run_id, call_id, name, args_json);
+                }
+            }
+        })
+        .await
+        .expect("fixture call timed out");
+        assert_eq!(requested.0, "fixture-turn");
+        assert_eq!(requested.1, "fixture-call");
+        assert_eq!(requested.2, "remote_inventory");
+        assert_eq!(
+            serde_json::from_str::<Value>(&requested.3).unwrap(),
+            json!({"fixture":mode})
+        );
+        if mode == "held-call" {
+            commands.send(HarnessCommand::Interrupt).await.unwrap();
+            let cancel = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = received.recv().await.expect("fixture event stream");
+                    assert_ne!(event.kind(), "tool_call_completed");
+                    if event.kind() == "tool_call_cancel_requested" {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("fixture cancellation timed out");
+            assert_eq!(cancel.tool_call_id(), Some("fixture-call"));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = received.recv().await.expect("fixture event stream");
+                    assert_ne!(event.kind(), "tool_call_completed");
+                    if event.kind() == "run_interrupted" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("fixture turn interruption timed out");
+            assert!(tokio::fs::read(&proof).await.unwrap().is_empty());
+        } else {
+            commands.send(HarnessCommand::ToolResult { call_id: "fixture-call".into(), result_json: r#"{"outcome":"succeeded","delivery":"available","output":{"content":[{"type":"text","text":"sentinel"},{"type":"text","text":"second sentinel"}],"structuredContent":{"fixture":true},"isError":false},"resultUnavailable":false}"#.into() }).await.unwrap();
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(bytes) = tokio::fs::read(&proof).await {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                            break value;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("fixture receipt timed out");
+            assert_eq!(observed["success"], true);
+            assert_eq!(observed["textSequence"], true);
+            assert_eq!(observed["structuredSentinel"], true);
+            assert_eq!(observed["outcome"], "succeeded");
+            assert_eq!(observed["delivery"], "available");
+        }
+        commands
+            .send(HarnessCommand::Shutdown { grace_secs: 1 })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine)
+            .await
+            .expect("fixture engine shutdown")
+            .unwrap();
+        let _ = tokio::fs::remove_dir_all(&harness_state).await;
+        let _ = tokio::fs::remove_file(harness_state.with_extension("attach-token")).await;
+    }
+
     #[tokio::test]
     async fn native_request_user_input_uses_generic_frames_and_is_parked_durably() {
         let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
