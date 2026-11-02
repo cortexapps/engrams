@@ -425,3 +425,44 @@ environment, and no arguments. Native attachment identity, reliable control
 liveness, and child-process state are checked before a closed receipt. A helper
 cleanup timeout stays failed after forced reaping. This local cleanup result
 cannot replace the proxy's lease barrier or clear its stable session poison.
+
+### Firecracker closed cold producer
+
+Managed Firecracker uses one anonymous network namespace per preparation. The
+namespace has only its loopback device and one TAP. It has no veth, external
+route, shared address slot, or host-root firewall rule. A dedicated native
+thread creates it; retained namespace descriptors select every later command
+and the Firecracker child. Namespace device/inode, TAP ifindex, MAC, IPv4
+addresses, MTU, routes and installed rules are read back. Carrier state and
+TAP queue count can change when Firecracker opens the same attachment; they
+are not attachment identity. Administrative state remains checked.
+
+Before the TAP is brought up, owned netdev ingress/egress and inet
+input/output/forward chains drop all traffic. Separate strict chains remain
+installed behind that fence. They check the selected source tuple and narrow
+ARP exchange, redirect all IPv4 TCP to a namespace-local listener, allow DNS
+only at the selected gateway, and drop other protocols. Port inspection is
+after defragmentation. No host-root NAT or established-flow rule participates.
+The namespace owns its conntrack table; destroying all namespace, socket and
+process owners discards it without a host-wide flush or address-slot reuse.
+
+The bounded Rust adapter transfers Unix streams only to the registered private
+policy ingress. TCP requires the kernel original destination and port, with
+no default-port fallback. Gateway TCP/UDP DNS uses the bounded private DNS
+operation. The adapter makes no destination dial. Proxy loss, an invalid
+handoff, owner loss or runtime shutdown is terminal. Owned flow tasks stop
+before private cleanup EOF. Native child cleanup runs on a reserved thread;
+Drop initiates it, while explicit close reports its result. Timeout or failed
+cleanup cannot become a successful receipt.
+
+The cold constructor verifies private copies of the selected disk, kernel
+and auxiliary files, configures fresh devices, and checks the Firecracker
+state is Not started. It does not load memory or saved device state and has
+no start, resume or ordinary-map conversion. The closed receipt binds the
+exact request, registration, network identity, rules digest and configuration
+digest. It does not certify capture consistency or final policy enforcement.
+The durable start producer must consume the owner, bind placement and final
+policy, then implement the sole release/start operation. Its guest resolver
+must use the selected gateway. Root installed-rule, packet and VM acceptance
+remain required on Linux; local socket fixtures and cross-compilation are not
+that evidence. This decision remains Proposed.
