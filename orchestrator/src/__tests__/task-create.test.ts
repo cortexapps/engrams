@@ -1429,10 +1429,13 @@ function recordingDb(
       if (throwOnTx) throw new Error("db boom");
       const tx = {
         insert: () => ({
-          values: async (v: Record<string, unknown>) => {
-            insertCount += 1;
-            if (insertCount === failInsertAt) throw new Error("insert boom");
-            records.push(v);
+          values: (v: Record<string, unknown>) => {
+            const result = Promise.resolve().then(() => {
+              insertCount += 1;
+              if (insertCount === failInsertAt) throw new Error("insert boom");
+              records.push(v);
+            });
+            return Object.assign(result, { onConflictDoNothing: () => result });
           },
         }),
         update: () => ({

@@ -928,9 +928,13 @@ export interface CreatedTask {
 }
 
 /** Make an already-persisted session discoverable by the listener scanner.
- * Callers with consumer-specific bindings must persist those bindings first. */
+ * Callers with consumer-specific bindings must persist those bindings first.
+ * Managed creation can enroll first; keep its existing lease and terminal state. */
 export async function registerSessionListener(db: Db, sessionId: string): Promise<void> {
-  await db.insert(sessionListenerTable).values({ sessionId });
+  await db
+    .insert(sessionListenerTable)
+    .values({ sessionId })
+    .onConflictDoNothing({ target: sessionListenerTable.sessionId });
 }
 
 /**
@@ -1112,7 +1116,10 @@ export async function createSessionForExistingTask(
     }
     if (params.registerListener === true) {
       await deps.db.transaction(async (tx) => {
-        await tx.insert(sessionListenerTable).values({ sessionId });
+        await tx
+          .insert(sessionListenerTable)
+          .values({ sessionId })
+          .onConflictDoNothing({ target: sessionListenerTable.sessionId });
       });
     }
   } catch (err) {
@@ -1344,7 +1351,10 @@ export async function createTaskWithSession(
       throw new Error("coordinator returned a different reserved session ID");
     }
     await deps.db.transaction(async (tx) => {
-      await tx.insert(sessionListenerTable).values({ sessionId });
+      await tx
+        .insert(sessionListenerTable)
+        .values({ sessionId })
+        .onConflictDoNothing({ target: sessionListenerTable.sessionId });
     });
   } catch (err) {
     if (err instanceof McpManagedCreationPending) throw err;
