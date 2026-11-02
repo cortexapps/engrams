@@ -519,3 +519,89 @@ async fn managed_boot_prestart_retirement_is_durably_observed() {
         assert_eq!(host.starts.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn managed_boot_attach_environment_is_exact_and_sealed() {
+    let (state, _, _, mut row) = fixture().await;
+    let target = &row.request.key.context.target;
+    let mut agent = AgentSpec {
+        argv: vec!["harness".into()],
+        env: [
+            ("ENGRAM_TOOLS".into(), "[]".into()),
+            ("ENGRAM_SANDBOX_ID".into(), target.sandbox_id.to_string()),
+            (
+                "ENGRAM_BINDING_EPOCH".into(),
+                target.binding_epoch.to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        session_env: Default::default(),
+        binding_epoch: target.binding_epoch,
+        host_ca_pem: None,
+    };
+    // Producer replaces stale harness-local values with the durable claim.
+    agent.env.insert("ENGRAM_SANDBOX_ID".into(), "stale".into());
+    agent.env.insert("ENGRAM_BINDING_EPOCH".into(), "0".into());
+    bind_agent_target(&mut agent, &row.request.key).unwrap();
+    assert_eq!(
+        agent.env["ENGRAM_SANDBOX_ID"],
+        target.sandbox_id.to_string()
+    );
+    assert_eq!(
+        agent.env["ENGRAM_BINDING_EPOCH"],
+        target.binding_epoch.to_string()
+    );
+    for name in ["ENGRAM_SANDBOX_ID", "ENGRAM_BINDING_EPOCH"] {
+        let mut override_agent = agent.clone();
+        override_agent
+            .session_env
+            .insert(name.into(), agent.env[name].clone());
+        assert!(bind_agent_target(&mut override_agent, &row.request.key).is_err());
+    }
+    let mut command = ManagedBootFinalize {
+        finalization: row.finalization.clone().unwrap(),
+        agent,
+    };
+    let canonical =
+        |agent: &AgentSpec| serde_json::to_vec(&serde_json::to_value(agent).unwrap()).unwrap();
+    command.finalization.agent_digest = digest(&canonical(&command.agent));
+    command.validate_agent().unwrap();
+    for name in ["ENGRAM_SANDBOX_ID", "ENGRAM_BINDING_EPOCH"] {
+        for change in 0..3 {
+            let mut wrong = command.clone();
+            match change {
+                0 => {
+                    wrong.agent.env.remove(name);
+                }
+                1 => {
+                    wrong.agent.env.insert(name.into(), "wrong".into());
+                }
+                _ => {
+                    wrong
+                        .agent
+                        .session_env
+                        .insert(name.into(), command.agent.env[name].clone());
+                }
+            }
+            // Recompute the hash: valid integrity cannot authorize an incorrect target.
+            wrong.finalization.agent_digest = digest(&canonical(&wrong.agent));
+            assert!(
+                wrong.validate_agent().is_err(),
+                "accepted invalid {name}, case {change}"
+            );
+        }
+    }
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let sealed = cipher.seal(&canonical(&command.agent)).await.unwrap();
+    row.finalization = Some(command.finalization);
+    row.sealed_agent = Some(ManagedBootSealedAgent {
+        wrapped_dek: sealed.wrapped_dek,
+        nonce: sealed.nonce.to_vec(),
+        ciphertext: sealed.ciphertext,
+        key_id: sealed.key_id,
+    });
+    let opened = open_finalize(&state, &row).await.unwrap();
+    assert_eq!(opened.agent.env, command.agent.env);
+    assert_eq!(opened.agent.session_env, command.agent.session_env);
+}

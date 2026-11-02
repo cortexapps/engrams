@@ -95,7 +95,7 @@ pub(crate) async fn finalize(
     }
     let mut agent = resolved.agent;
     crate::api::sessions::inject_harness_env(state, sid, &mut agent.env).await?;
-    agent.binding_epoch = input.key.context.target.binding_epoch;
+    bind_agent_target(&mut agent, &input.key)?;
     agent.session_env.remove("ENGRAM_TOOLS");
     agent.env.insert(
         "ENGRAM_TOOLS".into(),
@@ -138,6 +138,29 @@ pub(crate) async fn finalize(
             },
         )
         .await?)
+}
+
+/// Bind attach identity before canonical hashing or sealing. Session-wide values
+/// must not override the harness-only token, even when the strings happen to match.
+fn bind_agent_target(
+    agent: &mut engram_core::types::sandbox::AgentSpec,
+    key: &ManagedBootKey,
+) -> Result<(), engram_core::MetaError> {
+    key.validate()?;
+    let token = engram_harness_proto::attach_token::AttachToken {
+        sandbox_id: key.context.target.sandbox_id,
+        binding_epoch: key.context.target.binding_epoch,
+    };
+    let env = token.env();
+    if env
+        .iter()
+        .any(|(name, _)| agent.session_env.contains_key(name))
+    {
+        return Err(conflict());
+    }
+    agent.binding_epoch = token.binding_epoch;
+    agent.env.extend(env);
+    Ok(())
 }
 
 async fn open_finalize(
