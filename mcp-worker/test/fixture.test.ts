@@ -529,3 +529,102 @@ test("legacy cancellation cannot cross a transport session with the same request
   assert.match(await secondBody, /"id":10/);
   assert.equal(fixture.cancellations, 1);
 });
+
+for (const version of ["2025-11-25", "2025-06-18"] as const) {
+  test(`legacy session IDs remain distinct after termination: ${version}`, async (t) => {
+    const fixture = await startMcpFixture({ version });
+    t.after(() => fixture.close());
+    const initialize = (authorization: string) =>
+      rpc(
+        fixture,
+        "initialize",
+        {
+          protocolVersion: version,
+          capabilities: {},
+          clientInfo: { name: "test", version: "1" },
+        },
+        { authorization },
+      );
+    const first = await initialize("Bearer account-one");
+    const second = await initialize("Bearer account-two");
+    const firstId = first.response.headers.get("mcp-session-id")!;
+    const secondId = second.response.headers.get("mcp-session-id")!;
+    const deleted = await fixture.fetch(fixture.url, {
+      method: "DELETE",
+      headers: {
+        authorization: "Bearer account-one",
+        "mcp-session-id": firstId,
+      },
+    });
+    assert.equal(deleted.status, 200);
+    const third = await initialize("Bearer account-three");
+    const thirdId = third.response.headers.get("mcp-session-id");
+    assert.notEqual(thirdId, firstId);
+    assert.notEqual(thirdId, secondId);
+    assert.equal(thirdId, "fixture-session-3");
+    const stillActive = await rpc(
+      fixture,
+      "tools/list",
+      {},
+      {
+        authorization: "Bearer account-two",
+        "mcp-session-id": secondId,
+      },
+    );
+    assert.equal(stillActive.response.status, 200);
+    assert.equal(stillActive.body.result.tools[0].name, "read_counter");
+  });
+
+  test(`legacy session termination requires its credential identity: ${version}`, async (t) => {
+    const fixture = await startMcpFixture({ version });
+    t.after(() => fixture.close());
+    const initialized = await rpc(
+      fixture,
+      "initialize",
+      {
+        protocolVersion: version,
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+      },
+      { authorization: "Bearer account-one" },
+    );
+    const sessionId = initialized.response.headers.get("mcp-session-id")!;
+    const denied = await fixture.fetch(fixture.url, {
+      method: "DELETE",
+      headers: {
+        authorization: "Bearer account-two",
+        "mcp-session-id": sessionId,
+      },
+    });
+    assert.equal(denied.status, 404);
+    const stillActive = await rpc(
+      fixture,
+      "tools/list",
+      {},
+      {
+        authorization: "Bearer account-one",
+        "mcp-session-id": sessionId,
+      },
+    );
+    assert.equal(stillActive.response.status, 200);
+    assert.equal(stillActive.body.result.tools[0].name, "read_counter");
+    const deleted = await fixture.fetch(fixture.url, {
+      method: "DELETE",
+      headers: {
+        authorization: "Bearer account-one",
+        "mcp-session-id": sessionId,
+      },
+    });
+    assert.equal(deleted.status, 200);
+    const terminated = await rpc(
+      fixture,
+      "tools/list",
+      {},
+      {
+        authorization: "Bearer account-one",
+        "mcp-session-id": sessionId,
+      },
+    );
+    assert.equal(terminated.response.status, 404);
+  });
+}

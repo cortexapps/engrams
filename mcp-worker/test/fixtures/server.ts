@@ -45,6 +45,7 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
   let reads = 0;
   let writes = 0;
   let cancellations = 0;
+  let sessionSequence = 0;
   const requests: ObservedRequest[] = [];
   const sessions = new Map<string, string | undefined>();
   const pending = new Map<
@@ -101,12 +102,15 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
       return;
     }
     const sessionId = header(req, "mcp-session-id");
-    if (
-      req.method === "DELETE" &&
-      !modern &&
-      sessionId &&
-      sessions.has(sessionId)
-    ) {
+    if (req.method === "DELETE" && !modern) {
+      if (
+        !sessionId ||
+        !sessions.has(sessionId) ||
+        sessions.get(sessionId) !== req.headers.authorization
+      ) {
+        res.writeHead(404).end();
+        return;
+      }
       sessions.delete(sessionId);
       res.writeHead(200).end();
       return;
@@ -147,7 +151,7 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
       return;
     }
     if (!modern && message.method === "initialize") {
-      const id = `fixture-session-${sessions.size + 1}`;
+      const id = `fixture-session-${++sessionSequence}`;
       sessions.set(id, req.headers.authorization);
       res.setHeader("mcp-session-id", id);
       sendResult(res, message, {
