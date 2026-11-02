@@ -8,6 +8,7 @@ service SessionPolicyService {
   rpc CreatePolicySession(CreatePolicySessionRequest) returns (CreatePolicySessionResponse);
   rpc ReadWritePolicy(ReadWritePolicyRequest) returns (ReadWritePolicyResponse);
   rpc AcceptPlanExit(AcceptPlanExitRequest) returns (AcceptPlanExitResponse);
+  rpc ValidateExecutionIdentity(ValidateExecutionIdentityRequest) returns (ValidateExecutionIdentityResponse);
   rpc ValidateDispatchFence(ValidateDispatchFenceRequest) returns (ValidateDispatchFenceResponse);
 }
 message CreatePolicySessionRequest {
@@ -36,6 +37,8 @@ message ValidateDispatchFenceRequest {
   engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
   string accepted_write_eligibility = 6;
   repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+  string model_tool_name = 8;
+  string original_arguments = 9;
 }
 message ValidateDispatchFenceResponse {
   uint32 protocol = 1;
@@ -50,4 +53,20 @@ message ReadWritePolicyResponse {
 }
 message AcceptPlanExitResponse {
   engram.app.v1.McpTrustedWritePolicy policy = 1;
+}
+
+message ValidateExecutionIdentityRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
+  string accepted_write_eligibility = 6;
+  repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+  string model_tool_name = 8;
+  string original_arguments = 9;
+}
+message ValidateExecutionIdentityResponse {
+  uint32 protocol = 1;
+  string status = 2;
 }

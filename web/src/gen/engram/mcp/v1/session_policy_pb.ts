@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/mcp/v1/session_policy.proto.
  */
 export const file_engram_mcp_v1_session_policy: GenFile = /*@__PURE__*/
-  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIo0CChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYiQQodVmFsaWRhdGVEaXNwYXRjaEZlbmNlUmVzcG9uc2USEAoIcHJvdG9jb2wYASABKA0SDgoGc3RhdHVzGAIgASgJIlQKG0NyZWF0ZVBvbGljeVNlc3Npb25SZXNwb25zZRI1CgdzZXNzaW9uGAEgASgLMiQuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVzcG9uc2UiUgoXUmVhZFdyaXRlUG9saWN5UmVzcG9uc2USNwoFc3RhdGUYASABKAsyKC5lbmdyYW0uYXBwLnYxLkdldE1jcFdyaXRlUG9saWN5UmVzcG9uc2UiTgoWQWNjZXB0UGxhbkV4aXRSZXNwb25zZRI0CgZwb2xpY3kYASABKAsyJC5lbmdyYW0uYXBwLnYxLk1jcFRydXN0ZWRXcml0ZVBvbGljeTK5AwoUU2Vzc2lvblBvbGljeVNlcnZpY2USbAoTQ3JlYXRlUG9saWN5U2Vzc2lvbhIpLmVuZ3JhbS5tY3AudjEuQ3JlYXRlUG9saWN5U2Vzc2lvblJlcXVlc3QaKi5lbmdyYW0ubWNwLnYxLkNyZWF0ZVBvbGljeVNlc3Npb25SZXNwb25zZRJgCg9SZWFkV3JpdGVQb2xpY3kSJS5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlcXVlc3QaJi5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlc3BvbnNlEl0KDkFjY2VwdFBsYW5FeGl0EiQuZW5ncmFtLm1jcC52MS5BY2NlcHRQbGFuRXhpdFJlcXVlc3QaJS5lbmdyYW0ubWNwLnYxLkFjY2VwdFBsYW5FeGl0UmVzcG9uc2UScgoVVmFsaWRhdGVEaXNwYXRjaEZlbmNlEisuZW5ncmFtLm1jcC52MS5WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0GiwuZW5ncmFtLm1jcC52MS5WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
+  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIsICChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSFwoPbW9kZWxfdG9vbF9uYW1lGAggASgJEhoKEm9yaWdpbmFsX2FyZ3VtZW50cxgJIAEoCSJBCh1WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIOCgZzdGF0dXMYAiABKAkiVAobQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEjUKB3Nlc3Npb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZSJSChdSZWFkV3JpdGVQb2xpY3lSZXNwb25zZRI3CgVzdGF0ZRgBIAEoCzIoLmVuZ3JhbS5hcHAudjEuR2V0TWNwV3JpdGVQb2xpY3lSZXNwb25zZSJOChZBY2NlcHRQbGFuRXhpdFJlc3BvbnNlEjQKBnBvbGljeRgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuTWNwVHJ1c3RlZFdyaXRlUG9saWN5IsYCCiBWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRISCgpzZXNzaW9uX2lkGAIgASgJEg4KBnJ1bl9pZBgDIAEoCRIUCgx0b29sX2NhbGxfaWQYBCABKAkSPQoTYWNjZXB0ZWRfcG9saWN5X3JlZhgFIAEoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSIgoaYWNjZXB0ZWRfd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSPgoUYW5jZXN0b3JfcG9saWN5X3JlZnMYByADKAsyIC5lbmdyYW0uYXBwLnYxLk1jcFdyaXRlUG9saWN5UmVmEhcKD21vZGVsX3Rvb2xfbmFtZRgIIAEoCRIaChJvcmlnaW5hbF9hcmd1bWVudHMYCSABKAkiRQohVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEg4KBnN0YXR1cxgCIAEoCTK5BAoUU2Vzc2lvblBvbGljeVNlcnZpY2USbAoTQ3JlYXRlUG9saWN5U2Vzc2lvbhIpLmVuZ3JhbS5tY3AudjEuQ3JlYXRlUG9saWN5U2Vzc2lvblJlcXVlc3QaKi5lbmdyYW0ubWNwLnYxLkNyZWF0ZVBvbGljeVNlc3Npb25SZXNwb25zZRJgCg9SZWFkV3JpdGVQb2xpY3kSJS5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlcXVlc3QaJi5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlc3BvbnNlEl0KDkFjY2VwdFBsYW5FeGl0EiQuZW5ncmFtLm1jcC52MS5BY2NlcHRQbGFuRXhpdFJlcXVlc3QaJS5lbmdyYW0ubWNwLnYxLkFjY2VwdFBsYW5FeGl0UmVzcG9uc2USfgoZVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eRIvLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlcXVlc3QaMC5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRXhlY3V0aW9uSWRlbnRpdHlSZXNwb25zZRJyChVWYWxpZGF0ZURpc3BhdGNoRmVuY2USKy5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRGlzcGF0Y2hGZW5jZVJlcXVlc3QaLC5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRGlzcGF0Y2hGZW5jZVJlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.mcp.v1.CreatePolicySessionRequest
@@ -148,6 +148,16 @@ export type ValidateDispatchFenceRequest = Message<"engram.mcp.v1.ValidateDispat
    * @generated from field: repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
    */
   ancestorPolicyRefs: McpWritePolicyRef[];
+
+  /**
+   * @generated from field: string model_tool_name = 8;
+   */
+  modelToolName: string;
+
+  /**
+   * @generated from field: string original_arguments = 9;
+   */
+  originalArguments: string;
 };
 
 /**
@@ -231,6 +241,85 @@ export const AcceptPlanExitResponseSchema: GenMessage<AcceptPlanExitResponse> = 
   messageDesc(file_engram_mcp_v1_session_policy, 7);
 
 /**
+ * @generated from message engram.mcp.v1.ValidateExecutionIdentityRequest
+ */
+export type ValidateExecutionIdentityRequest = Message<"engram.mcp.v1.ValidateExecutionIdentityRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: string session_id = 2;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string run_id = 3;
+   */
+  runId: string;
+
+  /**
+   * @generated from field: string tool_call_id = 4;
+   */
+  toolCallId: string;
+
+  /**
+   * @generated from field: engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
+   */
+  acceptedPolicyRef?: McpWritePolicyRef;
+
+  /**
+   * @generated from field: string accepted_write_eligibility = 6;
+   */
+  acceptedWriteEligibility: string;
+
+  /**
+   * @generated from field: repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+   */
+  ancestorPolicyRefs: McpWritePolicyRef[];
+
+  /**
+   * @generated from field: string model_tool_name = 8;
+   */
+  modelToolName: string;
+
+  /**
+   * @generated from field: string original_arguments = 9;
+   */
+  originalArguments: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ValidateExecutionIdentityRequest.
+ * Use `create(ValidateExecutionIdentityRequestSchema)` to create a new message.
+ */
+export const ValidateExecutionIdentityRequestSchema: GenMessage<ValidateExecutionIdentityRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 8);
+
+/**
+ * @generated from message engram.mcp.v1.ValidateExecutionIdentityResponse
+ */
+export type ValidateExecutionIdentityResponse = Message<"engram.mcp.v1.ValidateExecutionIdentityResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: string status = 2;
+   */
+  status: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ValidateExecutionIdentityResponse.
+ * Use `create(ValidateExecutionIdentityResponseSchema)` to create a new message.
+ */
+export const ValidateExecutionIdentityResponseSchema: GenMessage<ValidateExecutionIdentityResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 9);
+
+/**
  * Dedicated pinned mTLS only. Create reuses the ordinary creation core.
  *
  * @generated from service engram.mcp.v1.SessionPolicyService
@@ -259,6 +348,14 @@ export const SessionPolicyService: GenService<{
     methodKind: "unary";
     input: typeof AcceptPlanExitRequestSchema;
     output: typeof AcceptPlanExitResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ValidateExecutionIdentity
+   */
+  validateExecutionIdentity: {
+    methodKind: "unary";
+    input: typeof ValidateExecutionIdentityRequestSchema;
+    output: typeof ValidateExecutionIdentityResponseSchema;
   },
   /**
    * @generated from rpc engram.mcp.v1.SessionPolicyService.ValidateDispatchFence

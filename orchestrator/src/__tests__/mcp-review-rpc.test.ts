@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { checkDb } from "../db/client.ts";
 import { task, user, pendingToolCall, mcpApproval } from "../db/schema.ts";
-import { reviewFixture } from "./mcp-review-fixture.ts";
+import { schemaVerifiedFixture as reviewFixture } from "./mcp-review-fixture.ts";
 import { buildServer } from "../server.ts";
 import {
   IntegrationService,

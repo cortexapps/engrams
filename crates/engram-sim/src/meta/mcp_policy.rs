@@ -70,15 +70,23 @@ impl SimMetadataStore {
     pub(super) fn policy_fence(
         &self,
         ctx: &RequestPolicyContext,
+        expected: &ExecutionRequest,
+        write: bool,
     ) -> Result<DispatchFence, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        dispatch_fence(
+        let check = if write {
+            dispatch_fence
+        } else {
+            execution_identity_fence
+        };
+        check(
             &nodes(&db, ctx.session_id)?,
             db.session_events
                 .get(&ctx.session_id)
                 .map_or(&[], Vec::as_slice),
             ctx,
+            expected,
         )
     }
     pub(super) fn policy_accept(

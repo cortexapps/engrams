@@ -17,6 +17,7 @@ export interface McpOperatorPolicy {
   aliases: string[];
 }
 export interface McpLiveAuthority {
+  profilePublication?: import("../db/profiles.ts").McpGrantPublication | null;
   profileId: string;
   profileGrants: ProfileIntegrationGrant[];
   connections: {
@@ -51,6 +52,7 @@ export interface McpSessionBindingSnapshot {
   bindingEpoch: number;
   profileId: string;
   profileGrantsHash: string;
+  profilePublication?: import("../db/profiles.ts").McpGrantPublication | null;
   managedAuthorityHash: string;
   immutableBindings: McpSessionBinding[];
   ancestorAuthorityRefs: McpAncestorAuthorityRef[];
@@ -167,6 +169,15 @@ export function compileSessionBindings(input: {
     throw new Error("MCP binding context unavailable");
   if (profileHash(launchPolicy.integrationGrants) !== profileHash(live.profileGrants))
     throw new Error("MCP profile changed during compilation");
+  const publication = live.profilePublication;
+  if (
+    publication &&
+    (!Number.isSafeInteger(publication.revision) ||
+      publication.revision < 1 ||
+      !publication.actorId ||
+      publication.grantsHash !== profileHash(live.profileGrants))
+  )
+    throw new Error("MCP grant publication identity unavailable");
   let grants = mcpGrants(launchPolicy.integrationGrants);
   if (input.requestedGrants !== undefined)
     grants = intersectMcpGrants(grants, mcpGrants(input.requestedGrants));
@@ -227,6 +238,7 @@ export function compileSessionBindings(input: {
     bindingEpoch: input.bindingEpoch,
     profileId: live.profileId,
     profileGrantsHash: profileHash(live.profileGrants),
+    profilePublication: live.profilePublication ?? null,
     immutableBindings,
     ancestorAuthorityRefs,
     managedAuthorityHash: managedAuthorityHash(live),
@@ -251,7 +263,9 @@ export function checkBindingCurrent(input: {
   }
   if (
     snapshot.profileId !== live.profileId ||
-    snapshot.profileGrantsHash !== profileHash(live.profileGrants)
+    snapshot.profileGrantsHash !== profileHash(live.profileGrants) ||
+    canonicalDigest(snapshot.profilePublication ?? null) !==
+      canonicalDigest(live.profilePublication ?? null)
   )
     staleReasons.push("profile_grants");
   try {

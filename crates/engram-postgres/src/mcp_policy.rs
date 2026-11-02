@@ -109,13 +109,21 @@ impl PostgresStore {
     pub(super) async fn policy_fence(
         &self,
         ctx: &RequestPolicyContext,
+        expected: &ExecutionRequest,
+        write: bool,
     ) -> Result<DispatchFence, MetaError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let ns = nodes(&mut tx, ctx.session_id).await?;
-        let answer = dispatch_fence(
+        let check = if write {
+            dispatch_fence
+        } else {
+            execution_identity_fence
+        };
+        let answer = check(
             &ns,
             &events(&mut tx, ctx.session_id, &ctx.tool_call_id).await?,
             ctx,
+            expected,
         )?;
         tx.commit().await.map_err(db_err)?;
         Ok(answer)

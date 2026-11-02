@@ -35,7 +35,7 @@ test.skipIf(!reachable)(
   },
 );
 
-import { reviewFixture } from "./mcp-review-fixture.ts";
+import { schemaVerifiedFixture as reviewFixture } from "./mcp-review-fixture.ts";
 test.skipIf(!reachable)(
   "journal freezes original bytes and rejects argument hash mismatch",
   async () => {
@@ -261,9 +261,7 @@ test.skipIf(!reachable)(
           authorization,
         ),
       ).rejects.toThrow("stale");
-      expect(
-        await f.db.select().from(mcpAdmission).where(eq(mcpAdmission.executionId, call.id)),
-      ).toHaveLength(0);
+      expect((await f.journal.getAdmission(call.id))?.state).toBe("released");
       const [approval] = await f.db
         .select()
         .from(mcpApproval)
@@ -333,7 +331,9 @@ test.skipIf(!reachable)(
         originalArguments: null,
         requestContext: null,
       });
-      await f.journal.requestApproval(legacyId, f.deploymentId, f.now);
+      await expect(f.journal.requestApproval(legacyId, f.deploymentId, f.now)).rejects.toThrow(
+        "schema",
+      );
       const current = await f.journal.pending(f.sessionId, f.actorId, f.now);
       expect(current.map((row) => row.call.id)).not.toContain(legacyId);
       await expect(

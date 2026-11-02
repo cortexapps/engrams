@@ -1222,6 +1222,11 @@ export const profile = pgTable(
     // ADR 0109: structured integration authority. Unlike the retired flat
     // capability array, this preserves which configured identity an operation
     // uses and keeps its resource constraints attached.
+    mcpGrantPublication: jsonb("mcp_grant_publication").$type<{
+      revision: number;
+      actorId: string;
+      grantsHash: string;
+    }>(),
     integrationGrants: jsonb("integration_grants")
       .$type<ProfileIntegrationGrant[]>()
       .notNull()
@@ -2335,7 +2340,12 @@ export const mcpAdmission = pgTable(
       .notNull()
       .references(() => integrationConnection.id),
     sessionId: text("session_id").notNull(),
-    state: text("state").$type<"queued" | "admitted">().notNull(),
+    phase: text("phase").$type<"schema" | "execute">().notNull().default("execute"),
+    schemaQueueExpiresAt: timestamp("schema_queue_expires_at", { withTimezone: true }),
+    executeQueueExpiresAt: timestamp("execute_queue_expires_at", { withTimezone: true }),
+    executeExpiresAt: timestamp("execute_expires_at", { withTimezone: true }),
+    schemaDigest: text("schema_digest"),
+    state: text("state").$type<"queued" | "admitted" | "released">().notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   },
@@ -2344,6 +2354,7 @@ export const mcpAdmission = pgTable(
     index("mcp_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
     index("mcp_admission_connection_idx").on(t.connectionId, t.state),
     index("mcp_admission_session_idx").on(t.sessionId, t.state),
-    check("mcp_admission_state_check", sql`${t.state} IN ('queued','admitted')`),
+    check("mcp_admission_phase_check", sql`${t.phase} IN ('schema','execute')`),
+    check("mcp_admission_state_check", sql`${t.state} IN ('queued','admitted','released')`),
   ],
 );

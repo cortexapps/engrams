@@ -20,6 +20,11 @@ export const readWritePolicy = SessionPolicyService.method.readWritePolicy;
 export const acceptPlanExit = SessionPolicyService.method.acceptPlanExit;
 
 /**
+ * @generated from rpc engram.mcp.v1.SessionPolicyService.ValidateExecutionIdentity
+ */
+export const validateExecutionIdentity = SessionPolicyService.method.validateExecutionIdentity;
+
+/**
  * @generated from rpc engram.mcp.v1.SessionPolicyService.ValidateDispatchFence
  */
 export const validateDispatchFence = SessionPolicyService.method.validateDispatchFence;

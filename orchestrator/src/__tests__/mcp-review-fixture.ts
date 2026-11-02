@@ -17,7 +17,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     actorId = crypto.randomUUID(),
     taskId = crypto.randomUUID(),
     sessionId = crypto.randomUUID(),
-    deploymentId = crypto.randomUUID();
+    deploymentId: string = crypto.randomUUID();
   const now = new Date("2026-01-01T00:00:00Z");
   const connections = makeIntegrationConnectionStore(db),
     repository = makeMcpRepository(db);
@@ -122,6 +122,8 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
   await db.insert(taskSession).values({
     taskId,
     sessionId,
+    profileId,
+    integrationPrincipalId: actorId,
     ...bindingSnapshotColumns(snapshot, [
       {
         id: connection.id,
@@ -202,6 +204,48 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
       await connections.delete(connection.id);
       await db.delete(profile).where(eq(profile.id, profileId));
       await db.delete(user).where(eq(user.id, actorId));
+    },
+  };
+}
+
+/** Stage fixture for tests of review/journal behavior after a successful worker preflight.
+ * It obtains and releases real durable leases; the boolean worker result is injected. */
+let priorSchemaPreparation: Promise<unknown> = Promise.resolve();
+export async function schemaVerifiedFixture(
+  documents: Record<string, unknown>[] = [],
+  toolCount = 1,
+  deploymentId?: string,
+) {
+  const f = await reviewFixture(documents, toolCount);
+  if (deploymentId) f.deploymentId = deploymentId;
+  const base = f.journal;
+  return {
+    ...f,
+    journal: {
+      ...base,
+      async create(...args: Parameters<typeof base.create>) {
+        const call = await base.create(...args);
+        const ready = priorSchemaPreparation.then(async () => {
+          if (
+            ["waiting_approval", "authorized"].includes(call.state) &&
+            !(await base.getAdmission(call.id))?.schemaDigest
+          ) {
+            await base.admitSchema(call.id, f.deploymentId, args[2]);
+            const lease = (await base.getAdmission(call.id))!;
+            await base.finishSchema(
+              call.id,
+              lease.reservationId,
+              lease.expiresAt,
+              call.requestDigest,
+              true,
+              args[2],
+            );
+          }
+        });
+        priorSchemaPreparation = ready.catch(() => {});
+        await ready;
+        return call;
+      },
     },
   };
 }

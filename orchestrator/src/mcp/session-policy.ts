@@ -162,9 +162,25 @@ export function makeSessionWritePolicy(
         throw new ConnectError("session policy unavailable", Code.FailedPrecondition);
       return response.state.policy;
     },
+    async validateExecutionIdentity(
+      context: RequestPolicyContext,
+      expected: { modelToolName: string; originalArguments: string },
+    ) {
+      const result = await control.validateExecutionIdentity({
+        protocol: 1,
+        ...context,
+        ...expected,
+      });
+      if (result.protocol !== 1 || !["current", "stale", "unknown"].includes(result.status))
+        throw new ConnectError("session identity fence unavailable", Code.FailedPrecondition);
+      return result.status;
+    },
     /** After the durable barrier, immediately before dispatch. Never cache a success. */
-    async validateDispatchFence(context: RequestPolicyContext) {
-      const result = await control.validateDispatchFence({ protocol: 1, ...context });
+    async validateDispatchFence(
+      context: RequestPolicyContext,
+      expected: { modelToolName: string; originalArguments: string },
+    ) {
+      const result = await control.validateDispatchFence({ protocol: 1, ...context, ...expected });
       if (result.protocol !== 1 || !["current", "stale", "unknown"].includes(result.status))
         throw new ConnectError("session policy fence unavailable", Code.FailedPrecondition);
       return result.status;

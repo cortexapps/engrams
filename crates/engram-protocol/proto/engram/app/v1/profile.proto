@@ -84,6 +84,8 @@ message Profile {
   repeated SessionApp apps = 24;
   // When true, only automations, API keys, and admins can start sessions.
   bool programmatic_only = 25;
+  // Revision for explicit MCP grant publication; zero means no publication.
+  int64 mcp_grant_revision = 26;
 }
 
 // ADR 0118: one service a session hosts, published at
@@ -231,6 +233,8 @@ message CreateProfileRequest {
   repeated SessionApp apps = 20;
   // When true, only automations, API keys, and admins can start sessions.
   bool programmatic_only = 21;
+  // Presence requests explicit MCP grant publication. First publication expects zero.
+  optional int64 expected_mcp_grant_revision = 22;
 }
 
 message CreateProfileResponse {
@@ -266,6 +270,8 @@ message UpdateProfileRequest {
   // When true, only automations, API keys, and admins can start sessions.
   // Omit to preserve the current setting.
   optional bool programmatic_only = 22;
+  // Presence requests publication or republication of the exact MCP grants.
+  optional int64 expected_mcp_grant_revision = 23;
 }
 
 message UpdateProfileResponse {

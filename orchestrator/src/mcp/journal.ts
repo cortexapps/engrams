@@ -1,3 +1,5 @@
+import { lockRuntimeAuthority } from "./runtime-authority.ts";
+import { makeMcpAdmission, lockAdmissionScope as lockScope } from "./admission.ts";
 import { and, asc, eq, gt, inArray, isNull, lte, sql } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import {
@@ -7,7 +9,6 @@ import {
   mcpApproval as approval,
   mcpResolution as resolution,
   mcpAdmission as admission,
-  mcpAdmissionScope as scope,
   taskSession,
 } from "../db/schema.ts";
 import {
@@ -54,10 +55,6 @@ export type McpCallInput = Pick<
   requestPolicyContext: RequestPolicyContext;
 };
 
-async function lockScope(tx: Tx, id: string) {
-  await tx.insert(scope).values({ id }).onConflictDoNothing();
-  await tx.select().from(scope).where(eq(scope.id, id)).for("update");
-}
 async function unknown(tx: Tx | Db, sessionId: string, connectionId: string): Promise<boolean> {
   const rows = await tx
     .select({ id: execution.id })
@@ -88,7 +85,11 @@ export interface McpLiveDispatchAuthorization {
   reservationExpiresAt: Date;
 }
 export function makeMcpJournal(db = getDb()) {
+  const phasedAdmission = makeMcpAdmission(db);
   return {
+    admitSchema: (id: string, deploymentId: string, now: Date) =>
+      phasedAdmission.reserve(id, deploymentId, "schema", now),
+    finishSchema: phasedAdmission.finishSchema,
     async get(id: string) {
       return (await db.select().from(execution).where(eq(execution.id, id)))[0] ?? null;
     },
@@ -190,6 +191,8 @@ export function makeMcpJournal(db = getDb()) {
         );
         if (
           snapshot.bindingHash !== input.bindingHash ||
+          canonicalDigest(snapshot.profilePublication ?? null) !==
+            canonicalDigest(resolvedTool.profilePublication ?? null) ||
           BigInt(snapshot.bindingEpoch) !== policy.acceptedPolicyRef.bindingEpoch ||
           !snapshot.immutableBindings.some(
             (binding) => canonicalDigest(binding) === canonicalDigest(bound),
@@ -231,6 +234,9 @@ export function makeMcpJournal(db = getDb()) {
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
         if (!call || call.state !== "waiting_approval" || call.deadline <= now)
           throw new Error("call is not pending approval");
+        const [schema] = await tx.select().from(admission).where(eq(admission.executionId, id));
+        if (!schema || schema.schemaDigest !== call.requestDigest || schema.state !== "released")
+          throw new Error("verified released schema is required");
         const [existing] = await tx.select().from(approval).where(eq(approval.executionId, id));
         if (existing) return existing;
         const pending = await tx
@@ -420,65 +426,8 @@ export function makeMcpJournal(db = getDb()) {
         return { call: updated!, approval: decision!, reviewedContext: expected };
       });
     },
-    async admit(
-      id: string,
-      deploymentId: string,
-      now: Date,
-      toolMs = MCP_LIMITS.toolMs,
-    ): Promise<"queued" | "admitted"> {
-      if (!Number.isSafeInteger(toolMs) || toolMs < 1 || toolMs > MCP_LIMITS.maxToolMs)
-        throw new Error("invalid tool deadline");
-      return db.transaction(async (tx) => {
-        await lockScope(tx, deploymentId);
-        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-        if (!call || call.state !== "authorized" || call.deadline <= now)
-          throw new Error("call is not ready for admission");
-        const rows = await tx
-          .select()
-          .from(admission)
-          .where(eq(admission.deploymentId, deploymentId))
-          .orderBy(asc(admission.createdAt));
-        const existing = rows.find((a) => a.executionId === id);
-        if (existing?.state === "admitted") return "admitted";
-        if (existing && existing.expiresAt <= now) throw new Error("queue entry expired");
-        // Expired active leases still count until expire() records the unknown outcome.
-        const active = rows.filter((a) => a.state === "admitted");
-        const available =
-          active.length < MCP_LIMITS.deploymentConcurrency &&
-          active.filter((a) => a.connectionId === call.connectionId).length <
-            MCP_LIMITS.connectionConcurrency &&
-          active.filter((a) => a.sessionId === call.sessionId).length <
-            MCP_LIMITS.sessionConcurrency;
-        // Polling cannot extend the original queue deadline. Promotion starts a tool lease.
-        if (existing && !available) return "queued";
-        const state = available ? "admitted" : "queued";
-        if (
-          !available &&
-          !existing &&
-          rows.filter((a) => a.state === "queued").length >= MCP_LIMITS.queueSize
-        )
-          throw new Error("MCP queue is full");
-        const expiresAt = new Date(
-          Math.min(
-            call.deadline.getTime(),
-            now.getTime() + (available ? toolMs : MCP_LIMITS.queueMs),
-          ),
-        );
-        if (existing)
-          await tx.update(admission).set({ state, expiresAt }).where(eq(admission.executionId, id));
-        else
-          await tx.insert(admission).values({
-            executionId: id,
-            deploymentId,
-            sessionId: call.sessionId,
-            connectionId: call.connectionId,
-            state,
-            expiresAt,
-            createdAt: now,
-          });
-        return state;
-      });
-    },
+    admit: (id: string, deploymentId: string, now: Date, toolMs = MCP_LIMITS.toolMs) =>
+      phasedAdmission.reserve(id, deploymentId, "execute", now, toolMs),
     /** Irreversible dispatch barrier. The upstream effect runs after this commits. */
     async dispatch(
       id: string,
@@ -493,12 +442,10 @@ export function makeMcpJournal(db = getDb()) {
       try {
         return await db.transaction(async (tx) => {
           await lockScope(tx, reservation.deploymentId);
-          // Connection lock serializes unknown-outcome checks with finish/revoke.
-          const [identity] = await tx
-            .select({ connectionId: execution.connectionId })
-            .from(execution)
-            .where(eq(execution.id, id));
+          const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
           if (!identity) throw new Error("call not found");
+          // Scope -> principal -> tasks/sessions -> profiles -> sorted connections -> call.
+          await lockRuntimeAuthority(tx, identity);
           const [live] = await tx
             .select()
             .from(connection)
@@ -571,6 +518,8 @@ export function makeMcpJournal(db = getDb()) {
             );
           if (
             !lease ||
+            lease.phase !== "execute" ||
+            lease.schemaDigest !== call.requestDigest ||
             lease.reservationId !== reservation.reservationId ||
             lease.reservationId !== liveAuthorization.reservationId ||
             lease.expiresAt.getTime() !== liveAuthorization.reservationExpiresAt.getTime() ||
@@ -628,7 +577,8 @@ export function makeMcpJournal(db = getDb()) {
             reservation.expiresAt.getTime() === liveAuthorization.reservationExpiresAt.getTime()
           )
             await tx
-              .delete(admission)
+              .update(admission)
+              .set({ state: "released" })
               .where(
                 and(
                   eq(admission.executionId, id),
@@ -639,6 +589,64 @@ export function makeMcpJournal(db = getDb()) {
         });
         throw error;
       }
+    },
+    /** Both credential-broker checks use the same committed generation and barrier revision. */
+    async assertDispatchCurrent(id: string, proof: McpLiveDispatchAuthorization, now: Date) {
+      const [observed] = await db.select().from(admission).where(eq(admission.executionId, id));
+      if (!observed) throw new Error("dispatch admission unavailable");
+      return db.transaction(async (tx) => {
+        await lockScope(tx, observed.deploymentId);
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call not found");
+        await lockRuntimeAuthority(tx, identity, "share");
+        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("share");
+        const [lease] = await tx
+          .select()
+          .from(admission)
+          .where(eq(admission.executionId, id))
+          .for("share");
+        if (
+          !call ||
+          call.state !== "dispatching" ||
+          call.deadline <= now ||
+          !call.intentExpiresAt ||
+          call.intentExpiresAt <= now ||
+          proof.executionId !== id ||
+          proof.requestDigest !== call.requestDigest ||
+          proof.bindingHash !== call.bindingHash ||
+          proof.principalId !== call.principalId ||
+          proof.expectedJournalRevision + 1 !== call.version ||
+          !lease ||
+          lease.phase !== "execute" ||
+          lease.state !== "admitted" ||
+          lease.schemaDigest !== call.requestDigest ||
+          lease.reservationId !== proof.reservationId ||
+          lease.expiresAt.getTime() !== proof.reservationExpiresAt.getTime() ||
+          lease.expiresAt <= now
+        )
+          throw new Error("stale dispatch admission");
+        if (call.authorizationKind === "approval") {
+          const [decision] = await tx
+            .select()
+            .from(approval)
+            .where(eq(approval.executionId, id))
+            .for("share");
+          if (
+            !decision ||
+            decision.decision !== "approved" ||
+            !decision.consumedAt ||
+            decision.requestDigest !== call.requestDigest ||
+            decision.expiresAt <= now
+          )
+            throw new Error("dispatch approval unavailable");
+        }
+        if (
+          call.classification === "write" &&
+          (await unknown(tx, call.sessionId, call.connectionId))
+        )
+          throw new Error("unknown write outcome blocks this connection");
+        return call;
+      });
     },
     async finish(
       id: string,
@@ -755,7 +763,7 @@ export function makeMcpJournal(db = getDb()) {
           and(
             inArray(execution.state, ["waiting_approval", "authorized"]),
             lte(execution.deadline, now),
-            isNull(admission.executionId),
+            sql`(${admission.executionId} IS NULL OR ${admission.state} = 'released')`,
           ),
         )
         .orderBy(asc(execution.deadline))
@@ -780,7 +788,7 @@ export function makeMcpJournal(db = getDb()) {
             .select()
             .from(admission)
             .where(eq(admission.executionId, call.id));
-          if (lease) return false;
+          if (lease && lease.state !== "released") return false;
           await tx
             .update(execution)
             .set({ state: "canceled", version: call.version + 1, updatedAt: now })
@@ -808,7 +816,13 @@ export function makeMcpJournal(db = getDb()) {
         const expired = await tx
           .select()
           .from(admission)
-          .where(and(eq(admission.deploymentId, deploymentId), lte(admission.expiresAt, now)));
+          .where(
+            and(
+              eq(admission.deploymentId, deploymentId),
+              inArray(admission.state, ["queued", "admitted"]),
+              lte(admission.expiresAt, now),
+            ),
+          );
         for (const lease of expired.sort((a, b) => a.connectionId.localeCompare(b.connectionId))) {
           await tx
             .select()
@@ -820,7 +834,18 @@ export function makeMcpJournal(db = getDb()) {
             .from(execution)
             .where(eq(execution.id, lease.executionId))
             .for("update");
-          if (call && ["authorized", "dispatching"].includes(call.state))
+          if (
+            lease.phase === "schema" &&
+            lease.schemaQueueExpiresAt &&
+            lease.schemaQueueExpiresAt > now
+          ) {
+            await tx
+              .update(admission)
+              .set({ state: "released" })
+              .where(eq(admission.executionId, lease.executionId));
+            continue;
+          }
+          if (call && ["waiting_approval", "authorized", "dispatching"].includes(call.state))
             await tx
               .update(execution)
               .set({
@@ -829,7 +854,10 @@ export function makeMcpJournal(db = getDb()) {
                 updatedAt: now,
               })
               .where(eq(execution.id, call.id));
-          await tx.delete(admission).where(eq(admission.executionId, lease.executionId));
+          await tx
+            .update(admission)
+            .set({ state: "released" })
+            .where(eq(admission.executionId, lease.executionId));
         }
         const pending = await tx
           .select()

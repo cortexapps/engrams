@@ -731,8 +731,16 @@ impl MetadataStore for SimMetadataStore {
     async fn validate_mcp_dispatch_fence(
         &self,
         ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
     ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
-        self.policy_fence(ctx)
+        self.policy_fence(ctx, expected, true)
+    }
+    async fn validate_mcp_execution_identity(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx, expected, false)
     }
 
     /// `INSERT INTO sessions (id, status='pending', image_uri, mode,

@@ -241,10 +241,62 @@ impl SessionPolicyService for PolicyControl {
             .authority
             .manager
             .meta
-            .validate_mcp_dispatch_fence(&ctx)
+            .validate_mcp_dispatch_fence(
+                &ctx,
+                &ExecutionRequest {
+                    model_tool_name: r.model_tool_name,
+                    original_arguments: r.original_arguments,
+                },
+            )
             .await
             .map_err(err)?;
         Ok(Response::new(wire::ValidateDispatchFenceResponse {
+            protocol: wire::PROTOCOL,
+            status: match answer {
+                DispatchFence::Current => "current",
+                DispatchFence::Stale => "stale",
+                DispatchFence::Unknown => "unknown",
+            }
+            .into(),
+        }))
+    }
+    async fn validate_execution_identity(
+        &self,
+        req: Request<wire::ValidateExecutionIdentityRequest>,
+    ) -> Result<Response<wire::ValidateExecutionIdentityResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let r = req.into_inner();
+        let ctx = RequestPolicyContext {
+            session_id: id(&r.session_id)?,
+            run_id: r.run_id,
+            tool_call_id: r.tool_call_id,
+            accepted_policy_ref: from_ref(required(r.accepted_policy_ref)?)?,
+            accepted_write_eligibility: eligibility(&r.accepted_write_eligibility)?,
+            ancestor_policy_refs: r
+                .ancestor_policy_refs
+                .into_iter()
+                .map(from_ref)
+                .collect::<Result<_, _>>()?,
+        };
+        let answer = self
+            .control
+            .authority
+            .manager
+            .meta
+            .validate_mcp_execution_identity(
+                &ctx,
+                &ExecutionRequest {
+                    model_tool_name: r.model_tool_name,
+                    original_arguments: r.original_arguments,
+                },
+            )
+            .await
+            .map_err(err)?;
+        Ok(Response::new(wire::ValidateExecutionIdentityResponse {
             protocol: wire::PROTOCOL,
             status: match answer {
                 DispatchFence::Current => "current",

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { eq, sql } from "drizzle-orm";
 import { checkDb } from "../db/client.ts";
 import { mcpAdmission, mcpApproval, task, taskSession } from "../db/schema.ts";
-import { reviewFixture } from "./mcp-review-fixture.ts";
+import { schemaVerifiedFixture as reviewFixture } from "./mcp-review-fixture.ts";
 import { bindingSnapshotColumns } from "../mcp/binding-store.ts";
 import { reviewContext } from "../mcp/journal-review.ts";
 import { type McpCallAuthorization, makeMcpJournal } from "../mcp/journal.ts";
@@ -20,8 +20,8 @@ const config = {
   auth: { kind: "api_key", secretRef: "mcp.service.api-key" },
 };
 // These adapters supply trusted producer fixtures only. They do not prove host or runtime enforcement.
-async function fixture() {
-  const f = await reviewFixture();
+async function fixture(deploymentId?: string) {
+  const f = await reviewFixture([], 1, deploymentId);
   const base = f.journal;
   const input = { ...f.input, deadline: new Date(f.now.getTime() + 60_000) };
   const actor = (id: string) => (id === "owner" ? f.actorId : id);
@@ -173,17 +173,11 @@ describe("MCP durable authority", () => {
         await f.journal.finish(call.id, current.version, "outcome_unknown", null, false, f.now);
         const next = await f.journal.create(
           { ...f.input, toolCallId: "call-2" },
-          {
-            kind: "automation",
-            grant: {
-              upstreamName: tool.upstreamName,
-              automationWrite: true,
-              argumentConstraintDocuments: [],
-              unrestricted: true,
-            },
-          },
+          { kind: "approval" },
           f.now,
         );
+        await f.journal.requestApproval(next.id, f.deploymentId, f.now);
+        await f.journal.decide(next.id, "owner", false, true, f.now);
         await f.journal.admit(next.id, f.deploymentId, f.now);
         await expect(
           f.journal.dispatch(
@@ -224,16 +218,16 @@ describe("MCP durable authority", () => {
             ),
           ),
         );
-        const statuses = await Promise.all(
-          calls.map((c) => f.journal.admit(c.id, f.deploymentId, f.now)),
-        );
-        expect(statuses.filter((s) => s === "admitted")).toHaveLength(4);
-        expect(statuses.filter((s) => s === "queued")).toHaveLength(2);
         const pending = await f.journal.create(
           { ...f.input, toolCallId: "approval" },
           { kind: "approval" },
           f.now,
         );
+        const statuses = await Promise.all(
+          calls.map((c) => f.journal.admit(c.id, f.deploymentId, f.now)),
+        );
+        expect(statuses.filter((s) => s === "admitted")).toHaveLength(4);
+        expect(statuses.filter((s) => s === "queued")).toHaveLength(2);
         await f.journal.requestApproval(pending.id, f.deploymentId, f.now);
         await f.journal.expire(f.deploymentId, new Date(f.now.getTime() + 601_000));
         expect((await f.journal.get(pending.id))!.state).toBe("canceled");
@@ -338,19 +332,9 @@ describe("MCP authority isolation", () => {
     async () => {
       const f = await fixture();
       try {
-        const call = await f.journal.create(
-          f.input,
-          {
-            kind: "automation",
-            grant: {
-              upstreamName: tool.upstreamName,
-              automationWrite: true,
-              argumentConstraintDocuments: [],
-              unrestricted: true,
-            },
-          },
-          f.now,
-        );
+        const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+        await f.journal.requestApproval(call.id, f.deploymentId, f.now);
+        await f.journal.decide(call.id, "owner", false, true, f.now);
         await f.journal.admit(call.id, f.deploymentId, f.now);
         await f.journal.dispatch(
           call.id,
@@ -430,7 +414,8 @@ test.skipIf(!reachable)("replicas share connection and deployment admission ceil
     },
   };
   try {
-    for (let i = 0; i < 9; i++) fixtures.push(await fixture());
+    const sharedDeployment = crypto.randomUUID();
+    for (let i = 0; i < 9; i++) fixtures.push(await fixture(sharedDeployment));
     const first = fixtures[0]!;
     const allCalls = await Promise.all(
       fixtures.flatMap((f) =>

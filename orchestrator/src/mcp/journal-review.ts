@@ -132,6 +132,12 @@ export async function lockHumanSession(
   const [actor] = await tx.select().from(user).where(eq(user.id, actorId)).for("share");
   if (!actor || actor.banned || isServiceAccountEmail(actor.email))
     throw new Error("human session owner or administrator required");
+  const { owner, session, ancestors } = await lockSessionChain(tx, sessionId, includeAncestors);
+  if (actor.role !== "admin" && owner.createdByUserId !== actorId)
+    throw new Error("human session owner or administrator required");
+  return { owner, session, actor, ancestors };
+}
+export async function lockSessionChain(tx: JournalTx, sessionId: string, includeAncestors = true) {
   const chain: { sessionId: string; taskId: string; parentId: string | null }[] = [];
   let id: string | null = sessionId;
   const seen = new Set<string>();
@@ -169,12 +175,9 @@ export async function lockHumanSession(
   }
   const owner = tasks.get(chain[0]!.taskId)!,
     session = sessions.get(sessionId)!;
-  if (actor.role !== "admin" && owner.createdByUserId !== actorId)
-    throw new Error("human session owner or administrator required");
   return {
     owner,
     session,
-    actor,
     ancestors: chain
       .slice(1)
       .map((ref) => ({ session: sessions.get(ref.sessionId)!, owner: tasks.get(ref.taskId)! })),
@@ -185,6 +188,7 @@ export async function assertLocalReviewCurrent(
   call: typeof mcpExecution.$inferSelect,
   session: typeof taskSession.$inferSelect,
   ancestors: { session: typeof taskSession.$inferSelect; owner: typeof task.$inferSelect }[],
+  connectionLock: "share" | "update" = "share",
 ) {
   if (!call.requestContext || call.originalArguments === null || !session.mcpBindingEnvelope)
     throw new Error("original request context unavailable");
@@ -196,6 +200,8 @@ export async function assertLocalReviewCurrent(
   const policy = requestPolicyContext(call.requestContext);
   if (
     stored.bindingHash !== call.bindingHash ||
+    canonicalDigest(stored.profilePublication ?? null) !==
+      canonicalDigest(bound.profilePublication ?? null) ||
     BigInt(stored.bindingEpoch) !== policy.acceptedPolicyRef.bindingEpoch ||
     canonicalDigest(stored.ancestorAuthorityRefs) !==
       canonicalDigest(bound.ancestorAuthorityRefs) ||
@@ -251,7 +257,9 @@ export async function assertLocalReviewCurrent(
           (snapshot) =>
             canonicalDigest(
               (currentProfile.integrationGrants ?? []).filter((grant) => grant.mcp !== undefined),
-            ) !== snapshot.profileGrantsHash,
+            ) !== snapshot.profileGrantsHash ||
+            canonicalDigest(currentProfile.mcpGrantPublication) !==
+              canonicalDigest(snapshot.profilePublication ?? null),
         )
     )
       throw new Error("stale MCP review profile");
@@ -262,7 +270,7 @@ export async function assertLocalReviewCurrent(
       .select()
       .from(integrationConnection)
       .where(eq(integrationConnection.id, id))
-      .for("share");
+      .for(connectionLock);
     for (const binding of bindings.filter((binding) => binding.connectionId === id)) {
       const [catalog] = await tx
         .select()
@@ -272,6 +280,7 @@ export async function assertLocalReviewCurrent(
         !live ||
         live.provider !== "mcp" ||
         !live.enabled ||
+        live.mcpCredential?.transition ||
         live.revoked ||
         live.alias !== binding.alias ||
         canonicalDigest(live.config) !== canonicalDigest(binding.config) ||

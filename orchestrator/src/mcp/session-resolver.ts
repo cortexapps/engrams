@@ -45,12 +45,13 @@ export interface BoundSessionAuthority {
 export interface SessionBindingResolverDeps {
   readSession(sessionId: string): Promise<BoundSessionAuthority | null>;
   readAuthority(profileId: string): Promise<McpLiveAuthority>;
-  /** Fresh coordinator policy reference. Unknown/legacy/terminal sessions must reject. */
+  /** Fresh coordinator policy reference. Missing or terminal identity must reject; write eligibility is separate. */
   readBindingEpoch(sessionId: string): Promise<number>;
   /** Mandatory trusted host read/apply fence. Do not implement with a stored JSON receipt. */
   enforceManagedDeny?(expected: ManagedDenyAck, policy: ManagedDenyPolicy): Promise<ManagedDenyAck>;
 }
 export interface ResolvedBoundTool {
+  profilePublication?: import("../db/profiles.ts").McpGrantPublication | null;
   bindingHash: string;
   binding: McpSessionBinding;
   modelToolName: string;
@@ -115,6 +116,7 @@ export function makeSessionBindingResolver(deps: SessionBindingResolverDeps) {
           if (bound)
             return structuredClone({
               bindingHash: snapshot.bindingHash,
+              profilePublication: snapshot.profilePublication ?? null,
               binding,
               modelToolName: bound.name,
               reviewedTool: bound.tool,

@@ -249,6 +249,74 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                 .unwrap()
                 .unwrap();
             assert_eq!(outbox.payload["result_json"], "{\"decision\":\"approve\"}");
+            for state in [
+                engram_core::SessionState::Pending,
+                engram_core::SessionState::Created,
+                engram_core::SessionState::Active,
+            ] {
+                meta.transition_session(policy_sid, state, engram_core::BindingDisposition::Retain)
+                    .await
+                    .unwrap();
+            }
+            meta.append_session_event(
+                policy_sid,
+                "run_started",
+                serde_json::json!({"run_id":"run-a"}),
+            )
+            .await
+            .unwrap();
+            meta.append_session_event(policy_sid, "tool_call_requested", serde_json::json!({"name":"mcp_docs_search", "tool_call_id":"read-a", "run_id":"run-a", "args_json":"{ \"x\": 1 }"})).await.unwrap();
+            let exact = wire::ValidateExecutionIdentityRequest {
+                protocol: 1,
+                session_id: policy_sid.to_string(),
+                run_id: "run-a".into(),
+                tool_call_id: "read-a".into(),
+                accepted_policy_ref: approved.r#ref.clone(),
+                accepted_write_eligibility: "write_eligible".into(),
+                ancestor_policy_refs: Vec::new(),
+                model_tool_name: "mcp_docs_search".into(),
+                original_arguments: "{ \"x\": 1 }".into(),
+            };
+            assert_eq!(
+                policy_client
+                    .validate_execution_identity(exact.clone())
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .status,
+                "current"
+            );
+            assert_eq!(
+                policy_client
+                    .validate_execution_identity(wire::ValidateExecutionIdentityRequest {
+                        original_arguments: "{\"x\":1}".into(),
+                        ..exact.clone()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .status,
+                "stale"
+            );
+            assert_eq!(
+                policy_client
+                    .validate_dispatch_fence(wire::ValidateDispatchFenceRequest {
+                        protocol: exact.protocol,
+                        session_id: exact.session_id,
+                        run_id: exact.run_id,
+                        tool_call_id: exact.tool_call_id,
+                        accepted_policy_ref: exact.accepted_policy_ref,
+                        accepted_write_eligibility: exact.accepted_write_eligibility,
+                        ancestor_policy_refs: exact.ancestor_policy_refs,
+                        model_tool_name: "wrong-name".into(),
+                        original_arguments: exact.original_arguments,
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .status,
+                "stale"
+            );
             let prior = policy_client
                 .validate_dispatch_fence(wire::ValidateDispatchFenceRequest {
                     protocol: 1,
@@ -258,6 +326,8 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                     accepted_policy_ref: reviewed.policy_ref,
                     accepted_write_eligibility: "read_only".into(),
                     ancestor_policy_refs: Vec::new(),
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into(),
                 })
                 .await
                 .unwrap()

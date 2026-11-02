@@ -8,9 +8,12 @@
 
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 
+import { canonicalDigest } from "../mcp/hash.ts";
+import { isServiceAccountEmail } from "../rpc/api-key.ts";
 import { getDb } from "./client.ts";
 import {
   profile as profileTable,
+  user,
   DEFAULT_PROFILE_NETWORK,
   type ProfileApp,
   type ProfileNetwork,
@@ -19,7 +22,10 @@ import {
   type ProfileIntegrationGrant,
 } from "./schema.ts";
 
+export type McpGrantPublication = { revision: number; actorId: string; grantsHash: string };
+export type PublishMcpGrants = { actorId: string; expectedRevision: number };
 export interface ProfileRow {
+  mcpGrantPublication?: McpGrantPublication | null;
   id: string;
   name: string;
   description: string;
@@ -82,9 +88,13 @@ export interface ProfileStore {
   getActive(id: string): Promise<ProfileRow | null>;
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
-  create(input: ProfileInput): Promise<ProfileRow>;
+  create(input: ProfileInput, publication?: PublishMcpGrants): Promise<ProfileRow>;
   /** Returns the updated row, or null if the id is absent / archived. */
-  update(id: string, input: ProfileInput): Promise<ProfileRow | null>;
+  update(
+    id: string,
+    input: ProfileInput,
+    publication?: PublishMcpGrants,
+  ): Promise<ProfileRow | null>;
   /** Idempotent soft delete (sets deleted_at). */
   softDelete(id: string): Promise<void>;
 }
@@ -92,6 +102,7 @@ export interface ProfileStore {
 function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
   return {
     id: r.id,
+    mcpGrantPublication: r.mcpGrantPublication,
     name: r.name,
     description: r.description,
     icon: r.icon,
@@ -140,20 +151,79 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
       const rows = await db.select().from(profileTable).where(inArray(profileTable.id, ids));
       return rows.map(toRow);
     },
-    async create(input) {
-      const id = crypto.randomUUID();
-      await db.insert(profileTable).values({ id, ...input });
-      const row = await this.get(id);
-      return row!;
+    async create(input, publication) {
+      return db.transaction(async (tx) => {
+        await lockPublisher(tx, publication);
+        const provenance = publicationFor([], null, input.integrationGrants, publication);
+        const [row] = await tx
+          .insert(profileTable)
+          .values({ id: crypto.randomUUID(), ...input, mcpGrantPublication: provenance })
+          .returning();
+        return toRow(row!);
+      });
     },
-    async update(id, input) {
-      const existing = await this.getActive(id);
-      if (!existing) return null;
-      await db
-        .update(profileTable)
-        .set({ ...input, updatedAt: new Date() })
-        .where(eq(profileTable.id, id));
-      return this.get(id);
+    async update(id, input, publication) {
+      return db.transaction(async (tx) => {
+        await lockPublisher(tx, publication);
+        const [existing] = await tx
+          .select()
+          .from(profileTable)
+          .where(and(eq(profileTable.id, id), isNull(profileTable.deletedAt)))
+          .for("update");
+        if (!existing) return null;
+        const provenance = publicationFor(
+          existing.integrationGrants,
+          existing.mcpGrantPublication,
+          input.integrationGrants,
+          publication,
+        );
+        // Select only writable fields; a caller cannot supply publication metadata through input.
+        const {
+          name,
+          description,
+          icon,
+          imageId,
+          harness,
+          modelRouter,
+          model,
+          effort,
+          programmaticOnly,
+          includeUserTokens,
+          envVars,
+          skills,
+          integrationGrants,
+          network,
+          secrets,
+          repos,
+          apps,
+        } = input;
+        const [row] = await tx
+          .update(profileTable)
+          .set({
+            name,
+            description,
+            icon,
+            imageId,
+            harness,
+            modelRouter,
+            model,
+            effort,
+            programmaticOnly,
+            includeUserTokens,
+            envVars,
+            skills,
+            integrationGrants,
+            network,
+            secrets,
+            repos,
+            apps,
+            mcpGrantPublication: provenance,
+            updatedAt: new Date(),
+          })
+          .where(eq(profileTable.id, id))
+          .returning();
+        return toRow(row!);
+      });
     },
     async softDelete(id) {
       await db
@@ -162,4 +232,33 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
         .where(and(eq(profileTable.id, id), isNull(profileTable.deletedAt)));
     },
   };
+}
+
+type ProfileTx = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+async function lockPublisher(tx: ProfileTx, publication?: PublishMcpGrants) {
+  if (!publication) return;
+  const [actor] = await tx.select().from(user).where(eq(user.id, publication.actorId)).for("share");
+  if (!actor || actor.banned || actor.role !== "admin" || isServiceAccountEmail(actor.email))
+    throw new Error("current human administrator required for MCP grant publication");
+}
+function publicationFor(
+  previous: ProfileIntegrationGrant[],
+  provenance: McpGrantPublication | null,
+  next: ProfileIntegrationGrant[],
+  publication?: PublishMcpGrants,
+): McpGrantPublication | null {
+  const hash = (grants: ProfileIntegrationGrant[]) =>
+    canonicalDigest(grants.filter((g) => g.mcp !== undefined));
+  if (!publication) {
+    if (hash(previous) !== hash(next)) throw new Error("explicit MCP grant publication required");
+    return provenance;
+  }
+  const revision = provenance?.revision ?? 0;
+  if (
+    !Number.isSafeInteger(publication.expectedRevision) ||
+    publication.expectedRevision !== revision ||
+    revision >= Number.MAX_SAFE_INTEGER
+  )
+    throw new Error("MCP grant publication revision changed");
+  return { revision: revision + 1, actorId: publication.actorId, grantsHash: hash(next) };
 }

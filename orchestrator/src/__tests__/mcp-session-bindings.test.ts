@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { canonicalDigest } from "../mcp/hash.ts";
 import { reviewCatalog } from "../mcp/catalog.ts";
 import {
   compileSessionBindings,
@@ -185,4 +186,33 @@ test("merged manifest checks native collisions and the total tool and byte limit
       snapshot,
     ),
   ).toThrow();
+});
+
+test("publication revision and publisher are frozen and cannot silently rebase a session", () => {
+  const source = bindingAuthority();
+  const authority = {
+    ...source,
+    profilePublication: {
+      revision: 1,
+      actorId: "admin-a",
+      grantsHash: canonicalDigest(source.profileGrants),
+    },
+  };
+  const snapshot = compileSessionBindings({
+    launchPolicy: { profileId: authority.profileId, integrationGrants: authority.profileGrants },
+    liveAuthority: authority,
+    bindingEpoch: 0,
+  });
+  expect(snapshot.profilePublication).toEqual(authority.profilePublication);
+  authority.profilePublication.revision = 2;
+  expect(checkBindingCurrent({ snapshot, liveAuthority: authority }).current).toBe(false);
+  expect(snapshot.profilePublication!.revision).toBe(1);
+  authority.profilePublication.grantsHash = canonicalDigest([]);
+  expect(() =>
+    compileSessionBindings({
+      launchPolicy: { profileId: authority.profileId, integrationGrants: authority.profileGrants },
+      liveAuthority: authority,
+      bindingEpoch: 0,
+    }),
+  ).toThrow("publication");
 });

@@ -794,3 +794,22 @@ describe("MCP profile grant contract", () => {
     } finally { await s.close(); }
   });
 });
+
+test("typed profile publication preserves optional revision presence and authenticates the publisher", async () => {
+  const store = makeFakeStore();
+  const calls: unknown[] = [];
+  const originalCreate = store.create.bind(store);
+  store.create = async (input, publication) => {
+    calls.push(publication);
+    return originalCreate(input);
+  };
+  const s = await spawn({ getSession: makeGetSession("admin-publisher", "admin"), store, images: fakeImages(["img-1"]) });
+  const input = { name: "Profile", imageId: "img-1", harness: "claude" };
+  try {
+    await s.client.createProfile(input);
+    await s.client.createProfile({ ...input, expectedMcpGrantRevision: 0n });
+    expect(calls).toEqual([undefined, { actorId: "admin-publisher", expectedRevision: 0 }]);
+    await expectErr(s.client.createProfile({ ...input, expectedMcpGrantRevision: BigInt(Number.MAX_SAFE_INTEGER) + 1n }), Code.InvalidArgument);
+    expect(calls).toHaveLength(2);
+  } finally { await s.close(); }
+});

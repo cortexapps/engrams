@@ -267,6 +267,15 @@ pub trait MetadataStore: Send + Sync {
     async fn validate_mcp_dispatch_fence(
         &self,
         _context: &crate::types::mcp_policy::RequestPolicyContext,
+        _expected: &crate::types::mcp_policy::ExecutionRequest,
+    ) -> Result<crate::types::mcp_policy::DispatchFence, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Exact execution identity only; the trusted caller must use the write fence for writes.
+    async fn validate_mcp_execution_identity(
+        &self,
+        _context: &crate::types::mcp_policy::RequestPolicyContext,
+        _expected: &crate::types::mcp_policy::ExecutionRequest,
     ) -> Result<crate::types::mcp_policy::DispatchFence, MetaError> {
         Err(MetaError::Conflict("policy unavailable".into()))
     }

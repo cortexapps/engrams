@@ -1538,8 +1538,16 @@ impl MetadataStore for PostgresStore {
     async fn validate_mcp_dispatch_fence(
         &self,
         ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
     ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
-        self.policy_fence(ctx).await
+        self.policy_fence(ctx, expected, true).await
+    }
+    async fn validate_mcp_execution_identity(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx, expected, false).await
     }
 
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {

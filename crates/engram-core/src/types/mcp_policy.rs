@@ -187,6 +187,13 @@ pub struct RequestPolicyContext {
     pub accepted_write_eligibility: WriteEligibility,
     pub ancestor_policy_refs: Vec<WritePolicyRef>,
 }
+/// Exact platform request bytes, before any argument normalization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionRequest {
+    pub model_tool_name: String,
+    pub original_arguments: String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchFence {
@@ -300,19 +307,15 @@ pub fn accept_plan(
     p.plan_request_digest = Some(input.review.request_digest.clone());
     Ok(p)
 }
-pub fn dispatch_fence(
+pub fn execution_identity_fence(
     nodes: &[PolicyNode],
     events: &[PersistedEvent],
     ctx: &RequestPolicyContext,
+    expected: &ExecutionRequest,
 ) -> Result<DispatchFence, MetaError> {
     let p = compose_policy(nodes)?;
-    if !nodes[0].active {
+    if !nodes[0].active || !p.current {
         return Ok(DispatchFence::Stale);
-    }
-    if ctx.accepted_write_eligibility != WriteEligibility::WriteEligible
-        || p.write_eligibility != WriteEligibility::WriteEligible
-    {
-        return Ok(DispatchFence::Unknown);
     }
     if ctx.session_id != ctx.accepted_policy_ref.session_id
         || p.reference != ctx.accepted_policy_ref
@@ -331,7 +334,12 @@ pub fn dispatch_fence(
                 "run_started" | "run_completed" | "run_interrupted"
             )
     });
-    if ctx.run_id.is_empty()
+    if expected.model_tool_name.is_empty()
+        || expected.model_tool_name.len() > 256
+        || expected.original_arguments.len() > 256 * 1024
+        || request.payload["name"].as_str() != Some(&expected.model_tool_name)
+        || request.payload["args_json"].as_str() != Some(&expected.original_arguments)
+        || ctx.run_id.is_empty()
         || request.payload["run_id"].as_str() != Some(&ctx.run_id)
         || last_run.is_none_or(|e| {
             e.kind != "run_started" || e.payload["run_id"].as_str() != Some(&ctx.run_id)
@@ -340,4 +348,23 @@ pub fn dispatch_fence(
         return Ok(DispatchFence::Stale);
     }
     Ok(DispatchFence::Current)
+}
+
+/// Write eligibility adds to the exact execution identity checks; it never creates identity.
+pub fn dispatch_fence(
+    nodes: &[PolicyNode],
+    events: &[PersistedEvent],
+    ctx: &RequestPolicyContext,
+    expected: &ExecutionRequest,
+) -> Result<DispatchFence, MetaError> {
+    let p = compose_policy(nodes)?;
+    if ctx.accepted_write_eligibility != WriteEligibility::WriteEligible
+        || p.write_eligibility != WriteEligibility::WriteEligible
+        || nodes
+            .iter()
+            .any(|n| !n.policy.as_ref().is_some_and(|p| p.initialized))
+    {
+        return Ok(DispatchFence::Unknown);
+    }
+    execution_identity_fence(nodes, events, ctx, expected)
 }

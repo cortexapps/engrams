@@ -147,6 +147,7 @@ export async function readLiveBindingAuthority(
   return {
     profileId,
     profileGrants: currentProfile.integrationGrants,
+    profilePublication: currentProfile.mcpGrantPublication,
     connections,
     operatorPolicies: structuredClone([...operatorPolicies]),
   };
@@ -170,7 +171,7 @@ export function makeStoredSessionBindingResolver(
       const current = await policy.readForRequest({ sessionId });
       const epoch = current.ref?.bindingEpoch;
       if (
-        !current.initialized ||
+        !current.current ||
         epoch === undefined ||
         epoch < 0n ||
         epoch > BigInt(Number.MAX_SAFE_INTEGER)

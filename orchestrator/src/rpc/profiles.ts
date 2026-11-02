@@ -112,11 +112,18 @@ export interface ProfileDeps {
   discoverRepos?: (profileId: string) => Promise<DiscoveredRepo[]>;
 }
 
+function publication(expected: bigint | undefined, actorId: string) {
+  if (expected === undefined) return undefined;
+  if (expected < 0n || expected > BigInt(Number.MAX_SAFE_INTEGER))
+    throw new ConnectError("invalid MCP grant revision", Code.InvalidArgument);
+  return { actorId, expectedRevision: Number(expected) };
+}
 
 /** Map a ProfileRow to the proto Profile. env_vars included only when admin. */
 function toProto(row: ProfileRow, isAdmin: boolean): Profile {
   return {
     id: row.id,
+    mcpGrantRevision: BigInt(row.mcpGrantPublication?.revision ?? 0),
     name: row.name,
     description: row.description,
     icon: row.icon,
@@ -492,7 +499,12 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       operation?: string;
       resourceConstraints?: string[];
       credentialScope?: string;
-      mcp?: { upstreamName: string; automationWrite: boolean; argumentConstraintDocumentsJson: string[]; unrestricted: boolean };
+      mcp?: {
+        upstreamName: string;
+        automationWrite: boolean;
+        argumentConstraintDocumentsJson: string[];
+        unrestricted: boolean;
+      };
     }>,
   ): ProfileIntegrationGrant[] {
     return grants.map((grant) => {
@@ -559,88 +571,99 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     async createProfile(req, ctx) {
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
-      if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
+      if (!ability.can("manage", "Profile"))
+        throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       const model = catalogOptionId(req.model);
       const modelRouter = catalogOptionId(req.modelRouter);
       const effort = catalogOptionId(req.effort);
-      const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
+      const harness = await assertHarnessValid(
+        catalogOptionId(req.harness),
+        modelRouter,
+        model,
+        effort,
+      );
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
       const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
-      assertResolvedGrantsValid(
-        resolvedGrants,
-        await loadRegistry(connectors),
-        toolCapabilities(),
-      );
+      assertResolvedGrantsValid(resolvedGrants, await loadRegistry(connectors), toolCapabilities());
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.create({
-        name: req.name,
-        description: req.description,
-        icon: req.icon || "Bot",
-        imageId: req.imageId,
-        programmaticOnly: req.programmaticOnly,
-        includeUserTokens: req.includeUserTokens,
-        envVars: req.envVars ?? {},
-        skills: req.skills ?? [],
-        integrationGrants,
-        network,
-        secrets,
-        repos: normalizeReposChecked(req.repos ?? []),
-        harness,
-        modelRouter,
-        model,
-        effort,
-        apps: normalizeAppsChecked(req.apps ?? []),
-      });
+      const row = await store.create(
+        {
+          name: req.name,
+          description: req.description,
+          icon: req.icon || "Bot",
+          imageId: req.imageId,
+          programmaticOnly: req.programmaticOnly,
+          includeUserTokens: req.includeUserTokens,
+          envVars: req.envVars ?? {},
+          skills: req.skills ?? [],
+          integrationGrants,
+          network,
+          secrets,
+          repos: normalizeReposChecked(req.repos ?? []),
+          harness,
+          modelRouter,
+          model,
+          effort,
+          apps: normalizeAppsChecked(req.apps ?? []),
+        },
+        publication(req.expectedMcpGrantRevision, user.id),
+      );
       return { profile: toProto(row, true) };
     },
 
     async updateProfile(req, ctx) {
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
-      if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
+      if (!ability.can("manage", "Profile"))
+        throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       const model = catalogOptionId(req.model);
       const modelRouter = catalogOptionId(req.modelRouter);
       const effort = catalogOptionId(req.effort);
-      const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
+      const harness = await assertHarnessValid(
+        catalogOptionId(req.harness),
+        modelRouter,
+        model,
+        effort,
+      );
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
       const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
-      assertResolvedGrantsValid(
-        resolvedGrants,
-        await loadRegistry(connectors),
-        toolCapabilities(),
-      );
+      assertResolvedGrantsValid(resolvedGrants, await loadRegistry(connectors), toolCapabilities());
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.update(req.id, {
-        name: req.name,
-        description: req.description,
-        icon: req.icon || "Bot",
-        imageId: req.imageId,
-        programmaticOnly: req.programmaticOnly,
-        includeUserTokens: req.includeUserTokens,
-        envVars: req.envVars ?? {},
-        skills: req.skills ?? [],
-        integrationGrants,
-        network,
-        secrets,
-        repos: normalizeReposChecked(req.repos ?? []),
-        harness,
-        modelRouter,
-        model,
-        effort,
-        apps: normalizeAppsChecked(req.apps ?? []),
-      });
+      const row = await store.update(
+        req.id,
+        {
+          name: req.name,
+          description: req.description,
+          icon: req.icon || "Bot",
+          imageId: req.imageId,
+          programmaticOnly: req.programmaticOnly,
+          includeUserTokens: req.includeUserTokens,
+          envVars: req.envVars ?? {},
+          skills: req.skills ?? [],
+          integrationGrants,
+          network,
+          secrets,
+          repos: normalizeReposChecked(req.repos ?? []),
+          harness,
+          modelRouter,
+          model,
+          effort,
+          apps: normalizeAppsChecked(req.apps ?? []),
+        },
+        publication(req.expectedMcpGrantRevision, user.id),
+      );
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };
     },

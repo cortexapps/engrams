@@ -8304,7 +8304,16 @@ async fn mcp_write_policy_projections_and_fences(ctx: &Ctx) {
         .await
         .unwrap();
     assert_eq!(
-        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Unknown,
         "earlier read-only request cannot gain writes"
     );
@@ -8318,7 +8327,13 @@ async fn mcp_write_policy_projections_and_fences(ctx: &Ctx) {
     };
     assert_eq!(
         ctx.meta
-            .validate_mcp_dispatch_fence(&current)
+            .validate_mcp_dispatch_fence(
+                &current,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
             .await
             .unwrap(),
         DispatchFence::Current
@@ -8326,19 +8341,43 @@ async fn mcp_write_policy_projections_and_fences(ctx: &Ctx) {
     let mut forged = current.clone();
     forged.run_id = "other-run".into();
     assert_eq!(
-        ctx.meta.validate_mcp_dispatch_fence(&forged).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &forged,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Stale
     );
     forged = current.clone();
     forged.ancestor_policy_refs.clear();
     assert_eq!(
-        ctx.meta.validate_mcp_dispatch_fence(&forged).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &forged,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Stale
     );
     mcp_write_policy_restrict(ctx, parent, "parent-plan").await;
     assert_ne!(
         ctx.meta
-            .validate_mcp_dispatch_fence(&current)
+            .validate_mcp_dispatch_fence(
+                &current,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
             .await
             .unwrap(),
         DispatchFence::Current
@@ -8477,7 +8516,16 @@ async fn mcp_write_policy_restore_and_generic_results(ctx: &Ctx) {
         ancestor_policy_refs: p.ancestor_policy_refs.clone(),
     };
     assert_eq!(
-        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Current
     );
     ctx.meta
@@ -8485,7 +8533,16 @@ async fn mcp_write_policy_restore_and_generic_results(ctx: &Ctx) {
         .await
         .unwrap();
     assert_eq!(
-        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Stale
     );
     let restored = ctx.meta.read_mcp_write_policy(id).await.unwrap();
@@ -8539,8 +8596,12 @@ async fn mcp_write_policy_restriction_race(ctx: &Ctx) {
         accepted_write_eligibility: p.write_eligibility,
         ancestor_policy_refs: p.ancestor_policy_refs,
     };
+    let expected = ExecutionRequest {
+        model_tool_name: "exit_plan_mode".into(),
+        original_arguments: "{}".into(),
+    };
     let (fence, ()) = tokio::join!(
-        ctx.meta.validate_mcp_dispatch_fence(&frozen),
+        ctx.meta.validate_mcp_dispatch_fence(&frozen, &expected),
         mcp_write_policy_restrict(ctx, id, "race-plan")
     );
     assert!(
@@ -8551,7 +8612,16 @@ async fn mcp_write_policy_restriction_race(ctx: &Ctx) {
         "the lock defines which operation is admitted first"
     );
     assert_ne!(
-        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        ctx.meta
+            .validate_mcp_dispatch_fence(
+                &frozen,
+                &ExecutionRequest {
+                    model_tool_name: "exit_plan_mode".into(),
+                    original_arguments: "{}".into()
+                }
+            )
+            .await
+            .unwrap(),
         DispatchFence::Current,
         "a committed restriction blocks every later fence"
     );
@@ -8649,4 +8719,95 @@ async fn mcp_write_policy_parent_lifecycle(ctx: &Ctx) {
 conformance!(
     t_mcp_write_policy_parent_lifecycle,
     super::mcp_write_policy_parent_lifecycle
+);
+
+async fn mcp_read_execution_identity(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    for eligibility in [
+        WriteEligibility::Unknown,
+        WriteEligibility::ReadOnly,
+        WriteEligibility::WriteEligible,
+    ] {
+        let parent = SessionId::new();
+        let id = SessionId::new();
+        mcp_write_policy_create(ctx, parent, None, eligibility).await;
+        mcp_write_policy_create(ctx, id, Some(parent), eligibility).await;
+        for status in [
+            SessionState::Pending,
+            SessionState::Created,
+            SessionState::Active,
+        ] {
+            ctx.meta
+                .transition_session(id, status, BindingDisposition::Retain)
+                .await
+                .unwrap();
+        }
+        ctx.meta
+            .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        mcp_write_policy_event(ctx, id, "call-a", "run-a", "{ \"value\": 1 }").await;
+        let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+        let frozen = RequestPolicyContext {
+            session_id: id,
+            run_id: "run-a".into(),
+            tool_call_id: "call-a".into(),
+            accepted_policy_ref: p.reference,
+            accepted_write_eligibility: p.write_eligibility,
+            ancestor_policy_refs: p.ancestor_policy_refs,
+        };
+        let expected = ExecutionRequest {
+            model_tool_name: "exit_plan_mode".into(),
+            original_arguments: "{ \"value\": 1 }".into(),
+        };
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Current
+        );
+        let mut changed = expected.clone();
+        changed.original_arguments = "{\"value\":1}".into();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &changed)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        changed = expected.clone();
+        changed.model_tool_name = "different".into();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &changed)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        let mut stale = frozen.clone();
+        stale.ancestor_policy_refs.clear();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&stale, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+        ctx.meta
+            .append_session_event(id, "run_interrupted", serde_json::json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&frozen, &expected)
+                .await
+                .unwrap(),
+            DispatchFence::Stale
+        );
+    }
+}
+conformance!(
+    t_mcp_read_execution_identity,
+    super::mcp_read_execution_identity
 );
