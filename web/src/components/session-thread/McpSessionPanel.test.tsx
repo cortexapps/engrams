@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClient } from "@tanstack/react-query";
 import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
 import { IntegrationService, McpCompletionSettlement } from "@/gen/engram/app/v1/integration_pb";
 import { renderWithProviders } from "@/test-utils";
@@ -238,12 +239,20 @@ test("execution and tool pages advance independently when the first tool page is
     router.service(IntegrationService, {
       getSessionMcpState: (req) => {
         requests.push(req);
+        const bindingReceipt = { bindingHash: "H1", bindingEpoch: "1" };
         if (req.omitExecutions)
-          return { bindingTools: [{ modelToolName: "tool-a", connectionId: "c1" }] };
+          return {
+            bindingReceipt,
+            bindingTools: [{ modelToolName: "tool-a", connectionId: "c1" }],
+          };
         if (req.omitBindings)
-          return { executions: [{ executionId: "e2", upstreamName: "second", state: "failed" }] };
+          return {
+            bindingReceipt,
+            executions: [{ executionId: "e2", upstreamName: "second", state: "failed" }],
+          };
         return {
           availability: "available",
+          bindingReceipt,
           hasMoreBindingTools: true,
           hasMoreExecutions: true,
           nextExecutionId: "e1",
@@ -341,4 +350,298 @@ test("result expansion shows persisted JSON as inert text and reports ambiguous 
   expect(container.querySelector("img, iframe, a[href^='https://example.test']")).toBeNull();
   expect(requests).toBe(1);
   expect(fetch).not.toHaveBeenCalled();
+});
+
+test("a base refetch clears supplemental tools and call actions before showing the new binding", async () => {
+  let generation = 1;
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        const bindingReceipt = {
+          bindingHash: `H${generation}`,
+          bindingEpoch: `${generation}`,
+          current: true,
+        };
+        if (req.omitExecutions)
+          return { bindingReceipt, bindingTools: [{ modelToolName: "old-extra-tool" }] };
+        if (req.omitBindings)
+          return {
+            bindingReceipt,
+            executions: [
+              {
+                executionId: "old-call",
+                upstreamName: "old-extra-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        return {
+          bindingReceipt,
+          bindingTools: [{ modelToolName: `base-tool-${generation}` }],
+          hasMoreBindingTools: generation === 1,
+          hasMoreExecutions: generation === 1,
+          nextExecutionId: "first",
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more tools" }));
+  await screen.findByText("old-extra-tool");
+  await userEvent.click(screen.getByRole("button", { name: "Load more calls" }));
+  await screen.findByText("old-extra-call");
+  generation = 2;
+  await act(async () => {
+    await client.invalidateQueries();
+  });
+  expect(await screen.findByText("base-tool-2")).toBeTruthy();
+  expect(screen.queryByText("old-extra-tool")).toBeNull();
+  expect(screen.queryByText("old-extra-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
+
+test("a page from a different binding restarts pagination without displaying that page", async () => {
+  let generation = 1;
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitExecutions) {
+          generation = 2;
+          return {
+            bindingReceipt: { bindingHash: "H2", bindingEpoch: "2" },
+            bindingTools: [{ modelToolName: "mismatched-tool" }],
+          };
+        }
+        return {
+          bindingReceipt: { bindingHash: `H${generation}`, bindingEpoch: `${generation}` },
+          bindingTools: [{ modelToolName: `base-tool-${generation}` }],
+          hasMoreBindingTools: generation === 1,
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more tools" }));
+  expect(await screen.findByText("base-tool-2")).toBeTruthy();
+  expect(screen.queryByText("mismatched-tool")).toBeNull();
+});
+
+test("a late older execution page cannot reappear after the base refresh", async () => {
+  let generation = 1;
+  let finishPage!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finishPage = resolve;
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: async (req) => {
+        if (req.omitBindings) {
+          await pending;
+          return {
+            bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+            executions: [
+              {
+                executionId: "old",
+                upstreamName: "late-old-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        return {
+          bindingReceipt: { bindingHash: `H${generation}`, bindingEpoch: `${generation}` },
+          bindingTools: [{ modelToolName: `base-tool-${generation}` }],
+          hasMoreExecutions: generation === 1,
+          nextExecutionId: "first",
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  generation = 2;
+  await act(async () => {
+    await client.invalidateQueries();
+  });
+  expect(await screen.findByText("base-tool-2")).toBeTruthy();
+  await act(async () => {
+    finishPage();
+    await pending;
+  });
+  expect(screen.queryByText("late-old-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
+
+test("a changed binding epoch in an execution page restarts the base read", async () => {
+  let epoch = "1";
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitBindings) {
+          epoch = "2";
+          return {
+            bindingReceipt: { bindingHash: "same-hash", bindingEpoch: epoch },
+            executions: [
+              {
+                executionId: "wrong",
+                upstreamName: "wrong-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        return {
+          bindingReceipt: { bindingHash: "same-hash", bindingEpoch: epoch },
+          bindingTools: [{ modelToolName: `epoch-${epoch}` }],
+          hasMoreExecutions: epoch === "1",
+          nextExecutionId: "first",
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  expect(await screen.findByText("epoch-2")).toBeTruthy();
+  expect(screen.queryByText("wrong-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
+
+test("even an identical base response invalidates a late earlier page", async () => {
+  let finishPage!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finishPage = resolve;
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: async (req) => {
+        if (req.omitExecutions) {
+          await pending;
+          return {
+            bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+            bindingTools: [{ modelToolName: "late-tool" }],
+          };
+        }
+        return {
+          bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+          bindingTools: [{ modelToolName: "base-tool" }],
+          hasMoreBindingTools: true,
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more tools" }));
+  await act(async () => {
+    await client.invalidateQueries();
+  });
+  await act(async () => {
+    finishPage();
+    await pending;
+  });
+  expect(screen.queryByText("late-tool")).toBeNull();
+});
+
+test("receiptless execution history remains available but receiptless tool pages are not shown", async () => {
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitBindings)
+          return {
+            executions: [{ executionId: "history", upstreamName: "history-call", state: "failed" }],
+          };
+        if (req.omitExecutions) return { bindingTools: [{ modelToolName: "unverified-tool" }] };
+        return { hasMoreExecutions: true, hasMoreBindingTools: true, nextExecutionId: "first" };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  expect(await screen.findByText("history-call")).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Load more tools" }));
+  expect(await screen.findByText(/binding changed or is unavailable/)).toBeTruthy();
+  expect(screen.queryByText("unverified-tool")).toBeNull();
+});
+
+test("a transition from a receiptless base to a bound history page restarts the read", async () => {
+  let bound = false;
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitBindings) {
+          bound = true;
+          return {
+            bindingReceipt: { bindingHash: "H2", bindingEpoch: "2" },
+            executions: [
+              {
+                executionId: "new",
+                upstreamName: "unmatched-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        return bound
+          ? {
+              bindingReceipt: { bindingHash: "H2", bindingEpoch: "2" },
+              bindingTools: [{ modelToolName: "new-base" }],
+            }
+          : { hasMoreExecutions: true, nextExecutionId: "first" };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  expect(await screen.findByText("new-base")).toBeTruthy();
+  expect(screen.queryByText("unmatched-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
+
+test("a transition from a bound base to receiptless history restarts the read", async () => {
+  let bound = true;
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitBindings) {
+          bound = false;
+          return {
+            executions: [
+              {
+                executionId: "old",
+                upstreamName: "unmatched-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        return bound
+          ? {
+              bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+              hasMoreExecutions: true,
+              nextExecutionId: "first",
+            }
+          : { availability: "unavailable" };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  expect(await screen.findByText("Binding unavailable.")).toBeTruthy();
+  expect(screen.queryByText("unmatched-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
 });

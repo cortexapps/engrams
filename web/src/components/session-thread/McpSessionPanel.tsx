@@ -1,12 +1,13 @@
 import { createClient } from "@connectrpc/connect";
 import { useQuery, useTransport } from "@connectrpc/connect-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { getSessionMcpState } from "@/gen/engram/app/v1/integration-IntegrationService_connectquery";
 import {
   IntegrationService,
   McpCompletionSettlement,
   type GetMcpExecutionResultResponse,
+  type GetSessionMcpStateResponse,
   type McpBoundToolSummary,
   type PrepareMcpRebindResponse,
 } from "@/gen/engram/app/v1/integration_pb";
@@ -86,28 +87,52 @@ function ExecutionResult({ sessionId, executionId }: { sessionId: string; execut
   );
 }
 
+function sameBinding(a: GetSessionMcpStateResponse, b: GetSessionMcpStateResponse) {
+  if (!a.bindingReceipt && !b.bindingReceipt) return true;
+  return Boolean(
+    a.bindingReceipt?.bindingHash &&
+    a.bindingReceipt.bindingEpoch &&
+    a.bindingReceipt.bindingHash === b.bindingReceipt?.bindingHash &&
+    a.bindingReceipt.bindingEpoch === b.bindingReceipt?.bindingEpoch,
+  );
+}
+
+type SupplementalPages = { base: GetSessionMcpStateResponse; pages: GetSessionMcpStateResponse[] };
+
 export function McpSessionPanel({ sessionId }: { sessionId: string }) {
   const client = createClient(IntegrationService, useTransport());
   const [open, setOpen] = useState(false);
   const state = useQuery(
     getSessionMcpState,
     { sessionId, pageSize: 16, bindingPageSize: 16 },
-    { enabled: open },
+    { enabled: open, structuralSharing: false },
   );
-  const [executionPages, setExecutionPages] = useState<NonNullable<typeof state.data>[]>([]);
-  const [bindingPages, setBindingPages] = useState<NonNullable<typeof state.data>[]>([]);
+  const [executionSupplement, setExecutionSupplement] = useState<SupplementalPages | null>(null);
+  const [bindingSupplement, setBindingSupplement] = useState<SupplementalPages | null>(null);
+  const latest = useRef({ base: state.data, fetching: state.isFetching });
+  latest.current = { base: state.data, fetching: state.isFetching };
+  const executionPages =
+    !state.isFetching && executionSupplement && executionSupplement.base === state.data
+      ? executionSupplement.pages
+      : [];
+  const bindingPages =
+    !state.isFetching && bindingSupplement && bindingSupplement.base === state.data
+      ? bindingSupplement.pages
+      : [];
   const [candidate, setCandidate] = useState<{
     review: PrepareMcpRebindResponse;
     expectedBindingHash: string;
+    base: GetSessionMcpStateResponse;
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [observation, setObservation] = useState<Record<string, string>>({});
   const pages = state.data ? [state.data, ...executionPages] : [];
   const binding = state.data?.bindingReceipt;
+  const hasBindingIdentity = Boolean(binding?.bindingHash && binding.bindingEpoch);
   async function refresh() {
-    setExecutionPages([]);
-    setBindingPages([]);
+    setExecutionSupplement(null);
+    setBindingSupplement(null);
     setCandidate(null);
     await state.refetch();
   }
@@ -125,7 +150,8 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
       setBusy(false);
     }
   }
-  const proposal = candidate?.review;
+  const currentCandidate = !state.isFetching && candidate?.base === state.data ? candidate : null;
+  const proposal = currentCandidate?.review;
   const lastExecution = executionPages.at(-1) ?? state.data;
   const lastBinding = bindingPages.at(-1) ?? state.data;
   return (
@@ -164,9 +190,13 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
               New calls for connection {id} are blocked while the write outcome is unknown.
             </p>
           ))}
-          <Tools
-            tools={[...state.data.bindingTools, ...bindingPages.flatMap((p) => p.bindingTools)]}
-          />
+          {hasBindingIdentity ? (
+            <Tools
+              tools={[...state.data.bindingTools, ...bindingPages.flatMap((p) => p.bindingTools)]}
+            />
+          ) : state.data.bindingTools.length > 0 ? (
+            <p>Tool binding identity is unavailable.</p>
+          ) : null}
           {lastBinding?.hasMoreBindingTools && (
             <Button
               size="sm"
@@ -175,6 +205,8 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
               onClick={async () => {
                 setBusy(true);
                 try {
+                  const base = state.data;
+                  if (!base) return;
                   const page = await client.getSessionMcpState({
                     sessionId,
                     pageSize: 16,
@@ -182,7 +214,18 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                     omitExecutions: true,
                     afterBindingToolName: lastBinding.nextBindingToolName,
                   });
-                  setBindingPages((old) => [...old, page]);
+                  if (latest.current.base !== base || latest.current.fetching) return;
+                  if (!base.bindingReceipt || !page.bindingReceipt || !sameBinding(base, page)) {
+                    await refresh();
+                    setMessage(
+                      "The binding changed or is unavailable. Review the refreshed state.",
+                    );
+                    return;
+                  }
+                  setBindingSupplement((old) => ({
+                    base,
+                    pages: [...(old?.base === base ? old.pages : []), page],
+                  }));
                 } catch {
                   setMessage("Could not load more tools.");
                 } finally {
@@ -348,6 +391,8 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
               onClick={async () => {
                 setBusy(true);
                 try {
+                  const base = state.data;
+                  if (!base) return;
                   const page = await client.getSessionMcpState({
                     sessionId,
                     pageSize: 16,
@@ -355,7 +400,18 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                     omitBindings: true,
                     afterExecutionId: lastExecution.nextExecutionId,
                   });
-                  setExecutionPages((old) => [...old, page]);
+                  if (latest.current.base !== base || latest.current.fetching) return;
+                  if (!sameBinding(base, page)) {
+                    await refresh();
+                    setMessage(
+                      "The binding changed or is unavailable. Review the refreshed state.",
+                    );
+                    return;
+                  }
+                  setExecutionSupplement((old) => ({
+                    base,
+                    pages: [...(old?.base === base ? old.pages : []), page],
+                  }));
                 } catch {
                   setMessage("Could not load more calls.");
                 } finally {
@@ -366,14 +422,16 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
               Load more calls
             </Button>
           )}
-          {binding?.allowedActions.includes("rebind") && !candidate && (
+          {binding?.allowedActions.includes("rebind") && !currentCandidate && (
             <Button
               size="sm"
               disabled={busy}
               onClick={async () => {
                 setBusy(true);
                 try {
+                  if (!state.data) return;
                   setCandidate({
+                    base: state.data,
                     review: await client.prepareMcpRebind({
                       sessionId,
                       expectedBindingHash: binding.bindingHash,
@@ -391,7 +449,7 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
               Review rebind
             </Button>
           )}
-          {candidate && proposal && (
+          {currentCandidate && proposal && (
             <section>
               <p>
                 Candidate binding {proposal.bindingHash} · epoch {proposal.bindingEpoch}
@@ -414,7 +472,7 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                       () =>
                         client.rebindMcp({
                           sessionId,
-                          expectedBindingHash: candidate.expectedBindingHash,
+                          expectedBindingHash: currentCandidate.expectedBindingHash,
                           expectedCandidateHash: proposal.bindingHash,
                         }),
                       "Binding updated.",
