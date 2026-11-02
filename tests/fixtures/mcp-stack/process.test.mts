@@ -444,6 +444,7 @@ test("standalone OAuth enforces PKCE/resource, rotates refresh and exposes only 
     assert.deepEqual(observed.json().oauth, {
       account: "account-two",
       scope: "tools:read",
+      expiresInSeconds: 3600,
       authorizations: 1,
       exchanges: 1,
       rotations: 1,
@@ -592,6 +593,165 @@ test("config accepts separate DNS origins with matching supplied SANs and exact 
     );
     assert.throws(() => loadConfig(f.path));
   } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("OAuth TTL control changes future tokens only and enforces real bearer deadlines", async () => {
+  const f = await setup();
+  let running: Awaited<ReturnType<typeof start>> | undefined;
+  try {
+    running = await start(f);
+    const observed = () => control(f, "observe").then((r) => r.json().oauth);
+    assert.equal((await observed()).expiresInSeconds, 3600);
+    const before = await observed();
+    for (const expiresInSeconds of [0, -1, 1.5, 3601, "2", null]) {
+      assert.equal(
+        (
+          await control(f, "oauth", {
+            account: "account-two",
+            scope: "tools:read",
+            issuer: "mismatch",
+            expiresInSeconds,
+          })
+        ).status,
+        400,
+      );
+      assert.deepEqual(await observed(), before);
+    }
+    for (const invalid of [
+      { unknown: true },
+      { account: "bad" },
+      { scope: "admin" },
+      { issuer: "bad" },
+    ]) {
+      assert.equal(
+        (await control(f, "oauth", { expiresInSeconds: 2, ...invalid })).status,
+        400,
+      );
+      assert.deepEqual(await observed(), before);
+    }
+    const verifier = "v".repeat(43);
+    const token = (body: Record<string, string>) =>
+      wire(`${f.origin}/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body).toString(),
+      });
+    const mint = async (state: string) => {
+      const url = new URL(`${f.origin}/authorize`);
+      url.search = new URLSearchParams({
+        response_type: "code",
+        client_id: "fixture-public",
+        redirect_uri: f.config.advertised.redirectUri,
+        state,
+        code_challenge: createHash("sha256")
+          .update(verifier)
+          .digest("base64url"),
+        code_challenge_method: "S256",
+        resource: `${f.origin}/mcp`,
+        scope: "tools:read tools:write",
+      }).toString();
+      const authorized = await wire(url);
+      assert.equal(authorized.status, 302);
+      const code = new URL(
+        String(authorized.headers.location),
+      ).searchParams.get("code")!;
+      const response = await token({
+        grant_type: "authorization_code",
+        code,
+        code_verifier: verifier,
+        client_id: "fixture-public",
+        redirect_uri: f.config.advertised.redirectUri,
+        resource: `${f.origin}/mcp`,
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const refresh = (refreshToken: string) =>
+      token({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: "fixture-public",
+        resource: `${f.origin}/mcp`,
+      });
+    assert.equal(
+      (await control(f, "oauth", { expiresInSeconds: 2 })).status,
+      200,
+    );
+    assert.equal((await observed()).expiresInSeconds, 2);
+    assert.equal((await mint("ttl-runner")).expires_in, 2);
+    await control(f, "oauth", { expiresInSeconds: 3600 });
+    const first = await mint("ttl-default");
+    assert.equal(first.expires_in, 3600);
+    assert.equal(
+      (await control(f, "oauth", { expiresInSeconds: 1 })).status,
+      200,
+    );
+    assert.equal((await observed()).expiresInSeconds, 1);
+    await delay(1100);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-earlier", first.access_token)).status,
+      200,
+    );
+    const short = await mint("ttl-short");
+    assert.equal(short.expires_in, 1);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-live", short.access_token)).status,
+      200,
+    );
+    await control(f, "oauth", { expiresInSeconds: 3600 });
+    await delay(1100);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-expired", short.access_token)).status,
+      401,
+    );
+    const renewed = (await refresh(short.refresh_token)).json();
+    assert.equal(renewed.expires_in, 3600);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-renewed", renewed.access_token))
+        .status,
+      200,
+    );
+    await control(f, "oauth", { expiresInSeconds: 1 });
+    const rotated = (await refresh(renewed.refresh_token)).json();
+    assert.equal(rotated.expires_in, 1);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-rotated", rotated.access_token))
+        .status,
+      200,
+    );
+    assert.equal((await refresh(renewed.refresh_token)).status, 400);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-old", renewed.access_token)).status,
+      401,
+    );
+    await control(f, "oauth", { expiresInSeconds: 3600 });
+    await delay(1100);
+    assert.equal(
+      (
+        await rpc(
+          f,
+          "read_counter",
+          "ttl-refresh-expired",
+          rotated.access_token,
+        )
+      ).status,
+      401,
+    );
+    const recovered = (await refresh(rotated.refresh_token)).json();
+    assert.equal(recovered.expires_in, 3600);
+    assert.equal(
+      (await rpc(f, "read_counter", "ttl-recovered", recovered.access_token))
+        .status,
+      200,
+    );
+    const observation = await control(f, "observe");
+    assert.equal(observation.json().oauth.expiresInSeconds, 3600);
+    assert.equal(observation.text.includes("fixture-access-"), false);
+    assert.equal(observation.text.includes("fixture-refresh-"), false);
+  } finally {
+    if (running) await running.stop();
     rmSync(f.root, { recursive: true, force: true });
   }
 });

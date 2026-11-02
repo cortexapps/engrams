@@ -263,6 +263,7 @@ test("OAuth metadata, PKCE code exchange, rotation and replay use real TLS", asy
   assert.equal(exchanged.status, 200);
   const tokens = await exchanged.json();
   assert.equal(tokens.access_token, "fixture-access-1");
+  assert.equal(tokens.expires_in, 3600);
   assert.equal((await token(fixture, grant)).status, 400);
   assert.equal((await fixture.fetch(authorizationUrl)).status, 400);
   const authorized = await rpc(

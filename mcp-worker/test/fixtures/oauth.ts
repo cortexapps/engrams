@@ -30,6 +30,8 @@ export function createOAuthFixture(
   let codeSequence = 0;
   let tokenSequence = 0;
   let accessToken: string | undefined;
+  let accessExpiresAt = 0;
+  let expiresInSeconds = 3600;
   const resource = () => `${origin()}/mcp`;
   const issuer = () => advertised?.issuer ?? origin();
   const redirectUri = () => advertised?.redirectUri ?? `${origin()}/callback`;
@@ -55,6 +57,7 @@ export function createOAuthFixture(
       return {
         account,
         scope: scopeOverride ?? null,
+        expiresInSeconds,
         authorizations,
         exchanges,
         rotations,
@@ -65,7 +68,17 @@ export function createOAuthFixture(
       account?: string;
       scope?: string;
       issuer?: "configured" | "mismatch";
+      expiresInSeconds?: number;
     }) {
+      if (
+        value.expiresInSeconds !== undefined &&
+        (!Number.isInteger(value.expiresInSeconds) ||
+          value.expiresInSeconds < 1 ||
+          value.expiresInSeconds > 3600)
+      )
+        throw new Error("Invalid token lifetime");
+      if (value.expiresInSeconds !== undefined)
+        expiresInSeconds = value.expiresInSeconds;
       if (value.account !== undefined) account = value.account;
       if (value.scope !== undefined) scopeOverride = value.scope;
       if (value.issuer !== undefined)
@@ -74,7 +87,9 @@ export function createOAuthFixture(
     },
     accepts(authorization: string | undefined) {
       return (
-        accessToken !== undefined && authorization === `Bearer ${accessToken}`
+        accessToken !== undefined &&
+        authorization === `Bearer ${accessToken}` &&
+        Date.now() < accessExpiresAt
       );
     },
     handle(
@@ -219,13 +234,14 @@ export function createOAuthFixture(
       scope = scopeOverride ?? scope;
       ++tokenSequence;
       accessToken = `fixture-access-${tokenSequence}`;
+      accessExpiresAt = Date.now() + expiresInSeconds * 1000;
       const refreshToken = `fixture-refresh-${tokenSequence}`;
       refreshes.set(refreshToken, { client: client!, scope });
       respond(res, {
         access_token: accessToken,
         refresh_token: refreshToken,
         token_type: "Bearer",
-        expires_in: 3600,
+        expires_in: expiresInSeconds,
         scope,
         ...(advertised ? { fixture_account: account } : {}),
       });
