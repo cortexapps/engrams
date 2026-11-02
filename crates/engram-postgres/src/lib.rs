@@ -1667,6 +1667,12 @@ impl MetadataStore for PostgresStore {
     ) -> Result<engram_core::types::managed_bridge::ManagedBootSelection, MetaError> {
         self.bridge_selection(q).await
     }
+    async fn read_managed_boot_slot_need(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<u32, MetaError> {
+        self.bridge_slot_need(q).await
+    }
     async fn begin_managed_boot_intent(
         &self,
         i: engram_core::types::managed_bridge::ManagedBootIntent,

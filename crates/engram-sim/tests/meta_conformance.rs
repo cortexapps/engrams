@@ -11322,12 +11322,27 @@ async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
     use engram_core::types::managed_bridge::*;
     engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
     let mut ws = managed_creation_ws(SessionId::new());
+    ws.nbd_slot_need = 2;
     let i = bridge_intent(&ws);
     ws.managed_boot_selection = Some(i.selection.clone());
     ctx.meta
         .reserve_and_persist_create(ws.clone(), &[], 0)
         .await
         .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_slot_need(&i.query)
+            .await
+            .unwrap(),
+        2
+    );
+    let mut wrong_query = i.query.clone();
+    wrong_query.native_digest = engram_core::types::managed_create::digest(b"other native");
+    assert!(ctx
+        .meta
+        .read_managed_boot_slot_need(&wrong_query)
+        .await
+        .is_err());
     assert_eq!(
         ctx.meta
             .read_managed_boot_selection(&i.query)
@@ -11423,6 +11438,36 @@ async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
             .is_err(),
         "full candidate must not become pinned"
     );
+    let one_slot = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(one_slot, "one-slot-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    heartbeat.utilization.nbd_slots_total = 1;
+    ctx.meta
+        .touch_host_heartbeat(one_slot, heartbeat)
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &a.intent_id,
+                a.revision,
+                ManagedIntentAdvance::SelectHost(one_slot)
+            )
+            .await
+            .is_err(),
+        "held two-slot need must reject one-slot host"
+    );
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    heartbeat.utilization.nbd_slots_total = 2;
+    ctx.meta
+        .touch_host_heartbeat(host, heartbeat)
+        .await
+        .unwrap();
     let (x, y) = tokio::join!(
         ctx.meta.advance_managed_boot_intent(
             &a.intent_id,

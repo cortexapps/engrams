@@ -157,6 +157,7 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
         None
     };
     {
+        let nbd_slot_need = meta.read_managed_boot_slot_need(&i.query).await?;
         let (repo, tag) = engram_core::types::session::split_image_ref(&i.selection.image);
         let bundles: Vec<_> = i
             .selection
@@ -168,7 +169,7 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
             })
             .collect();
         let context = crate::placement::ScheduleContext {
-            nbd_slot_need: 1,
+            nbd_slot_need,
             repo,
             image_version: tag,
             snapshot_host: None,
@@ -194,7 +195,7 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
                 &candidates.hosts,
                 i64::from(i.selection.memory_mib),
                 i32::try_from(i.selection.vcpus).map_err(|_| conflict())?,
-                1,
+                nbd_slot_need,
             )
             .await?;
         let mut hosts = candidates.hosts;

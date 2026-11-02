@@ -1226,6 +1226,15 @@ async fn operator_scanner_keeps_policy_only_lineage_blocked_without_host_calls()
 
 #[tokio::test]
 async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() {
+    managed_bridge_driver(false).await;
+}
+
+#[tokio::test]
+async fn managed_bridge_driver_uses_held_two_slot_requirement() {
+    managed_bridge_driver(true).await;
+}
+
+async fn managed_bridge_driver(two_slots: bool) {
     use engram_core::types::{host::*, managed_bridge::*};
     let (mut state, meta, host, row) = fixture().await;
     let sid = row.request.key.creation.session_id;
@@ -1259,6 +1268,9 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
         s.session.host_id = None;
         s.session.sandbox_id = None;
         s.binding_epoch = 0;
+        if two_slots {
+            s.nbd_slot_need = 2;
+        }
         db.managed_boot_selections.insert(sid, selection.clone());
     });
     *host.state.lock().unwrap() = Some(ManagedBootHostState::Missing {
@@ -1330,7 +1342,16 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
                 status: HostStatus::Ready,
                 capacity: second.capacity.clone(),
                 utilization: HostUtilization {
-                    allocatable_mib: capacity,
+                    allocatable_mib: if two_slots { 1024 } else { capacity },
+                    nbd_slots_total: if two_slots {
+                        if id == host_id {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        0
+                    },
                     ..Default::default()
                 },
                 ready_images: vec![selection.image_digest.clone()],
@@ -1459,11 +1480,11 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
             .await
             .unwrap();
             meta.with_db_mut(|db| {
-                db.hosts
-                    .get_mut(&host_id)
-                    .unwrap()
-                    .utilization
-                    .allocatable_mib = 1024
+                let host = db.hosts.get_mut(&host_id).unwrap();
+                host.utilization.allocatable_mib = 1024;
+                if two_slots {
+                    host.utilization.nbd_slots_total = 2;
+                }
             });
         }
         if step == 3 {
@@ -1562,6 +1583,9 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
             .ciphertext,
         sealed.ciphertext
     );
+    if two_slots {
+        meta.set_host_cordon(free_host, None, None).await.unwrap();
+    }
     let input = ManagedRecoveryInput {
         query: q.clone(),
         expected_source_key: claimed.request.key.clone(),

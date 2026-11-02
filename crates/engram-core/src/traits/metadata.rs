@@ -332,6 +332,14 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<crate::types::managed_bridge::ManagedBootSelection, MetaError> {
         panic!("read_managed_boot_selection not implemented")
     }
+    /// Read the held session's existing slot reservation, under its creation identity.
+    /// Selection and claim recheck this same persisted value in their transactions.
+    async fn read_managed_boot_slot_need(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<u32, MetaError> {
+        panic!("read_managed_boot_slot_need not implemented")
+    }
     async fn begin_managed_boot_intent(
         &self,
         _intent: crate::types::managed_bridge::ManagedBootIntent,

@@ -1094,6 +1094,19 @@ impl MetadataStore for SimMetadataStore {
         s.validate()?;
         Ok(s)
     }
+    async fn read_managed_boot_slot_need(
+        &self,
+        q: &ManagedCreationQuery,
+    ) -> Result<u32, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        q.matches(&managed_creation_source(&db, &q.identity, false)?)?;
+        Ok(db
+            .sessions
+            .get(&q.identity.session_id)
+            .ok_or(MetaError::NotFound)?
+            .nbd_slot_need)
+    }
     async fn read_managed_boot_intent(
         &self,
         q: &ManagedCreationQuery,
@@ -1226,7 +1239,10 @@ impl MetadataStore for SimMetadataStore {
                 0,
                 i64::from(old.selection.memory_mib),
                 i64::from(old.selection.vcpus),
-                1,
+                db.sessions
+                    .get(&old.query.identity.session_id)
+                    .ok_or(MetaError::NotFound)?
+                    .nbd_slot_need,
             ) != Some(*host)
             {
                 return Err(conflict());

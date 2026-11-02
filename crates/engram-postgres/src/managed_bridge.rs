@@ -33,6 +33,15 @@ async fn lock(c: &mut PgConnection, sid: SessionId) -> Result<(), MetaError> {
         .ok_or(MetaError::NotFound)?;
     Ok(())
 }
+async fn slot_need(c: &mut PgConnection, sid: SessionId) -> Result<u32, MetaError> {
+    let need: i64 = sqlx::query_scalar("SELECT nbd_slot_need FROM sessions WHERE id=$1")
+        .bind(sid.as_uuid())
+        .fetch_optional(c)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+    u32::try_from(need).map_err(|_| conflict())
+}
 async fn selection(
     c: &mut PgConnection,
     q: &ManagedCreationQuery,
@@ -118,6 +127,14 @@ impl PostgresStore {
         q: &ManagedCreationQuery,
     ) -> Result<ManagedBootSelection, MetaError> {
         selection(&mut *self.pool.acquire().await.map_err(db_err)?, q).await
+    }
+    pub(crate) async fn bridge_slot_need(
+        &self,
+        q: &ManagedCreationQuery,
+    ) -> Result<u32, MetaError> {
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        q.matches(&managed_create::read(&mut conn, &q.identity, false).await?)?;
+        slot_need(&mut conn, q.identity.session_id).await
     }
     pub(crate) async fn bridge_intent(
         &self,
@@ -244,13 +261,14 @@ impl PostgresStore {
             }
         }
         if let ManagedIntentAdvance::SelectHost(host) = &c {
+            let need = slot_need(&mut tx, old.query.identity.session_id).await?;
             if crate::pick_host_2d(
                 &mut tx,
                 &[host.as_uuid()],
                 0,
                 i64::from(old.selection.memory_mib),
                 i64::from(old.selection.vcpus),
-                1,
+                need,
             )
             .await?
                 != Some(host.as_uuid())
