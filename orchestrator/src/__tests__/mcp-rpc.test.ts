@@ -77,6 +77,7 @@ function services(): McpServices {
       cancel: unavailable,
       resolveUnknown: unavailable,
       expire: unavailable,
+      expireUnadmitted: unavailable,
     },
   };
 }

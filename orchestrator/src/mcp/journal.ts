@@ -495,6 +495,64 @@ export function makeMcpJournal(db = getDb()) {
         return row;
       });
     },
+    /** Recover a crash between call insertion and its approval/admission transaction. */
+    async expireUnadmitted(now: Date, limit = MCP_LIMITS.queueSize) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > MCP_LIMITS.queueSize)
+        throw new Error("invalid expiry batch size");
+      const candidates = await db
+        .select({ id: execution.id })
+        .from(execution)
+        .leftJoin(admission, eq(admission.executionId, execution.id))
+        .where(
+          and(
+            inArray(execution.state, ["waiting_approval", "authorized"]),
+            lte(execution.deadline, now),
+            isNull(admission.executionId),
+          ),
+        )
+        .orderBy(asc(execution.deadline))
+        .limit(limit);
+      let expired = 0;
+      // One call lock per transaction avoids lock-order cycles with the lease sweeper.
+      for (const candidate of candidates) {
+        const changed = await db.transaction(async (tx) => {
+          const [call] = await tx
+            .select()
+            .from(execution)
+            .where(eq(execution.id, candidate.id))
+            .for("update");
+          if (
+            !call ||
+            !["waiting_approval", "authorized"].includes(call.state) ||
+            call.deadline > now
+          )
+            return false;
+          // Re-read after the row lock. Admission can have committed while this step waited.
+          const [lease] = await tx
+            .select()
+            .from(admission)
+            .where(eq(admission.executionId, call.id));
+          if (lease) return false;
+          await tx
+            .update(execution)
+            .set({ state: "canceled", version: call.version + 1, updatedAt: now })
+            .where(eq(execution.id, call.id));
+          await tx
+            .update(approval)
+            .set({ decision: "expired", decidedAt: now })
+            .where(
+              and(
+                eq(approval.executionId, call.id),
+                inArray(approval.decision, ["pending", "approved"]),
+                isNull(approval.consumedAt),
+              ),
+            );
+          return true;
+        });
+        if (changed) expired++;
+      }
+      return expired;
+    },
     async expire(deploymentId: string, now: Date) {
       // Lock order is scope -> connection -> execution, shared with admission/dispatch.
       return db.transaction(async (tx) => {

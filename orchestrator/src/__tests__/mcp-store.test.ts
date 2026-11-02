@@ -515,3 +515,32 @@ test.skipIf(!reachable)(
     }
   },
 );
+
+test.skipIf(!reachable)(
+  "recovers calls after a crash before approval or admission is recorded",
+  async () => {
+    const f = await fixture();
+    try {
+      const waiting = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      const ready = await f.journal.create(
+        { ...f.input, toolCallId: "before-admission" },
+        {
+          kind: "automation",
+          grant: {
+            upstreamName: tool.upstreamName,
+            automationWrite: true,
+            argumentConstraints: {},
+            unrestricted: true,
+          },
+        },
+        f.now,
+      );
+      const count = await f.journal.expireUnadmitted(new Date(f.now.getTime() + 61_000));
+      expect(count).toBeGreaterThanOrEqual(2);
+      expect((await f.journal.get(waiting.id))!.state).toBe("canceled");
+      expect((await f.journal.get(ready.id))!.state).toBe("canceled");
+    } finally {
+      await f.cleanup();
+    }
+  },
+);
