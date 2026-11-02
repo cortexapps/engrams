@@ -151,7 +151,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Test MCP path selection
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_mcp_lanes.py'
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_mcp*.py'
       - name: Detect changed lanes
         id: lanes
         run: |
@@ -262,7 +262,7 @@ jobs:
           python3 -m unittest discover \
             -s deploy/helm/engram/ci/tests -p 'test_callback_profiles.py'
           python3 -m unittest discover \
-            -s .github/scripts/tests -p 'test_mcp_lanes.py'
+            -s .github/scripts/tests -p 'test_mcp*.py'
           image="$(sed -n 's/^FROM \(nginx:[^ ]*\)$/\1/p' docker/web.Dockerfile)"
           test -n "$image"
           docker pull "$image"
@@ -2396,8 +2396,8 @@ jobs:
         run: touch /tmp/engram-vz-rootfs.ext4
       - name: Run ignored VZ tests (config validation; e2e_vz runs live below)
         if: always()
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz) and not test(actual_helper_closed_lifetime_and_descriptor_isolation)'
-      - name: Run verified packaged helper test
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz) and not test(=managed::helper::tests::actual_helper_closed_lifetime_and_descriptor_isolation) and not test(=managed::helper::tests::actual_helper_release_ack_and_active_dns_cleanup) and not test(=managed::helper::tests::actual_helper_rejects_wrong_epoch_and_canceled_release)'
+      - name: Run verified packaged helper tests
         if: always()
         run: bash .github/scripts/mcp-acceptance-helper.sh
       - name: Build arm64 static MCP model fixture

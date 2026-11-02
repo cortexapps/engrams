@@ -79,6 +79,17 @@ class McpLanes(unittest.TestCase):
         self.assertEqual(result['e2e'], 'true')
         self.assertEqual(result['node_assets'], 'false')
 
+    def test_helper_source_and_gate_select_artifact_and_vz_lanes(self):
+        for path, crates in [
+            ('crates/engram-sandbox-vz/src/managed/helper.rs', {'engram-sandbox-vz'}),
+            ('.github/scripts/mcp-acceptance-helper.sh', set()),
+            ('.github/workflows/ci.yml', set()),
+        ]:
+            with self.subTest(path=path):
+                result = detect(path, crates, crates)
+                self.assertEqual(result['test_rust'], 'true')
+                self.assertEqual(result['test_netstack'], 'true')
+
     def test_unrelated_path_does_not_run_new_lanes(self):
         result = detect('README.md')
         self.assertEqual(result['test_mcp_worker'], 'false')
