@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
-import { logger as honoLogger } from "hono/logger";
+import { makeHttpLog } from "./http-log.ts";
 import { config } from "./config.ts";
 import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
@@ -267,10 +267,9 @@ const specSyncHub = new SpecSyncHub({
 });
 setSpecPresence(specSyncHub);
 
-// Request logging (hono/logger) routed through pino, so every HTTP leg — the
-// Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
+// Request metadata only. OAuth codes and state in query strings are not logged.
 const httpLog = log.child({ component: "http" });
-app.use(honoLogger((message) => httpLog.info(message)));
+app.use(makeHttpLog((record) => httpLog.info(record, "HTTP request")));
 
 // ADR 0064 P2b: live-host preview reverse-proxy. Mounted FIRST so a request to
 // `<slug>.<previewBaseDomain>` is resolved + tunneled to the guest port before
