@@ -99,3 +99,20 @@ Firecracker/VZ isolation, cold restore, authenticated server policy, worker
 network enforcement, journal/outbox durability, and pinned vendor CLI behavior
 remain separate acceptance gates. `HarnessAttach` does not negotiate the global
 wire version. CI builds the test and wrappers from the same source revision.
+
+The Linux gate runs under the test-only `linux_mcp_supervisor` Cargo example.
+Before starting the test driver, it becomes a Linux child subreaper. A forced
+100 ms deadline check starts both real wrappers with held calls, kills the test
+process with SIGKILL, and confirms that its four observed wrapper/model children
+remain alive in separate groups. The supervisor then kills only its own
+kernel-reported direct children, reaps adopted descendants until `ECHILD`, and
+checks that the observed processes are gone before it removes state. It repeats
+this cleanup after the ordinary eight-case matrix, including timeout/failure.
+
+The matrix has a 100 second internal deadline; cleanup waits are bounded.
+A 240 second hard outer deadline bounds supervisor failure. The shell removes
+state only after the supervisor writes its cleanup-complete marker. If cleanup
+cannot be confirmed, the gate fails and retains state. The supervisor is an
+explicitly built example, not a production binary or a libtest discovery target.
+The deliberately held `supervisor_timeout_fixture` test is ignored and excluded
+from the eight-case matrix; only the supervisor runs it.

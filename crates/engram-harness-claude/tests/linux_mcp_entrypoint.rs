@@ -584,3 +584,36 @@ async fn stable_call_id_refires_after_model_cli_death() {
         .expect("refire scenario deadline");
     }
 }
+
+/// Only the external supervisor invokes this case. It SIGKILLs this process
+/// after both real wrappers are holding calls; ordinary suite selection skips it.
+#[tokio::test]
+#[ignore = "requires the external deadline supervisor"]
+async fn supervisor_timeout_fixture() {
+    let mut held = Vec::new();
+    let mut pairs = Vec::new();
+    for wrapper in [Wrapper::Claude, Wrapper::Codex] {
+        let mut h = Harness::start(wrapper, "held-call", false).await;
+        h.prompt().await;
+        h.requested("held-call").await;
+        let proofs = h.proofs();
+        assert_eq!(proofs.len(), 1);
+        let fixture: u32 = proofs[0]
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("launch-")
+            .unwrap()
+            .parse()
+            .unwrap();
+        pairs.push([h.process.child.id(), fixture]);
+        held.push(h);
+    }
+    let root = PathBuf::from(std::env::var_os("ENGRAM_TEST_STATE_ROOT").unwrap());
+    let staged = root.join("cleanup-ready.tmp");
+    fs::write(&staged, serde_json::to_vec(&pairs).unwrap()).unwrap();
+    fs::rename(staged, root.join("cleanup-ready")).unwrap();
+    std::future::pending::<()>().await;
+    drop(held);
+}
