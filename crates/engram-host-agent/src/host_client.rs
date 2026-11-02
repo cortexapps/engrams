@@ -174,7 +174,7 @@ impl HostClient for LocalHostClient {
         let mut ids = self.sandbox.list().await?;
         ids.retain(|id| self.ordinary_only(*id).is_ok());
         if let Some(boot) = &self.boot {
-            ids.extend(boot.list().await);
+            ids.extend(boot.list()?);
         }
         Ok(ids)
     }
@@ -361,6 +361,7 @@ impl HostClient for LocalHostClient {
         self.check_restore_gate(fence, metadata.source_sandbox_id)?;
         if let Some(boot) = &self.boot {
             boot.ordinary_disk(metadata.disk_manifest, None)?;
+            boot.ordinary_disk(metadata.swap_manifest, None)?;
         }
         self.sandbox.restore(metadata).await
     }
@@ -396,6 +397,7 @@ impl HostClient for LocalHostClient {
         self.check_restore_gate(fence, metadata.source_sandbox_id)?;
         if let Some(boot) = &self.boot {
             boot.ordinary_disk(metadata.disk_manifest, None)?;
+            boot.ordinary_disk(metadata.swap_manifest, None)?;
         }
         self.sandbox
             .restore_base_for_session(metadata, session_env, selected_mounts)

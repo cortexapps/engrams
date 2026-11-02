@@ -99,6 +99,63 @@ pub struct HarnessHub {
     inner: Arc<HubInner>,
 }
 
+/// Minted only after the host persists the exact StartPending intent. The
+/// private backend receives a weak sink, so a stream cannot keep its owner alive.
+/// Drop revokes admission and active registration under the registration mutex.
+pub(crate) struct ManagedHarnessOwner {
+    hub: HarnessHub,
+    state: Arc<ManagedAttachState>,
+}
+struct ManagedAttachState {
+    intent: engram_core::types::managed_boot::ManagedBootStart,
+    revoked: tokio::sync::watch::Sender<bool>,
+}
+impl ManagedAttachState {
+    async fn revoked(&self) {
+        let mut receiver = self.revoked.subscribe();
+        let _ = receiver.wait_for(|revoked| *revoked).await;
+    }
+    fn validate(&self, inner: &HubInner, attach: &HarnessAttach) -> bool {
+        let target = &self.intent.receipt.key.context.target;
+        !*self.revoked.borrow()
+            && attach.session_id == target.session_id
+            && attach.sandbox_id == target.sandbox_id
+            && attach.binding_epoch == target.binding_epoch
+            && validate_binding(inner, attach)
+                .is_ok_and(|record| record.sandbox_id == target.sandbox_id)
+    }
+}
+impl ManagedHarnessOwner {
+    pub(crate) fn sink(&self) -> engram_core::traits::HarnessSink {
+        let state = Arc::downgrade(&self.state);
+        let inner = self.hub.inner.clone();
+        Arc::new(move |stream| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run_managed_connection(inner, state, stream).await;
+            });
+        })
+    }
+}
+impl Drop for ManagedHarnessOwner {
+    fn drop(&mut self) {
+        let mut connections = self.hub.inner.connections.lock();
+        self.state.revoked.send_replace(true);
+        let id = self.state.intent.receipt.key.context.target.sandbox_id;
+        if connections.get(&id).is_some_and(|connection| {
+            connection
+                .managed_owner
+                .as_ref()
+                .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        }) {
+            connections.remove(&id);
+        }
+    }
+}
+
 /// Locking (post-ADR 0073): ONE leaf mutex. The issue #217 "CANONICAL
 /// LOCK ORDER" era — eight mutexed maps, a documented acquisition
 /// order, and an ABBA wedge that stalled the whole harness plane while
@@ -138,6 +195,7 @@ struct HubInner {
 }
 
 struct ConnectionHandle {
+    managed_owner: Option<Arc<ManagedAttachState>>,
     /// Ack writes retain a sender, so registration owns an explicit close signal.
     disconnected: Arc<Notify>,
     /// Sender into the writer task; takes encoded `HarnessFrame`s.
@@ -252,6 +310,19 @@ impl HarnessHub {
             .ok()
             .flatten()
             .map(|r| r.sandbox_id)
+    }
+
+    pub(crate) fn managed_owner(
+        &self,
+        intent: engram_core::types::managed_boot::ManagedBootStart,
+    ) -> ManagedHarnessOwner {
+        ManagedHarnessOwner {
+            hub: self.clone(),
+            state: Arc::new(ManagedAttachState {
+                intent,
+                revoked: tokio::sync::watch::channel(false).0,
+            }),
+        }
     }
 
     /// Accept an anonymous connection from a harness — used by the
@@ -586,6 +657,18 @@ fn register_generation_ordered(
     handle: ConnectionHandle,
 ) -> bool {
     let mut conns = inner.connections.lock();
+    if let Some(owner) = &handle.managed_owner {
+        let target = &owner.intent.receipt.key.context.target;
+        let attach = HarnessAttach {
+            session_id: target.session_id,
+            sandbox_id: target.sandbox_id,
+            binding_epoch: target.binding_epoch,
+            harness_version: String::new(),
+        };
+        if target.sandbox_id != sandbox_id || !owner.validate(inner, &attach) {
+            return false;
+        }
+    }
     match conns.get(&sandbox_id) {
         Some(existing) if existing.generation > handle.generation => false,
         _ => {
@@ -636,6 +719,20 @@ async fn run_connection<S>(
             return;
         }
     }
+    if inner
+        .bindings
+        .managed_sandbox_required(sandbox_id)
+        .unwrap_or(true)
+    {
+        reject_attach(
+            &mut writer,
+            &attach,
+            AttachReject::UnknownBinding,
+            "managed owner required",
+        )
+        .await;
+        return;
+    }
     // ADR 0073: even with a transport-derived sandbox_id, the token is
     // validated against the durable record — the transport tells us
     // where the bytes came from, the record tells us which GENERATION
@@ -656,7 +753,7 @@ async fn run_connection<S>(
                     "attach token/record sandbox differs from transport (live-move shape)",
                 );
             }
-            drive_attached(inner, sandbox_id, attach, reader, writer).await;
+            drive_attached(inner, sandbox_id, attach, reader, writer, None).await;
         }
         Err(reject) => {
             reject_attach(&mut writer, &attach, reject, reject_reason(reject)).await;
@@ -683,7 +780,7 @@ where
     match validate_attach(&inner, &attach) {
         Ok(record) => {
             let sandbox_id = record.sandbox_id;
-            drive_attached(inner, sandbox_id, attach, reader, writer).await;
+            drive_attached(inner, sandbox_id, attach, reader, writer, None).await;
         }
         Err(reject) => {
             reject_attach(&mut writer, &attach, reject, reject_reason(reject)).await;
@@ -691,8 +788,32 @@ where
     }
 }
 
-/// ADR 0073 attach-token validation, shared by both connection paths.
-/// The EPOCH is the entire fence:
+async fn run_managed_connection<S>(inner: Arc<HubInner>, owner: Arc<ManagedAttachState>, stream: S)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let attach = tokio::select! {
+        biased;
+        _ = owner.revoked() => return,
+        result = read_attach_bounded(&mut reader) => match result { Ok(attach) => attach, Err(_) => return },
+    };
+    if !owner.validate(&inner, &attach) {
+        tokio::select! {
+            biased;
+            _ = owner.revoked() => (),
+            _ = reject_attach(&mut writer, &attach, AttachReject::SessionMismatch,
+                "managed owner does not match attachment") => (),
+        }
+        return;
+    }
+    let sandbox_id = owner.intent.receipt.key.context.target.sandbox_id;
+    drive_attached(inner, sandbox_id, attach, reader, writer, Some(owner)).await;
+}
+
+/// Ordinary connections use the binding epoch fence. Managed bindings require
+/// the separate private owner capability and cannot use either generic path.
+/// For ordinary bindings:
 /// - no record / unreadable record → `UnknownBinding` (transient);
 /// - presented epoch < record        → `Superseded` (fatal);
 /// - presented epoch > record        → `UnknownBinding` (the bind for
@@ -701,6 +822,26 @@ where
 ///   compared: a live-moved harness (ADR 0045) presents its frozen
 ///   spawn-time sandbox while remaining the current generation.
 fn validate_attach(
+    inner: &HubInner,
+    attach: &HarnessAttach,
+) -> Result<crate::bindings::BindingRecord, AttachReject> {
+    let record = validate_binding(inner, attach)?;
+    if inner.bindings.managed_required(attach.session_id)
+        || inner
+            .bindings
+            .managed_sandbox_required(attach.sandbox_id)
+            .unwrap_or(true)
+        || inner
+            .bindings
+            .managed_sandbox_required(record.sandbox_id)
+            .unwrap_or(true)
+    {
+        return Err(AttachReject::UnknownBinding);
+    }
+    Ok(record)
+}
+
+fn validate_binding(
     inner: &HubInner,
     attach: &HarnessAttach,
 ) -> Result<crate::bindings::BindingRecord, AttachReject> {
@@ -764,6 +905,7 @@ async fn drive_attached<R, W>(
     attach: HarnessAttach,
     reader: R,
     mut writer: W,
+    managed_owner: Option<Arc<ManagedAttachState>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -783,6 +925,7 @@ async fn drive_attached<R, W>(
     let my_generation = inner.next_gen.fetch_add(1, Ordering::Relaxed);
     let disconnected = Arc::new(Notify::new());
     let handle = ConnectionHandle {
+        managed_owner: managed_owner.clone(),
         disconnected: disconnected.clone(),
         cmd_tx: cmd_tx.clone(),
         pending_checkpoint: Mutex::new(None),
@@ -812,7 +955,12 @@ async fn drive_attached<R, W>(
         reject: None,
         message: None,
     };
-    if let Err(e) = write_msg(&mut writer, &ack).await {
+    let ack_result = tokio::select! {
+        biased;
+        _ = managed_revoked(managed_owner.as_ref()) => Err(std::io::Error::other("managed owner revoked")),
+        result = write_msg(&mut writer, &ack) => result,
+    };
+    if let Err(e) = ack_result {
         tracing::debug!(error = %e, "harness ack write failed");
         // We registered but the peer can never learn it: undo, guarded
         // by our own generation (a newer connection may already own the
@@ -848,6 +996,7 @@ async fn drive_attached<R, W>(
     // event acks the row) — host memory holds nothing durable.
     let reader_outcome = tokio::select! {
         biased;
+        _ = managed_revoked(managed_owner.as_ref()) => Err(HarnessError::WriterClosed),
         _ = disconnected.notified() => Err(HarnessError::WriterClosed),
         result = reader_loop(reader, &inner, attach.session_id, sandbox_id, attach.binding_epoch, &cmd_tx) => result,
         _ = &mut writer_task => Err(HarnessError::WriterClosed),
@@ -878,6 +1027,13 @@ async fn drive_attached<R, W>(
             error = %e,
             "harness reader loop ended",
         );
+    }
+}
+
+async fn managed_revoked(owner: Option<&Arc<ManagedAttachState>>) {
+    match owner {
+        Some(owner) => owner.revoked().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1099,6 +1255,84 @@ mod tests {
             })
         });
         (sink, collected)
+    }
+
+    #[tokio::test]
+    async fn managed_binding_rejects_generic_and_transport_claimed_streams() {
+        let (sink, events) = collecting_sink();
+        let hub = test_hub(sink);
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        hub.bind_session(session_id, sandbox_id, 1).unwrap();
+        std::fs::write(
+            hub.binding_store()
+                .directory()
+                .join(format!("{session_id}.managed-boot")),
+            b"1",
+        )
+        .unwrap();
+        std::fs::write(
+            hub.binding_store()
+                .directory()
+                .join(format!("{sandbox_id}.managed-sandbox")),
+            b"1",
+        )
+        .unwrap();
+        for transport in [None, Some(sandbox_id), Some(SandboxId::new())] {
+            let (host, mut guest) = duplex_pair();
+            if let Some(transport) = transport {
+                hub.accept_connection(transport, Some(session_id), host);
+            } else {
+                hub.accept_via_session_lookup(host);
+            }
+            write_msg(
+                &mut guest,
+                &HarnessAttach {
+                    session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
+                    harness_version: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let ack: HarnessAttachAck = read_msg(&mut guest).await.unwrap();
+            assert!(
+                !ack.ok,
+                "guest fields cannot grant managed transport authority"
+            );
+            assert!(!hub.is_attached(sandbox_id));
+        }
+        let ordinary_session = SessionId::new();
+        let ordinary_sandbox = SandboxId::new();
+        hub.bind_session(ordinary_session, ordinary_sandbox, 1)
+            .unwrap();
+        for transport in [None, Some(sandbox_id)] {
+            let (host, mut guest) = duplex_pair();
+            if let Some(transport) = transport {
+                hub.accept_connection(transport, Some(ordinary_session), host);
+            } else {
+                hub.accept_via_session_lookup(host);
+            }
+            write_msg(
+                &mut guest,
+                &HarnessAttach {
+                    session_id: ordinary_session,
+                    sandbox_id: ordinary_sandbox,
+                    binding_epoch: 1,
+                    harness_version: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let ack: HarnessAttachAck = read_msg(&mut guest).await.unwrap();
+            assert_eq!(
+                ack.ok,
+                transport.is_none(),
+                "ordinary lookup stays valid; managed transport cannot be relabeled ordinary"
+            );
+        }
+        assert!(events.lock().is_empty());
     }
 
     /// ADR 0073: hub over an ephemeral binding store. Tests exercise
@@ -1724,6 +1958,7 @@ mod tests {
             &hub.inner,
             sandbox_id,
             ConnectionHandle {
+                managed_owner: None,
                 disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_new,
                 pending_checkpoint: Mutex::new(None),
@@ -1735,6 +1970,7 @@ mod tests {
             &hub.inner,
             sandbox_id,
             ConnectionHandle {
+                managed_owner: None,
                 disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_old,
                 pending_checkpoint: Mutex::new(None),

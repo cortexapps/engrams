@@ -140,6 +140,7 @@ struct Record {
 }
 struct Entry {
     record: Record,
+    attach_owner: Option<crate::harness::ManagedHarnessOwner>,
     owner: Option<Owner>,
     agent: Option<AgentSpec>,
 }
@@ -290,6 +291,7 @@ impl ManagedBootHost {
         }
     }
     async fn fail(&self, entry: &mut Entry) {
+        entry.attach_owner = None;
         entry.record.state = ManagedBootHostState::Failed {
             key: entry.record.request.key.clone(),
         };
@@ -388,6 +390,7 @@ impl ManagedBootHost {
                 entry
                     .insert(Arc::new(Mutex::new(Entry {
                         record,
+                        attach_owner: None,
                         owner: None,
                         agent: None,
                     })))
@@ -756,6 +759,7 @@ impl ManagedBootHost {
             .clone()
             .ok_or_else(|| invalid("prepared receipt absent"))?;
         let key = entry.record.request.key.clone();
+        entry.attach_owner = None;
         entry.record.state = ManagedBootHostState::Failed { key: key.clone() };
         entry.agent = None;
         // Persist the consumed run before stopping it. The owned disk is never
@@ -975,8 +979,9 @@ impl ManagedBootHost {
                     )
                     .map_err(invalid)?;
             }
-            let hub = self.hub.clone();
-            let sink: HarnessSink = Arc::new(move |stream| hub.accept_via_session_lookup(stream));
+            let attach_owner = self.hub.managed_owner(request.clone());
+            let sink = attach_owner.sink();
+            entry.attach_owner = Some(attach_owner);
             tokio::time::timeout(
                 std::time::Duration::from_secs(210),
                 entry
@@ -1034,6 +1039,7 @@ impl ManagedBootHost {
                     .or_insert_with(|| {
                         Arc::new(Mutex::new(Entry {
                             record,
+                            attach_owner: None,
                             owner: None,
                             agent: None,
                         }))
@@ -1064,6 +1070,7 @@ impl ManagedBootHost {
                 artifact: None,
                 authority: None,
             });
+            entry.attach_owner = None;
             entry.record.state = ManagedBootHostState::Failed {
                 key: request.key.clone(),
             };
@@ -1182,6 +1189,7 @@ impl ManagedBootHost {
                 // The physical source is already gone. Preserve its durable proof.
                 return Ok(());
             }
+            entry.attach_owner = None;
             entry.record.state = ManagedBootHostState::Failed {
                 key: entry.record.request.key.clone(),
             };
@@ -1200,7 +1208,8 @@ impl ManagedBootHost {
         &self,
         spec: &engram_core::types::sandbox::SandboxSpec,
     ) -> Result<(), SandboxError> {
-        self.ordinary_disk(spec.rootfs_manifest, spec.rootfs_source.as_deref())
+        self.ordinary_disk(spec.rootfs_manifest, spec.rootfs_source.as_deref())?;
+        self.ordinary_disk(spec.swap_manifest, spec.swap_source.as_deref())
     }
     pub fn ordinary_disk(
         &self,
@@ -1286,15 +1295,30 @@ impl ManagedBootHost {
             }
         }
     }
-    pub async fn list(&self) -> Vec<SandboxId> {
-        let ids: Vec<_> = self.entries.iter().map(|entry| *entry.key()).collect();
-        let mut live = Vec::new();
-        for id in ids {
-            if self.guard_running(id).await.is_ok() {
-                live.push(id);
+    /// Diagnostic residency only. A busy lifecycle is unknown, never absence.
+    /// Do not wait for native I/O or reuse this inventory as start/policy proof.
+    pub fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        let mut residents = Vec::new();
+        for (id, entry) in entries {
+            let entry = entry.try_lock().map_err(|_| invalid("inventory busy"))?;
+            if entry.owner.is_some()
+                || matches!(
+                    entry.record.state,
+                    ManagedBootHostState::Prepared { .. }
+                        | ManagedBootHostState::Finalized { .. }
+                        | ManagedBootHostState::StartPending { .. }
+                        | ManagedBootHostState::Started { .. }
+                )
+            {
+                residents.push(id);
             }
         }
-        live
+        Ok(residents)
     }
 }
 
@@ -1540,6 +1564,317 @@ mod tests {
             finalization: None,
             capture: None,
             retired: None,
+        }
+    }
+
+    fn issued_start(request: &ManagedBootPrepare) -> ManagedBootStart {
+        ManagedBootStart {
+            receipt: ManagedBootFinalReceipt {
+                key: request.key.clone(),
+                prepared_receipt_id: digest(b"prepared"),
+                finalization_digest: digest(b"final"),
+                host_incarnation: "current-host".into(),
+                network_identity: digest(b"network"),
+                receipt_id: digest(b"receipt"),
+            },
+            start_id: "issued-start".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_attach_requires_exact_private_owner_and_revokes_pending_and_live_streams() {
+        use engram_harness_proto::{read_msg, write_msg, HarnessAttach, HarnessAttachAck};
+        use tokio::io::AsyncReadExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let target = &request.key.context.target;
+        host.hub
+            .bind_session(target.session_id, target.sandbox_id, target.binding_epoch)
+            .unwrap();
+        durable_write(
+            &host
+                .bindings
+                .directory()
+                .join(format!("{}.managed-boot", target.session_id)),
+            b"1",
+        )
+        .unwrap();
+        durable_write(
+            &host
+                .bindings
+                .directory()
+                .join(format!("{}.managed-sandbox", target.sandbox_id)),
+            b"1",
+        )
+        .unwrap();
+        let intent = issued_start(&request);
+        let mut record = failed(request.clone());
+        record.state = ManagedBootHostState::StartPending {
+            intent: intent.clone(),
+        };
+        host.persist(&record).unwrap();
+        let entry = Arc::new(Mutex::new(Entry {
+            record,
+            attach_owner: Some(host.hub.managed_owner(intent)),
+            owner: None,
+            agent: None,
+        }));
+        host.entries.insert(target.sandbox_id, entry.clone());
+        let mut guard = entry.lock().await;
+        let sink = guard.attach_owner.as_ref().unwrap().sink();
+        let exact = HarnessAttach {
+            session_id: target.session_id,
+            sandbox_id: target.sandbox_id,
+            binding_epoch: target.binding_epoch,
+            harness_version: "test".into(),
+        };
+        // A valid token from another private source still cannot enter this owner.
+        let other_session = engram_core::SessionId::new();
+        let other_sandbox = SandboxId::new();
+        host.hub
+            .bind_session(other_session, other_sandbox, target.binding_epoch)
+            .unwrap();
+        for wrong in [
+            HarnessAttach {
+                session_id: other_session,
+                sandbox_id: other_sandbox,
+                ..exact.clone()
+            },
+            HarnessAttach {
+                sandbox_id: other_sandbox,
+                ..exact.clone()
+            },
+            HarnessAttach {
+                binding_epoch: target.binding_epoch + 1,
+                ..exact.clone()
+            },
+        ] {
+            let (transport, mut guest) = tokio::io::duplex(4096);
+            sink(Box::pin(transport));
+            write_msg(&mut guest, &wrong).await.unwrap();
+            let ack: HarnessAttachAck = read_msg(&mut guest).await.unwrap();
+            assert!(!ack.ok);
+            assert!(!host.hub.is_attached(target.sandbox_id));
+            assert!(!host.hub.is_attached(other_sandbox));
+        }
+        let (transport, mut live) = tokio::io::duplex(4096);
+        sink(Box::pin(transport));
+        write_msg(&mut live, &exact).await.unwrap();
+        let ack: HarnessAttachAck =
+            tokio::time::timeout(std::time::Duration::from_millis(100), read_msg(&mut live))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            ack.ok,
+            "first attach must work while issued start holds its lifecycle lock"
+        );
+        assert!(matches!(
+            guard.record.state,
+            ManagedBootHostState::StartPending { .. }
+        ));
+        assert!(host.hub.is_attached(target.sandbox_id));
+        // A second accepted transport is waiting for Hello when the owner is lost.
+        let (transport, mut waiting) = tokio::io::duplex(4096);
+        sink(Box::pin(transport));
+        tokio::task::yield_now().await;
+        host.fail(&mut guard).await;
+        assert!(!host.hub.is_attached(target.sandbox_id));
+        for guest in [&mut live, &mut waiting] {
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    guest.read(&mut [0u8; 1])
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                0
+            );
+        }
+        // The sink outlives its owner but cannot issue another capability.
+        let (transport, mut late) = tokio::io::duplex(4096);
+        sink(Box::pin(transport));
+        assert_eq!(late.read(&mut [0u8; 1]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn managed_attach_revocation_serializes_registration_and_preserves_replacement() {
+        use engram_harness_proto::{read_msg, write_msg, HarnessAttach, HarnessAttachAck};
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let target = &request.key.context.target;
+        host.hub
+            .bind_session(target.session_id, target.sandbox_id, target.binding_epoch)
+            .unwrap();
+        let intent = issued_start(&request);
+        let old = host.hub.managed_owner(intent.clone());
+        let old_sink = old.sink();
+        let (transport, mut old_guest) = tokio::io::duplex(4096);
+        old_sink(Box::pin(transport));
+        let exact = HarnessAttach {
+            session_id: target.session_id,
+            sandbox_id: target.sandbox_id,
+            binding_epoch: target.binding_epoch,
+            harness_version: "test".into(),
+        };
+        write_msg(&mut old_guest, &exact).await.unwrap();
+        assert!(
+            read_msg::<_, HarnessAttachAck>(&mut old_guest)
+                .await
+                .unwrap()
+                .ok
+        );
+        let replacement = host.hub.managed_owner(intent.clone());
+        let (transport, mut new_guest) = tokio::io::duplex(4096);
+        replacement.sink()(Box::pin(transport));
+        write_msg(&mut new_guest, &exact).await.unwrap();
+        assert!(
+            read_msg::<_, HarnessAttachAck>(&mut new_guest)
+                .await
+                .unwrap()
+                .ok
+        );
+        drop(old);
+        tokio::task::yield_now().await;
+        assert!(
+            host.hub.is_attached(target.sandbox_id),
+            "stale owner cleanup cannot remove replacement registration"
+        );
+        drop(replacement);
+        assert!(!host.hub.is_attached(target.sandbox_id));
+        // The ACK is blocked after registration. Revocation must remove the
+        // entry immediately and cut the pending write, not wait for the peer.
+        let pending = host.hub.managed_owner(intent);
+        let (transport, mut pending_guest) = tokio::io::duplex(1);
+        pending.sink()(Box::pin(transport));
+        write_msg(&mut pending_guest, &exact).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while !host.hub.is_attached(target.sandbox_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(pending);
+        assert!(!host.hub.is_attached(target.sandbox_id));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_msg::<_, HarnessAttachAck>(&mut pending_guest)
+        )
+        .await
+        .unwrap()
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_inventory_busy_is_unknown_without_waiting_for_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let mut record = failed(request.clone());
+        record.state = ManagedBootHostState::Prepared {
+            receipt: Box::new(ManagedBootPreparedReceipt {
+                request,
+                host_incarnation: host.incarnation.clone(),
+                network_identity: digest(b"network"),
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                receipt_id: digest(b"prepared"),
+            }),
+        };
+        let entry = Arc::new(Mutex::new(Entry {
+            record,
+            attach_owner: None,
+            owner: None,
+            agent: None,
+        }));
+        host.entries.insert(id, entry.clone());
+        let local =
+            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                .with_managed_boot(host.clone());
+        let guard = entry.lock().await;
+        let inventory = tokio::time::timeout(std::time::Duration::from_millis(100), local.list())
+            .await
+            .expect("heartbeat inventory must not wait for lifecycle work");
+        assert!(
+            inventory.is_err(),
+            "busy is unknown, never an empty known inventory"
+        );
+        drop(guard);
+        assert!(local.list().await.unwrap().contains(&id));
+    }
+
+    #[tokio::test]
+    async fn managed_disk_reservation_covers_swap_create_and_both_restores() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let capture = ManagedCaptureRequest {
+            key: request.key.clone(),
+            capture_id: engram_core::SnapshotId::new(),
+        };
+        let mut record = failed(request.clone());
+        record.capture = Some(CaptureProgress {
+            request: capture.clone(),
+            manifest: capture.disk_manifest(),
+            artifact: None,
+            authority: None,
+        });
+        host.persist(&record).unwrap();
+        let local =
+            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                .with_managed_boot(host.clone());
+        let mut ordinary: engram_core::types::sandbox::SandboxSpec =
+            serde_json::from_str(&request.sandbox_spec_json).unwrap();
+        ordinary.rootfs_manifest = Some(ManifestRef::new());
+        ordinary.rootfs_source = Some(temp.path().join("ordinary.ext4"));
+        host.ordinary_spec(&ordinary).unwrap();
+        let rejected = |result: Result<SandboxId, SandboxError>| {
+            assert!(
+                matches!(result, Err(SandboxError::InvalidSpec(message)) if message == "managed boot ownership changed or unavailable")
+            );
+        };
+        for protected in [request.cold.disk.manifest, capture.disk_manifest()] {
+            let mut spec = ordinary.clone();
+            spec.swap_manifest = Some(protected);
+            rejected(local.create(spec).await);
+            let metadata: engram_core::types::snapshot::SnapshotMetadata =
+                serde_json::from_value(serde_json::json!({
+                    "id": engram_core::SnapshotId::new(), "size_bytes": 4,
+                    "created_at": "2026-01-01T00:00:00Z", "image_version": "image-v1",
+                    "disk_manifest": ordinary.rootfs_manifest, "swap_manifest": protected
+                }))
+                .unwrap();
+            let fence = engram_core::traits::SessionFence {
+                session_id: engram_core::SessionId::new(),
+                epoch: 1,
+            };
+            rejected(local.restore(metadata.clone(), fence).await);
+            rejected(
+                local
+                    .restore_base_for_session(metadata, Default::default(), vec![], fence)
+                    .await,
+            );
+        }
+        for path in [
+            host.directory.join("private.ext4"),
+            temp.path().join(format!(
+                "managed-{}-{}/rootfs.ext4",
+                request.key.context.target.sandbox_id, request.key.boot_attempt
+            )),
+            temp.path().join(format!(
+                "m-{}/rootfs.ext4",
+                &digest(
+                    format!(
+                        "{}\0{}",
+                        request.key.context.target.sandbox_id, request.key.boot_attempt
+                    )
+                    .as_bytes()
+                )[7..31]
+            )),
+        ] {
+            let mut spec = ordinary.clone();
+            spec.swap_source = Some(path);
+            rejected(local.create(spec).await);
         }
     }
 
@@ -1811,6 +2146,7 @@ mod tests {
         assert!(!bootstrap_retirement_allowed(&record, &changed));
         let entry = Arc::new(Mutex::new(Entry {
             record,
+            attach_owner: None,
             owner: None,
             agent: None,
         }));
@@ -1904,6 +2240,7 @@ mod tests {
             id,
             Arc::new(Mutex::new(Entry {
                 record,
+                attach_owner: None,
                 owner: None,
                 agent: None,
             })),
