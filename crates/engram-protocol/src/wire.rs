@@ -241,6 +241,9 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
     Some((kind.to_string(), message.trim().to_string()))
 }
 
+/// Exact failed-precondition marker. It is an outcome, not retirement proof.
+pub const MANAGED_RECOVERY_REQUIRED_STATUS: &str = "managed_recovery_required";
+
 /// Marker prefix for the host-agent's "memory image unusable" restore
 /// refusal ([`engram_core::SandboxError::MemoryImageUnusable`], the
 /// [`HARNESS_SPAWN_STATUS_PREFIX`] precedent). The host returns a

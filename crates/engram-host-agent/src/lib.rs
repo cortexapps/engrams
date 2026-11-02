@@ -75,6 +75,7 @@ pub use config::HostAgentConfig;
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
     managed_ownership: Option<Arc<managed_policy::ManagedOwnership>>,
+    managed_backend: Option<managed_boot::ManagedBackend>,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
     /// ADR 0006: local egress proxy. The production host-agent binary
@@ -133,6 +134,7 @@ impl HostAgent {
         Self {
             cfg,
             managed_ownership: None,
+            managed_backend: None,
             sandbox,
             cloud,
             egress: None,
@@ -225,6 +227,11 @@ impl HostAgent {
     /// coordinator hands out images by URI.
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
         self.image_cache = Some(cache);
+        self
+    }
+
+    pub fn with_managed_backend(mut self, backend: managed_boot::ManagedBackend) -> Self {
+        self.managed_backend = Some(backend);
         self
     }
 
@@ -985,6 +992,37 @@ impl HostAgent {
             if let Some(managed) = managed_policy {
                 local = local.with_managed_policy(managed);
             }
+            let mut managed_boot_host = None;
+            if self.cfg.managed_tls.is_some() {
+                use engram_core::traits::Entropy;
+                let backend = self.managed_backend.clone().ok_or_else(|| {
+                    HostAgentError::Config("managed backend is not installed".into())
+                })?;
+                let chunks = self
+                    .chunk_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostAgentError::Config("managed disk storage is not installed".into())
+                    })?
+                    .0
+                    .clone();
+                let boot = managed_boot::ManagedBootHost::new(
+                    managed_boot::ManagedBootHostConfig {
+                        host_id,
+                        incarnation: engram_core::traits::OsEntropy.uuid().to_string(),
+                        directory: self.cfg.work_dir.join("managed-boots"),
+                    },
+                    backend,
+                    pooled.clone(),
+                    self.egress.clone().expect("managed egress checked"),
+                    harness_hub.clone(),
+                    chunks,
+                )
+                .map_err(|e| HostAgentError::Config(e.to_string()))?;
+                let boot = Arc::new(boot);
+                managed_boot_host = Some(boot.clone());
+                local = local.with_managed_boot(boot);
+            }
             let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(local);
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
@@ -1518,6 +1556,7 @@ impl HostAgent {
             // heartbeat/registration path anyway.)
             const HEARTBEAT_FAILURES_BEFORE_ESCALATION: u32 = 6; // ~30s at 5s cadence
             let mut consecutive_heartbeat_failures: u32 = 0;
+            let managed_list_host = local_host.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1535,7 +1574,7 @@ impl HostAgent {
                     // coord skips reconcile for this heartbeat instead of
                     // mistaking the empty set for a real running set.
                     // Residents include running and tearing-down sandboxes.
-                    let (running_sandboxes, running_sandboxes_known) = match pooled_for_heartbeat
+                    let (running_sandboxes, running_sandboxes_known) = match managed_list_host
                         .list()
                         .await
                     {
@@ -1957,6 +1996,9 @@ impl HostAgent {
             // exact post-bitmap failure this quiesce exists to prevent.
             // In-flight captures are drained (bounded) below instead.
             pooled.quiesce_captures_for_shutdown();
+            if let Some(boot) = &managed_boot_host {
+                boot.shutdown().await;
+            }
             // ADR 0116 A-D2: declare the handoff BEFORE the heartbeat
             // task dies — the coordinator must learn "this exit is
             // planned; hold the lease" while our channel to it is still
@@ -2514,3 +2556,5 @@ mod tests {
 pub mod managed_policy;
 
 pub mod managed_tls;
+
+pub mod managed_boot;

@@ -107,6 +107,14 @@ impl BindingStore {
     }
 
     pub(crate) fn managed_required(&self, session: SessionId) -> bool {
+        if self
+            .dir
+            .join(format!("{session}.managed-boot"))
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return true;
+        }
         self.dir
             .join(format!("{session}.managed-required"))
             .try_exists()
@@ -120,6 +128,13 @@ impl BindingStore {
     /// Check every durable managed association, including a record whose binding
     /// has been removed or moved. An unreadable association cannot prove ordinary.
     pub(crate) fn managed_sandbox_required(&self, sandbox: SandboxId) -> std::io::Result<bool> {
+        if self
+            .dir
+            .join(format!("{sandbox}.managed-sandbox"))
+            .try_exists()?
+        {
+            return Ok(true);
+        }
         let mut sessions = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let path = entry?.path();

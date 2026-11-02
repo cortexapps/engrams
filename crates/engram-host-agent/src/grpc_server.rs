@@ -225,7 +225,9 @@ async fn serve(
         ),
         None => (tonic::transport::Server::builder(), None),
     };
-    let service = HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024);
+    let service = HostServiceServer::new(svc)
+        .max_encoding_message_size(32 * 1024 * 1024)
+        .max_decoding_message_size(9 * 1024 * 1024);
     let authenticated =
         tonic::service::interceptor::InterceptedService::new(service, move |req: Request<()>| {
             if let Some(pins) = &pins {
@@ -1068,33 +1070,118 @@ impl HostService for HostServiceImpl {
     /// labelled `kind="warm"`).
     async fn capture_managed_boot(
         &self,
-        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("managed capture unavailable"))
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .capture_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
     }
     async fn prepare_managed_boot(
         &self,
-        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("managed boot unavailable"))
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .prepare_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
     }
     async fn read_managed_boot(
         &self,
-        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("managed boot unavailable"))
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .read_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
     }
     async fn finalize_managed_boot(
         &self,
-        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("managed boot unavailable"))
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .finalize_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
     }
     async fn start_managed_boot(
         &self,
-        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("managed boot unavailable"))
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .start_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
     }
     async fn read_managed_policy(
         &self,
@@ -1954,6 +2041,9 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         ),
         // Same marker shape: the coordinator reads the typed variant and
         // recovers the session from its disk instead of retrying.
+        SandboxError::ManagedRecoveryRequired => {
+            Status::failed_precondition(engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS)
+        }
         SandboxError::MemoryImageUnusable(message) => Status::failed_precondition(
             engram_protocol::wire::memory_image_unusable_message(&message),
         ),
@@ -2203,6 +2293,16 @@ mod wire_version_tests {
                 "NotFound".to_string(),
                 "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn managed_recovery_maps_to_exact_failed_precondition_marker() {
+        let status = sandbox_to_status(SandboxError::ManagedRecoveryRequired);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS
         );
     }
 

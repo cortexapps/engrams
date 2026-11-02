@@ -190,6 +190,17 @@ impl ProxydHandle {
             .map_err(|e| ProxydError(format!("private network register: {e}")))
     }
 
+    pub async fn handoff_closed_private(
+        &self,
+        request: engram_egress_proto::private::ClosedPolicyHandoff,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::HandoffClosedPrivate(Box::new(request)),
+            "closed policy handoff",
+        )
+        .await
+    }
+
     pub async fn hello(&self) -> Result<HelloInfo, ProxydError> {
         match self
             .request(&ToProxyd::Hello {

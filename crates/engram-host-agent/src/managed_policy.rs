@@ -200,7 +200,7 @@ impl ManagedPolicyHost {
             let path = entry.map_err(invalid)?.path();
             if matches!(
                 path.extension().and_then(|s| s.to_str()),
-                Some("managed" | "managed-required")
+                Some("managed" | "managed-required" | "managed-boot")
             ) {
                 sessions.insert(
                     path.file_stem()
@@ -218,6 +218,17 @@ impl ManagedPolicyHost {
         let mut records = Vec::new();
         for sid in &sessions {
             let sid = *sid;
+            // A boot owner never survives a host incarnation. Keep its proxy
+            // quarantined; typed boot recovery validates retained disk records.
+            if self
+                .bindings
+                .directory()
+                .join(format!("{sid}.managed-boot"))
+                .try_exists()
+                .map_err(invalid)?
+            {
+                continue;
+            }
             let record = read_record(&self.bindings, sid)
                 .map_err(invalid)?
                 .ok_or_else(|| invalid("managed record missing"))?;
@@ -812,6 +823,22 @@ mod live_tests {
             let mut next = target.clone();
             next.binding_epoch = 2;
             assert!(successor.read_applied(&next).await.is_err());
+            // A new boot marker stays quarantined without an ordinary policy
+            // replay record; restart never adopts its missing native owner.
+            std::fs::remove_file(&record_path).unwrap();
+            std::fs::write(
+                bindings
+                    .directory()
+                    .join(format!("{}.managed-boot", target.session_id)),
+                target.sandbox_id.to_string(),
+            )
+            .unwrap();
+            successor.recover_all().await.unwrap();
+            assert!(handle
+                .read_managed(target.session_id)
+                .await
+                .unwrap()
+                .is_none());
             let mut socket =
                 tokio::net::UnixStream::connect(dir.join(engram_egress_proto::CONTROL_SOCK_NAME))
                     .await

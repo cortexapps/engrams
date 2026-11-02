@@ -554,3 +554,55 @@ This is source wiring until the assigned CI lane runs and records a pass. It che
 installed CLOSED state and detects route tampering. Packet forwarding, original
 destination, live DNS, Firecracker VM, VZ parity, full-stack and CNI acceptance
 remain separate gates. This check does not authorize activation.
+
+### Managed host ownership and the CLOSED policy handoff
+
+The host keeps each managed machine in one private owner from preparation to
+retirement. Durable session and sandbox markers precede backend I/O. Generic
+restore, execution, snapshot, pause, resume and attach commands cannot adopt
+these owners. A lost owner stays closed. A durable start intent precedes the
+single `SpawnHarness` write into a fresh guest. The host persists only digests
+of the final agent environment, not plaintext credentials.
+
+The initial private allocation holds a deny-only bootstrap policy lease. There
+is one narrow exception to ordinary policy replacement: a NEVER-BOUND private
+allocation with no flow work can transfer that lease to its final policy. The
+private ingress checks the complete allocation, old policy and current session
+Arc. Under the existing per-session apply mutex it closes admission, drops its
+own lease, drains every other lease, checks the cancellation generation, then
+publishes the new policy and acquires the exact current lease before ACK. An
+unrelated close, poison, cancellation or unknown outcome leaves admission
+closed. No transfer is permitted after Bind. Ordinary policy replacement keeps
+its existing drain and terminal-owner semantics. The private control protocol
+is version 4; mixed binaries cannot be adopted.
+
+The guest remains stopped through this transfer. VZ requires the actual helper
+Bind ACK for the exact epoch and the retained native descriptor, MAC and MTU.
+Firecracker requires that same private ACK before it removes only its two owned
+CLOSED nftables tables. It then reads back the exact namespace, process, device,
+route and remaining rule shape. Init replaces any existing resolver with the
+selected gateway. The VZ helper comes from an explicit operator-owned path and
+SHA-256; the private copy is checked before execution.
+
+A newer operator generation can also retire an exact never-started preparation:
+expected policy and final binding hash must both be absent, the bootstrap deny
+union must be monotone, and the same owner lock serializes this path against
+start. The backend verifies its actual stopped state before teardown. A missing
+owner or start-uncertain state cannot use this branch. The original boot key
+stays immutable. Same-generation final policy handoff is unchanged.
+
+A live managed policy change retires the old machine and network. It preserves
+an exact synced local disk cut and returns a retired-source receipt rather than
+an applied-policy ACK. `ManagedRecoveryRequired` has an exact bounded gRPC
+status marker, but is not retirement proof; callers must read the exact Retired
+receipt. Later requests preserve that proof. Source retention latches before
+native start and survives unknown replies, Drop and close until explicit artifact
+cleanup. Explicit capture reserves its deterministic manifest
+before upload. Capture pauses and retires the source, syncs the disk, stores its
+hash and size, and uploads that exact cut. Retries use the same source key,
+capture ID and immutable manifest. A completed manifest write with a lost reply
+is accepted only if its chunk list is identical. A path without a complete
+record cannot become authority. `CrashConsistentDiskCutV1` does not promise that
+guest page-cache or application writes were flushed. Recovery uses a fresh
+kernel, device context and empty swap; it never restores old RAM. Physical FC
+and VZ acceptance remains required before activation.

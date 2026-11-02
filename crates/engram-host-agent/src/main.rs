@@ -376,6 +376,7 @@ async fn main() -> Result<(), HostAgentError> {
     // for non-FC backends — the live-attach pass becomes a no-op
     // and the host-agent starts clean-slate.
     let fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>;
+    let mut managed_backend = None;
     let sandbox: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
         BackendChoice::Firecracker => {
             let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
@@ -499,6 +500,11 @@ async fn main() -> Result<(), HostAgentError> {
                      iptables/ip are on PATH."
                 );
             }
+            #[cfg(target_os = "linux")]
+            if cfg.managed_tls.is_some() {
+                managed_backend =
+                    Some(engram_host_agent::managed_boot::ManagedBackend::Firecracker(fc.clone()));
+            }
             fc_for_reattach = Some(fc.clone());
             fc
         }
@@ -540,11 +546,32 @@ async fn main() -> Result<(), HostAgentError> {
                 // the same `blob` Arc as the PooledBackend wrapper below.
                 let cs = engram_chunk_store::ChunkStore::new(blob.clone())
                     .with_upload_budget(upload_budget.clone());
-                Arc::new(
+                let vz = Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
                         .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?
                         .with_chunk_store(cs),
-                )
+                );
+                if cfg.managed_tls.is_some() {
+                    let path = std::env::var_os("ENGRAM_MANAGED_NETSTACK_PATH")
+                        .map(PathBuf::from)
+                        .ok_or_else(|| {
+                            HostAgentError::Config("managed network helper path required".into())
+                        })?;
+                    let sha256 = std::env::var("ENGRAM_MANAGED_NETSTACK_SHA256").map_err(|_| {
+                        HostAgentError::Config("managed network helper digest required".into())
+                    })?;
+                    if !path.is_absolute() || !engram_core::types::managed_cold::is_sha256(&sha256)
+                    {
+                        return Err(HostAgentError::Config(
+                            "invalid managed network helper artifact".into(),
+                        ));
+                    }
+                    managed_backend = Some(engram_host_agent::managed_boot::ManagedBackend::Vz {
+                        backend: vz.clone(),
+                        helper: engram_sandbox_vz::ManagedHelperArtifact { path, sha256 },
+                    });
+                }
+                vz
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -665,6 +692,9 @@ async fn main() -> Result<(), HostAgentError> {
         .with_image_cache(image_cache)
         .with_host_id(host_id)
         .with_base_shm_protected(base_shm_protected);
+    if let Some(backend) = managed_backend {
+        agent = agent.with_managed_backend(backend);
+    }
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
     }

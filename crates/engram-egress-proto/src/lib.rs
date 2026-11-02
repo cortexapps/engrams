@@ -45,7 +45,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump on any wire-incompatible change. A mismatch in `Hello`
 /// position is never adopted — the caller kills and respawns.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 /// Frame size cap. `SyncPolicies` carries every live session's policy
 /// (resolved secrets included), so the cap is generous; both ends are
@@ -88,6 +88,7 @@ pub const BUILD_ENV_SOURCE_FINGERPRINT: &str = "ENGRAM_EGRESS_PROXYD_FINGERPRINT
 pub enum ToProxyd {
     /// Upgrade this host-only connection. A bounded private Allocation follows.
     PrivateNetwork,
+    HandoffClosedPrivate(Box<private::ClosedPolicyHandoff>),
     ListManaged,
     ReadManaged(engram_core::SessionId),
     QuarantineManaged(engram_core::SessionId),
