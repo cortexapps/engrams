@@ -18,6 +18,7 @@ use std::sync::{
 struct LossyHost {
     state: Mutex<Option<ManagedBootHostState>>,
     starts: AtomicUsize,
+    policy_calls: AtomicUsize,
     policy: Mutex<Option<ManagedAppliedState>>,
     prepared: ManagedBootPreparedReceipt,
     apply_mode: AtomicUsize,
@@ -30,12 +31,14 @@ impl HostClient for LossyHost {
         &self,
         _: ManagedPolicyTarget,
     ) -> Result<Option<ManagedAppliedState>, SandboxError> {
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.policy.lock().unwrap().clone())
     }
     async fn apply_managed_policy(
         &self,
         request: ManagedPolicyApply,
     ) -> Result<ManagedAppliedState, SandboxError> {
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
         let mode = self.apply_mode.load(Ordering::SeqCst);
         if mode == 0 {
             return Err(SandboxError::Unavailable("policy unavailable".into()));
@@ -372,6 +375,7 @@ async fn fixture() -> (
             receipt: row.receipt.clone().unwrap(),
         })),
         starts: AtomicUsize::new(0),
+        policy_calls: AtomicUsize::new(0),
         policy: Mutex::new(Some(row.finalization.as_ref().unwrap().policy.clone())),
         prepared: row.prepared.clone().unwrap(),
         apply_mode: AtomicUsize::new(0),
@@ -1023,4 +1027,101 @@ async fn operator_scanner_retires_closed_owner_without_fabricating_binding() {
             .admission_open
     );
     assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn operator_scanner_keeps_policy_only_lineage_blocked_without_host_calls() {
+    let (state, meta, host, row) = fixture().await;
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Retired {
+        receipt: Box::new(ManagedBootRetiredReceipt {
+            prepared: row.prepared.clone().unwrap(),
+            retained_policy: row.request.bootstrap_policy.clone(),
+            receipt_id: digest(b"permanent owner"),
+        }),
+    });
+    let sid = meta
+        .create_session(engram_core::types::SessionSpec {
+            image: "test.invalid/policy-only:latest".into(),
+            mode: Default::default(),
+        })
+        .await
+        .unwrap();
+    let hid = row.request.key.context.target.host_id;
+    meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = SandboxId::from(uuid::Uuid::from_u128(991));
+    let epoch = meta.transition_session_created(sid, sandbox).await.unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        host_id: hid,
+        sandbox_id: sandbox,
+        binding_epoch: epoch,
+    };
+    meta.retain_managed_deny(
+        &target,
+        &ManagedDenyPolicy::new(1, ["tools.example".into(), "history.example".into()]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let candidate = engram_testkit::operator::candidate();
+    let g = meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    for (host_inc, proxy_inc) in [
+        ("old-host", "old-proxy"),
+        ("next-host", "old-proxy"),
+        ("next-host", "next-proxy"),
+    ] {
+        let receipt = ManagedAppliedState::new(
+            ManagedPolicyContext {
+                target: target.clone(),
+                operator_generation: g.generation,
+                operator_identity: g.identity.clone(),
+                binding_hash: None,
+            },
+            ManagedDenyPolicy::new(2, ["tools.example".into(), "history.example".into()]).unwrap(),
+            host_inc.into(),
+            proxy_inc.into(),
+            Some(ManagedNetworkProof {
+                target: target.clone(),
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                network_identity: digest(b"network"),
+            }),
+        )
+        .unwrap();
+        *host.policy.lock().unwrap() = Some(receipt);
+        crate::mcp::operator::run_once(&state, &candidate, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.policy_calls.load(Ordering::SeqCst),
+            0,
+            "unsupported lineage must not authorize host I/O"
+        );
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+        assert!(
+            !meta
+                .read_operator_publication()
+                .await
+                .unwrap()
+                .admission_open
+        );
+        meta.with_db_mut(|db| {
+            assert!(
+                db.operator_readiness
+                    .get(&(g.generation, row.request.key.creation.session_id))
+                    .unwrap()
+                    .1
+                    .is_some(),
+                "current immutable source still reaches permanent readiness"
+            );
+            let (participant, proof) = db.operator_readiness.get(&(g.generation, sid)).unwrap();
+            assert!(proof.is_none());
+            assert!(participant.policy.denies("history.example"));
+            assert!(participant.policy.denies("tools.example"));
+            assert!(participant.boot.is_none());
+        });
+    }
 }
