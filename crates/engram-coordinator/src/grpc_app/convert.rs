@@ -186,7 +186,11 @@ pub(crate) fn create_request_from_proto(
                 Ok(app::OauthSubjectKind::Connector) => {
                     engram_core::types::oauth::OAuthSubjectKind::Connector
                 }
-                Ok(app::OauthSubjectKind::Mcp) => engram_core::types::oauth::OAuthSubjectKind::Mcp,
+                Ok(app::OauthSubjectKind::Mcp) => {
+                    return Err(ApiError::BadRequest(
+                        "MCP credentials cannot be bound to a guest session".into(),
+                    ))
+                }
                 Ok(app::OauthSubjectKind::UserConnector) => {
                     engram_core::types::oauth::OAuthSubjectKind::UserConnector
                 }
@@ -970,6 +974,22 @@ pub(super) fn retirement_to_proto(
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    #[test]
+    fn mcp_guest_create_is_rejected() {
+        let request = engram_protocol::app::CreateSessionRequest {
+            image_uri: "registry.test/example:latest".into(),
+            oauth_credential: Some(engram_protocol::app::OAuthCredentialBinding {
+                subject: Some(engram_protocol::app::OAuthSubject {
+                    kind: engram_protocol::app::OauthSubjectKind::Mcp as i32,
+                    id: "connection-a".into(),
+                }),
+                provider: "mcp".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(super::create_request_from_proto(request).is_err());
+    }
+
     use super::*;
     use engram_core::types::session::SessionMode;
     use engram_core::types::{Session, SessionState};

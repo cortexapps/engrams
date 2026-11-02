@@ -1579,6 +1579,14 @@ impl MetadataStore for PostgresStore {
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
+        if ws.oauth_binding.as_ref().is_some_and(|binding| {
+            binding.key.subject_kind == engram_core::types::oauth::OAuthSubjectKind::Mcp
+        }) {
+            return Err(MetaError::Conflict(
+                "MCP credentials cannot be bound to a guest session".into(),
+            ));
+        }
+
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
@@ -1855,6 +1863,22 @@ impl MetadataStore for PostgresStore {
         &self,
         sealed: engram_core::types::org_secret::SealedOrgSecret,
     ) -> Result<engram_core::types::org_secret::OrgSecret, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("INSERT INTO org_secret_purposes (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&sealed.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT connection_id FROM org_secret_purposes WHERE name=$1 FOR UPDATE",
+        )
+        .bind(&sealed.name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if owner.is_some() {
+            return Err(MetaError::Conflict("credential is reserved for MCP".into()));
+        }
         let (name, key_id, created_at, updated_at): (
             String,
             String,
@@ -1862,8 +1886,8 @@ impl MetadataStore for PostgresStore {
             chrono::DateTime<chrono::Utc>,
         ) = sqlx::query_as(
             r#"
-            INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $6)
             ON CONFLICT (name) DO UPDATE SET
                 wrapped_dek = EXCLUDED.wrapped_dek,
                 nonce       = EXCLUDED.nonce,
@@ -1879,9 +1903,10 @@ impl MetadataStore for PostgresStore {
         .bind(&sealed.ciphertext)
         .bind(&sealed.key_id)
         .bind(self.clock.now_utc())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         // Wake every replica's mint broker so a rotated cred rebuilds its
         // engine (ADR 0057 C2). Best-effort: the value is already committed,
         // so a notify failure must not fail the write.
@@ -1947,12 +1972,23 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn delete_org_secret(&self, name: &str) -> Result<bool, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT name FROM org_secret_purposes WHERE name=$1 FOR UPDATE")
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         let res = sqlx::query("DELETE FROM org_secrets WHERE name = $1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         let deleted = res.rows_affected() > 0;
+        if deleted {
+            sqlx::query("UPDATE org_secret_purposes SET generation=generation+1 WHERE name=$1 AND connection_id IS NOT NULL")
+                .bind(name).execute(&mut *tx).await.map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         if deleted {
             let _ = sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
                 .bind(name)
@@ -1960,6 +1996,89 @@ impl MetadataStore for PostgresStore {
                 .await;
         }
         Ok(deleted)
+    }
+
+    async fn reserve_mcp_org_secret(
+        &self,
+        name: &str,
+        connection_id: &str,
+        role: engram_core::types::org_secret::McpSecretRole,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        if name.is_empty() || connection_id.is_empty() {
+            return Err(MetaError::Conflict("invalid MCP reservation".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("INSERT INTO org_secret_purposes (name, connection_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+            .bind(name).bind(connection_id).bind(role.as_str()).execute(&mut *tx).await.map_err(db_err)?;
+        let (owner, stored_role, generation): (Option<String>, Option<String>, i64) = sqlx::query_as("SELECT connection_id, role, generation FROM org_secret_purposes WHERE name=$1 FOR UPDATE")
+            .bind(name).fetch_one(&mut *tx).await.map_err(db_err)?;
+        if owner.as_deref() != Some(connection_id) || stored_role.as_deref() != Some(role.as_str())
+        {
+            return Err(MetaError::Conflict("credential purpose conflict".into()));
+        }
+        sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::org_secret::McpSecretReservation {
+            name: name.into(),
+            connection_id: connection_id.into(),
+            role,
+            generation,
+        })
+    }
+
+    async fn get_mcp_org_secret_reservation(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::org_secret::McpSecretReservation>, MetaError> {
+        use engram_core::types::org_secret::{McpSecretReservation, McpSecretRole};
+        let row: Option<(String,String,i64)> = sqlx::query_as("SELECT connection_id, role, generation FROM org_secret_purposes WHERE name=$1 AND connection_id IS NOT NULL")
+            .bind(name).fetch_optional(&self.pool).await.map_err(db_err)?;
+        row.map(|(connection_id, role, generation)| {
+            Ok(McpSecretReservation {
+                name: name.into(),
+                connection_id,
+                role: match role.as_str() {
+                    "api_key" => McpSecretRole::ApiKey,
+                    "client_secret" => McpSecretRole::ClientSecret,
+                    _ => return Err(MetaError::Conflict("invalid credential role".into())),
+                },
+                generation,
+            })
+        })
+        .transpose()
+    }
+
+    async fn put_mcp_org_secret(
+        &self,
+        sealed: engram_core::types::org_secret::SealedOrgSecret,
+        expected: &engram_core::types::org_secret::McpSecretReservation,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        if sealed.name != expected.name {
+            return Err(MetaError::Conflict("credential reservation changed".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let generation: Option<i64> = sqlx::query_scalar("UPDATE org_secret_purposes SET generation=generation+1 WHERE name=$1 AND connection_id=$2 AND role=$3 AND generation=$4 RETURNING generation")
+            .bind(&sealed.name).bind(&expected.connection_id).bind(expected.role.as_str()).bind(expected.generation)
+            .fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let generation = generation
+            .ok_or_else(|| MetaError::Conflict("credential reservation changed".into()))?;
+        sqlx::query("INSERT INTO org_secrets (name,wrapped_dek,nonce,ciphertext,key_id,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$6) ON CONFLICT (name) DO UPDATE SET wrapped_dek=$2,nonce=$3,ciphertext=$4,key_id=$5,updated_at=$6")
+            .bind(&sealed.name).bind(&sealed.wrapped_dek).bind(&sealed.nonce).bind(&sealed.ciphertext).bind(&sealed.key_id).bind(self.clock.now_utc())
+            .execute(&mut *tx).await.map_err(db_err)?;
+        sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+            .bind(&sealed.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::org_secret::McpSecretReservation {
+            generation,
+            ..expected.clone()
+        })
     }
 
     // ---- ADR 0106: subject-scoped OAuth credentials and flow state ----

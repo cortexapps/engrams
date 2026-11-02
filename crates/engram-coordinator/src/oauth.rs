@@ -311,15 +311,28 @@ impl OAuthManager {
             .await?)
     }
 
-    pub async fn fetch_session(
+    async fn guest_binding(
         &self,
         session_id: SessionId,
-    ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
+    ) -> Result<engram_core::types::oauth::SessionOAuthBinding, OAuthServiceError> {
         let binding = self
             .meta
             .get_session_oauth_binding(session_id)
             .await?
             .ok_or(OAuthServiceError::NotFound)?;
+        if binding.key.subject_kind == OAuthSubjectKind::Mcp {
+            return Err(OAuthServiceError::BadRequest(
+                "MCP credentials are not available to guest sessions".into(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    pub async fn fetch_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
+        let binding = self.guest_binding(session_id).await?;
         let row = self
             .meta
             .get_oauth_credential(&binding.key)
@@ -339,11 +352,7 @@ impl OAuthManager {
         expected_version: i64,
         payload: &[u8],
     ) -> Result<(String, i64, Vec<u8>), OAuthServiceError> {
-        let binding = self
-            .meta
-            .get_session_oauth_binding(session_id)
-            .await?
-            .ok_or(OAuthServiceError::NotFound)?;
+        let binding = self.guest_binding(session_id).await?;
         let current = self
             .meta
             .get_oauth_credential(&binding.key)
@@ -384,11 +393,7 @@ impl OAuthManager {
         expected_version: i64,
         reason: &str,
     ) -> Result<(), OAuthServiceError> {
-        let binding = self
-            .meta
-            .get_session_oauth_binding(session_id)
-            .await?
-            .ok_or(OAuthServiceError::NotFound)?;
+        let binding = self.guest_binding(session_id).await?;
         match self
             .meta
             .mark_oauth_credential_broken(&binding.key, expected_version, reason)

@@ -512,6 +512,36 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// Reserve only a fresh ref. Ownership survives deletion of its value.
+    async fn reserve_mcp_org_secret(
+        &self,
+        _name: &str,
+        _connection_id: &str,
+        _role: crate::types::org_secret::McpSecretRole,
+    ) -> Result<crate::types::org_secret::McpSecretReservation, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credentials are unavailable".into(),
+        ))
+    }
+    async fn get_mcp_org_secret_reservation(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::org_secret::McpSecretReservation>, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credential purpose is unavailable".into(),
+        ))
+    }
+    /// Store ciphertext only if ownership and generation still match.
+    async fn put_mcp_org_secret(
+        &self,
+        _sealed: crate::types::org_secret::SealedOrgSecret,
+        _expected: &crate::types::org_secret::McpSecretReservation,
+    ) -> Result<crate::types::org_secret::McpSecretReservation, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credentials are unavailable".into(),
+        ))
+    }
+
     // ---- ADR 0106: subject-scoped OAuth credentials and short-lived flows ----
 
     /// Insert a credential when `expected_version` is `None`, or update it iff

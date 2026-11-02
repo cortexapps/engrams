@@ -7373,3 +7373,211 @@ async fn nbd_capture_placement(ctx: &Ctx) {
     );
 }
 conformance!(t_nbd_capture_placement, super::nbd_capture_placement);
+
+async fn mcp_org_secret_clock(ctx: &Ctx) {
+    use engram_core::types::org_secret::SealedOrgSecret;
+    let value = SealedOrgSecret {
+        name: "fresh-key".into(),
+        wrapped_dek: vec![1],
+        nonce: vec![0; 12],
+        ciphertext: vec![2],
+        key_id: "test".into(),
+    };
+    let row = ctx.meta.upsert_org_secret(value.clone()).await.unwrap();
+    assert_eq!(row.created_at, ctx.clock.now_utc());
+    ctx.clock.advance(Duration::from_secs(5));
+    let rotated = ctx.meta.upsert_org_secret(value).await.unwrap();
+    assert_eq!(rotated.created_at, row.created_at);
+    assert_eq!(rotated.updated_at, ctx.clock.now_utc());
+    assert_eq!(ctx.meta.list_org_secrets().await.unwrap().len(), 1);
+    assert_eq!(
+        ctx.meta
+            .get_org_secret_sealed("fresh-key")
+            .await
+            .unwrap()
+            .unwrap()
+            .ciphertext,
+        vec![2]
+    );
+    assert!(ctx.meta.delete_org_secret("fresh-key").await.unwrap());
+    assert!(!ctx.meta.delete_org_secret("fresh-key").await.unwrap());
+    assert!(ctx
+        .meta
+        .get_org_secret_sealed("fresh-key")
+        .await
+        .unwrap()
+        .is_none());
+}
+conformance!(t_mcp_org_secret_clock, super::mcp_org_secret_clock);
+
+async fn mcp_org_reservation(ctx: &Ctx) {
+    use engram_core::types::org_secret::{McpSecretRole, SealedOrgSecret};
+    let sealed = |name: &str| SealedOrgSecret {
+        name: name.into(),
+        wrapped_dek: vec![1],
+        nonce: vec![0; 12],
+        ciphertext: vec![2],
+        key_id: "test".into(),
+    };
+    let reserved = ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .unwrap();
+    assert_eq!(reserved.generation, 0);
+    assert_eq!(
+        ctx.meta
+            .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ApiKey)
+            .await
+            .unwrap(),
+        reserved
+    );
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-b", McpSecretRole::ApiKey)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("reserved", "connection-a", McpSecretRole::ClientSecret)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .upsert_org_secret(sealed("reserved"))
+        .await
+        .is_err());
+    let first = ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &reserved)
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert!(ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &reserved)
+        .await
+        .is_err());
+    assert!(ctx.meta.delete_org_secret("reserved").await.unwrap());
+    let deleted = ctx
+        .meta
+        .get_mcp_org_secret_reservation("reserved")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.generation, 2);
+    assert!(ctx
+        .meta
+        .get_org_secret_sealed("reserved")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .meta
+        .put_mcp_org_secret(sealed("reserved"), &first)
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .put_mcp_org_secret(sealed("reserved"), &deleted)
+            .await
+            .unwrap()
+            .generation,
+        3
+    );
+    let concurrent = ctx
+        .meta
+        .reserve_mcp_org_secret("concurrent", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        ctx.meta
+            .put_mcp_org_secret(sealed("concurrent"), &concurrent),
+        ctx.meta
+            .put_mcp_org_secret(sealed("concurrent"), &concurrent),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert_eq!(
+        ctx.meta
+            .get_mcp_org_secret_reservation("concurrent")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    ctx.meta.upsert_org_secret(sealed("exposed")).await.unwrap();
+    ctx.meta.delete_org_secret("exposed").await.unwrap();
+    assert!(ctx
+        .meta
+        .reserve_mcp_org_secret("exposed", "connection-a", McpSecretRole::ApiKey)
+        .await
+        .is_err());
+}
+conformance!(t_mcp_org_reservation, super::mcp_org_reservation);
+
+async fn mcp_guest_binding_rejected(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthSubjectKind,
+        SessionOAuthBinding,
+    };
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "mcp".into(),
+    };
+    ctx.meta
+        .put_oauth_credential(
+            NewSealedOAuthCredential {
+                key: key.clone(),
+                wrapped_dek: vec![1],
+                nonce: vec![0; 12],
+                ciphertext: vec![2],
+                key_id: "test".into(),
+                metadata: OAuthAccountMetadata::default(),
+                expires_at: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let sid = SessionId::from(uuid::Uuid::from_u128(4));
+    let ws = engram_core::traits::SessionCreateWriteSet {
+        nbd_slot_need: 0,
+        session_id: sid,
+        spec: spec("test:mcp"),
+        mem_budget_mib: 1024,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: vec![],
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            vec![],
+            None,
+            None,
+            vec![],
+        ),
+        oauth_binding: Some(SessionOAuthBinding {
+            session_id: sid,
+            key,
+        }),
+    };
+    assert!(matches!(
+        ctx.meta.reserve_and_persist_create(ws, &[], 0).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(ctx
+        .meta
+        .get_session_oauth_binding(sid)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        ctx.meta.get_session(sid).await,
+        Err(MetaError::NotFound)
+    ));
+}
+conformance!(
+    t_mcp_guest_binding_rejected,
+    super::mcp_guest_binding_rejected
+);

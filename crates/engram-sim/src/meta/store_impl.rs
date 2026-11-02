@@ -817,6 +817,14 @@ impl MetadataStore for SimMetadataStore {
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
+        if ws.oauth_binding.as_ref().is_some_and(|binding| {
+            binding.key.subject_kind == engram_core::types::oauth::OAuthSubjectKind::Mcp
+        }) {
+            return Err(MetaError::Conflict(
+                "MCP credentials cannot be bound to a guest session".into(),
+            ));
+        }
+
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
@@ -4487,8 +4495,20 @@ impl MetadataStore for SimMetadataStore {
         Ok(DeleteHostOutcome::Deleted)
     }
 
-    async fn delete_org_secret(&self, _name: &str) -> Result<bool, MetaError> {
-        panic!("SimMeta: delete_org_secret not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn delete_org_secret(&self, name: &str) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let deleted = db.org_secrets.remove(name).is_some();
+        if deleted {
+            if let Some(Some(reservation)) = db.org_secret_purposes.get_mut(name) {
+                reservation.generation += 1;
+            }
+        }
+        drop(db);
+        if deleted {
+            self.notify("org_secret_changed", name.to_string());
+        }
+        Ok(deleted)
     }
 
     async fn expire_capture_job_stages(
@@ -4559,9 +4579,15 @@ impl MetadataStore for SimMetadataStore {
 
     async fn get_org_secret_sealed(
         &self,
-        _name: &str,
+        name: &str,
     ) -> Result<Option<engram_core::types::org_secret::SealedOrgSecret>, MetaError> {
-        panic!("SimMeta: get_org_secret_sealed not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .org_secrets
+            .get(name)
+            .map(|(sealed, _)| sealed.clone()))
     }
 
     async fn get_oauth_credential(
@@ -4836,7 +4862,14 @@ impl MetadataStore for SimMetadataStore {
     async fn list_org_secrets(
         &self,
     ) -> Result<Vec<engram_core::types::org_secret::OrgSecret>, MetaError> {
-        panic!("SimMeta: list_org_secrets not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .org_secrets
+            .values()
+            .map(|(_, meta)| meta.clone())
+            .collect())
     }
 
     /// `SELECT prestage_ref FROM enable_jobs WHERE state='prestaging'` —
@@ -5516,9 +5549,109 @@ impl MetadataStore for SimMetadataStore {
 
     async fn upsert_org_secret(
         &self,
-        _sealed: engram_core::types::org_secret::SealedOrgSecret,
+        sealed: engram_core::types::org_secret::SealedOrgSecret,
     ) -> Result<engram_core::types::org_secret::OrgSecret, MetaError> {
-        panic!("SimMeta: upsert_org_secret not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if db
+            .org_secret_purposes
+            .get(&sealed.name)
+            .is_some_and(Option::is_some)
+        {
+            return Err(MetaError::Conflict("credential is reserved for MCP".into()));
+        }
+        db.org_secret_purposes.insert(sealed.name.clone(), None);
+        let meta = engram_core::types::org_secret::OrgSecret {
+            name: sealed.name.clone(),
+            key_id: sealed.key_id.clone(),
+            created_at: db
+                .org_secrets
+                .get(&sealed.name)
+                .map_or(now, |(_, row)| row.created_at),
+            updated_at: now,
+        };
+        db.org_secrets
+            .insert(sealed.name.clone(), (sealed, meta.clone()));
+        drop(db);
+        self.notify("org_secret_changed", meta.name.clone());
+        Ok(meta)
+    }
+
+    async fn reserve_mcp_org_secret(
+        &self,
+        name: &str,
+        connection_id: &str,
+        role: engram_core::types::org_secret::McpSecretRole,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        if name.is_empty() || connection_id.is_empty() {
+            return Err(MetaError::Conflict("invalid MCP reservation".into()));
+        }
+        if let Some(current) = db.org_secret_purposes.get(name) {
+            return match current {
+                Some(r) if r.connection_id == connection_id && r.role == role => Ok(r.clone()),
+                _ => Err(MetaError::Conflict("credential purpose conflict".into())),
+            };
+        }
+        let reservation = engram_core::types::org_secret::McpSecretReservation {
+            name: name.into(),
+            connection_id: connection_id.into(),
+            role,
+            generation: 0,
+        };
+        db.org_secret_purposes
+            .insert(name.into(), Some(reservation.clone()));
+        drop(db);
+        self.notify("org_secret_changed", name.to_string());
+        Ok(reservation)
+    }
+
+    async fn get_mcp_org_secret_reservation(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::org_secret::McpSecretReservation>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .org_secret_purposes
+            .get(name)
+            .cloned()
+            .flatten())
+    }
+
+    async fn put_mcp_org_secret(
+        &self,
+        sealed: engram_core::types::org_secret::SealedOrgSecret,
+        expected: &engram_core::types::org_secret::McpSecretReservation,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if sealed.name != expected.name
+            || db.org_secret_purposes.get(&sealed.name) != Some(&Some(expected.clone()))
+        {
+            return Err(MetaError::Conflict("credential reservation changed".into()));
+        }
+        let mut next = expected.clone();
+        next.generation += 1;
+        let meta = engram_core::types::org_secret::OrgSecret {
+            name: sealed.name.clone(),
+            key_id: sealed.key_id.clone(),
+            created_at: db
+                .org_secrets
+                .get(&sealed.name)
+                .map_or(now, |(_, row)| row.created_at),
+            updated_at: now,
+        };
+        db.org_secrets.insert(sealed.name.clone(), (sealed, meta));
+        db.org_secret_purposes
+            .insert(next.name.clone(), Some(next.clone()));
+        drop(db);
+        self.notify("org_secret_changed", next.name.clone());
+        Ok(next)
     }
 
     async fn put_oauth_credential(

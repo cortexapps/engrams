@@ -222,6 +222,17 @@ pub struct SimDb {
     /// `session_broker_tokens`, PK `session_id`).
     pub broker_tokens:
         std::collections::BTreeMap<SessionId, engram_core::types::registry::SessionBrokerToken>,
+    pub org_secret_purposes: std::collections::BTreeMap<
+        String,
+        Option<engram_core::types::org_secret::McpSecretReservation>,
+    >,
+    pub org_secrets: std::collections::BTreeMap<
+        String,
+        (
+            engram_core::types::org_secret::SealedOrgSecret,
+            engram_core::types::org_secret::OrgSecret,
+        ),
+    >,
     /// ADR 0106: sealed payloads keyed by opaque subject + provider.
     pub oauth_credentials: std::collections::BTreeMap<
         engram_core::types::oauth::OAuthCredentialKey,
