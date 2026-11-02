@@ -1,6 +1,7 @@
 import { createClient } from "@connectrpc/connect";
-import { useQuery, useTransport } from "@connectrpc/connect-query";
-import { useRef, useState } from "react";
+import { createConnectQueryKey, useQuery, useTransport } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { getSessionMcpState } from "@/gen/engram/app/v1/integration-IntegrationService_connectquery";
 import {
@@ -97,10 +98,42 @@ function sameBinding(a: GetSessionMcpStateResponse, b: GetSessionMcpStateRespons
   );
 }
 
-type SupplementalPages = { base: GetSessionMcpStateResponse; pages: GetSessionMcpStateResponse[] };
+type SupplementalPages = {
+  base: GetSessionMcpStateResponse;
+  generation: number;
+  pages: GetSessionMcpStateResponse[];
+};
 
 export function McpSessionPanel({ sessionId }: { sessionId: string }) {
-  const client = createClient(IntegrationService, useTransport());
+  const transport = useTransport();
+  const client = createClient(IntegrationService, transport);
+  const queryClient = useQueryClient();
+  const generationRef = useRef(0);
+  const [generation, setGeneration] = useState(0);
+  const queryKey = useMemo(
+    () =>
+      createConnectQueryKey({
+        schema: getSessionMcpState,
+        input: { sessionId, pageSize: 16, bindingPageSize: 16 },
+        transport,
+        cardinality: "finite",
+      }),
+    [sessionId, transport],
+  );
+  useEffect(
+    () =>
+      queryClient.getQueryCache().subscribe((event) => {
+        if (
+          event.type === "updated" &&
+          event.action.type === "fetch" &&
+          queryClient.getQueryCache().find({ queryKey, exact: true }) === event.query
+        ) {
+          generationRef.current += 1;
+          setGeneration(generationRef.current);
+        }
+      }),
+    [queryClient, queryKey],
+  );
   const [open, setOpen] = useState(false);
   const state = useQuery(
     getSessionMcpState,
@@ -112,17 +145,24 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
   const latest = useRef({ base: state.data, fetching: state.isFetching });
   latest.current = { base: state.data, fetching: state.isFetching };
   const executionPages =
-    !state.isFetching && executionSupplement && executionSupplement.base === state.data
+    !state.isFetching &&
+    executionSupplement &&
+    executionSupplement.base === state.data &&
+    executionSupplement.generation === generation
       ? executionSupplement.pages
       : [];
   const bindingPages =
-    !state.isFetching && bindingSupplement && bindingSupplement.base === state.data
+    !state.isFetching &&
+    bindingSupplement &&
+    bindingSupplement.base === state.data &&
+    bindingSupplement.generation === generation
       ? bindingSupplement.pages
       : [];
   const [candidate, setCandidate] = useState<{
     review: PrepareMcpRebindResponse;
     expectedBindingHash: string;
     base: GetSessionMcpStateResponse;
+    generation: number;
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -150,7 +190,13 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
       setBusy(false);
     }
   }
-  const currentCandidate = !state.isFetching && candidate?.base === state.data ? candidate : null;
+  const currentCandidate =
+    !state.isFetching &&
+    candidate &&
+    candidate.base === state.data &&
+    candidate.generation === generation
+      ? candidate
+      : null;
   const proposal = currentCandidate?.review;
   const lastExecution = executionPages.at(-1) ?? state.data;
   const lastBinding = bindingPages.at(-1) ?? state.data;
@@ -206,6 +252,7 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                 setBusy(true);
                 try {
                   const base = state.data;
+                  const requestGeneration = generationRef.current;
                   if (!base) return;
                   const page = await client.getSessionMcpState({
                     sessionId,
@@ -214,7 +261,12 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                     omitExecutions: true,
                     afterBindingToolName: lastBinding.nextBindingToolName,
                   });
-                  if (latest.current.base !== base || latest.current.fetching) return;
+                  if (
+                    latest.current.base !== base ||
+                    latest.current.fetching ||
+                    generationRef.current !== requestGeneration
+                  )
+                    return;
                   if (!base.bindingReceipt || !page.bindingReceipt || !sameBinding(base, page)) {
                     await refresh();
                     setMessage(
@@ -224,7 +276,13 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                   }
                   setBindingSupplement((old) => ({
                     base,
-                    pages: [...(old?.base === base ? old.pages : []), page],
+                    generation: requestGeneration,
+                    pages: [
+                      ...(old?.base === base && old.generation === requestGeneration
+                        ? old.pages
+                        : []),
+                      page,
+                    ],
                   }));
                 } catch {
                   setMessage("Could not load more tools.");
@@ -392,6 +450,7 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                 setBusy(true);
                 try {
                   const base = state.data;
+                  const requestGeneration = generationRef.current;
                   if (!base) return;
                   const page = await client.getSessionMcpState({
                     sessionId,
@@ -400,7 +459,12 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                     omitBindings: true,
                     afterExecutionId: lastExecution.nextExecutionId,
                   });
-                  if (latest.current.base !== base || latest.current.fetching) return;
+                  if (
+                    latest.current.base !== base ||
+                    latest.current.fetching ||
+                    generationRef.current !== requestGeneration
+                  )
+                    return;
                   if (!sameBinding(base, page)) {
                     await refresh();
                     setMessage(
@@ -410,7 +474,13 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                   }
                   setExecutionSupplement((old) => ({
                     base,
-                    pages: [...(old?.base === base ? old.pages : []), page],
+                    generation: requestGeneration,
+                    pages: [
+                      ...(old?.base === base && old.generation === requestGeneration
+                        ? old.pages
+                        : []),
+                      page,
+                    ],
                   }));
                 } catch {
                   setMessage("Could not load more calls.");
@@ -432,6 +502,7 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
                   if (!state.data) return;
                   setCandidate({
                     base: state.data,
+                    generation: generationRef.current,
                     review: await client.prepareMcpRebind({
                       sessionId,
                       expectedBindingHash: binding.bindingHash,

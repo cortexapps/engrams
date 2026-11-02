@@ -645,3 +645,99 @@ test("a transition from a bound base to receiptless history restarts the read", 
   expect(screen.queryByText("unmatched-call")).toBeNull();
   expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
 });
+
+test("failed base refetch invalidates previously loaded pages even if cached data is restored", async () => {
+  let fail = false;
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitExecutions)
+          return {
+            bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+            bindingTools: [{ modelToolName: "old-extra-tool" }],
+          };
+        if (fail) throw new ConnectError("unavailable", Code.Unavailable);
+        return {
+          bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+          hasMoreBindingTools: true,
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more tools" }));
+  await screen.findByText("old-extra-tool");
+  const query = client
+    .getQueryCache()
+    .getAll()
+    .find((q) => q.queryKey[0] === "connect-query")!;
+  const previous = query.state.data;
+  fail = true;
+  await act(async () => {
+    await client.invalidateQueries();
+  });
+  expect(await screen.findByText("Session MCP state is unavailable.")).toBeTruthy();
+  await act(async () => {
+    client.setQueryData(query.queryKey, previous);
+  });
+  expect(screen.queryByText("old-extra-tool")).toBeNull();
+});
+
+test("a page started before a failed base refetch cannot reappear after cache recovery", async () => {
+  let fail = false;
+  let finishPage!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finishPage = resolve;
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: async (req) => {
+        if (req.omitBindings) {
+          await pending;
+          return {
+            bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+            executions: [
+              {
+                executionId: "old",
+                upstreamName: "late-old-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        if (fail) throw new ConnectError("unavailable", Code.Unavailable);
+        return {
+          bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+          hasMoreExecutions: true,
+          nextExecutionId: "first",
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  await userEvent.click(await screen.findByRole("button", { name: "Load more calls" }));
+  const query = client
+    .getQueryCache()
+    .getAll()
+    .find((q) => q.queryKey[0] === "connect-query")!;
+  const previous = query.state.data;
+  fail = true;
+  await act(async () => {
+    await client.invalidateQueries();
+  });
+  expect(await screen.findByText("Session MCP state is unavailable.")).toBeTruthy();
+  await act(async () => {
+    finishPage();
+    await pending;
+  });
+  await act(async () => {
+    client.setQueryData(query.queryKey, previous);
+  });
+  expect(screen.queryByText("late-old-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
