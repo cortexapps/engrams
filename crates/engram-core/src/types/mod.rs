@@ -64,3 +64,5 @@ pub mod managed_cold;
 pub mod managed_create;
 
 pub mod managed_boot;
+
+pub mod managed_operator;

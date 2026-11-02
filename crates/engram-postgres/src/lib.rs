@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 mod managed_boot;
 mod managed_create;
+mod managed_operator;
 mod managed_operator_gate;
 mod mcp_policy;
 mod outbox_accept;
@@ -1612,6 +1613,47 @@ impl MetadataStore for PostgresStore {
         Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
+    async fn read_operator_publication(
+        &self,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_read().await
+    }
+    async fn stage_operator_publication(
+        &self,
+        expected: Option<u64>,
+        candidate: engram_core::types::managed_operator::OperatorCandidate,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_stage(expected, candidate).await
+    }
+    async fn list_operator_participants(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        self.operator_list(after, limit).await
+    }
+    async fn retain_operator_participant(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+        session: SessionId,
+    ) -> Result<engram_core::types::managed_operator::OperatorParticipant, MetaError> {
+        self.operator_retain(generation, session).await
+    }
+    async fn record_operator_readiness(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+        participant: &engram_core::types::managed_operator::OperatorParticipant,
+        proof: engram_core::types::managed_operator::OperatorReadiness,
+    ) -> Result<(), MetaError> {
+        self.operator_ready(generation, participant, proof).await
+    }
+    async fn publish_operator_generation(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_publish(generation).await
+    }
+
     async fn get_managed_boot(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
@@ -1693,7 +1735,7 @@ impl MetadataStore for PostgresStore {
 
     async fn reserve_and_persist_create(
         &self,
-        ws: SessionCreateWriteSet,
+        mut ws: SessionCreateWriteSet,
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
@@ -1714,6 +1756,7 @@ impl MetadataStore for PostgresStore {
 
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        managed_operator::prepare_creation(&mut tx, &mut ws).await?;
 
         if let Some(creation) = &ws.managed_creation {
             if !managed_create::reserve(&mut tx, creation).await? {
@@ -8229,6 +8272,7 @@ impl MetadataStore for PostgresStore {
     ) -> Result<(), MetaError> {
         use sqlx::Row;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let pending = managed_operator::policy_registration_lock(&mut tx).await?;
         let row = sqlx::query("SELECT host_id, sandbox_id, binding_epoch FROM sessions WHERE id=$1 AND status NOT IN ('dead','failed','completed') FOR UPDATE")
             .bind(target.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
         if row
@@ -8254,6 +8298,7 @@ impl MetadataStore for PostgresStore {
         .map_err(db_err)?;
         let next = engram_core::types::managed_deny::retain_in_policy_json(old.as_deref(), policy)
             .map_err(MetaError::Conflict)?;
+        managed_operator::check_registration(pending, old.as_deref(), &next)?;
         sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(target.session_id.as_uuid()).bind(next).execute(&mut *tx).await.map_err(db_err)?;
         tx.commit().await.map_err(db_err)
     }
@@ -8263,6 +8308,7 @@ impl MetadataStore for PostgresStore {
         policy_json: &str,
     ) -> Result<(), MetaError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let pending = managed_operator::policy_registration_lock(&mut tx).await?;
         sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
             .bind(session_id.as_uuid())
             .fetch_optional(&mut *tx)
@@ -8276,6 +8322,7 @@ impl MetadataStore for PostgresStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
+        managed_operator::check_registration(pending, old.as_deref(), policy_json)?;
         engram_core::types::managed_deny::validate_policy_replacement(old.as_deref(), policy_json)
             .map_err(MetaError::Conflict)?;
         sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(session_id.as_uuid()).bind(policy_json).execute(&mut *tx).await.map_err(db_err)?;

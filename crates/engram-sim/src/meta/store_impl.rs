@@ -913,6 +913,123 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    async fn read_operator_publication(
+        &self,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().operator_publication.clone())
+    }
+    async fn stage_operator_publication(
+        &self,
+        expected: Option<u64>,
+        candidate: engram_core::types::managed_operator::OperatorCandidate,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let next = db.operator_publication.stage(expected, candidate)?;
+        if !next.admission_open {
+            if let Some(g) = &mut db.managed_operator_gate {
+                g.2 = false;
+            }
+        }
+        db.operator_publication = next.clone();
+        Ok(next)
+    }
+    async fn list_operator_participants(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        self.gate()?;
+        if !(1..=512).contains(&limit) {
+            return Err(engram_core::types::managed_operator::conflict());
+        }
+        Ok(super::managed_operator::ids(&self.db.lock())
+            .into_iter()
+            .filter(|s| after.is_none_or(|a| *s > a))
+            .take(limit as usize)
+            .collect())
+    }
+    async fn retain_operator_participant(
+        &self,
+        g: &engram_core::types::managed_operator::OperatorGeneration,
+        sid: SessionId,
+    ) -> Result<engram_core::types::managed_operator::OperatorParticipant, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        db.operator_publication.pending(g)?;
+        if !super::managed_operator::ids(&db).contains(&sid) {
+            return Err(engram_core::types::managed_operator::conflict());
+        }
+        let (raw, p) = super::managed_operator::snapshot(
+            &db,
+            sid,
+            g.candidate.hosts()?,
+            !db.operator_readiness.contains_key(&(g.generation, sid)),
+        )?;
+        db.session_integration_policy.insert(sid, raw);
+        db.operator_readiness
+            .insert((g.generation, sid), (p.clone(), None));
+        Ok(p)
+    }
+    async fn record_operator_readiness(
+        &self,
+        g: &engram_core::types::managed_operator::OperatorGeneration,
+        p: &engram_core::types::managed_operator::OperatorParticipant,
+        proof: engram_core::types::managed_operator::OperatorReadiness,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        proof.validate(g, p)?;
+        let mut db = self.db.lock();
+        db.operator_publication.pending(g)?;
+        if super::managed_operator::snapshot(&db, p.session_id, Vec::new(), false)?.1 != *p {
+            return Err(engram_core::types::managed_operator::conflict());
+        }
+        if db
+            .operator_readiness
+            .get(&(g.generation, p.session_id))
+            .is_none_or(|(stored, _)| stored != p)
+        {
+            return Err(engram_core::types::managed_operator::conflict());
+        }
+        db.operator_readiness
+            .insert((g.generation, p.session_id), (p.clone(), Some(proof)));
+        Ok(())
+    }
+    async fn publish_operator_generation(
+        &self,
+        g: &engram_core::types::managed_operator::OperatorGeneration,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let old = &db.operator_publication;
+        if old.pending.is_none() && old.published.as_ref() == Some(g) && old.admission_open {
+            return Ok(old.clone());
+        }
+        old.pending(g)?;
+        for sid in super::managed_operator::ids(&db) {
+            let p = super::managed_operator::snapshot(&db, sid, Vec::new(), false)?.1;
+            let (recorded, proof) = db
+                .operator_readiness
+                .get(&(g.generation, sid))
+                .ok_or_else(engram_core::types::managed_operator::conflict)?;
+            if &p != recorded {
+                return Err(engram_core::types::managed_operator::conflict());
+            }
+            proof
+                .as_ref()
+                .ok_or_else(engram_core::types::managed_operator::conflict)?
+                .validate(g, &p)?;
+        }
+        db.managed_operator_gate = Some((g.generation, g.identity.clone(), true));
+        db.operator_publication = engram_core::types::managed_operator::OperatorPublication {
+            published: Some(g.clone()),
+            pending: None,
+            admission_open: true,
+        };
+        Ok(db.operator_publication.clone())
+    }
+
     async fn get_managed_boot(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
@@ -1331,7 +1448,7 @@ impl MetadataStore for SimMetadataStore {
     /// One transaction: session row, held authority and all satellites.
     async fn reserve_and_persist_create(
         &self,
-        ws: SessionCreateWriteSet,
+        mut ws: SessionCreateWriteSet,
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
@@ -1376,6 +1493,34 @@ impl MetadataStore for SimMetadataStore {
                     "managed creation input already reserved".into(),
                 ));
             }
+        }
+        let managed_policy = ws
+            .integration_policy_json
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|_| engram_core::types::managed_operator::conflict())?
+            .is_some_and(|v| v.get("managed_deny").is_some_and(|p| !p.is_null()));
+        if ws.managed_creation.is_some()
+            || (managed_policy
+                && (db.operator_publication.published.is_some()
+                    || db.operator_publication.pending.is_some()))
+        {
+            let publication = &db.operator_publication;
+            if !publication.admission_open || publication.pending.is_some() {
+                return Err(engram_core::types::managed_operator::conflict());
+            }
+            let published = publication
+                .published
+                .as_ref()
+                .ok_or_else(engram_core::types::managed_operator::conflict)?;
+            ws.integration_policy_json = Some(
+                engram_core::types::managed_operator::retain(
+                    ws.integration_policy_json.as_deref(),
+                    published.candidate.hosts()?,
+                )?
+                .0,
+            );
         }
         if ws.oauth_binding.as_ref().is_some_and(|binding| {
             db.oauth_credentials
@@ -4951,6 +5096,12 @@ impl MetadataStore for SimMetadataStore {
             policy,
         )
         .map_err(MetaError::Conflict)?;
+        db.operator_publication.validate_registration(
+            db.session_integration_policy
+                .get(&target.session_id)
+                .map(String::as_str),
+            &next,
+        )?;
         db.session_integration_policy
             .insert(target.session_id, next);
         Ok(())
@@ -4965,6 +5116,12 @@ impl MetadataStore for SimMetadataStore {
         if !db.sessions.contains_key(&session_id) {
             return Err(MetaError::NotFound);
         }
+        db.operator_publication.validate_registration(
+            db.session_integration_policy
+                .get(&session_id)
+                .map(String::as_str),
+            policy_json,
+        )?;
         engram_core::types::managed_deny::validate_policy_replacement(
             db.session_integration_policy
                 .get(&session_id)

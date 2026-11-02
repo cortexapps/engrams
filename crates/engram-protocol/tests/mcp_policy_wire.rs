@@ -9,6 +9,8 @@ fn app_reflection_excludes_internal_policy_and_credential_services() {
         "engram/mcp/v1/session_policy.proto",
         "SessionPolicyService",
         "CredentialControlService",
+        "OperatorPublicationService",
+        "engram/mcp/v1/operator.proto",
     ] {
         assert!(!bytes
             .windows(private.len())
@@ -17,6 +19,17 @@ fn app_reflection_excludes_internal_policy_and_credential_services() {
 }
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, failure_persistence: Some(Box::new(FileFailurePersistence::Direct("proptest-regressions/mcp_policy_wire.txt"))), ..ProptestConfig::default() })]
+    #[test]
+    fn managed_boot_response_envelopes_are_wire_compatible(
+        protocol in any::<u32>(),
+        boot_json in proptest::option::of(proptest::collection::vec(any::<u8>(),0..=4096)),
+    ) {
+        let read = mcp::ReadManagedBootResponse { protocol, boot_json: boot_json.clone() };
+        let finalized = mcp::FinalizeManagedBootResponse { protocol, boot_json };
+        prop_assert_eq!(read.encode_to_vec(), finalized.encode_to_vec());
+        prop_assert_eq!(mcp::ReadManagedBootResponse::decode(finalized.encode_to_vec().as_slice()).unwrap(), read.clone());
+        prop_assert_eq!(mcp::FinalizeManagedBootResponse::decode(read.encode_to_vec().as_slice()).unwrap(), finalized);
+    }
     #[test]
     fn policy_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(),0..=4096)) {
         let _=mcp::CreatePolicySessionRequest::decode(bytes.as_slice());
@@ -34,6 +47,15 @@ proptest! {
         let _=mcp::ReadManagedBootRequest::decode(bytes.as_slice());
         let _=mcp::ReadManagedBootResponse::decode(bytes.as_slice());
         let _=mcp::FinalizeManagedBootRequest::decode(bytes.as_slice());
+        let _=mcp::FinalizeManagedBootResponse::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceStageRequest::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceReadRequest::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceReadResponse::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceStageResponse::decode(bytes.as_slice());
+        let _=mcp::ReadPublishedOperatorRequest::decode(bytes.as_slice());
+        let _=mcp::ReadPublishedOperatorResponse::decode(bytes.as_slice());
+        let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorCandidate>(&bytes);
+        let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorPublication>(&bytes);
     }
 }
 
@@ -112,6 +134,21 @@ fn managed_boot_pinned_wire_tags_are_stable() {
         boot_json: Some(b"{}".to_vec()),
     };
     assert_eq!(response.encode_to_vec(), [8, 1, 18, 2, 123, 125]);
+    for (boot_json, bytes) in [
+        (None, vec![8, 1]),
+        (Some(Vec::new()), vec![8, 1, 18, 0]),
+        (Some(b"{}".to_vec()), vec![8, 1, 18, 2, 123, 125]),
+    ] {
+        let finalized = mcp::FinalizeManagedBootResponse {
+            protocol: 1,
+            boot_json,
+        };
+        assert_eq!(finalized.encode_to_vec(), bytes);
+        assert_eq!(
+            mcp::FinalizeManagedBootResponse::decode(bytes.as_slice()).unwrap(),
+            finalized
+        );
+    }
     assert_eq!(
         mcp::ReadManagedBootResponse::decode([8u8, 1].as_slice())
             .unwrap()

@@ -478,7 +478,38 @@ participant readiness in a short transaction. It may open the gate only after
 all required participants have current actual receipts. No host I/O occurs
 under either lock. The publisher must also use this lock for held-create
 admission and placement invalidation. There is no public or configuration
-setter. Public managed creation stays unavailable until that publisher exists.
+setter. The producer uses an optional separate operator mTLS listener with a
+separate client CA and exact leaf pins that cannot overlap orchestrator pins.
+Stage accepts only expected generation and configured candidate identity. It
+resolves every candidate byte from operator-owned configuration. There is no
+manual publish endpoint. The pinned orchestrator service has only a read-only
+published projection. Rollout and registry flags remain separate admission gates.
+
+Migration 0134 stores immutable generation records and per-session requirements
+and readiness. The participant query unions managed creations, registered boots,
+and retained managed policies; it does not filter by active executions or terminal
+status. The scanner commits the historical deny union before host I/O, including
+unused zone authorities and aliases. A route or trust change advances the deny
+revision once even when hosts are unchanged. Exact immutable Retired evidence can
+prove a source nonrunning while its durable next-boot requirement advances; it
+never counts as a new applied ACK or capture. A destroyed Captured source is a
+separate readiness case. An old source can still be addressed after SQL detaches
+its sandbox only when its recorded session, epoch, and retained host match.
+Publication accepts only never-allocated held creation or exact permanent
+Retired/Captured source evidence. Live applied-policy receipts do not supply a
+durably invalidated host/proxy lifetime, so they cannot authorize publication.
+Policy-only historical rows without immutable managed source lineage remain
+enumerated and retain their complete deny union, but block publication with no
+legacy host mutation. They need a separately reviewed durable lifecycle or
+destruction migration; terminal labels, row deletion and synthetic boot/capture
+records are not supported workarounds. This session-lineage restriction is
+separate from required legacy external MCP protocol support. Every MCP-bound root
+and child must use immutable managed creation. Current held, prepared, started
+and captured managed sources retain their existing progress paths.
+All participant snapshots and proofs are checked again under the exclusive gate
+and stable session locks before publication. Host I/O holds no database locks.
+The deployment configuration and pinned read contract are described in
+[operator MCP publication](../operator-mcp-publication.md).
 
 A cold capture first interrupts the old physical target. It preserves history
 and pending prompts, retires pending old tool-result deliveries, and makes old

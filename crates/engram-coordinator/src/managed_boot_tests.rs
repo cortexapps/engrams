@@ -18,9 +18,61 @@ use std::sync::{
 struct LossyHost {
     state: Mutex<Option<ManagedBootHostState>>,
     starts: AtomicUsize,
+    policy_calls: AtomicUsize,
+    policy: Mutex<Option<ManagedAppliedState>>,
+    prepared: ManagedBootPreparedReceipt,
+    apply_mode: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 #[async_trait]
 impl HostClient for LossyHost {
+    async fn read_managed_policy(
+        &self,
+        _: ManagedPolicyTarget,
+    ) -> Result<Option<ManagedAppliedState>, SandboxError> {
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.policy.lock().unwrap().clone())
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: ManagedPolicyApply,
+    ) -> Result<ManagedAppliedState, SandboxError> {
+        self.policy_calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self.apply_mode.load(Ordering::SeqCst);
+        if mode == 0 {
+            return Err(SandboxError::Unavailable("policy unavailable".into()));
+        }
+        assert_eq!(*self.policy.lock().unwrap(), request.expected);
+        assert_eq!(
+            request.context.target,
+            self.prepared.request.key.context.target
+        );
+        assert!(
+            request.context.operator_generation
+                > self.prepared.request.key.context.operator_generation
+        );
+        assert_eq!(request.egress.guest_ip, self.prepared.guest_ip);
+        if request.expected.is_none() {
+            assert!(request.context.binding_hash.is_none());
+        }
+        self.entered.notify_one();
+        if mode == 2 {
+            let _permit = self.release.acquire().await.unwrap();
+        }
+        let retained = request.egress.managed_deny.unwrap();
+        assert!(retained.contains(&self.prepared.request.bootstrap_policy));
+        *self.state.lock().unwrap() = Some(ManagedBootHostState::Retired {
+            receipt: Box::new(ManagedBootRetiredReceipt {
+                prepared: self.prepared.clone(),
+                retained_policy: retained,
+                receipt_id: digest(b"operator retired"),
+            }),
+        });
+        Err(SandboxError::Unavailable(
+            "reply lost after retirement".into(),
+        ))
+    }
     async fn start_managed_boot(
         &self,
         start: ManagedBootStart,
@@ -165,6 +217,7 @@ async fn fixture() -> (
         runtime_spec: RuntimeSpec::new(vec![], Some("claude".into()), None, vec![]),
         oauth_binding: None,
     };
+    engram_testkit::operator::publish_empty(meta.as_ref()).await;
     meta.reserve_and_persist_create(ws, &[], 0).await.unwrap();
     let disk = engram_core::types::manifest::ManifestRef {
         manifest_id: uuid::Uuid::from_u128(703),
@@ -205,7 +258,7 @@ async fn fixture() -> (
                 binding_epoch: 1,
             },
             operator_generation: 1,
-            operator_identity: digest(b"operator"),
+            operator_identity: engram_testkit::operator::candidate().identity().unwrap(),
             binding_hash: None,
         },
         boot_attempt: "boot-one".into(),
@@ -322,6 +375,12 @@ async fn fixture() -> (
             receipt: row.receipt.clone().unwrap(),
         })),
         starts: AtomicUsize::new(0),
+        policy_calls: AtomicUsize::new(0),
+        policy: Mutex::new(Some(row.finalization.as_ref().unwrap().policy.clone())),
+        prepared: row.prepared.clone().unwrap(),
+        apply_mode: AtomicUsize::new(0),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
     });
     let blob = Arc::new(MemBlobStorage::new());
     let services = crate::Services {
@@ -718,6 +777,7 @@ async fn managed_boot_interruption_publishes_through_pg_listener() {
     let target = &key.context.target;
     let now = state.services.clock.now_utc();
     let meta = Arc::new(db.store.clone());
+    engram_testkit::operator::publish_empty(meta.as_ref()).await;
     let creation = sim.read_managed_creation(&key.creation).await.unwrap();
     meta.reserve_and_persist_create(
         engram_core::traits::SessionCreateWriteSet {
@@ -838,4 +898,230 @@ async fn managed_boot_interruption_publishes_through_pg_listener() {
     );
     listener.abort();
     let _ = listener.await;
+}
+
+#[tokio::test]
+async fn operator_scanner_requires_retirement_and_retains_before_host_io() {
+    let (state, meta, host, row) = fixture().await;
+    let mut candidate = engram_testkit::operator::candidate();
+    candidate.network_identity = digest(b"new network same authority hosts");
+    let g = meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    // Error and Missing are not proof. The scanner remains closed on both.
+    *host.state.lock().unwrap() = None;
+    crate::mcp::operator::run_once(&state, &candidate, None)
+        .await
+        .unwrap();
+    assert!(
+        !meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Missing {
+        key: row.request.key.clone(),
+    });
+    crate::mcp::operator::run_once(&state, &candidate, None)
+        .await
+        .unwrap();
+    assert!(
+        !meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Finalized {
+        receipt: row.receipt.clone().unwrap(),
+    });
+    host.apply_mode.store(2, Ordering::SeqCst);
+    let scanner = tokio::spawn({
+        let state = state.clone();
+        let candidate = candidate.clone();
+        async move { crate::mcp::operator::run_once(&state, &candidate, None).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), host.entered.notified())
+        .await
+        .unwrap();
+    let retained = meta
+        .get_session_integration_policy(row.request.key.creation.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&retained).unwrap();
+    assert_eq!(
+        value["managed_deny"]["revision"], 2,
+        "same-host generation must invalidate the old policy receipt"
+    );
+    // The same-row retention transaction can complete while the host is blocked.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        meta.bind_session_integration_policy(row.request.key.creation.session_id, &retained),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(meta.publish_operator_generation(&g).await.is_err());
+    scanner.abort();
+    let _ = scanner.await;
+    assert!(
+        !meta
+            .read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    // A fresh pass recovers the persistent candidate/union, obtains a fresh host
+    // observation after a lost apply reply, and never asks the host to start.
+    host.apply_mode.store(1, Ordering::SeqCst);
+    crate::mcp::operator::run_once(&state, &candidate, None)
+        .await
+        .unwrap();
+    assert!(
+        meta.read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        meta.managed_boot_open(row.request.key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn operator_scanner_retires_closed_owner_without_fabricating_binding() {
+    let (state, meta, host, row) = fixture().await;
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Prepared {
+        receipt: Box::new(row.prepared.clone().unwrap()),
+    });
+    *host.policy.lock().unwrap() = None;
+    host.apply_mode.store(1, Ordering::SeqCst);
+    // Model a prepared reply not yet persisted: the registered claim still owns it.
+    meta.with_db_mut(|db| {
+        db.managed_boots.insert(
+            row.request.key.creation.session_id,
+            ManagedBootRecord::claimed(row.request.clone()),
+        );
+    });
+    let mut candidate = engram_testkit::operator::candidate();
+    candidate.network_identity = digest(b"new closed network");
+    meta.stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap();
+    crate::mcp::operator::run_once(&state, &candidate, None)
+        .await
+        .unwrap();
+    assert!(
+        meta.read_operator_publication()
+            .await
+            .unwrap()
+            .admission_open
+    );
+    assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn operator_scanner_keeps_policy_only_lineage_blocked_without_host_calls() {
+    let (state, meta, host, row) = fixture().await;
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Retired {
+        receipt: Box::new(ManagedBootRetiredReceipt {
+            prepared: row.prepared.clone().unwrap(),
+            retained_policy: row.request.bootstrap_policy.clone(),
+            receipt_id: digest(b"permanent owner"),
+        }),
+    });
+    let sid = meta
+        .create_session(engram_core::types::SessionSpec {
+            image: "test.invalid/policy-only:latest".into(),
+            mode: Default::default(),
+        })
+        .await
+        .unwrap();
+    let hid = row.request.key.context.target.host_id;
+    meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = SandboxId::from(uuid::Uuid::from_u128(991));
+    let epoch = meta.transition_session_created(sid, sandbox).await.unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        host_id: hid,
+        sandbox_id: sandbox,
+        binding_epoch: epoch,
+    };
+    meta.retain_managed_deny(
+        &target,
+        &ManagedDenyPolicy::new(1, ["tools.example".into(), "history.example".into()]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let candidate = engram_testkit::operator::candidate();
+    let g = meta
+        .stage_operator_publication(Some(1), candidate.clone())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    for (host_inc, proxy_inc) in [
+        ("old-host", "old-proxy"),
+        ("next-host", "old-proxy"),
+        ("next-host", "next-proxy"),
+    ] {
+        let receipt = ManagedAppliedState::new(
+            ManagedPolicyContext {
+                target: target.clone(),
+                operator_generation: g.generation,
+                operator_identity: g.identity.clone(),
+                binding_hash: None,
+            },
+            ManagedDenyPolicy::new(2, ["tools.example".into(), "history.example".into()]).unwrap(),
+            host_inc.into(),
+            proxy_inc.into(),
+            Some(ManagedNetworkProof {
+                target: target.clone(),
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                network_identity: digest(b"network"),
+            }),
+        )
+        .unwrap();
+        *host.policy.lock().unwrap() = Some(receipt);
+        crate::mcp::operator::run_once(&state, &candidate, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.policy_calls.load(Ordering::SeqCst),
+            0,
+            "unsupported lineage must not authorize host I/O"
+        );
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+        assert!(
+            !meta
+                .read_operator_publication()
+                .await
+                .unwrap()
+                .admission_open
+        );
+        meta.with_db_mut(|db| {
+            assert!(
+                db.operator_readiness
+                    .get(&(g.generation, row.request.key.creation.session_id))
+                    .unwrap()
+                    .1
+                    .is_some(),
+                "current immutable source still reaches permanent readiness"
+            );
+            let (participant, proof) = db.operator_readiness.get(&(g.generation, sid)).unwrap();
+            assert!(proof.is_none());
+            assert!(participant.policy.denies("history.example"));
+            assert!(participant.policy.denies("tools.example"));
+            assert!(participant.boot.is_none());
+        });
+    }
 }
