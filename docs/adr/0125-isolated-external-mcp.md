@@ -637,3 +637,13 @@ record cannot become authority. `CrashConsistentDiskCutV1` does not promise that
 guest page-cache or application writes were flushed. Recovery uses a fresh
 kernel, device context and empty swap; it never restores old RAM. Physical FC
 and VZ acceptance remains required before activation.
+
+### Managed cold asset inspection
+
+The coordinator selects an immutable approved disk manifest and ordered bundle
+hashes before asking the authenticated host for cold asset inspection. The
+version-one JSON request binds host, session and durable preparation intent.
+The reply reports the actual backend and host incarnation plus verified logical
+disk byte hash/size and kernel hash. Inspection creates no VM or policy lease.
+Preparation checks the same bytes again. An unsupported host remains closed.
+This additive gRPC method does not change the bincode wire layout.

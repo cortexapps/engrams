@@ -1068,6 +1068,15 @@ impl HostService for HostServiceImpl {
     /// warm-lease path doesn't reach here — it goes through
     /// `WarmPool::launch` (which has its own histogram emission
     /// labelled `kind="warm"`).
+    async fn read_managed_cold_assets(
+        &self,
+        _req: tonic::Request<engram_protocol::grpc::ReadManagedColdAssetsRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ReadManagedColdAssetsResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "managed cold assets unavailable",
+        ))
+    }
     async fn capture_managed_boot(
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,

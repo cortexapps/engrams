@@ -766,6 +766,15 @@ impl HostClient for HostRegistry {
         result
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        self.backend_for(request.host_id)
+            .await?
+            .read_managed_cold_assets(request)
+            .await
+    }
     async fn prepare_managed_boot(
         &self,
         request: engram_core::types::managed_boot::ManagedBootPrepare,
