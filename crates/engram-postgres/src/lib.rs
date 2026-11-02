@@ -5875,6 +5875,13 @@ impl MetadataStore for PostgresStore {
         Ok(Some(settled))
     }
 
+    async fn append_managed_harness_event(
+        &self,
+        event: &engram_core::types::event::ManagedHarnessEvent,
+    ) -> Result<engram_core::types::event::ManagedHarnessEventAccepted, MetaError> {
+        self.managed_event_append(event).await
+    }
+
     async fn append_session_event_idempotent(
         &self,
         session: SessionId,

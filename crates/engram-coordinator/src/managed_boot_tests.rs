@@ -605,3 +605,237 @@ async fn managed_boot_attach_environment_is_exact_and_sealed() {
     assert_eq!(opened.agent.env, command.agent.env);
     assert_eq!(opened.agent.session_env, command.agent.session_env);
 }
+
+#[tokio::test]
+async fn managed_boot_event_entry_points_reject_interrupted_authority() {
+    use crate::state::{emit_harness_event, SessionEvent};
+    use engram_harness_proto::HarnessEvent;
+    use engram_host_agent::harness::EventDelivery;
+    let (state, meta, _, row) = fixture().await;
+    let key = row.request.key.clone();
+    let sid = key.creation.session_id;
+    let sbx = key.context.target.sandbox_id;
+    let start = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"event-start"),
+    };
+    let row = meta
+        .advance_managed_boot(
+            &key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone()),
+        )
+        .await
+        .unwrap();
+    let row = meta
+        .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Started(start))
+        .await
+        .unwrap();
+    let now = state.services.clock.now_utc();
+    let delivery = Some(EventDelivery {
+        binding_epoch: 1,
+        incarnation: 1,
+        seq: 1,
+    });
+    let run = || HarnessEvent::RunStarted {
+        run_id: "old-run".into(),
+        prompt_summary: None,
+        prompt_id: None,
+    };
+    emit_harness_event(&state, sid, sbx, run(), now, delivery)
+        .await
+        .unwrap();
+    // Replay through the other entry point uses the same transactional key.
+    state
+        .harness_hub
+        .emit_external(sid, sbx, run(), delivery)
+        .await
+        .unwrap();
+    let pending = engram_core::types::outbox::OutboxRow {
+        prompt_id: "pending-boundary".into(),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text":"pending"}),
+        created_at: now,
+        not_before: now,
+        attempts: 0,
+        delivered_at: None,
+        acked_at: None,
+    };
+    meta.outbox_enqueue(&pending).await.unwrap();
+    let mut live = state.events.subscribe(sid);
+    meta.advance_managed_boot(&key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    let late = || HarnessEvent::RunStarted {
+        run_id: "late-run".into(),
+        prompt_summary: None,
+        prompt_id: Some(pending.prompt_id.clone()),
+    };
+    let delivery = Some(EventDelivery {
+        binding_epoch: 1,
+        incarnation: 1,
+        seq: 2,
+    });
+    assert!(emit_harness_event(&state, sid, sbx, late(), now, delivery)
+        .await
+        .is_err());
+    assert!(state
+        .harness_hub
+        .emit_external(sid, sbx, late(), delivery)
+        .await
+        .is_err());
+    assert!(live.try_recv().is_err());
+    assert!(meta
+        .outbox_get(&pending.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    let rows = meta.list_session_events_since(sid, -1, 100).await.unwrap();
+    assert_eq!(rows.iter().filter(|r| r.kind == "run_started").count(), 1);
+    let interrupted = rows
+        .into_iter()
+        .find(|r| r.kind == "run_interrupted")
+        .unwrap();
+    assert!(
+        matches!(serde_json::from_value::<SessionEvent>(interrupted.payload).unwrap(),SessionEvent::HarnessRunInterrupted {run_id,..} if run_id=="old-run")
+    );
+}
+
+#[tokio::test]
+async fn managed_boot_interruption_publishes_through_pg_listener() {
+    use crate::state::SessionEvent;
+    use engram_core::types::host::{HostCapacity, HostRecord, HostStatus};
+    use std::time::Duration;
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let (state, sim, _, row) = fixture().await;
+    let key = &row.request.key;
+    let sid = key.creation.session_id;
+    let target = &key.context.target;
+    let now = state.services.clock.now_utc();
+    let meta = Arc::new(db.store.clone());
+    let creation = sim.read_managed_creation(&key.creation).await.unwrap();
+    meta.reserve_and_persist_create(
+        engram_core::traits::SessionCreateWriteSet {
+            session_id: sid,
+            spec: engram_core::types::SessionSpec {
+                image: row.request.cold.image.clone(),
+                mode: Default::default(),
+            },
+            mem_budget_mib: 128,
+            cpu_budget_vcpus: 1,
+            nbd_slot_need: 1,
+            sealed_secrets: None,
+            capabilities: vec![],
+            integration_policy_json: None,
+            runtime_spec: RuntimeSpec::new(vec![], Some("claude".into()), None, vec![]),
+            oauth_binding: None,
+            mcp_policy: Some(creation.identity.policy.clone()),
+            managed_creation: Some(creation),
+            managed_initial_prompt: None,
+        },
+        &[],
+        0,
+    )
+    .await
+    .unwrap();
+    meta.upsert_host(HostRecord {
+        id: target.host_id,
+        hostname: "managed-host".into(),
+        cloud_metadata: Default::default(),
+        capacity: HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: 1024,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: now,
+        host_addr: None,
+        ready_images: vec![],
+        current_bundles: vec![],
+        sandbox_bundles: vec![],
+        cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
+        total_vcpus: 2,
+        wire_version: 0,
+        stages_images: false,
+        capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
+    })
+    .await
+    .unwrap();
+    // Explicit fixture imports a finalized source. This test proves event storage
+    // and publication, not a real host receipt or public admission.
+    sqlx::query("UPDATE sessions SET status='created',host_id=$2,sandbox_id=$3,binding_epoch=$4 WHERE id=$1")
+        .bind(sid.as_uuid()).bind(target.host_id.as_uuid()).bind(target.sandbox_id.as_uuid()).bind(target.binding_epoch as i64)
+        .execute(meta.pool()).await.unwrap();
+    sqlx::query("INSERT INTO session_managed_boots(session_id,host_id,sandbox_id,binding_epoch,boot_attempt,revision,phase,record,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        .bind(sid.as_uuid()).bind(target.host_id.as_uuid()).bind(target.sandbox_id.as_uuid()).bind(target.binding_epoch as i64)
+        .bind(&key.boot_attempt).bind(row.revision as i64).bind(row.phase.as_str()).bind(serde_json::to_value(&row).unwrap()).bind(now)
+        .execute(meta.pool()).await.unwrap();
+    let mut live = state.events.subscribe(sid);
+    let listener = crate::pg_listener::spawn(
+        db.url.clone(),
+        meta.clone(),
+        state.events.clone(),
+        state.host_registry.clone(),
+        state.integrations.clone(),
+        state.boot_bundles.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    // No local publish: receiving this marker proves LISTEN is established.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            meta.append_session_event(
+                sid,
+                "run_started",
+                serde_json::to_value(SessionEvent::HarnessRunStarted {
+                    run_id: "old-run".into(),
+                    prompt_summary: None,
+                    prompt_id: None,
+                    at: now,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(50), live.recv()).await {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("listener must receive readiness marker");
+    meta.advance_managed_boot(key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    let published = tokio::time::timeout(Duration::from_secs(3),async {
+        loop { let event = live.recv().await.unwrap(); if matches!(&event.event,SessionEvent::HarnessRunInterrupted {run_id,..} if run_id=="old-run") { break event; } }
+    }).await.expect("committed interruption must reach the live bus through NOTIFY");
+    let stored = meta
+        .list_session_events_since(sid, published.idx - 1, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(stored.kind, "run_interrupted");
+    assert_eq!(stored.idx, published.idx);
+    assert!(
+        matches!(serde_json::from_value::<SessionEvent>(stored.payload).unwrap(),SessionEvent::HarnessRunInterrupted {run_id,..} if run_id=="old-run")
+    );
+    listener.abort();
+    let _ = listener.await;
+}

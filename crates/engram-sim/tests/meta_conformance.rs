@@ -9839,6 +9839,14 @@ async fn managed_boot_interrupt_capture_and_recovery(ctx: &Ctx) {
     assert!(events
         .iter()
         .any(|e| e.kind == "run_interrupted" && e.payload["run_id"] == "run-old"));
+    assert_eq!(
+        events
+            .iter()
+            .find(|e| e.kind == "run_interrupted")
+            .unwrap()
+            .payload["type"],
+        "harness_run_interrupted"
+    );
     assert!(ctx.meta.managed_delivery_target_gone(sid, 1).await.unwrap());
     assert!(ctx
         .meta
@@ -10128,4 +10136,212 @@ async fn managed_boot_retirement_preserves_source_and_next_deny(ctx: &Ctx) {
 conformance!(
     t_managed_boot_retirement_preserves_source_and_next_deny,
     super::managed_boot_retirement_preserves_source_and_next_deny
+);
+
+async fn managed_boot_ingestion_is_serialized_with_interruption(ctx: &Ctx) {
+    use engram_core::types::{event::ManagedHarnessEvent, managed_boot::*, managed_create::digest};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = row.request.key.clone();
+    let start = ManagedBootStart {
+        receipt: row.receipt.unwrap(),
+        start_id: digest(b"event-start"),
+    };
+    let row = ctx
+        .meta
+        .advance_managed_boot(
+            &key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(start.clone()),
+        )
+        .await
+        .unwrap();
+    let row = ctx
+        .meta
+        .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Started(start))
+        .await
+        .unwrap();
+    let sid = key.creation.session_id;
+    let now = ctx.clock.now_utc();
+    let pending = engram_core::types::outbox::OutboxRow {
+        prompt_id: format!("paused:{sid}"),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text":"pending"}),
+        created_at: now,
+        not_before: now,
+        attempts: 0,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta.outbox_enqueue(&pending).await.unwrap();
+    let original = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 1,
+        kind: "run_started".into(),
+        payload: serde_json::json!({"type":"harness_run_started","run_id":"old-run","prompt_id":null,"at":now}),
+        ack_id: None,
+    };
+    let first = ctx
+        .meta
+        .append_managed_harness_event(&original)
+        .await
+        .unwrap();
+    assert!(first.idx.is_some());
+    assert!(!first.outbox_acked);
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&original)
+        .await
+        .unwrap()
+        .idx
+        .is_none());
+    let mut mismatch = original.clone();
+    mismatch.target.sandbox_id = engram_core::SandboxId::new();
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&mismatch)
+        .await
+        .is_err());
+    let mut changed = original.clone();
+    changed.payload["prompt_id"] = pending.prompt_id.clone().into();
+    changed.ack_id = Some(pending.prompt_id.clone());
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&changed)
+        .await
+        .is_err());
+
+    let mut consumed = pending.clone();
+    consumed.prompt_id = format!("consumed:{sid}");
+    ctx.meta.outbox_enqueue(&consumed).await.unwrap();
+    let acknowledged = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 4,
+        kind: "prompt_steered".into(),
+        payload: serde_json::json!({"type":"harness_prompt_steered","prompt_id":consumed.prompt_id,"at":now}),
+        ack_id: Some(consumed.prompt_id.clone()),
+    };
+    let accepted = ctx
+        .meta
+        .append_managed_harness_event(&acknowledged)
+        .await
+        .unwrap();
+    assert!(accepted.idx.is_some() && accepted.outbox_acked);
+    assert!(ctx
+        .meta
+        .outbox_get(&consumed.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_some());
+    let mut replay = acknowledged.clone();
+    replay.payload["at"] = serde_json::to_value(now + chrono::Duration::seconds(1)).unwrap();
+    let accepted = ctx
+        .meta
+        .append_managed_harness_event(&replay)
+        .await
+        .unwrap();
+    assert!(accepted.idx.is_none() && !accepted.outbox_acked);
+
+    // Both ingestions have observed Started before interruption. The barriers
+    // pause them at the transaction boundary without sleeps or scheduler guesses.
+    let paused = Arc::new(tokio::sync::Barrier::new(3));
+    let resume = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for (seq, kind, payload, ack_id) in [
+        (
+            2,
+            "tool_call_requested",
+            serde_json::json!({"type":"harness_tool_call_requested","tool_call_id":"late-call","run_id":"old-run","at":now}),
+            None,
+        ),
+        (
+            3,
+            "run_started",
+            serde_json::json!({"type":"harness_run_started","run_id":"late-run","prompt_id":pending.prompt_id,"at":now}),
+            Some(pending.prompt_id.clone()),
+        ),
+    ] {
+        let meta = ctx.meta.clone();
+        let paused = paused.clone();
+        let resume = resume.clone();
+        let target = key.context.target.clone();
+        tasks.push(tokio::spawn(async move {
+            assert_eq!(meta.managed_boot_open(sid).await.unwrap(), Some(true));
+            assert_eq!(meta.managed_policy_target(sid).await.unwrap(), target);
+            paused.wait().await;
+            resume.wait().await;
+            meta.append_managed_harness_event(&ManagedHarnessEvent {
+                target,
+                incarnation: 1,
+                seq,
+                kind: kind.into(),
+                payload,
+                ack_id,
+            })
+            .await
+        }));
+    }
+    paused.wait().await;
+    ctx.meta
+        .advance_managed_boot(&key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    resume.wait().await;
+    for task in tasks {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(
+        ctx.meta
+            .append_managed_harness_event(&original)
+            .await
+            .is_err(),
+        "stale replay must not acknowledge after interruption"
+    );
+    let completed = ManagedHarnessEvent {
+        target: key.context.target.clone(),
+        incarnation: 1,
+        seq: 5,
+        kind: "tool_call_completed".into(),
+        payload: serde_json::json!({"type":"harness_tool_call_completed","tool_call_id":"late-call","at":now}),
+        ack_id: Some(engram_core::types::outbox::tool_result_outbox_id(
+            sid,
+            "late-call",
+        )),
+    };
+    assert!(ctx
+        .meta
+        .append_managed_harness_event(&completed)
+        .await
+        .is_err());
+    let events = ctx
+        .meta
+        .list_session_events_since(sid, -1, 100)
+        .await
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| e.payload["tool_call_id"] == "late-call" || e.payload["run_id"] == "late-run"));
+    assert!(ctx
+        .meta
+        .outbox_get(&pending.prompt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    assert!(ctx
+        .meta
+        .managed_tool_target_gone(sid, "late-call")
+        .await
+        .unwrap());
+    let interrupted = events.iter().find(|e| e.kind == "run_interrupted").unwrap();
+    assert_eq!(interrupted.payload["type"], "harness_run_interrupted");
+}
+conformance!(
+    t_managed_boot_ingestion_is_serialized_with_interruption,
+    super::managed_boot_ingestion_is_serialized_with_interruption
 );

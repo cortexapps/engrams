@@ -2489,6 +2489,15 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Check exact managed physical authority, append, and acknowledge its outbox
+    /// row under the same session lock as interruption. Stale replays also fail.
+    async fn append_managed_harness_event(
+        &self,
+        _event: &crate::types::event::ManagedHarnessEvent,
+    ) -> Result<crate::types::event::ManagedHarnessEventAccepted, MetaError> {
+        unimplemented!("append_managed_harness_event")
+    }
+
     /// Append once per session and key. A replay returns no index.
     async fn append_session_event_idempotent(
         &self,

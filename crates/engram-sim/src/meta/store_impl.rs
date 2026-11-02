@@ -1173,6 +1173,7 @@ impl MetadataStore for SimMetadataStore {
             .map_err(MetaError::Conflict)?;
             db.session_integration_policy.insert(sid, retained);
         }
+        let mut interruption_idx = None;
         if next.phase == ManagedBootPhase::Interrupted && old.phase != ManagedBootPhase::Interrupted
         {
             let session = db.sessions.get_mut(&sid).ok_or(MetaError::NotFound)?;
@@ -1200,11 +1201,12 @@ impl MetadataStore for SimMetadataStore {
                 .and_then(|e| e.payload.get("run_id").and_then(|v| v.as_str()))
                 .map(str::to_string);
             if let Some(run) = run {
-                super::mcp_policy::append(
+                interruption_idx = append_event_idempotent_locked(
                     &mut db,
                     sid,
+                    &format!("managed-interrupt:{}:{run}", key.boot_attempt),
                     "run_interrupted",
-                    serde_json::json!({"type":"run_interrupted","run_id":run,"at":self.now()}),
+                    serde_json::json!({"type":"harness_run_interrupted","run_id":run,"at":self.now()}),
                     self.now(),
                 )?;
             }
@@ -1225,6 +1227,13 @@ impl MetadataStore for SimMetadataStore {
             s.updated_at = self.now();
         }
         db.managed_boots.insert(sid, next.clone());
+        drop(db);
+        if let Some(idx) = interruption_idx {
+            self.notify(
+                "session_events",
+                serde_json::json!({"session_id":sid,"idx":idx}).to_string(),
+            );
+        }
         Ok(next)
     }
     async fn list_managed_boots(
@@ -2594,6 +2603,65 @@ impl MetadataStore for SimMetadataStore {
             );
         }
         Ok(Some(settled))
+    }
+
+    async fn append_managed_harness_event(
+        &self,
+        event: &engram_core::types::event::ManagedHarnessEvent,
+    ) -> Result<engram_core::types::event::ManagedHarnessEventAccepted, MetaError> {
+        self.gate()?;
+        event.validate()?;
+        let sid = event.target.session_id;
+        let mut db = self.db.lock();
+        let candidate = db.managed_boots.get(&sid).ok_or_else(conflict)?;
+        managed_operator_gate(&db, &candidate.request.key)?;
+        let current = managed_boot_read_locked(&db, &candidate.request.key)?;
+        if current.phase != ManagedBootPhase::Started
+            || current.request.key.context.target != event.target
+            || db.sessions.get(&sid).ok_or_else(conflict)?.session.status != SessionState::Active
+            || db
+                .managed_interrupted
+                .contains(&(sid, event.target.binding_epoch))
+        {
+            return Err(conflict());
+        }
+        let key = event.key();
+        if let Some(previous) = db
+            .session_events
+            .get(&sid)
+            .into_iter()
+            .flatten()
+            .find(|row| {
+                row.payload.get("idempotency_key").and_then(|v| v.as_str()) == Some(key.as_str())
+            })
+        {
+            if !event.matches_replay(&previous.kind, &previous.payload) {
+                return Err(conflict());
+            }
+        }
+        let idx = append_event_idempotent_locked(
+            &mut db,
+            sid,
+            &key,
+            &event.kind,
+            event.payload.clone(),
+            self.now(),
+        )?;
+        let mut outbox_acked = false;
+        if let Some(row) = event.ack_id.as_ref().and_then(|ack| db.outbox.get_mut(ack)) {
+            if row.session_id == sid && row.acked_at.is_none() {
+                row.acked_at = Some(self.now());
+                outbox_acked = true;
+            }
+        }
+        drop(db);
+        if let Some(idx) = idx {
+            self.notify(
+                "session_events",
+                serde_json::json!({"session_id":sid,"idx":idx}).to_string(),
+            );
+        }
+        Ok(engram_core::types::event::ManagedHarnessEventAccepted { idx, outbox_acked })
     }
 
     async fn append_session_event_idempotent(

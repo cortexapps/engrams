@@ -221,8 +221,12 @@ impl PostgresStore {
                 let payload: serde_json::Value = event.try_get("payload").map_err(db_err)?;
                 if event.try_get::<String, _>("kind").map_err(db_err)? == "run_started" {
                     if let Some(run) = payload.get("run_id").and_then(|v| v.as_str()) {
-                        let idx:i64=sqlx::query_scalar("UPDATE sessions SET next_event_idx=next_event_idx+1,last_event_at=$2,updated_at=$2 WHERE id=$1 RETURNING next_event_idx-1").bind(sid.as_uuid()).bind(self.clock.now_utc()).fetch_one(&mut *tx).await.map_err(db_err)?;
-                        sqlx::query("INSERT INTO session_events(session_id,idx,kind,payload,recovery_epoch,created_at) SELECT id,$2,'run_interrupted',$3,recovery_epoch,$4 FROM sessions WHERE id=$1").bind(sid.as_uuid()).bind(idx).bind(serde_json::json!({"type":"run_interrupted","run_id":run,"at":self.clock.now_utc()})).bind(self.clock.now_utc()).execute(&mut *tx).await.map_err(db_err)?;
+                        crate::append_event_idempotent_tx(
+                            &mut tx, sid, &format!("managed-interrupt:{}:{run}", key.boot_attempt),
+                            "run_interrupted",
+                            serde_json::json!({"type":"harness_run_interrupted","run_id":run,"at":self.clock.now_utc()}),
+                            self.clock.now_utc(),
+                        ).await?;
                     }
                 }
             }
@@ -459,4 +463,68 @@ pub(crate) async fn require_tool_result_target(
         return Err(MetaError::Conflict("delivery target gone".into()));
     }
     Ok(())
+}
+
+impl PostgresStore {
+    pub(crate) async fn managed_event_append(
+        &self,
+        event: &engram_core::types::event::ManagedHarnessEvent,
+    ) -> Result<engram_core::types::event::ManagedHarnessEventAccepted, MetaError> {
+        event.validate()?;
+        let sid = event.target.session_id;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Read only to select the generation lock. Authority is checked again
+        // after the session lock, which also serializes interruption and append.
+        let raw: serde_json::Value =
+            sqlx::query_scalar("SELECT record FROM session_managed_boots WHERE session_id=$1")
+                .bind(sid.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(conflict)?;
+        let candidate: ManagedBootRecord = serde_json::from_value(raw).map_err(|_| conflict())?;
+        crate::managed_operator_gate::require(&mut tx, &candidate.request.key).await?;
+        let active: bool =
+            sqlx::query_scalar("SELECT status='active' FROM sessions WHERE id=$1 FOR UPDATE")
+                .bind(sid.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(conflict)?;
+        let current = read(&mut tx, &candidate.request.key).await?;
+        let interrupted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM session_managed_interrupted_targets WHERE session_id=$1 AND binding_epoch=$2)")
+            .bind(sid.as_uuid()).bind(event.target.binding_epoch as i64).fetch_one(&mut *tx).await.map_err(db_err)?;
+        if !active
+            || interrupted
+            || current.phase != ManagedBootPhase::Started
+            || current.request.key.context.target != event.target
+        {
+            return Err(conflict());
+        }
+        let key = event.key();
+        if let Some(previous) = sqlx::query("SELECT kind,payload FROM session_events WHERE session_id=$1 AND payload->>'idempotency_key'=$2")
+            .bind(sid.as_uuid()).bind(&key).fetch_optional(&mut *tx).await.map_err(db_err)? {
+            if !event.matches_replay(&previous.try_get::<String,_>("kind").map_err(db_err)?, &previous.try_get("payload").map_err(db_err)?) {
+                return Err(conflict());
+            }
+        }
+        let now = self.clock.now_utc();
+        let idx = crate::append_event_idempotent_tx(
+            &mut tx,
+            sid,
+            &key,
+            &event.kind,
+            event.payload.clone(),
+            now,
+        )
+        .await?;
+        let outbox_acked = if let Some(ack) = &event.ack_id {
+            sqlx::query("UPDATE session_outbox SET acked_at=$3 WHERE session_id=$1 AND prompt_id=$2 AND acked_at IS NULL")
+                .bind(sid.as_uuid()).bind(ack).bind(now).execute(&mut *tx).await.map_err(db_err)?.rows_affected() > 0
+        } else {
+            false
+        };
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::event::ManagedHarnessEventAccepted { idx, outbox_acked })
+    }
 }
