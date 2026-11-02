@@ -18,10 +18,9 @@ import type {
 import { makeCredentialBroker } from "./credential-broker.ts";
 import { makeMcpActiveWatch } from "./active-watch.ts";
 import { canonicalDigest, canonicalJson } from "./hash.ts";
-import { makeMcpJournal, type McpLiveDispatchAuthorization } from "./journal.ts";
+import { makeMcpJournal, McpUnknownWrite, type McpLiveDispatchAuthorization } from "./journal.ts";
 import { requestPolicyContext } from "./journal-review.ts";
 import { MCP_LIMITS } from "./limits.ts";
-import { lockRuntimeAuthority } from "./runtime-authority.ts";
 import { makeSessionWritePolicy, type RequestPolicyContext } from "./session-policy.ts";
 import {
   resolveSnapshotTool,
@@ -236,12 +235,7 @@ export function makeMcpEffectDriver(deps: {
     publication(snapshot);
     if (snapshot.bindingHash !== call.bindingHash)
       throw new McpAuthorityStale("MCP binding changed");
-    await db.transaction((tx) => lockRuntimeAuthority(tx, call, "share"));
-    if (
-      call.classification === "write" &&
-      (await journal.hasUnknown(call.sessionId, call.connectionId, deps.now()))
-    )
-      throw Error("unknown write outcome blocks this connection");
+    await journal.assertCurrent(call, deps.now());
     await fence(requestPolicyContext(call.requestContext!), resolved, call.originalArguments);
     enabled(resolved, signal);
     return resolved;
@@ -406,12 +400,6 @@ export function makeMcpEffectDriver(deps: {
         .where(eq(taskSession.sessionId, input.sessionId));
       if (!session?.integrationPrincipalId) throw new McpRequestDenied("principal_unavailable");
       const write = resolved.reviewedTool.classification === "write";
-      if (
-        write &&
-        (context.acceptedWriteEligibility !== "write_eligible" ||
-          (await journal.hasUnknown(input.sessionId, resolved.binding.connectionId, deps.now())))
-      )
-        throw new McpRequestDenied("write_not_allowed");
       const authorization = !write
         ? { kind: "read" as const }
         : session.integrationPrincipalId.startsWith("automation:")
@@ -453,6 +441,7 @@ export function makeMcpEffectDriver(deps: {
         // A concurrent first acceptance owns the deadline and immutable context.
         const winner = await lookup(input);
         if (winner) return winner;
+        if (error instanceof McpUnknownWrite) throw new McpRequestDenied("write_not_allowed");
         throw error;
       }
       await current(call);
