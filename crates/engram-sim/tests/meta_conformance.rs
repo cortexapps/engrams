@@ -7581,3 +7581,242 @@ conformance!(
     t_mcp_guest_binding_rejected,
     super::mcp_guest_binding_rejected
 );
+
+// Consuming a redirect must remove its encrypted state before any exchange.
+async fn mcp_flow_consume(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "registered-a".into(),
+    };
+    let id = uuid::Uuid::from_u128(810);
+    let flow = OAuthFlow {
+        id,
+        key: key.clone(),
+        owner_replica: "replica-a".into(),
+        lease_expires_at: now + chrono::Duration::minutes(10),
+        expires_at: now + chrono::Duration::minutes(10),
+        status: OAuthFlowStatus::Pending,
+        error_code: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let state = McpSealedState {
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+    };
+    ctx.meta
+        .create_mcp_oauth_flow(flow.clone(), state.clone())
+        .await
+        .unwrap();
+    let mut wrong = key.clone();
+    wrong.subject_id = "connection-b".into();
+    assert!(ctx.meta.consume_mcp_oauth_flow(id, &wrong).await.is_err());
+    let (a, b) = tokio::join!(
+        ctx.meta.consume_mcp_oauth_flow(id, &key),
+        ctx.meta.consume_mcp_oauth_flow(id, &key)
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert_eq!(a.or(b).unwrap(), state);
+    assert!(ctx.meta.consume_mcp_oauth_flow(id, &key).await.is_err());
+    ctx.meta
+        .finish_oauth_flow_unowned(id, OAuthFlowStatus::Succeeded, None)
+        .await
+        .unwrap();
+    let mut expired = flow;
+    expired.id = uuid::Uuid::from_u128(811);
+    ctx.meta
+        .create_mcp_oauth_flow(expired, state)
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(600));
+    assert!(ctx
+        .meta
+        .consume_mcp_oauth_flow(uuid::Uuid::from_u128(811), &key)
+        .await
+        .is_err());
+}
+conformance!(t_mcp_flow_consume, mcp_flow_consume);
+
+async fn mcp_admission_and_refresh(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Mcp,
+        subject_id: "connection-a".into(),
+        provider: "registered-a".into(),
+    };
+    let candidate = NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+        metadata: OAuthAccountMetadata::default(),
+        expires_at: Some(now),
+    };
+    let row = ctx
+        .meta
+        .put_oauth_credential(candidate.clone(), None)
+        .await
+        .unwrap();
+    let claim = McpRefreshClaim {
+        id: uuid::Uuid::from_u128(901),
+        key: key.clone(),
+        version: row.version,
+        expires_at: now + chrono::Duration::seconds(20),
+    };
+    let (a, b) = tokio::join!(
+        ctx.meta.claim_mcp_refresh(&claim),
+        ctx.meta.claim_mcp_refresh(&claim)
+    );
+    assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1);
+    assert!(ctx
+        .meta
+        .get_oauth_credential(&key)
+        .await
+        .unwrap()
+        .unwrap()
+        .broken_at
+        .is_some());
+    let mut wrong = claim.clone();
+    wrong.id = uuid::Uuid::from_u128(902);
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(candidate.clone(), &wrong)
+        .await
+        .is_err());
+    let refreshed = ctx
+        .meta
+        .complete_mcp_refresh(candidate.clone(), &claim)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.version, row.version + 1);
+    assert!(refreshed.broken_at.is_none());
+    let mut uncertain = claim;
+    uncertain.version = refreshed.version;
+    assert!(ctx.meta.claim_mcp_refresh(&uncertain).await.unwrap());
+    ctx.clock.advance(Duration::from_secs(21));
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(candidate, &uncertain)
+        .await
+        .is_err());
+    uncertain.expires_at = ctx.clock.now_utc() + chrono::Duration::seconds(20);
+    assert!(
+        !ctx.meta.claim_mcp_refresh(&uncertain).await.unwrap(),
+        "uncertain rotation must require reconnect"
+    );
+    let lease = |n| McpOAuthAdmission {
+        id: uuid::Uuid::from_u128(n),
+        deployment_id: "deployment-a".into(),
+        connection_id: format!("connection-{n}"),
+        expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(15),
+    };
+    let leases: Vec<_> = (1..=5).map(lease).collect();
+    for item in &leases[..4] {
+        assert!(ctx.meta.acquire_mcp_oauth_admission(item).await.unwrap());
+    }
+    assert!(!ctx
+        .meta
+        .acquire_mcp_oauth_admission(&leases[4])
+        .await
+        .unwrap());
+    ctx.meta
+        .release_mcp_oauth_admission(&leases[0])
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .acquire_mcp_oauth_admission(&leases[4])
+        .await
+        .unwrap());
+    let mut same_connection = leases[4].clone();
+    same_connection.id = uuid::Uuid::from_u128(99);
+    assert!(!ctx
+        .meta
+        .acquire_mcp_oauth_admission(&same_connection)
+        .await
+        .unwrap());
+    ctx.clock.advance(Duration::from_secs(15));
+    same_connection.expires_at = ctx.clock.now_utc() + chrono::Duration::seconds(15);
+    assert!(ctx
+        .meta
+        .acquire_mcp_oauth_admission(&same_connection)
+        .await
+        .unwrap());
+    let contenders: Vec<_> = (201..=205)
+        .map(|n| McpOAuthAdmission {
+            id: uuid::Uuid::from_u128(n),
+            deployment_id: "deployment-race".into(),
+            connection_id: format!("connection-{n}"),
+            expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(15),
+        })
+        .collect();
+    let (a, b, c, d, e) = tokio::join!(
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[0]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[1]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[2]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[3]),
+        ctx.meta.acquire_mcp_oauth_admission(&contenders[4]),
+    );
+    assert_eq!(
+        [a, b, c, d, e]
+            .into_iter()
+            .filter(|r| *r.as_ref().unwrap())
+            .count(),
+        4
+    );
+    // Revocation fences both a dispatched refresh and a late reconnect CAS.
+    let mut replacement = NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![1; 32],
+        nonce: vec![2; 12],
+        ciphertext: vec![3; 64],
+        key_id: "test".into(),
+        metadata: OAuthAccountMetadata::default(),
+        expires_at: None,
+    };
+    replacement.key.subject_id = "connection-revoked".into();
+    let row = ctx
+        .meta
+        .put_oauth_credential(replacement.clone(), None)
+        .await
+        .unwrap();
+    let claim = McpRefreshClaim {
+        id: uuid::Uuid::from_u128(903),
+        key: replacement.key.clone(),
+        version: row.version,
+        expires_at: ctx.clock.now_utc() + chrono::Duration::seconds(20),
+    };
+    assert!(ctx.meta.claim_mcp_refresh(&claim).await.unwrap());
+    let receipt = ctx
+        .meta
+        .revoke_oauth_credential(&replacement.key, row.version)
+        .await
+        .unwrap();
+    assert_eq!(receipt.version, row.version + 1);
+    assert!(ctx
+        .meta
+        .complete_mcp_refresh(replacement.clone(), &claim)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .put_oauth_credential(replacement.clone(), Some(row.version))
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_oauth_credential(&replacement.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+}
+conformance!(t_mcp_admission_and_refresh, mcp_admission_and_refresh);

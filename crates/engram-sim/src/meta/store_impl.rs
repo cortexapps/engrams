@@ -5795,6 +5795,157 @@ impl MetadataStore for SimMetadataStore {
         Ok(row.clone())
     }
 
+    async fn claim_mcp_refresh(
+        &self,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        if claim.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp
+            || claim.expires_at <= now
+            || claim.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid refresh claim".into()));
+        }
+        let mut db = self.db.lock();
+        let Some(row) = db.oauth_credentials.get_mut(&claim.key) else {
+            return Ok(false);
+        };
+        if row.version != claim.version || row.revoked_at.is_some() || row.broken_at.is_some() {
+            return Ok(false);
+        }
+        row.broken_at = Some(now);
+        row.broken_reason = Some("refresh_pending".into());
+        db.mcp_refresh_claims
+            .insert(claim.key.clone(), claim.clone());
+        Ok(true)
+    }
+    async fn complete_mcp_refresh(
+        &self,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if credential.key != claim.key
+            || db.mcp_refresh_claims.get(&claim.key) != Some(claim)
+            || claim.expires_at <= now
+        {
+            return Err(MetaError::Conflict("refresh claim lost".into()));
+        }
+        let row = db
+            .oauth_credentials
+            .get_mut(&claim.key)
+            .ok_or(MetaError::NotFound)?;
+        if row.version != claim.version
+            || row.revoked_at.is_some()
+            || row.broken_reason.as_deref() != Some("refresh_pending")
+        {
+            return Err(MetaError::Conflict("refresh claim lost".into()));
+        }
+        row.wrapped_dek = credential.wrapped_dek;
+        row.nonce = credential.nonce;
+        row.ciphertext = credential.ciphertext;
+        row.key_id = credential.key_id;
+        row.metadata = credential.metadata;
+        row.expires_at = credential.expires_at;
+        row.version += 1;
+        row.updated_at = now;
+        row.broken_at = None;
+        row.broken_reason = None;
+        let result = row.clone();
+        db.mcp_refresh_claims.remove(&claim.key);
+        db.oauth_refresh_claims.remove(&claim.key);
+        Ok(result)
+    }
+    async fn acquire_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        if lease.deployment_id.is_empty()
+            || lease.connection_id.is_empty()
+            || lease.expires_at <= now
+            || lease.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid OAuth admission".into()));
+        }
+        let mut db = self.db.lock();
+        db.mcp_oauth_admission.retain(|_, l| l.expires_at > now);
+        if db.mcp_oauth_admission.contains_key(&lease.id)
+            || db.mcp_oauth_admission.values().any(|l| {
+                l.deployment_id == lease.deployment_id && l.connection_id == lease.connection_id
+            })
+            || db
+                .mcp_oauth_admission
+                .values()
+                .filter(|l| l.deployment_id == lease.deployment_id)
+                .count()
+                >= 4
+        {
+            return Ok(false);
+        }
+        db.mcp_oauth_admission.insert(lease.id, lease.clone());
+        Ok(true)
+    }
+    async fn release_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        if db.mcp_oauth_admission.get(&lease.id) == Some(lease) {
+            db.mcp_oauth_admission.remove(&lease.id);
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_oauth_flow(
+        &self,
+        flow: engram_core::types::oauth::OAuthFlow,
+        state: engram_core::types::mcp::McpSealedState,
+    ) -> Result<(), MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        self.gate()?;
+        let mut db = self.db.lock();
+        if flow.key.subject_kind != OAuthSubjectKind::Mcp
+            || flow.status != OAuthFlowStatus::Pending
+            || flow.expires_at <= self.now()
+            || db.oauth_flows.contains_key(&flow.id)
+            || db
+                .oauth_flows
+                .values()
+                .any(|f| f.key == flow.key && f.status == OAuthFlowStatus::Pending)
+        {
+            return Err(MetaError::Conflict("MCP flow creation rejected".into()));
+        }
+        db.mcp_flow_states.insert(flow.id, state);
+        db.oauth_flows.insert(flow.id, flow);
+        Ok(())
+    }
+    async fn consume_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<engram_core::types::mcp::McpSealedState, MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        self.gate()?;
+        let mut db = self.db.lock();
+        let flow = db.oauth_flows.get(&id).ok_or(MetaError::NotFound)?;
+        if key.subject_kind != OAuthSubjectKind::Mcp
+            || &flow.key != key
+            || flow.status != OAuthFlowStatus::Pending
+            || flow.expires_at <= self.now()
+        {
+            return Err(MetaError::Conflict("MCP state unavailable".into()));
+        }
+        db.mcp_flow_states
+            .remove(&id)
+            .ok_or_else(|| MetaError::Conflict("MCP state consumed".into()))
+    }
+
     async fn create_oauth_flow(
         &self,
         flow: engram_core::types::oauth::OAuthFlow,
@@ -5951,6 +6102,13 @@ impl MetadataStore for SimMetadataStore {
         let before = db.oauth_flows.len();
         db.oauth_flows
             .retain(|_, flow| !flow.status.is_terminal() || flow.updated_at >= delete_before);
+        let pending: std::collections::BTreeSet<_> = db
+            .oauth_flows
+            .values()
+            .filter(|f| !f.status.is_terminal())
+            .map(|f| f.id)
+            .collect();
+        db.mcp_flow_states.retain(|id, _| pending.contains(id));
         Ok(changed + (before - db.oauth_flows.len()) as u64)
     }
 }

@@ -17,6 +17,7 @@ pub mod image;
 pub mod integration;
 pub mod manifest;
 pub mod materialize;
+pub mod mcp;
 pub mod oauth;
 pub mod org_secret;
 pub mod outbox;

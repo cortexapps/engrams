@@ -35,6 +35,19 @@ OAuth have separate budgets. The worker cannot authorize a tool call or refresh 
 credential on its own. The coordinator is the only credential and refresh
 authority. The worker receives secrets only after admission, near dispatch.
 
+The coordinator exposes credential control only on a separate, default-off mTLS
+listener. Exact client certificate pins identify the trusted orchestrator role.
+The existing cleartext application gRPC listener never serves this service. The
+orchestrator may hold a short-lived credential lease in memory for one admitted
+worker operation. It must not queue, cache, log, persist, or return the value to a
+guest or browser. Resource calls use the orchestrator worker role; OAuth metadata
+and token calls use the coordinator worker role. A lease checks the actual sealed
+identity, config revision, and authorization generation, including when publication
+in the orchestrator database failed. Worker boot and operator policy must match
+the frozen operation; a new identity lookup cannot replace a frozen boot identity.
+Worker boot binds an operation, not durable credential authority. After a worker
+restart, fresh operations can use the current boot with the same sealed authority.
+
 ### Reviewed catalogs and session binding
 
 Reuse named integration connections and profile integration grants. Discovery
@@ -101,6 +114,19 @@ consent to share the organization-session account.
 Use single-flight refresh and rotating-token compare-and-swap. Do not fall back
 to stale credentials or expand scope silently. Send access tokens only to the
 resource; send client secrets and refresh tokens only to the token endpoint.
+
+MCP redirect state is sealed in the existing OAuth flow store and consumed
+atomically before token exchange. Coordinator OAuth requests use durable admission
+with four concurrent slots per deployment and one per connection. Refresh claims
+are exclusive and version-fenced; a token deadline ends before its claim. An
+uncertain rotating exchange leaves the credential unavailable until reconnect.
+No expired-claim retry may reuse the previous refresh token. Ordinary refresh
+preserves authority identity; reconnect and API-key rotation create a new identity
+bound to the next expected authorization generation. Before switching credential
+kinds, references, or registrations, the orchestrator serializes the connection
+transition and revokes the old authority with its exact identity and version. It
+verifies the durable revocation receipt before acquisition and publication of the
+replacement. Failed publication cannot restore the old authority.
 
 ### Authorization and irreversible dispatch
 

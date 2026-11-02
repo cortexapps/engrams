@@ -582,6 +582,52 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::NotFound)
     }
 
+    /// Exclusive refresh dispatch. Marks the current token unavailable immediately;
+    /// an expired or uncertain claim cannot be reacquired without reconnect.
+    async fn claim_mcp_refresh(
+        &self,
+        _claim: &crate::types::mcp::McpRefreshClaim,
+    ) -> Result<bool, MetaError> {
+        Err(MetaError::Conflict("MCP refresh unavailable".into()))
+    }
+    async fn complete_mcp_refresh(
+        &self,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _claim: &crate::types::mcp::McpRefreshClaim,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict("MCP refresh unavailable".into()))
+    }
+    /// Four deployment slots and one slot per connection, shared by replicas.
+    async fn acquire_mcp_oauth_admission(
+        &self,
+        _lease: &crate::types::mcp::McpOAuthAdmission,
+    ) -> Result<bool, MetaError> {
+        Err(MetaError::Conflict("MCP admission unavailable".into()))
+    }
+    async fn release_mcp_oauth_admission(
+        &self,
+        _lease: &crate::types::mcp::McpOAuthAdmission,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP admission unavailable".into()))
+    }
+
+    /// Create encrypted MCP redirect state atomically with its metadata row.
+    async fn create_mcp_oauth_flow(
+        &self,
+        _flow: crate::types::oauth::OAuthFlow,
+        _state: crate::types::mcp::McpSealedState,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+    /// Remove and return state exactly once, before any token exchange.
+    async fn consume_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<crate::types::mcp::McpSealedState, MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+
     async fn create_oauth_flow(
         &self,
         _flow: crate::types::oauth::OAuthFlow,

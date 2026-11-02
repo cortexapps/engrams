@@ -243,6 +243,14 @@ pub struct SimDb {
     /// state, not part of the domain credential type.
     pub oauth_refresh_claims:
         std::collections::BTreeMap<engram_core::types::oauth::OAuthCredentialKey, DateTime<Utc>>,
+    pub mcp_refresh_claims: std::collections::BTreeMap<
+        engram_core::types::oauth::OAuthCredentialKey,
+        engram_core::types::mcp::McpRefreshClaim,
+    >,
+    pub mcp_oauth_admission:
+        std::collections::BTreeMap<uuid::Uuid, engram_core::types::mcp::McpOAuthAdmission>,
+    pub mcp_flow_states:
+        std::collections::BTreeMap<uuid::Uuid, engram_core::types::mcp::McpSealedState>,
     pub oauth_flows: std::collections::BTreeMap<uuid::Uuid, engram_core::types::oauth::OAuthFlow>,
     pub session_oauth_bindings:
         std::collections::BTreeMap<SessionId, engram_core::types::oauth::SessionOAuthBinding>,

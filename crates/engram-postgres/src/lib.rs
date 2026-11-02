@@ -2237,6 +2237,116 @@ impl MetadataStore for PostgresStore {
         }
     }
 
+    async fn claim_mcp_refresh(
+        &self,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        if claim.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp
+            || claim.expires_at <= now
+            || claim.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid refresh claim".into()));
+        }
+        let r = sqlx::query("UPDATE oauth_credentials SET mcp_refresh_claim=$4, refresh_claim_until=$5, broken_at=$6, broken_reason='refresh_pending' WHERE subject_kind='mcp' AND subject_id=$1 AND provider=$2 AND version=$3 AND revoked_at IS NULL AND broken_at IS NULL")
+            .bind(&claim.key.subject_id).bind(&claim.key.provider).bind(claim.version).bind(claim.id).bind(claim.expires_at).bind(now).execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() == 1)
+    }
+    async fn complete_mcp_refresh(
+        &self,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        if credential.key != claim.key
+            || claim.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp
+        {
+            return Err(MetaError::Conflict("refresh claim lost".into()));
+        }
+        let metadata = serde_json::to_value(&credential.metadata)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let row = sqlx::query("UPDATE oauth_credentials SET wrapped_dek=$6,nonce=$7,ciphertext=$8,key_id=$9,account_metadata=$10,expires_at=$11,version=version+1,updated_at=$12,broken_at=NULL,broken_reason=NULL,refresh_claim_until=NULL,mcp_refresh_claim=NULL WHERE subject_kind='mcp' AND subject_id=$1 AND provider=$2 AND version=$3 AND mcp_refresh_claim=$4 AND refresh_claim_until=$5 AND refresh_claim_until>$12 AND revoked_at IS NULL AND broken_reason='refresh_pending' RETURNING *")
+            .bind(&claim.key.subject_id).bind(&claim.key.provider).bind(claim.version).bind(claim.id).bind(claim.expires_at)
+            .bind(credential.wrapped_dek).bind(credential.nonce).bind(credential.ciphertext).bind(credential.key_id).bind(metadata).bind(credential.expires_at).bind(self.clock.now_utc()).fetch_optional(&self.pool).await.map_err(db_err)?.ok_or_else(|| MetaError::Conflict("refresh claim lost".into()))?;
+        oauth_credential_from_pg(&row)
+    }
+    async fn acquire_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        if lease.deployment_id.is_empty()
+            || lease.connection_id.is_empty()
+            || lease.expires_at <= now
+            || lease.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid OAuth admission".into()));
+        }
+        sqlx::query("DELETE FROM mcp_oauth_admission WHERE expires_at<=$1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        // The fixed slot primary key and connection uniqueness bound concurrent replicas.
+        for slot in 0..4i16 {
+            let r = sqlx::query("INSERT INTO mcp_oauth_admission (deployment_id,slot,id,connection_id,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+                .bind(&lease.deployment_id).bind(slot).bind(lease.id).bind(&lease.connection_id).bind(lease.expires_at).execute(&self.pool).await.map_err(db_err)?;
+            if r.rows_affected() == 1 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    async fn release_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM mcp_oauth_admission WHERE id=$1 AND deployment_id=$2 AND connection_id=$3 AND expires_at=$4")
+            .bind(lease.id).bind(&lease.deployment_id).bind(&lease.connection_id).bind(lease.expires_at).execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn create_mcp_oauth_flow(
+        &self,
+        flow: engram_core::types::oauth::OAuthFlow,
+        state: engram_core::types::mcp::McpSealedState,
+    ) -> Result<(), MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        if flow.key.subject_kind != OAuthSubjectKind::Mcp
+            || flow.status != OAuthFlowStatus::Pending
+            || flow.expires_at <= self.clock.now_utc()
+        {
+            return Err(MetaError::Conflict("MCP flow creation rejected".into()));
+        }
+        let state =
+            serde_json::to_value(state).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let result = sqlx::query("INSERT INTO oauth_flows (id,subject_kind,subject_id,provider,owner_replica,lease_expires_at,expires_at,status,created_at,updated_at,mcp_state) VALUES ($1,'mcp',$2,$3,$4,$5,$6,'pending',$7,$8,$9) ON CONFLICT DO NOTHING")
+            .bind(flow.id).bind(&flow.key.subject_id).bind(&flow.key.provider).bind(&flow.owner_replica).bind(flow.lease_expires_at).bind(flow.expires_at).bind(flow.created_at).bind(flow.updated_at).bind(state).execute(&self.pool).await.map_err(db_err)?;
+        if result.rows_affected() != 1 {
+            return Err(MetaError::Conflict("MCP flow creation rejected".into()));
+        }
+        Ok(())
+    }
+    async fn consume_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<engram_core::types::mcp::McpSealedState, MetaError> {
+        if key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP state unavailable".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let state: Option<serde_json::Value> = sqlx::query_scalar("SELECT mcp_state FROM oauth_flows WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3 AND status='pending' AND expires_at>$4 AND mcp_state IS NOT NULL FOR UPDATE")
+            .bind(id).bind(&key.subject_id).bind(&key.provider).bind(self.clock.now_utc()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let state = state.ok_or_else(|| MetaError::Conflict("MCP state unavailable".into()))?;
+        sqlx::query("UPDATE oauth_flows SET mcp_state=NULL WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        serde_json::from_value(state).map_err(|e| MetaError::Serialization(e.to_string()))
+    }
+
     async fn create_oauth_flow(
         &self,
         flow: engram_core::types::oauth::OAuthFlow,
@@ -2559,6 +2669,8 @@ impl MetadataStore for PostgresStore {
         now: chrono::DateTime<chrono::Utc>,
         delete_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, MetaError> {
+        sqlx::query("UPDATE oauth_flows SET mcp_state=NULL WHERE mcp_state IS NOT NULL AND (status<>'pending' OR expires_at<=$1 OR lease_expires_at<=$1)")
+            .bind(now).execute(&self.pool).await.map_err(db_err)?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let changed = sqlx::query(
             r#"
