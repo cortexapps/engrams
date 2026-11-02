@@ -1,3 +1,4 @@
+import { McpAuthorityStale } from "./authority-error.ts";
 import {
   create,
   fromJson,
@@ -128,21 +129,33 @@ export async function lockHumanSession(
   sessionId: string,
   actorId: string,
   includeAncestors = false,
+  sessionLock: "share" | "update" = "share",
 ) {
   const [actor] = await tx.select().from(user).where(eq(user.id, actorId)).for("share");
   if (!actor || actor.banned || isServiceAccountEmail(actor.email))
-    throw new Error("human session owner or administrator required");
-  const { owner, session, ancestors } = await lockSessionChain(tx, sessionId, includeAncestors);
+    throw new McpAuthorityStale("human session owner or administrator required");
+  const { owner, session, ancestors } = await lockSessionChain(
+    tx,
+    sessionId,
+    includeAncestors,
+    sessionLock,
+  );
   if (actor.role !== "admin" && owner.createdByUserId !== actorId)
-    throw new Error("human session owner or administrator required");
+    throw new McpAuthorityStale("human session owner or administrator required");
   return { owner, session, actor, ancestors };
 }
-export async function lockSessionChain(tx: JournalTx, sessionId: string, includeAncestors = true) {
+export async function lockSessionChain(
+  tx: JournalTx,
+  sessionId: string,
+  includeAncestors = true,
+  sessionLock: "share" | "update" = "share",
+) {
   const chain: { sessionId: string; taskId: string; parentId: string | null }[] = [];
   let id: string | null = sessionId;
   const seen = new Set<string>();
   while (id) {
-    if (seen.has(id) || chain.length >= 32) throw new Error("stale MCP review ancestry");
+    if (seen.has(id) || chain.length >= 32)
+      throw new McpAuthorityStale("stale MCP review ancestry");
     seen.add(id);
     const refs = await tx
       .select({ taskId: taskSession.taskId, parentId: task.spawningSessionId })
@@ -150,7 +163,8 @@ export async function lockSessionChain(tx: JournalTx, sessionId: string, include
       .innerJoin(task, eq(task.id, taskSession.taskId))
       .where(eq(taskSession.sessionId, id))
       .limit(2);
-    if (refs.length !== 1) throw new Error("human session owner or administrator required");
+    if (refs.length !== 1)
+      throw new McpAuthorityStale("human session owner or administrator required");
     chain.push({ sessionId: id, ...refs[0]! });
     id = includeAncestors ? refs[0]!.parentId : null;
   }
@@ -158,7 +172,7 @@ export async function lockSessionChain(tx: JournalTx, sessionId: string, include
   const tasks = new Map<string, typeof task.$inferSelect>();
   for (const taskId of [...new Set(chain.map((ref) => ref.taskId))].sort()) {
     const [row] = await tx.select().from(task).where(eq(task.id, taskId)).for("share");
-    if (!row) throw new Error("human session owner or administrator required");
+    if (!row) throw new McpAuthorityStale("human session owner or administrator required");
     tasks.set(taskId, row);
   }
   const sessions = new Map<string, typeof taskSession.$inferSelect>();
@@ -167,10 +181,10 @@ export async function lockSessionChain(tx: JournalTx, sessionId: string, include
       .select()
       .from(taskSession)
       .where(and(eq(taskSession.sessionId, ref.sessionId), eq(taskSession.taskId, ref.taskId)))
-      .for("share");
+      .for(sessionLock);
     // Revalidate the discovered chain after all relevant writes are blocked.
     if (!row || tasks.get(ref.taskId)?.spawningSessionId !== ref.parentId)
-      throw new Error("stale MCP review ancestry");
+      throw new McpAuthorityStale("stale MCP review ancestry");
     sessions.set(ref.sessionId, row);
   }
   const owner = tasks.get(chain[0]!.taskId)!,
@@ -191,7 +205,7 @@ export async function assertLocalReviewCurrent(
   connectionLock: "share" | "update" = "share",
 ) {
   if (!call.requestContext || call.originalArguments === null || !session.mcpBindingEnvelope)
-    throw new Error("original request context unavailable");
+    throw new McpAuthorityStale("original request context unavailable");
   const stored = restoreBindingSnapshot(
     session.mcpBindingEnvelope,
     session.integrationConnections ?? [],
@@ -209,16 +223,17 @@ export async function assertLocalReviewCurrent(
       (binding) => canonicalDigest(binding) === canonicalDigest(bound.binding),
     )
   )
-    throw new Error("stale MCP review binding");
+    throw new McpAuthorityStale("stale MCP review binding");
   const snapshots = [stored];
   const [leafTask] = await tx.select().from(task).where(eq(task.id, session.taskId));
   let parentId = leafTask?.spawningSessionId;
   const seen = new Set([session.sessionId]);
-  if (stored.ancestorAuthorityRefs.length >= 32) throw new Error("stale MCP review ancestry");
+  if (stored.ancestorAuthorityRefs.length >= 32)
+    throw new McpAuthorityStale("stale MCP review ancestry");
   for (let i = 0; i < stored.ancestorAuthorityRefs.length; i++) {
     const expected = stored.ancestorAuthorityRefs[i]!;
     if (parentId !== expected.sessionId || seen.has(parentId))
-      throw new Error("stale MCP review ancestry");
+      throw new McpAuthorityStale("stale MCP review ancestry");
     seen.add(parentId);
     const ancestor = ancestors[i]?.session,
       ancestorTask = ancestors[i]?.owner;
@@ -228,7 +243,7 @@ export async function assertLocalReviewCurrent(
       ancestor.sessionId !== parentId ||
       ["done", "failed", "cancelled"].includes(ancestorTask.status)
     )
-      throw new Error("stale MCP review ancestry");
+      throw new McpAuthorityStale("stale MCP review ancestry");
     const snapshot = restoreBindingSnapshot(
       ancestor.mcpBindingEnvelope,
       ancestor.integrationConnections ?? [],
@@ -239,12 +254,12 @@ export async function assertLocalReviewCurrent(
       canonicalDigest(snapshot.ancestorAuthorityRefs) !==
         canonicalDigest(stored.ancestorAuthorityRefs.slice(i + 1))
     )
-      throw new Error("stale MCP review ancestry");
+      throw new McpAuthorityStale("stale MCP review ancestry");
     snapshots.push(snapshot);
     parentId = ancestorTask.spawningSessionId;
   }
   if (parentId || ancestors.length !== stored.ancestorAuthorityRefs.length)
-    throw new Error("stale MCP review ancestry");
+    throw new McpAuthorityStale("stale MCP review ancestry");
   const profileIds = [...new Set(snapshots.map((snapshot) => snapshot.profileId))].sort();
   for (const id of profileIds) {
     const [currentProfile] = await tx.select().from(profile).where(eq(profile.id, id)).for("share");
@@ -262,7 +277,7 @@ export async function assertLocalReviewCurrent(
               canonicalDigest(snapshot.profilePublication ?? null),
         )
     )
-      throw new Error("stale MCP review profile");
+      throw new McpAuthorityStale("stale MCP review profile");
   }
   const bindings = snapshots.flatMap((snapshot) => snapshot.immutableBindings);
   for (const id of [...new Set(bindings.map((binding) => binding.connectionId))].sort()) {
@@ -300,7 +315,7 @@ export async function assertLocalReviewCurrent(
             !catalog.tools.some((tool) => canonicalDigest(tool) === canonicalDigest(bound.tool)),
         )
       )
-        throw new Error("stale MCP review connection");
+        throw new McpAuthorityStale("stale MCP review connection");
     }
   }
 }
@@ -309,7 +324,7 @@ export function reviewContext(
   approval: typeof mcpApproval.$inferSelect,
 ): JournalReviewContext {
   if (!call.requestContext || call.originalArguments === null)
-    throw new Error("original request context unavailable");
+    throw new McpAuthorityStale("original request context unavailable");
   const { resolvedTool } = call.requestContext,
     policy = requestPolicyContext(call.requestContext);
   return {

@@ -1,3 +1,4 @@
+import { McpAuthorityStale } from "./authority-error.ts";
 import { makeSessionBindingResolver } from "./session-resolver.ts";
 import { makeSessionWritePolicy } from "./session-policy.ts";
 import { and, eq } from "drizzle-orm";
@@ -58,7 +59,7 @@ export function restoreBindingSnapshot(
       binding.alias !== connection.alias ||
       canonicalDigest(binding.config) !== canonicalDigest(connection.config)
     )
-      throw new Error("MCP stored binding identity missing");
+      throw new McpAuthorityStale("MCP stored binding identity missing");
     immutableBindings.push(binding);
   }
   immutableBindings.sort((a, b) =>
@@ -69,7 +70,8 @@ export function restoreBindingSnapshot(
     immutableBindings: structuredClone(immutableBindings),
   };
   const { bindingHash, ...body } = snapshot;
-  if (canonicalDigest(body) !== bindingHash) throw new Error("MCP stored binding hash mismatch");
+  if (canonicalDigest(body) !== bindingHash)
+    throw new McpAuthorityStale("MCP stored binding hash mismatch");
   return snapshot;
 }
 export async function readStoredBindingSession(
@@ -100,10 +102,11 @@ export async function readStoredBindingSession(
 export async function readLiveBindingAuthority(
   profileId: string,
   operatorPolicies: readonly McpOperatorPolicy[],
-  db = getDb(),
+  db: ReturnType<typeof getDb> | import("./journal-review.ts").JournalTx = getDb(),
 ): Promise<McpLiveAuthority> {
   const [currentProfile] = await db.select().from(profile).where(eq(profile.id, profileId));
-  if (!currentProfile || currentProfile.deletedAt) throw new Error("MCP profile unavailable");
+  if (!currentProfile || currentProfile.deletedAt)
+    throw new McpAuthorityStale("MCP profile unavailable");
   const rows = await db
     .select()
     .from(integrationConnection)
@@ -127,7 +130,7 @@ export async function readLiveBindingAuthority(
       catalog.credentialIdentity === row.credentialIdentity;
     const tools = available ? reviewCatalog(catalog.tools) : [];
     if (available && canonicalDigest(tools) !== canonicalDigest(catalog.tools))
-      throw new Error("MCP catalog fingerprint mismatch");
+      throw new McpAuthorityStale("MCP catalog fingerprint mismatch");
     connections.push({
       id: row.id,
       catalogId: catalog?.id ?? "",

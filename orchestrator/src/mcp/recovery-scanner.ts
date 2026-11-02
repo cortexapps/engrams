@@ -15,6 +15,8 @@ export function makeMcpRecoveryScanner(deps: {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | undefined;
   let stopped = true;
+  let lifecycleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lifecycleRunning: Promise<void> | undefined;
   async function runOnce() {
     const journal = deps.journal ?? makeMcpJournal();
     const now = (deps.now ?? (() => new Date()))();
@@ -41,18 +43,36 @@ export function makeMcpRecoveryScanner(deps: {
         running = tick();
       }, 1_000);
   }
+  async function runLifecycleOnce() {
+    await (deps.runtime ?? mcpRecovery)()?.reconcileLifecycle();
+  }
+  async function lifecycleTick() {
+    try {
+      await runLifecycleOnce();
+    } catch {
+      log.warn("MCP lifecycle reconciliation unavailable");
+    }
+    if (!stopped)
+      lifecycleTimer = setTimeout(() => {
+        lifecycleRunning = lifecycleTick();
+      }, 1_000);
+  }
   return {
     runOnce,
+    runLifecycleOnce,
     async start() {
       if (!stopped) return;
       stopped = false;
       running = tick();
+      lifecycleRunning = lifecycleTick();
       await running;
     },
     async stop() {
       stopped = true;
       clearTimeout(timer);
+      clearTimeout(lifecycleTimer);
       await running;
+      await lifecycleRunning;
     },
   };
 }

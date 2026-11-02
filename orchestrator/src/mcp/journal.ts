@@ -1,6 +1,6 @@
 import { lockRuntimeAuthority } from "./runtime-authority.ts";
 import { makeMcpAdmission, lockAdmissionScope as lockScope } from "./admission.ts";
-import { and, asc, eq, gt, inArray, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import {
   integrationConnection as connection,
@@ -8,6 +8,7 @@ import {
   mcpExecution as execution,
   mcpApproval as approval,
   mcpResolution as resolution,
+  mcpCancellation as cancellation,
   mcpAdmission as admission,
   taskSession,
 } from "../db/schema.ts";
@@ -55,7 +56,20 @@ export type McpCallInput = Pick<
   requestPolicyContext: RequestPolicyContext;
 };
 
-async function unknown(tx: Tx | Db, sessionId: string, connectionId: string): Promise<boolean> {
+function unknownBlocks(now: Date) {
+  return or(
+    isNull(resolution.executionId),
+    isNull(execution.intentId),
+    isNull(execution.intentExpiresAt),
+    gt(execution.intentExpiresAt, now),
+  );
+}
+async function unknown(
+  tx: Tx | Db,
+  sessionId: string,
+  connectionId: string,
+  now: Date,
+): Promise<boolean> {
   const rows = await tx
     .select({ id: execution.id })
     .from(execution)
@@ -66,7 +80,7 @@ async function unknown(tx: Tx | Db, sessionId: string, connectionId: string): Pr
         eq(execution.connectionId, connectionId),
         eq(execution.classification, "write"),
         eq(execution.state, "outcome_unknown"),
-        isNull(resolution.executionId),
+        unknownBlocks(now),
       ),
     )
     .limit(1);
@@ -84,8 +98,98 @@ export interface McpLiveDispatchAuthorization {
   reservationId: string;
   reservationExpiresAt: Date;
 }
+export type McpUnknownContext = {
+  executionId: string;
+  journalRevision: number;
+  requestDigest: string;
+  bindingHash: string;
+  intentId: string;
+};
+export function unknownContext(call: typeof execution.$inferSelect): McpUnknownContext {
+  if (call.state !== "outcome_unknown" || !call.intentId)
+    throw Error("call has no unknown outcome");
+  return {
+    executionId: call.id,
+    journalRevision: call.version,
+    requestDigest: call.requestDigest,
+    bindingHash: call.bindingHash,
+    intentId: call.intentId,
+  };
+}
+export type McpInternalCancellationCause =
+  | "interrupt"
+  | "end"
+  | "revoke"
+  | "kill"
+  | "deadline"
+  | "resume"
+  | "authority_changed";
 export function makeMcpJournal(db = getDb()) {
   const phasedAdmission = makeMcpAdmission(db);
+  async function cancelExecution(
+    id: string,
+    authority:
+      | { kind: "human"; actorId: string; expectedJournalRevision: number }
+      | { kind: "internal"; cause: McpInternalCancellationCause },
+    now: Date,
+  ) {
+    return db.transaction(async (tx) => {
+      const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+      if (!identity) throw Error("call not found");
+      if (authority.kind === "human")
+        await lockHumanSession(tx, identity.sessionId, authority.actorId);
+      await tx
+        .select()
+        .from(connection)
+        .where(eq(connection.id, identity.connectionId))
+        .for("update");
+      const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
+      if (!call) throw Error("call not found");
+      const [prior] = await tx.select().from(cancellation).where(eq(cancellation.executionId, id));
+      if (authority.kind === "human") {
+        if (
+          prior?.actorId === authority.actorId &&
+          prior.expectedJournalRevision === authority.expectedJournalRevision
+        )
+          return call;
+        if (
+          !Number.isSafeInteger(authority.expectedJournalRevision) ||
+          call.version !== authority.expectedJournalRevision
+        )
+          throw Error("stale cancellation context");
+      }
+      if (!["waiting_approval", "authorized", "dispatching"].includes(call.state)) {
+        if (authority.kind === "human") throw Error("stale cancellation context");
+        return call;
+      }
+      const state = call.state === "dispatching" ? "outcome_unknown" : "canceled";
+      const [updated] = await tx
+        .update(execution)
+        .set({ state, version: call.version + 1, updatedAt: now })
+        .where(eq(execution.id, id))
+        .returning();
+      await tx.insert(cancellation).values({
+        executionId: id,
+        actorId: authority.kind === "human" ? authority.actorId : null,
+        cause: authority.kind === "human" ? "human" : authority.cause,
+        expectedJournalRevision: call.version,
+        journalRevision: call.version + 1,
+        state,
+        createdAt: now,
+      });
+      await tx.delete(admission).where(eq(admission.executionId, id));
+      await tx
+        .update(approval)
+        .set({
+          decision: "denied",
+          actorId: authority.kind === "human" ? authority.actorId : null,
+          decidedAt: now,
+        })
+        .where(and(eq(approval.executionId, id), eq(approval.decision, "pending")));
+      return updated!;
+    });
+  }
+
   return {
     admitSchema: (id: string, deploymentId: string, now: Date) =>
       phasedAdmission.reserve(id, deploymentId, "schema", now),
@@ -96,8 +200,8 @@ export function makeMcpJournal(db = getDb()) {
     async getAdmission(id: string) {
       return (await db.select().from(admission).where(eq(admission.executionId, id)))[0] ?? null;
     },
-    hasUnknown(sessionId: string, connectionId: string) {
-      return unknown(db, sessionId, connectionId);
+    hasUnknown(sessionId: string, connectionId: string, now: Date = new Date()) {
+      return unknown(db, sessionId, connectionId, now);
     },
     async create(input: McpCallInput, authorization: McpCallAuthorization, now: Date) {
       input = structuredClone(input);
@@ -294,6 +398,7 @@ export function makeMcpJournal(db = getDb()) {
       sessionId: string,
       actorId: string,
       page: { after?: string; limit?: number } = {},
+      now: Date = new Date(),
     ) {
       const limit = page.limit ?? 16;
       if (
@@ -306,10 +411,11 @@ export function makeMcpJournal(db = getDb()) {
       return db.transaction(async (tx) => {
         const { session } = await lockHumanSession(tx, sessionId, actorId);
         const rows = await tx
-          .select({ call: execution, approval, resolution })
+          .select({ call: execution, approval, resolution, cancellation })
           .from(execution)
           .leftJoin(approval, eq(approval.executionId, execution.id))
           .leftJoin(resolution, eq(resolution.executionId, execution.id))
+          .leftJoin(cancellation, eq(cancellation.executionId, execution.id))
           .where(
             and(
               eq(execution.sessionId, sessionId),
@@ -327,7 +433,7 @@ export function makeMcpJournal(db = getDb()) {
               eq(execution.sessionId, sessionId),
               eq(execution.classification, "write"),
               eq(execution.state, "outcome_unknown"),
-              isNull(resolution.executionId),
+              unknownBlocks(now),
             ),
           )
           .limit(17);
@@ -503,7 +609,7 @@ export function makeMcpJournal(db = getDb()) {
             throw new Error("tool is not approved for this operation");
           if (
             call.classification === "write" &&
-            (await unknown(tx, call.sessionId, call.connectionId))
+            (await unknown(tx, call.sessionId, call.connectionId, now))
           )
             throw new Error("unknown write outcome blocks this connection");
           const [lease] = await tx
@@ -642,7 +748,7 @@ export function makeMcpJournal(db = getDb()) {
         }
         if (
           call.classification === "write" &&
-          (await unknown(tx, call.sessionId, call.connectionId))
+          (await unknown(tx, call.sessionId, call.connectionId, now))
         )
           throw new Error("unknown write outcome blocks this connection");
         return call;
@@ -767,42 +873,24 @@ export function makeMcpJournal(db = getDb()) {
         return row;
       });
     },
-    async cancel(id: string, actorId: string, now: Date) {
-      return db.transaction(async (tx) => {
-        const [identity] = await tx
-          .select({ connectionId: execution.connectionId, sessionId: execution.sessionId })
-          .from(execution)
-          .where(eq(execution.id, id));
-        if (!identity) throw new Error("call not found");
-        await lockHumanSession(tx, identity.sessionId, actorId);
-        await tx
-          .select()
-          .from(connection)
-          .where(eq(connection.id, identity.connectionId))
-          .for("update");
-        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-
-        if (!["waiting_approval", "authorized", "dispatching"].includes(call!.state)) return call!;
-        const state: McpExecutionState =
-          call!.state === "dispatching" ? "outcome_unknown" : "canceled";
-        const [updated] = await tx
-          .update(execution)
-          .set({ state, version: call!.version + 1, updatedAt: now })
-          .where(eq(execution.id, id))
-          .returning();
-        await tx.delete(admission).where(eq(admission.executionId, id));
-        await tx
-          .update(approval)
-          .set({ decision: "denied", actorId, decidedAt: now })
-          .where(and(eq(approval.executionId, id), eq(approval.decision, "pending")));
-        return updated!;
-      });
+    cancel(id: string, actorId: string, now: Date, expectedJournalRevision: number) {
+      return cancelExecution(id, { kind: "human", actorId, expectedJournalRevision }, now);
+    },
+    /** Trusted server lifecycle only; never supplied through a public request. */
+    cancelInternal(id: string, cause: McpInternalCancellationCause, now: Date) {
+      return cancelExecution(id, { kind: "internal", cause }, now);
+    },
+    async cancellationReceipt(id: string) {
+      return (
+        (await db.select().from(cancellation).where(eq(cancellation.executionId, id)))[0] ?? null
+      );
     },
     async resolveUnknown(
       id: string,
       actorId: string,
       outcome: "succeeded" | "failed" | "acknowledged",
       now: Date,
+      expected: McpUnknownContext,
     ) {
       return db.transaction(async (tx) => {
         const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
@@ -814,12 +902,25 @@ export function makeMcpJournal(db = getDb()) {
           .where(eq(connection.id, identity.connectionId))
           .for("update");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-        if (!call || call.state !== "outcome_unknown")
-          throw new Error("call has no unknown outcome");
+        const [prior] = await tx.select().from(resolution).where(eq(resolution.executionId, id));
+        if (
+          prior &&
+          prior.actorId === actorId &&
+          prior.outcome === outcome &&
+          canonicalDigest(prior.expectedContext) === canonicalDigest(expected)
+        )
+          return prior;
+        if (
+          !call ||
+          call.state !== "outcome_unknown" ||
+          !expected ||
+          canonicalDigest(expected) !== canonicalDigest(unknownContext(call))
+        )
+          throw new Error("stale unknown outcome context");
 
         const [row] = await tx
           .insert(resolution)
-          .values({ executionId: id, actorId, outcome, createdAt: now })
+          .values({ executionId: id, actorId, outcome, expectedContext: expected, createdAt: now })
           .onConflictDoNothing()
           .returning();
         if (!row) throw new Error("outcome already resolved");

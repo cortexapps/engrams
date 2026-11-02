@@ -14,6 +14,9 @@ import {
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { makeMcpJournal } from "./journal.ts";
 import { MCP_LIMITS } from "./limits.ts";
+import { makeMcpLifecycleEvents, type LifecycleEvent } from "./lifecycle-events.ts";
+import { observeMcpAuthorityChanges } from "./authority-notification.ts";
+import { makeMcpLifecycleReconciler } from "./lifecycle-reconciler.ts";
 
 /** Only references cross the durable workflow boundary. */
 export interface McpExecutionMarker {
@@ -64,9 +67,31 @@ export function makeMcpRecovery(deps: {
   completer?: ToolCallCompleter;
   now(): Date;
   readRequestEvent?: (sessionId: string, index: bigint) => Promise<CuratedEvent | undefined>;
+  listLifecycleEvents?: (sessionId: string, after: bigint) => Promise<LifecycleEvent[]>;
 }) {
   const db = deps.db ?? getDb();
   const journal = makeMcpJournal(db);
+  const reconciler = makeMcpLifecycleReconciler({
+    db,
+    driver: deps.driver,
+    onSession: (id) => lifecycle.runOnce(id),
+  });
+  const lifecycle = makeMcpLifecycleEvents({
+    db,
+    now: deps.now,
+    async list(sessionId, after) {
+      if (deps.listLifecycleEvents) return deps.listLifecycleEvents(sessionId, after);
+      const page = await sessions.listSessionEvents(
+        { sessionId, afterIdx: after, limit: 200n },
+        { signal: AbortSignal.timeout(5_000) },
+      );
+      return page.events.map((event) => {
+        if (event.idx === undefined) throw Error("MCP lifecycle event index unavailable");
+        return { idx: event.idx, kind: event.kind, payloadJson: event.payloadJson };
+      });
+    },
+    reconcile: (sessionId) => reconciler.reconcileSession(sessionId),
+  });
   async function existing(ref: Pick<McpRequestMarker, "sessionId" | "toolCallId">) {
     return (
       await db
@@ -81,6 +106,13 @@ export function makeMcpRecovery(deps: {
     )[0];
   }
   return {
+    reconcileLifecycle: async () => {
+      await reconciler.runOnce();
+    },
+    async reconcileAuthorityChange() {
+      await reconciler.reconcileAuthorityChange();
+    },
+    abortExecution: (id: string) => deps.driver.cancel(id),
     /** The durable step records only this decision. It never runs a provider operation. */
     async decideRequest(ref: McpRequestMarker): Promise<McpRequestDecision> {
       try {
@@ -269,6 +301,25 @@ let runtime: McpRecovery | undefined;
 export function installMcpRecovery(value: McpRecovery): void {
   if (runtime) throw Error("MCP runtime already installed");
   runtime = value;
+  let pending = false;
+  let running = false;
+  observeMcpAuthorityChanges(() => {
+    pending = true;
+    if (running) return;
+    running = true;
+    void (async () => {
+      try {
+        while (pending) {
+          pending = false;
+          await value.reconcileAuthorityChange();
+        }
+      } catch {
+        log.warn("MCP authority reconciliation unavailable");
+      } finally {
+        running = false;
+      }
+    })();
+  });
 }
 export function mcpRecovery(): McpRecovery | undefined {
   return runtime;

@@ -1,3 +1,4 @@
+import { notifyMcpAuthorityChanged } from "./authority-notification.ts";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import { integrationConnection as connection, mcpCatalog as catalog } from "../db/schema.ts";
@@ -37,6 +38,7 @@ export function makeMcpRepository(db = getDb()) {
         )
         .returning();
       if (!rows[0]) throw new Error("stale connection revision");
+      notifyMcpAuthorityChanged();
       return rows[0];
     },
     /** Only a verified credential exchange may call this method. Refresh does not call it. */
@@ -70,6 +72,7 @@ export function makeMcpRepository(db = getDb()) {
         )
         .returning();
       if (!rows[0]) throw new Error("stale authorization generation");
+      notifyMcpAuthorityChanged();
       return rows[0];
     },
     async disconnect(id: string, expectedGeneration: number, now: Date) {
@@ -92,10 +95,11 @@ export function makeMcpRepository(db = getDb()) {
         )
         .returning();
       if (!rows[0]) throw new Error("stale authorization generation");
+      notifyMcpAuthorityChanged();
       return rows[0];
     },
     async setEnabled(id: string, expectedRevision: number, enabled: boolean, now: Date) {
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const [row] = await tx
           .select()
           .from(connection)
@@ -131,6 +135,8 @@ export function makeMcpRepository(db = getDb()) {
           .returning();
         return updated!;
       });
+      notifyMcpAuthorityChanged();
+      return result;
     },
     async saveDraft(
       id: string,
@@ -208,7 +214,7 @@ export function makeMcpRepository(db = getDb()) {
       now: Date,
     ) {
       const tools = reviewCatalog(input);
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const [row] = await tx
           .select()
           .from(connection)
@@ -266,6 +272,8 @@ export function makeMcpRepository(db = getDb()) {
           .where(eq(connection.id, id));
         return published!;
       });
+      notifyMcpAuthorityChanged();
+      return result;
     },
     async getCatalog(id: string, revision: number) {
       return (

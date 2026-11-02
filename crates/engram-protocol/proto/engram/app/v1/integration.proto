@@ -67,6 +67,7 @@ service IntegrationService {
   rpc DecideMcpApproval(DecideMcpApprovalRequest) returns (DecideMcpApprovalResponse);
   rpc CancelMcpCall(CancelMcpCallRequest) returns (CancelMcpCallResponse);
   rpc ResolveMcpOutcome(ResolveMcpOutcomeRequest) returns (ResolveMcpOutcomeResponse);
+  rpc PrepareMcpRebind(PrepareMcpRebindRequest) returns (PrepareMcpRebindResponse);
   rpc RebindMcp(RebindMcpRequest) returns (RebindMcpResponse);
 }
 
@@ -443,20 +444,59 @@ message DecideMcpApprovalResponse {
 }
 message CancelMcpCallRequest {
   string execution_id = 1;
+  uint32 expected_journal_revision = 2;
 }
 message CancelMcpCallResponse {
   string state = 1;
+  McpCancellationReceipt receipt = 2;
 }
 message ResolveMcpOutcomeRequest {
   string execution_id = 1;
   string outcome = 2;
+  McpUnknownContext expected_unknown_context = 3;
 }
 message ResolveMcpOutcomeResponse {
   string outcome = 1;
+  McpResolutionReceipt receipt = 2;
+}
+message PrepareMcpRebindRequest {
+  string session_id = 1;
+  string expected_binding_hash = 2;
+}
+message PrepareMcpRebindResponse {
+  string binding_hash = 1;
+  string binding_epoch = 2;
+  repeated McpBoundToolSummary binding_tools = 3;
+  repeated string deny_hosts = 4;
+  string deny_revision = 5;
+  string deny_digest = 6;
+  repeated McpRebindConnection connections = 7;
+  McpRebindDrain drain = 8;
+}
+enum McpRebindDrainReason {
+  MCP_REBIND_DRAIN_REASON_UNSPECIFIED = 0;
+  MCP_REBIND_DRAIN_REASON_DISPATCH_IN_PROGRESS = 1;
+  MCP_REBIND_DRAIN_REASON_UNKNOWN_INTENT = 2;
+  MCP_REBIND_DRAIN_REASON_LEGACY_INTENT = 3;
+}
+message McpRebindDrain {
+  McpRebindDrainReason reason = 1;
+  string retry_after = 2;
+}
+message McpRebindConnection {
+  string connection_id = 1;
+  string alias = 2;
+  string endpoint = 3;
+  string zone = 4;
+  string credential_identity = 5;
+  uint32 config_revision = 6;
+  uint32 auth_generation = 7;
+  uint32 catalog_revision = 8;
 }
 message RebindMcpRequest {
   string session_id = 1;
   string expected_binding_hash = 2;
+  string expected_candidate_hash = 3;
 }
 message RebindMcpResponse {
   string binding_hash = 1;
@@ -586,12 +626,31 @@ message McpExecutionReview {
   McpTool reviewed_tool = 15;
   repeated string argument_constraint_documents_json = 16;
   string binding_hash = 17;
+  McpUnknownContext expected_unknown_context = 18;
+  McpCancellationReceipt cancellation_receipt = 19;
+}
+message McpUnknownContext {
+  string execution_id = 1;
+  uint32 journal_revision = 2;
+  string request_digest = 3;
+  string binding_hash = 4;
+  string intent_id = 5;
+}
+message McpCancellationReceipt {
+  string execution_id = 1;
+  string actor_id = 2;
+  string cause = 3;
+  uint32 expected_journal_revision = 4;
+  uint32 journal_revision = 5;
+  string state = 6;
+  string created_at = 7;
 }
 message McpResolutionReceipt {
   string execution_id = 1;
   string actor_id = 2;
   string outcome = 3;
   string created_at = 4;
+  McpUnknownContext expected_context = 5;
 }
 message McpBindingReceipt {
   string binding_hash = 1;

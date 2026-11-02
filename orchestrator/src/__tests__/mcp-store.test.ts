@@ -1,3 +1,4 @@
+import { unknownContext } from "../mcp/journal.ts";
 import { describe, expect, test } from "bun:test";
 import { eq, sql } from "drizzle-orm";
 import { checkDb } from "../db/client.ts";
@@ -82,15 +83,15 @@ async function fixture(deploymentId?: string) {
         reservationExpiresAt: (await base.getAdmission(id))!.expiresAt,
       });
     },
-    cancel: (id: string, who: string, _cachedAdmin: boolean, now: Date) =>
-      base.cancel(id, actor(who), now),
-    resolveUnknown: (
+    cancel: async (id: string, who: string, _cachedAdmin: boolean, now: Date) =>
+      base.cancel(id, actor(who), now, (await base.get(id))!.version),
+    resolveUnknown: async (
       id: string,
       who: string,
       _cachedAdmin: boolean,
       outcome: "succeeded" | "failed" | "acknowledged",
       now: Date,
-    ) => base.resolveUnknown(id, actor(who), outcome, now),
+    ) => base.resolveUnknown(id, actor(who), outcome, now, unknownContext((await base.get(id))!)),
   };
   return { ...f, input, journal, row: f.connection, repo: f.repository, published: f.catalog };
 }

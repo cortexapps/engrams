@@ -1,3 +1,4 @@
+import { unknownContext } from "../mcp/journal.ts";
 import { expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { checkDb, getDb } from "../db/client.ts";
@@ -304,7 +305,13 @@ test.skipIf(!reachable)(
       const page = await f.journal.readSession(f.sessionId, f.actorId, { after: "zzzz" });
       expect(page.rows).toHaveLength(0);
       expect(page.unknownWriteBlocks).toEqual([f.connection.id]);
-      await f.journal.resolveUnknown(call.id, f.actorId, "acknowledged", f.now);
+      await f.journal.resolveUnknown(
+        call.id,
+        f.actorId,
+        "acknowledged",
+        f.now,
+        unknownContext((await f.journal.get(call.id))!),
+      );
       expect((await f.journal.readSession(f.sessionId, f.actorId)).unknownWriteBlocks).toHaveLength(
         0,
       );

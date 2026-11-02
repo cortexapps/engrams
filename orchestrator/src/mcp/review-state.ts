@@ -1,6 +1,6 @@
 import { create, toBinary, toJson, type MessageInitShape } from "@bufbuild/protobuf";
 import { GetSessionMcpStateResponseSchema } from "../gen/engram/app/v1/integration_pb.ts";
-import type { McpJournal } from "./journal.ts";
+import { unknownContext, type McpJournal } from "./journal.ts";
 import { reviewContext, policyReviewCurrent } from "./journal-review.ts";
 import { restoreBindingSnapshot } from "./binding-store.ts";
 import type { SessionBindingResolver } from "./session-resolver.ts";
@@ -75,10 +75,15 @@ export async function sessionMcpState(input: {
     (input.afterBindingToolName?.length ?? 0) > 128
   )
     throw new Error("invalid binding page");
-  const data = await input.journal.readSession(input.sessionId, input.actorId, {
-    after: input.after,
-    limit: input.limit,
-  });
+  const data = await input.journal.readSession(
+    input.sessionId,
+    input.actorId,
+    {
+      after: input.after,
+      limit: input.limit,
+    },
+    input.now,
+  );
   const response: MessageInitShape<typeof GetSessionMcpStateResponseSchema> = {
     executions: [],
     bindingTools: [],
@@ -128,7 +133,7 @@ export async function sessionMcpState(input: {
     response.bindingReceipt.allowedActions = ["rebind"];
   let last = input.after ?? "";
   for (const row of input.omitExecutions ? [] : data.rows) {
-    const { call, approval, resolution } = row;
+    const { call, approval, resolution, cancellation } = row;
     const actions: string[] = [];
     const review =
       approval && call.requestContext && call.originalArguments !== null
@@ -183,6 +188,17 @@ export async function sessionMcpState(input: {
         : {};
     const entry = {
       ...content,
+      expectedUnknownContext:
+        call.state === "outcome_unknown" && call.intentId && !resolution
+          ? unknownContext(call)
+          : undefined,
+      cancellationReceipt: cancellation
+        ? {
+            ...cancellation,
+            actorId: cancellation.actorId ?? "",
+            createdAt: cancellation.createdAt.toISOString(),
+          }
+        : undefined,
       bindingHash: call.bindingHash,
       executionId: call.id,
       connectionId: call.connectionId,
@@ -214,6 +230,7 @@ export async function sessionMcpState(input: {
                 actorId: resolution.actorId,
                 outcome: resolution.outcome,
                 createdAt: resolution.createdAt.toISOString(),
+                expectedContext: resolution.expectedContext ?? undefined,
               },
             ]
           : []),

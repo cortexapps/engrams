@@ -1,3 +1,4 @@
+import { McpAuthorityStale } from "./authority-error.ts";
 import type { McpBoundTool } from "./types.ts";
 import {
   checkBindingCurrent,
@@ -35,7 +36,7 @@ export function assertManagedDenyAck(expected: ManagedDenyAck, actual: ManagedDe
       (key) => expected[key as keyof ManagedDenyAck] !== actual[key as keyof ManagedDenyAck],
     )
   )
-    throw new Error("MCP managed deny enforcement changed");
+    throw new McpAuthorityStale("MCP managed deny enforcement changed");
 }
 export interface BoundSessionAuthority {
   snapshot: McpSessionBindingSnapshot;
@@ -84,16 +85,16 @@ export function resolveSnapshotTool(
 export function makeSessionBindingResolver(deps: SessionBindingResolverDeps) {
   async function readCurrent(sessionId: string): Promise<McpSessionBindingSnapshot> {
     const leaf = await deps.readSession(sessionId);
-    if (!leaf?.active) throw new Error("MCP session unavailable");
+    if (!leaf?.active) throw new McpAuthorityStale("MCP session unavailable");
     const refs = leaf.snapshot.ancestorAuthorityRefs;
-    if (refs.length >= 32) throw new Error("MCP ancestry unavailable");
+    if (refs.length >= 32) throw new McpAuthorityStale("MCP ancestry unavailable");
     const seen = new Set<string>();
     let id: string | null = sessionId;
     for (let index = 0; index <= refs.length; index++) {
-      if (!id || seen.has(id)) throw new Error("MCP ancestry unavailable");
+      if (!id || seen.has(id)) throw new McpAuthorityStale("MCP ancestry unavailable");
       seen.add(id);
       const row: BoundSessionAuthority | null = index === 0 ? leaf : await deps.readSession(id);
-      if (!row?.active) throw new Error("MCP ancestor unavailable");
+      if (!row?.active) throw new McpAuthorityStale("MCP ancestor unavailable");
       const snapshot = row.snapshot;
       const expected = index === 0 ? undefined : refs[index - 1];
       if (
@@ -102,19 +103,19 @@ export function makeSessionBindingResolver(deps: SessionBindingResolverDeps) {
           expected.bindingHash !== snapshot.bindingHash ||
           expected.bindingEpoch !== snapshot.bindingEpoch)
       )
-        throw new Error("MCP ancestor binding changed");
+        throw new McpAuthorityStale("MCP ancestor binding changed");
       const suffix = refs.slice(index);
       if (JSON.stringify(snapshot.ancestorAuthorityRefs) !== JSON.stringify(suffix))
-        throw new Error("MCP ancestry changed");
+        throw new McpAuthorityStale("MCP ancestry changed");
       const live = await deps.readAuthority(snapshot.profileId);
       if (
         !checkBindingCurrent({ snapshot, liveAuthority: live }).current ||
         (await deps.readBindingEpoch(id)) !== snapshot.bindingEpoch
       )
-        throw new Error("MCP authority changed");
+        throw new McpAuthorityStale("MCP authority changed");
       id = row.parentSessionId;
     }
-    if (id !== null) throw new Error("MCP ancestry truncated");
+    if (id !== null) throw new McpAuthorityStale("MCP ancestry truncated");
     if (!deps.enforceManagedDeny) throw new Error("MCP managed deny enforcement unavailable");
     const expected = expectedManagedDenyAck(sessionId, leaf.snapshot);
     assertManagedDenyAck(

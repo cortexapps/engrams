@@ -81,6 +81,8 @@ function services(): McpServices {
       dispatch: unavailable,
       finish: unavailable,
       cancel: unavailable,
+      cancelInternal: unavailable,
+      cancellationReceipt: unavailable,
       resolveUnknown: unavailable,
       expire: unavailable,
       expireUnadmitted: unavailable,

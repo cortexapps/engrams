@@ -434,7 +434,7 @@ test("cancel after provider send leaves an unknown write that cannot replay", as
     while (!(await f.command("stats")).calls && Date.now() < until)
       await new Promise((resolve) => setTimeout(resolve, 10));
     expect((await f.command("stats")).calls).toBe(1);
-    await f.journal.cancel(call.id, f.actorId, new Date());
+    await f.journal.cancel(call.id, f.actorId, new Date(), (await f.journal.get(call.id))!.version);
     controller.abort();
     expect((await pending).state).toBe("outcome_unknown");
     await f.driver.driveOnce(call.id);
@@ -608,6 +608,161 @@ test("credential delivery expiry during only the final fence prevents send and r
     expect(f.leases).toBe(1);
     expect((await f.command("stats")).credentialRequests).toBe(0);
   } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("durable cancellation aborts an active provider call without a notification", async () => {
+  const f = await effectFixture({ classification: "write", response: "hold" });
+  const controller = new AbortController();
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    await f.driver.driveOnce(call.id);
+    const approval = await f.journal.requestApproval(call.id, f.deploymentId, new Date());
+    await f.journal.decide(call.id, f.actorId, true, reviewContext(call, approval), new Date());
+    const pending = f.driver.driveOnce(call.id, controller.signal);
+    const until = Date.now() + 5000;
+    while (!(await f.command("stats")).calls && Date.now() < until)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect((await f.command("stats")).calls).toBe(1);
+    const dispatched = (await f.journal.get(call.id))!;
+    await f.journal.cancel(call.id, f.actorId, new Date(), dispatched.version);
+    const result = await Promise.race([
+      pending,
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2500)),
+    ]);
+    expect(result).not.toBe("timeout");
+    if (result !== "timeout") expect(result.state).toBe("outcome_unknown");
+    expect((await f.command("stats")).calls).toBe(1);
+  } finally {
+    controller.abort();
+    await f.cleanup();
+  }
+}, 20000);
+
+test("canceling a dispatched read does not invent an upstream failure", async () => {
+  const f = await effectFixture({ classification: "read", response: "hold" });
+  const controller = new AbortController();
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    const pending = f.driver.driveOnce(call.id, controller.signal);
+    const until = Date.now() + 5000;
+    while (!(await f.command("stats")).calls && Date.now() < until)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect((await f.command("stats")).calls).toBe(1);
+    const dispatched = (await f.journal.get(call.id))!;
+    await f.journal.cancel(call.id, f.actorId, new Date(), dispatched.version);
+    const result = await Promise.race([
+      pending,
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2500)),
+    ]);
+    expect(result).not.toBe("timeout");
+    if (result !== "timeout") expect(result.state).toBe("outcome_unknown");
+  } finally {
+    controller.abort();
+    await f.cleanup();
+  }
+}, 20000);
+
+test("lifecycle reconciliation preserves a current newer execution", async () => {
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    await f.driver.reconcile(call.id);
+    expect((await f.journal.get(call.id))!.state).toBe("authorized");
+    expect((await f.driver.driveOnce(call.id)).state).toBe("succeeded");
+    expect((await f.command("stats")).calls).toBe(1);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("lifecycle reconciliation cancels an old run before it can dispatch", async () => {
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    f.setFence(false);
+    await f.driver.reconcile(call.id);
+    expect((await f.journal.get(call.id))!.state).toBe("canceled");
+    expect((await f.driver.driveOnce(call.id)).state).toBe("canceled");
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("lifecycle reconciliation cancels after the principal loses access", async () => {
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    await f.db.update(user).set({ banned: true }).where(eq(user.id, f.actorId));
+    await f.driver.reconcile(call.id);
+    expect((await f.journal.get(call.id))!.state).toBe("canceled");
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("unavailable coordinator fence leaves execution pending for retry", async () => {
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    f.beforeFence(async () => {
+      throw Error("temporary control outage");
+    });
+    await expect(f.driver.reconcile(call.id)).rejects.toThrow();
+    expect((await f.journal.get(call.id))!.state).toBe("authorized");
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("an older resume reconciles current authority without canceling a newer run", async () => {
+  const { makeMcpLifecycleEvents } = await import("../mcp/lifecycle-events.ts");
+  const { consumerCursor } = await import("../db/schema.ts");
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    const lifecycle = makeMcpLifecycleEvents({
+      db: f.db,
+      now: () => new Date(),
+      list: async (_id, after) =>
+        after < 1n ? [{ idx: 1n, kind: "resumed", payloadJson: "{}" }] : [],
+      reconcile: async () => f.driver.reconcile(call.id),
+    });
+    await lifecycle.runOnce(f.sessionId);
+    expect((await f.journal.get(call.id))!.state).toBe("authorized");
+    expect((await f.driver.driveOnce(call.id)).state).toBe("succeeded");
+    expect((await f.command("stats")).calls).toBe(1);
+  } finally {
+    await f.db.delete(consumerCursor).where(eq(consumerCursor.sessionId, f.sessionId));
+    await f.cleanup();
+  }
+}, 20000);
+
+test("a late old-run acceptance is canceled by independent reconciliation", async () => {
+  const { makeMcpLifecycleEvents } = await import("../mcp/lifecycle-events.ts");
+  const { consumerCursor } = await import("../db/schema.ts");
+  const f = await effectFixture({ classification: "read" });
+  try {
+    const lifecycle = makeMcpLifecycleEvents({
+      db: f.db,
+      now: () => new Date(),
+      list: async (_id, after) =>
+        after < 1n ? [{ idx: 1n, kind: "run_interrupted", payloadJson: '{"run_id":"run-1"}' }] : [],
+      reconcile: async () => {},
+    });
+    await lifecycle.runOnce(f.sessionId);
+    const call = await f.driver.acceptToolRequest(f.request);
+    f.setFence(false);
+    await f.driver.reconcile(call.id);
+    expect((await f.journal.get(call.id))!.state).toBe("canceled");
+    expect((await f.driver.driveOnce(call.id)).state).toBe("canceled");
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.db.delete(consumerCursor).where(eq(consumerCursor.sessionId, f.sessionId));
     await f.cleanup();
   }
 }, 20000);

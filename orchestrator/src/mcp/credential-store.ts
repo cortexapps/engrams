@@ -1,3 +1,4 @@
+import { notifyMcpAuthorityChanged } from "./authority-notification.ts";
 import { and, eq, sql } from "drizzle-orm";
 import { create, fromJson, toJson, type JsonObject } from "@bufbuild/protobuf";
 import { getDb } from "../db/client.ts";
@@ -88,7 +89,7 @@ export function makeCredentialMetadataStore(db = getDb()) {
     callbackId?: string,
   ) {
     const target = validateMcpConfig(config);
-    return db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       const [row] = await tx
         .select()
         .from(connection)
@@ -135,6 +136,8 @@ export function makeCredentialMetadataStore(db = getDb()) {
         config: target,
       };
     });
+    notifyMcpAuthorityChanged();
+    return result;
   }
   async function stage(claim: CredentialClaim, metadata: CredentialMetadata, now: Date) {
     const safe = checkedMetadata({ ...metadata, transition: claim.metadata.transition });
@@ -212,6 +215,7 @@ export function makeCredentialMetadataStore(db = getDb()) {
       )
       .returning();
     if (!row) throw new Error("stale credential transition");
+    notifyMcpAuthorityChanged();
     return row;
   }
   return {
@@ -232,10 +236,11 @@ export function makeCredentialMetadataStore(db = getDb()) {
         )
         .returning({ id: connection.id });
       if (!rows.length) throw new Error("stale credential transition");
+      notifyMcpAuthorityChanged();
       return true;
     },
     async recover(id: string, revision: number, generation: number, actorId: string, now: Date) {
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const [row] = await tx.select().from(connection).where(eq(connection.id, id)).for("update");
         if (
           !row ||
@@ -261,6 +266,8 @@ export function makeCredentialMetadataStore(db = getDb()) {
           config: validateMcpConfig(row.config),
         };
       });
+      notifyMcpAuthorityChanged();
+      return result;
     },
   };
 }

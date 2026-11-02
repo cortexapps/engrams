@@ -111,7 +111,7 @@ function policyFor(config: ReturnType<typeof validateMcpConfig>, live: McpLiveAu
     throw new Error("MCP authority is not operator approved");
   return policy;
 }
-function managedAuthorityHash(live: McpLiveAuthority) {
+export function managedAuthorityHash(live: McpLiveAuthority) {
   return canonicalDigest(
     live.connections
       .map((connection) => {

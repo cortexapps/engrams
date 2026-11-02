@@ -1,6 +1,11 @@
 import { sessionMcpState, type McpReviewProducers } from "./review-state.ts";
 import { toJson } from "@bufbuild/protobuf";
-import { McpApprovalReviewContextSchema } from "../gen/engram/app/v1/integration_pb.ts";
+import {
+  McpApprovalReviewContextSchema,
+  McpRebindDrainSchema,
+  McpRebindDrainReason,
+} from "../gen/engram/app/v1/integration_pb.ts";
+import { McpRebindDraining, type McpRebindDrain } from "./rebind.ts";
 import { policyReviewCurrent, type JournalReviewContext } from "./journal-review.ts";
 import { credentialHandlers } from "./credential-rpc.ts";
 import type { CredentialAdmin } from "./credential-admin.ts";
@@ -11,10 +16,9 @@ import type {
   IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import { requireAdmin, requireUser, type GetSession } from "../rpc/require.ts";
-import { assertOwnerOrAdmin } from "./approvals.ts";
 import { validateMcpConfig, type McpConfig } from "./config.ts";
 import type { McpRepository } from "./repository.ts";
-import type { McpJournal } from "./journal.ts";
+import type { McpJournal, McpUnknownContext } from "./journal.ts";
 import type { McpDiscoveredTool, McpReviewedTool } from "./types.ts";
 
 /** Internal services use trusted connection identities, never guest destinations. */
@@ -31,12 +35,19 @@ export interface McpServices {
   destinations?: { zoneId: string; endpoint: string }[];
   runtime?: {
     cancel(executionId: string): Promise<void>;
-    /** Must authorize the live owner/admin and acknowledge deny policy before activation. */
-    rebind(
+    /** Both operations authorize a fresh owner/admin; commit requires the reviewed candidate. */
+    prepareRebind(
       sessionId: string,
       expectedBindingHash: string,
       actorId: string,
-      isAdmin: boolean,
+    ): Promise<
+      import("./session-bindings.ts").McpSessionBindingSnapshot & { drain?: McpRebindDrain }
+    >;
+    rebind(
+      sessionId: string,
+      expectedBindingHash: string,
+      expectedCandidateHash: string,
+      actorId: string,
     ): Promise<{ bindingHash: string }>;
   };
 }
@@ -50,11 +61,24 @@ export function requireMcpHook<T>(hook: T | undefined): T {
     throw new ConnectError("external MCP service is not configured", Code.FailedPrecondition);
   return hook;
 }
+function drainProto(drain: McpRebindDrain) {
+  const reason =
+    drain.reason === "dispatch_in_progress"
+      ? McpRebindDrainReason.DISPATCH_IN_PROGRESS
+      : drain.reason === "unknown_intent"
+        ? McpRebindDrainReason.UNKNOWN_INTENT
+        : McpRebindDrainReason.LEGACY_INTENT;
+  return { reason, retryAfter: drain.retryAfter };
+}
 export async function mcpOperation<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } catch (error) {
     if (error instanceof ConnectError) throw error;
+    if (error instanceof McpRebindDraining)
+      throw new ConnectError("MCP calls are still draining", Code.FailedPrecondition, undefined, [
+        { desc: McpRebindDrainSchema, value: drainProto(error.drain) },
+      ]);
     const message = error instanceof Error ? error.message : "MCP operation failed";
     const code = /owner or administrator/.test(message)
       ? Code.PermissionDenied
@@ -153,6 +177,7 @@ type Methods =
   | "decideMcpApproval"
   | "cancelMcpCall"
   | "resolveMcpOutcome"
+  | "prepareMcpRebind"
   | "rebindMcp";
 export function mcpHandlers(deps: {
   services?: McpServices;
@@ -237,7 +262,7 @@ export function mcpHandlers(deps: {
           planToolCallId: req.planToolCallId,
           producers: service.reviewProducers,
           canCancel: Boolean(service.runtime?.cancel),
-          canRebind: Boolean(service.runtime?.rebind),
+          canRebind: Boolean(service.runtime?.prepareRebind && service.runtime?.rebind),
           afterBindingToolName: req.afterBindingToolName || undefined,
           bindingPageSize: req.bindingPageSize || undefined,
           omitBindings: req.omitBindings,
@@ -322,9 +347,26 @@ export function mcpHandlers(deps: {
       const service = services();
       const runtime = requireMcpHook(service.runtime);
       return mcpOperation(async () => {
-        const call = await service.journal.cancel(req.executionId, actor.id, deps.now());
+        if (!req.expectedJournalRevision)
+          throw new ConnectError("expected journal revision is required", Code.InvalidArgument);
+        const call = await service.journal.cancel(
+          req.executionId,
+          actor.id,
+          deps.now(),
+          req.expectedJournalRevision,
+        );
+        // The committed cancellation fences other replicas even if local I/O already ended.
         await runtime.cancel(call.id);
-        return { state: call.state };
+        const receipt = await service.journal.cancellationReceipt(call.id);
+        if (!receipt) throw Error("cancellation receipt unavailable");
+        return {
+          state: call.state,
+          receipt: {
+            ...receipt,
+            actorId: receipt.actorId ?? "",
+            createdAt: receipt.createdAt.toISOString(),
+          },
+        };
       });
     },
     async resolveMcpOutcome(req, ctx) {
@@ -335,28 +377,108 @@ export function mcpHandlers(deps: {
       if (req.outcome !== "succeeded" && req.outcome !== "failed" && req.outcome !== "acknowledged")
         throw new ConnectError("invalid outcome resolution", Code.InvalidArgument);
       const outcome = req.outcome;
-      return mcpOperation(async () => ({
-        outcome: (
-          await service.journal.resolveUnknown(req.executionId, actor.id, outcome, deps.now())
-        ).outcome,
-      }));
+      if (!req.expectedUnknownContext)
+        throw new ConnectError("exact unknown context is required", Code.InvalidArgument);
+      const context = req.expectedUnknownContext;
+      const expected: McpUnknownContext = {
+        executionId: context.executionId,
+        journalRevision: context.journalRevision,
+        requestDigest: context.requestDigest,
+        bindingHash: context.bindingHash,
+        intentId: context.intentId,
+      };
+      return mcpOperation(async () => {
+        const receipt = await service.journal.resolveUnknown(
+          req.executionId,
+          actor.id,
+          outcome,
+          deps.now(),
+          expected,
+        );
+        return {
+          outcome: receipt.outcome,
+          receipt: {
+            ...receipt,
+            createdAt: receipt.createdAt.toISOString(),
+            expectedContext: receipt.expectedContext ?? undefined,
+          },
+        };
+      });
     },
-    async rebindMcp(req, ctx) {
+    async prepareMcpRebind(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
-      const service = services();
-      const runtime = requireMcpHook(service.runtime);
+      if (actor.serviceAccount)
+        throw new ConnectError("a human decision is required", Code.PermissionDenied);
+      const runtime = requireMcpHook(services().runtime);
       if (!req.expectedBindingHash)
         throw new ConnectError("expected binding hash is required", Code.InvalidArgument);
-      const owner = requireMcpHook(service.sessionOwner);
       return mcpOperation(async () => {
-        assertOwnerOrAdmin(await owner(req.sessionId), actor.id, actor.role === "admin");
-        return runtime.rebind(
+        const snapshot = await runtime.prepareRebind(
           req.sessionId,
           req.expectedBindingHash,
           actor.id,
-          actor.role === "admin",
         );
+        const bindingTools = snapshot.immutableBindings
+          .flatMap((binding) =>
+            binding.tools.map((bound) => ({
+              connectionId: binding.connectionId,
+              connectionAlias: binding.alias,
+              modelToolName: bound.name,
+              reviewedTool: {
+                ...bound.tool,
+                inputSchemaJson: JSON.stringify(bound.tool.inputSchema),
+                outputSchemaJson: bound.tool.outputSchema
+                  ? JSON.stringify(bound.tool.outputSchema)
+                  : "",
+              },
+              argumentConstraintDocumentsJson: bound.grant.argumentConstraintDocuments.map(
+                (document) => JSON.stringify(document),
+              ),
+              automationWrite: bound.grant.automationWrite,
+              unrestricted: bound.grant.unrestricted,
+              catalogId: binding.catalogId,
+              catalogRevision: binding.catalogRevision,
+              configRevision: binding.configRevision,
+              authGeneration: binding.authGeneration,
+            })),
+          )
+          .sort((a, b) =>
+            a.modelToolName < b.modelToolName ? -1 : a.modelToolName > b.modelToolName ? 1 : 0,
+          );
+        return {
+          bindingHash: snapshot.bindingHash,
+          bindingEpoch: String(snapshot.bindingEpoch),
+          bindingTools,
+          drain: snapshot.drain ? drainProto(snapshot.drain) : undefined,
+          denyHosts: snapshot.managedDenyPolicy.hosts,
+          denyRevision: String(snapshot.managedDenyPolicy.revision),
+          denyDigest: snapshot.managedDenyPolicy.digest,
+          connections: snapshot.immutableBindings.map((binding) => ({
+            connectionId: binding.connectionId,
+            alias: binding.alias,
+            endpoint: binding.config.endpoint,
+            zone: binding.config.zone,
+            credentialIdentity: binding.credentialIdentity,
+            configRevision: binding.configRevision,
+            authGeneration: binding.authGeneration,
+            catalogRevision: binding.catalogRevision,
+          })),
+        };
       });
+    },
+    async rebindMcp(req, ctx) {
+      const actor = await requireUser(ctx, deps.getSession);
+      if (actor.serviceAccount)
+        throw new ConnectError("a human decision is required", Code.PermissionDenied);
+      const runtime = requireMcpHook(services().runtime);
+      if (!req.expectedBindingHash || !req.expectedCandidateHash)
+        throw new ConnectError(
+          "binding and reviewed candidate hashes are required",
+          Code.InvalidArgument,
+        );
+      return mcpOperation(() =>
+        runtime.rebind(req.sessionId, req.expectedBindingHash, req.expectedCandidateHash, actor.id),
+      );
     },
   };
 }

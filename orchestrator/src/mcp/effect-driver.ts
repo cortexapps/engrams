@@ -1,3 +1,4 @@
+import { McpAuthorityStale } from "./authority-error.ts";
 import { fromJson } from "@bufbuild/protobuf";
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
@@ -15,6 +16,7 @@ import type {
   SessionPolicyControlClient,
 } from "./control-client.ts";
 import { makeCredentialBroker } from "./credential-broker.ts";
+import { makeMcpActiveWatch } from "./active-watch.ts";
 import { canonicalDigest, canonicalJson } from "./hash.ts";
 import { makeMcpJournal, type McpLiveDispatchAuthorization } from "./journal.ts";
 import { requestPolicyContext } from "./journal-review.ts";
@@ -160,6 +162,7 @@ export async function persistVerifiedOutcome(
   dispatched: Call,
   outcome: ReturnType<typeof verifiedExecutionResult>,
   now: () => Date,
+  verified = true,
 ): Promise<Call> {
   // Cancellation can change dispatching to unknown once. Only the result CAS is retried.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -167,7 +170,8 @@ export async function persistVerifiedOutcome(
     if (!latest || latest.intentId !== dispatched.intentId)
       throw Error("MCP result identity changed");
     if (!["dispatching", "outcome_unknown"].includes(latest.state)) return latest;
-    if (latest.state === "outcome_unknown" && outcome.state === "outcome_unknown") return latest;
+    if (latest.state === "outcome_unknown" && (!verified || outcome.state === "outcome_unknown"))
+      return latest;
     try {
       return await journal.finish(
         dispatched.id,
@@ -228,7 +232,8 @@ export function makeMcpEffectDriver(deps: {
     const status = await (resolved.reviewedTool.classification === "write"
       ? policy.validateDispatchFence(context, expected)
       : policy.validateExecutionIdentity(context, expected));
-    if (status !== "current") throw new McpRequestDenied("authority_changed");
+    if (status === "stale") throw new McpRequestDenied("authority_changed");
+    if (status !== "current") throw Error("MCP policy fence unavailable");
   }
   async function current(call: Call, signal?: AbortSignal) {
     const resolved = call.requestContext?.resolvedTool;
@@ -237,11 +242,12 @@ export function makeMcpEffectDriver(deps: {
     enabled(resolved, signal);
     const snapshot = await deps.resolver.readCurrent(call.sessionId);
     publication(snapshot);
-    if (snapshot.bindingHash !== call.bindingHash) throw Error("MCP binding changed");
+    if (snapshot.bindingHash !== call.bindingHash)
+      throw new McpAuthorityStale("MCP binding changed");
     await db.transaction((tx) => lockRuntimeAuthority(tx, call, "share"));
     if (
       call.classification === "write" &&
-      (await journal.hasUnknown(call.sessionId, call.connectionId))
+      (await journal.hasUnknown(call.sessionId, call.connectionId, deps.now()))
     )
       throw Error("unknown write outcome blocks this connection");
     await fence(requestPolicyContext(call.requestContext!), resolved, call.originalArguments);
@@ -339,7 +345,41 @@ export function makeMcpEffectDriver(deps: {
     }
     return true;
   }
+  const activeWatch = makeMcpActiveWatch({
+    intervalMs: 1_000,
+    async check(id) {
+      const call = await journal.get(id);
+      if (!call || !["waiting_approval", "authorized", "dispatching"].includes(call.state))
+        throw Error("MCP execution no longer active");
+      await current(call);
+    },
+  });
   return {
+    cancel(id: string) {
+      activeWatch.cancel(id);
+    },
+    async reconcile(id: string, signal?: AbortSignal) {
+      signal?.throwIfAborted();
+      const call = await journal.get(id);
+      if (!call || !["waiting_approval", "authorized", "dispatching"].includes(call.state)) return;
+      if (call.deadline <= deps.now()) {
+        signal?.throwIfAborted();
+        activeWatch.cancel(id);
+        await journal.cancelInternal(id, "deadline", deps.now());
+        return;
+      }
+      try {
+        await current(call, signal);
+      } catch (error) {
+        activeWatch.cancel(id);
+        signal?.throwIfAborted();
+        if (error instanceof McpRequestDenied || error instanceof McpAuthorityStale) {
+          await journal.cancelInternal(id, "authority_changed", deps.now());
+          return;
+        }
+        throw error;
+      }
+    },
     async acceptToolRequest(input: McpToolRequest, trustedDeadline?: Date) {
       input = structuredClone(input);
       const existing = await lookup(input);
@@ -377,7 +417,7 @@ export function makeMcpEffectDriver(deps: {
       if (
         write &&
         (context.acceptedWriteEligibility !== "write_eligible" ||
-          (await journal.hasUnknown(input.sessionId, resolved.binding.connectionId)))
+          (await journal.hasUnknown(input.sessionId, resolved.binding.connectionId, deps.now())))
       )
         throw new McpRequestDenied("write_not_allowed");
       const authorization = !write
@@ -427,122 +467,138 @@ export function makeMcpEffectDriver(deps: {
       return call;
     },
     async driveOnce(id: string, signal?: AbortSignal): Promise<Call> {
-      let call = await journal.get(id);
-      if (!call) throw Error("MCP call unavailable");
-      if (!["waiting_approval", "authorized"].includes(call.state)) return call;
-      const resolved = await current(call, signal);
+      const watch = activeWatch.register(id);
+      signal = signal ? AbortSignal.any([signal, watch.signal]) : watch.signal;
       try {
-        if (!(await schema(call, resolved, signal))) return (await journal.get(id))!;
-      } catch (error) {
-        if (!(error instanceof InvalidArguments)) throw error;
-        return journal.rejectBeforeDispatch(
-          id,
-          {
-            requestDigest: call.requestDigest,
-            version: call.version,
-            reservation: {
-              reservationId: error.lease.reservationId,
-              expiresAt: error.lease.expiresAt,
-            },
-          },
-          deps.now(),
-        );
-      }
-      if (call.state === "waiting_approval") {
-        await journal.requestApproval(id, deps.deploymentId, deps.now());
-        return (await journal.get(id))!;
-      }
-      await current(call, signal);
-      const [connection] = await db
-        .select()
-        .from(integrationConnection)
-        .where(eq(integrationConnection.id, call.connectionId));
-      if (!connection?.mcpCredential.status || connection.mcpCredential.transition)
-        throw Error("MCP credential authority unavailable");
-      const status = fromJson(CredentialStatusSchema, connection.mcpCredential.status);
-      if (status.context?.authorizationGeneration !== BigInt(call.authGeneration))
-        throw Error("MCP credential authority changed");
-      if ((await journal.admit(id, deps.deploymentId, deps.now())) === "queued")
-        return (await journal.get(id))!;
-      const lease = (await journal.getAdmission(id))!;
-      const worker = client(resolved, signal);
-      try {
-        const identity = await worker.identity();
-        await current(call, signal);
-        const operation: Extract<WorkerOperation, { kind: "execute" }> = {
-          kind: "execute",
-          endpoint: resolved.binding.config.endpoint,
-          tool: resolved.reviewedTool.upstreamName,
-          arguments: argumentsValue(call.originalArguments!),
-          inputSchema: resolved.reviewedTool.inputSchema,
-          ...(resolved.reviewedTool.outputSchema
-            ? { outputSchema: resolved.reviewedTool.outputSchema }
-            : {}),
-          argumentConstraintDocuments: resolved.effectiveGrant.argumentConstraintDocuments,
-          classification: resolved.reviewedTool.classification,
-        };
-        const dispatchIntent = intent(call, lease, identity, operation);
-        const proof: McpLiveDispatchAuthorization = {
-          executionId: id,
-          requestDigest: call.requestDigest,
-          bindingHash: call.bindingHash,
-          principalId: call.principalId,
-          expectedJournalRevision: call.version,
-          reservationId: lease.reservationId,
-          reservationExpiresAt: lease.expiresAt,
-        };
-        call = await journal.dispatch(
-          id,
-          { bootId: identity.bootId, intentId: dispatchIntent.id, expiresAt: lease.expiresAt },
-          deps.now(),
-          proof,
-        );
-        const dispatched = call;
-        const broker = makeCredentialBroker({
-          control: deps.control,
-          now: () => deps.now().getTime(),
-          admission: {
-            async assertAdmitted() {
-              await current(dispatched, signal);
-              await journal.assertDispatchCurrent(id, proof, deps.now());
-            },
-          },
-          worker,
-          async beforeDispatch() {
-            enabled(resolved, signal);
-            await fence(
-              requestPolicyContext(dispatched.requestContext!),
-              resolved,
-              dispatched.originalArguments!,
-            );
-            // The broker checks delivery expiry next, then sends on the retained socket.
-            enabled(resolved, signal);
-          },
-        });
-        let outcome: ReturnType<typeof verifiedExecutionResult>;
+        let call = await journal.get(id);
+        if (!call) throw Error("MCP call unavailable");
+        if (!["waiting_approval", "authorized"].includes(call.state)) return call;
+        await watch.ready;
+        watch.throwIfFailed();
+        signal.throwIfAborted();
+        const resolved = await current(call, signal);
         try {
-          const response = await broker.dispatch({
-            status,
-            identity,
-            intent: dispatchIntent,
-            operation,
-          });
-          if (!response.ok) throw Error("MCP result unavailable");
-          outcome = verifiedExecutionResult(response.result);
-        } catch {
-          outcome = {
-            state: call.classification === "write" ? "outcome_unknown" : "failed",
-            result: {
-              outcome: call.classification === "write" ? "outcome_unknown" : "failed",
-              delivery: "unavailable",
-              reason: "upstream_failure",
+          if (!(await schema(call, resolved, signal))) return (await journal.get(id))!;
+        } catch (error) {
+          if (!(error instanceof InvalidArguments)) throw error;
+          return journal.rejectBeforeDispatch(
+            id,
+            {
+              requestDigest: call.requestDigest,
+              version: call.version,
+              reservation: {
+                reservationId: error.lease.reservationId,
+                expiresAt: error.lease.expiresAt,
+              },
             },
-            resultUnavailable: false,
-          };
+            deps.now(),
+          );
         }
-        return persistVerifiedOutcome(journal, dispatched, outcome, deps.now);
+        if (call.state === "waiting_approval") {
+          await journal.requestApproval(id, deps.deploymentId, deps.now());
+          return (await journal.get(id))!;
+        }
+        await current(call, signal);
+        const [connection] = await db
+          .select()
+          .from(integrationConnection)
+          .where(eq(integrationConnection.id, call.connectionId));
+        if (!connection?.mcpCredential.status || connection.mcpCredential.transition)
+          throw Error("MCP credential authority unavailable");
+        const status = fromJson(CredentialStatusSchema, connection.mcpCredential.status);
+        if (status.context?.authorizationGeneration !== BigInt(call.authGeneration))
+          throw Error("MCP credential authority changed");
+        if ((await journal.admit(id, deps.deploymentId, deps.now())) === "queued")
+          return (await journal.get(id))!;
+        const lease = (await journal.getAdmission(id))!;
+        const worker = client(resolved, signal);
+        try {
+          const identity = await worker.identity();
+          await current(call, signal);
+          const operation: Extract<WorkerOperation, { kind: "execute" }> = {
+            kind: "execute",
+            endpoint: resolved.binding.config.endpoint,
+            tool: resolved.reviewedTool.upstreamName,
+            arguments: argumentsValue(call.originalArguments!),
+            inputSchema: resolved.reviewedTool.inputSchema,
+            ...(resolved.reviewedTool.outputSchema
+              ? { outputSchema: resolved.reviewedTool.outputSchema }
+              : {}),
+            argumentConstraintDocuments: resolved.effectiveGrant.argumentConstraintDocuments,
+            classification: resolved.reviewedTool.classification,
+          };
+          const dispatchIntent = intent(call, lease, identity, operation);
+          const proof: McpLiveDispatchAuthorization = {
+            executionId: id,
+            requestDigest: call.requestDigest,
+            bindingHash: call.bindingHash,
+            principalId: call.principalId,
+            expectedJournalRevision: call.version,
+            reservationId: lease.reservationId,
+            reservationExpiresAt: lease.expiresAt,
+          };
+          call = await journal.dispatch(
+            id,
+            { bootId: identity.bootId, intentId: dispatchIntent.id, expiresAt: lease.expiresAt },
+            deps.now(),
+            proof,
+          );
+          const dispatched = call;
+          const broker = makeCredentialBroker({
+            control: deps.control,
+            now: () => deps.now().getTime(),
+            admission: {
+              async assertAdmitted() {
+                await current(dispatched, signal);
+                await journal.assertDispatchCurrent(id, proof, deps.now());
+              },
+            },
+            worker,
+            async beforeDispatch() {
+              enabled(resolved, signal);
+              await fence(
+                requestPolicyContext(dispatched.requestContext!),
+                resolved,
+                dispatched.originalArguments!,
+              );
+              // The broker checks delivery expiry next, then sends on the retained socket.
+              enabled(resolved, signal);
+            },
+          });
+          let outcome: ReturnType<typeof verifiedExecutionResult>;
+          let verified = true;
+          try {
+            const response = await broker.dispatch({
+              status,
+              identity,
+              intent: dispatchIntent,
+              operation,
+            });
+            if (!response.ok) throw Error("MCP result unavailable");
+            outcome = verifiedExecutionResult(response.result);
+          } catch {
+            verified = false;
+            const latest = await journal.get(call.id);
+            if (!latest || latest.intentId !== dispatched.intentId)
+              throw Error("MCP result identity changed");
+            const interrupted = signal?.aborted || latest.state === "outcome_unknown";
+            const unknown = interrupted || call.classification === "write";
+            outcome = {
+              state: unknown ? "outcome_unknown" : "failed",
+              result: {
+                outcome: unknown ? "outcome_unknown" : "failed",
+                delivery: "unavailable",
+                reason: interrupted ? "execution_interrupted" : "upstream_failure",
+              },
+              resultUnavailable: false,
+            };
+          }
+          return persistVerifiedOutcome(journal, dispatched, outcome, deps.now, verified);
+        } finally {
+          worker.close();
+        }
       } finally {
-        worker.close();
+        watch.close();
       }
     },
   };

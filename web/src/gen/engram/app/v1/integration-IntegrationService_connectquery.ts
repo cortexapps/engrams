@@ -182,6 +182,11 @@ export const cancelMcpCall = IntegrationService.method.cancelMcpCall;
 export const resolveMcpOutcome = IntegrationService.method.resolveMcpOutcome;
 
 /**
+ * @generated from rpc engram.app.v1.IntegrationService.PrepareMcpRebind
+ */
+export const prepareMcpRebind = IntegrationService.method.prepareMcpRebind;
+
+/**
  * @generated from rpc engram.app.v1.IntegrationService.RebindMcp
  */
 export const rebindMcp = IntegrationService.method.rebindMcp;

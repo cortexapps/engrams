@@ -87,7 +87,13 @@ test("a verified late success survives cancellation between result read and resu
       {
         ...f.journal,
         async finish(...args) {
-          if (++commits === 1) await f.journal.cancel(call.id, f.actorId, f.now);
+          if (++commits === 1)
+            await f.journal.cancel(
+              call.id,
+              f.actorId,
+              f.now,
+              (await f.journal.get(call.id))!.version,
+            );
           return f.journal.finish(...args);
         },
       },

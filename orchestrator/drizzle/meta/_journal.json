@@ -785,6 +785,20 @@
       "when": 1793613661405,
       "tag": "0111_mcp_completion_receipt",
       "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1793616759320,
+      "tag": "0112_mcp_lifecycle_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1793619176833,
+      "tag": "0113_mcp_lifecycle_active",
+      "breakpoints": true
     }
   ]
 }

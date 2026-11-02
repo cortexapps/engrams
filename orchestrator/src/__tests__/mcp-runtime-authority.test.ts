@@ -226,7 +226,7 @@ test("barrier and human cancellation share a safe lock order", async () => {
   try {
     const results = await Promise.allSettled([
       f.journal.dispatch(f.call.id, f.intent, f.now, f.proof),
-      f.journal.cancel(f.call.id, f.actorId, f.now),
+      f.journal.cancel(f.call.id, f.actorId, f.now, (await f.journal.get(f.call.id))!.version),
     ]);
     expect(results[1]!.status).toBe("fulfilled");
     expect(["canceled", "outcome_unknown"]).toContain((await f.journal.get(f.call.id))!.state);

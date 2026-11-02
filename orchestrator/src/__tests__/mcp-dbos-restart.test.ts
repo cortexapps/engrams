@@ -1,3 +1,4 @@
+import { unknownContext } from "../mcp/journal.ts";
 import { beforeAll, afterAll, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -403,7 +404,13 @@ test("late verified outcome after expiry gets a new completion receipt without a
     expect(unknown.completionEnqueuedVersion).toBe(unknown.version);
     f.requests.set("new-write", { ...f.request, toolCallId: "new-write" });
     await expect(f.driver.acceptToolRequest(f.requests.get("new-write")!)).rejects.toThrow();
-    await f.journal.resolveUnknown(dispatched.id, f.actorId, "acknowledged", new Date());
+    await f.journal.resolveUnknown(
+      dispatched.id,
+      f.actorId,
+      "acknowledged",
+      new Date(),
+      unknownContext((await f.journal.get(dispatched.id))!),
+    );
     const resolved = (await callFor(f))!;
     expect(resolved.state).toBe("outcome_unknown");
     expect(resolved.result).toBeNull();

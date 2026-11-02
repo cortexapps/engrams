@@ -8,6 +8,7 @@
 
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 
+import { notifyMcpAuthorityChanged } from "../mcp/authority-notification.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
 import { isServiceAccountEmail } from "../rpc/api-key.ts";
 import { getDb } from "./client.ts";
@@ -163,7 +164,7 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
       });
     },
     async update(id, input, publication) {
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         await lockPublisher(tx, publication);
         const [existing] = await tx
           .select()
@@ -224,12 +225,15 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
           .returning();
         return toRow(row!);
       });
+      if (result) notifyMcpAuthorityChanged();
+      return result;
     },
     async softDelete(id) {
       await db
         .update(profileTable)
         .set({ deletedAt: new Date() })
         .where(and(eq(profileTable.id, id), isNull(profileTable.deletedAt)));
+      notifyMcpAuthorityChanged();
     },
   };
 }

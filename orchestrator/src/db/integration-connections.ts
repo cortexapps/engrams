@@ -1,3 +1,4 @@
+import { notifyMcpAuthorityChanged } from "../mcp/authority-notification.ts";
 /** Named integration connection store (ADR 0109). */
 
 import { validateMcpConfig } from "../mcp/config.ts";
@@ -42,7 +43,10 @@ export interface IntegrationConnectionStore {
   getMany(ids: readonly string[]): Promise<IntegrationConnectionRow[]>;
   getDefault(provider: string): Promise<IntegrationConnectionRow | null>;
   create(input: IntegrationConnectionInput): Promise<IntegrationConnectionRow>;
-  update(id: string, input: Omit<IntegrationConnectionInput, "provider">): Promise<IntegrationConnectionRow | null>;
+  update(
+    id: string,
+    input: Omit<IntegrationConnectionInput, "provider">,
+  ): Promise<IntegrationConnectionRow | null>;
   delete(id: string): Promise<boolean>;
   markTested(id: string, testedAt: Date): Promise<IntegrationConnectionRow | null>;
   setEnabled(id: string, enabled: boolean): Promise<IntegrationConnectionRow | null>;
@@ -55,15 +59,17 @@ export interface IntegrationConnectionStore {
 
 function toRow(r: typeof connectionTable.$inferSelect): IntegrationConnectionRow {
   return {
-    ...(r.provider === "mcp" ? {
-      mcp: {
-        configRevision: r.configRevision,
-        authGeneration: r.authGeneration,
-        credentialIdentity: r.credentialIdentity,
-        catalogRevision: r.catalogRevision,
-        revoked: r.revoked,
-      },
-    } : {}),
+    ...(r.provider === "mcp"
+      ? {
+          mcp: {
+            configRevision: r.configRevision,
+            authGeneration: r.authGeneration,
+            credentialIdentity: r.credentialIdentity,
+            catalogRevision: r.catalogRevision,
+            revoked: r.revoked,
+          },
+        }
+      : {}),
     id: r.id,
     alias: r.alias,
     provider: r.provider,
@@ -84,17 +90,16 @@ export function makeIntegrationConnectionStore(
     const rows = await db
       .select()
       .from(connectionTable)
-      .where(and(
-        eq(connectionTable.provider, provider),
-        eq(connectionTable.isDefault, true),
-      ))
+      .where(and(eq(connectionTable.provider, provider), eq(connectionTable.isDefault, true)))
       .limit(1);
     return rows[0] ? toRow(rows[0]) : null;
   }
 
   return {
     async list() {
-      return (await db.select().from(connectionTable).orderBy(asc(connectionTable.alias))).map(toRow);
+      return (await db.select().from(connectionTable).orderBy(asc(connectionTable.alias))).map(
+        toRow,
+      );
     },
 
     async get(id) {
@@ -123,6 +128,7 @@ export function makeIntegrationConnectionStore(
         .insert(connectionTable)
         .values({ id: crypto.randomUUID(), ...input, enabled: false })
         .returning();
+      if (input.provider === "mcp") notifyMcpAuthorityChanged();
       return toRow(rows[0]!);
     },
 
@@ -139,7 +145,8 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .delete(connectionTable)
         .where(eq(connectionTable.id, id))
-        .returning({ id: connectionTable.id });
+        .returning({ id: connectionTable.id, provider: connectionTable.provider });
+      if (rows[0]?.provider === "mcp") notifyMcpAuthorityChanged();
       return rows.length > 0;
     },
 
@@ -174,16 +181,19 @@ export function makeIntegrationConnectionStore(
       if (provider === "mcp") throw new Error("MCP requires an explicit named connection");
       const existing = await getDefault(provider);
       if (existing) return existing;
-      await db.insert(connectionTable).values({
-        id: crypto.randomUUID(),
-        alias: `${provider}-default`,
-        provider,
-        displayName,
-        isDefault: true,
-        config: {},
-        enabled: true,
-        testedAt: new Date(0),
-      }).onConflictDoNothing();
+      await db
+        .insert(connectionTable)
+        .values({
+          id: crypto.randomUUID(),
+          alias: `${provider}-default`,
+          provider,
+          displayName,
+          isDefault: true,
+          config: {},
+          enabled: true,
+          testedAt: new Date(0),
+        })
+        .onConflictDoNothing();
       const created = await getDefault(provider);
       if (!created) {
         throw new Error(`failed to create default integration connection for "${provider}"`);

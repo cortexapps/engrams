@@ -2265,6 +2265,9 @@ export const mcpExecution = pgTable(
     index("mcp_execution_connection_state_idx").on(t.connectionId, t.sessionId, t.state),
     index("mcp_execution_catalog_idx").on(t.catalogId),
     index("mcp_execution_pending_idx").on(t.state, t.deadline),
+    index("mcp_execution_lifecycle_active_idx")
+      .on(t.id)
+      .where(sql`${t.state} IN ('waiting_approval','authorized','dispatching')`),
     index("mcp_execution_recovery_idx")
       .on(t.id)
       .where(sql`${t.completionEnqueuedVersion} < ${t.version}`),
@@ -2318,12 +2321,37 @@ export const mcpApproval = pgTable(
   ],
 );
 
+/** A cancellation is a durable decision, not proof that an upstream effect was undone. */
+export const mcpCancellation = pgTable(
+  "mcp_cancellation",
+  {
+    executionId: text("execution_id")
+      .primaryKey()
+      .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    actorId: text("actor_id"),
+    cause: text("cause").notNull(),
+    expectedJournalRevision: integer("expected_journal_revision").notNull(),
+    journalRevision: integer("journal_revision").notNull(),
+    state: text("state").$type<"canceled" | "outcome_unknown">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    check(
+      "mcp_cancellation_revision_check",
+      sql`${t.expectedJournalRevision} > 0 AND ${t.journalRevision} = ${t.expectedJournalRevision} + 1`,
+    ),
+    check("mcp_cancellation_state_check", sql`${t.state} IN ('canceled','outcome_unknown')`),
+  ],
+);
+
 export const mcpResolution = pgTable(
   "mcp_resolution",
   {
     executionId: text("execution_id")
       .primaryKey()
       .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    expectedContext:
+      jsonb("expected_context").$type<import("../mcp/journal.ts").McpUnknownContext>(),
     actorId: text("actor_id").notNull(),
     outcome: text("outcome").$type<"succeeded" | "failed" | "acknowledged">().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),

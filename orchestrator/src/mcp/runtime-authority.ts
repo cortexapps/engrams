@@ -1,3 +1,4 @@
+import { McpAuthorityStale } from "./authority-error.ts";
 import { subject } from "@casl/ability";
 import { eq } from "drizzle-orm";
 import { automation, automationRun, automationSession, mcpExecution } from "../db/schema.ts";
@@ -23,7 +24,7 @@ export async function lockRuntimeAuthority(
       .select()
       .from(automationSession)
       .where(eq(automationSession.sessionId, call.sessionId));
-    if (!linked || !id) throw new Error("automation identity unavailable");
+    if (!linked || !id) throw new McpAuthorityStale("automation identity unavailable");
     const [owner] = await tx.select().from(automation).where(eq(automation.id, id)).for("share");
     const [run] = await tx
       .select()
@@ -47,7 +48,7 @@ export async function lockRuntimeAuthority(
       (session.role === "primary" &&
         (run.sessionId !== call.sessionId || run.taskId !== call.taskId))
     )
-      throw new Error("automation authority unavailable");
+      throw new McpAuthorityStale("automation authority unavailable");
     authority = await lockSessionChain(tx, call.sessionId);
     if (call.classification === "write") {
       const resolved = call.requestContext?.resolvedTool;
@@ -62,7 +63,7 @@ export async function lockRuntimeAuthority(
         publication.grantsHash !== authority.session.mcpBindingEnvelope?.profileGrantsHash ||
         canonicalDigest(resolved.effectiveGrant) !== call.automationGrantHash
       )
-        throw new Error("explicit published automation write grant required");
+        throw new McpAuthorityStale("explicit published automation write grant required");
     }
   } else {
     const human = await lockHumanSession(tx, call.sessionId, call.principalId, true);
@@ -73,7 +74,7 @@ export async function lockRuntimeAuthority(
       !ability.can("prompt", subject("Session", { ...owner })) ||
       call.authorizationKind === "automation"
     )
-      throw new Error("current session permission required");
+      throw new McpAuthorityStale("current session permission required");
     authority = human;
   }
   if (
@@ -82,7 +83,7 @@ export async function lockRuntimeAuthority(
     authority.session.taskId !== call.taskId ||
     ["done", "failed", "cancelled"].includes(authority.owner.status)
   )
-    throw new Error("current session principal required");
+    throw new McpAuthorityStale("current session principal required");
   await assertLocalReviewCurrent(tx, call, authority.session, authority.ancestors, connectionLock);
   return authority;
 }
