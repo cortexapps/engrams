@@ -144,3 +144,9 @@ policy widens these routes, that the CNI enforces them, and that service NAT doe
 not bypass the intended exclusions. Rendered YAML and local TLS tests do not
 prove effective cluster isolation or Firecracker guest isolation. Those release
 gates remain required before dispatch can be enabled.
+
+The coordinator credential API uses `engram.mcp.v1.CredentialControlService` on
+the pinned mTLS listener. Its status responses wrap `CredentialStatus`; a missing
+status is an error. The credential API remains limited to 32 KiB. The separate
+`engram.mcp.v1.SessionPolicyService` uses a 4 MiB create budget on that same
+listener. Neither service is on the application listener or in its reflection.

@@ -1,3 +1,4 @@
+import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { expect, test } from "bun:test";
 import { createSecureServer } from "node:http2";
 import { execFileSync } from "node:child_process";
@@ -6,8 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { X509Certificate } from "node:crypto";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
-import { CredentialControl } from "../gen/engram/mcp/v1/control_pb.ts";
-import { makeCredentialControlClient } from "../mcp/control-client.ts";
+import { CredentialControlService } from "../gen/engram/mcp/v1/control_pb.ts";
+import {
+  makeCredentialControlClient,
+  unwrapCredentialControlClient,
+  makeSessionPolicyControlClient,
+} from "../mcp/control-client.ts";
+
+import { SessionPolicyService } from "../gen/engram/mcp/v1/session_policy_pb.ts";
 
 function certificates() {
   const dir = mkdtempSync(join(tmpdir(), "mcp-control-test-"));
@@ -53,11 +60,27 @@ test("control client requires pinned mTLS and preserves int64 metadata", async (
     { key: tls.key, cert: tls.cert, ca: tls.ca, requestCert: true, rejectUnauthorized: true },
     connectNodeAdapter({
       routes(router) {
-        router.service(CredentialControl, {
+        router.service(SessionPolicyService, {
+          async readWritePolicy(req) {
+            return {
+              state: {
+                policy: {
+                  ref: {
+                    sessionId: req.sessionId,
+                    policyRevision: 9007199254740993n,
+                    bindingEpoch: 9007199254740995n,
+                  },
+                  writeEligibility: "read_only",
+                },
+              },
+            };
+          },
+        });
+        router.service(CredentialControlService, {
           async getStatus(req) {
             calls++;
             expect(req.protocol).toBe(1);
-            return { protocol: 1, version: 9007199254740993n, status: "connected" };
+            return { status: { protocol: 1, version: 9007199254740993n, status: "connected" } };
           },
         });
       },
@@ -77,6 +100,17 @@ test("control client requires pinned mTLS and preserves int64 metadata", async (
     expect((await good.getStatus({ protocol: 1, connectionId: "c" })).version).toBe(
       9007199254740993n,
     );
+    const policy = makeSessionPolicyControlClient({ url, ...tls });
+    expect(
+      (await policy.readWritePolicy({ protocol: 1, sessionId: "s" })).state?.policy?.ref
+        ?.policyRevision,
+    ).toBe(9007199254740993n);
+    const badPolicy = makeSessionPolicyControlClient({
+      url,
+      ...tls,
+      serverFingerprint: "00:".repeat(31) + "00",
+    });
+    await expect(badPolicy.readWritePolicy({ protocol: 1 })).rejects.toThrow("control unavailable");
     const bad = makeCredentialControlClient({
       url,
       ...tls,
@@ -102,4 +136,32 @@ test("control client requires pinned mTLS and preserves int64 metadata", async (
     for (const s of sessions) s.destroy();
     await new Promise<void>((r) => server.close(() => r()));
   }
+});
+
+test("credential response wrappers fail closed when status is absent", async () => {
+  const client = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async putSecret() {
+            return {};
+          },
+          async completeAuthorization() {
+            return {};
+          },
+          async getStatus() {
+            return {};
+          },
+          async revoke() {
+            return {};
+          },
+        }),
+      ),
+    ),
+  );
+  await expect(client.putSecret({})).rejects.toThrow("status unavailable");
+  await expect(client.completeAuthorization({})).rejects.toThrow("status unavailable");
+  await expect(client.getStatus({})).rejects.toThrow("status unavailable");
+  await expect(client.revoke({})).rejects.toThrow("status unavailable");
 });

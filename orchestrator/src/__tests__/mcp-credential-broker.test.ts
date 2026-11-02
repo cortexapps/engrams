@@ -1,8 +1,9 @@
+import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import {
-  CredentialControl,
+  CredentialControlService,
   CredentialKind,
   CredentialStatusSchema,
 } from "../gen/engram/mcp/v1/control_pb.ts";
@@ -40,24 +41,26 @@ function fixture(expire = false) {
     deliveries = 0,
     leases = 0;
   const seen: unknown[] = [];
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async lease(req) {
-          leases++;
-          seen.push(req);
-          if (expire) time = now + 10000;
-          return {
-            protocol: 1,
-            header: "x-api-key",
-            value: "transient-value",
-            expiresAt: req.expiresAt,
-            operationExpiresAt: req.operationExpiresAt,
-            intentId: req.intentId,
-          };
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async lease(req) {
+            leases++;
+            seen.push(req);
+            if (expire) time = now + 10000;
+            return {
+              protocol: 1,
+              header: "x-api-key",
+              value: "transient-value",
+              expiresAt: req.expiresAt,
+              operationExpiresAt: req.operationExpiresAt,
+              intentId: req.intentId,
+            };
+          },
+        }),
+      ),
     ),
   );
   const broker = makeCredentialBroker({
@@ -143,15 +146,17 @@ test("worker policy and boot mismatch prevents secret lease", async () => {
 test("admission rejection prevents worker and credential access", async () => {
   const f = fixture();
   let touched = false;
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async lease() {
-          touched = true;
-          throw new Error("unexpected");
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async lease() {
+            touched = true;
+            throw new Error("unexpected");
+          },
+        }),
+      ),
     ),
   );
   const broker = makeCredentialBroker({
@@ -198,21 +203,23 @@ test("authority invalidated after lease is checked again before resource dispatc
   const f = fixture();
   let checks = 0,
     sent = false;
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async lease(req) {
-          return {
-            protocol: 1,
-            header: "x-api-key",
-            value: "secret",
-            expiresAt: req.expiresAt,
-            operationExpiresAt: req.operationExpiresAt,
-            intentId: req.intentId,
-          };
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async lease(req) {
+            return {
+              protocol: 1,
+              header: "x-api-key",
+              value: "secret",
+              expiresAt: req.expiresAt,
+              operationExpiresAt: req.operationExpiresAt,
+              intentId: req.intentId,
+            };
+          },
+        }),
+      ),
     ),
   );
   const broker = makeCredentialBroker({
@@ -247,21 +254,23 @@ test("authority invalidated after lease is checked again before resource dispatc
 });
 test("worker transport errors cannot expose the transient credential", async () => {
   const f = fixture();
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async lease(req) {
-          return {
-            protocol: 1,
-            header: "x-api-key",
-            value: "secret-value",
-            expiresAt: req.expiresAt,
-            operationExpiresAt: req.operationExpiresAt,
-            intentId: req.intentId,
-          };
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async lease(req) {
+            return {
+              protocol: 1,
+              header: "x-api-key",
+              value: "secret-value",
+              expiresAt: req.expiresAt,
+              operationExpiresAt: req.operationExpiresAt,
+              intentId: req.intentId,
+            };
+          },
+        }),
+      ),
     ),
   );
   const broker = makeCredentialBroker({

@@ -378,10 +378,11 @@ pub async fn run_with_registry_and_local(
     }
 
     // The optional credential service has its own authenticated listener.
-    let mcp_control = mcp::startup::start(
+    let mcp_control = mcp::startup::start_with_policy(
         cfg.mcp_control_config.as_deref(),
         state.oauth.clone(),
         state.subscribe_shutdown(),
+        Some(state.clone()),
     )
     .await
     .map_err(|_| {

@@ -1,5 +1,5 @@
 //! Internal MCP credential control protocol 1; no cleartext app registration.
-tonic::include_proto!("engram.mcp.v1");
+include!(concat!(env!("OUT_DIR"), "/mcp/engram.mcp.v1.rs"));
 pub const PROTOCOL: u32 = 1;
 macro_rules! redacted_debug {
     ($($ty:ty),*) => {$ (impl std::fmt::Debug for $ty {
@@ -8,6 +8,7 @@ macro_rules! redacted_debug {
 }
 redacted_debug!(
     PutSecretRequest,
+    CreatePolicySessionRequest,
     CompleteAuthorizationRequest,
     BeginAuthorizationResponse,
     LeaseResponse

@@ -72,6 +72,16 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
+    async fn get_mcp_write_policy(
+        &self,
+        req: Request<app::GetMcpWritePolicyRequest>,
+    ) -> Result<Response<app::GetMcpWritePolicyResponse>, Status> {
+        self.auth.check(&req)?;
+        Err(Status::failed_precondition(
+            "trusted policy transport required",
+        ))
+    }
+
     async fn get_session(
         &self,
         req: Request<app::GetSessionRequest>,
@@ -160,6 +170,11 @@ impl app::session_service_server::SessionService for AppSessionService {
     ) -> Result<Response<app::CompleteToolCallResponse>, Status> {
         self.auth.check(&req)?;
         let r = req.into_inner();
+        if r.expected_mcp_plan_review.is_some() {
+            return Err(Status::failed_precondition(
+                "trusted policy transport required",
+            ));
+        }
         let id = parse_session_id(&r.session_id)?;
         let note = crate::api::prompt::complete_tool_call_core(
             &self.state,

@@ -69,6 +69,7 @@ async fn enqueue(
     cpu_budget_vcpus: i32,
 ) {
     let ws = engram_core::traits::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id,
         spec,
@@ -111,6 +112,7 @@ async fn reserve(
     affinity_len: usize,
 ) -> Option<HostId> {
     let ws = engram_core::traits::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id,
         spec: spec.clone(),

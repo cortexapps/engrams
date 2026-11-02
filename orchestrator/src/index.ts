@@ -1,3 +1,4 @@
+import { makeSessionPolicyOverrides } from "./mcp/session-policy.ts";
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { makeHttpLog } from "./http-log.ts";
@@ -578,7 +579,7 @@ const server = buildServer(
         const response = await controlPlaneSessions.getSession({ sessionId });
         await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
       },
-    });
+    }, makeSessionPolicyOverrides());
   },
   // Raw WS-upgrade hooks, tried in order: the preview proxy first
   // (Host-keyed — a preview host is a different origin, so it wins

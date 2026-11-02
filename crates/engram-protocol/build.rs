@@ -47,15 +47,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // reach 16 MiB at 1M IDs; the host server bumps its decode
         // cap inline at the call site rather than globally here.
         .compile_protos(&protos, &includes)?;
+    let mcp_out = std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("mcp");
+    std::fs::create_dir_all(&mcp_out)?;
     tonic_prost_build::configure()
+        .out_dir(mcp_out)
         .build_server(true)
         .build_client(true)
+        .extern_path(".engram.app.v1", "crate::app")
         .skip_debug([
             ".engram.mcp.v1.PutSecretRequest",
+            ".engram.mcp.v1.CreatePolicySessionRequest",
             ".engram.mcp.v1.CompleteAuthorizationRequest",
             ".engram.mcp.v1.BeginAuthorizationResponse",
             ".engram.mcp.v1.LeaseResponse",
         ])
-        .compile_protos(&["proto/engram/mcp/v1/control.proto"], &includes)?;
+        .compile_protos(
+            &[
+                "proto/engram/mcp/v1/control.proto",
+                "proto/engram/mcp/v1/session_policy.proto",
+            ],
+            &includes,
+        )?;
     Ok(())
 }

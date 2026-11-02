@@ -5,7 +5,9 @@ use engram_protocol::mcp as wire;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tonic::{Request, Response, Status};
-use wire::credential_control_server::{CredentialControl, CredentialControlServer};
+use wire::credential_control_service_server::{
+    CredentialControlService, CredentialControlServiceServer,
+};
 
 type RpcResult<T> = std::result::Result<Response<T>, Status>;
 pub struct ControlTls {
@@ -15,14 +17,21 @@ pub struct ControlTls {
     pub orchestrator_fingerprints: Vec<String>,
 }
 #[derive(Clone)]
-struct Control {
-    authority: Arc<McpAuthority>,
+pub(super) struct Control {
+    pub(super) authority: Arc<McpAuthority>,
     pins: Arc<BTreeSet<String>>,
     admission: Arc<tokio::sync::Semaphore>,
 }
 pub fn server(
     authority: Arc<McpAuthority>,
     tls: ControlTls,
+) -> super::Result<tonic::transport::server::Router> {
+    server_with_policy(authority, tls, None)
+}
+pub fn server_with_policy(
+    authority: Arc<McpAuthority>,
+    tls: ControlTls,
+    state: Option<crate::state::SharedState>,
 ) -> super::Result<tonic::transport::server::Router> {
     if tls.orchestrator_fingerprints.is_empty()
         || tls.orchestrator_fingerprints.len() > 8
@@ -58,13 +67,23 @@ pub fn server(
         .timeout(Duration::from_secs(30))
         .max_concurrent_streams(16)
         .add_service(
-            CredentialControlServer::new(service)
+            CredentialControlServiceServer::new(service.clone())
                 .max_decoding_message_size(32768)
                 .max_encoding_message_size(32768),
+        )
+        .add_service(
+            wire::session_policy_service_server::SessionPolicyServiceServer::new(
+                super::policy::PolicyControl {
+                    control: service,
+                    state,
+                },
+            )
+            .max_decoding_message_size(4 * 1024 * 1024)
+            .max_encoding_message_size(4 * 1024 * 1024),
         ))
 }
 impl Control {
-    fn check<T>(
+    pub(super) fn check<T>(
         &self,
         req: &Request<T>,
         protocol: u32,
@@ -243,11 +262,11 @@ fn status(v: wire::CredentialStatus) -> std::result::Result<domain::CredentialSt
     })
 }
 #[tonic::async_trait]
-impl CredentialControl for Control {
+impl CredentialControlService for Control {
     async fn put_secret(
         &self,
         req: Request<wire::PutSecretRequest>,
-    ) -> RpcResult<wire::CredentialStatus> {
+    ) -> RpcResult<wire::PutSecretResponse> {
         let _permit = self.check(&req, req.get_ref().protocol)?;
         let v = req.into_inner();
         actor(&v.actor_id)?;
@@ -257,18 +276,20 @@ impl CredentialControl for Control {
             _ => return Err(Status::invalid_argument("invalid secret kind")),
         };
         let expected = v.expected.map(reference).transpose()?;
-        Ok(Response::new(status_wire(
-            self.authority
-                .put_secret(
-                    &change(v.context)?,
-                    role,
-                    expected.as_ref(),
-                    &v.header,
-                    &v.value,
-                )
-                .await
-                .map_err(error)?,
-        )))
+        Ok(Response::new(wire::PutSecretResponse {
+            status: Some(status_wire(
+                self.authority
+                    .put_secret(
+                        &change(v.context)?,
+                        role,
+                        expected.as_ref(),
+                        &v.header,
+                        &v.value,
+                    )
+                    .await
+                    .map_err(error)?,
+            )),
+        }))
     }
     async fn begin_authorization(
         &self,
@@ -301,7 +322,7 @@ impl CredentialControl for Control {
     async fn complete_authorization(
         &self,
         req: Request<wire::CompleteAuthorizationRequest>,
-    ) -> RpcResult<wire::CredentialStatus> {
+    ) -> RpcResult<wire::CompleteAuthorizationResponse> {
         let _permit = self.check(&req, req.get_ref().protocol)?;
         let v = req.into_inner();
         actor(&v.actor_id)?;
@@ -318,9 +339,11 @@ impl CredentialControl for Control {
             code: v.code,
             actor_id: v.actor_id,
         };
-        Ok(Response::new(status_wire(
-            self.authority.callback(&callback).await.map_err(error)?,
-        )))
+        Ok(Response::new(wire::CompleteAuthorizationResponse {
+            status: Some(status_wire(
+                self.authority.callback(&callback).await.map_err(error)?,
+            )),
+        }))
     }
     async fn cancel_authorization(
         &self,
@@ -347,26 +370,30 @@ impl CredentialControl for Control {
     async fn get_status(
         &self,
         req: Request<wire::GetStatusRequest>,
-    ) -> RpcResult<wire::CredentialStatus> {
+    ) -> RpcResult<wire::GetStatusResponse> {
         let _permit = self.check(&req, req.get_ref().protocol)?;
         let v = req.into_inner();
-        Ok(Response::new(status_wire(
-            self.authority
-                .status(&v.connection_id, &reference(required(v.reference)?)?)
-                .await
-                .map_err(error)?,
-        )))
+        Ok(Response::new(wire::GetStatusResponse {
+            status: Some(status_wire(
+                self.authority
+                    .status(&v.connection_id, &reference(required(v.reference)?)?)
+                    .await
+                    .map_err(error)?,
+            )),
+        }))
     }
-    async fn revoke(&self, req: Request<wire::RevokeRequest>) -> RpcResult<wire::CredentialStatus> {
+    async fn revoke(&self, req: Request<wire::RevokeRequest>) -> RpcResult<wire::RevokeResponse> {
         let _permit = self.check(&req, req.get_ref().protocol)?;
         let v = req.into_inner();
         actor(&v.actor_id)?;
-        Ok(Response::new(status_wire(
-            self.authority
-                .revoke(&status(required(v.expected)?)?)
-                .await
-                .map_err(error)?,
-        )))
+        Ok(Response::new(wire::RevokeResponse {
+            status: Some(status_wire(
+                self.authority
+                    .revoke(&status(required(v.expected)?)?)
+                    .await
+                    .map_err(error)?,
+            )),
+        }))
     }
     async fn lease(&self, req: Request<wire::LeaseRequest>) -> RpcResult<wire::LeaseResponse> {
         let _permit = self.check(&req, req.get_ref().protocol)?;

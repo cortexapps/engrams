@@ -42,6 +42,7 @@ use engram_core::traits::{Clock, Entropy};
 use engram_core::MetaError;
 use parking_lot::Mutex;
 
+mod mcp_policy;
 mod store_impl;
 
 /// A would-be `pg_notify` recorded instead of fired. The D5 scheduler
@@ -138,6 +139,8 @@ use engram_core::{HostId, SessionId, SnapshotId};
 /// keeps that the domain type doesn't carry.
 #[derive(Clone, Debug)]
 pub struct SessRow {
+    pub mcp_write_policy: Option<engram_core::types::mcp_policy::StoredWritePolicy>,
+    pub mcp_policy_parent_id: Option<SessionId>,
     pub nbd_slot_need: u32,
     pub session: Session,
     pub mem_budget_mib: i64,

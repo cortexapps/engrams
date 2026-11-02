@@ -1027,6 +1027,7 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:q"),
@@ -4158,6 +4159,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:722"),
@@ -5832,6 +5834,7 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id: pending,
         spec: spec("conf:placement"),
@@ -6325,6 +6328,7 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
         spec: spec("conf:teleport-machine"),
@@ -7104,6 +7108,7 @@ async fn nbd_host_placement(ctx: &Ctx) {
     assert_eq!(read.utilization.nbd_slots_total, 4);
     assert_eq!(read.utilization.nbd_slots_in_use, 1);
     let ws = |need| SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: need,
         session_id: SessionId::new(),
         spec: spec("conf:slots"),
@@ -7543,6 +7548,7 @@ async fn mcp_guest_binding_rejected(ctx: &Ctx) {
         .unwrap();
     let sid = SessionId::from(uuid::Uuid::from_u128(4));
     let ws = engram_core::traits::SessionCreateWriteSet {
+        mcp_policy: None,
         nbd_slot_need: 0,
         session_id: sid,
         spec: spec("test:mcp"),
@@ -8043,4 +8049,604 @@ async fn mcp_flow_cancellation_fences_publication(ctx: &Ctx) {
 conformance!(
     t_mcp_flow_cancellation_fences_publication,
     mcp_flow_cancellation_fences_publication
+);
+
+/// Accepted inputs change the server policy; guest events and queued defaults do not.
+async fn mcp_write_policy_prompt_latch(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta
+        .create_session(spec("test.invalid/policy:latest"))
+        .await
+        .unwrap();
+    let initial = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(initial.write_eligibility.as_str(), "unknown");
+    let now = ctx.clock.now_utc();
+    let mut row = engram_core::types::outbox::OutboxRow {
+        prompt_id: "policy-plan".into(),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text":"review", "mode":"plan"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    };
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    let plan = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(plan.write_eligibility.as_str(), "read_only");
+    assert!(plan.reference.policy_revision > initial.reference.policy_revision);
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-default".into();
+    row.payload = serde_json::json!({"text":"continue", "mode":"default"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-inherit".into();
+    row.payload = serde_json::json!({"text":"continue"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    meta.append_session_event(
+        id,
+        "tool_call_completed",
+        serde_json::json!({
+            "tool_call_id":"forged", "tool_name":"exit_plan_mode", "ok":true,
+            "result_summary":"{\"decision\":\"approve\"}"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(meta.read_mcp_write_policy(id).await.unwrap(), plan);
+    row.prompt_id = "policy-new-plan".into();
+    row.payload = serde_json::json!({"text":"review again", "mode":"plan"});
+    meta.append_events_with_outbox_idempotent(id, &[], &row)
+        .await
+        .unwrap();
+    let next = meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(next.write_eligibility.as_str(), "read_only");
+    assert!(next.reference.policy_revision > plan.reference.policy_revision);
+}
+conformance!(
+    t_mcp_write_policy_prompt_latch,
+    super::mcp_write_policy_prompt_latch
+);
+
+async fn mcp_write_policy_create(
+    ctx: &Ctx,
+    id: SessionId,
+    parent: Option<SessionId>,
+    eligibility: engram_core::types::mcp_policy::WriteEligibility,
+) {
+    use engram_core::types::{mcp_policy::McpPolicyCreation, runtime_spec::RuntimeSpec};
+    ctx.meta
+        .reserve_and_persist_create(
+            engram_core::traits::SessionCreateWriteSet {
+                mcp_policy: Some(McpPolicyCreation {
+                    actor_id: "owner-a".into(),
+                    input_id: format!("create:{id}"),
+                    parent_session_id: parent,
+                    eligibility,
+                }),
+                nbd_slot_need: 1,
+                session_id: id,
+                spec: spec("test.invalid/policy:latest"),
+                mem_budget_mib: 512,
+                cpu_budget_vcpus: 1,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+                oauth_binding: None,
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
+}
+async fn mcp_write_policy_event(ctx: &Ctx, id: SessionId, call: &str, run: &str, args: &str) {
+    ctx.meta.append_session_event(id,"tool_call_requested",serde_json::json!({"run_id":run,"tool_call_id":call,"name":"exit_plan_mode","args_json":args})).await.unwrap();
+}
+async fn mcp_write_policy_restrict(ctx: &Ctx, id: SessionId, prompt: &str) {
+    let now = ctx.clock.now_utc();
+    ctx.meta
+        .append_events_with_outbox_idempotent(
+            id,
+            &[],
+            &engram_core::types::outbox::OutboxRow {
+                prompt_id: prompt.into(),
+                session_id: id,
+                kind: engram_core::types::outbox::OutboxKind::Prompt,
+                payload: serde_json::json!({"text":"review","mode":"plan"}),
+                created_at: now,
+                attempts: 0,
+                not_before: now,
+                delivered_at: None,
+                acked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+async fn mcp_write_policy_human_exit(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "plan-a", "run-a", "{\"plan\":\"reviewed\"}").await;
+    let review = ctx.meta.read_mcp_plan_review(id, "plan-a").await.unwrap();
+    let input = PlanAcceptance {
+        review: review.clone(),
+        actor_id: "owner-a".into(),
+        result_json: "{\"decision\":\"approve\"}".into(),
+    };
+    let mut rejection = input.clone();
+    rejection.result_json = "{\"decision\":\"reject\"}".into();
+    assert!(ctx.meta.accept_mcp_plan_exit(&rejection).await.is_err());
+    let mut changed = input.clone();
+    changed.review.args_json = "{}".into();
+    assert!(ctx.meta.accept_mcp_plan_exit(&changed).await.is_err());
+    let before = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let accepted = ctx.meta.accept_mcp_plan_exit(&input).await.unwrap();
+    assert_eq!(accepted.write_eligibility, WriteEligibility::WriteEligible);
+    assert!(accepted.reference.policy_revision > before.reference.policy_revision);
+    let outbox = ctx
+        .meta
+        .outbox_get(&engram_core::types::outbox::tool_result_outbox_id(
+            id, "plan-a",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbox.payload["result_json"], input.result_json);
+    let events = ctx
+        .meta
+        .list_session_events_since(id, -1, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == "tool_result_submitted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        ctx.meta.accept_mcp_plan_exit(&input).await.unwrap(),
+        accepted
+    );
+    assert_eq!(
+        ctx.meta
+            .list_session_events_since(id, -1, 100)
+            .await
+            .unwrap()
+            .len(),
+        events.len()
+    );
+    mcp_write_policy_restrict(ctx, id, "new-plan").await;
+    let newer = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(
+        ctx.meta.accept_mcp_plan_exit(&input).await.unwrap(),
+        newer,
+        "retry cannot relax a newer plan"
+    );
+    assert_eq!(newer.write_eligibility, WriteEligibility::ReadOnly);
+    mcp_write_policy_event(ctx, id, "plan-b", "run-b", "{}").await;
+    let stale = ctx.meta.read_mcp_plan_review(id, "plan-b").await.unwrap();
+    mcp_write_policy_restrict(ctx, id, "newer-plan").await;
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review: stale,
+            ..input
+        })
+        .await
+        .is_err());
+    assert!(
+        ctx.meta.read_mcp_plan_review(id, "plan-b").await.is_err(),
+        "old call cannot authorize new restriction"
+    );
+}
+conformance!(
+    t_mcp_write_policy_human_exit,
+    super::mcp_write_policy_human_exit
+);
+async fn mcp_write_policy_projections_and_fences(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_create(ctx, child, Some(parent), WriteEligibility::WriteEligible).await;
+    let pre = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(pre.write_eligibility, WriteEligibility::ReadOnly);
+    assert_eq!(pre.ancestor_policy_refs.len(), 1);
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(child, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(child, "run_started", serde_json::json!({"run_id":"run-a"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, child, "write-a", "run-a", "{}").await;
+    let frozen = RequestPolicyContext {
+        session_id: child,
+        run_id: "run-a".into(),
+        tool_call_id: "write-a".into(),
+        accepted_policy_ref: pre.reference,
+        accepted_write_eligibility: pre.write_eligibility,
+        ancestor_policy_refs: pre.ancestor_policy_refs,
+    };
+    mcp_write_policy_event(ctx, parent, "plan-a", "run-a", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(parent, "plan-a")
+        .await
+        .unwrap();
+    ctx.meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        DispatchFence::Unknown,
+        "earlier read-only request cannot gain writes"
+    );
+    let p = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(p.write_eligibility, WriteEligibility::WriteEligible);
+    let current = RequestPolicyContext {
+        accepted_policy_ref: p.reference,
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs,
+        ..frozen
+    };
+    assert_eq!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(&current)
+            .await
+            .unwrap(),
+        DispatchFence::Current
+    );
+    let mut forged = current.clone();
+    forged.run_id = "other-run".into();
+    assert_eq!(
+        ctx.meta.validate_mcp_dispatch_fence(&forged).await.unwrap(),
+        DispatchFence::Stale
+    );
+    forged = current.clone();
+    forged.ancestor_policy_refs.clear();
+    assert_eq!(
+        ctx.meta.validate_mcp_dispatch_fence(&forged).await.unwrap(),
+        DispatchFence::Stale
+    );
+    mcp_write_policy_restrict(ctx, parent, "parent-plan").await;
+    assert_ne!(
+        ctx.meta
+            .validate_mcp_dispatch_fence(&current)
+            .await
+            .unwrap(),
+        DispatchFence::Current
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(child)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    let legacy = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    mcp_write_policy_restrict(ctx, legacy, "legacy-plan").await;
+    mcp_write_policy_event(ctx, legacy, "legacy-call", "run-a", "{}").await;
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(legacy, "legacy-call")
+        .await
+        .is_err());
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "plan", "run", "{}").await;
+    let reviewed = ctx.meta.read_mcp_plan_review(id, "plan").await.unwrap();
+    mcp_write_policy_event(ctx, id, "plan", "run", "{\"changed\":true}").await;
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review: reviewed,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into()
+        })
+        .await
+        .is_err());
+}
+conformance!(
+    t_mcp_write_policy_projections_and_fences,
+    super::mcp_write_policy_projections_and_fences
+);
+
+async fn mcp_write_policy_restore_and_generic_results(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    mcp_write_policy_event(ctx, id, "automatic-plan", "run-a", "{}").await;
+    let now = ctx.clock.now_utc();
+    let row = engram_core::types::outbox::OutboxRow {
+        prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, "automatic-plan"),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({"tool_call_id":"automatic-plan","result_json":"{\"decision\":\"approve\"}"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    };
+    ctx.meta.append_session_event_and_outbox(id,"tool_result_submitted",serde_json::json!({"tool_call_id":"automatic-plan","result_json":"{\"decision\":\"approve\"}"}),&row).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "automatic-plan")
+        .await
+        .is_err());
+    mcp_write_policy_event(ctx, id, "restored-plan", "run-a", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(id, "restored-plan")
+        .await
+        .unwrap();
+    ctx.meta.rewind_session_to_cursor(id, -1).await.unwrap();
+    assert!(ctx
+        .meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into()
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    mcp_write_policy_event(ctx, id, "current-plan", "run-b", "{}").await;
+    let review = ctx
+        .meta
+        .read_mcp_plan_review(id, "current-plan")
+        .await
+        .unwrap();
+    ctx.meta
+        .accept_mcp_plan_exit(&PlanAcceptance {
+            review,
+            actor_id: "owner-a".into(),
+            result_json: "{\"decision\":\"approve\"}".into(),
+        })
+        .await
+        .unwrap();
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(id, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-b"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, id, "write-b", "run-b", "{}").await;
+    let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let frozen = RequestPolicyContext {
+        session_id: id,
+        run_id: "run-b".into(),
+        tool_call_id: "write-b".into(),
+        accepted_policy_ref: p.reference.clone(),
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs.clone(),
+    };
+    assert_eq!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        DispatchFence::Current
+    );
+    ctx.meta
+        .fenced_assign_sandbox(id, 0, Some(engram_core::SandboxId::new()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        DispatchFence::Stale
+    );
+    let restored = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    assert_eq!(
+        restored.reference.policy_revision,
+        p.reference.policy_revision
+    );
+    assert_eq!(restored.write_eligibility, WriteEligibility::WriteEligible);
+    if let Some(db) = &ctx._pg {
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap()
+            .with_clock(ctx.clock.clone());
+        assert_eq!(
+            reopened.read_mcp_write_policy(id).await.unwrap(),
+            restored,
+            "new connection reads durable policy after restore"
+        );
+    }
+}
+conformance!(
+    t_mcp_write_policy_restore_and_generic_results,
+    super::mcp_write_policy_restore_and_generic_results
+);
+
+async fn mcp_write_policy_restriction_race(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::WriteEligible).await;
+    for status in [
+        SessionState::Pending,
+        SessionState::Created,
+        SessionState::Active,
+    ] {
+        ctx.meta
+            .transition_session(id, status, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    }
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-a"}))
+        .await
+        .unwrap();
+    mcp_write_policy_event(ctx, id, "call-a", "run-a", "{}").await;
+    let p = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+    let frozen = RequestPolicyContext {
+        session_id: id,
+        run_id: "run-a".into(),
+        tool_call_id: "call-a".into(),
+        accepted_policy_ref: p.reference,
+        accepted_write_eligibility: p.write_eligibility,
+        ancestor_policy_refs: p.ancestor_policy_refs,
+    };
+    let (fence, ()) = tokio::join!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen),
+        mcp_write_policy_restrict(ctx, id, "race-plan")
+    );
+    assert!(
+        matches!(
+            fence.unwrap(),
+            DispatchFence::Current | DispatchFence::Unknown
+        ),
+        "the lock defines which operation is admitted first"
+    );
+    assert_ne!(
+        ctx.meta.validate_mcp_dispatch_fence(&frozen).await.unwrap(),
+        DispatchFence::Current,
+        "a committed restriction blocks every later fence"
+    );
+}
+conformance!(
+    t_mcp_write_policy_restriction_race,
+    super::mcp_write_policy_restriction_race
+);
+
+async fn mcp_write_policy_history_bound(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::WriteEligibility;
+    let id = SessionId::new();
+    mcp_write_policy_create(ctx, id, None, WriteEligibility::ReadOnly).await;
+    ctx.meta
+        .append_session_event(id, "run_started", serde_json::json!({"run_id":"run-bound"}))
+        .await
+        .unwrap();
+    let request = serde_json::json!({"run_id":"run-bound","tool_call_id":"bounded-plan","name":"exit_plan_mode","args_json":"{}"});
+    let events: Vec<_> = (0..1023)
+        .map(|_| ("tool_call_requested".to_string(), request.clone()))
+        .collect();
+    let now = ctx.clock.now_utc();
+    ctx.meta
+        .append_events_with_outbox_idempotent(
+            id,
+            &events,
+            &engram_core::types::outbox::OutboxRow {
+                prompt_id: "bounded-request-input".into(),
+                session_id: id,
+                kind: engram_core::types::outbox::OutboxKind::Prompt,
+                payload: serde_json::json!({"text":"test history"}),
+                created_at: now,
+                attempts: 0,
+                not_before: now,
+                delivered_at: None,
+                acked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "bounded-plan")
+        .await
+        .is_ok());
+    ctx.meta
+        .append_session_event(id, "tool_call_requested", request)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_mcp_plan_review(id, "bounded-plan")
+        .await
+        .is_err());
+}
+conformance!(
+    t_mcp_write_policy_history_bound,
+    super::mcp_write_policy_history_bound
+);
+
+async fn mcp_write_policy_parent_lifecycle(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::WriteEligibility;
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::WriteEligible).await;
+    mcp_write_policy_create(ctx, child, Some(parent), WriteEligibility::WriteEligible).await;
+    ctx.meta
+        .transition_session(parent, SessionState::Pending, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            ctx.meta.delete_pending_session(parent).await,
+            Err(engram_core::MetaError::Db(_))
+        ),
+        "immutable parent FK must preserve ancestry"
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(child)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::WriteEligible
+    );
+    ctx.meta
+        .transition_session(parent, SessionState::Failed, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let policy = ctx.meta.read_mcp_write_policy(child).await.unwrap();
+    assert_eq!(policy.write_eligibility, WriteEligibility::Unknown);
+    assert!(!policy.current);
+    assert_eq!(policy.ancestor_policy_refs.len(), 1);
+}
+conformance!(
+    t_mcp_write_policy_parent_lifecycle,
+    super::mcp_write_policy_parent_lifecycle
 );

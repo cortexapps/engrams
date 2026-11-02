@@ -23,6 +23,7 @@ mod io;
 mod lifecycle;
 pub mod model;
 pub mod oauth;
+mod policy;
 pub mod startup;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use engram_core::types::org_secret::{McpSecretReservation, McpSecretRole};

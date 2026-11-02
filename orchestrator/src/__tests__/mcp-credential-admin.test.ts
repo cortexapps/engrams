@@ -1,3 +1,4 @@
+import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
@@ -6,7 +7,7 @@ import { makeIntegrationConnectionStore } from "../db/integration-connections.ts
 import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 import { makeCredentialAdmin } from "../mcp/credential-admin.ts";
 import {
-  CredentialControl,
+  CredentialControlService,
   CredentialKind,
   CredentialStatusSchema,
   type CredentialStatus,
@@ -30,56 +31,61 @@ async function fixture() {
   let failRevoke = false,
     lostRevoke = false;
   const calls: string[] = [];
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async putSecret(req) {
-          calls.push("put");
-          current = create(CredentialStatusSchema, {
-            protocol: 1,
-            context: {
-              connectionId: req.context!.connectionId,
-              configRevision: req.context!.configRevision,
-              resource: req.context!.resource,
-              authorizationGeneration: req.context!.previousAuthorizationGeneration + 1n,
-              credentialIdentity: `identity-${calls.length}`,
-              policyDigest: "a".repeat(64),
-              policyRevision: "v1",
-            },
-            reference: {
-              kind: req.kind,
-              name: req.expected?.name || "mcp.fresh",
-              connectionId: row.id,
-              generation: (req.expected?.generation ?? 0n) + 1n,
-            },
-            version: (req.expected?.generation ?? 0n) + 1n,
-            status: "connected",
-          });
-          return current;
-        },
-        async getStatus() {
-          if (!current) throw new Error("absent");
-          return current;
-        },
-        async revoke() {
-          calls.push("revoke");
-          if (failRevoke) throw new Error("refused");
-          current = create(CredentialStatusSchema, {
-            ...current!,
-            context: {
-              ...current!.context!,
-              authorizationGeneration: current!.context!.authorizationGeneration + 1n,
-              credentialIdentity: "revoked-identity",
-            },
-            reference: { ...current!.reference!, generation: current!.reference!.generation + 1n },
-            version: current!.version + 1n,
-            status: "revoked",
-          });
-          if (lostRevoke) throw new Error("lost reply");
-          return current;
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async putSecret(req) {
+            calls.push("put");
+            current = create(CredentialStatusSchema, {
+              protocol: 1,
+              context: {
+                connectionId: req.context!.connectionId,
+                configRevision: req.context!.configRevision,
+                resource: req.context!.resource,
+                authorizationGeneration: req.context!.previousAuthorizationGeneration + 1n,
+                credentialIdentity: `identity-${calls.length}`,
+                policyDigest: "a".repeat(64),
+                policyRevision: "v1",
+              },
+              reference: {
+                kind: req.kind,
+                name: req.expected?.name || "mcp.fresh",
+                connectionId: row.id,
+                generation: (req.expected?.generation ?? 0n) + 1n,
+              },
+              version: (req.expected?.generation ?? 0n) + 1n,
+              status: "connected",
+            });
+            return { status: current };
+          },
+          async getStatus() {
+            if (!current) throw new Error("absent");
+            return { status: current };
+          },
+          async revoke() {
+            calls.push("revoke");
+            if (failRevoke) throw new Error("refused");
+            current = create(CredentialStatusSchema, {
+              ...current!,
+              context: {
+                ...current!.context!,
+                authorizationGeneration: current!.context!.authorizationGeneration + 1n,
+                credentialIdentity: "revoked-identity",
+              },
+              reference: {
+                ...current!.reference!,
+                generation: current!.reference!.generation + 1n,
+              },
+              version: current!.version + 1n,
+              status: "revoked",
+            });
+            if (lostRevoke) throw new Error("lost reply");
+            return { status: current };
+          },
+        }),
+      ),
     ),
   );
   const admin = makeCredentialAdmin({ store, control, registrations: [], now: () => new Date() });

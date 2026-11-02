@@ -709,6 +709,32 @@ impl MetadataStore for SimMetadataStore {
 
     // ================= sessions =================
 
+    async fn read_mcp_write_policy(
+        &self,
+        id: SessionId,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_read(id)
+    }
+    async fn read_mcp_plan_review(
+        &self,
+        id: SessionId,
+        call: &str,
+    ) -> Result<engram_core::types::mcp_policy::PlanReview, MetaError> {
+        self.policy_review(id, call)
+    }
+    async fn accept_mcp_plan_exit(
+        &self,
+        input: &engram_core::types::mcp_policy::PlanAcceptance,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_accept(input)
+    }
+    async fn validate_mcp_dispatch_fence(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx)
+    }
+
     /// `INSERT INTO sessions (id, status='pending', image_uri, mode,
     /// created_at, last_active_at) VALUES (...)`.
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
@@ -719,6 +745,8 @@ impl MetadataStore for SimMetadataStore {
         db.sessions.insert(
             id,
             SessRow {
+                mcp_write_policy: None,
+                mcp_policy_parent_id: None,
                 nbd_slot_need: 2,
                 session: Session {
                     id,
@@ -837,6 +865,20 @@ impl MetadataStore for SimMetadataStore {
                 "session OAuth binding requires a live credential".into(),
             ));
         }
+        if db.sessions.contains_key(&ws.session_id) {
+            return Err(MetaError::Conflict("session already exists".into()));
+        }
+        if let Some(policy) = &ws.mcp_policy {
+            if policy.actor_id.is_empty()
+                || policy.input_id.is_empty()
+                || policy.parent_session_id == Some(ws.session_id)
+            {
+                return Err(MetaError::Conflict("invalid policy creation".into()));
+            }
+            if let Some(parent) = policy.parent_session_id {
+                super::mcp_policy::nodes(&db, parent)?;
+            }
+        }
         let picked = Self::pick_host_2d(
             &db,
             candidates,
@@ -857,6 +899,11 @@ impl MetadataStore for SimMetadataStore {
         db.sessions.insert(
             ws.session_id,
             SessRow {
+                mcp_write_policy: ws
+                    .mcp_policy
+                    .as_ref()
+                    .map(engram_core::types::mcp_policy::StoredWritePolicy::initial),
+                mcp_policy_parent_id: ws.mcp_policy.as_ref().and_then(|p| p.parent_session_id),
                 nbd_slot_need: ws.nbd_slot_need,
                 session: Session {
                     id: ws.session_id,
@@ -923,6 +970,16 @@ impl MetadataStore for SimMetadataStore {
             r.session.status == SessionState::Pending && r.session.sandbox_id.is_none()
         });
         if remove {
+            // The immutable ancestry FK prevents orphaning a child policy.
+            if db
+                .sessions
+                .values()
+                .any(|row| row.mcp_policy_parent_id == Some(session_id))
+            {
+                return Err(MetaError::Db(Box::new(std::io::Error::other(
+                    "policy parent is referenced",
+                ))));
+            }
             db.sessions.remove(&session_id);
         }
         Ok(())
@@ -4054,26 +4111,29 @@ impl MetadataStore for SimMetadataStore {
                 "outbox row session_id mismatch".into(),
             ));
         }
-        {
-            let mut db = self.db.lock();
-            match db.outbox.get(&row.prompt_id) {
-                None => {
-                    db.outbox.insert(row.prompt_id.clone(), row.clone());
-                }
-                Some(existing) => {
-                    if existing.session_id != row.session_id
-                        || existing.kind != row.kind
-                        || existing.payload != row.payload
-                    {
-                        return Err(MetaError::Conflict(format!(
-                            "outbox id {} belongs to another command",
-                            row.prompt_id
-                        )));
-                    }
-                }
+        let mut db = self.db.lock();
+        if !db.sessions.contains_key(&session_id) {
+            return Err(MetaError::NotFound);
+        }
+        if let Some(existing) = db.outbox.get(&row.prompt_id) {
+            if existing.session_id != row.session_id
+                || existing.kind != row.kind
+                || existing.payload != row.payload
+            {
+                return Err(MetaError::Conflict(
+                    "outbox belongs to another command".into(),
+                ));
             }
         }
-        let idx = self.append_session_event(session_id, kind, payload).await?;
+        db.outbox
+            .entry(row.prompt_id.clone())
+            .or_insert_with(|| row.clone());
+        let idx = super::mcp_policy::append(&mut db, session_id, kind, payload, self.now())?;
+        drop(db);
+        self.notify(
+            "session_events",
+            serde_json::json!({"session_id":session_id,"idx":idx}).to_string(),
+        );
         self.notify("session_outbox", session_id.to_string());
         Ok(idx)
     }
@@ -4084,44 +4144,58 @@ impl MetadataStore for SimMetadataStore {
         events: &[(String, serde_json::Value)],
         row: &engram_core::types::outbox::OutboxRow,
     ) -> Result<Option<Vec<i64>>, MetaError> {
-        // Faithful mirror of the PG impl: a retry of the SAME command
-        // (existing prompt_id, matching identity) appends NOTHING and
-        // returns Ok(None); a prompt_id claimed by a DIFFERENT command
-        // is Conflict. Only a fresh insert appends the events.
         self.gate()?;
         if row.session_id != session_id {
             return Err(MetaError::Serialization(
                 "outbox row session_id mismatch".into(),
             ));
         }
-        {
-            let mut db = self.db.lock();
-            match db.outbox.get(&row.prompt_id) {
-                None => {
-                    db.outbox.insert(row.prompt_id.clone(), row.clone());
-                }
-                Some(existing) => {
-                    // Payload is part of the command identity (review
-                    // finding on #993, PG parity): a reused prompt_id
-                    // with different text/mode conflicts, never drops.
-                    if existing.session_id != row.session_id
-                        || existing.kind != row.kind
-                        || existing.payload != row.payload
-                    {
-                        return Err(MetaError::Conflict(format!(
-                            "outbox id {} belongs to another command",
-                            row.prompt_id
-                        )));
-                    }
-                    return Ok(None);
-                }
+        let mut db = self.db.lock();
+        let session = db.sessions.get(&session_id).ok_or(MetaError::NotFound)?;
+        if let Some(existing) = db.outbox.get(&row.prompt_id) {
+            if existing.session_id != row.session_id
+                || existing.kind != row.kind
+                || existing.payload != row.payload
+            {
+                return Err(MetaError::Conflict(
+                    "outbox belongs to another command".into(),
+                ));
             }
+            return Ok(None);
         }
+        let restriction = if row.kind == engram_core::types::outbox::OutboxKind::Prompt
+            && row.payload["mode"] == "plan"
+        {
+            Some(engram_core::types::mcp_policy::StoredWritePolicy::restrict(
+                session.mcp_write_policy.as_ref(),
+                &row.prompt_id,
+                session.next_event_idx,
+            )?)
+        } else {
+            None
+        };
+        if let Some(policy) = restriction {
+            db.sessions
+                .get_mut(&session_id)
+                .ok_or(MetaError::NotFound)?
+                .mcp_write_policy = Some(policy);
+        }
+        db.outbox.insert(row.prompt_id.clone(), row.clone());
         let mut idxs = Vec::with_capacity(events.len());
         for (kind, payload) in events {
-            idxs.push(
-                self.append_session_event(session_id, kind, payload.clone())
-                    .await?,
+            idxs.push(super::mcp_policy::append(
+                &mut db,
+                session_id,
+                kind,
+                payload.clone(),
+                self.now(),
+            )?);
+        }
+        drop(db);
+        for idx in &idxs {
+            self.notify(
+                "session_events",
+                serde_json::json!({"session_id":session_id,"idx":idx}).to_string(),
             );
         }
         self.notify("session_outbox", session_id.to_string());

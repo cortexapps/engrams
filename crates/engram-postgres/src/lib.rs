@@ -34,6 +34,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
+mod mcp_policy;
 mod row;
 
 #[derive(Clone)]
@@ -1515,6 +1516,32 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)
     }
 
+    async fn read_mcp_write_policy(
+        &self,
+        id: SessionId,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_read(id).await
+    }
+    async fn read_mcp_plan_review(
+        &self,
+        id: SessionId,
+        call: &str,
+    ) -> Result<engram_core::types::mcp_policy::PlanReview, MetaError> {
+        self.policy_review(id, call).await
+    }
+    async fn accept_mcp_plan_exit(
+        &self,
+        input: &engram_core::types::mcp_policy::PlanAcceptance,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_accept(input).await
+    }
+    async fn validate_mcp_dispatch_fence(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx).await
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = self.entropy.uuid();
         let now = self.clock.now_utc();
@@ -1674,6 +1701,32 @@ impl MetadataStore for PostgresStore {
                 CreateDisposition::Queued
             }
         };
+
+        if let Some(policy) = &ws.mcp_policy {
+            if policy.actor_id.is_empty()
+                || policy.input_id.is_empty()
+                || policy.parent_session_id == Some(ws.session_id)
+            {
+                return Err(MetaError::Conflict("invalid policy creation".into()));
+            }
+            if let Some(parent) = policy.parent_session_id {
+                mcp_policy::nodes(&mut tx, parent).await?;
+            }
+            sqlx::query(
+                "UPDATE sessions SET mcp_write_policy=$2,mcp_policy_parent_id=$3 WHERE id=$1",
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(
+                serde_json::to_value(engram_core::types::mcp_policy::StoredWritePolicy::initial(
+                    policy,
+                ))
+                .map_err(|_| MetaError::Conflict("policy encode failed".into()))?,
+            )
+            .bind(policy.parent_session_id.map(|id| id.as_uuid()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
 
         // -------- satellites, in the SAME transaction (issue #535 (b)) --------
         // `harness` already rode the row INSERT above (mirrored from the
@@ -3940,6 +3993,12 @@ impl MetadataStore for PostgresStore {
         }
 
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO session_outbox
@@ -4041,6 +4100,12 @@ impl MetadataStore for PostgresStore {
             ));
         }
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO session_outbox
@@ -4098,6 +4163,35 @@ impl MetadataStore for PostgresStore {
             return Ok(None);
         }
 
+        if outbox.kind == engram_core::types::outbox::OutboxKind::Prompt
+            && outbox.payload["mode"] == "plan"
+        {
+            let row =
+                sqlx::query("SELECT mcp_write_policy,next_event_idx FROM sessions WHERE id=$1")
+                    .bind(session_id.as_uuid())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            let old: Option<serde_json::Value> = row.try_get("mcp_write_policy").map_err(db_err)?;
+            let old = old
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| MetaError::Conflict("policy unavailable".into()))?;
+            let policy = engram_core::types::mcp_policy::StoredWritePolicy::restrict(
+                old.as_ref(),
+                &outbox.prompt_id,
+                row.try_get("next_event_idx").map_err(db_err)?,
+            )?;
+            sqlx::query("UPDATE sessions SET mcp_write_policy=$2 WHERE id=$1")
+                .bind(session_id.as_uuid())
+                .bind(
+                    serde_json::to_value(policy)
+                        .map_err(|_| MetaError::Conflict("policy encode failed".into()))?,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
         let mut idxs = Vec::with_capacity(events.len());
         for (kind, payload) in events {
             let event = sqlx::query(

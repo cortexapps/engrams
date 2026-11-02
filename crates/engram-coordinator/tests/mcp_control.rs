@@ -116,10 +116,12 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             .await;
         if let Ok(channel) = no_cert {
             assert!(
-                wire::credential_control_client::CredentialControlClient::new(channel)
-                    .get_status(wire::GetStatusRequest::default())
-                    .await
-                    .is_err()
+                wire::credential_control_service_client::CredentialControlServiceClient::new(
+                    channel
+                )
+                .get_status(wire::GetStatusRequest::default())
+                .await
+                .is_err()
             );
         }
         let channel = endpoint
@@ -131,8 +133,147 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             .connect()
             .await
             .unwrap();
-        let mut client = wire::credential_control_client::CredentialControlClient::new(channel);
+        let mut policy_client =
+            wire::session_policy_service_client::SessionPolicyServiceClient::new(channel.clone());
+        let sid = meta
+            .create_session(engram_core::types::SessionSpec {
+                image: "test.invalid/policy:latest".into(),
+                mode: Default::default(),
+            })
+            .await
+            .unwrap();
+        let policy = policy_client
+            .read_write_policy(wire::ReadWritePolicyRequest {
+                protocol: 1,
+                session_id: sid.to_string(),
+                plan_tool_call_id: None,
+            })
+            .await;
         if pinned {
+            assert_eq!(
+                policy
+                    .unwrap()
+                    .into_inner()
+                    .state
+                    .unwrap()
+                    .policy
+                    .unwrap()
+                    .write_eligibility,
+                "unknown"
+            );
+            assert_eq!(
+                policy_client
+                    .read_write_policy(wire::ReadWritePolicyRequest {
+                        protocol: 0,
+                        session_id: sid.to_string(),
+                        plan_tool_call_id: None
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        } else {
+            assert_eq!(policy.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
+        let mut client =
+            wire::credential_control_service_client::CredentialControlServiceClient::new(channel);
+        if pinned {
+            use engram_core::types::mcp_policy::{McpPolicyCreation, WriteEligibility};
+            let policy_sid = engram_core::SessionId(uuid::Uuid::from_u128(1200));
+            meta.reserve_and_persist_create(
+                engram_core::traits::SessionCreateWriteSet {
+                    mcp_policy: Some(McpPolicyCreation {
+                        actor_id: "owner-a".into(),
+                        input_id: "create-a".into(),
+                        parent_session_id: None,
+                        eligibility: WriteEligibility::ReadOnly,
+                    }),
+                    nbd_slot_need: 1,
+                    session_id: policy_sid,
+                    spec: engram_core::types::SessionSpec {
+                        image: "test.invalid/policy:latest".into(),
+                        mode: Default::default(),
+                    },
+                    mem_budget_mib: 512,
+                    cpu_budget_vcpus: 1,
+                    sealed_secrets: None,
+                    capabilities: Vec::new(),
+                    integration_policy_json: None,
+                    runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+                        Vec::new(),
+                        Some("claude".into()),
+                        None,
+                        Vec::new(),
+                    ),
+                    oauth_binding: None,
+                },
+                &[],
+                0,
+            )
+            .await
+            .unwrap();
+            meta.append_session_event(policy_sid,"tool_call_requested",serde_json::json!({"name":"exit_plan_mode","tool_call_id":"plan-a","run_id":"run-a","args_json":"{}"})).await.unwrap();
+            let reviewed = policy_client
+                .read_write_policy(wire::ReadWritePolicyRequest {
+                    protocol: 1,
+                    session_id: policy_sid.to_string(),
+                    plan_tool_call_id: Some("plan-a".into()),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .state
+                .unwrap()
+                .plan_review
+                .unwrap();
+            let approved = policy_client
+                .accept_plan_exit(wire::AcceptPlanExitRequest {
+                    protocol: 1,
+                    expected: Some(reviewed.clone()),
+                    actor_id: "owner-a".into(),
+                    result_json: "{\"decision\":\"approve\"}".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .policy
+                .unwrap();
+            assert_eq!(approved.write_eligibility, "write_eligible");
+            assert_eq!(approved.authenticated_actor_id.as_deref(), Some("owner-a"));
+            let outbox = meta
+                .outbox_get(&engram_core::types::outbox::tool_result_outbox_id(
+                    policy_sid, "plan-a",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(outbox.payload["result_json"], "{\"decision\":\"approve\"}");
+            let prior = policy_client
+                .validate_dispatch_fence(wire::ValidateDispatchFenceRequest {
+                    protocol: 1,
+                    session_id: policy_sid.to_string(),
+                    run_id: "run-a".into(),
+                    tool_call_id: "call-a".into(),
+                    accepted_policy_ref: reviewed.policy_ref,
+                    accepted_write_eligibility: "read_only".into(),
+                    ancestor_policy_refs: Vec::new(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_ne!(prior.status, "current");
+            assert_eq!(
+                policy_client
+                    .create_policy_session(wire::CreatePolicySessionRequest {
+                        protocol: 1,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
             let missing = client
                 .get_status(wire::GetStatusRequest {
                     protocol: 1,
@@ -222,10 +363,12 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                 .await;
         if let Ok(channel) = plaintext {
             assert!(
-                wire::credential_control_client::CredentialControlClient::new(channel)
-                    .get_status(wire::GetStatusRequest::default())
-                    .await
-                    .is_err()
+                wire::credential_control_service_client::CredentialControlServiceClient::new(
+                    channel
+                )
+                .get_status(wire::GetStatusRequest::default())
+                .await
+                .is_err()
             );
         }
         let _ = stop.send(());

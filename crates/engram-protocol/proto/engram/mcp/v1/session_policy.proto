@@ -1,0 +1,53 @@
+syntax = "proto3";
+package engram.mcp.v1;
+
+import "engram/app/v1/session.proto";
+
+// Dedicated pinned mTLS only. Create reuses the ordinary creation core.
+service SessionPolicyService {
+  rpc CreatePolicySession(CreatePolicySessionRequest) returns (CreatePolicySessionResponse);
+  rpc ReadWritePolicy(ReadWritePolicyRequest) returns (ReadWritePolicyResponse);
+  rpc AcceptPlanExit(AcceptPlanExitRequest) returns (AcceptPlanExitResponse);
+  rpc ValidateDispatchFence(ValidateDispatchFenceRequest) returns (ValidateDispatchFenceResponse);
+}
+message CreatePolicySessionRequest {
+  uint32 protocol = 1;
+  engram.app.v1.CreateSessionRequest create = 2;
+  string actor_id = 3;
+  string input_id = 4;
+  optional string parent_session_id = 5;
+}
+message ReadWritePolicyRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  optional string plan_tool_call_id = 3;
+}
+message AcceptPlanExitRequest {
+  uint32 protocol = 1;
+  engram.app.v1.McpPlanReview expected = 2;
+  string actor_id = 3;
+  string result_json = 4;
+}
+message ValidateDispatchFenceRequest {
+  uint32 protocol = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  engram.app.v1.McpWritePolicyRef accepted_policy_ref = 5;
+  string accepted_write_eligibility = 6;
+  repeated engram.app.v1.McpWritePolicyRef ancestor_policy_refs = 7;
+}
+message ValidateDispatchFenceResponse {
+  uint32 protocol = 1;
+  string status = 2;
+}
+
+message CreatePolicySessionResponse {
+  engram.app.v1.CreateSessionResponse session = 1;
+}
+message ReadWritePolicyResponse {
+  engram.app.v1.GetMcpWritePolicyResponse state = 1;
+}
+message AcceptPlanExitResponse {
+  engram.app.v1.McpTrustedWritePolicy policy = 1;
+}

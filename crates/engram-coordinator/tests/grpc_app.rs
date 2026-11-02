@@ -485,6 +485,7 @@ async fn complete_tool_call_appends_submitted_event_and_enqueues_outbox() {
 
     service
         .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            expected_mcp_plan_review: None,
             session_id: session_id.to_string(),
             tool_call_id: "call_1".into(),
             result_json: r#" { "saved": true } "#.into(),
@@ -509,6 +510,32 @@ async fn complete_tool_call_appends_submitted_event_and_enqueues_outbox() {
 }
 
 #[tokio::test]
+async fn complete_tool_call_app_transport_cannot_accept_policy_context() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let error = complete_tool_call_service(state)
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            expected_mcp_plan_review: Some(app::McpPlanReview::default()),
+            session_id: session_id.to_string(),
+            tool_call_id: "plan-call".into(),
+            result_json: r#"{"decision":"approve"}"#.into(),
+        }))
+        .await
+        .expect_err("application transport must reject policy authority");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(outbox_rows(&meta).is_empty());
+    assert!(!session_events(&meta, session_id)
+        .iter()
+        .any(|(kind, _)| kind == "tool_result_submitted"));
+}
+
+#[tokio::test]
 async fn complete_tool_call_rejects_empty_tool_call_id() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
     let session_id = meta
@@ -522,6 +549,7 @@ async fn complete_tool_call_rejects_empty_tool_call_id() {
 
     let err = service
         .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            expected_mcp_plan_review: None,
             session_id: session_id.to_string(),
             tool_call_id: String::new(),
             result_json: "{}".into(),
@@ -555,6 +583,7 @@ async fn complete_tool_call_rejects_terminal_session() {
 
     let err = service
         .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            expected_mcp_plan_review: None,
             session_id: session_id.to_string(),
             tool_call_id: "call_1".into(),
             result_json: "{}".into(),
@@ -586,6 +615,7 @@ async fn complete_tool_call_is_idempotent_on_tool_call_id() {
     for _ in 0..2 {
         service
             .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                expected_mcp_plan_review: None,
                 session_id: session_id.to_string(),
                 tool_call_id: "call_1".into(),
                 result_json: r#"{"saved":true}"#.into(),
@@ -625,6 +655,7 @@ async fn complete_tool_call_namespaces_outbox_identity_by_session() {
     for session_id in [first, second] {
         service
             .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                expected_mcp_plan_review: None,
                 session_id: session_id.to_string(),
                 tool_call_id: "shared-call".into(),
                 result_json: r#"{"saved":true}"#.into(),

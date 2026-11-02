@@ -242,6 +242,7 @@ pub(crate) fn create_request_from_proto(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(CreateSessionRequest {
+        mcp_creation: None,
         requested_session_id,
         image: image_uri,
         mode,

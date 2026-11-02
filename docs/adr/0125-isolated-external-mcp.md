@@ -36,7 +36,10 @@ credential on its own. The coordinator is the only credential and refresh
 authority. The worker receives secrets only after admission, near dispatch.
 
 The coordinator exposes credential control only on a separate, default-off mTLS
-listener. Exact client certificate pins identify the trusted orchestrator role.
+listener. The internal service name is `engram.mcp.v1.CredentialControlService`.
+Its four status operations return method-specific response wrappers with one
+`CredentialStatus` field. Clients reject a missing status. The unreleased service
+has no alias for the earlier name. Exact client certificate pins identify the trusted orchestrator role.
 The existing cleartext application gRPC listener never serves this service. The
 orchestrator may hold a short-lived credential lease in memory for one admitted
 worker operation. It must not queue, cache, log, persist, or return the value to a
@@ -155,6 +158,48 @@ recovery queries and revokes that exact credential before clearing its local fen
 A lost begin response can leave an unknown pending flow until expiry and cleanup;
 the stale orchestrator call cannot return its authorization URL or record a usable
 callback after recovery. Unknown flow IDs are never inferred or broadly cancelled.
+
+### Trusted session write policy
+
+The coordinator owns a durable conservative MCP write-policy latch. This is server
+permission, not proof of the guest mode. A trusted plan input sets read-only and
+advances the revision in the existing prompt/outbox transaction. A later queued
+default or absent directive cannot relax it. This can keep external writes blocked
+after a default prompt starts locally. The session state explains the restriction;
+the feature stays disabled until the UI presents the required review action.
+
+Only actual new creation over the dedicated pinned mTLS session-policy service can
+initialize known policy, inside the existing creation write-set and after validation
+of supported harness semantics. Legacy and generic creation remain unknown. The
+initial plan restriction is part of creation, not its best-effort initial prompt.
+An immutable parent link makes reads and dispatch intersect all current ancestors.
+Missing ancestry fails closed. Durable policy survives restart and disk restore;
+binding-epoch changes invalidate old request references.
+
+A human owner or administrator can relax a known restrictive policy only by accepting
+the exact pending plan exit, bound to the restrictive revision, binding epoch, and
+first durable requested-call payload. Changed duplicates, rewound requests, already
+submitted/completed calls, and old plan requests cannot authorize relaxation. Fresh
+orchestrator identity and ownership checks precede a pinned mTLS acceptance. The
+coordinator commits the policy decision, submitted event and existing result outbox
+in one transaction. Public CompleteToolCall carries additive expected review context;
+without it, ordinary delivery is unchanged and cannot relax MCP policy. Automation,
+guest completion, run-start, mode-shaped strings and disk stamps never relax policy.
+The session-policy service shares the dedicated listener and client pins, with a
+separate bounded create message budget; credential control keeps its 32 KiB limit.
+
+Request acceptance freezes eligibility and exact leaf/ancestor policy references.
+An earlier read-only or unknown request cannot gain writes after relaxation. A stale
+eligible request cannot rebase. After the orchestrator commits its irreversible
+journal barrier, it must synchronously validate those references, the complete
+stored ancestry, current binding and execution identity at the coordinator. The
+coordinator locks all involved session rows in stable order. Its successful locked
+check is the policy-admission ordering point. A restriction before that point blocks
+the operation; one after it applies to already-admitted active I/O, canceled best
+effort. This is not an atomic transaction across the two databases. Live orchestrator
+permissions and journal admission are separate checks. A lost reply or crash after
+the journal barrier never permits automatic write replay. Plan approval does not
+replace the separate exact external-write approval or explicit automation grant.
 
 ### Authorization and irreversible dispatch
 

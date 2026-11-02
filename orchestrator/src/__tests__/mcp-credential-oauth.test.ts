@@ -1,3 +1,4 @@
+import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
@@ -6,7 +7,7 @@ import { makeIntegrationConnectionStore } from "../db/integration-connections.ts
 import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 import { makeCredentialAdmin } from "../mcp/credential-admin.ts";
 import {
-  CredentialControl,
+  CredentialControlService,
   CredentialKind,
   CredentialStatusSchema,
   type AuthorityContext,
@@ -42,76 +43,78 @@ async function fixture() {
   let pauseComplete: (() => Promise<void>) | undefined;
   let pauseBegin: (() => Promise<void>) | undefined;
   let pauseStatus: (() => Promise<void>) | undefined;
-  const control = createClient(
-    CredentialControl,
-    createRouterTransport((router) =>
-      router.service(CredentialControl, {
-        async getStatus() {
-          if (outage) throw new ConnectError("outage", Code.Unavailable);
-          if (!current) throw new ConnectError("absent", Code.NotFound);
-          return current;
-        },
-        async cancelAuthorization(req) {
-          if (outage) throw new ConnectError("outage", Code.Unavailable);
-          expect(req.connectionId).toBe(row.id);
-          cancelled.add(req.flowId);
-          return {
-            protocol: 1,
-            flowId: req.flowId,
-            connectionId: req.connectionId,
-            registrationId: req.registrationId,
-          };
-        },
-        async beginAuthorization(req) {
-          calls.push("begin");
-          expect(req.sharingConsent).toBe(true);
-          expect(req.clientSecret).toBeUndefined();
-          expect(req.registrationId).toBe("public-client");
-          expect(req.context!.resource!.zoneId).toBe("internal");
-          callback.flowId = `flow-${++flowNumber}`;
-          return {
-            protocol: 1,
-            flowId: callback.flowId,
-            context: {
-              connectionId: row.id,
-              configRevision: req.context!.configRevision,
-              authorizationGeneration: req.context!.previousAuthorizationGeneration + 1n,
-              credentialIdentity: "ceremony",
-              resource: req.context!.resource,
-              policyDigest: "a".repeat(64),
-              policyRevision: "v1",
-            },
-            authorizationUrl: "https://auth.example.test/authorize?state=secret-state",
-            expiresAt: BigInt(clock + 600000),
-          };
-        },
-        async completeAuthorization(req) {
-          if (cancelled.has(req.flowId)) throw new ConnectError("cancelled", Code.Aborted);
-          calls.push("complete");
-          expect(req.state).toBe("secret-state");
-          expect(req.code).toBe("secret-code");
-          flowContext = req.context!;
-          current = create(CredentialStatusSchema, {
-            protocol: 1,
-            context: flowContext,
-            reference: { kind: CredentialKind.OAUTH, registrationId: "public-client" },
-            version: (current?.version ?? 0n) + 1n,
-            status: "connected",
-          });
-          if (lostCallback) throw new ConnectError("lost reply", Code.NotFound);
-          return current;
-        },
-        async revoke(req) {
-          calls.push("revoke");
-          expect(req.expected!.version).toBe(current!.version);
-          current = create(CredentialStatusSchema, {
-            ...current!,
-            version: current!.version + 1n,
-            status: "revoked",
-          });
-          return current;
-        },
-      }),
+  const control = unwrapCredentialControlClient(
+    createClient(
+      CredentialControlService,
+      createRouterTransport((router) =>
+        router.service(CredentialControlService, {
+          async getStatus() {
+            if (outage) throw new ConnectError("outage", Code.Unavailable);
+            if (!current) throw new ConnectError("absent", Code.NotFound);
+            return { status: current };
+          },
+          async cancelAuthorization(req) {
+            if (outage) throw new ConnectError("outage", Code.Unavailable);
+            expect(req.connectionId).toBe(row.id);
+            cancelled.add(req.flowId);
+            return {
+              protocol: 1,
+              flowId: req.flowId,
+              connectionId: req.connectionId,
+              registrationId: req.registrationId,
+            };
+          },
+          async beginAuthorization(req) {
+            calls.push("begin");
+            expect(req.sharingConsent).toBe(true);
+            expect(req.clientSecret).toBeUndefined();
+            expect(req.registrationId).toBe("public-client");
+            expect(req.context!.resource!.zoneId).toBe("internal");
+            callback.flowId = `flow-${++flowNumber}`;
+            return {
+              protocol: 1,
+              flowId: callback.flowId,
+              context: {
+                connectionId: row.id,
+                configRevision: req.context!.configRevision,
+                authorizationGeneration: req.context!.previousAuthorizationGeneration + 1n,
+                credentialIdentity: "ceremony",
+                resource: req.context!.resource,
+                policyDigest: "a".repeat(64),
+                policyRevision: "v1",
+              },
+              authorizationUrl: "https://auth.example.test/authorize?state=secret-state",
+              expiresAt: BigInt(clock + 600000),
+            };
+          },
+          async completeAuthorization(req) {
+            if (cancelled.has(req.flowId)) throw new ConnectError("cancelled", Code.Aborted);
+            calls.push("complete");
+            expect(req.state).toBe("secret-state");
+            expect(req.code).toBe("secret-code");
+            flowContext = req.context!;
+            current = create(CredentialStatusSchema, {
+              protocol: 1,
+              context: flowContext,
+              reference: { kind: CredentialKind.OAUTH, registrationId: "public-client" },
+              version: (current?.version ?? 0n) + 1n,
+              status: "connected",
+            });
+            if (lostCallback) throw new ConnectError("lost reply", Code.NotFound);
+            return { status: current };
+          },
+          async revoke(req) {
+            calls.push("revoke");
+            expect(req.expected!.version).toBe(current!.version);
+            current = create(CredentialStatusSchema, {
+              ...current!,
+              version: current!.version + 1n,
+              status: "revoked",
+            });
+            return { status: current };
+          },
+        }),
+      ),
     ),
   );
   const admin = makeCredentialAdmin({

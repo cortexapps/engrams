@@ -454,6 +454,9 @@ pub(crate) async fn load_session_secrets(
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    /// Supplied only by the dedicated pinned mTLS creation service.
+    #[serde(skip)]
+    pub(crate) mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
     /// ADR 0109: trusted app-gRPC callers can reserve an ID so their external
     /// authorization snapshot exists before the VM starts. The public JSON
     /// surface cannot set this field.
@@ -596,7 +599,14 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared, start, req.oauth_credential.clone()).await;
+    let result = boot_prepared(
+        state,
+        prepared,
+        start,
+        req.oauth_credential.clone(),
+        req.mcp_creation.clone(),
+    )
+    .await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -638,6 +648,7 @@ async fn boot_prepared(
     // (now-concurrent, host-side) restore work.
     create_start: std::time::Duration,
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
+    mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         nbd_slot_need,
@@ -745,7 +756,16 @@ async fn boot_prepared(
         None => None,
     };
 
+    if mcp_creation.is_some()
+        && (!matches!(inputs.selected_harness.as_deref(), Some("claude" | "codex"))
+            || inputs.spec.mode != SessionMode::Agent)
+    {
+        return Err(ApiError::BadRequest(
+            "external write policy requires a supported agent harness".into(),
+        ));
+    }
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        mcp_policy: mcp_creation,
         nbd_slot_need,
         session_id,
         spec: inputs.spec.clone(),

@@ -2,13 +2,13 @@ syntax = "proto3";
 package engram.mcp.v1;
 
 // Internal protocol 1. Served only on the separate mTLS listener.
-service CredentialControl {
-  rpc PutSecret(PutSecretRequest) returns (CredentialStatus);
+service CredentialControlService {
+  rpc PutSecret(PutSecretRequest) returns (PutSecretResponse);
   rpc BeginAuthorization(BeginAuthorizationRequest) returns (BeginAuthorizationResponse);
   rpc CancelAuthorization(CancelAuthorizationRequest) returns (CancelAuthorizationResponse);
-  rpc CompleteAuthorization(CompleteAuthorizationRequest) returns (CredentialStatus);
-  rpc GetStatus(GetStatusRequest) returns (CredentialStatus);
-  rpc Revoke(RevokeRequest) returns (CredentialStatus);
+  rpc CompleteAuthorization(CompleteAuthorizationRequest) returns (CompleteAuthorizationResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
   rpc Lease(LeaseRequest) returns (LeaseResponse);
 }
 message Destination {
@@ -161,4 +161,20 @@ message CancelAuthorizationResponse {
   string flow_id = 2;
   string connection_id = 3;
   string registration_id = 4;
+}
+
+message PutSecretResponse {
+  CredentialStatus status = 1;
+}
+
+message CompleteAuthorizationResponse {
+  CredentialStatus status = 1;
+}
+
+message GetStatusResponse {
+  CredentialStatus status = 1;
+}
+
+message RevokeResponse {
+  CredentialStatus status = 1;
 }

@@ -61,6 +61,11 @@ export const dequeueQueuedPrompt = SessionService.method.dequeueQueuedPrompt;
 export const completeToolCall = SessionService.method.completeToolCall;
 
 /**
+ * @generated from rpc engram.app.v1.SessionService.GetMcpWritePolicy
+ */
+export const getMcpWritePolicy = SessionService.method.getMcpWritePolicy;
+
+/**
  * ADR 0060: unary, paginated, UNFILTERED read of the persistent event log
  * (curation is the consumer's concern). The reverse-channel pump
  * (SessionIngestWorkflow) walks `after_idx` forward in bounded batches; a

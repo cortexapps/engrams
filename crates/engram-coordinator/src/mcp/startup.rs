@@ -48,7 +48,15 @@ async fn bounded_file(path: &Path) -> super::Result<Vec<u8>> {
 pub async fn start(
     path: Option<&Path>,
     manager: Arc<crate::oauth::OAuthManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
+    start_with_policy(path, manager, shutdown, None).await
+}
+pub async fn start_with_policy(
+    path: Option<&Path>,
+    manager: Arc<crate::oauth::OAuthManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    state: Option<crate::state::SharedState>,
 ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
     let Some(path) = path else { return Ok(None) };
     let config: OperatorConfig =
@@ -77,7 +85,7 @@ pub async fn start(
         client_ca: bounded_file(&config.orchestrator_ca_file).await?,
         orchestrator_fingerprints: config.orchestrator_fingerprints,
     };
-    let router = control::server(authority, tls)?;
+    let router = control::server_with_policy(authority, tls, state)?;
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .map_err(|_| McpError::Unavailable)?;

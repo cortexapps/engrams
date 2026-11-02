@@ -51,6 +51,7 @@ pub enum DisableEnabledImageOutcome {
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    pub mcp_policy: Option<crate::types::mcp_policy::McpPolicyCreation>,
     /// One root slot plus one slot when swap is enabled.
     pub nbd_slot_need: u32,
     pub session_id: SessionId,
@@ -241,6 +242,35 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- sessions ----
+    /// Read durable server policy and all current ancestors in one locked snapshot.
+    async fn read_mcp_write_policy(
+        &self,
+        _id: SessionId,
+    ) -> Result<crate::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    async fn read_mcp_plan_review(
+        &self,
+        _id: SessionId,
+        _call: &str,
+    ) -> Result<crate::types::mcp_policy::PlanReview, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Commit human decision, policy and original result delivery together.
+    async fn accept_mcp_plan_exit(
+        &self,
+        _input: &crate::types::mcp_policy::PlanAcceptance,
+    ) -> Result<crate::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Call only after the external-write journal barrier. No grant is reusable.
+    async fn validate_mcp_dispatch_fence(
+        &self,
+        _context: &crate::types::mcp_policy::RequestPolicyContext,
+    ) -> Result<crate::types::mcp_policy::DispatchFence, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
 
     /// Atomically insert a session in `Created` status with `host_id`
