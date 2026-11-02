@@ -184,6 +184,21 @@ mod authority {
         )
     }
     #[tokio::test]
+    async fn status_missing_authority_is_not_found() {
+        let (authority, _, _, _) = setup();
+        assert!(matches!(
+            authority
+                .status(
+                    "connection-a",
+                    &CredentialReference::OAuth {
+                        registration_id: "missing".into()
+                    }
+                )
+                .await,
+            Err(McpError::NotFound)
+        ));
+    }
+    #[tokio::test]
     async fn api_rotation_fences_old_lease_even_before_orchestrator_publication() {
         let (authority, clock, identity, worker) = setup();
         let change = ChangeContext {
@@ -216,6 +231,7 @@ mod authority {
                 request_id: "request-a".into(),
                 actor_id: "actor-a".into(),
             },
+            operation_expires_at: clock.now_utc().timestamp_millis() + 10000,
             expires_at: clock.now_utc().timestamp_millis() + 10000,
             admission: WorkerLease {
                 id: "lease-a".into(),
@@ -223,6 +239,18 @@ mod authority {
                 expires_at: clock.now_utc().timestamp_millis() + 10000,
             },
         };
+        let mut operation = lease.clone();
+        operation.operation_expires_at = clock.now_utc().timestamp_millis() + 60000;
+        operation.admission.expires_at = operation.operation_expires_at;
+        assert_eq!(
+            authority.lease(&operation).await.unwrap().value,
+            "first-secret"
+        );
+        operation.admission.expires_at -= 1;
+        assert!(authority.lease(&operation).await.is_err());
+        operation.operation_expires_at = clock.now_utc().timestamp_millis() + 300001;
+        operation.admission.expires_at = operation.operation_expires_at;
+        assert!(authority.lease(&operation).await.is_err());
         assert_eq!(authority.lease(&lease).await.unwrap().value, "first-secret");
         let mut next = change;
         next.previous_authorization_generation = first.context.authorization_generation;

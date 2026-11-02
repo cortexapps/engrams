@@ -94,6 +94,7 @@ impl Control {
 }
 fn error(e: McpError) -> Status {
     match e {
+        McpError::NotFound => Status::not_found("credential not found"),
         McpError::Invalid => Status::invalid_argument("invalid credential request"),
         McpError::Denied => Status::permission_denied("credential request denied"),
         McpError::Stale => Status::failed_precondition("credential context changed"),
@@ -376,6 +377,7 @@ impl CredentialControl for Control {
             request_digest: v.request_digest,
             operation: v.operation,
             expires_at: v.expires_at,
+            operation_expires_at: v.operation_expires_at,
             admission: worker::WorkerLease {
                 id: a.id,
                 deployment_id: a.deployment_id,
@@ -389,6 +391,7 @@ impl CredentialControl for Control {
             header: credential.header,
             value: credential.value,
             expires_at: lease.expires_at,
+            operation_expires_at: lease.operation_expires_at,
             intent_id: lease.intent_id,
         }))
     }

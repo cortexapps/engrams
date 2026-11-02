@@ -54,7 +54,10 @@ pub struct ResourceLease {
     pub request_digest: String,
     pub operation: String,
     pub scope: WorkerScope,
+    /// Credential delivery deadline, at most ten seconds.
     pub expires_at: i64,
+    /// Frozen worker operation deadline; admission must cover the full operation.
+    pub operation_expires_at: i64,
     pub admission: WorkerLease,
 }
 // Raw values live only in an authenticated request or one operation's memory.

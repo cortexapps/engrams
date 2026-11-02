@@ -204,6 +204,7 @@ fn lease(f: &Fixture, status: &CredentialStatus) -> ResourceLease {
             request_id: "request-a".into(),
             actor_id: "actor-a".into(),
         },
+        operation_expires_at: now + 10000,
         expires_at: now + 10000,
         admission: WorkerLease {
             id: "lease-a".into(),

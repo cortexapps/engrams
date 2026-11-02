@@ -16,7 +16,7 @@ impl McpAuthority {
                     .meta
                     .get_mcp_org_secret_reservation(&reservation.name)
                     .await?
-                    .ok_or(McpError::Unavailable)?;
+                    .ok_or(McpError::NotFound)?;
                 if current.connection_id != connection || current.role != reservation.role {
                     return Err(McpError::Denied);
                 }
@@ -47,7 +47,7 @@ impl McpAuthority {
                         provider: registration_id.clone(),
                     })
                     .await?
-                    .ok_or(McpError::Unavailable)?;
+                    .ok_or(McpError::NotFound)?;
                 let bundle = self.decode_bundle(&row).await?;
                 Ok(CredentialStatus {
                     context: bundle.context,

@@ -125,7 +125,10 @@ message LeaseRequest {
   string intent_id = 5;
   string request_digest = 6;
   string operation = 7;
+  // Short credential delivery deadline, at most ten seconds.
   int64 expires_at = 8;
+  // Frozen worker operation deadline, at most five minutes.
+  int64 operation_expires_at = 12;
   Admission admission = 9;
   oneof scope {
     AdministrationScope administration = 10;
@@ -141,4 +144,5 @@ message LeaseResponse {
   string value = 3;
   int64 expires_at = 4;
   string intent_id = 5;
+  int64 operation_expires_at = 6;
 }

@@ -63,6 +63,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             manager,
             Arc::new(SystemSecurityEntropy),
             Registry {
+                enabled: true,
                 deployment_id: "deployment-a".into(),
                 ..Default::default()
             },
@@ -127,7 +128,23 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             .connect()
             .await
             .unwrap();
-        let error = wire::credential_control_client::CredentialControlClient::new(channel)
+        let mut client = wire::credential_control_client::CredentialControlClient::new(channel);
+        if pinned {
+            let missing = client
+                .get_status(wire::GetStatusRequest {
+                    protocol: 1,
+                    connection_id: "connection-a".into(),
+                    reference: Some(wire::CredentialReference {
+                        kind: wire::CredentialKind::Oauth as i32,
+                        registration_id: "absent".into(),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(missing.code(), tonic::Code::NotFound);
+        }
+        let error = client
             .get_status(wire::GetStatusRequest {
                 protocol: 2,
                 ..Default::default()

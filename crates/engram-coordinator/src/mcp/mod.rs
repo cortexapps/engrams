@@ -6,6 +6,7 @@ pub enum McpError {
     Invalid,
     Denied,
     Unavailable,
+    NotFound,
     Stale,
     Crypto,
     Transport,
@@ -314,7 +315,9 @@ impl McpAuthority {
         let now = self.manager.clock.now_utc().timestamp_millis();
         if lease.expires_at <= now
             || lease.expires_at > now + 10000
-            || lease.admission.expires_at < lease.expires_at
+            || lease.operation_expires_at < lease.expires_at
+            || lease.operation_expires_at > now + 300000
+            || lease.admission.expires_at < lease.operation_expires_at
             || lease.admission.expires_at > now + 300000
             || lease.admission.deployment_id != self.registry.deployment_id
             || lease.admission.id.is_empty()
