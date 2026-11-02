@@ -87,7 +87,7 @@ disallowed_methods = "deny"
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
 # feature since the operator is the sole consumer.
-kube = { version = "4.2", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+kube = { version = "5.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
 k8s-openapi = { version = "0.29", features = ["latest"] }
 # ADR 0045 C2: peer page-channel payload compression. Pure Rust on
 # purpose — the uffd-handler's musl build must not grow a C dep.
@@ -98,9 +98,16 @@ lz4_flex = "0.14"
 blake3 = "1"
 # schemars is required by kube's CustomResource derive (CRD schema gen).
 # Version-locked to kube: kube 2.0 moved from schemars 0.8 to 1.0, and
-# kube-derive 4.2 emits `schemars::generate::*` / `schemars::transform::*`,
+# kube-derive emits `schemars::generate::*` / `schemars::transform::*`,
 # which are 1.x module paths. Moving kube without moving this fails in the
 # derive macro, not at a call site.
+#
+# kube also pins an exact k8s-openapi minor (every kube API type is generic
+# over k8s-openapi's resource types), so kube and k8s-openapi move together:
+# kube 5.0 carries k8s-openapi 0.29 (the `latest` = v1.37 feature, which
+# dropped Kubernetes 1.32). A k8s-openapi-only bump splits the graph into two
+# k8s-openapi minors and the stale 0.28 copy (no version feature) panics in
+# its build script.
 schemars = "1.2"
 # internal
 engram-core = { path = "crates/engram-core" }
