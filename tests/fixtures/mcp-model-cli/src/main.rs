@@ -45,9 +45,20 @@ fn config() -> Result<Config> {
     if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
         return Err("state directory must be private".into());
     }
-    let proof_path = PathBuf::from(std::env::var("ENGRAM_FIXTURE_PROOF")?);
+    let mut proof_path = PathBuf::from(std::env::var("ENGRAM_FIXTURE_PROOF")?);
     if !direct_child(&root, &proof_path) {
         return Err("proof must be a direct child of the state directory".into());
+    }
+    // Optional launch-local observation, never a production identity or authority.
+    let basename = proof_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid proof name")?;
+    if basename.contains("{pid}") {
+        if basename.matches("{pid}").count() != 1 {
+            return Err("invalid proof PID token".into());
+        }
+        proof_path = root.join(basename.replace("{pid}", &std::process::id().to_string()));
     }
     let barrier = std::env::var_os("ENGRAM_FIXTURE_BARRIER").map(PathBuf::from);
     if barrier
@@ -121,9 +132,6 @@ fn emit(value: Value) -> Result<()> {
     Ok(())
 }
 fn codex(mut cfg: Config) -> Result<()> {
-    if cfg.mode == "forged" {
-        return Err("forged mode requires Claude".into());
-    }
     let mut initialized = false;
     let mut thread_ready = false;
     let mut pending = false;
@@ -139,6 +147,27 @@ fn codex(mut cfg: Config) -> Result<()> {
                 .get("success")
                 .and_then(Value::as_bool)
                 .ok_or("missing success")?;
+            if cfg.mode == "forged" {
+                if success
+                    || result.get("contentItems")
+                        != Some(
+                            &json!([{"type":"inputText","text":"undeclared dynamic tool: fixture_forged"}]),
+                        )
+                {
+                    return Err("forged tool was not rejected".into());
+                }
+                writeln!(
+                    cfg.proof,
+                    "{}",
+                    json!({"callId":"fixture-call","tool":"fixture_forged","forgedRejected":true})
+                )?;
+                cfg.proof.flush()?;
+                emit(
+                    json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
+                )?;
+                pending = false;
+                continue;
+            }
             let items = result
                 .get("contentItems")
                 .and_then(Value::as_array)
@@ -251,7 +280,7 @@ fn codex(mut cfg: Config) -> Result<()> {
                     continue;
                 }
                 emit(
-                    json!({"id":77,"method":"item/tool/call","params":{"callId":"fixture-call","tool":cfg.tool,"arguments":{"fixture":cfg.mode},"threadId":"fixture-thread","turnId":"fixture-turn"}}),
+                    json!({"id":77,"method":"item/tool/call","params":{"callId":"fixture-call","tool":if cfg.mode == "forged" { "fixture_forged" } else { &cfg.tool },"arguments":{"fixture":cfg.mode},"threadId":"fixture-thread","turnId":"fixture-turn"}}),
                 )?;
                 pending = true;
             }
@@ -433,8 +462,19 @@ fn claude(mut cfg: Config) -> Result<()> {
     emit(json!({"type":"system","subtype":"init","session_id":"fixture-session"}))?;
     let input = stdin_lines();
     let mut call_request_id = 3_u64;
-    while let Ok(line) = input.recv() {
-        let prompt: Value = serde_json::from_str(&line?)?;
+    // A real resumed Claude can re-fire its deferred tool without a new prompt.
+    // Restrict that behavior to the two explicit deferred fixture scenarios.
+    let mut resumed = ["write", "refire"].contains(&cfg.mode.as_str())
+        && args.iter().any(|arg| arg == "--resume");
+    loop {
+        let prompt: Value = if std::mem::take(&mut resumed) {
+            json!({"type":"user"})
+        } else {
+            match input.recv() {
+                Ok(line) => serde_json::from_str(&line?)?,
+                Err(_) => break,
+            }
+        };
         if prompt["type"] != "user" {
             return Err("unsupported Claude input".into());
         }
@@ -452,6 +492,9 @@ fn claude(mut cfg: Config) -> Result<()> {
         } else {
             &cfg.tool
         };
+        emit(
+            json!({"type":"assistant","message":{"id":"fixture-message","content":[{"type":"tool_use","id":"fixture-call","name":format!("mcp__engrams__{call_tool}"),"input":arguments}]}}),
+        )?;
         child_send(
             &mut hook.0,
             json!({"tool_name":format!("mcp__engrams__{}",call_tool),"tool_use_id":"fixture-call","tool_input":arguments,"permission_mode":"default"}),
@@ -467,7 +510,7 @@ fn claude(mut cfg: Config) -> Result<()> {
             Some("allow") => {}
             Some("defer") | Some("deny") => {
                 emit(
-                    json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
+                    json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture","terminal_reason":"tool_deferred"}),
                 )?;
                 continue;
             }
@@ -575,7 +618,12 @@ fn claude(mut cfg: Config) -> Result<()> {
         emit(
             json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
         )?;
-        break;
+        // A completed deferred re-fire must leave this model process idle.
+        // Exiting here would simulate a new crash and replay the completed
+        // fixture call on every subsequent --resume startup.
+        if !["write", "refire"].contains(&cfg.mode.as_str()) {
+            break;
+        }
     }
     Ok(())
 }

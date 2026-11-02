@@ -558,6 +558,11 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: bash .github/scripts/mcp-acceptance-native.sh
 
+      - name: Run production Linux MCP wrapper entrypoints
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .github/scripts/mcp-acceptance-linux.sh
+
       - name: cargo nextest run --workspace
         if: always()
         run: cargo nextest run --workspace --no-fail-fast

@@ -50,6 +50,13 @@ class McpLanes(unittest.TestCase):
                 self.assertEqual(result['test_rust'], 'true')
                 self.assertEqual(result['test_cross'], 'true')
 
+    def test_linux_wrapper_target_and_gate_select_linux_lane(self):
+        result = detect('crates/engram-harness-claude/tests/linux_mcp_entrypoint.rs',
+                        {'engram-harness-claude'}, {'engram-harness-claude'})
+        self.assertEqual(result['test_rust'], 'true')
+        self.assertEqual(result['test_cross'], 'true')
+        self.assertEqual(detect('.github/scripts/mcp-acceptance-linux.sh')['test_rust'], 'true')
+
     def test_helper_runs_native_gate(self):
         result = detect('sandbox-netstack/go.sum')
         self.assertEqual(result['test_netstack'], 'true')
