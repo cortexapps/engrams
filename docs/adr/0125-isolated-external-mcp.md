@@ -495,6 +495,17 @@ prove a source nonrunning while its durable next-boot requirement advances; it
 never counts as a new applied ACK or capture. A destroyed Captured source is a
 separate readiness case. An old source can still be addressed after SQL detaches
 its sandbox only when its recorded session, epoch, and retained host match.
+Publication accepts only never-allocated held creation or exact permanent
+Retired/Captured source evidence. Live applied-policy receipts do not supply a
+durably invalidated host/proxy lifetime, so they cannot authorize publication.
+Policy-only historical rows without immutable managed source lineage remain
+enumerated and retain their complete deny union, but block publication with no
+legacy host mutation. They need a separately reviewed durable lifecycle or
+destruction migration; terminal labels, row deletion and synthetic boot/capture
+records are not supported workarounds. This session-lineage restriction is
+separate from required legacy external MCP protocol support. Every MCP-bound root
+and child must use immutable managed creation. Current held, prepared, started
+and captured managed sources retain their existing progress paths.
 All participant snapshots and proofs are checked again under the exclusive gate
 and stable session locks before publication. Host I/O holds no database locks.
 The deployment configuration and pinned read contract are described in

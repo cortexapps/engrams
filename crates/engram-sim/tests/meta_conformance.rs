@@ -10781,7 +10781,7 @@ conformance!(
     super::operator_captured_source_requires_exact_destroyed_owner
 );
 
-async fn operator_legacy_idle_owner_needs_exact_applied_network_receipt(ctx: &Ctx) {
+async fn operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts(ctx: &Ctx) {
     use engram_core::types::{managed_deny::*, managed_operator::*};
     let sid = ctx
         .meta
@@ -10844,22 +10844,116 @@ async fn operator_legacy_idle_owner_needs_exact_applied_network_receipt(ctx: &Ct
         }),
     )
     .unwrap();
-    let mut wrong = receipt.clone();
-    wrong.context.operator_generation += 1;
-    assert!(ctx
-        .meta
-        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(wrong)))
-        .await
-        .is_err());
-    let mut missing = receipt.clone();
-    missing.network_proof = None;
-    assert!(ctx
-        .meta
-        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(missing)))
-        .await
-        .is_err());
+    let original_policy = ctx.meta.get_session_integration_policy(sid).await.unwrap();
+    for (host, proxy) in [
+        ("host-incarnation", "proxy-incarnation"),
+        ("next-host", "proxy-incarnation"),
+        ("host-incarnation", "next-proxy"),
+        ("next-host", "next-proxy"),
+    ] {
+        let live = ManagedAppliedState::new(
+            receipt.context.clone(),
+            receipt.policy.clone(),
+            host.into(),
+            proxy.into(),
+            receipt.network_proof.clone(),
+        )
+        .unwrap();
+        live.validate().unwrap();
+        let saved = serde_json::json!({"Applied":live});
+        // Neither an old receipt nor a fresh receipt has durable lifetime authority.
+        assert!(serde_json::from_value::<OperatorReadiness>(saved.clone()).is_err());
+        assert!(ctx
+            .meta
+            .record_operator_readiness(&g, &p, OperatorReadiness::NeverAllocated)
+            .await
+            .is_err());
+        if let Some(db) = &ctx._pg {
+            // Model an existing pending proof written by the earlier implementation.
+            // Sim cannot construct the removed enum variant; both stores reject it
+            // at their typed/JSON boundary and keep this participant unready.
+            sqlx::query("UPDATE managed_operator_readiness SET proof=$3 WHERE generation=$1 AND session_id=$2")
+                .bind(g.generation as i64).bind(sid.as_uuid()).bind(saved).execute(db.store.pool()).await.unwrap();
+        }
+        assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+        assert!(
+            !ctx.meta
+                .read_operator_publication()
+                .await
+                .unwrap()
+                .admission_open
+        );
+        assert_eq!(
+            ctx.meta.managed_policy_target(sid).await.unwrap(),
+            receipt.context.target
+        );
+        assert_eq!(
+            ctx.meta.get_session_integration_policy(sid).await.unwrap(),
+            original_policy
+        );
+    }
+    // Terminal labels do not remove unsupported lineage from the barrier.
     ctx.meta
-        .record_operator_readiness(&g, &p, OperatorReadiness::Applied(Box::new(receipt)))
+        .transition_session(sid, SessionState::Completed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.list_operator_participants(None, 64).await.unwrap(),
+        vec![sid]
+    );
+    let terminal = ctx.meta.retain_operator_participant(&g, sid).await.unwrap();
+    assert!(terminal.policy.denies("history.example"));
+    assert!(terminal.policy.denies("unused.example"));
+    assert!(!terminal.dormant());
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+}
+conformance!(
+    t_operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts,
+    super::operator_policy_only_lineage_blocks_stale_and_fresh_live_receipts
+);
+
+async fn operator_started_owner_progresses_after_permanent_retirement(ctx: &Ctx) {
+    use engram_core::types::{managed_boot::*, managed_create::digest, managed_operator::*};
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let key = &row.request.key;
+    let intent = ManagedBootStart {
+        receipt: row.receipt.clone().unwrap(),
+        start_id: digest(b"started owner"),
+    };
+    let issued = ctx
+        .meta
+        .advance_managed_boot(
+            key,
+            row.revision,
+            ManagedBootAdvance::IssueStart(intent.clone()),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .advance_managed_boot(key, issued.revision, ManagedBootAdvance::Started(intent))
+        .await
+        .unwrap();
+    let g = ctx
+        .meta
+        .stage_operator_publication(Some(1), operator_candidate())
+        .await
+        .unwrap()
+        .pending
+        .unwrap();
+    let p = ctx
+        .meta
+        .retain_operator_participant(&g, key.creation.session_id)
+        .await
+        .unwrap();
+    assert_eq!(p.status, "active");
+    assert!(ctx.meta.publish_operator_generation(&g).await.is_err());
+    let proof = OperatorReadiness::Retired(Box::new(ManagedBootRetiredReceipt {
+        prepared: row.prepared.unwrap(),
+        retained_policy: row.request.bootstrap_policy.clone(),
+        receipt_id: digest(b"permanent started owner retirement"),
+    }));
+    ctx.meta
+        .record_operator_readiness(&g, &p, proof)
         .await
         .unwrap();
     assert!(
@@ -10869,8 +10963,15 @@ async fn operator_legacy_idle_owner_needs_exact_applied_network_receipt(ctx: &Ct
             .unwrap()
             .admission_open
     );
+    assert_eq!(
+        ctx.meta
+            .managed_boot_open(key.creation.session_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
 }
 conformance!(
-    t_operator_legacy_idle_owner_needs_exact_applied_network_receipt,
-    super::operator_legacy_idle_owner_needs_exact_applied_network_receipt
+    t_operator_started_owner_progresses_after_permanent_retirement,
+    super::operator_started_owner_progresses_after_permanent_retirement
 );

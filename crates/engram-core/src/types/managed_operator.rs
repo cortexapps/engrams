@@ -5,9 +5,7 @@ use super::{
         ManagedCaptureAuthority,
     },
     managed_create::digest,
-    managed_deny::{
-        canonical_host, is_digest, ManagedAppliedState, ManagedDenyPolicy, ManagedPolicyTarget,
-    },
+    managed_deny::{canonical_host, is_digest, ManagedDenyPolicy, ManagedPolicyTarget},
 };
 use crate::{HostId, MetaError, SandboxId, SessionId};
 use serde::{Deserialize, Serialize};
@@ -339,10 +337,11 @@ impl OperatorParticipant {
             && self.status == "queued"
     }
 }
+/// Publication accepts only never-allocated or permanent source evidence.
+/// Live Applied receipts cannot represent durably invalidated service lifetimes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperatorReadiness {
     NeverAllocated,
-    Applied(Box<ManagedAppliedState>),
     Retired(Box<ManagedBootRetiredReceipt>),
     Captured(Box<ManagedCaptureAuthority>),
 }
@@ -363,25 +362,6 @@ impl OperatorReadiness {
         }
         match self {
             Self::NeverAllocated if p.dormant() => Ok(()),
-            Self::Applied(r) => {
-                r.validate().map_err(MetaError::Conflict)?;
-                if Some(&r.context.target) != p.target()?.as_ref()
-                    || r.policy != p.policy
-                    || r.context.operator_generation != generation.generation
-                    || r.context.operator_identity != generation.identity
-                    || r.network_proof.is_none()
-                {
-                    return Err(conflict());
-                }
-                // An in-flight boot has an immutable old context. It must retire, not resume an older start intent.
-                if p.boot.as_ref().is_some_and(|(k, _, _)| {
-                    k.key.context.operator_generation != generation.generation
-                        || k.key.context.operator_identity != generation.identity
-                }) {
-                    return Err(conflict());
-                }
-                Ok(())
-            }
             Self::Captured(a) => {
                 a.validate()?;
                 let (request, _, prepared) = p.boot.as_ref().ok_or_else(conflict)?;

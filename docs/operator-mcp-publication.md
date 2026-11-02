@@ -65,13 +65,25 @@ rows. It stores the union of historical denies and every candidate authority and
 alias before host I/O. A policy-only generation change still advances the deny
 revision once. A restart resumes from this durable requirement.
 
-Readiness requires exact authenticated host evidence for the current source and
-placement. A permanent Retired receipt proves that the old owner is nonrunning;
-it is not a new applied policy ACK or a capture. A Captured receipt proves the
+Readiness requires an immutable managed creation with authoritative never-allocated
+state, or exact permanent host evidence for its source and placement. A live
+Applied receipt is not publication authority: a host or proxy restart can expire
+it without changing session rows. A permanent Retired receipt proves that the old
+owner is nonrunning; it is not a new applied policy ACK or a capture. A Captured receipt proves the
 exact source was destroyed, but publication does not create a recovery artifact.
 A held creation with no allocation or boot attempt can use its durable next-boot
 requirement. Missing owners, errors, timeouts, and terminal session labels do not
 prove readiness. Policy or placement changes invalidate a saved observation.
+Policy-only historical rows without immutable managed creation/boot lineage remain
+in the scan. Their complete deny union is retained, but they block publication,
+even if a fresh live receipt is available. The scanner makes no host call for
+that unsupported lineage. Such rows require a separately reviewed durable
+lifecycle or destruction migration before publication can proceed. A terminal SQL
+status or row deletion is not a supported workaround. Do not invent a boot or
+capture record to adopt an old owner. This restriction concerns session lineage;
+it does not remove support for legacy external MCP protocol transports. All
+MCP-bound root and child creation must use the immutable managed creation path.
+
 The final transaction locks and checks all participants again before it publishes
 the generation and opens admission. No host call holds a database transaction.
 

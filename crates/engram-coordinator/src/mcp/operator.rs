@@ -166,29 +166,30 @@ async fn fence(
     if p.dormant() {
         return Ok(OperatorReadiness::NeverAllocated);
     }
+    // A live receipt has no durable host/proxy lifecycle authority. Policy-only
+    // legacy rows remain blockers; they cannot authorize even a host mutation.
+    let (request, _, prepared) = p.boot.as_ref().ok_or_else(conflict)?;
+    let key = &request.key;
     let target = p.target()?.ok_or_else(conflict)?;
     let mut observed_prepared = None;
-    if let Some((request, _, _)) = &p.boot {
-        let key = &request.key;
-        match state.services.host.read_managed_boot(key.clone()).await? {
-            ManagedBootHostState::Retired { receipt } => {
-                return Ok(OperatorReadiness::Retired(receipt))
-            }
-            ManagedBootHostState::Captured { authority } => {
-                return Ok(OperatorReadiness::Captured(Box::new(authority)))
-            }
-            ManagedBootHostState::Prepared { receipt } => {
-                receipt.validate()?;
-                if receipt.request != *request {
-                    return Err(conflict().into());
-                }
-                observed_prepared = Some(receipt);
-            }
-            ManagedBootHostState::Missing { .. } | ManagedBootHostState::Failed { .. } => {
-                return Err(conflict().into())
-            }
-            _ => {}
+    match state.services.host.read_managed_boot(key.clone()).await? {
+        ManagedBootHostState::Retired { receipt } => {
+            return Ok(OperatorReadiness::Retired(receipt))
         }
+        ManagedBootHostState::Captured { authority } => {
+            return Ok(OperatorReadiness::Captured(Box::new(authority)))
+        }
+        ManagedBootHostState::Prepared { receipt } => {
+            receipt.validate()?;
+            if receipt.request != *request {
+                return Err(conflict().into());
+            }
+            observed_prepared = Some(receipt);
+        }
+        ManagedBootHostState::Missing { .. } | ManagedBootHostState::Failed { .. } => {
+            return Err(conflict().into())
+        }
+        _ => {}
     }
     let expected = state
         .services
@@ -209,13 +210,9 @@ async fn fence(
         .as_ref()
         .and_then(|r| r.network_proof.as_ref().map(|n| n.guest_ip))
         .or_else(|| observed_prepared.as_ref().map(|r| r.guest_ip))
-        .or_else(|| {
-            p.boot
-                .as_ref()
-                .and_then(|(_, _, r)| r.as_ref().map(|r| r.guest_ip))
-        })
+        .or_else(|| prepared.as_ref().map(|r| r.guest_ip))
         .ok_or_else(conflict)?;
-    let mut egress = engram_core::types::egress::SessionEgressPolicy {
+    let egress = engram_core::types::egress::SessionEgressPolicy {
         session_id: p.session_id,
         sandbox_id: target.sandbox_id,
         guest_ip,
@@ -231,21 +228,7 @@ async fn fence(
         apps: Vec::new(),
         managed_deny: Some(p.policy.clone()),
     };
-    // Preserve ordinary egress policy for legacy live placements. Managed owners
-    // retire on generation change, so no new allow or credential is introduced.
-    if p.boot.is_none() {
-        let session = state.services.meta.get_session(p.session_id).await?;
-        egress = crate::api::sessions::build_resume_egress_policy(
-            state,
-            p.session_id,
-            target.sandbox_id,
-            &session.image.to_string(),
-        )
-        .await?
-        .ok_or_else(conflict)?;
-        egress.managed_deny = Some(p.policy.clone());
-    }
-    let applied = state
+    let _ = state
         .services
         .host
         .apply_managed_policy(ManagedPolicyApply {
@@ -254,17 +237,12 @@ async fn fence(
             egress,
         })
         .await;
-    if let Some((request, _, _)) = &p.boot {
-        let key = &request.key;
-        match state.services.host.read_managed_boot(key.clone()).await? {
-            ManagedBootHostState::Retired { receipt } => Ok(OperatorReadiness::Retired(receipt)),
-            ManagedBootHostState::Captured { authority } => {
-                Ok(OperatorReadiness::Captured(Box::new(authority)))
-            }
-            _ => Err(conflict().into()),
+    match state.services.host.read_managed_boot(key.clone()).await? {
+        ManagedBootHostState::Retired { receipt } => Ok(OperatorReadiness::Retired(receipt)),
+        ManagedBootHostState::Captured { authority } => {
+            Ok(OperatorReadiness::Captured(Box::new(authority)))
         }
-    } else {
-        Ok(OperatorReadiness::Applied(Box::new(applied?)))
+        _ => Err(conflict().into()),
     }
 }
 /// One bounded page per durable pass. No transaction is held across host I/O.
