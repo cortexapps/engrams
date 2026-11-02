@@ -194,3 +194,55 @@ test("internal CIDRs cannot grant public routes and defaults enter policy identi
   const b = new ZonePolicy({ ...config, limits: { execute: 31 } });
   assert.notEqual(a.digest, b.digest);
 });
+
+for (const fault of ["status", "header"] as const) {
+  test(
+    `invalid upstream ${fault} rejects only its operation`,
+    { timeout: 3000 },
+    async (t) => {
+      const { createServer, request } = await import("node:https");
+      const { workerTls } = await import("./fixtures/worker-tls.ts");
+      const tls = await workerTls();
+      let requests = 0;
+      const server = createServer(tls, (_req, res) => {
+        requests++;
+        res
+          .writeHead(requests === 1 && fault === "status" ? 600 : 200)
+          .end("ok");
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      t.after(() => {
+        server.closeAllConnections();
+        server.close();
+      });
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+      let conversions = 0;
+      const fetch = restrictedFetch(new ZonePolicy({ ...config, ca: tls.ca }), {
+        resolve: async () => ["8.8.8.8"],
+        request: (url, options) => {
+          const req = request(url, {
+            ...options,
+            hostname: "127.0.0.1",
+            port: address.port,
+          });
+          req.prependOnceListener("response", (res) => {
+            if (++conversions === 1 && fault === "header")
+              res.headers["invalid\nname"] = "untrusted";
+          });
+          return req;
+        },
+      });
+      await assert.rejects(fetch("https://tools.example/mcp"), {
+        message: "response_invalid",
+      });
+      assert.equal(
+        await (await fetch("https://tools.example/mcp")).text(),
+        "ok",
+      );
+      assert.equal(requests, 2);
+    },
+  );
+}

@@ -7,6 +7,7 @@ import { object } from "./encoding.ts";
 if (getHeapStatistics().heap_size_limit > 128 * 1024 * 1024) process.exit(1);
 process.stdout.write("ready\n");
 let raw = "";
+process.stdin.setEncoding("utf8");
 for await (const part of process.stdin) {
   raw += String(part);
   if (raw.length > 1024 * 1024) process.exit(1);

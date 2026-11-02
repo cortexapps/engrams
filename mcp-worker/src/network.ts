@@ -2,6 +2,7 @@ import { resolve4, resolve6 } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import type { RequestOptions } from "node:https";
 import type { ClientRequest } from "node:http";
+import type { Transform } from "node:stream";
 import { createGunzip, createInflate, createBrotliDecompress } from "node:zlib";
 import ipaddr from "ipaddr.js";
 import { digest } from "./encoding.ts";
@@ -245,72 +246,89 @@ export function restrictedFetch(
       });
       req.once("response", (res) => {
         clearTimeout(timer);
-        const status = res.statusCode ?? 500;
-        if (status >= 300 && status < 400) {
-          res.destroy();
-          reject(Error("redirect_denied"));
-          return;
-        }
-        const encoding = res.headers["content-encoding"];
-        if (
-          encoding &&
-          !["identity", "gzip", "deflate", "br"].includes(encoding)
-        ) {
-          res.destroy();
-          reject(Error("encoding_denied"));
-          return;
-        }
-        const decoder =
-          encoding === "gzip"
-            ? createGunzip()
-            : encoding === "deflate"
-              ? createInflate()
-              : encoding === "br"
-                ? createBrotliDecompress()
-                : undefined;
-        const stream = decoder ? res.pipe(decoder) : res;
-        let received = 0;
-        const responseHeaders = new Headers();
-        for (const [name, value] of Object.entries(res.headers))
+        let decoder: Transform | undefined;
+        try {
+          const status = res.statusCode;
           if (
-            value !== undefined &&
-            !["content-encoding", "content-length", "set-cookie"].includes(name)
+            status === undefined ||
+            !Number.isInteger(status) ||
+            status < 200 ||
+            status > 599
           )
-            responseHeaders.set(
-              name,
-              Array.isArray(value) ? value.join(",") : value,
-            );
-        const bodyStream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            stream.on("data", (chunk: Buffer) => {
-              received += chunk.length;
-              if (received > RESPONSE_BYTES) {
-                stream.destroy(Error("response_limit"));
-                res.destroy();
-                return;
-              }
-              controller.enqueue(chunk);
-            });
-            stream.once("end", () => controller.close());
-            stream.once("error", () =>
-              controller.error(Error("response_failed")),
-            );
-            res.once("error", () => {
-              if (decoder) decoder.destroy(Error("response_failed"));
-            });
-          },
-          cancel() {
-            stream.destroy();
+            throw Error("response_invalid");
+          if (status >= 300 && status < 400) {
             res.destroy();
-            req.destroy();
-          },
-        });
-        resolve(
-          new Response([204, 205, 304].includes(status) ? null : bodyStream, {
-            status,
-            headers: responseHeaders,
-          }),
-        );
+            reject(Error("redirect_denied"));
+            return;
+          }
+          const encoding = res.headers["content-encoding"];
+          if (
+            encoding &&
+            !["identity", "gzip", "deflate", "br"].includes(encoding)
+          ) {
+            res.destroy();
+            reject(Error("encoding_denied"));
+            return;
+          }
+          decoder =
+            encoding === "gzip"
+              ? createGunzip()
+              : encoding === "deflate"
+                ? createInflate()
+                : encoding === "br"
+                  ? createBrotliDecompress()
+                  : undefined;
+          const stream = decoder ? res.pipe(decoder) : res;
+          let received = 0;
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(res.headers))
+            if (
+              value !== undefined &&
+              !["content-encoding", "content-length", "set-cookie"].includes(
+                name,
+              )
+            )
+              responseHeaders.set(
+                name,
+                Array.isArray(value) ? value.join(",") : value,
+              );
+          const bodyStream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              stream.on("data", (chunk: Buffer) => {
+                received += chunk.length;
+                if (received > RESPONSE_BYTES) {
+                  stream.destroy(Error("response_limit"));
+                  res.destroy();
+                  return;
+                }
+                controller.enqueue(chunk);
+              });
+              stream.once("end", () => controller.close());
+              stream.once("error", () =>
+                controller.error(Error("response_failed")),
+              );
+              res.once("error", () => {
+                if (decoder) decoder.destroy(Error("response_failed"));
+              });
+            },
+            cancel() {
+              stream.destroy();
+              res.destroy();
+              req.destroy();
+            },
+          });
+          resolve(
+            new Response([204, 205, 304].includes(status) ? null : bodyStream, {
+              status,
+              headers: responseHeaders,
+            }),
+          );
+        } catch {
+          decoder?.destroy();
+          res.destroy();
+          req.destroy();
+          reject(Error("response_invalid"));
+        }
       });
       req.end(body);
     });

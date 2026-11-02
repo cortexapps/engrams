@@ -144,3 +144,53 @@ test("the actual disposable V8 heap ceiling is at most 128 MiB", async (t) => {
   );
   assert.equal(await validateSchemas([{ type: "integer" }], 1), true);
 });
+
+test("split UTF-8 preserves schema constants and argument values", async () => {
+  const { spawn } = await import("node:child_process");
+  const results: string[] = [];
+  for (const [value, splitValue] of [
+    ["é", false],
+    ["��", false],
+    ["é", true],
+  ] as const) {
+    const child = spawn(
+      process.execPath,
+      [
+        "--max-old-space-size=125",
+        "--max-semi-space-size=1",
+        new URL("../src/schema-child.ts", import.meta.url).pathname,
+      ],
+      {
+        env: {},
+        stdio: ["pipe", "pipe", "ignore"],
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    const result = new Promise<string>((resolve, reject) => {
+      let output = "";
+      let sent = false;
+      child.on("error", reject);
+      child.stdout.on("data", (chunk: Buffer) => {
+        output += chunk.toString();
+        if (!sent && output.startsWith("ready\n")) {
+          sent = true;
+          const payload = Buffer.from(
+            JSON.stringify({ documents: [{ const: "é" }], value }),
+          );
+          const split =
+            (splitValue
+              ? payload.lastIndexOf(Buffer.from("é"))
+              : payload.indexOf(Buffer.from("é"))) + 1;
+          child.stdin.write(payload.subarray(0, split));
+          setTimeout(() => child.stdin.end(payload.subarray(split)), 50);
+        }
+      });
+      child.on("close", (code) => {
+        if (code !== 0) reject(Error("child_failed"));
+        else resolve(output);
+      });
+    });
+    results.push(await result);
+  }
+  assert.deepEqual(results, ["ready\ntrue", "ready\nfalse", "ready\ntrue"]);
+});
