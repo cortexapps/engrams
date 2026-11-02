@@ -76,6 +76,7 @@ function services(): McpServices {
       admit: unavailable,
       admitSchema: unavailable,
       finishSchema: unavailable,
+      rejectBeforeDispatch: unavailable,
       assertDispatchCurrent: unavailable,
       dispatch: unavailable,
       finish: unavailable,

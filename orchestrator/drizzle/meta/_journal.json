@@ -771,6 +771,13 @@
       "when": 1793609726214,
       "tag": "0109_mcp_fixed_execute_deadline",
       "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1793611948671,
+      "tag": "0110_mcp_preflight_rejection",
+      "breakpoints": true
     }
   ]
 }

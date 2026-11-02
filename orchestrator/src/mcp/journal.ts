@@ -648,6 +648,82 @@ export function makeMcpJournal(db = getDb()) {
         return call;
       });
     },
+    /** Trusted local validation failure, before any irreversible dispatch. */
+    async rejectBeforeDispatch(
+      id: string,
+      expected: {
+        requestDigest: string;
+        version: number;
+        reservation: { reservationId: string; expiresAt: Date } | null;
+      },
+      now: Date,
+    ) {
+      expected = structuredClone(expected);
+      const [observed] = await db.select().from(admission).where(eq(admission.executionId, id));
+      return db.transaction(async (tx) => {
+        if (observed) await lockScope(tx, observed.deploymentId);
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call not found");
+        await tx
+          .select()
+          .from(connection)
+          .where(eq(connection.id, identity.connectionId))
+          .for("update");
+        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
+        const [lease] = await tx
+          .select()
+          .from(admission)
+          .where(eq(admission.executionId, id))
+          .for("update");
+        if (
+          !call ||
+          !["waiting_approval", "authorized"].includes(call.state) ||
+          call.version !== expected.version ||
+          call.requestDigest !== expected.requestDigest ||
+          call.intentId ||
+          (expected.reservation
+            ? !observed ||
+              !lease ||
+              lease.deploymentId !== observed.deploymentId ||
+              lease.reservationId !== expected.reservation.reservationId ||
+              lease.expiresAt.getTime() !== expected.reservation.expiresAt.getTime()
+            : Boolean(lease))
+        )
+          throw new Error("stale pre-dispatch rejection");
+        const [updated] = await tx
+          .update(execution)
+          .set({
+            state: "failed",
+            version: call.version + 1,
+            result: {
+              source: "local_validation",
+              delivery: "available",
+              output: {
+                content: [
+                  { type: "text", text: "Tool arguments do not satisfy the approved schemas." },
+                ],
+                isError: true,
+              },
+            },
+            resultUnavailable: false,
+            updatedAt: now,
+          })
+          .where(eq(execution.id, id))
+          .returning();
+        await tx.delete(admission).where(eq(admission.executionId, id));
+        await tx
+          .update(approval)
+          .set({ decision: "denied", decidedAt: now })
+          .where(
+            and(
+              eq(approval.executionId, id),
+              isNull(approval.consumedAt),
+              inArray(approval.decision, ["pending", "approved"]),
+            ),
+          );
+        return updated!;
+      });
+    },
     async finish(
       id: string,
       version: number,
