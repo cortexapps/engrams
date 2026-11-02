@@ -2,7 +2,7 @@ import { expect } from "bun:test";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
-import { create } from "@bufbuild/protobuf";
+import { create, toJson } from "@bufbuild/protobuf";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { eq } from "drizzle-orm";
 import { workerTls } from "../../../mcp-worker/test/fixtures/worker-tls.ts";
@@ -22,7 +22,10 @@ import {
   CredentialStatusSchema,
 } from "../gen/engram/mcp/v1/control_pb.ts";
 import { SessionPolicyService } from "../gen/engram/mcp/v1/session_policy_pb.ts";
-import type { McpWritePolicyRef } from "../gen/engram/app/v1/session_pb.ts";
+import {
+  McpWritePolicyRefSchema,
+  type McpWritePolicyRef,
+} from "../gen/engram/app/v1/session_pb.ts";
 import { statusMetadata } from "../mcp/credential-store.ts";
 import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { makeMcpEffectDriver } from "../mcp/effect-driver.ts";
@@ -140,6 +143,7 @@ export async function effectFixture(
       token = "known-literal-token",
       leases = 0;
     let enabled = true;
+    let authorityFailures = 0;
     let clockOffsetMs = 0;
     let beforeFence: (() => Promise<void>) | undefined;
     let beforeLease: (() => Promise<void>) | undefined;
@@ -256,7 +260,13 @@ export async function effectFixture(
     const resolver = makeStoredSessionBindingResolver(
       {
         control: policy,
-        readOperatorPolicies: async () => operatorPolicies,
+        readOperatorPolicies: async () => {
+          if (authorityFailures > 0) {
+            authorityFailures--;
+            throw Error("private-authority-transport-error");
+          }
+          return operatorPolicies;
+        },
         enforceManagedDeny: async (expected) => expected,
       },
       f.db,
@@ -278,6 +288,17 @@ export async function effectFixture(
     return {
       ...f,
       driver,
+      remote: {
+        workerTls: {
+          ...tls,
+          url: `https://127.0.0.1:${ready.port}`,
+          serverFingerprint: tls.fingerprint,
+        },
+        operatorPolicies,
+        status: toJson(CredentialStatusSchema, status),
+        eligibility,
+        policyRef: toJson(McpWritePolicyRefSchema, f.input.requestPolicyContext.acceptedPolicyRef),
+      },
       resolver,
       request,
       requests,
@@ -288,6 +309,9 @@ export async function effectFixture(
       operatorPolicies,
       advanceNow(milliseconds: number) {
         clockOffsetMs += milliseconds;
+      },
+      failAuthorityReads(count: number) {
+        authorityFailures = count;
       },
       setEnabled(value: boolean) {
         enabled = value;

@@ -21,7 +21,11 @@ import { requestPolicyContext } from "./journal-review.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import { lockRuntimeAuthority } from "./runtime-authority.ts";
 import { makeSessionWritePolicy, type RequestPolicyContext } from "./session-policy.ts";
-import type { SessionBindingResolver, ResolvedBoundTool } from "./session-resolver.ts";
+import {
+  resolveSnapshotTool,
+  type SessionBindingResolver,
+  type ResolvedBoundTool,
+} from "./session-resolver.ts";
 import type { McpSessionBindingSnapshot } from "./session-bindings.ts";
 import { makeResourceWorkerClient } from "./worker-client.ts";
 import { toWorkerBindingHash } from "./worker-encoding.ts";
@@ -36,6 +40,30 @@ export interface McpToolRequest {
   /** Exact first coordinator tool_call_requested.args_json, not parsed and serialized again. */
   originalArguments: string;
 }
+const requestDenials = {
+  invalid_arguments: "MCP arguments invalid or exceed limit",
+  tool_unavailable: "MCP tool unavailable",
+  publication_required: "MCP profile grants require administrator publication",
+  disabled: "external MCP is disabled",
+  session_unavailable: "MCP session unavailable",
+  authority_changed: "MCP execution authority changed",
+  principal_unavailable: "MCP principal unavailable",
+  write_not_allowed: "MCP write authority unavailable",
+  deadline_expired: "MCP request deadline expired",
+} as const;
+export type McpRequestDenialCode = keyof typeof requestDenials;
+/** A known local rejection, before any execution effect. No raw values or underlying error. */
+export class McpRequestDenied extends Error {
+  constructor(readonly code: McpRequestDenialCode) {
+    super(requestDenials[code]);
+  }
+}
+export class McpRequestConflict extends Error {
+  readonly code = "existing_request";
+  constructor() {
+    super("MCP call identity changed");
+  }
+}
 class InvalidArguments extends Error {
   constructor(readonly lease: Lease) {
     super("MCP arguments do not satisfy approved schemas");
@@ -45,10 +73,15 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function argumentsValue(raw: string): Record<string, unknown> {
-  if (Buffer.byteLength(raw) > MCP_LIMITS.argumentBytes) throw Error("MCP arguments exceed limit");
-  const value: unknown = JSON.parse(raw);
-  if (!object(value)) throw Error("MCP arguments must be an object");
-  return value;
+  try {
+    if (Buffer.byteLength(raw) > MCP_LIMITS.argumentBytes)
+      throw new McpRequestDenied("invalid_arguments");
+    const value: unknown = JSON.parse(raw);
+    if (!object(value)) throw new McpRequestDenied("invalid_arguments");
+    return value;
+  } catch {
+    throw new McpRequestDenied("invalid_arguments");
+  }
 }
 function publication(snapshot: McpSessionBindingSnapshot) {
   const value = snapshot.profilePublication;
@@ -59,7 +92,7 @@ function publication(snapshot: McpSessionBindingSnapshot) {
     !value.actorId ||
     value.grantsHash !== snapshot.profileGrantsHash
   )
-    throw Error("MCP profile grants require administrator publication");
+    throw new McpRequestDenied("publication_required");
 }
 
 /** The authenticated worker envelope is verified by the client and broker first. */
@@ -169,7 +202,7 @@ export function makeMcpEffectDriver(deps: {
     policy = makeSessionWritePolicy(deps.policy);
   function enabled(resolved: ResolvedBoundTool, signal?: AbortSignal) {
     signal?.throwIfAborted();
-    if (!deps.enabled?.(resolved.binding.config.zone)) throw Error("external MCP is disabled");
+    if (!deps.enabled?.(resolved.binding.config.zone)) throw new McpRequestDenied("disabled");
   }
   async function lookup(input: McpToolRequest) {
     const [call] = await db
@@ -187,7 +220,7 @@ export function makeMcpEffectDriver(deps: {
         call.originalArguments !== input.originalArguments ||
         call.requestContext?.resolvedTool.modelToolName !== input.modelToolName)
     )
-      throw Error("MCP call identity changed");
+      throw new McpRequestConflict();
     return call;
   }
   async function fence(context: RequestPolicyContext, resolved: ResolvedBoundTool, raw: string) {
@@ -195,7 +228,7 @@ export function makeMcpEffectDriver(deps: {
     const status = await (resolved.reviewedTool.classification === "write"
       ? policy.validateDispatchFence(context, expected)
       : policy.validateExecutionIdentity(context, expected));
-    if (status !== "current") throw Error("MCP execution authority changed");
+    if (status !== "current") throw new McpRequestDenied("authority_changed");
   }
   async function current(call: Call, signal?: AbortSignal) {
     const resolved = call.requestContext?.resolvedTool;
@@ -312,13 +345,15 @@ export function makeMcpEffectDriver(deps: {
       const existing = await lookup(input);
       if (existing) return existing;
       const parsed = argumentsValue(input.originalArguments);
-      const resolved = await deps.resolver.resolveBoundTool(input);
-      if (!resolved) throw Error("MCP tool unavailable");
-      enabled(resolved);
+      // A transport failure must remain retryable, not become a durable missing-tool denial.
       const snapshot = await deps.resolver.readCurrent(input.sessionId);
+      const resolved = resolveSnapshotTool(snapshot, input.modelToolName);
+      if (!resolved) throw new McpRequestDenied("tool_unavailable");
+      enabled(resolved);
       publication(snapshot);
       const currentPolicy = await policy.readForRequest(input);
-      if (!currentPolicy.current || !currentPolicy.ref) throw Error("MCP session unavailable");
+      if (!currentPolicy.current || !currentPolicy.ref)
+        throw new McpRequestDenied("session_unavailable");
       const context: RequestPolicyContext = {
         sessionId: input.sessionId,
         runId: input.runId,
@@ -327,19 +362,24 @@ export function makeMcpEffectDriver(deps: {
         acceptedWriteEligibility: currentPolicy.writeEligibility,
         ancestorPolicyRefs: currentPolicy.ancestorPolicyRefs,
       };
+      if (
+        resolved.reviewedTool.classification === "write" &&
+        context.acceptedWriteEligibility !== "write_eligible"
+      )
+        throw new McpRequestDenied("write_not_allowed");
       await fence(context, resolved, input.originalArguments);
       const [session] = await db
         .select()
         .from(taskSession)
         .where(eq(taskSession.sessionId, input.sessionId));
-      if (!session?.integrationPrincipalId) throw Error("MCP principal unavailable");
+      if (!session?.integrationPrincipalId) throw new McpRequestDenied("principal_unavailable");
       const write = resolved.reviewedTool.classification === "write";
       if (
         write &&
         (context.acceptedWriteEligibility !== "write_eligible" ||
           (await journal.hasUnknown(input.sessionId, resolved.binding.connectionId)))
       )
-        throw Error("MCP write authority unavailable");
+        throw new McpRequestDenied("write_not_allowed");
       const authorization = !write
         ? { kind: "read" as const }
         : session.integrationPrincipalId.startsWith("automation:")
@@ -354,7 +394,7 @@ export function makeMcpEffectDriver(deps: {
         MCP_LIMITS.maxToolMs;
       const deadline = new Date(Math.min(cap, trustedDeadline?.getTime() ?? cap));
       if (!Number.isFinite(deadline.getTime()) || deadline <= now)
-        throw Error("MCP request deadline expired");
+        throw new McpRequestDenied("deadline_expired");
       let call: Call;
       try {
         call = await journal.create(

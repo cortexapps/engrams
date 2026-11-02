@@ -3,14 +3,8 @@ import { z } from "zod";
 
 import { registerBuiltinTools } from "../../tools/builtin.ts";
 import { createToolRegistry } from "../../tools/registry.ts";
-import type {
-  PendingToolCallInput,
-  PendingToolCallStore,
-} from "../../tools/pending-tool-calls.ts";
-import {
-  makeToolConsumer,
-  type ToolWorkflowStarter,
-} from "../tool-consumer.ts";
+import type { PendingToolCallInput, PendingToolCallStore } from "../../tools/pending-tool-calls.ts";
+import { makeToolConsumer, type ToolWorkflowStarter } from "../tool-consumer.ts";
 
 function pendingRecorder() {
   const requested: PendingToolCallInput[] = [];
@@ -185,22 +179,28 @@ describe("tool consumer", () => {
     });
 
     await consumer.handle(requested("ask_user_question"), { sessionId: "session-1" });
-    await consumer.handle({
-      idx: 2n,
-      kind: "tool_result_submitted",
-      payloadJson: JSON.stringify({
-        tool_call_id: "call-1",
-        at: "2026-07-13T12:01:00.000Z",
-      }),
-    }, { sessionId: "session-1" });
-    await consumer.handle({
-      idx: 3n,
-      kind: "tool_call_completed",
-      payloadJson: JSON.stringify({
-        tool_call_id: "call-1",
-        at: "2026-07-13T12:02:00.000Z",
-      }),
-    }, { sessionId: "session-1" });
+    await consumer.handle(
+      {
+        idx: 2n,
+        kind: "tool_result_submitted",
+        payloadJson: JSON.stringify({
+          tool_call_id: "call-1",
+          at: "2026-07-13T12:01:00.000Z",
+        }),
+      },
+      { sessionId: "session-1" },
+    );
+    await consumer.handle(
+      {
+        idx: 3n,
+        kind: "tool_call_completed",
+        payloadJson: JSON.stringify({
+          tool_call_id: "call-1",
+          at: "2026-07-13T12:02:00.000Z",
+        }),
+      },
+      { sessionId: "session-1" },
+    );
 
     expect(pending.requested[0]).toEqual({
       sessionId: "session-1",
@@ -224,4 +224,46 @@ describe("tool consumer", () => {
       },
     ]);
   });
+});
+
+test("MCP requests persist the exact event reference before cursor success", async () => {
+  const pending = pendingRecorder();
+  const accepted: unknown[] = [];
+  let fail = true;
+  const consumer = makeToolConsumer({
+    registry: registryFixture(),
+    pendingCalls: pending.store,
+    now: () => new Date(0),
+    startWorkflow: async () => {
+      throw Error("static path used");
+    },
+    startMcpRequest: async (input) => {
+      accepted.push(input);
+      if (fail) throw Error("acceptance unavailable");
+    },
+  });
+  const event = {
+    idx: 7n,
+    kind: "tool_call_requested",
+    payloadJson: JSON.stringify({
+      tool_call_id: "call-1",
+      run_id: "run-1",
+      name: "mcp_bound",
+      args_json: '{ "x": 1 }',
+    }),
+  };
+  await expect(consumer.handle(event, { sessionId: "s1" })).rejects.toThrow(
+    "MCP request unavailable",
+  );
+  fail = false;
+  await consumer.handle(event, { sessionId: "s1" });
+  expect(accepted).toEqual(
+    Array(2).fill({
+      sessionId: "s1",
+      runId: "run-1",
+      toolCallId: "call-1",
+      requestEventIdx: "7",
+      deadlineMs: 930000,
+    }),
+  );
 });

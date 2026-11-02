@@ -71,6 +71,8 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // ABOVE the initDbos() call below so their workflows/steps are registered
 // before DBOS.launch(). Imports below register the finite Slack-thread and
 // tool-execution workflows.
+import "./workflows/mcp-exec.ts";
+import { makeMcpRecoveryScanner } from "./mcp/recovery-scanner.ts";
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
@@ -570,16 +572,24 @@ const server = buildServer(
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
     // ADR 0053 §3: a DisableImage pre-flight blocks disabling an image that
     // any active profile still references (the coordinator only knows sessions).
-    registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
-      "ImageService.DisableImage": makeDisableImageGuard(),
-      "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
-      "SessionService.SendPrompt": async (request) => {
-        const sessionId = (request as { sessionId?: unknown }).sessionId;
-        if (typeof sessionId !== "string") return;
-        const response = await controlPlaneSessions.getSession({ sessionId });
-        await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
+    registerPassthrough(
+      router,
+      SURFACE,
+      controlPlaneTransport,
+      undefined,
+      undefined,
+      {
+        "ImageService.DisableImage": makeDisableImageGuard(),
+        "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
+        "SessionService.SendPrompt": async (request) => {
+          const sessionId = (request as { sessionId?: unknown }).sessionId;
+          if (typeof sessionId !== "string") return;
+          const response = await controlPlaneSessions.getSession({ sessionId });
+          await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
+        },
       },
-    }, makeSessionPolicyOverrides());
+      makeSessionPolicyOverrides(),
+    );
   },
   // Raw WS-upgrade hooks, tried in order: the preview proxy first
   // (Host-keyed — a preview host is a different origin, so it wins
@@ -660,6 +670,8 @@ void retireProviderWebhookSchemes({
 }).catch((err) => log.error({ err }, "provider webhook scheme retirement failed"));
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
+const mcpRecoveryScanner = makeMcpRecoveryScanner({ deploymentId: config.deploymentId });
+await mcpRecoveryScanner.start();
 assertSweepPoliciesExhaustive();
 // ADR 0119 D1: the block registry is static and must be populated before the
 // first RPC validates a definition — registration was lazy (first interpreter
@@ -732,6 +744,7 @@ process.on("SIGTERM", () => {
     await automationScheduler.stop();
     await integrationEventSweeper.stop();
     await listenerManager.stop();
+    await mcpRecoveryScanner.stop();
     await specPublishScanner.stop();
     await draftingSeedScanner.stop();
     await specSyncHub.stop();

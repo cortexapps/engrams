@@ -6,20 +6,25 @@ import { task as taskTable, taskSession as taskSessionTable } from "../db/schema
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { log as rootLog } from "../log.ts";
-import { makePendingToolCallStore, type PendingToolCallStore } from "../tools/pending-tool-calls.ts";
+import {
+  makePendingToolCallStore,
+  type PendingToolCallStore,
+} from "../tools/pending-tool-calls.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolExecInput } from "../tools/exec.ts";
+import { MCP_LIMITS } from "../mcp/limits.ts";
+import { mcpRecovery } from "../mcp/recovery.ts";
+import { startMcpRequestWorkflow } from "../workflows/mcp-exec.ts";
 import { toolExecWorkflow } from "../workflows/tool-exec.ts";
 import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "tool-consumer" });
 
-export type ToolWorkflowStarter = (
-  input: ToolExecInput,
-  workflowId: string,
-) => Promise<void>;
+export type ToolWorkflowStarter = (input: ToolExecInput, workflowId: string) => Promise<void>;
 
 export interface ToolConsumerDeps {
+  /** Persist the exact request-event reference before the listener cursor advances. */
+  startMcpRequest?: (input: import("../mcp/recovery.ts").McpRequestMarker) => Promise<void>;
   registry: ToolRegistry;
   pendingCalls: PendingToolCallStore;
   startWorkflow: ToolWorkflowStarter;
@@ -28,51 +33,40 @@ export interface ToolConsumerDeps {
    *  human owner (an automation). Absent = never auto-approve. */
   sessionIsOwnerless?: (sessionId: string) => Promise<boolean>;
   /** The internal completer (`tools.complete`) the auto-approve rides. */
-  completeSessionTool?: (
-    sessionId: string,
-    toolCallId: string,
-    result: unknown,
-  ) => Promise<void>;
+  completeSessionTool?: (sessionId: string, toolCallId: string, result: unknown) => Promise<void>;
 }
 
 interface ToolCallRequestedPayload {
   toolCallId: string;
   name: string;
   argsJson?: string;
+  runId?: string;
 }
 
-export function parseToolCallRequested(
-  event: CuratedEvent,
-): ToolCallRequestedPayload | undefined {
+export function parseToolCallRequested(event: CuratedEvent): ToolCallRequestedPayload | undefined {
   if (event.kind !== "tool_call_requested") return undefined;
   try {
     const payload = JSON.parse(event.payloadJson) as {
       tool_call_id?: unknown;
       name?: unknown;
       args_json?: unknown;
+      run_id?: unknown;
     };
-    if (
-      typeof payload.tool_call_id !== "string" ||
-      typeof payload.name !== "string"
-    ) {
+    if (typeof payload.tool_call_id !== "string" || typeof payload.name !== "string") {
       return undefined;
     }
     return {
       toolCallId: payload.tool_call_id,
       name: payload.name,
-      ...(typeof payload.args_json === "string"
-        ? { argsJson: payload.args_json }
-        : {}),
+      ...(typeof payload.run_id === "string" ? { runId: payload.run_id } : {}),
+      ...(typeof payload.args_json === "string" ? { argsJson: payload.args_json } : {}),
     };
   } catch {
     return undefined;
   }
 }
 
-function eventTimestamp(
-  payload: Record<string, unknown>,
-  now: () => Date,
-): Date {
+function eventTimestamp(payload: Record<string, unknown>, now: () => Date): Date {
   if (typeof payload.at === "string") {
     const parsed = new Date(payload.at);
     if (!Number.isNaN(parsed.getTime())) return parsed;
@@ -133,6 +127,28 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
       await bookkeepToolEvent(ctx.sessionId, event, deps);
       const requested = parseToolCallRequested(event);
       if (!requested) return;
+      if (requested.name.startsWith("mcp_")) {
+        // Fail closed without acknowledging this event. The durable listener retries it.
+        if (!deps.startMcpRequest || !requested.runId || requested.argsJson === undefined)
+          throw Error("MCP request unavailable");
+        try {
+          await deps.startMcpRequest({
+            sessionId: ctx.sessionId,
+            runId: requested.runId,
+            toolCallId: requested.toolCallId,
+            requestEventIdx: String(event.idx),
+            deadlineMs:
+              deps.now().getTime() +
+              MCP_LIMITS.approvalMs +
+              MCP_LIMITS.queueMs +
+              MCP_LIMITS.maxToolMs,
+          });
+        } catch {
+          // Listener errors can reach logs. Never retain a raw argument or driver error here.
+          throw Error("MCP request unavailable");
+        }
+        return;
+      }
       const tool = deps.registry.get(requested.name);
       // ADR 0107 headless policy: a plan proposed in an OWNERLESS session
       // (an automation — nobody is watching) auto-approves immediately, so
@@ -170,15 +186,10 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
         sessionId: ctx.sessionId,
         toolCallId: requested.toolCallId,
         toolName: requested.name,
-        ...(requested.argsJson !== undefined
-          ? { argsJson: requested.argsJson }
-          : {}),
+        ...(requested.argsJson !== undefined ? { argsJson: requested.argsJson } : {}),
       };
       try {
-        await deps.startWorkflow(
-          input,
-          `toolexec:${ctx.sessionId}:${requested.toolCallId}`,
-        );
+        await deps.startWorkflow(input, `toolexec:${ctx.sessionId}:${requested.toolCallId}`);
       } catch (err) {
         log.error(
           {
@@ -198,6 +209,10 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
 export function makeProductionToolConsumer(): SessionConsumer {
   const pendingCalls = makePendingToolCallStore();
   return makeToolConsumer({
+    startMcpRequest: async (input) => {
+      if (!mcpRecovery()) throw Error("MCP runtime unavailable");
+      await startMcpRequestWorkflow(input);
+    },
     registry: productionTools,
     pendingCalls,
     now: () => new Date(),

@@ -6,6 +6,7 @@ import { ZonePolicy } from "../../src/network.ts";
 const lines = createInterface({ input: process.stdin });
 const input = lines[Symbol.asyncIterator]();
 const { tls, response = "normal" } = JSON.parse((await input.next()).value!);
+const held: (() => void)[] = [];
 let calls = 0,
   credentialRequests = 0;
 const provider = createServer(tls, (req, res) => {
@@ -24,7 +25,22 @@ const provider = createServer(tls, (req, res) => {
       };
     else if (message.method === "tools/call") {
       calls++;
-      if (response === "hold") return;
+      if (response === "hold") {
+        held.push(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: message.id,
+              result: {
+                resultType: "complete",
+                content: [{ type: "text", text: "completed" }],
+              },
+            }),
+          );
+        });
+        return;
+      }
       if (response === "malformed") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{broken");
@@ -96,7 +112,10 @@ const send = (value: unknown) =>
 send({ port, identity: worker.identity, node: process.versions.node });
 for await (const command of { [Symbol.asyncIterator]: () => input }) {
   if (command === "stats") send({ calls, credentialRequests });
-  else if (command === "restart") {
+  else if (command === "release") {
+    for (const release of held.splice(0)) release();
+    send({ released: true });
+  } else if (command === "restart") {
     await worker.close();
     worker = make();
     await worker.listen(port, "127.0.0.1");

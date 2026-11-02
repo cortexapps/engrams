@@ -175,8 +175,8 @@ export const taskSession = pgTable(
     // mutable workflow state.
     integrationPrincipalId: text("integration_principal_id"),
     // Candidate metadata only. The host must separately acknowledge deny enforcement.
-    mcpBindingEnvelope: jsonb("mcp_binding_envelope")
-      .$type<import("../mcp/binding-store.ts").McpBindingEnvelope>(),
+    mcpBindingEnvelope:
+      jsonb("mcp_binding_envelope").$type<import("../mcp/binding-store.ts").McpBindingEnvelope>(),
     // ADR 0109: content-hash of the compiled authorization snapshot
     // (profileId + grants + connections). The broker emits it as the
     // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
@@ -1068,7 +1068,6 @@ export const consumerCursor = pgTable(
   (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
 );
 
-
 // ---------------------------------------------------------------------------
 // DBOS orphan sweep (ADR 0104)
 // ---------------------------------------------------------------------------
@@ -1194,65 +1193,62 @@ export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   allowHostPatterns: [],
 };
 
-export const profile = pgTable(
-  "profile",
-  {
-    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
-    name: text("name").notNull(),
-    description: text("description").notNull().default(""),
-    icon: text("icon").notNull().default("Bot"), // lucide icon name
-    imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
-    // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-    // this profile's sessions run, with default model + effort (catalog option
-    // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
-    // "inherit deployment default" semantics were superseded; existing rows were
-    // backfilled to `claude`). model/effort stay nullable → the harness
-    // descriptor's defaults. All overridable per session.
-    harness: text("harness").notNull(),
-    modelRouter: text("model_router"),
-    model: text("model"),
-    effort: text("effort"),
-    programmaticOnly: boolean("programmatic_only").notNull().default(false),
-    includeUserTokens: boolean("include_user_tokens").notNull().default(false),
-    envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
-    // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-    // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
-    // mounts at session create. Empty = base session (no skills).
-    skills: jsonb("skills").$type<string[]>().notNull().default([]),
-    // ADR 0109: structured integration authority. Unlike the retired flat
-    // capability array, this preserves which configured identity an operation
-    // uses and keeps its resource constraints attached.
-    mcpGrantPublication: jsonb("mcp_grant_publication").$type<{
-      revision: number;
-      actorId: string;
-      grantsHash: string;
-    }>(),
-    integrationGrants: jsonb("integration_grants")
-      .$type<ProfileIntegrationGrant[]>()
-      .notNull()
-      .default([]),
-    // ADR 0057: egress network allow-list (deny by default) + secrets this
-    // profile's sessions get, lifted off the image manifest. Additive in B1;
-    // compiled into the per-session SessionPolicy + consumed at boot in B2.
-    network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
-    secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-    // Git repositories this profile's image contains — explicit, user-managed
-    // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
-    repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
-    // ADR 0118: the services every session from this profile hosts. The
-    // orchestrator reserves one hostname per app BEFORE it creates the session
-    // (inside the transaction below this one) and injects each app's address
-    // into the guest's env, so a sibling app is configured with an address the
-    // user's browser can reach too. Empty = no apps.
-    apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
-    createdAt: timestamp("created_at").notNull().defaultNow(),
-    updatedAt: timestamp("updated_at")
-      .notNull()
-      .defaultNow()
-      .$onUpdate(() => new Date()),
-    deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
-  },
-);
+export const profile = pgTable("profile", {
+  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  icon: text("icon").notNull().default("Bot"), // lucide icon name
+  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+  // this profile's sessions run, with default model + effort (catalog option
+  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+  // "inherit deployment default" semantics were superseded; existing rows were
+  // backfilled to `claude`). model/effort stay nullable → the harness
+  // descriptor's defaults. All overridable per session.
+  harness: text("harness").notNull(),
+  modelRouter: text("model_router"),
+  model: text("model"),
+  effort: text("effort"),
+  programmaticOnly: boolean("programmatic_only").notNull().default(false),
+  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
+  // mounts at session create. Empty = base session (no skills).
+  skills: jsonb("skills").$type<string[]>().notNull().default([]),
+  // ADR 0109: structured integration authority. Unlike the retired flat
+  // capability array, this preserves which configured identity an operation
+  // uses and keeps its resource constraints attached.
+  mcpGrantPublication: jsonb("mcp_grant_publication").$type<{
+    revision: number;
+    actorId: string;
+    grantsHash: string;
+  }>(),
+  integrationGrants: jsonb("integration_grants")
+    .$type<ProfileIntegrationGrant[]>()
+    .notNull()
+    .default([]),
+  // ADR 0057: egress network allow-list (deny by default) + secrets this
+  // profile's sessions get, lifted off the image manifest. Additive in B1;
+  // compiled into the per-session SessionPolicy + consumed at boot in B2.
+  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+  // Git repositories this profile's image contains — explicit, user-managed
+  // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
+  repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
+  // ADR 0118: the services every session from this profile hosts. The
+  // orchestrator reserves one hostname per app BEFORE it creates the session
+  // (inside the transaction below this one) and injects each app's address
+  // into the guest's env, so a sibling app is configured with an address the
+  // user's browser can reach too. Empty = no apps.
+  apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+});
 
 // ---------------------------------------------------------------------------
 // Automations (ADR 0102 → ADR 0119): versioned block-graph definitions whose
@@ -1312,7 +1308,10 @@ export const routerModel = pgTable(
     available: boolean("available").notNull().default(true),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [primaryKey({ columns: [t.routerId, t.modelId] }), index("router_model_available_idx").on(t.routerId, t.available)],
+  (t) => [
+    primaryKey({ columns: [t.routerId, t.modelId] }),
+    index("router_model_available_idx").on(t.routerId, t.available),
+  ],
 );
 
 export const routerModelPolicy = pgTable(
@@ -1326,7 +1325,10 @@ export const routerModelPolicy = pgTable(
   },
   (t) => [
     primaryKey({ columns: [t.routerId, t.modelId] }),
-    foreignKey({ columns: [t.routerId, t.modelId], foreignColumns: [routerModel.routerId, routerModel.modelId] }).onDelete("cascade"),
+    foreignKey({
+      columns: [t.routerId, t.modelId],
+      foreignColumns: [routerModel.routerId, routerModel.modelId],
+    }).onDelete("cascade"),
     check("router_model_policy_user_implies_enabled", sql`NOT ${t.userEnabled} OR ${t.enabled}`),
   ],
 );
@@ -2230,7 +2232,8 @@ export const mcpExecution = pgTable(
     requestDigest: text("request_digest").notNull(),
     argumentHash: text("argument_hash").notNull(),
     originalArguments: text("original_arguments"),
-    requestContext: jsonb("request_context").$type<import("../mcp/journal-review.ts").FrozenRequestContext>(),
+    requestContext:
+      jsonb("request_context").$type<import("../mcp/journal-review.ts").FrozenRequestContext>(),
     upstreamName: text("upstream_name").notNull(),
     configRevision: integer("config_revision").notNull(),
     authGeneration: integer("auth_generation").notNull(),
@@ -2247,6 +2250,8 @@ export const mcpExecution = pgTable(
     deadline: timestamp("deadline", { withTimezone: true }).notNull(),
     result: jsonb("result").$type<Record<string, unknown>>(),
     resultUnavailable: boolean("result_unavailable").notNull().default(false),
+    // Delivery settlement: enqueue ACK or authoritative target-gone rejection, never guest/effect proof.
+    completionEnqueuedVersion: integer("completion_enqueued_version").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
   },
@@ -2260,6 +2265,13 @@ export const mcpExecution = pgTable(
     index("mcp_execution_connection_state_idx").on(t.connectionId, t.sessionId, t.state),
     index("mcp_execution_catalog_idx").on(t.catalogId),
     index("mcp_execution_pending_idx").on(t.state, t.deadline),
+    index("mcp_execution_recovery_idx")
+      .on(t.id)
+      .where(sql`${t.completionEnqueuedVersion} < ${t.version}`),
+    check(
+      "mcp_execution_completion_version_check",
+      sql`${t.completionEnqueuedVersion} >= 0 AND ${t.completionEnqueuedVersion} <= ${t.version}`,
+    ),
     uniqueIndex("mcp_execution_intent_idx").on(t.intentId),
     check(
       "mcp_execution_state_check",
@@ -2332,7 +2344,9 @@ export const mcpAdmission = pgTable(
     executionId: text("execution_id")
       .primaryKey()
       .references(() => mcpExecution.id, { onDelete: "cascade" }),
-    reservationId: text("reservation_id").notNull().default(sql`gen_random_uuid()::text`),
+    reservationId: text("reservation_id")
+      .notNull()
+      .default(sql`gen_random_uuid()::text`),
     deploymentId: text("deployment_id")
       .notNull()
       .references(() => mcpAdmissionScope.id),

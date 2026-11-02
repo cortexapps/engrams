@@ -60,6 +60,26 @@ export interface ResolvedBoundTool {
   ancestorAuthorityRefs: McpAncestorAuthorityRef[];
   execution: "sync" | "deferred";
 }
+/** Pure exact-name lookup after the caller has verified this snapshot's live authority. */
+export function resolveSnapshotTool(
+  snapshot: McpSessionBindingSnapshot,
+  modelToolName: string,
+): ResolvedBoundTool | undefined {
+  for (const binding of snapshot.immutableBindings) {
+    const bound = binding.tools.find((tool) => tool.name === modelToolName);
+    if (bound)
+      return structuredClone({
+        bindingHash: snapshot.bindingHash,
+        profilePublication: snapshot.profilePublication ?? null,
+        binding,
+        modelToolName: bound.name,
+        reviewedTool: bound.tool,
+        effectiveGrant: bound.grant,
+        ancestorAuthorityRefs: snapshot.ancestorAuthorityRefs,
+        execution: bound.tool.classification === "write" ? "deferred" : "sync",
+      });
+  }
+}
 /** Session-local resolution never changes the process-wide registry or accepts a destination. */
 export function makeSessionBindingResolver(deps: SessionBindingResolverDeps) {
   async function readCurrent(sessionId: string): Promise<McpSessionBindingSnapshot> {
@@ -111,20 +131,7 @@ export function makeSessionBindingResolver(deps: SessionBindingResolverDeps) {
     }): Promise<ResolvedBoundTool | undefined> {
       try {
         const snapshot = await readCurrent(input.sessionId);
-        for (const binding of snapshot.immutableBindings) {
-          const bound = binding.tools.find((tool) => tool.name === input.modelToolName);
-          if (bound)
-            return structuredClone({
-              bindingHash: snapshot.bindingHash,
-              profilePublication: snapshot.profilePublication ?? null,
-              binding,
-              modelToolName: bound.name,
-              reviewedTool: bound.tool,
-              effectiveGrant: bound.grant,
-              ancestorAuthorityRefs: snapshot.ancestorAuthorityRefs,
-              execution: bound.tool.classification === "write" ? "deferred" : "sync",
-            });
-        }
+        return resolveSnapshotTool(snapshot, input.modelToolName);
       } catch {
         /* Missing authority, enforcement and malformed old snapshots all deny. */
       }
