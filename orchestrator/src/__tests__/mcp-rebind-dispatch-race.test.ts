@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { effectFixture } from "./mcp-effect-fixture.ts";
 import { McpRebindDraining } from "../mcp/rebind.ts";
 import { coldFixture } from "./mcp-cold-fixture.ts";
+import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
+await verifyMcpTestDatabases();
 
 test("a rebind cannot expose a new binding while the old dispatch is in its final fence", async () => {
   const f = await effectFixture({ classification: "read", bindingEpoch: 1 });

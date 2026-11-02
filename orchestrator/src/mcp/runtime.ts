@@ -39,6 +39,7 @@ import { makeSessionWritePolicy } from "./session-policy.ts";
 import { makeMcpSessionCompiler } from "./session-compiler.ts";
 import { assertMcpDirectPolicyJson } from "./session-conflicts.ts";
 import { canonicalJson } from "./hash.ts";
+import type { ToolCallCompleter } from "../tools/complete.ts";
 import type { McpServices } from "./contracts.ts";
 import { makeManagedRebind } from "./managed-rebind.ts";
 
@@ -50,6 +51,7 @@ export function makeMcpRuntime(deps: {
   bridge(control: SessionPolicyControlClient): ManagedBootBridge;
   db?: ReturnType<typeof getDb>;
   now?: () => Date;
+  completer?: ToolCallCompleter;
 }) {
   const db = deps.db ?? getDb(),
     now = deps.now ?? (() => new Date());
@@ -59,7 +61,12 @@ export function makeMcpRuntime(deps: {
   if (!deps.configuration)
     return {
       services: { enabled: false, journal, repository } satisfies McpServices,
-      recovery: makeMcpRecovery({ db, deploymentId: deps.deploymentId, now }),
+      recovery: makeMcpRecovery({
+        db,
+        deploymentId: deps.deploymentId,
+        now,
+        completer: deps.completer,
+      }),
       store,
     };
   const configuration = deps.configuration;
@@ -153,8 +160,53 @@ export function makeMcpRuntime(deps: {
       }
     return refs;
   }
+  async function authorize(source: { actorId: string; inputId: string }, id: string) {
+    const { session, owner } = await store.read(id);
+    if (
+      source.inputId !== id ||
+      session.integrationPrincipalId !== source.actorId ||
+      ["done", "failed", "cancelled"].includes(owner.status)
+    )
+      throw Error("MCP creation principal unavailable");
+    if (source.actorId.startsWith("automation:")) {
+      const automationId = source.actorId.slice("automation:".length);
+      const rows = await db
+        .select({ definition: automation, run: automationRun })
+        .from(automationRun)
+        .innerJoin(automation, eq(automation.id, automationRun.automationId))
+        .where(
+          and(
+            eq(automation.id, automationId),
+            eq(automationRun.taskId, owner.rootTaskId ?? owner.id),
+          ),
+        )
+        .limit(2);
+      if (
+        rows.length !== 1 ||
+        !rows[0]!.definition.enabled ||
+        rows[0]!.definition.archivedAt ||
+        rows[0]!.run.status !== "running" ||
+        rows[0]!.run.dryRun ||
+        rows[0]!.run.endedAt
+      )
+        throw Error("MCP automation creation unavailable");
+      return;
+    }
+    const [principal] = await db.select().from(user).where(eq(user.id, source.actorId));
+    if (
+      !principal ||
+      principal.banned ||
+      source.inputId !== id ||
+      session.integrationPrincipalId !== source.actorId ||
+      owner.createdByUserId !== source.actorId ||
+      ["done", "failed", "cancelled"].includes(owner.status)
+    )
+      throw Error("MCP creation principal unavailable");
+  }
   async function validate(snapshot: McpSessionBindingSnapshot, sessionId: string) {
     const { session, owner } = await store.read(sessionId);
+    if (session.mcpManagedLifecycle)
+      await authorize(session.mcpManagedLifecycle.identity, sessionId);
     if (
       ["done", "failed", "cancelled"].includes(owner.status) ||
       !checkBindingCurrent({ snapshot, liveAuthority: await readAuthority(snapshot.profileId) })
@@ -191,49 +243,7 @@ export function makeMcpRuntime(deps: {
     readPublished: reader.read,
     validate,
     enabled: deps.enabled,
-    async authorize(source, id) {
-      const { session, owner } = await store.read(id);
-      if (
-        source.inputId !== id ||
-        session.integrationPrincipalId !== source.actorId ||
-        ["done", "failed", "cancelled"].includes(owner.status)
-      )
-        throw Error("MCP creation principal unavailable");
-      if (source.actorId.startsWith("automation:")) {
-        const automationId = source.actorId.slice("automation:".length);
-        const rows = await db
-          .select({ definition: automation, run: automationRun })
-          .from(automationRun)
-          .innerJoin(automation, eq(automation.id, automationRun.automationId))
-          .where(
-            and(
-              eq(automation.id, automationId),
-              eq(automationRun.taskId, owner.rootTaskId ?? owner.id),
-            ),
-          )
-          .limit(2);
-        if (
-          rows.length !== 1 ||
-          !rows[0]!.definition.enabled ||
-          rows[0]!.definition.archivedAt ||
-          rows[0]!.run.status !== "running" ||
-          rows[0]!.run.dryRun ||
-          rows[0]!.run.endedAt
-        )
-          throw Error("MCP automation creation unavailable");
-        return;
-      }
-      const [principal] = await db.select().from(user).where(eq(user.id, source.actorId));
-      if (
-        !principal ||
-        principal.banned ||
-        source.inputId !== id ||
-        session.integrationPrincipalId !== source.actorId ||
-        (owner.createdByUserId !== null && owner.createdByUserId !== source.actorId) ||
-        ["done", "failed", "cancelled"].includes(owner.status)
-      )
-        throw Error("MCP creation principal unavailable");
-    },
+    authorize,
     async enroll(sessionId) {
       await db.insert(sessionListener).values({ sessionId }).onConflictDoNothing();
     },
@@ -253,6 +263,7 @@ export function makeMcpRuntime(deps: {
     deploymentId: deps.deploymentId,
     driver,
     cancellationPolicy: control,
+    completer: deps.completer,
     dispatchEnabled: deps.enabled,
     now,
   });

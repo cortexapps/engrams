@@ -3,6 +3,8 @@ import { eq } from "drizzle-orm";
 import { integrationConnection, profile, task, taskSession } from "../db/schema.ts";
 import { McpRebindDraining } from "../mcp/rebind.ts";
 import { coldFixture } from "./mcp-cold-fixture.ts";
+import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
+await verifyMcpTestDatabases();
 
 const prepare = (f: Awaited<ReturnType<typeof coldFixture>>) =>
   f.service.prepare(f.sessionId, f.snapshot.bindingHash, f.actorId);
@@ -165,6 +167,38 @@ test("retired source is deny evidence only and the new boot retains later desire
     f.start();
     await f.restartRunOnce();
     expect((await f.store.read(f.sessionId)).session.mcpManagedLifecycle?.phase).toBe("started");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("sanitized state accepts the bounded JSON expansion of a maximum-size final manifest", async () => {
+  const { decodeManagedState } = await import("../mcp/managed-state.ts");
+  const { bytesDigest } = await import("../mcp/managed-create-input.ts");
+  const f = await coldFixture();
+  try {
+    const prefix = '[{"name":"native","description":"',
+      suffix = '","inputSchema":{},"execution":"sync"}]';
+    const bytes = new TextEncoder().encode(
+      prefix + "x".repeat(1024 * 1024 - prefix.length - suffix.length) + suffix,
+    );
+    expect(bytes.length).toBe(1024 * 1024);
+    f.state.boot!.finalization = {
+      prepared: f.state.boot!.prepared!,
+      native_version: 1,
+      combined_manifest: [...bytes],
+      combined_manifest_digest: bytesDigest(bytes),
+    };
+    const stateJson = new TextEncoder().encode(JSON.stringify(f.state));
+    expect(stateJson.length).toBeGreaterThan(4 * 1024 * 1024);
+    const value = (await f.store.read(f.sessionId)).session.mcpManagedLifecycle!;
+    expect(
+      decodeManagedState({ protocol: 1, stateJson }, value).boot!.finalization!
+        .combined_manifest_digest,
+    ).toBe(bytesDigest(bytes));
+    expect(() =>
+      decodeManagedState({ protocol: 1, stateJson: new Uint8Array(8 * 1024 * 1024 + 1) }, value),
+    ).toThrow("unavailable");
   } finally {
     await f.cleanup();
   }

@@ -40,3 +40,41 @@ test("managed scanner advances past a failed row and wraps its durable keyset cu
   expect(driven).toEqual(["a", "b", "a", "b"]);
   await scanner.stop();
 });
+
+test("managed scanner shutdown waits for its current reconciliation", async () => {
+  let release!: () => void, enter!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const driven: string[] = [];
+  const scanner = makeManagedSessionScanner({
+    store: {
+      async pending() {
+        return [{ sessionId: "pending" }, { sessionId: "later" }];
+      },
+    },
+    runtime: {
+      async runOnce(id) {
+        driven.push(id);
+        enter();
+        await held;
+      },
+    },
+  });
+  const started = scanner.start();
+  await entered;
+  let settled = false;
+  const stopped = scanner.stop().then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  release();
+  await started;
+  await stopped;
+  expect(settled).toBe(true);
+  expect(driven).toEqual(["pending"]);
+});

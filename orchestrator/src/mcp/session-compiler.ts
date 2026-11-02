@@ -4,6 +4,7 @@ import type { McpLiveAuthority, McpSessionBindingSnapshot } from "./session-bind
 import { compileBoundSessionCandidate } from "./session-create.ts";
 import { assertMcpDirectConflicts } from "./session-conflicts.ts";
 import { restoreBindingSnapshot } from "./binding-store.ts";
+import { appendMcpManifest } from "../tools/manifest.ts";
 import { frozenNativeManifest } from "./managed-create-input.ts";
 
 export function makeMcpSessionCompiler(deps: {
@@ -42,6 +43,8 @@ export function makeMcpSessionCompiler(deps: {
       await deps.reservedSecretReferences(),
     );
     const native = frozenNativeManifest(candidate.harnessEnv?.ENGRAM_TOOLS);
+    // Validate the combined limits now, but keep only native descriptors in the held request.
+    appendMcpManifest(native.text, snapshot);
     return { ...candidate, harnessEnv: { ...candidate.harnessEnv, ENGRAM_TOOLS: native.text } };
   };
 }

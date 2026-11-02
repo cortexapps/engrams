@@ -146,7 +146,7 @@ export function decodeManagedState(
   if (
     response.protocol !== 1 ||
     !response.stateJson.length ||
-    response.stateJson.length > 4 * 1024 * 1024
+    response.stateJson.length > 8 * 1024 * 1024
   )
     throw Error("MCP creation state unavailable");
   const value = state.parse(

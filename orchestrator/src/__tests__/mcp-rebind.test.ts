@@ -5,6 +5,8 @@ import { bindingSnapshotColumns, readLiveBindingAuthority } from "../mcp/binding
 import { compileSessionBindings } from "../mcp/session-bindings.ts";
 import { McpRebindDraining } from "../mcp/rebind.ts";
 import { coldFixture } from "./mcp-cold-fixture.ts";
+import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
+await verifyMcpTestDatabases();
 import { reviewFixture } from "./mcp-review-fixture.ts";
 
 async function finish(f: Awaited<ReturnType<typeof coldFixture>>, hash: string) {
@@ -80,23 +82,19 @@ test("child cold rebind uses the current parent intersection and rejects a chang
       bindingEpoch: 1,
       parentAuthority: { sessionId: base.sessionId, snapshot: narrow },
     });
-    await base.db
-      .insert(task)
-      .values({
-        id: childTask,
-        type: "chat",
-        createdByUserId: base.actorId,
-        spawningSessionId: base.sessionId,
-      });
-    await base.db
-      .insert(taskSession)
-      .values({
-        taskId: childTask,
-        sessionId: childId,
-        profileId: base.profileId,
-        integrationPrincipalId: base.actorId,
-        ...bindingSnapshotColumns(child, connections),
-      });
+    await base.db.insert(task).values({
+      id: childTask,
+      type: "chat",
+      createdByUserId: base.actorId,
+      spawningSessionId: base.sessionId,
+    });
+    await base.db.insert(taskSession).values({
+      taskId: childTask,
+      sessionId: childId,
+      profileId: base.profileId,
+      integrationPrincipalId: base.actorId,
+      ...bindingSnapshotColumns(child, connections),
+    });
     const f = await coldFixture(
       { ...base, sessionId: childId, taskId: childTask },
       undefined,

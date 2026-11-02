@@ -11,9 +11,10 @@ export function makeManagedSessionScanner(deps: {
   let stopped = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | undefined;
-  async function runOnce() {
+  async function runOnce(stopBetweenRows = false) {
     const rows = await deps.store.pending(after);
     for (const row of rows) {
+      if (stopBetweenRows && stopped) break;
       try {
         await deps.runtime.runOnce(row.sessionId);
       } catch {
@@ -25,7 +26,7 @@ export function makeManagedSessionScanner(deps: {
   }
   async function tick() {
     try {
-      await runOnce();
+      await runOnce(true);
     } catch {
       log.warn("MCP managed session scan unavailable");
     }
@@ -35,7 +36,7 @@ export function makeManagedSessionScanner(deps: {
       }, 1000);
   }
   return {
-    runOnce,
+    runOnce: () => runOnce(),
     async start() {
       if (!stopped) return;
       stopped = false;
