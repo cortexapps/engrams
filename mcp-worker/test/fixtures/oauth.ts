@@ -17,6 +17,12 @@ interface RefreshGrant {
 export function createOAuthFixture(
   origin: () => string,
   callbackIssuer?: string,
+  advertised?: {
+    issuer: string;
+    authorization: string;
+    token: string;
+    redirectUri: string;
+  },
 ) {
   const codes = new Map<string, CodeGrant>();
   const states = new Set<string>();
@@ -25,6 +31,14 @@ export function createOAuthFixture(
   let tokenSequence = 0;
   let accessToken: string | undefined;
   const resource = () => `${origin()}/mcp`;
+  const issuer = () => advertised?.issuer ?? origin();
+  const redirectUri = () => advertised?.redirectUri ?? `${origin()}/callback`;
+  let account = "account-one";
+  let scopeOverride: string | undefined;
+  let authorizations = 0;
+  let exchanges = 0;
+  let rotations = 0;
+  let rejections = 0;
   const respond = (res: ServerResponse, value: unknown, status = 200) => {
     res.writeHead(status, {
       "content-type": "application/json",
@@ -32,9 +46,32 @@ export function createOAuthFixture(
     });
     res.end(JSON.stringify(value));
   };
-  const fail = (res: ServerResponse, error = "invalid_request") =>
+  const fail = (res: ServerResponse, error = "invalid_request") => {
+    ++rejections;
     respond(res, { error }, 400);
+  };
   return {
+    observe() {
+      return {
+        account,
+        scope: scopeOverride ?? null,
+        authorizations,
+        exchanges,
+        rotations,
+        rejections,
+      };
+    },
+    configure(value: {
+      account?: string;
+      scope?: string;
+      issuer?: "configured" | "mismatch";
+    }) {
+      if (value.account !== undefined) account = value.account;
+      if (value.scope !== undefined) scopeOverride = value.scope;
+      if (value.issuer !== undefined)
+        callbackIssuer =
+          value.issuer === "mismatch" ? "https://other.example" : undefined;
+    },
     accepts(authorization: string | undefined) {
       return (
         accessToken !== undefined && authorization === `Bearer ${accessToken}`
@@ -52,7 +89,7 @@ export function createOAuthFixture(
       ) {
         respond(res, {
           resource: resource(),
-          authorization_servers: [origin()],
+          authorization_servers: [issuer()],
           scopes_supported: ["tools:read", "tools:write"],
           bearer_methods_supported: ["header"],
         });
@@ -60,9 +97,9 @@ export function createOAuthFixture(
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
         respond(res, {
-          issuer: origin(),
-          authorization_endpoint: `${origin()}/authorize`,
-          token_endpoint: `${origin()}/token`,
+          issuer: issuer(),
+          authorization_endpoint: `${advertised?.authorization ?? origin()}/authorize`,
+          token_endpoint: `${advertised?.token ?? origin()}/token`,
           response_types_supported: ["code"],
           grant_types_supported: ["authorization_code", "refresh_token"],
           token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
@@ -82,7 +119,7 @@ export function createOAuthFixture(
           req.method !== "GET" ||
           p.get("response_type") !== "code" ||
           !["fixture-public", "fixture-confidential"].includes(client ?? "") ||
-          p.get("redirect_uri") !== `${origin()}/callback` ||
+          p.get("redirect_uri") !== redirectUri() ||
           p.get("resource") !== resource() ||
           p.get("code_challenge_method") !== "S256" ||
           !challenge ||
@@ -94,20 +131,25 @@ export function createOAuthFixture(
           fail(res);
           return true;
         }
+        if (codes.size >= 128 || states.size >= 1024) {
+          fail(res);
+          return true;
+        }
+        ++authorizations;
         const code = `fixture-code-${++codeSequence}`;
         states.add(state);
         codes.set(code, {
           client: client!,
           challenge,
-          redirect: `${origin()}/callback`,
+          redirect: redirectUri(),
           resource: resource(),
           scope,
         });
-        const callback = new URL(`${origin()}/callback`);
+        const callback = new URL(redirectUri());
         callback.search = new URLSearchParams({
           code,
           state,
-          iss: callbackIssuer ?? origin(),
+          iss: callbackIssuer ?? issuer(),
         }).toString();
         res.writeHead(302, {
           location: callback.href,
@@ -150,6 +192,7 @@ export function createOAuthFixture(
           return true;
         }
         codes.delete(code);
+        ++exchanges;
         scope = grant.scope;
       } else if (p.get("grant_type") === "refresh_token") {
         const refresh = p.get("refresh_token") ?? "";
@@ -163,11 +206,17 @@ export function createOAuthFixture(
           return true;
         }
         refreshes.delete(refresh);
+        ++rotations;
         scope = p.get("scope") ?? grant.scope;
       } else {
         fail(res, "unsupported_grant_type");
         return true;
       }
+      if (refreshes.size >= 128) {
+        fail(res);
+        return true;
+      }
+      scope = scopeOverride ?? scope;
       ++tokenSequence;
       accessToken = `fixture-access-${tokenSequence}`;
       const refreshToken = `fixture-refresh-${tokenSequence}`;
@@ -178,6 +227,7 @@ export function createOAuthFixture(
         token_type: "Bearer",
         expires_in: 3600,
         scope,
+        ...(advertised ? { fixture_account: account } : {}),
       });
       return true;
     },
