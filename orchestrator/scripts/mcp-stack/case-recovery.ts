@@ -65,7 +65,7 @@ export const heldWriteRestartDriver: CaseDriver = async ({
     protocol: "modern",
     upstreamName: "write_counter",
     mode: "write",
-    caller: "unattended",
+    caller: "automation",
     automationWrite: true,
     arguments: { delta: 1 },
     constraints: [],

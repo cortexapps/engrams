@@ -53,7 +53,9 @@ API key, environment file, image, or primary-checkout path is used.
   configured identity and expected generation, then reads actual publication.
 - `identities.admin`, `owner`, `other`: distinct neutral email, password file,
   new cookie output file. `unattendedKeyFile` is a new output for a real public
-  service key. `routerSentinelFile` is a neutral input; each protocol fixture has its own resource key.
+  role=user service key. `automationKeyFile` is a separate new private output
+  for the role=admin service key that triggers actual manual automations. It
+  cannot replace the user key in denial cases. `routerSentinelFile` is a neutral input; each protocol fixture has its own resource key.
 - `supervisor`: private Unix socket plus separate token file.
 - `observer`: separate private coordinator and orchestrator DSN files. Each
   points to a fixture DNS host and database `mcp_<runId with hyphens changed to
@@ -70,7 +72,12 @@ Before any admin mutation, the final runner must check context artifacts,
 supervisor identities/network enforcement, fixture readiness and full source
 prerequisites. Signup/login requires the normal isolated password auth mode.
 The real public WhoAmI response must establish three distinct human principals
-and a distinct unattended service principal. The normal OrgSecret PutSecret and
+and distinct user/admin service principals. For unattended runtime cases, the
+normal public AutomationService creates a manual definition with one
+create_session block and an empty initial prompt. The admin service key triggers
+RunNow; GetRun supplies actual task/session IDs. Human admin definition author,
+service trigger principal and runtime automation actor are recorded separately.
+The runner checks Started and guest readiness before the first marked prompt. The normal OrgSecret PutSecret and
 migrated router model path provides neutral model auth. No provider refresh is
 called by this runner. The launcher must deny provider routing and external DNS
 for O, coordinator and worker before boot and across restart.

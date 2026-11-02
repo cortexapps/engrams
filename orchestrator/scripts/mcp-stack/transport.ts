@@ -5,6 +5,10 @@ import {
   createConnectTransport,
   createGrpcTransport,
 } from "@connectrpc/connect-node";
+import {
+  AutomationService,
+  AutomationRunService,
+} from "../../src/gen/engram/app/v1/automation_pb.ts";
 import { ApiKeyService } from "../../src/gen/engram/app/v1/api_key_pb.ts";
 import { IntegrationService } from "../../src/gen/engram/app/v1/integration_pb.ts";
 import { ProfileService } from "../../src/gen/engram/app/v1/profile_pb.ts";
@@ -79,6 +83,8 @@ export async function publicClient(ctx: Context, credential: Credential) {
   });
   return {
     identity: createClient(ApiKeyService, transport),
+    automations: createClient(AutomationService, transport),
+    automationRuns: createClient(AutomationRunService, transport),
     integration: createClient(IntegrationService, transport),
     profiles: createClient(ProfileService, transport),
     tasks: createClient(TaskService, transport),

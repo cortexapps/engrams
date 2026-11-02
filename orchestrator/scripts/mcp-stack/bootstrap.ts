@@ -107,6 +107,32 @@ export async function bootstrapHumans(ctx: Context) {
       !identities.includes(identity.userId),
     "unattended_principal",
   );
+  const automationKey = await clients.admin.identity.createApiKey({
+    name: "Fixture automation trigger",
+    role: "admin",
+  });
+  requireThat(
+    automationKey.key.startsWith("engk_") &&
+      automationKey.meta?.role === "admin",
+    "automation_api_key_creation",
+  );
+  await writeFile(ctx.identities.automationKeyFile, automationKey.key, {
+    mode: 0o600,
+    flag: "wx",
+  });
+  const automation = await publicClient(ctx, {
+    kind: "api-key",
+    value: automationKey.key,
+  });
+  const automationIdentity = await automation.identity.whoAmI({});
+  requireThat(
+    automationIdentity.serviceAccount &&
+      automationIdentity.role === "admin" &&
+      automationIdentity.userId &&
+      !identities.includes(automationIdentity.userId) &&
+      automationIdentity.userId !== identity.userId,
+    "separate_automation_trigger_principal",
+  );
   const sentinel = (
     await privateFile(ctx.runRoot, ctx.identities.routerSentinelFile)
   )
@@ -120,7 +146,7 @@ export async function bootstrapHumans(ctx: Context) {
     name: "openrouter.api_key",
     value: sentinel,
   });
-  for (const client of [clients.owner, clients.other, unattended]) {
+  for (const client of [clients.owner, clients.other, unattended, automation]) {
     const models = await client.models.listRouterModels({
       routerId: "openrouter",
     });
@@ -135,11 +161,13 @@ export async function bootstrapHumans(ctx: Context) {
     owner: clients.owner,
     other: clients.other,
     unattended,
+    automation,
     actorIds: {
       admin: identities[0]!,
       owner: identities[1]!,
       other: identities[2]!,
       unattended: identity.userId,
+      automation: automationIdentity.userId,
     },
   };
 }

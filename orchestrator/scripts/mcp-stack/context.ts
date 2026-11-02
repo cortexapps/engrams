@@ -122,6 +122,7 @@ export const ContextSchema = z.strictObject({
     owner: human,
     other: human,
     unattendedKeyFile: path,
+    automationKeyFile: path,
     routerSentinelFile: path,
   }),
   supervisor: z.strictObject({
@@ -264,6 +265,7 @@ export async function loadContext(filename: string): Promise<Context> {
   const outputs = [
     ...humanValues.map((v) => v.cookieFile),
     ctx.identities.unattendedKeyFile,
+    ctx.identities.automationKeyFile,
     ctx.evidenceFile,
   ];
   if (new Set(outputs).size !== outputs.length)

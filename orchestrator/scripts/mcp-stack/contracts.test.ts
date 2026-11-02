@@ -127,6 +127,7 @@ function validContext() {
         ]),
       ),
       unattendedKeyFile: "/owned/unattended.key",
+      automationKeyFile: "/owned/automation.key",
       routerSentinelFile: "/owned/router.key",
     },
     supervisor: {
@@ -460,4 +461,14 @@ test("guest JSONL preserves each flushed completion and does not invent partial 
     [],
   );
   expect(() => parseGuestProofRecords(Buffer.from("bad\n"))).toThrow();
+});
+
+test("automation trigger requires its own private output and cannot reuse the user key field", () => {
+  const context = validContext();
+  expect(ContextSchema.parse(context).identities.automationKeyFile).toBe(
+    "/owned/automation.key",
+  );
+  const { automationKeyFile: omitted, ...identities } = context.identities;
+  expect(omitted).toBeDefined();
+  expect(() => ContextSchema.parse({ ...context, identities })).toThrow();
 });

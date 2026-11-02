@@ -211,6 +211,69 @@ export async function guestReady(
   requireThat(response.status === 0, "guest_fixture_directory_ready");
 }
 
+/** Observe live harness/model environments, including inline ENGRAM_TOOLS. This is not a disk scan. */
+export async function probeOAuthCredentialAbsence(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  harness: "claude" | "codex",
+) {
+  const script = `set -eu
+harness_count=0
+model_count=0
+manifest_count=0
+scanned=0
+for path in /proc/[0-9]*/cmdline; do
+  [ -r "$path" ] || continue
+  first=$(tr '\\000' '\\n' < "$path" | head -n 1)
+  kind=other
+  case "$first" in
+    */engram-harness-"$2") kind=harness;;
+    "$1") kind=model;;
+  esac
+  [ "$kind" != other ] || continue
+  scanned=$((scanned+1))
+  [ "$scanned" -le 256 ] || exit 12
+  env_path=\${path%cmdline}environ
+  [ -r "$env_path" ] || exit 13
+  values=$(head -c 1048577 "$env_path" | tr '\\000' '\\n')
+  bytes=$(printf '%s' "$values" | wc -c)
+  [ "$bytes" -le 1048576 ] || exit 14
+  if printf '%s' "$values" | grep -Eq 'fixture-(access|refresh)-[0-9]+'; then exit 15; fi
+  if [ "$kind" = harness ]; then
+    harness_count=$((harness_count+1))
+    if printf '%s' "$values" | grep -q '^ENGRAM_TOOLS=.'; then manifest_count=$((manifest_count+1)); fi
+  else
+    model_count=$((model_count+1))
+  fi
+done
+[ "$harness_count" -ge 1 ] && [ "$model_count" -ge 1 ] && [ "$manifest_count" -eq "$harness_count" ] || exit 16
+printf '{"harnesses":%s,"models":%s,"manifests":%s,"credentialFound":false}\\n' "$harness_count" "$model_count" "$manifest_count"
+`;
+  const result = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    script,
+    "fixture-env-probe",
+    ctx.guest.cliPath,
+    harness,
+  ]);
+  requireThat(result.status === 0, "live_oauth_environment_clean");
+  const parsed = z
+    .strictObject({
+      harnesses: z.number().int().min(1).max(256),
+      models: z.number().int().min(1).max(256),
+      manifests: z.number().int().min(1).max(256),
+      credentialFound: z.literal(false),
+    })
+    .safeParse(JSON.parse(result.stdout.toString("utf8")));
+  requireThat(
+    parsed.success && parsed.data.manifests === parsed.data.harnesses,
+    "live_oauth_environment_observation",
+  );
+  return { ...parsed.data, sha256: sha256(result.stdout) };
+}
+
 export async function proofPaths(
   ctx: Context,
   client: PublicClient,

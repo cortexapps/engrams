@@ -25,6 +25,10 @@ import {
 } from "./guest.ts";
 import type { Harness } from "./manifest.ts";
 import { DatabaseObserver, FixtureObserver } from "./observer.ts";
+import {
+  createAutomationTask,
+  type CreatedScenarioTask,
+} from "./automation.ts";
 import type { CallPlan } from "./call-plan.ts";
 import type { PublicClient } from "./transport.ts";
 
@@ -40,7 +44,7 @@ export async function startScenario(
     protocol: FixtureKind;
     upstreamName: "read_counter" | "write_counter";
     mode: "read" | "write" | "denied" | "refire" | "held-call" | "forged";
-    caller: "owner" | "unattended";
+    caller: "owner" | "unattended" | "automation";
     automationWrite: boolean;
     arguments: Record<string, unknown>;
     constraints: object[];
@@ -72,13 +76,22 @@ export async function startScenario(
     defaultAllow: input.defaultAllow ?? false,
   });
   const client = principals[input.caller];
-  const reviewClient =
-    input.caller === "unattended" ? principals.admin : client;
-  const task = await createHumanTask(
+  const reviewClient = input.caller !== "owner" ? principals.admin : client;
+  const task: CreatedScenarioTask =
+    input.caller === "automation"
+      ? await createAutomationTask(
+          ctx,
+          principals,
+          profile.profileId,
+          input.suffix,
+        )
+      : await createHumanTask(ctx, client, profile.profileId, input.harness);
+  await waitFor(
     ctx,
-    client,
-    profile.profileId,
-    input.harness,
+    "scenario_public_active",
+    () => client.sessions.getSession({ sessionId: task.sessionId }),
+    (value) =>
+      value.session?.status === "active" && value.session.hostId === ctx.hostId,
   );
   database.own(task.taskId, task.sessionId);
   const coordinator = await waitFor(
@@ -94,6 +107,12 @@ export async function startScenario(
       coordinator.source_key.context.target.host_id === ctx.hostId,
     "started_target_publication",
   );
+  if (task.automation)
+    requireThat(
+      coordinator.source_key.creation.policy.actorId ===
+        task.automation.runtimeActorId,
+      "actual_automation_runtime_actor",
+    );
   await waitFor(
     ctx,
     "orchestrator_started",
@@ -440,6 +459,29 @@ export async function closeScenario(
   principals: Principals,
   scenario: StartedScenario,
 ) {
+  if (scenario.automation) {
+    const run = await principals.automation.automationRuns.getRun({
+      runId: scenario.automation.runId,
+    });
+    if (
+      run.run?.brief &&
+      ![
+        "completed",
+        "failed",
+        "filtered",
+        "superseded",
+        "halted",
+        "deadline",
+      ].includes(run.run.brief.status)
+    )
+      await principals.automation.automationRuns.stopRun({
+        runId: scenario.automation.runId,
+        reason: "Fixture cleanup",
+      });
+    await principals.admin.automations.archiveAutomation({
+      id: scenario.automation.id,
+    });
+  }
   await principals.admin.tasks.deleteTask({ taskId: scenario.taskId });
   await principals.admin.profiles.deleteProfile({ id: scenario.profileId });
   // Archived profiles retain grants. Keep the connection and journal for run-owned teardown.
