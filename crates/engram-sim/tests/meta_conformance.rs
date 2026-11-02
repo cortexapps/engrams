@@ -11294,6 +11294,13 @@ fn bridge_intent(
         intent_id: uuid::Uuid::new_v4().to_string(),
         revision: 1,
         selection: ManagedBootSelection {
+            launch: ManagedHarnessLaunch {
+                descriptor: engram_core::types::harness::HarnessDescriptor {
+                    name: "claude".into(),
+                    ..Default::default()
+                },
+                workdir: None,
+            },
             image: ws.spec.image.clone(),
             image_digest: digest(b"approved image"),
             base_manifest: base,
@@ -11395,6 +11402,27 @@ async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
         .await
         .is_err());
     let host = HostId::new();
+    let full = HostId::new();
+    for (id, capacity) in [(full, 64), (host, 1024)] {
+        ctx.meta
+            .upsert_host(host_record(id, "bridge-candidate", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+        let mut heartbeat = heartbeat_fixture();
+        heartbeat.utilization.allocatable_mib = capacity;
+        ctx.meta.touch_host_heartbeat(id, heartbeat).await.unwrap();
+    }
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &a.intent_id,
+                a.revision,
+                ManagedIntentAdvance::SelectHost(full)
+            )
+            .await
+            .is_err(),
+        "full candidate must not become pinned"
+    );
     let (x, y) = tokio::join!(
         ctx.meta.advance_managed_boot_intent(
             &a.intent_id,
@@ -11439,10 +11467,55 @@ async fn managed_bridge_intent_cas_pins_and_gate(ctx: &Ctx) {
         .advance_managed_boot_intent(
             &next.intent_id,
             next.revision,
-            ManagedIntentAdvance::Assets(Box::new(receipt)),
+            ManagedIntentAdvance::Assets(Box::new(receipt.clone())),
         )
         .await
         .unwrap();
+    ctx.meta
+        .set_host_cordon(
+            host,
+            Some(engram_core::types::host::CordonOwner::Admin),
+            Some("fixture"),
+        )
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(full, heartbeat)
+        .await
+        .unwrap();
+    let stale = next.clone();
+    next = ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::SelectHost(full),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.sandbox_id, a.sandbox_id);
+    assert_eq!(next.disk_manifest, a.disk_manifest);
+    assert!(next.assets.is_none());
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            stale.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt.clone()))
+        )
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .advance_managed_boot_intent(
+            &next.intent_id,
+            next.revision,
+            ManagedIntentAdvance::Assets(Box::new(receipt))
+        )
+        .await
+        .is_err());
     // Actual publication stage closes the shared gate before any further intent CAS.
     let p = ctx.meta.read_operator_publication().await.unwrap();
     let g = p.published.unwrap();
@@ -11667,6 +11740,26 @@ async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
     wrong.cold.disk.sha256 = "e".repeat(64);
     assert!(ctx.meta.claim_managed_boot(wrong).await.is_err());
     let row = ctx.meta.claim_managed_boot(request.clone()).await.unwrap();
+    let alternative = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(
+            alternative,
+            "alternative-host",
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .advance_managed_boot_intent(
+                &i.intent_id,
+                i.revision,
+                ManagedIntentAdvance::SelectHost(alternative)
+            )
+            .await
+            .is_err(),
+        "claim fences relocation before completion"
+    );
     // Commit succeeded but the caller lost its reply: exact retry returns the same owner.
     assert_eq!(
         serde_json::to_value(ctx.meta.claim_managed_boot(request.clone()).await.unwrap()).unwrap(),
@@ -11732,6 +11825,18 @@ async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
         assets: None,
         completed: false,
     };
+    let mut substituted = recovery.clone();
+    substituted
+        .selection
+        .launch
+        .descriptor
+        .args
+        .push("changed-argument".into());
+    assert!(ctx
+        .meta
+        .begin_managed_boot_intent(substituted)
+        .await
+        .is_err());
     recovery = ctx.meta.begin_managed_boot_intent(recovery).await.unwrap();
     assert_eq!(
         ctx.meta

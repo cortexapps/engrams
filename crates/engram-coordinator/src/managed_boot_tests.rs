@@ -29,6 +29,9 @@ struct LossyHost {
 }
 #[async_trait]
 impl HostClient for LossyHost {
+    fn harness_dial(&self) -> engram_core::traits::HarnessDial {
+        engram_core::traits::HarnessDial::Vsock
+    }
     async fn capture_managed_boot(
         &self,
         request: ManagedCaptureRequest,
@@ -1231,7 +1234,14 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
         ManagedColdSource::FreshImage { base_manifest } => base_manifest,
         _ => unreachable!(),
     };
-    let selection = ManagedBootSelection {
+    let mut selection = ManagedBootSelection {
+        launch: ManagedHarnessLaunch {
+            descriptor: crate::builtin_harness::builtin("claude")
+                .unwrap()
+                .descriptor()
+                .unwrap(),
+            workdir: Some("/work".into()),
+        },
         image: row.request.cold.image.clone(),
         image_digest: digest(b"approved image"),
         base_manifest: base,
@@ -1309,6 +1319,63 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
     )
     .await
     .unwrap();
+    let free_host = HostId::from(uuid::Uuid::from_u128(705));
+    let mut second = meta.get_host(host_id).await.unwrap().unwrap();
+    second.id = free_host;
+    meta.upsert_host(second.clone()).await.unwrap();
+    for (id, capacity) in [(host_id, 64), (free_host, 1024)] {
+        meta.touch_host_heartbeat(
+            id,
+            HostHeartbeat {
+                status: HostStatus::Ready,
+                capacity: second.capacity.clone(),
+                utilization: HostUtilization {
+                    allocatable_mib: capacity,
+                    ..Default::default()
+                },
+                ready_images: vec![selection.image_digest.clone()],
+                current_bundles: vec![],
+                sandbox_bundles: vec![],
+                total_vcpus: 4,
+                wire_version: engram_protocol::WIRE_VERSION,
+                stages_images: true,
+                capabilities: second.capabilities.clone(),
+                lease_renew_until: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // Resolve launch A through the real trusted catalog path, then retain it with the drive.
+    meta.with_db_mut(|db| {
+        db.hosts.get_mut(&host_id).unwrap().current_bundles = vec![AuxBundleRef {
+            drive_id: "harness-claude".into(),
+            sha256: "a".repeat(64),
+        }]
+    });
+    let resolved = crate::api::sessions::resolve_harness(
+        &state,
+        Some("claude"),
+        Default::default(),
+        sid,
+        [("ORIGINAL_SECRET".into(), "original-value".into())].into(),
+        Some("/work".into()),
+        Some("plan"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resolved.mount, selection.aux_ro_drives[0]);
+    let original_argv = resolved.agent.argv.clone();
+    selection.launch = resolved.launch;
+    let sealed =
+        crate::api::sessions::seal_session_secrets(&state, sid, &resolved.agent.session_env)
+            .await
+            .unwrap();
+    meta.with_db_mut(|db| {
+        db.managed_boot_selections.insert(sid, selection.clone());
+        db.session_secrets.insert(sid, sealed.clone());
+    });
     let manifest = engram_chunk_store::Manifest {
         schema_version: 1,
         kind: engram_chunk_store::ManifestKind::Disk,
@@ -1368,12 +1435,43 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
         .op_pending_exists(sid, engram_core::types::session_op::OpKind::Deliver)
         .await
         .unwrap());
-    for step in 0..3 {
+    for step in 0..5 {
         let current = meta
             .read_managed_boot_intent(&q, "initial")
             .await
             .unwrap()
             .unwrap();
+        if step == 1 {
+            assert_eq!(
+                current.host_id,
+                Some(free_host),
+                "skip full first candidate"
+            );
+        }
+        if step == 2 {
+            assert_eq!(current.host_id, Some(free_host));
+            assert!(current.assets.is_some());
+            meta.set_host_cordon(
+                free_host,
+                Some(CordonOwner::Admin),
+                Some("fixture host loss"),
+            )
+            .await
+            .unwrap();
+            meta.with_db_mut(|db| {
+                db.hosts
+                    .get_mut(&host_id)
+                    .unwrap()
+                    .utilization
+                    .allocatable_mib = 1024
+            });
+        }
+        if step == 3 {
+            assert_eq!(current.host_id, Some(host_id));
+            assert!(current.assets.is_none(), "old host assets are fenced");
+            assert_eq!(current.disk_manifest, initial.disk_manifest);
+            assert_eq!(current.sandbox_id, initial.sandbox_id);
+        }
         crate::managed_bridge::drive(&state, current)
             .await
             .unwrap_or_else(|e| panic!("initial phase {step}: {e:?}"));
@@ -1425,6 +1523,45 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
         .acked_at
         .is_none());
     assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+    meta.with_db_mut(|db| {
+        db.hosts.get_mut(&host_id).unwrap().current_bundles[0].sha256 = "f".repeat(64)
+    });
+    state.boot_bundles.invalidate_fleet_catalog();
+    let (_, _, current_mount) = crate::api::sessions::resolve_harness_mount(&state, "claude")
+        .await
+        .unwrap();
+    assert_ne!(
+        current_mount, selection.aux_ro_drives[0],
+        "current catalog is B"
+    );
+    let finalized = finalize_bridge_fixture(&state, &host, &prepared).await;
+    let opened = open_finalize(&state, &finalized).await.unwrap();
+    assert_eq!(opened.agent.argv, original_argv);
+    assert_eq!(opened.finalization.combined_manifest_digest, digest(b"[]"));
+    assert_eq!(
+        opened.finalization.prepared.request.cold.aux_ro_drives,
+        selection.aux_ro_drives
+    );
+    assert_eq!(
+        opened.agent.session_env.get("ORIGINAL_SECRET").unwrap(),
+        "original-value"
+    );
+    assert_eq!(
+        opened
+            .agent
+            .env
+            .get(engram_harness_proto::HARNESS_CWD_ENV)
+            .unwrap(),
+        "/work"
+    );
+    assert_eq!(
+        meta.get_session_secrets(sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .ciphertext,
+        sealed.ciphertext
+    );
     let input = ManagedRecoveryInput {
         query: q.clone(),
         expected_source_key: claimed.request.key.clone(),
@@ -1466,6 +1603,32 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
     let reconciled = crate::managed_bridge::recover(&state, input).await.unwrap();
     assert!(reconciled.operation.unwrap().completed);
     assert_eq!(reconciled.boot.unwrap().request.key, next.request.key);
+    assert!(
+        drive(&state, &next.request.key).await.is_err(),
+        "lost recovery prepare reply"
+    );
+    drive(&state, &next.request.key).await.unwrap();
+    let recovered = meta.read_managed_boot(&next.request.key).await.unwrap();
+    let final_recovery = finalize_bridge_fixture(&state, &host, &recovered).await;
+    let opened = open_finalize(&state, &final_recovery).await.unwrap();
+    assert_eq!(opened.agent.argv, original_argv);
+    assert_eq!(
+        opened.agent.session_env.get("ORIGINAL_SECRET").unwrap(),
+        "original-value"
+    );
+    assert_eq!(
+        opened.finalization.prepared.request.cold.aux_ro_drives,
+        selection.aux_ro_drives
+    );
+    assert_eq!(
+        meta.get_session_secrets(sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .ciphertext,
+        sealed.ciphertext
+    );
+
     assert!(meta
         .outbox_get("held-prompt")
         .await
@@ -1473,6 +1636,42 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
         .unwrap()
         .acked_at
         .is_none());
+}
+
+async fn finalize_bridge_fixture(
+    state: &SharedState,
+    host: &LossyHost,
+    prepared: &ManagedBootRecord,
+) -> ManagedBootRecord {
+    let receipt = prepared.prepared.clone().unwrap();
+    let mut context = prepared.request.key.context.clone();
+    context.binding_hash = Some(digest(b"binding"));
+    let applied = ManagedAppliedState::new(
+        context.clone(),
+        receipt.request.bootstrap_policy.clone(),
+        receipt.host_incarnation.clone(),
+        "proxy".into(),
+        Some(ManagedNetworkProof {
+            target: context.target,
+            guest_ip: receipt.guest_ip,
+            network_identity: receipt.network_identity.clone(),
+        }),
+    )
+    .unwrap();
+    *host.policy.lock().unwrap() = Some(applied.clone());
+    finalize(
+        state,
+        ManagedBootFinalizeInput {
+            key: prepared.request.key.clone(),
+            prepared_receipt_id: receipt.receipt_id,
+            policy: applied,
+            native_version: 1,
+            combined_manifest: b"[]".to_vec(),
+            combined_manifest_digest: digest(b"[]"),
+        },
+    )
+    .await
+    .expect("original A must finalize after catalog changes to B")
 }
 
 struct LostManifestReply {

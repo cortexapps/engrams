@@ -1156,6 +1156,7 @@ impl MetadataStore for SimMetadataStore {
                 || old.prepared.is_none()
                 || i.selection.image != old.request.cold.image
                 || i.selection.aux_ro_drives != old.request.cold.aux_ro_drives
+                || i.selection.launch != original.launch
                 || i.selection.image_digest != original.image_digest
                 || i.selection.base_manifest != original.base_manifest
                 || i.selection.vcpus != old.request.spec()?.cpu.vcpus
@@ -1208,6 +1209,28 @@ impl MetadataStore for SimMetadataStore {
                 .get(&old.query.identity.session_id)
                 .ok_or_else(conflict)?;
             old.validate_claim(&b.request)?;
+        }
+        if !matches!(c, ManagedIntentAdvance::Complete)
+            && db
+                .managed_boots
+                .get(&old.query.identity.session_id)
+                .map(|b| &b.request.key)
+                != old.recovery.as_ref().map(|r| &r.source)
+        {
+            return Err(conflict());
+        }
+        if let ManagedIntentAdvance::SelectHost(host) = &c {
+            if Self::pick_host_2d(
+                &db,
+                &[*host],
+                0,
+                i64::from(old.selection.memory_mib),
+                i64::from(old.selection.vcpus),
+                1,
+            ) != Some(*host)
+            {
+                return Err(conflict());
+            }
         }
         let next = old.advance(c)?;
         db.managed_boot_intents.insert(id.into(), next.clone());

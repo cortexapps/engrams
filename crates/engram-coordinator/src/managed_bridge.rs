@@ -156,7 +156,7 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
     } else {
         None
     };
-    if i.host_id.is_none() {
+    {
         let (repo, tag) = engram_core::types::session::split_image_ref(&i.selection.image);
         let bundles: Vec<_> = i
             .selection
@@ -189,20 +189,49 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
         )
         .await
         .map_err(engram_core::SandboxError::from)?;
-        for host in candidates.hosts {
+        let fits = meta
+            .placement_no_fit_details(
+                &candidates.hosts,
+                i64::from(i.selection.memory_mib),
+                i32::try_from(i.selection.vcpus).map_err(|_| conflict())?,
+                1,
+            )
+            .await?;
+        let mut hosts = candidates.hosts;
+        // Keep a usable selection stable; only read-only asset inspection precedes claim.
+        hosts.sort_by_key(|h| Some(*h) != i.host_id);
+        let mut selected = false;
+        for host in hosts {
+            if !fits
+                .iter()
+                .any(|f| f.host_id == host && matches!(f.reason, "fits_now" | "unmeasured"))
+            {
+                continue;
+            }
             let h = meta.get_host(host).await?.ok_or_else(conflict)?;
             if !matches!(h.capabilities.backend.as_str(), "firecracker" | "vz") {
                 continue;
             }
-            meta.advance_managed_boot_intent(
-                &i.intent_id,
-                i.revision,
-                ManagedIntentAdvance::SelectHost(host),
-            )
-            .await?;
-            return Ok(());
+            if i.host_id == Some(host) {
+                selected = true;
+                break;
+            }
+            match meta
+                .advance_managed_boot_intent(
+                    &i.intent_id,
+                    i.revision,
+                    ManagedIntentAdvance::SelectHost(host),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(engram_core::MetaError::Conflict(_)) => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        return Ok(()); // Durable pending capacity; scanner retries the same intent.
+        if !selected {
+            return Ok(()); // Retry the same immutable intent when capacity returns.
+        }
     }
     if capture.is_none() {
         fork(state, &i).await?;

@@ -34,9 +34,17 @@ impl ManagedCreationQuery {
         Ok(())
     }
 }
+/// Trusted nonsecret launch metadata resolved together with dyn_0 at reservation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedHarnessLaunch {
+    pub descriptor: super::harness::HarnessDescriptor,
+    pub workdir: Option<String>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedBootSelection {
+    pub launch: ManagedHarnessLaunch,
     pub image: String,
     pub image_digest: String,
     pub base_manifest: ManifestRef,
@@ -47,7 +55,8 @@ pub struct ManagedBootSelection {
 }
 impl ManagedBootSelection {
     pub fn validate(&self) -> Result<(), MetaError> {
-        if self.vcpus == 0
+        if !matches!(self.launch.descriptor.name.as_str(), "claude" | "codex")
+            || self.vcpus == 0
             || self.memory_mib == 0
             || self.disk_gib == 0
             || self.image.is_empty()
@@ -192,9 +201,10 @@ impl ManagedBootIntent {
         let mut next = self.clone();
         match change {
             ManagedIntentAdvance::SelectHost(h)
-                if self.host_id.is_none() && !h.as_uuid().is_nil() =>
+                if self.host_id != Some(h) && !h.as_uuid().is_nil() =>
             {
-                next.host_id = Some(h)
+                next.host_id = Some(h);
+                next.assets = None;
             }
             ManagedIntentAdvance::Assets(a) if self.assets.is_none() => {
                 a.validate_for(&self.assets_request()?)?;

@@ -167,6 +167,7 @@ impl PostgresStore {
                 || old.prepared.is_none()
                 || i.selection.image != old.request.cold.image
                 || i.selection.aux_ro_drives != old.request.cold.aux_ro_drives
+                || i.selection.launch != original.launch
                 || i.selection.image_digest != original.image_digest
                 || i.selection.base_manifest != original.base_manifest
                 || i.selection.vcpus != old.request.spec()?.cpu.vcpus
@@ -229,6 +230,33 @@ impl PostgresStore {
                     .ok_or_else(conflict)?;
             let b: ManagedBootRecord = decode(v)?;
             old.validate_claim(&b.request)?;
+        }
+        if !matches!(c, ManagedIntentAdvance::Complete) {
+            let v: Option<serde_json::Value> =
+                sqlx::query_scalar("SELECT record FROM session_managed_boots WHERE session_id=$1")
+                    .bind(sid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            let boot: Option<ManagedBootRecord> = v.map(decode).transpose()?;
+            if boot.as_ref().map(|b| &b.request.key) != old.recovery.as_ref().map(|r| &r.source) {
+                return Err(conflict());
+            }
+        }
+        if let ManagedIntentAdvance::SelectHost(host) = &c {
+            if crate::pick_host_2d(
+                &mut tx,
+                &[host.as_uuid()],
+                0,
+                i64::from(old.selection.memory_mib),
+                i64::from(old.selection.vcpus),
+                1,
+            )
+            .await?
+                != Some(host.as_uuid())
+            {
+                return Err(conflict());
+            }
         }
         let next = old.advance(c)?;
         sqlx::query("UPDATE session_managed_boot_intents SET revision=$2,completed=$3,record=$4,updated_at=$5 WHERE intent_id=$1").bind(id).bind(next.revision as i64).bind(next.completed).bind(serde_json::to_value(&next).map_err(|_|conflict())?).bind(self.clock.now_utc()).execute(&mut *tx).await.map_err(db_err)?;

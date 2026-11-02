@@ -758,7 +758,19 @@ async fn boot_prepared(
     // Issue #535 (b): the KEK seal is async crypto with no place inside a DB
     // transaction — do it here, once, and hand the SEALED row (not the
     // plaintext) to `reserve_and_persist_create`.
-    let sealed_secrets = match inputs.deferred_session_secrets.as_ref() {
+    // Managed retries use the complete original environment, never current image secrets.
+    let creation_secrets = if managed_creation.is_some() {
+        Some(
+            &inputs
+                .agent
+                .as_ref()
+                .ok_or_else(|| ApiError::Unavailable("managed harness unavailable".into()))?
+                .session_env,
+        )
+    } else {
+        inputs.deferred_session_secrets.as_ref()
+    };
+    let sealed_secrets = match creation_secrets {
         Some(overrides) => Some(seal_session_secrets(state, session_id, overrides).await?),
         None => None,
     };
@@ -1477,8 +1489,8 @@ async fn prepare_inner(
 
     // App committer identity (deployment config): stamped after every other
     // layer with `or_insert`, so anything explicit above wins. Resume takes
-    // the same stamp via `resolve_session_env` — deliberately NOT sealed
-    // into `session_secrets` (config is durable and hot-swappable).
+    // the same stamp via `resolve_session_env` for ordinary sessions. Managed
+    // reservations seal the complete original environment in `boot_prepared`.
     stamp_committer_env(&state.cfg, &mut session_env);
 
     let deferred_session_secrets: Option<HashMap<String, String>> = if deferred_map.is_empty() {
@@ -1501,7 +1513,7 @@ async fn prepare_inner(
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
-    let (agent, harness_mount, harness_egress) = match resolve_harness(
+    let (agent, harness_mount, harness_egress, managed_launch) = match resolve_harness(
         state,
         selected_harness.as_deref(),
         mode,
@@ -1512,11 +1524,10 @@ async fn prepare_inner(
     )
     .await?
     {
-        // The CREATE flavor consumes all three fields BY NAME (ADR 0116
-        // B2): the agent spec, the dyn_0 mount for the slot plan, and
-        // the egress to merge into the policy it persists.
-        Some(h) => (Some(h.agent), Some(h.mount), h.egress),
-        None => (None, None, Default::default()),
+        // CREATE retains the launch metadata with dyn_0 and merges its egress
+        // into the session policy before reservation.
+        Some(h) => (Some(h.agent), Some(h.mount), h.egress, Some(h.launch)),
+        None => (None, None, Default::default(), None),
     };
 
     // ADR 0063 addendum: fold the selected harness's declared egress
@@ -1561,28 +1572,34 @@ async fn prepare_inner(
     // the reserve-side `ScheduleContext` on `required_image_digest`.
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
-    let managed_selection = bundle.base_snapshot.disk_manifest.map(|base_manifest| {
-        let mut mounts = selected_mounts.clone();
-        mounts.sort_by_key(|d| {
-            (0..engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS)
-                .position(|i| {
-                    d.drive_id == engram_core::types::sandbox::AuxRoDrive::slot_drive_id(i)
-                })
-                .unwrap_or(usize::MAX)
-        });
-        engram_core::types::managed_bridge::ManagedBootSelection {
-            image: image_uri.into(),
-            image_digest: manifest_digest.clone(),
-            base_manifest,
-            aux_ro_drives: mounts,
-            vcpus: cpu_budget_vcpus,
-            memory_mib,
-            disk_gib: config
-                .resources
-                .suggested_disk_gib
-                .unwrap_or(DEFAULT_DISK_GIB),
-        }
-    });
+    let managed_selection =
+        bundle
+            .base_snapshot
+            .disk_manifest
+            .zip(managed_launch)
+            .map(|(base_manifest, launch)| {
+                let mut mounts = selected_mounts.clone();
+                mounts.sort_by_key(|d| {
+                    (0..engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS)
+                        .position(|i| {
+                            d.drive_id == engram_core::types::sandbox::AuxRoDrive::slot_drive_id(i)
+                        })
+                        .unwrap_or(usize::MAX)
+                });
+                engram_core::types::managed_bridge::ManagedBootSelection {
+                    launch,
+                    image: image_uri.into(),
+                    image_digest: manifest_digest.clone(),
+                    base_manifest,
+                    aux_ro_drives: mounts,
+                    vcpus: cpu_budget_vcpus,
+                    memory_mib,
+                    disk_gib: config
+                        .resources
+                        .suggested_disk_gib
+                        .unwrap_or(DEFAULT_DISK_GIB),
+                }
+            });
     Ok(crate::session_boot::PreparedBoot {
         managed_selection,
         nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
@@ -2079,8 +2096,33 @@ pub(crate) async fn resolve_harness(
         ));
     };
 
-    let (descriptor, exec, mount) = resolve_harness_mount(state, name).await?;
-    validate_harness_mode(&descriptor, name, harness_mode)?;
+    let (descriptor, _exec, mount) = resolve_harness_mount(state, name).await?;
+    let launch = engram_core::types::managed_bridge::ManagedHarnessLaunch {
+        descriptor,
+        workdir,
+    };
+    Ok(Some(resolve_pinned_harness(
+        state,
+        launch,
+        mount,
+        session_id,
+        session_env,
+        harness_mode,
+    )?))
+}
+
+pub(crate) fn resolve_pinned_harness(
+    state: &SharedState,
+    launch: engram_core::types::managed_bridge::ManagedHarnessLaunch,
+    mount: engram_core::types::sandbox::AuxRoDrive,
+    session_id: SessionId,
+    session_env: HashMap<String, String>,
+    harness_mode: Option<&str>,
+) -> Result<ResolvedHarness, ApiError> {
+    let descriptor = &launch.descriptor;
+    validate_harness_mode(descriptor, &descriptor.name, harness_mode)?;
+    let exec = format!("{}/{}", mount.guest_mount.display(), descriptor.exec_path());
+    let workdir = launch.workdir.clone();
 
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
@@ -2144,11 +2186,12 @@ pub(crate) async fn resolve_harness(
         session_env,
         host_ca_pem: None,
     };
-    Ok(Some(ResolvedHarness {
+    Ok(ResolvedHarness {
         agent,
         mount,
-        egress: descriptor.egress,
-    }))
+        egress: descriptor.egress.clone(),
+        launch,
+    })
 }
 
 /// ADR 0116 B2: `resolve_harness`'s output, with NAMED fields so each
@@ -2156,6 +2199,7 @@ pub(crate) async fn resolve_harness(
 /// tuple-dropping (`let (agent, _mount, _egress) = …`) is how the
 /// cold-boot harness wedge survived review, and it is retired.
 pub(crate) struct ResolvedHarness {
+    pub launch: engram_core::types::managed_bridge::ManagedHarnessLaunch,
     /// The spec the backend execs (argv points into `dyn_0`).
     pub agent: engram_core::types::sandbox::AgentSpec,
     /// The `dyn_0` catalog mount. Consumed by the CREATE flavor's slot

@@ -630,3 +630,18 @@ receipt and unchanged host/epoch; it cannot acknowledge or replace a newer targe
 Old run interruption and prompt delivery continue through the existing atomic event
 and Started gates. Test fixtures exercise coordinator retry ordering and paired
 metadata semantics; physical backend qualification remains a separate requirement.
+
+Pre-claim placement checks capacity before it saves a candidate. If that host loses
+capacity or eligibility, a revision CAS can select another host and discard the old
+asset receipt. The intent, sandbox, epoch, capture ID, and private manifest stay
+unchanged. The store serializes this transition with claim under the session lock;
+any claimed target prevents relocation, including after a lost claim reply.
+
+The immutable selection also stores the original nonsecret harness descriptor and
+workdir with the ordered bundle hashes. Managed reservation seals the complete
+original session environment in the existing session-secrets row. Finalization and
+explicit recovery use those saved launch inputs, without resolving a newer image,
+harness catalog generation, or creation secret. Live write authorization, operator
+generation, retained denies, and exact applied binding still gate finalization and
+start. Frozen launch metadata grants no permission. Migration 0135 is unchanged;
+selection records without the required launch authority remain closed.
