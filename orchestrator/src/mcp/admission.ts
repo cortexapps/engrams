@@ -1,16 +1,21 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import {
   mcpAdmission as admission,
   mcpAdmissionScope as scope,
   mcpExecution as execution,
+  integrationConnection as connection,
 } from "../db/schema.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import type { JournalTx } from "./journal-review.ts";
 
 export async function lockAdmissionScope(tx: JournalTx, id: string) {
-  await tx.insert(scope).values({ id }).onConflictDoNothing();
-  await tx.select().from(scope).where(eq(scope.id, id)).for("update");
+  // Serialize all zone deployments before their local scope and execution locks.
+  // ponytail: one short global lock; split into ordered session/connection scopes if measured load requires it.
+  for (const key of [...new Set(["mcp:global-admission", id])]) {
+    await tx.insert(scope).values({ id: key }).onConflictDoNothing();
+    await tx.select().from(scope).where(eq(scope.id, key)).for("update");
+  }
 }
 /** Both phases use the same durable capacity and retain their first queue deadline. */
 export function makeMcpAdmission(db = getDb()) {
@@ -26,9 +31,23 @@ export function makeMcpAdmission(db = getDb()) {
         throw new Error("invalid tool deadline");
       return db.transaction(async (tx) => {
         await lockAdmissionScope(tx, deploymentId);
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call is not ready for admission");
+        // The first admission INSERT also locks this parent for its FK check.
+        // Match cancellation: scope -> connection -> execution -> admission.
+        await tx
+          .select()
+          .from(connection)
+          .where(eq(connection.id, identity.connectionId))
+          .for("share");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
         if (
           !call ||
+          call.connectionId !== identity.connectionId ||
+          call.sessionId !== identity.sessionId ||
+          call.requestDigest !== identity.requestDigest ||
+          call.configRevision !== identity.configRevision ||
+          call.authGeneration !== identity.authGeneration ||
           !call.requestContext ||
           call.originalArguments === null ||
           call.deadline <= now ||
@@ -58,22 +77,30 @@ export function makeMcpAdmission(db = getDb()) {
           .from(admission)
           .where(
             and(
-              eq(admission.deploymentId, deploymentId),
+              or(
+                eq(admission.deploymentId, deploymentId),
+                eq(admission.sessionId, call.sessionId),
+                eq(admission.connectionId, call.connectionId),
+              ),
               inArray(admission.state, ["queued", "admitted"]),
             ),
           );
         const active = rows.filter((row) => row.state === "admitted");
         const available =
-          active.length < MCP_LIMITS.deploymentConcurrency &&
+          active.filter((row) => row.deploymentId === deploymentId).length <
+            MCP_LIMITS.deploymentConcurrency &&
           active.filter((row) => row.connectionId === call.connectionId).length <
             MCP_LIMITS.connectionConcurrency &&
           active.filter((row) => row.sessionId === call.sessionId).length <
             MCP_LIMITS.sessionConcurrency &&
-          (phase !== "schema" || active.filter((row) => row.phase === "schema").length < 4);
+          (phase !== "schema" ||
+            active.filter((row) => row.deploymentId === deploymentId && row.phase === "schema")
+              .length < 4);
         if (!available && existing?.state === "queued") return "queued";
         if (
           !available &&
-          rows.filter((row) => row.state === "queued").length >= MCP_LIMITS.queueSize
+          rows.filter((row) => row.deploymentId === deploymentId && row.state === "queued")
+            .length >= MCP_LIMITS.queueSize
         )
           throw new Error("MCP queue is full");
         const state = available ? "admitted" : "queued";
@@ -99,16 +126,14 @@ export function makeMcpAdmission(db = getDb()) {
         } as const;
         if (existing) await tx.update(admission).set(values).where(eq(admission.executionId, id));
         else
-          await tx
-            .insert(admission)
-            .values({
-              ...values,
-              executionId: id,
-              deploymentId,
-              sessionId: call.sessionId,
-              connectionId: call.connectionId,
-              createdAt: now,
-            });
+          await tx.insert(admission).values({
+            ...values,
+            executionId: id,
+            deploymentId,
+            sessionId: call.sessionId,
+            connectionId: call.connectionId,
+            createdAt: now,
+          });
         return state;
       });
     },
