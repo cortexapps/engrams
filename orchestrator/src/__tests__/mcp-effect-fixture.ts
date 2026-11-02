@@ -39,6 +39,7 @@ export async function effectFixture(
     outputSchema?: Record<string, unknown>;
     eligibility?: string;
     published?: boolean;
+    bindingEpoch?: number;
   } = {},
 ) {
   const tls = await workerTls("localhost");
@@ -116,7 +117,7 @@ export async function effectFixture(
     const snapshot = compileSessionBindings({
       launchPolicy: { profileId: f.profileId, integrationGrants: authority.profileGrants },
       liveAuthority: authority,
-      bindingEpoch: 0,
+      bindingEpoch: options.bindingEpoch ?? 0,
     });
     await f.db
       .update(taskSession)
@@ -160,7 +161,10 @@ export async function effectFixture(
       [
         f.sessionId,
         {
-          ref: f.input.requestPolicyContext.acceptedPolicyRef,
+          ref: create(McpWritePolicyRefSchema, {
+            ...f.input.requestPolicyContext.acceptedPolicyRef,
+            bindingEpoch: BigInt(snapshot.bindingEpoch),
+          }),
           ancestorPolicyRefs: f.input.requestPolicyContext.ancestorPolicyRefs,
         },
       ],

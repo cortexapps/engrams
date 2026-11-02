@@ -107,3 +107,13 @@ export async function loadMcpRuntimeConfiguration(path: string): Promise<McpRunt
     registrations: config.registrations,
   };
 }
+
+/** Both global and per-zone admission are opt-in. A file can remain configured on rollback. */
+export function mcpStartupSettings(env: Record<string, string | undefined>) {
+  const enabled = env.MCP_ENABLED === "true";
+  if (env.MCP_ENABLED !== undefined && !["true", "false"].includes(env.MCP_ENABLED))
+    throw Error("MCP_ENABLED must be true or false");
+  const path = env.MCP_RUNTIME_CONFIG?.trim() || undefined;
+  if (enabled && !path) throw Error("MCP runtime configuration required");
+  return { enabled, path };
+}

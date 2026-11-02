@@ -107,11 +107,28 @@ export function makeManagedRebind(deps: {
           snapshot: await deps.readParentCurrent(local.owner.spawningSessionId),
         }
       : undefined;
+    const parentTools = parentAuthority?.snapshot.immutableBindings.flatMap((binding) =>
+      binding.tools.map((tool) => ({
+        connectionId: binding.connectionId,
+        upstreamName: tool.grant.upstreamName,
+      })),
+    );
+    const requestedGrants = parentTools
+      ? live.profileGrants.filter(
+          (grant) =>
+            grant.mcp &&
+            parentTools.some(
+              (tool) =>
+                tool.connectionId === grant.connectionId &&
+                tool.upstreamName === grant.mcp!.upstreamName,
+            ),
+        )
+      : live.profileGrants;
     const next = compileSessionBindings({
       launchPolicy: { profileId: old.profileId, integrationGrants: live.profileGrants },
       liveAuthority: live,
       bindingEpoch: key.context.target.binding_epoch + 1,
-      requestedGrants: live.profileGrants,
+      requestedGrants,
       parentAuthority,
     });
     if (!hasPublishedLeaf(next)) throw new McpPublicationRequired();

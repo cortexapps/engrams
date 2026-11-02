@@ -4,7 +4,7 @@ import { log } from "../log.ts";
 
 /** Durable keyset scan. A failed row cannot starve later reservations. */
 export function makeManagedSessionScanner(deps: {
-  store: ReturnType<typeof makeManagedLifecycleStore>;
+  store: Pick<ReturnType<typeof makeManagedLifecycleStore>, "pending">;
   runtime: Pick<ReturnType<typeof makeManagedSessionRuntime>, "runOnce">;
 }) {
   let after: string | undefined;

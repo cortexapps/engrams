@@ -20,7 +20,6 @@
 import {
   createReservedTaskSession,
   McpSessionCreationMismatchError,
-  type makeBoundSessionCreator,
 } from "../mcp/session-create.ts";
 
 import { resolveIntegrationHost } from "../integrations/run-op.ts";
@@ -817,7 +816,7 @@ export interface TaskSessionsClient {
 }
 
 export interface CreateTaskDeps {
-  boundSessionCreator?: ReturnType<typeof makeBoundSessionCreator>;
+  boundSessionCreator?: Pick<McpSessionCapabilities, "create">;
   profiles: ProfileStore;
   images: ImagesClient;
   connectors: CustomConnectorSource;
