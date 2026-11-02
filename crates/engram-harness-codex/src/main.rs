@@ -3905,6 +3905,8 @@ done
             assert_eq!(observed["structuredSentinel"], true);
             assert_eq!(observed["outcome"], "succeeded");
             assert_eq!(observed["delivery"], "available");
+            assert_eq!(observed["isError"], false);
+            assert_eq!(observed["resultUnavailable"], false);
         }
         commands
             .send(HarnessCommand::Shutdown { grace_secs: 1 })

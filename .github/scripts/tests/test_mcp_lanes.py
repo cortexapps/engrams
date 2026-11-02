@@ -15,11 +15,11 @@ lanes = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lanes)
 
 
-def detect(path):
+def detect(path, crates=None, closure=None):
     with tempfile.NamedTemporaryFile() as output, patch.object(lanes, 'cargo_meta', return_value={}), \
          patch.object(lanes, 'crate_dirs', return_value={}), \
-         patch.object(lanes, 'changed_crates', return_value=set()), \
-         patch.object(lanes, 'release_closure', return_value=set()), \
+         patch.object(lanes, 'changed_crates', return_value=crates or set()), \
+         patch.object(lanes, 'release_closure', return_value=closure or set()), \
          patch.object(sys, 'argv', ['detect', '--stdin']), \
          patch.object(sys, 'stdin', io.StringIO(path + '\n')), \
          patch.dict(os.environ, {'GITHUB_OUTPUT': output.name}), \
@@ -36,6 +36,19 @@ class McpLanes(unittest.TestCase):
         self.assertEqual(result['test_mcp_worker'], 'true')
         self.assertEqual(json.loads(result['images_matrix']), ['orchestrator', 'mcp-worker'])
         self.assertEqual(result['node_assets'], 'false')
+
+    def test_fixture_selects_native_and_static_gates(self):
+        result = detect('tests/fixtures/mcp-model-cli/src/main.rs')
+        self.assertEqual(result['test_rust'], 'true')
+        self.assertEqual(result['test_cross'], 'true')
+        self.assertEqual(result['node_assets'], 'false')
+
+    def test_harness_and_shared_protocol_select_fixture_consumers(self):
+        for name in ['engram-harness-codex', 'engram-harness-claude', 'engram-harness-proto']:
+            with self.subTest(name=name):
+                result = detect(f'crates/{name}/src/main.rs', {name}, {name})
+                self.assertEqual(result['test_rust'], 'true')
+                self.assertEqual(result['test_cross'], 'true')
 
     def test_helper_runs_native_gate(self):
         result = detect('sandbox-netstack/go.sum')
