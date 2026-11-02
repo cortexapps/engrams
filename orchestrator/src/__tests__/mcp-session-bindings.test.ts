@@ -21,6 +21,7 @@ test("session bindings preserve reviewed schema and freeze every authority input
   const manifest = compileMcpManifest(snapshot);
   expect(manifest[0]?.inputSchema).toEqual(schema);
   expect(manifest[0]?.execution).toBe("sync");
+  expect(manifest[0]?.resultFormat).toBe("mcp");
   expect(snapshot.managedDenyPolicy.hosts).toEqual(["alias.example.test", "tools.example.test"]);
   const original = structuredClone(snapshot);
   authority.connections[0]!.tools[0]!.inputSchema = { type: "null" };
@@ -123,6 +124,7 @@ test("write descriptors stay deferred and catalog changes cannot mutate old mani
   const snapshot = compile(authority);
   const manifest = compileMcpManifest(snapshot);
   expect(manifest[0]!.execution).toBe("deferred");
+  expect(manifest[0]!.resultFormat).toBe("mcp");
   manifest[0]!.inputSchema = {};
   expect(compileMcpManifest(snapshot)[0]!.inputSchema).toEqual(schema);
 });

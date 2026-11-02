@@ -33,6 +33,7 @@
 //! image small (one codec).
 
 pub mod attach_token;
+pub mod tool_result;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -469,6 +470,14 @@ pub enum HarnessEvent {
     },
     /// The harness re-attached while this run was in flight.
     RunContinued { run_id: String },
+    /// Best-effort cancellation signal for the original call. The trusted
+    /// runtime must validate session, run and pending tool identity. This
+    /// event neither completes a journal entry nor reverses an effect.
+    ToolCallCancelRequested {
+        run_id: String,
+        call_id: String,
+        name: String,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -501,6 +510,7 @@ impl HarnessEvent {
             | Self::AgentMessageChunk { run_id, .. }
             | Self::FileChanged { run_id, .. }
             | Self::ToolCallRequested { run_id, .. }
+            | Self::ToolCallCancelRequested { run_id, .. }
             | Self::BrowserActivity { run_id, .. }
             | Self::Generation { run_id, .. }
             | Self::RunCost { run_id, .. }
@@ -533,6 +543,7 @@ impl HarnessEvent {
             Self::TitleSuggested { .. } => "title_suggested",
             Self::PromptSteered { .. } => "prompt_steered",
             Self::ToolCallRequested { .. } => "tool_call_requested",
+            Self::ToolCallCancelRequested { .. } => "tool_call_cancel_requested",
             Self::Idle => "harness_idle",
             Self::Parked => "harness_parked",
             Self::Busy => "harness_busy",
@@ -551,7 +562,8 @@ impl HarnessEvent {
             | Self::ToolCallCompleted { tool_call_id, .. }
             | Self::FileChanged { tool_call_id, .. }
             | Self::BrowserActivity { tool_call_id, .. } => Some(tool_call_id.as_str()),
-            Self::ToolCallRequested { call_id, .. } => Some(call_id.as_str()),
+            Self::ToolCallRequested { call_id, .. }
+            | Self::ToolCallCancelRequested { call_id, .. } => Some(call_id.as_str()),
             _ => None,
         }
     }

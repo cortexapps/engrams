@@ -736,7 +736,7 @@ fn wire_version_pinned() {
     // Existing goldens embed neither payload and keep their bytes.
     // 37 -> 38: SessionEgressPolicy appends the managed deny envelope.
     assert_eq!(
-        WIRE_VERSION, 38,
+        WIRE_VERSION, 39,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
