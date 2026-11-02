@@ -166,7 +166,11 @@ private copies, builds a fresh stopped machine with a file-handle attachment,
 and returns an opaque `PreparedManagedVz` outside the ordinary sandbox map.
 It does not load saved memory, start the machine, open the helper, publish a
 network enforcement proof, or return a final policy acknowledgement. Its only
-public lifecycle operations check closed readiness or close and reap the owner.
+public lifecycle operations check closed readiness or asynchronously close and
+reap the owner. Drop starts cleanup without waiting. A thread reserved before
+helper creation owns cleanup through reaping, so an unresponsive child cannot
+block other allocations on the async executor. Canceling a close wait does not
+cancel cleanup or discard its result while the owner remains live.
 
 The helper inherits only descriptors 0, 1 and 2 through native close-by-default
 spawn actions, an empty environment and no arguments. The selected native

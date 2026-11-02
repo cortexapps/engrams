@@ -41,7 +41,9 @@ async fn read_closed(control: &mut UnixStream) -> io::Result<()> {
 
 pub(super) struct Helper {
     control: UnixStream,
-    child: Child,
+    child: Option<Child>,
+    cleanup: Cleanup,
+    cleanup_complete: bool,
     cleanup_failed: bool,
 }
 impl Helper {
@@ -51,7 +53,10 @@ impl Helper {
         proxy: UnixStream,
         config: &Config,
     ) -> io::Result<Self> {
-        let (mut control, child_control) = UnixStream::pair()?;
+        let (control, child_control) = UnixStream::pair()?;
+        // Reserve the cleanup thread before creating a process. Drop then needs
+        // neither a running Tokio runtime nor a new thread allocation.
+        let cleanup = Cleanup::new()?;
         let child = Child::spawn(
             path,
             [
@@ -62,19 +67,29 @@ impl Helper {
         )?;
         // Only the helper retains the child endpoints after spawn.
         drop((packet, child_control, proxy));
-        private::write(&mut control, config).await?;
         let mut helper = Self {
             control,
-            child,
+            child: Some(child),
+            cleanup,
+            cleanup_complete: false,
             cleanup_failed: false,
         };
+        // Establish the Drop owner before the first cancellable handshake write.
+        private::write(&mut helper.control, config).await?;
         read_closed(&mut helper.control).await?;
         helper.check_closed()?;
         Ok(helper)
     }
     /// Reliable-channel and process checks. Datagram EOF is never evidence.
     pub fn check_closed(&mut self) -> io::Result<()> {
-        if self.cleanup_failed || self.child.poll()?.is_some() {
+        if self.cleanup_failed
+            || self
+                .child
+                .as_mut()
+                .ok_or_else(private::invalid)?
+                .poll()?
+                .is_some()
+        {
             return Err(private::invalid());
         }
         let mut byte = [0];
@@ -93,27 +108,77 @@ impl Helper {
             Err(private::invalid())
         }
     }
-    pub fn close(&mut self) -> io::Result<()> {
+    fn begin_close(&mut self) {
         // SAFETY: control owns this live socket. Shutdown changes no FD ownership.
         unsafe {
             libc::shutdown(self.control.as_raw_fd(), libc::SHUT_RDWR);
         }
+        if let Some(child) = self.child.take() {
+            // The reserved worker waits only on this channel before receiving
+            // the child; it cannot exit while its sender is still owned here.
+            self.cleanup
+                .sender
+                .take()
+                .expect("cleanup sender")
+                .send(child)
+                .expect("reserved cleanup worker");
+        }
+    }
+    pub async fn close(&mut self) -> io::Result<()> {
+        self.begin_close();
         if self.cleanup_failed {
             return Err(io::Error::other("network helper cleanup remains failed"));
         }
-        let result = self.child.reap_bounded();
+        if self.cleanup_complete {
+            return Ok(());
+        }
+        // Keep the receiver in the owner. Canceling this await neither cancels
+        // the worker nor consumes its result; Drop does not wait for it.
+        let result = (&mut self.cleanup.result)
+            .await
+            .unwrap_or_else(|_| Err(io::Error::other("network helper cleanup worker failed")));
+        self.cleanup_complete = true;
         self.cleanup_failed = result.is_err();
         result
     }
 }
 impl Drop for Helper {
     fn drop(&mut self) {
-        if let Err(error) = self.close() {
-            tracing::error!(%error, "network helper cleanup failed");
-        }
+        self.begin_close();
     }
 }
 
+/// A reserved thread owns the child from cleanup handoff through final reap.
+/// Its result is local cleanup evidence only, never a proxy barrier ACK.
+struct Cleanup {
+    sender: Option<std::sync::mpsc::Sender<Child>>,
+    result: tokio::sync::oneshot::Receiver<io::Result<()>>,
+}
+impl Cleanup {
+    fn new() -> io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<Child>();
+        let (result_tx, result) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("managed-network-cleanup".into())
+            .spawn(move || {
+                if let Ok(mut child) = receiver.recv() {
+                    let result = child.reap_bounded();
+                    // Complete all fallback cleanup before publishing a result.
+                    drop(child);
+                    if let Err(error) = &result {
+                        tracing::error!(%error, "network helper cleanup failed");
+                    }
+                    let _ = result_tx.send(result);
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            result,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct Child {
     pid: libc::pid_t,
     status: Option<i32>,
@@ -254,12 +319,93 @@ impl Drop for Child {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_helper_cleanup_does_not_delay_an_unrelated_private_stop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for await_close in [false, true] {
+            let (input, keep_input_open) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (control, output) = UnixStream::pair().unwrap();
+            let (errors, _read_errors) = UnixStream::pair().unwrap();
+            let cleanup = Cleanup::new().unwrap();
+            let child = Child::spawn(
+                Path::new("/bin/cat"),
+                [input.as_raw_fd(), output.as_raw_fd(), errors.as_raw_fd()],
+            )
+            .unwrap();
+            let pid = child.pid;
+            drop((input, output, errors));
+            let mut helper = Helper {
+                control,
+                child: Some(child),
+                cleanup,
+                cleanup_complete: false,
+                cleanup_failed: false,
+            };
+            let (allocation, mut proxy) = UnixStream::pair().unwrap();
+            let started = Instant::now();
+            let cleanup = tokio::spawn(async move {
+                if await_close {
+                    helper.close().await.unwrap();
+                } else {
+                    drop(helper);
+                }
+            });
+            // First poll must transfer cleanup, not wait for the held child.
+            tokio::task::yield_now().await;
+            proxy.shutdown().await.unwrap();
+            let watcher = tokio::spawn(async move {
+                super::super::wait_for_private_stop(&allocation).await;
+                drop(allocation);
+            });
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(250), proxy.read(&mut [0]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "helper cleanup blocked the unrelated allocation stop"
+            );
+            // SAFETY: signal zero only observes the owned fixture; it does not reap.
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "child must still be held during unrelated cleanup"
+            );
+            watcher.await.unwrap();
+            if await_close {
+                assert!(!cleanup.is_finished(), "close must wait for the held child");
+                // Cancellation drops the owner but cannot cancel the reserved reaper.
+                cleanup.abort();
+                assert!(cleanup.await.unwrap_err().is_cancelled());
+            } else {
+                cleanup.await.unwrap();
+            }
+            drop(keep_input_open);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    // SAFETY: signal zero does not change the child or its ownership.
+                    if unsafe { libc::kill(pid, 0) } < 0 {
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn forced_cleanup_failure_is_terminal_and_child_is_reaped() {
         let (input, _keep_input_open) = std::os::unix::net::UnixStream::pair().unwrap();
         let (control, output) = UnixStream::pair().unwrap();
         let (errors, _read_errors) = UnixStream::pair().unwrap();
         // cat blocks on input and does not implement the reliable close barrier.
+        let cleanup = Cleanup::new().unwrap();
         let child = Child::spawn(
             Path::new("/bin/cat"),
             [input.as_raw_fd(), output.as_raw_fd(), errors.as_raw_fd()],
@@ -269,15 +415,26 @@ mod tests {
         drop((input, output, errors));
         let mut helper = Helper {
             control,
-            child,
+            child: Some(child),
+            cleanup,
+            cleanup_complete: false,
             cleanup_failed: false,
         };
         assert!(
-            helper.close().is_err(),
+            tokio::time::timeout(Duration::from_millis(10), helper.close())
+                .await
+                .is_err()
+        );
+        assert!(
+            helper.check_closed().is_err(),
+            "cleanup cannot become ready again"
+        );
+        assert!(
+            helper.close().await.is_err(),
             "unresponsive helper must fail cleanup"
         );
         assert!(
-            helper.close().is_err(),
+            helper.close().await.is_err(),
             "reaping cannot erase cleanup failure"
         );
         // SAFETY: the owner must have reaped its child after the bounded kill.
@@ -343,7 +500,7 @@ mod tests {
             let mut helper = Helper::spawn(&path, packet, private, &config)
                 .await
                 .unwrap();
-            let pid = helper.child.pid;
+            let pid = helper.child.as_ref().unwrap().pid;
             drop(extra);
             assert_eq!(
                 tokio::time::timeout(DEADLINE, extra_peer.read(&mut [0]))
@@ -364,9 +521,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
+                helper.close().await.unwrap();
                 drop(helper);
             } else {
-                helper.close().unwrap();
+                helper.close().await.unwrap();
                 assert_eq!(
                     tokio::time::timeout(DEADLINE, proxy.read(&mut [0]))
                         .await

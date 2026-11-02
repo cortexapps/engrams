@@ -68,16 +68,17 @@ impl PreparedManagedVz {
         .unwrap_or(false);
         if self.failed || !native_closed || self.helper.check_closed().is_err() {
             self.failed = true;
-            let _ = self.helper.close();
+            let _ = self.helper.close().await;
             return Err(io::Error::other("managed preparation is no longer live").into());
         }
         Ok(self.receipt.clone())
     }
-    /// Wait for owned process cleanup. Success does not acknowledge the proxy
+    /// Await owned process cleanup without blocking the executor. Drop starts
+    /// cleanup but does not wait for its result. Success does not acknowledge the proxy
     /// policy barrier. Only that proxy can release its lease or poison its gate.
-    pub fn close(mut self) -> Result<(), engram_core::SandboxError> {
+    pub async fn close(mut self) -> Result<(), engram_core::SandboxError> {
         self.failed = true;
-        self.helper.close()?;
+        self.helper.close().await?;
         Ok(())
     }
 }
