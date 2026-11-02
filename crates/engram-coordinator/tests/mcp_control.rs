@@ -176,6 +176,145 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
         } else {
             assert_eq!(policy.unwrap_err().code(), tonic::Code::PermissionDenied);
         }
+        // Exact native input is available only to the pinned policy service.
+        // This fixture exercises persistence and transport, never backend execution.
+        use engram_core::types::{managed_create::*, mcp_policy::*, runtime_spec::RuntimeSpec};
+        use prost::Message;
+        let native_sid =
+            engram_core::SessionId(uuid::Uuid::from_u128(if pinned { 1400 } else { 1401 }));
+        let policy = McpPolicyCreation {
+            actor_id: "owner-native".into(),
+            input_id: format!("create:{native_sid}"),
+            parent_session_id: None,
+            eligibility: WriteEligibility::ReadOnly,
+        };
+        let mut create = engram_protocol::app::CreateSessionRequest {
+            requested_session_id: Some(native_sid.to_string()),
+            harness: Some("claude".into()),
+            harness_mode: Some("plan".into()),
+            ..Default::default()
+        };
+        create
+            .harness_env
+            .insert("ENGRAM_TOOLS".into(), " [ ] ".into());
+        let mut reserve = wire::ReserveManagedCreateRequest {
+            protocol: 1,
+            task_id: "task-native".into(),
+            native_version: 1,
+            native_digest: digest(b" [ ] "),
+            creation_request: wire::CreatePolicySessionRequest {
+                protocol: 1,
+                actor_id: policy.actor_id.clone(),
+                input_id: policy.input_id.clone(),
+                create: Some(create),
+                parent_session_id: None,
+            }
+            .encode_to_vec(),
+            input_digest: String::new(),
+        };
+        reserve.input_digest = wire::managed_create_input_digest(&reserve);
+        assert_eq!(
+            policy_client
+                .reserve_managed_create(reserve.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            if pinned {
+                tonic::Code::Unavailable
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        );
+        assert!(meta.get_session(native_sid).await.is_err());
+        let identity = ManagedCreateIdentity {
+            session_id: native_sid,
+            task_id: reserve.task_id.clone(),
+            policy: policy.clone(),
+            input_digest: reserve.input_digest.clone(),
+        };
+        meta.reserve_and_persist_create(
+            engram_core::traits::SessionCreateWriteSet {
+                managed_creation: Some(ManagedCreation {
+                    identity: identity.clone(),
+                    native: FrozenNativeManifest {
+                        version: 1,
+                        bytes: b" [ ] ".to_vec(),
+                        digest: reserve.native_digest.clone(),
+                    },
+                }),
+                mcp_policy: Some(policy.clone()),
+                nbd_slot_need: 1,
+                session_id: native_sid,
+                spec: engram_core::types::SessionSpec {
+                    image: "test.invalid/native:latest".into(),
+                    mode: Default::default(),
+                },
+                mem_budget_mib: 512,
+                cpu_budget_vcpus: 1,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+                oauth_binding: None,
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
+        let native_identity = wire::ManagedCreateIdentity {
+            session_id: native_sid.to_string(),
+            task_id: identity.task_id,
+            input_id: policy.input_id,
+            actor_id: policy.actor_id,
+            parent_session_id: None,
+            write_eligibility: "read_only".into(),
+            input_digest: identity.input_digest,
+        };
+        let request = wire::ReadNativeManifestRequest {
+            protocol: 1,
+            identity: Some(native_identity.clone()),
+        };
+        let result = policy_client.read_native_manifest(request.clone()).await;
+        if pinned {
+            let native = result.unwrap().into_inner();
+            assert_eq!(native.native_bytes, b" [ ] ");
+            assert_eq!(native.native_digest, reserve.native_digest);
+            assert_eq!(native.identity, Some(native_identity));
+            assert_eq!(native.native_version, 1);
+            let mut wrong = request.clone();
+            wrong.identity.as_mut().unwrap().task_id = "another-task".into();
+            assert_eq!(
+                policy_client
+                    .read_native_manifest(wrong)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut wrong = request.clone();
+            wrong.identity.as_mut().unwrap().session_id = sid.to_string();
+            assert_eq!(
+                policy_client
+                    .read_native_manifest(wrong)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut wrong = request;
+            wrong.protocol = 0;
+            assert_eq!(
+                policy_client
+                    .read_native_manifest(wrong)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
         let mut client =
             wire::credential_control_service_client::CredentialControlServiceClient::new(channel);
         if pinned {
@@ -183,6 +322,7 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             let policy_sid = engram_core::SessionId(uuid::Uuid::from_u128(1200));
             meta.reserve_and_persist_create(
                 engram_core::traits::SessionCreateWriteSet {
+                    managed_creation: None,
                     mcp_policy: Some(McpPolicyCreation {
                         actor_id: "owner-a".into(),
                         input_id: "create-a".into(),

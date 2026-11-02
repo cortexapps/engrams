@@ -51,6 +51,8 @@ pub enum DisableEnabledImageOutcome {
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    /// Held managed reservation; ordinary placement must never consume it.
+    pub managed_creation: Option<crate::types::managed_create::ManagedCreation>,
     pub mcp_policy: Option<crate::types::mcp_policy::McpPolicyCreation>,
     /// One root slot plus one slot when swap is enabled.
     pub nbd_slot_need: u32,
@@ -242,6 +244,15 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- sessions ----
+    /// Read exact immutable native input under the complete creation association.
+    /// Missing legacy authority is an error, never an empty manifest.
+    async fn read_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_managed_creation")
+    }
+
     /// Read durable server policy and all current ancestors in one locked snapshot.
     async fn read_mcp_write_policy(
         &self,

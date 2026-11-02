@@ -465,6 +465,8 @@ pub(crate) async fn load_session_secrets(
 pub struct CreateSessionRequest {
     /// Supplied only by the dedicated pinned mTLS creation service.
     #[serde(skip)]
+    pub(crate) managed_creation: Option<engram_core::types::managed_create::ManagedCreation>,
+    #[serde(skip)]
     pub(crate) mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
     /// ADR 0109: trusted app-gRPC callers can reserve an ID so their external
     /// authorization snapshot exists before the VM starts. The public JSON
@@ -614,6 +616,7 @@ pub(crate) async fn create_session_core(
         start,
         req.oauth_credential.clone(),
         req.mcp_creation.clone(),
+        req.managed_creation.clone(),
     )
     .await;
     let kind = match &result {
@@ -658,6 +661,7 @@ async fn boot_prepared(
     create_start: std::time::Duration,
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
     mcp_creation: Option<engram_core::types::mcp_policy::McpPolicyCreation>,
+    managed_creation: Option<engram_core::types::managed_create::ManagedCreation>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         nbd_slot_need,
@@ -774,6 +778,7 @@ async fn boot_prepared(
         ));
     }
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        managed_creation: managed_creation.clone(),
         mcp_policy: mcp_creation,
         nbd_slot_need,
         session_id,
@@ -810,6 +815,17 @@ async fn boot_prepared(
         .reserve_and_persist_create(write_set, &candidates.hosts, candidates.affinity_len)
         .await
         .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
+
+    // Held managed creates cannot reach prompt delivery or ordinary boot. The
+    // later physical boot consumer must claim this same durable reservation.
+    if managed_creation.is_some() {
+        return Ok(CreateSessionResponse {
+            session_id,
+            status: SessionState::Queued.as_str(),
+            image_version: image_tag,
+            kind: "queued",
+        });
+    }
 
     // ADR 0073 → ADR 0108 A6: the create-time initial prompt gets its
     // durable accept here (receipt + user echo + outbox row, committed

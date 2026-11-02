@@ -391,3 +391,22 @@ poisons the stable session gate; policy replay or a fresh allocation cannot
 reopen it in that proxy incarnation. Recovery needs a fresh proxy incarnation
 and full policy replay with quarantine checks. Other sessions remain usable.
 This barrier cannot revoke bytes that were delivered before it completed.
+
+### Immutable managed creation authority
+
+The session create transaction stores a held reservation with the exact native
+ENGRAM_TOOLS bytes, version and SHA-256 digest. It binds the reserved session ID
+to the task, create input, actor and immutable parent policy. The request digest
+covers the exact serialized trusted creation request and its native version and
+task context. A retry must match all original input; it cannot replace a manifest
+with the current profile. Empty native input is an explicit `[]`, never an absent
+value. Native classification follows the descriptor contract, not a name prefix.
+
+Held reservations use the existing queued session row and all existing creation
+satellites. Ordinary queue listing and placement exclude them. No host request
+occurs during reservation. The pinned mTLS policy service alone can read this
+source. Public creation and managed admission stay closed until the operator
+admission and physical boot gate exist. The future boot transition must claim
+the same held row and bind the actual physical epoch; a reservation is not a
+network receipt or permission to start a harness. Legacy sessions have no source
+and cannot be backfilled from guest state or a current profile.

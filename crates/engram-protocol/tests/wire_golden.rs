@@ -735,8 +735,10 @@ fn wire_version_pinned() {
     // indices stay fixed; the optional hint is separate from immutable disk seals.
     // Existing goldens embed neither payload and keep their bytes.
     // 37 -> 38: SessionEgressPolicy appends the managed deny envelope.
+    // 38 -> 39: per-call harness cancellation; 39 -> 40: creation authority RPCs.
+    // The latter adds protobuf messages without changing existing bincode bytes.
     assert_eq!(
-        WIRE_VERSION, 39,
+        WIRE_VERSION, 40,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

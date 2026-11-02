@@ -845,8 +845,40 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
-    /// One transaction: pick_host_2d, then INSERT the session row as
-    /// pending-on-host (Placed) or queued (Queued) + satellites.
+    async fn read_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.gate()?;
+        identity.validate()?;
+        let db = self.db.lock();
+        let session = db
+            .sessions
+            .get(&identity.session_id)
+            .ok_or(MetaError::NotFound)?;
+        if matches!(
+            session.session.status,
+            SessionState::Dead | SessionState::Completed | SessionState::Failed
+        ) {
+            return Err(MetaError::NotFound);
+        }
+        let stored = db
+            .managed_creations
+            .get(&identity.session_id)
+            .ok_or(MetaError::NotFound)?;
+        if session.mcp_policy_parent_id != stored.identity.policy.parent_session_id {
+            return Err(MetaError::NotFound);
+        }
+        if stored.identity != *identity {
+            return Err(MetaError::Conflict(
+                "managed creation association changed".into(),
+            ));
+        }
+        stored.native.validate()?;
+        Ok(stored.clone())
+    }
+
+    /// One transaction: session row, held authority and all satellites.
     async fn reserve_and_persist_create(
         &self,
         ws: SessionCreateWriteSet,
@@ -861,9 +893,37 @@ impl MetadataStore for SimMetadataStore {
             ));
         }
 
+        if let Some(creation) = &ws.managed_creation {
+            creation.validate_for(&ws)?;
+        }
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
+        if let Some(creation) = &ws.managed_creation {
+            if let Some(stored) = db.managed_creations.get(&ws.session_id) {
+                let held = db.sessions.get(&ws.session_id).is_some_and(|s| {
+                    s.session.status == SessionState::Queued
+                        && s.session.host_id.is_none()
+                        && s.session.sandbox_id.is_none()
+                        && s.binding_epoch == 0
+                });
+                if stored != creation || !held {
+                    return Err(MetaError::Conflict(
+                        "managed creation association changed".into(),
+                    ));
+                }
+                return Ok(CreateDisposition::Queued);
+            }
+            if db
+                .managed_creations
+                .values()
+                .any(|c| c.identity.policy.input_id == creation.identity.policy.input_id)
+            {
+                return Err(MetaError::Conflict(
+                    "managed creation input already reserved".into(),
+                ));
+            }
+        }
         if ws.oauth_binding.as_ref().is_some_and(|binding| {
             db.oauth_credentials
                 .get(&binding.key)
@@ -887,6 +947,16 @@ impl MetadataStore for SimMetadataStore {
                 super::mcp_policy::nodes(&db, parent)?;
             }
         }
+        let candidates = if ws.managed_creation.is_some() {
+            &[][..]
+        } else {
+            candidates
+        };
+        let affinity_len = if ws.managed_creation.is_some() {
+            0
+        } else {
+            affinity_len
+        };
         let picked = Self::pick_host_2d(
             &db,
             candidates,
@@ -944,6 +1014,9 @@ impl MetadataStore for SimMetadataStore {
                 updated_at: now,
             },
         );
+        if let Some(creation) = ws.managed_creation {
+            db.managed_creations.insert(ws.session_id, creation);
+        }
         db.runtime_specs.insert(ws.session_id, ws.runtime_spec);
         if let Some(secrets) = ws.sealed_secrets {
             db.session_secrets.insert(ws.session_id, secrets);
@@ -1118,7 +1191,10 @@ impl MetadataStore for SimMetadataStore {
         let mut rows: Vec<&SessRow> = db
             .sessions
             .values()
-            .filter(|r| r.session.status == SessionState::Queued)
+            .filter(|r| {
+                r.session.status == SessionState::Queued
+                    && !db.managed_creations.contains_key(&r.session.id)
+            })
             .collect();
         rows.sort_by_key(|r| (r.queued_at, r.session.id));
         Ok(rows
@@ -1150,7 +1226,7 @@ impl MetadataStore for SimMetadataStore {
         }
         let now = self.now();
         let mut db = self.db.lock();
-        if !db.sessions.contains_key(&id) {
+        if db.managed_creations.contains_key(&id) || !db.sessions.contains_key(&id) {
             return Ok(None);
         }
         let Some(host) = Self::pick_host_2d(

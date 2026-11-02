@@ -5,6 +5,8 @@ import "engram/app/v1/session.proto";
 
 // Dedicated pinned mTLS only. Create reuses the ordinary creation core.
 service SessionPolicyService {
+  rpc ReserveManagedCreate(ReserveManagedCreateRequest) returns (ReserveManagedCreateResponse);
+  rpc ReadNativeManifest(ReadNativeManifestRequest) returns (ReadNativeManifestResponse);
   rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
   rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
   rpc CreatePolicySession(CreatePolicySessionRequest) returns (CreatePolicySessionResponse);
@@ -137,4 +139,41 @@ message ManagedNetworkProof {
   ManagedPolicyTarget target = 1;
   string guest_ip = 2;
   string network_identity = 3;
+}
+
+// Exact bytes of CreatePolicySessionRequest, retained by the caller for retries.
+// The coordinator stores only the digest of this payload, which can hold secrets.
+message ReserveManagedCreateRequest {
+  uint32 protocol = 1;
+  bytes creation_request = 2;
+  string task_id = 3;
+  uint32 native_version = 4;
+  string native_digest = 5;
+  string input_digest = 6;
+}
+message ManagedCreateIdentity {
+  string session_id = 1;
+  string task_id = 2;
+  string input_id = 3;
+  string actor_id = 4;
+  optional string parent_session_id = 5;
+  string write_eligibility = 6;
+  string input_digest = 7;
+}
+message ReserveManagedCreateResponse {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  // A held queued reservation is not permission to start a sandbox.
+  string state = 3;
+}
+message ReadNativeManifestRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+}
+message ReadNativeManifestResponse {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  bytes native_bytes = 4;
+  string native_digest = 5;
 }

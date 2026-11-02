@@ -34,6 +34,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
+mod managed_create;
 mod mcp_policy;
 mod row;
 
@@ -1608,6 +1609,13 @@ impl MetadataStore for PostgresStore {
         Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
+    async fn read_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity).await
+    }
+
     async fn reserve_and_persist_create(
         &self,
         ws: SessionCreateWriteSet,
@@ -1622,8 +1630,28 @@ impl MetadataStore for PostgresStore {
             ));
         }
 
+        if let Some(creation) = &ws.managed_creation {
+            creation.validate_for(&ws)?;
+        }
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        if let Some(creation) = &ws.managed_creation {
+            if !managed_create::reserve(&mut tx, creation).await? {
+                tx.commit().await.map_err(db_err)?;
+                return Ok(CreateDisposition::Queued);
+            }
+        }
+        let candidates = if ws.managed_creation.is_some() {
+            &[][..]
+        } else {
+            candidates
+        };
+        let affinity_len = if ws.managed_creation.is_some() {
+            0
+        } else {
+            affinity_len
+        };
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
         // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
@@ -2843,7 +2871,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at, nbd_slot_need
             FROM sessions
-            WHERE status = 'queued'
+            WHERE status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             ORDER BY queued_at ASC
             "#,
         )
@@ -2893,7 +2921,7 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE sessions
                SET status = 'pending', host_id = $2, last_active_at = $3
-             WHERE id = $1 AND status = 'queued'
+             WHERE id = $1 AND status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             "#,
         )
         .bind(id.as_uuid())

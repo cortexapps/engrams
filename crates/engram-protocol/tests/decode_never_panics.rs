@@ -31,6 +31,11 @@ use support::{wire_exec_request, wire_reap_stats};
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
+    use prost::Message;
+    let _ = engram_protocol::mcp::ReserveManagedCreateRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestResponse::decode(bytes);
+
     let _ = engram_protocol::managed_policy::decode::<
         engram_core::types::managed_deny::ManagedPolicyApply,
     >(bytes);

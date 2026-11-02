@@ -172,7 +172,8 @@ use serde::{Deserialize, Serialize};
 // v36 gates page-channel v6 fault windows for a lockstep host roll.
 // v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
 // v39 appends the harness per-call cancellation signal. Older fleets cannot decode it.
-pub const WIRE_VERSION: u32 = 39;
+// v40 adds immutable managed creation reservation and native-manifest reads.
+pub const WIRE_VERSION: u32 = 40;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -1027,6 +1027,7 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
@@ -4159,6 +4160,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     // A placed pending with a queued create_boot op.
     let with_op = SessionId::new();
     let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
@@ -5834,6 +5836,7 @@ async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
     let mut t = teleport_fixture(ctx, source, h).await;
     let pending = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id: pending,
@@ -6328,6 +6331,7 @@ async fn teleport_admission_fixture(
     }
     let sid = SessionId::new();
     let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id: sid,
@@ -7108,6 +7112,7 @@ async fn nbd_host_placement(ctx: &Ctx) {
     assert_eq!(read.utilization.nbd_slots_total, 4);
     assert_eq!(read.utilization.nbd_slots_in_use, 1);
     let ws = |need| SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: need,
         session_id: SessionId::new(),
@@ -7548,6 +7553,7 @@ async fn mcp_guest_binding_rejected(ctx: &Ctx) {
         .unwrap();
     let sid = SessionId::from(uuid::Uuid::from_u128(4));
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 0,
         session_id: sid,
@@ -8128,6 +8134,7 @@ async fn mcp_write_policy_create(
     ctx.meta
         .reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
+                managed_creation: None,
                 mcp_policy: Some(McpPolicyCreation {
                     actor_id: "owner-a".into(),
                     input_id: format!("create:{id}"),
@@ -8869,3 +8876,355 @@ async fn managed_deny_retention(ctx: &Ctx) {
     assert!(meta.retain_managed_deny(&target, &union).await.is_err());
 }
 conformance!(t_managed_deny_retention, super::managed_deny_retention);
+
+fn managed_creation_ws(id: SessionId) -> engram_core::traits::SessionCreateWriteSet {
+    use engram_core::types::{managed_create::*, mcp_policy::*, runtime_spec::RuntimeSpec};
+    let policy = McpPolicyCreation {
+        actor_id: "owner-a".into(),
+        input_id: format!("create:{id}"),
+        parent_session_id: None,
+        eligibility: WriteEligibility::ReadOnly,
+    };
+    let bytes = br#" [ {"name":"native","description":"all fields","inputSchema":{},"execution":"sync","nativeBindings":{"codex":"native"},"extra":true} ] "#.to_vec();
+    engram_core::traits::SessionCreateWriteSet {
+        managed_creation: Some(ManagedCreation {
+            identity: ManagedCreateIdentity {
+                session_id: id,
+                task_id: "task-a".into(),
+                policy: policy.clone(),
+                input_digest: digest(b"exact original create input"),
+            },
+            native: FrozenNativeManifest {
+                version: 1,
+                digest: digest(&bytes),
+                bytes,
+            },
+        }),
+        mcp_policy: Some(policy),
+        nbd_slot_need: 1,
+        session_id: id,
+        spec: spec("test.invalid/managed:latest"),
+        mem_budget_mib: 512,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+        oauth_binding: None,
+    }
+}
+
+async fn managed_creation_exact_retry_and_held_queue(ctx: &Ctx) {
+    use engram_core::traits::CreateDisposition;
+    let ws = managed_creation_ws(SessionId::new());
+    let frozen = ws.managed_creation.clone().unwrap();
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(host, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Queued
+    );
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    assert_eq!(
+        ctx.meta.get_session(ws.session_id).await.unwrap().status,
+        SessionState::Queued
+    );
+    assert!(ctx
+        .meta
+        .list_queued_sessions_fifo()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.session.id != ws.session_id));
+    assert_eq!(
+        ctx.meta
+            .place_queued_session(ws.session_id, 512, 1, &[host], 0)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Queued
+    );
+    let (a, b) = tokio::join!(
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0),
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0)
+    );
+    assert_eq!(a.unwrap(), CreateDisposition::Queued);
+    assert_eq!(b.unwrap(), CreateDisposition::Queued);
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(ws.session_id)
+            .await
+            .unwrap()
+            .write_eligibility
+            .as_str(),
+        "read_only"
+    );
+    if let Some(db) = &ctx._pg {
+        // A fresh store and connection pool recover the same exact bytes.
+        let reopened = engram_postgres::PostgresStore::connect(&db.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .read_managed_creation(&frozen.identity)
+                .await
+                .unwrap(),
+            frozen
+        );
+        let pool = sqlx::PgPool::connect(&db.url).await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE session_managed_creations SET native_bytes=$2 WHERE session_id=$1"
+        )
+        .bind(ws.session_id.as_uuid())
+        .bind(b"[]".as_slice())
+        .execute(&pool)
+        .await
+        .is_err());
+        assert_eq!(
+            reopened
+                .read_managed_creation(&frozen.identity)
+                .await
+                .unwrap(),
+            frozen
+        );
+        pool.close().await;
+    }
+}
+conformance!(
+    t_managed_creation_exact_retry_and_held_queue,
+    super::managed_creation_exact_retry_and_held_queue
+);
+
+async fn managed_creation_rejects_changes_and_rolls_back(ctx: &Ctx) {
+    use engram_core::types::managed_create::digest;
+    let ws = managed_creation_ws(SessionId::new());
+    let original = ws.managed_creation.clone().unwrap();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    for change in 0..8 {
+        let mut bad = ws.clone();
+        let authority = bad.managed_creation.as_mut().unwrap();
+        match change {
+            0 => {
+                authority.native.bytes = b"[]".to_vec();
+                authority.native.digest = digest(b"[]");
+            }
+            1 => authority.native.version = 2,
+            2 => authority.native.digest = digest(b"other"),
+            3 => authority.identity.input_digest = digest(b"other"),
+            4 => authority.identity.task_id = "other-task".into(),
+            5 => {
+                authority.identity.policy.actor_id = "other-owner".into();
+                bad.mcp_policy = Some(authority.identity.policy.clone());
+            }
+            6 => {
+                authority.identity.policy.input_id = "other-input".into();
+                bad.mcp_policy = Some(authority.identity.policy.clone());
+            }
+            _ => {
+                let id = SessionId::new();
+                bad.session_id = id;
+                authority.identity.session_id = id;
+            }
+        }
+        assert!(
+            ctx.meta
+                .reserve_and_persist_create(bad.clone(), &[], 0)
+                .await
+                .is_err(),
+            "change {change}"
+        );
+        if bad.session_id != ws.session_id {
+            assert!(ctx.meta.get_session(bad.session_id).await.is_err());
+        }
+    }
+    let mut wrong = original.identity.clone();
+    wrong.task_id = "other-task".into();
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    wrong = original.identity.clone();
+    wrong.session_id = SessionId::new();
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    let legacy = ctx
+        .meta
+        .create_session(spec("test.invalid/legacy:latest"))
+        .await
+        .unwrap();
+    wrong.session_id = legacy;
+    assert!(ctx.meta.read_managed_creation(&wrong).await.is_err());
+    let adopt = managed_creation_ws(legacy);
+    let adopt_identity = adopt.managed_creation.as_ref().unwrap().identity.clone();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(adopt, &[], 0)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&adopt_identity)
+        .await
+        .is_err());
+    let mut bad = managed_creation_ws(SessionId::new());
+    let id = bad.session_id;
+    bad.mcp_policy.as_mut().unwrap().parent_session_id = Some(SessionId::new());
+    bad.managed_creation.as_mut().unwrap().identity.policy = bad.mcp_policy.clone().unwrap();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(bad.clone(), &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(id).await.is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&bad.managed_creation.as_ref().unwrap().identity)
+        .await
+        .is_err());
+    bad.mcp_policy.as_mut().unwrap().parent_session_id = None;
+    bad.managed_creation.as_mut().unwrap().identity.policy = bad.mcp_policy.clone().unwrap();
+    ctx.meta
+        .reserve_and_persist_create(bad, &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&original.identity)
+            .await
+            .unwrap(),
+        original
+    );
+}
+conformance!(
+    t_managed_creation_rejects_changes_and_rolls_back,
+    super::managed_creation_rejects_changes_and_rolls_back
+);
+
+async fn managed_creation_race_parent_and_late_rollback(ctx: &Ctx) {
+    use engram_core::types::{managed_create::digest, mcp_policy::WriteEligibility, oauth::*};
+    let parent = SessionId::new();
+    mcp_write_policy_create(ctx, parent, None, WriteEligibility::ReadOnly).await;
+    let mut ws = managed_creation_ws(SessionId::new());
+    ws.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent);
+    ws.mcp_policy.as_mut().unwrap().eligibility = WriteEligibility::WriteEligible;
+    ws.managed_creation.as_mut().unwrap().identity.policy = ws.mcp_policy.clone().unwrap();
+    let mut other = ws.clone();
+    other
+        .managed_creation
+        .as_mut()
+        .unwrap()
+        .identity
+        .input_digest = digest(b"different original input");
+    let (a, b) = tokio::join!(
+        ctx.meta.reserve_and_persist_create(ws.clone(), &[], 0),
+        ctx.meta.reserve_and_persist_create(other.clone(), &[], 0)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let winner = if a.is_ok() { ws.clone() } else { other };
+    let identity = winner.managed_creation.as_ref().unwrap().identity.clone();
+    assert_eq!(
+        ctx.meta.read_managed_creation(&identity).await.unwrap(),
+        winner.managed_creation.unwrap()
+    );
+    assert_eq!(
+        ctx.meta
+            .read_mcp_write_policy(ws.session_id)
+            .await
+            .unwrap()
+            .write_eligibility,
+        WriteEligibility::ReadOnly
+    );
+    let mut bad_parent = identity;
+    bad_parent.policy.parent_session_id = None;
+    assert!(ctx.meta.read_managed_creation(&bad_parent).await.is_err());
+
+    // Missing OAuth credential fails after session/native/runtime writes in PG.
+    // The simulator checks the same condition before its atomic in-memory write.
+    let mut failed = managed_creation_ws(SessionId::new());
+    failed.oauth_binding = Some(SessionOAuthBinding {
+        session_id: failed.session_id,
+        key: OAuthCredentialKey {
+            subject_kind: OAuthSubjectKind::User,
+            subject_id: "missing-user".into(),
+            provider: "missing-provider".into(),
+        },
+    });
+    let frozen = failed.managed_creation.clone().unwrap();
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(failed.clone(), &[], 0)
+        .await
+        .is_err());
+    assert!(ctx.meta.get_session(failed.session_id).await.is_err());
+    assert!(ctx
+        .meta
+        .read_managed_creation(&frozen.identity)
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_session_runtime_spec(failed.session_id)
+        .await
+        .unwrap()
+        .is_none());
+    failed.oauth_binding = None;
+    ctx.meta
+        .reserve_and_persist_create(failed, &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+}
+conformance!(
+    t_managed_creation_race_parent_and_late_rollback,
+    super::managed_creation_race_parent_and_late_rollback
+);
+
+async fn managed_creation_denies_stale_session(ctx: &Ctx) {
+    let ws = managed_creation_ws(SessionId::new());
+    let identity = ws.managed_creation.as_ref().unwrap().identity.clone();
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            ws.session_id,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(ctx.meta.read_managed_creation(&identity).await.is_err());
+    assert!(ctx
+        .meta
+        .reserve_and_persist_create(ws, &[], 0)
+        .await
+        .is_err());
+}
+conformance!(
+    t_managed_creation_denies_stale_session,
+    super::managed_creation_denies_stale_session
+);

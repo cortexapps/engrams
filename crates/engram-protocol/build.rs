@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".engram.app.v1", "crate::app")
         .skip_debug([
             ".engram.mcp.v1.PutSecretRequest",
+            ".engram.mcp.v1.ReserveManagedCreateRequest",
             ".engram.mcp.v1.CreatePolicySessionRequest",
             ".engram.mcp.v1.CompleteAuthorizationRequest",
             ".engram.mcp.v1.BeginAuthorizationResponse",
