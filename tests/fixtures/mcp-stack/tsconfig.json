@@ -1,0 +1,7 @@
+{
+  "extends": "../../../mcp-worker/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["../../../mcp-worker/node_modules/@types"]
+  },
+  "include": ["./*.mts"]
+}
