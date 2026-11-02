@@ -18,7 +18,7 @@ pub(crate) async fn gate(
         )),
     }
 }
-/// Called only by the trusted admission/placement producer. Public admission is closed.
+/// Called by the trusted durable preparation driver after physical input verification.
 pub async fn register(
     state: &SharedState,
     request: ManagedBootPrepare,
@@ -65,34 +65,36 @@ pub(crate) async fn finalize(
     if !policy.current {
         return Err(conflict().into());
     }
-    let session = meta.get_session(sid).await?;
-    let selected = meta.get_session_harness(sid).await?;
-    let (bundle, mut session_env) =
-        crate::api::sessions::resolve_session_env(state, &session).await?;
+    let selection = meta
+        .read_managed_boot_selection(&engram_core::types::managed_bridge::ManagedCreationQuery {
+            identity: input.key.creation.clone(),
+            native_version: native.version,
+            native_digest: native.digest.clone(),
+        })
+        .await?;
+    if selection.aux_ro_drives != old.request.cold.aux_ro_drives
+        || meta.get_session_harness(sid).await?.as_deref()
+            != Some(selection.launch.descriptor.name.as_str())
+    {
+        return Err(conflict().into());
+    }
+    let mut session_env = crate::api::sessions::load_session_secrets(state, sid)
+        .await?
+        .ok_or_else(conflict)?;
     session_env.insert("ENGRAM_SESSION_ID".into(), sid.to_string());
     let mode = (policy.write_eligibility != WriteEligibility::WriteEligible).then_some("plan");
-    let resolved = crate::api::sessions::resolve_harness(
+    let resolved = crate::api::sessions::resolve_pinned_harness(
         state,
-        selected.as_deref(),
-        session.mode,
+        selection.launch,
+        selection
+            .aux_ro_drives
+            .first()
+            .ok_or_else(conflict)?
+            .clone(),
         sid,
         session_env,
-        bundle.config.workdir.clone(),
         mode,
-    )
-    .await?
-    .ok_or_else(conflict)?;
-    let expected_mount = old
-        .request
-        .cold
-        .aux_ro_drives
-        .first()
-        .ok_or_else(conflict)?;
-    if resolved.mount != *expected_mount {
-        return Err(ApiError::Unavailable(
-            "registered harness bundle changed".into(),
-        ));
-    }
+    )?;
     let mut agent = resolved.agent;
     crate::api::sessions::inject_harness_env(state, sid, &mut agent.env).await?;
     bind_agent_target(&mut agent, &input.key)?;
@@ -333,6 +335,7 @@ async fn confirm_started(
     }
 }
 pub async fn run_once(state: &SharedState) -> Result<(), ApiError> {
+    crate::managed_bridge::run_once(state).await?;
     let mut after = None;
     loop {
         let keys = state.services.meta.list_managed_boots(after, 128).await?;

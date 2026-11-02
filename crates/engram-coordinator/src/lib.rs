@@ -636,3 +636,4 @@ impl std::error::Error for CoordinatorError {
 }
 
 pub mod managed_boot;
+mod managed_bridge;

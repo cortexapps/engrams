@@ -406,6 +406,7 @@ async fn managed_retry_denies_requeued_nonzero_epoch() {
         .await
         .unwrap());
     let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_boot_selection: None,
         managed_initial_prompt: None,
         managed_creation: Some(frozen.clone()),
         mcp_policy: Some(policy),

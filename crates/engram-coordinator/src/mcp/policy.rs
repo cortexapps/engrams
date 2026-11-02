@@ -245,6 +245,87 @@ impl SessionPolicyService for PolicyControl {
         }))
     }
 
+    async fn read_managed_creation_state(
+        &self,
+        req: Request<wire::ReadManagedCreationStateRequest>,
+    ) -> Result<Response<wire::ReadManagedCreationStateResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let r = req.into_inner();
+        let q = bridge_query(r.identity, r.native_version, r.native_digest)?;
+        let state = self
+            .control
+            .authority
+            .manager
+            .meta
+            .read_managed_creation_state(&q)
+            .await
+            .map_err(bridge_err)?;
+        Ok(Response::new(wire::ReadManagedCreationStateResponse {
+            protocol: wire::PROTOCOL,
+            state_json: engram_protocol::managed_boot::encode(&state)
+                .map_err(|_| Status::internal("state encoding failed"))?,
+        }))
+    }
+    async fn prepare_managed_boot(
+        &self,
+        req: Request<wire::PrepareManagedBootRequest>,
+    ) -> Result<Response<wire::PrepareManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let r = req.into_inner();
+        let q = bridge_query(r.identity, r.native_version, r.native_digest)?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed boot unavailable"))?;
+        let view = crate::managed_bridge::prepare(state, q)
+            .await
+            .map_err(bridge_api_err)?;
+        Ok(Response::new(wire::PrepareManagedBootResponse {
+            protocol: wire::PROTOCOL,
+            state_json: engram_protocol::managed_boot::encode(&view)
+                .map_err(|_| Status::internal("state encoding failed"))?,
+        }))
+    }
+    async fn recover_managed_boot(
+        &self,
+        req: Request<wire::RecoverManagedBootRequest>,
+    ) -> Result<Response<wire::RecoverManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let r = req.into_inner();
+        let query = bridge_query(r.identity, r.native_version, r.native_digest)?;
+        let source = engram_protocol::managed_boot::decode(&r.expected_source_key_json)
+            .map_err(|_| Status::invalid_argument("invalid recovery source"))?;
+        let input = engram_core::types::managed_bridge::ManagedRecoveryInput {
+            query,
+            expected_source_key: source,
+            recovery_id: r.recovery_id,
+        };
+        input.validate().map_err(bridge_err)?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed boot unavailable"))?;
+        let view = crate::managed_bridge::recover(state, input)
+            .await
+            .map_err(bridge_api_err)?;
+        Ok(Response::new(wire::RecoverManagedBootResponse {
+            protocol: wire::PROTOCOL,
+            state_json: engram_protocol::managed_boot::encode(&view)
+                .map_err(|_| Status::internal("state encoding failed"))?,
+        }))
+    }
     async fn read_managed_boot(
         &self,
         req: Request<wire::ReadManagedBootRequest>,
@@ -831,4 +912,34 @@ fn boot_json(
             .map_err(|_| Status::internal("managed boot encoding failed"))
     })
     .transpose()
+}
+
+fn bridge_query(
+    identity: Option<wire::ManagedCreateIdentity>,
+    native_version: u32,
+    native_digest: String,
+) -> Result<engram_core::types::managed_bridge::ManagedCreationQuery, Status> {
+    let q = engram_core::types::managed_bridge::ManagedCreationQuery {
+        identity: managed_identity(required(identity)?)?,
+        native_version,
+        native_digest,
+    };
+    q.validate().map_err(bridge_err)?;
+    Ok(q)
+}
+fn bridge_err(e: engram_core::MetaError) -> Status {
+    match e {
+        engram_core::MetaError::Conflict(_) | engram_core::MetaError::NotFound => {
+            Status::failed_precondition("managed creation authority changed")
+        }
+        _ => Status::unavailable("managed creation state unavailable"),
+    }
+}
+fn bridge_api_err(e: crate::error::ApiError) -> Status {
+    match e {
+        crate::error::ApiError::Conflict(_) | crate::error::ApiError::NotFound(_) => {
+            Status::failed_precondition("managed creation authority changed")
+        }
+        _ => Status::unavailable("managed creation state unavailable"),
+    }
 }

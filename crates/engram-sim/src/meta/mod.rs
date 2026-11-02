@@ -305,6 +305,12 @@ pub struct SimDb {
     >,
     pub managed_interrupted_floors: std::collections::BTreeMap<SessionId, i64>,
     pub managed_interrupted: std::collections::BTreeSet<(SessionId, u64)>,
+    pub managed_boot_selections: std::collections::BTreeMap<
+        SessionId,
+        engram_core::types::managed_bridge::ManagedBootSelection,
+    >,
+    pub managed_boot_intents:
+        std::collections::BTreeMap<String, engram_core::types::managed_bridge::ManagedBootIntent>,
     pub managed_creations:
         std::collections::BTreeMap<SessionId, engram_core::types::managed_create::ManagedCreation>,
     pub session_integration_policy: std::collections::BTreeMap<SessionId, String>,
