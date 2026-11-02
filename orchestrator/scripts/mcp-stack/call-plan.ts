@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { requireThat } from "./context.ts";
+import { canonicalJson } from "./guest.ts";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 export const CallPlanSchema = z.strictObject({
@@ -30,10 +31,30 @@ function depth(value: unknown, current = 0): number {
 export function encodeCallPlan(input: CallPlan) {
   const plan = CallPlanSchema.parse(input);
   requireThat(
-    new Set(plan.steps.map((step) => step.marker)).size === plan.steps.length &&
-      new Set(plan.steps.map((step) => step.callId)).size === plan.steps.length,
+    new Set(plan.steps.map((step) => step.marker)).size === plan.steps.length,
     "call_plan_unique_identity",
   );
+  for (const callId of new Set(plan.steps.map((step) => step.callId))) {
+    const pair = plan.steps.filter((step) => step.callId === callId);
+    if (pair.length === 1) continue;
+    const [present, absent] = pair;
+    requireThat(
+      pair.length === 2 &&
+        present &&
+        absent &&
+        present.expectExposure !== "absent" &&
+        absent.expectExposure === "absent" &&
+        present.resultFormat === "mcp" &&
+        absent.resultFormat === "mcp" &&
+        present.tool.startsWith("mcp_") &&
+        present.tool === absent.tool &&
+        canonicalJson(present.arguments) === canonicalJson(absent.arguments) &&
+        present.completionProjection === undefined &&
+        absent.completionProjection === undefined &&
+        absent.expectedResult === undefined,
+      "call_plan_duplicate_rebind_pair",
+    );
+  }
   for (const step of plan.steps) {
     requireThat(
       step.expectExposure !== "absent" ||

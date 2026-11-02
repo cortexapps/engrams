@@ -347,6 +347,31 @@ export class DatabaseObserver {
     requireThat(row.success, "coordinator_outbox_shape");
     return row.data;
   }
+  async deliveryTarget(sessionId: string, callId: string) {
+    const taskId = this.task(sessionId);
+    requireThat(
+      /^[A-Za-z0-9_-]{1,64}$/.test(callId),
+      "delivery_target_call_id",
+    );
+    const result = await this.coordinator.query(
+      "SELECT (SELECT min(e.idx)::text FROM session_events e WHERE e.session_id=c.session_id AND e.kind='tool_call_requested' AND e.payload->>'tool_call_id'=$3) AS requested_index,COALESCE((SELECT max(event_floor) FROM session_managed_interrupted_targets WHERE session_id=c.session_id),0)::text AS interruption_floor FROM session_managed_creations c WHERE c.session_id=$1 AND c.task_id=$2",
+      [sessionId, taskId, callId],
+    );
+    requireThat(result.rowCount === 1, "delivery_target_creation");
+    const parsed = z
+      .strictObject({
+        requested_index: z.string().regex(/^[0-9]+$/),
+        interruption_floor: z.string().regex(/^[0-9]+$/),
+      })
+      .safeParse(result.rows[0]);
+    requireThat(parsed.success, "delivery_target_actual_request");
+    return {
+      ...parsed.data,
+      targetGone:
+        BigInt(parsed.data.requested_index) <
+        BigInt(parsed.data.interruption_floor),
+    };
+  }
   async close() {
     await Promise.all([this.coordinator.end(), this.orchestrator.end()]);
   }

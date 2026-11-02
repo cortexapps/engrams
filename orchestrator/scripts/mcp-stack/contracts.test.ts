@@ -593,3 +593,30 @@ test("grant replacement preserves public profile state and exact publication CAS
   expect(decoded.network?.default).toBe("allow");
   expect(decoded.programmaticOnly).toBe(true);
 });
+
+test("only an exact ordered present-to-absent pair can reuse a native call ID", async () => {
+  const { encodeCallPlan } = await import("./call-plan.ts");
+  const present = {
+    marker: "before",
+    tool: "mcp_counter",
+    arguments: { delta: 1 },
+    callId: "same-call",
+    resultFormat: "mcp" as const,
+  };
+  const absent = {
+    ...present,
+    marker: "after",
+    expectExposure: "absent" as const,
+  };
+  expect(
+    JSON.parse(encodeCallPlan({ steps: [present, absent] })).steps,
+  ).toHaveLength(2);
+  for (const steps of [
+    [absent, present],
+    [present, { ...absent, arguments: { delta: 2 } }],
+    [present, { ...absent, tool: "mcp_other" }],
+    [present, { ...absent, expectExposure: "present" as const }],
+    [present, absent, { ...absent, marker: "third" }],
+  ])
+    expect(() => encodeCallPlan({ steps })).toThrow();
+});

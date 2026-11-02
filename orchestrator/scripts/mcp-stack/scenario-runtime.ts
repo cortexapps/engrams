@@ -346,6 +346,46 @@ export async function verifiedCounterResult(
     settlement: response.settlement,
   };
 }
+export async function toolCompletionEvents(
+  scenario: StartedScenario,
+  callId = scenario.input.callId,
+) {
+  const page = await scenario.reviewClient.sessions.listSessionEvents({
+    sessionId: scenario.sessionId,
+    kinds: ["tool_call_completed"],
+    toolNames: [scenario.alias],
+    limit: 129n,
+  });
+  requireThat(page.events.length < 129, "completion_event_bound");
+  return page.events.flatMap((event) => {
+    requireThat(
+      event.kind === "tool_call_completed" && event.idx !== undefined,
+      "completion_event_identity",
+    );
+    const parsed = z
+      .object({
+        tool_call_id: z.string(),
+        tool_name: z.string(),
+        run_id: z.string(),
+        ok: z.boolean(),
+      })
+      .safeParse(JSON.parse(event.payloadJson));
+    requireThat(
+      parsed.success && parsed.data.tool_name === scenario.alias,
+      "completion_event_shape",
+    );
+    return parsed.data.tool_call_id === callId
+      ? [
+          {
+            ...parsed.data,
+            idx: String(event.idx),
+            sha256: sha256(event.payloadJson),
+          },
+        ]
+      : [];
+  });
+}
+
 export async function delivered(
   ctx: Context,
   database: DatabaseObserver,
@@ -401,7 +441,23 @@ export async function delivered(
     outbox.relayed && outbox.attempts >= 1,
     "outbox_relay_before_ack",
   );
-  return { proofHashes: observed.map((value) => value.sha256), outbox };
+  const completion = await waitFor(
+    ctx,
+    "actual_native_completion_event",
+    () => toolCompletionEvents(scenario),
+    (events) => events.length > 0,
+  );
+  const target = await database.deliveryTarget(
+    scenario.sessionId,
+    scenario.input.callId,
+  );
+  requireThat(!target.targetGone, "guest_ack_is_not_target_gone_settlement");
+  return {
+    proofHashes: observed.map((value) => value.sha256),
+    outbox,
+    completion,
+    target,
+  };
 }
 
 /** A native receipt is separate from outbox ACK and upstream outcome. */

@@ -189,3 +189,14 @@ Managed resume uses the public `PrepareMcpRebind` and `RebindMcp` review flow.
 The runner checks a new sandbox and boot attempt, the next binding epoch, exact
 reviewed bindings, coordinator and orchestrator Started state, and guest return.
 Ordinary `SessionService.Resume` must remain denied for this managed session.
+
+A call ID may occur in exactly two ordered plan steps for the rebind test:
+first present, then explicit absent. Both steps must use the same MCP alias,
+canonical arguments, and MCP result format. Neither can project a premature
+completion. All other duplicate IDs fail. The runner counts prior proofs before
+recovery and requires a new explicit absent-denial proof after the second step.
+
+Delivery checks combine the actual native result proof, public
+`tool_call_completed` event, and coordinator outbox ACK with the current managed
+delivery target. An outbox ACK alone is insufficient: the coordinator also ACKs
+an old delivery after managed cold recovery retires its target.
