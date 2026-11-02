@@ -8,6 +8,7 @@ import {
   sha256,
   type Context,
   type FixtureKind,
+  type ConfigurationId,
 } from "./context.ts";
 import {
   jsonRequest,
@@ -15,6 +16,7 @@ import {
   publicClient,
   type PublicClient,
 } from "./transport.ts";
+import { canonicalJson } from "./guest.ts";
 import type { Harness } from "./manifest.ts";
 import { encodeCallPlan, type CallPlan } from "./call-plan.ts";
 
@@ -133,10 +135,16 @@ export async function bootstrapHumans(ctx: Context) {
     owner: clients.owner,
     other: clients.other,
     unattended,
+    actorIds: {
+      admin: identities[0]!,
+      owner: identities[1]!,
+      other: identities[2]!,
+      unattended: identity.userId,
+    },
   };
 }
 
-export async function publishOperator(ctx: Context): Promise<void> {
+export async function publishOperator(ctx: Context, variant?: ConfigurationId) {
   const client = await operatorClient(ctx);
   const parse = (bytes: Uint8Array) => {
     try {
@@ -163,20 +171,26 @@ export async function publishOperator(ctx: Context): Promise<void> {
   const before = await client.read({ protocol: 1 });
   requireThat(before.protocol === 1, "operator_protocol");
   const prior = parse(before.publicationJson);
+  const candidateIdentity = variant
+    ? ctx.supervisor.operatorCandidates[variant]?.identity
+    : ctx.publication.candidateIdentity;
+  requireThat(candidateIdentity, "declared_operator_candidate");
+  const expectedGeneration = variant
+    ? (prior.published?.generation ?? null)
+    : ctx.publication.expectedGeneration;
   requireThat(
     prior.pending === null &&
-      (prior.published?.generation ?? null) ===
-        ctx.publication.expectedGeneration,
+      (prior.published?.generation ?? null) === expectedGeneration,
     "operator_expected_generation",
   );
   await client.stage({
     protocol: 1,
-    configuredCandidateIdentity: ctx.publication.candidateIdentity,
-    ...(ctx.publication.expectedGeneration === null
+    configuredCandidateIdentity: candidateIdentity,
+    ...(expectedGeneration === null
       ? {}
-      : { expectedGeneration: BigInt(ctx.publication.expectedGeneration) }),
+      : { expectedGeneration: BigInt(expectedGeneration) }),
   });
-  await waitFor(
+  return waitFor(
     ctx,
     "publication_open",
     async () => {
@@ -187,9 +201,8 @@ export async function publishOperator(ctx: Context): Promise<void> {
     (value) =>
       value.pending === null &&
       value.admission_open === true &&
-      value.published?.identity === ctx.publication.candidateIdentity &&
-      value.published.generation ===
-        (ctx.publication.expectedGeneration ?? 0) + 1 &&
+      value.published?.identity === candidateIdentity &&
+      value.published.generation === (expectedGeneration ?? 0) + 1 &&
       value.published.candidate?.deployment_identity ===
         ctx.publication.deploymentIdentity &&
       value.published.candidate.network_identity ===
@@ -199,12 +212,36 @@ export async function publishOperator(ctx: Context): Promise<void> {
   );
 }
 
+export async function publishOperatorVariant(
+  ctx: Context,
+  configurationId: ConfigurationId,
+) {
+  return publishOperator(ctx, configurationId);
+}
+
 export async function createCatalog(
   ctx: Context,
   admin: PublicClient,
   suffix: string,
   protocol: FixtureKind = "modern",
+  authKind: "api_key" | "oauth" = "api_key",
 ) {
+  let registrationId: string | undefined;
+  if (authKind === "oauth") {
+    const setup = await admin.integration.getMcpSetup({});
+    const matches = setup.registrations.filter(
+      (registration) =>
+        registration.resource?.endpoint ===
+          `${ctx.protocolFixtures[protocol].resourceOrigin}/mcp` &&
+        registration.issuer === ctx.protocolFixtures[protocol].issuerOrigin &&
+        registration.redirectUri === ctx.protocolFixtures[protocol].redirectUri,
+    );
+    requireThat(
+      setup.enabled && matches.length === 1,
+      "exact_oauth_registration_before_create",
+    );
+    registrationId = matches[0]!.id;
+  }
   requireThat(/^[a-z0-9-]{1,40}$/.test(suffix), "connection_suffix");
   const created = await admin.integration.createConnection({
     alias: `fixture-${suffix}`,
@@ -213,7 +250,13 @@ export async function createCatalog(
     mcp: {
       endpoint: `${ctx.protocolFixtures[protocol].resourceOrigin}/mcp`,
       zone: ctx.publication.zone,
-      authKind: "api_key",
+      authKind,
+      ...(registrationId
+        ? {
+            oauthClientRegistrationId: registrationId,
+            shareWithOrgSessions: true,
+          }
+        : {}),
     },
   });
   requireThat(
@@ -222,30 +265,41 @@ export async function createCatalog(
         `${ctx.protocolFixtures[protocol].resourceOrigin}/mcp`,
     "created_connection",
   );
-  const resourceKey = (
-    await privateFile(
-      ctx.runRoot,
-      ctx.protocolFixtures[protocol].resourceKeyFile,
+  let authorizedConnection;
+  if (authKind === "oauth") {
+    authorizedConnection = await authorizeOAuth(
+      ctx,
+      admin,
+      created.connection.id,
+      protocol,
+    );
+  } else {
+    const resourceKey = (
+      await privateFile(
+        ctx.runRoot,
+        ctx.protocolFixtures[protocol].resourceKeyFile,
+      )
     )
-  )
-    .toString("utf8")
-    .trim();
-  requireThat(
-    /^[A-Za-z0-9_-]{16,128}$/.test(resourceKey),
-    "neutral_resource_key",
-  );
-  const credential = await admin.integration.putMcpCredential({
-    connectionId: created.connection.id,
-    expectedRevision: created.connection.configRevision,
-    expectedGeneration: created.connection.authGeneration,
-    kind: "api_key",
-    header: "authorization",
-    value: `Bearer ${resourceKey}`,
-  });
-  requireThat(credential.connection, "credential_connection");
+      .toString("utf8")
+      .trim();
+    requireThat(
+      /^[A-Za-z0-9_-]{16,128}$/.test(resourceKey),
+      "neutral_resource_key",
+    );
+    const credential = await admin.integration.putMcpCredential({
+      connectionId: created.connection.id,
+      expectedRevision: created.connection.configRevision,
+      expectedGeneration: created.connection.authGeneration,
+      kind: "api_key",
+      header: "authorization",
+      value: `Bearer ${resourceKey}`,
+    });
+    requireThat(credential.connection, "credential_connection");
+    authorizedConnection = credential.connection;
+  }
   const discovered = await admin.integration.discoverMcp({
     connectionId: created.connection.id,
-    expectedRevision: credential.connection.configRevision,
+    expectedRevision: authorizedConnection.configRevision,
   });
   requireThat(
     discovered.catalog?.tools.length === 2 &&
@@ -278,7 +332,7 @@ export async function createCatalog(
       published.catalog.tools.length === 2,
     "published_catalog",
   );
-  return { connection: credential.connection, catalog: published.catalog };
+  return { connection: authorizedConnection, catalog: published.catalog };
 }
 
 /** Stable compiled name from actual public connection identity; verify against public binding before prompt. */
@@ -304,7 +358,7 @@ export async function bindingTools(client: PublicClient, sessionId: string) {
       sessionId,
       omitExecutions: true,
       omitBindings: false,
-      bindingPageSize: 64,
+      bindingPageSize: 16,
       afterBindingToolName: cursor,
     });
     requireThat(state.bindingReceipt?.current, "current_binding");
@@ -390,6 +444,7 @@ export async function authorizeOAuth(
   ctx: Context,
   admin: PublicClient,
   connectionId: string,
+  protocol: FixtureKind = "modern",
 ) {
   const setup = await admin.integration.getMcpSetup({ connectionId });
   requireThat(
@@ -402,10 +457,10 @@ export async function authorizeOAuth(
   );
   requireThat(
     registration &&
-      registration.redirectUri === ctx.protocolFixtures.modern.redirectUri &&
-      registration.issuer === ctx.protocolFixtures.modern.issuerOrigin &&
+      registration.redirectUri === ctx.protocolFixtures[protocol].redirectUri &&
+      registration.issuer === ctx.protocolFixtures[protocol].issuerOrigin &&
       registration.resource?.endpoint ===
-        `${ctx.protocolFixtures.modern.resourceOrigin}/mcp`,
+        `${ctx.protocolFixtures[protocol].resourceOrigin}/mcp`,
     "oauth_exact_registration",
   );
   const begun = await admin.integration.authorizeMcp({
@@ -416,10 +471,11 @@ export async function authorizeOAuth(
   });
   const authorization = new URL(begun.authorizationUrl);
   requireThat(
-    authorization.origin === ctx.protocolFixtures.modern.authorizationOrigin &&
+    authorization.origin ===
+      ctx.protocolFixtures[protocol].authorizationOrigin &&
       authorization.pathname === "/authorize" &&
       authorization.searchParams.get("resource") ===
-        `${ctx.protocolFixtures.modern.resourceOrigin}/mcp` &&
+        `${ctx.protocolFixtures[protocol].resourceOrigin}/mcp` &&
       authorization.searchParams.get("redirect_uri") ===
         registration.redirectUri &&
       authorization.searchParams.get("client_id") === registration.clientId &&
@@ -433,7 +489,7 @@ export async function authorizeOAuth(
   requireThat(state && state.length <= 256, "oauth_state");
   const response = await jsonRequest(
     ctx,
-    { ...ctx.protocolFixtures.modern, origin: authorization.origin },
+    { ...ctx.protocolFixtures[protocol], origin: authorization.origin },
     "GET",
     authorization.pathname + authorization.search,
   );
@@ -562,5 +618,12 @@ export async function createFixtureProfile(
       response.profile.mcpGrantRevision === 1n,
     "published_fixture_profile",
   );
-  return { profileId: response.profile.id, alias, proof };
+  return {
+    profileId: response.profile.id,
+    alias,
+    proof,
+    planSha256: input.callPlan
+      ? `sha256:${sha256(canonicalJson(input.callPlan))}`
+      : undefined,
+  };
 }

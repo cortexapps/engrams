@@ -47,6 +47,7 @@ export async function startScenario(
     callId: string;
     defaultAllow?: boolean;
     grant?: boolean;
+    authKind?: "api_key" | "oauth";
     callPlan?: (alias: string) => CallPlan;
     expectedNativeResult?: Record<string, unknown>;
   },
@@ -58,6 +59,7 @@ export async function startScenario(
     principals.admin,
     input.suffix,
     input.protocol,
+    input.authKind,
   );
   const profile = await createFixtureProfile(ctx, principals.admin, {
     ...input,
@@ -70,6 +72,8 @@ export async function startScenario(
     defaultAllow: input.defaultAllow ?? false,
   });
   const client = principals[input.caller];
+  const reviewClient =
+    input.caller === "unattended" ? principals.admin : client;
   const task = await createHumanTask(
     ctx,
     client,
@@ -98,7 +102,7 @@ export async function startScenario(
   );
   if (input.grant !== false) {
     const bound = await bindingTool(
-      client,
+      reviewClient,
       task.sessionId,
       connection.id,
       input.upstreamName,
@@ -116,7 +120,7 @@ export async function startScenario(
     );
   } else {
     requireThat(
-      (await bindingTools(client, task.sessionId)).length === 0,
+      (await bindingTools(reviewClient, task.sessionId)).length === 0,
       "missing_grant_empty_binding",
     );
   }
@@ -125,6 +129,12 @@ export async function startScenario(
     ...task,
     ...profile,
     client,
+    reviewClient,
+    callerActorId: principals.actorIds[input.caller],
+    reviewActorId:
+      principals.actorIds[
+        input.caller === "unattended" ? "admin" : input.caller
+      ],
     fixture,
     connection,
     catalog,
@@ -160,20 +170,21 @@ export async function execution(
   ctx: Context,
   scenario: StartedScenario,
   terminal = true,
+  callId = scenario.input.callId,
 ) {
   return waitFor(
     ctx,
     "public_execution",
     async () => {
-      const state = await scenario.client.integration.getSessionMcpState({
+      const state = await scenario.reviewClient.integration.getSessionMcpState({
         sessionId: scenario.sessionId,
         omitBindings: true,
-        pageSize: 64,
+        pageSize: 16,
       });
       requireThat(!state.hasMoreExecutions, "fresh_session_execution_bound");
       const matches = state.executions.filter(
         (row) =>
-          row.toolCallId === scenario.input.callId &&
+          row.toolCallId === callId &&
           row.connectionId === scenario.connection.id,
       );
       requireThat(matches.length <= 1, "single_call_identity");
@@ -197,9 +208,11 @@ export async function approveOnce(
     ctx,
     "interactive_approval",
     async () => {
-      const response = await scenario.client.integration.listMcpApprovals({
-        sessionId: scenario.sessionId,
-      });
+      const response = await scenario.reviewClient.integration.listMcpApprovals(
+        {
+          sessionId: scenario.sessionId,
+        },
+      );
       requireThat(
         !response.nextExecutionId && response.approvals.length <= 1,
         "single_approval",
@@ -267,10 +280,11 @@ export async function verifiedCounterResult(
   count: number,
   isError: boolean,
 ) {
-  const response = await scenario.client.integration.getMcpExecutionResult({
-    sessionId: scenario.sessionId,
-    executionId,
-  });
+  const response =
+    await scenario.reviewClient.integration.getMcpExecutionResult({
+      sessionId: scenario.sessionId,
+      executionId,
+    });
   requireThat(
     response.resultJson && !response.resultUnavailable,
     "persisted_verified_result_available",
@@ -363,6 +377,64 @@ export async function delivered(
     "outbox_relay_before_ack",
   );
   return { proofHashes: observed.map((value) => value.sha256), outbox };
+}
+
+/** A native receipt is separate from outbox ACK and upstream outcome. */
+export async function pollProof(
+  ctx: Context,
+  scenario: StartedScenario,
+  input: {
+    callId: string;
+    tool: string;
+    planSha256?: string;
+    afterCount?: number;
+  },
+) {
+  requireThat(
+    /^[A-Za-z0-9_-]{1,64}$/.test(input.callId) &&
+      /^[A-Za-z0-9_]{1,128}$/.test(input.tool),
+    "proof_selection_identity",
+  );
+  const afterCount = input.afterCount ?? 0;
+  requireThat(
+    Number.isInteger(afterCount) && afterCount >= 0 && afterCount <= 128,
+    "proof_selection_count",
+  );
+  return waitFor(
+    ctx,
+    "native_completed_proof",
+    async () => {
+      const paths = await proofPaths(
+        ctx,
+        scenario.client,
+        scenario.sessionId,
+        scenario.input.suffix,
+      );
+      requireThat(paths.length <= 16, "proof_launch_bound");
+      const records = (
+        await Promise.all(
+          paths.map((path) =>
+            readGuestProofRecords(
+              ctx,
+              scenario.client,
+              scenario.sessionId,
+              path,
+            ),
+          ),
+        )
+      ).flat();
+      return records.filter(
+        (record) =>
+          record.proof.callId === input.callId &&
+          record.proof.tool === input.tool &&
+          (input.planSha256 === undefined ||
+            record.proof.planSha256 === input.planSha256) &&
+          (record.proof.resultReceived === true ||
+            record.proof.forgedRejected === true),
+      );
+    },
+    (records) => records.length > afterCount,
+  );
 }
 export async function closeScenario(
   principals: Principals,

@@ -15,6 +15,10 @@ const observation = z.strictObject({
   caseKey: z.enum(REQUIRED_CASES.map((v) => v.key)),
   // Object identities are hashed before reaching this sink. Never store arguments, results or headers.
   identitySha256: z.string().regex(/^[a-f0-9]{64}$/),
+  actorSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   state: z.enum([
     "created",
     "started",
