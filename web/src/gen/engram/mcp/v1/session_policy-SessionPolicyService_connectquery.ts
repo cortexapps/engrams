@@ -5,6 +5,21 @@
 import { SessionPolicyService } from "./session_policy_pb";
 
 /**
+ * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadManagedCreationState
+ */
+export const readManagedCreationState = SessionPolicyService.method.readManagedCreationState;
+
+/**
+ * @generated from rpc engram.mcp.v1.SessionPolicyService.PrepareManagedBoot
+ */
+export const prepareManagedBoot = SessionPolicyService.method.prepareManagedBoot;
+
+/**
+ * @generated from rpc engram.mcp.v1.SessionPolicyService.RecoverManagedBoot
+ */
+export const recoverManagedBoot = SessionPolicyService.method.recoverManagedBoot;
+
+/**
  * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadPublishedOperator
  */
 export const readPublishedOperator = SessionPolicyService.method.readPublishedOperator;

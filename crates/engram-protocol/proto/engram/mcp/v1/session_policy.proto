@@ -5,6 +5,9 @@ import "engram/app/v1/session.proto";
 
 // Dedicated pinned mTLS only. Create reuses the ordinary creation core.
 service SessionPolicyService {
+  rpc ReadManagedCreationState(ReadManagedCreationStateRequest) returns (ReadManagedCreationStateResponse);
+  rpc PrepareManagedBoot(PrepareManagedBootRequest) returns (PrepareManagedBootResponse);
+  rpc RecoverManagedBoot(RecoverManagedBootRequest) returns (RecoverManagedBootResponse);
   rpc ReadPublishedOperator(ReadPublishedOperatorRequest) returns (ReadPublishedOperatorResponse);
   rpc ReadManagedBoot(ReadManagedBootRequest) returns (ReadManagedBootResponse);
   rpc FinalizeManagedBoot(FinalizeManagedBootRequest) returns (FinalizeManagedBootResponse);
@@ -194,3 +197,27 @@ message ReadPublishedOperatorResponse {
   uint32 protocol = 1;
   bytes publication_json = 2;
 }
+
+message ReadManagedCreationStateRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+}
+message ReadManagedCreationStateResponse { uint32 protocol = 1; bytes state_json = 2; }
+message PrepareManagedBootRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+}
+message PrepareManagedBootResponse { uint32 protocol = 1; bytes state_json = 2; }
+message RecoverManagedBootRequest {
+  uint32 protocol = 1;
+  ManagedCreateIdentity identity = 2;
+  uint32 native_version = 3;
+  string native_digest = 4;
+  bytes expected_source_key_json = 5;
+  string recovery_id = 6;
+}
+message RecoverManagedBootResponse { uint32 protocol = 1; bytes state_json = 2; }

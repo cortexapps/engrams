@@ -595,3 +595,20 @@ The reply reports the actual backend and host incarnation plus verified logical
 disk byte hash/size and kernel hash. Inspection creates no VM or policy lease.
 Preparation checks the same bytes again. An unsupported host remains closed.
 This additive gRPC method does not change the bincode wire layout.
+
+### Identity-only managed preparation and recovery bridge
+
+The internal policy service exposes `ReadManagedCreationState`, `PrepareManagedBoot`,
+and `RecoverManagedBoot`. Each method has its own response envelope. Requests bind
+only the immutable creation identity and native manifest version/digest; recovery
+also binds an exact previously read source key and a bounded recovery ID. The
+coordinator selects and pins approved physical inputs. Callers cannot provide a
+host, disk path, kernel hash, or replacement epoch.
+
+The sanitized state distinguishes absent, held, preparing, boot, recovering, and
+terminal. It includes the exact current boot and operation identity, but excludes
+sealed agent ciphertext. Absence does not fence an in-flight reserve. Recovery
+retries retain their original operation identity even when a newer boot exists.
+The JSON contracts are versioned by their existing nested authorities; additive
+protobuf methods preserve protocol and WIRE versions. These contracts alone do
+not enable creation or prove physical host execution.
