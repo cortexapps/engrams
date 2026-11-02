@@ -68,45 +68,119 @@ export async function readGuestFile(
   return value;
 }
 
-export const NativeProofSchema = z.object({
-  callId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
-  tool: z.string().regex(/^[A-Za-z0-9_]{1,128}$/),
-  resultReceived: z.boolean().optional(),
-  forgedRejected: z.boolean().optional(),
-  delivery: z.enum(["available", "unavailable"]).optional(),
-  outcome: z
-    .enum(["succeeded", "failed", "canceled", "outcome_unknown"])
-    .nullable()
-    .optional(),
-  resultUnavailable: z.boolean().nullable().optional(),
-  isError: z.boolean().nullable().optional(),
-  denialPlanMode: z.boolean().optional(),
-  selectedToolName: z
-    .string()
-    .regex(/^[A-Za-z0-9_]{1,128}$/)
-    .optional(),
-  selectedSchemaSha256: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/)
-    .optional(),
-  exposedMcpToolNamesSha256: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/)
-    .optional(),
-  planSha256: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/)
-    .optional(),
-  resultMatchesExpected: z.boolean().optional(),
-  resultSha256: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/)
-    .optional(),
-  expectedResultSha256: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/)
-    .optional(),
-});
+export const NativeProofSchema = z
+  .object({
+    callId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+    tool: z.string().regex(/^[A-Za-z0-9_]{1,128}$/),
+    observation: z
+      .enum([
+        "completionBarrierHeld",
+        "completionBarrierReleased",
+        "prematureBarrierHeld",
+        "prematureBarrierReleased",
+        "prematureCompletionEmitted",
+      ])
+      .optional(),
+    eventSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    expectExposure: z.enum(["present", "absent"]).optional(),
+    requestAttempted: z.literal(true).optional(),
+    protocolDenialCode: z.literal("unknown_tool").optional(),
+    nativeDenialCode: z.literal(-32602).optional(),
+    resultReceived: z.boolean().optional(),
+    forgedRejected: z.boolean().optional(),
+    delivery: z.enum(["available", "unavailable"]).optional(),
+    outcome: z
+      .enum(["succeeded", "failed", "canceled", "outcome_unknown"])
+      .nullable()
+      .optional(),
+    resultUnavailable: z.boolean().nullable().optional(),
+    isError: z.boolean().nullable().optional(),
+    denialPlanMode: z.boolean().optional(),
+    selectedToolName: z
+      .string()
+      .regex(/^[A-Za-z0-9_]{1,128}$/)
+      .optional(),
+    selectedSchemaSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    exposedMcpToolNamesSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    planSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    resultMatchesExpected: z.boolean().optional(),
+    resultSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    expectedResultSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    const resultFields = [
+      value.resultReceived,
+      value.forgedRejected,
+      value.delivery,
+      value.outcome,
+      value.resultUnavailable,
+      value.isError,
+      value.denialPlanMode,
+      value.resultMatchesExpected,
+      value.resultSha256,
+      value.expectedResultSha256,
+    ];
+    if (value.observation !== undefined) {
+      if (
+        resultFields.some((field) => field !== undefined) ||
+        value.expectExposure !== undefined ||
+        value.requestAttempted !== undefined ||
+        value.protocolDenialCode !== undefined ||
+        value.nativeDenialCode !== undefined ||
+        value.selectedSchemaSha256 !== undefined ||
+        value.selectedToolName !== undefined ||
+        value.exposedMcpToolNamesSha256 !== undefined ||
+        (value.observation === "prematureCompletionEmitted") !==
+          (value.eventSha256 !== undefined)
+      )
+        ctx.addIssue({ code: "custom", message: "observation_is_not_result" });
+    } else if (value.eventSha256 !== undefined) {
+      ctx.addIssue({ code: "custom", message: "event_requires_observation" });
+    }
+    if (
+      value.expectExposure === "absent" &&
+      (value.observation !== undefined ||
+        !value.tool.startsWith("mcp_") ||
+        value.selectedToolName !== value.tool ||
+        value.requestAttempted !== true ||
+        value.protocolDenialCode !== "unknown_tool" ||
+        !value.planSha256 ||
+        !value.exposedMcpToolNamesSha256 ||
+        value.selectedSchemaSha256 !== undefined ||
+        resultFields.some((field) => field !== undefined))
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "absent_is_protocol_denial_only",
+      });
+    if (
+      value.expectExposure !== "absent" &&
+      [
+        value.requestAttempted,
+        value.protocolDenialCode,
+        value.nativeDenialCode,
+      ].some((field) => field !== undefined)
+    )
+      ctx.addIssue({ code: "custom", message: "denial_requires_absence" });
+  });
 
 export function parseGuestProofRecords(bytes: Buffer) {
   requireThat(bytes.length <= 1024 * 1024, "guest_proof_size");
@@ -325,4 +399,35 @@ export function expectedCounterNative(
           { type: "inputText", text: canonicalJson(metadata) },
         ],
       };
+}
+
+/** Publish only the fixed exclusive release file; the CLI independently checks its owner/type/mode. */
+export async function releaseGuestBarrier(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  kind: "completion" | "premature",
+) {
+  requireThat(
+    kind === "completion" || kind === "premature",
+    "guest_barrier_kind",
+  );
+  const response = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    `set -eu
+root=/tmp/mcp-stack-fixture
+path="$root/${kind}-release"
+test -d "$root" && test ! -L "$root"
+test "$(stat -c %a "$root")" = 700
+test "$(stat -c %u "$root")" = "$(id -u)"
+umask 077
+set -C
+: > "$path"
+`,
+  ]);
+  requireThat(
+    response.status === 0 && response.stdout.length === 0,
+    "guest_barrier_exclusive_release",
+  );
 }

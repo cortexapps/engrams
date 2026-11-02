@@ -171,3 +171,21 @@ It does not print exceptions, credentials, cookies, codes, arguments or results.
    owned fixture extension must be integrated before a run.
 8. Coherent production startup and both physical adapters remain external work.
    No helper module or unit test in this directory establishes physical proof.
+
+The fixed call plan can assert `expectExposure: "absent"` for an exact MCP
+alias. Such a step must observe a real protocol denial and cannot include an
+expected result or premature completion. `completionProjection: "premature"`
+is a separate adversarial step for an exposed MCP call and cannot include an
+expected result. Barrier records are observations, never result receipts.
+
+The common runner exposes only two release files under the fixed guest state
+root: `completion-release` and `premature-release`. Profile options enable the
+matching fixture environment variables. Releases use exclusive creation with
+mode 0600. The CLI independently validates and consumes each release. Its fixed
+120-second bound is not configurable by the runner. A normal native completion
+notification still requires separate actual coordinator outbox ACK evidence.
+
+Managed resume uses the public `PrepareMcpRebind` and `RebindMcp` review flow.
+The runner checks a new sandbox and boot attempt, the next binding epoch, exact
+reviewed bindings, coordinator and orchestrator Started state, and guest return.
+Ordinary `SessionService.Resume` must remain denied for this managed session.

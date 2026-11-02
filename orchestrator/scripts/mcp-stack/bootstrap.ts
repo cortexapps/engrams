@@ -567,6 +567,8 @@ export async function createFixtureProfile(
     callId: string;
     expectedNativeResult?: Record<string, unknown>;
     callPlan?: CallPlan;
+    completionBarrier?: boolean;
+    prematureBarrier?: boolean;
     grant: boolean;
     automationWrite: boolean;
     constraints: object[];
@@ -595,6 +597,12 @@ export async function createFixtureProfile(
       Buffer.byteLength(expectedJson) <= 1024 * 1024,
     "expected_native_result_bounds",
   );
+  requireThat(
+    !input.callPlan?.steps.some(
+      (step) => step.completionProjection === "premature",
+    ) || input.prematureBarrier === true,
+    "premature_barrier_required",
+  );
   const response = await admin.profiles.createProfile({
     name: `Fixture ${input.suffix}`,
     imageId: ctx.imageId,
@@ -615,6 +623,16 @@ export async function createFixtureProfile(
               : { ENGRAM_FIXTURE_EXPECTED_RESULT_JSON: expectedJson }),
           }),
       ENGRAM_FIXTURE_STATE_DIR: ctx.guest.stateDirectory,
+      ...(input.completionBarrier
+        ? {
+            ENGRAM_FIXTURE_COMPLETION_BARRIER: `${ctx.guest.stateDirectory}/completion-release`,
+          }
+        : {}),
+      ...(input.prematureBarrier
+        ? {
+            ENGRAM_FIXTURE_PREMATURE_BARRIER: `${ctx.guest.stateDirectory}/premature-release`,
+          }
+        : {}),
       ENGRAM_FIXTURE_PROOF: proof,
       [input.harness === "claude" ? "ENGRAM_CLAUDE_BIN" : "ENGRAM_CODEX_BIN"]:
         ctx.guest.cliPath,

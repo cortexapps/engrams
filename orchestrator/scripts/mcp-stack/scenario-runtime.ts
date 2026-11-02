@@ -52,7 +52,12 @@ export async function startScenario(
     defaultAllow?: boolean;
     grant?: boolean;
     authKind?: "api_key" | "oauth";
-    callPlan?: (alias: string) => CallPlan;
+    callPlan?: (
+      alias: string,
+      connection: { id: string; alias: string },
+    ) => CallPlan;
+    completionBarrier?: boolean;
+    prematureBarrier?: boolean;
     expectedNativeResult?: Record<string, unknown>;
   },
 ) {
@@ -72,6 +77,7 @@ export async function startScenario(
     grant: input.grant ?? true,
     callPlan: input.callPlan?.(
       modelToolName(connection.id, connection.alias, input.upstreamName),
+      { id: connection.id, alias: connection.alias },
     ),
     defaultAllow: input.defaultAllow ?? false,
   });
@@ -399,7 +405,34 @@ export async function delivered(
 }
 
 /** A native receipt is separate from outbox ACK and upstream outcome. */
+type ProofSelection = {
+  callId: string;
+  tool: string;
+  planSha256?: string;
+  afterCount?: number;
+};
 export async function pollProof(
+  ctx: Context,
+  scenario: StartedScenario,
+  input: ProofSelection,
+) {
+  return pollSelectedProof(ctx, scenario, input);
+}
+export async function pollGuestObservation(
+  ctx: Context,
+  scenario: StartedScenario,
+  input: ProofSelection & {
+    observation:
+      | "completionBarrierHeld"
+      | "completionBarrierReleased"
+      | "prematureBarrierHeld"
+      | "prematureBarrierReleased"
+      | "prematureCompletionEmitted";
+  },
+) {
+  return pollSelectedProof(ctx, scenario, input);
+}
+async function pollSelectedProof(
   ctx: Context,
   scenario: StartedScenario,
   input: {
@@ -407,6 +440,12 @@ export async function pollProof(
     tool: string;
     planSha256?: string;
     afterCount?: number;
+    observation?:
+      | "completionBarrierHeld"
+      | "completionBarrierReleased"
+      | "prematureBarrierHeld"
+      | "prematureBarrierReleased"
+      | "prematureCompletionEmitted";
   },
 ) {
   requireThat(
@@ -448,8 +487,14 @@ export async function pollProof(
           record.proof.tool === input.tool &&
           (input.planSha256 === undefined ||
             record.proof.planSha256 === input.planSha256) &&
-          (record.proof.resultReceived === true ||
-            record.proof.forgedRejected === true),
+          (input.observation !== undefined
+            ? record.proof.observation === input.observation
+            : record.proof.observation === undefined &&
+              (record.proof.resultReceived === true ||
+                record.proof.forgedRejected === true ||
+                (record.proof.expectExposure === "absent" &&
+                  record.proof.requestAttempted === true &&
+                  record.proof.protocolDenialCode === "unknown_tool"))),
       );
     },
     (records) => records.length > afterCount,

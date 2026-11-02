@@ -12,6 +12,8 @@ export const CallPlanSchema = z.strictObject({
         callId: id,
         resultFormat: z.enum(["mcp", "json"]),
         expectedResult: z.record(z.string(), z.unknown()).optional(),
+        expectExposure: z.enum(["present", "absent"]).optional(),
+        completionProjection: z.literal("premature").optional(),
       }),
     )
     .min(1)
@@ -32,12 +34,28 @@ export function encodeCallPlan(input: CallPlan) {
       new Set(plan.steps.map((step) => step.callId)).size === plan.steps.length,
     "call_plan_unique_identity",
   );
-  for (const step of plan.steps)
+  for (const step of plan.steps) {
+    requireThat(
+      step.expectExposure !== "absent" ||
+        (step.resultFormat === "mcp" &&
+          step.tool.startsWith("mcp_") &&
+          step.expectedResult === undefined &&
+          step.completionProjection === undefined),
+      "call_plan_absent_contract",
+    );
+    requireThat(
+      step.completionProjection === undefined ||
+        (step.resultFormat === "mcp" &&
+          step.expectExposure !== "absent" &&
+          step.expectedResult === undefined),
+      "call_plan_premature_contract",
+    );
     requireThat(
       Buffer.byteLength(JSON.stringify(step.arguments)) <= 4096 &&
         depth(step.arguments) <= 16,
       "call_plan_argument_bounds",
     );
+  }
   const encoded = JSON.stringify(plan);
   requireThat(Buffer.byteLength(encoded) <= 65536, "call_plan_size");
   return encoded;

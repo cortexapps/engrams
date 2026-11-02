@@ -472,3 +472,124 @@ test("automation trigger requires its own private output and cannot reuse the us
   expect(omitted).toBeDefined();
   expect(() => ContextSchema.parse({ ...context, identities })).toThrow();
 });
+
+test("absent and premature plans cannot request fabricated expected results", async () => {
+  const { encodeCallPlan } = await import("./call-plan.ts");
+  const step = {
+    marker: "missing",
+    tool: "mcp_counter",
+    arguments: {},
+    callId: "missing-1",
+    resultFormat: "mcp" as const,
+  };
+  expect(
+    JSON.parse(
+      encodeCallPlan({ steps: [{ ...step, expectExposure: "absent" }] }),
+    ).steps[0].expectExposure,
+  ).toBe("absent");
+  for (const invalid of [
+    { ...step, expectExposure: "absent" as const, expectedResult: {} },
+    { ...step, expectExposure: "absent" as const, tool: "spawn_session" },
+    {
+      ...step,
+      expectExposure: "absent" as const,
+      resultFormat: "json" as const,
+    },
+    {
+      ...step,
+      expectExposure: "absent" as const,
+      completionProjection: "premature" as const,
+    },
+    { ...step, completionProjection: "premature" as const, expectedResult: {} },
+    {
+      ...step,
+      completionProjection: "premature" as const,
+      resultFormat: "json" as const,
+    },
+  ])
+    expect(() => encodeCallPlan({ steps: [invalid] })).toThrow();
+});
+
+test("native barrier and absent denial records cannot masquerade as result receipts", async () => {
+  const { NativeProofSchema } = await import("./guest.ts");
+  const identity = {
+    callId: "call-1",
+    tool: "mcp_counter",
+    planSha256: `sha256:${h}`,
+  };
+  const held = { ...identity, observation: "completionBarrierHeld" };
+  expect(NativeProofSchema.safeParse(held).success).toBe(true);
+  expect(
+    NativeProofSchema.safeParse({ ...held, resultReceived: true }).success,
+  ).toBe(false);
+  expect(
+    NativeProofSchema.safeParse({ ...held, eventSha256: `sha256:${h}` })
+      .success,
+  ).toBe(false);
+  expect(
+    NativeProofSchema.safeParse({
+      ...identity,
+      observation: "prematureCompletionEmitted",
+      eventSha256: `sha256:${h}`,
+    }).success,
+  ).toBe(true);
+  expect(
+    NativeProofSchema.safeParse({
+      ...identity,
+      observation: "prematureCompletionEmitted",
+    }).success,
+  ).toBe(false);
+  const denied = {
+    ...identity,
+    expectExposure: "absent",
+    selectedToolName: identity.tool,
+    exposedMcpToolNamesSha256: `sha256:${h}`,
+    requestAttempted: true,
+    protocolDenialCode: "unknown_tool",
+    nativeDenialCode: -32602,
+  };
+  expect(NativeProofSchema.safeParse(denied).success).toBe(true);
+  expect(
+    NativeProofSchema.safeParse({ ...denied, resultReceived: true }).success,
+  ).toBe(false);
+  expect(
+    NativeProofSchema.safeParse({
+      ...denied,
+      selectedSchemaSha256: `sha256:${h}`,
+    }).success,
+  ).toBe(false);
+  expect(
+    NativeProofSchema.safeParse({ ...denied, nativeDenialCode: -32603 })
+      .success,
+  ).toBe(false);
+});
+
+test("grant replacement preserves public profile state and exact publication CAS", async () => {
+  const { ProfileSchema, UpdateProfileRequestSchema } = await import(
+    "../../src/gen/engram/app/v1/profile_pb.ts"
+  );
+  const { grantUpdateRequest } = await import("./rebind.ts");
+  const profile = create(ProfileSchema, {
+    id: "profile-1",
+    name: "Fixture",
+    imageId: "image-1",
+    envVars: { FIXTURE: "value" },
+    network: { default: "allow" },
+    mcpGrantRevision: 7n,
+    programmaticOnly: true,
+    integrationGrants: [{ connectionId: "connection-1", operation: "invoke" }],
+  });
+  const request = create(
+    UpdateProfileRequestSchema,
+    grantUpdateRequest(profile, []),
+  );
+  const decoded = fromBinary(
+    UpdateProfileRequestSchema,
+    toBinary(UpdateProfileRequestSchema, request),
+  );
+  expect(decoded.expectedMcpGrantRevision).toBe(7n);
+  expect(decoded.integrationGrants).toEqual([]);
+  expect(decoded.envVars).toEqual({ FIXTURE: "value" });
+  expect(decoded.network?.default).toBe("allow");
+  expect(decoded.programmaticOnly).toBe(true);
+});
