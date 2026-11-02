@@ -81,14 +81,14 @@ function services(): McpServices {
     },
   };
 }
-async function spawn(service?: McpServices, role = "admin") {
+async function spawn(service?: McpServices, role = "admin", email?: string) {
   const server = buildServer(new Hono(), (router) =>
     router.service(
       IntegrationService,
       mcpHandlers({
         services: service,
         connections,
-        getSession: async () => ({ user: { id: "owner", role } }),
+        getSession: async () => ({ user: { id: "owner", role, email } }),
         now: () => new Date(0),
         connectionToProto: (c) => ({ id: c.id }),
       }),
@@ -125,6 +125,9 @@ describe("MCP native wire contract", () => {
         s.client.discoverMcp({ connectionId: row.id, expectedRevision: 1 }),
         Code.FailedPrecondition,
       );
+      await code(s.client.putMcpCredential({}), Code.FailedPrecondition);
+      await code(s.client.completeMcpAuthorization({}), Code.FailedPrecondition);
+      await code(s.client.recoverMcpCredential({}), Code.FailedPrecondition);
       await code(s.client.publishMcp({}), Code.FailedPrecondition);
       await code(s.client.authorizeMcp({}), Code.FailedPrecondition);
       await code(s.client.disconnectMcp({}), Code.FailedPrecondition);
@@ -210,4 +213,23 @@ describe("MCP native wire contract", () => {
       await s.close();
     }
   });
+});
+
+test("credential lifecycle requires a human administrator before service access", async () => {
+  const member = await spawn(services(), "user");
+  const serviceAccount = await spawn(services(), "admin", "apikey+agent@service.local");
+  try {
+    for (const s of [member, serviceAccount]) {
+      await code(s.client.putMcpCredential({ value: "entered-value" }), Code.PermissionDenied);
+      await code(s.client.authorizeMcp({ shareWithOrgSessions: true }), Code.PermissionDenied);
+      await code(
+        s.client.completeMcpAuthorization({ code: "provider-code", state: "provider-state" }),
+        Code.PermissionDenied,
+      );
+      await code(s.client.disconnectMcp({}), Code.PermissionDenied);
+    }
+  } finally {
+    await member.close();
+    await serviceAccount.close();
+  }
 });

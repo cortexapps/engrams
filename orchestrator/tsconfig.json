@@ -7,7 +7,7 @@
     "skipLibCheck": true,
     "types": ["bun", "node"],
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": "..",
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "allowImportingTsExtensions": true,

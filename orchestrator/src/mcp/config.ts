@@ -2,13 +2,15 @@ import { isIP } from "node:net";
 import { z } from "zod";
 
 // Naming convention only. Coordinator reservation metadata protects the sealed secret.
-const reference = z.string().regex(/^mcp\.[a-zA-Z0-9_.-]{1,160}$/);
+const reference = z.string().regex(/^mcp[.-][a-zA-Z0-9_.-]{1,160}$/);
 const configSchema = z
   .object({
     endpoint: z.string().max(2048),
     zone: z.string().regex(/^[a-z][a-z0-9-]{0,62}$/),
     auth: z.discriminatedUnion("kind", [
-      z.object({ kind: z.literal("api_key"), secretRef: reference }).strict(),
+      z
+        .object({ kind: z.literal("api_key"), secretRef: z.union([reference, z.literal("")]) })
+        .strict(),
       z
         .object({
           kind: z.literal("oauth"),

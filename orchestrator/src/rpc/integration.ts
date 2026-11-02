@@ -10,6 +10,7 @@
  *
  * Injectable deps (getSession, connectors) for tests.
  */
+import { requireMcpHumanAdmin } from "../mcp/credential-rpc.ts";
 
 import {
   mcpHandlers, mcpConfigFromProto, mcpConfigToProto,
@@ -737,6 +738,12 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
     async createConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
       if (req.provider === "mcp") {
+        await requireMcpHumanAdmin(ctx, getSession);
+        if (req.mcp?.apiKeySecretRef)
+          throw new ConnectError(
+            "use fresh credential setup after creating the connection",
+            Code.InvalidArgument,
+          );
         const service = requireMcp(deps?.mcp);
         const validate = requireMcpHook(service.validateDestination);
         assertConnectionNames(req.alias, req.displayName);
@@ -767,14 +774,23 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       assertConnectionNames(req.alias, req.displayName);
       const current = await connections.get(req.id);
       if (current?.provider === "mcp") {
+        const actor = await requireMcpHumanAdmin(ctx, getSession);
         const service = requireMcp(deps?.mcp);
         const validate = requireMcpHook(service.validateDestination);
+        const credentials = requireMcpHook(service.credentials);
+        if (req.mcp?.apiKeySecretRef)
+          throw new ConnectError("credential references cannot be entered", Code.InvalidArgument);
         const config = mcpConfigFromProto(req.mcp);
         return mcpOperation(async () => {
           await validate(config);
-          await service.repository.updateConfig(req.id, req.expectedRevision, {
-            alias: req.alias, displayName: req.displayName.trim(), config,
-          }, now());
+          await credentials.configure(
+            req.id,
+            req.expectedRevision,
+            req.expectedGeneration,
+            actor.id,
+            config,
+            { alias: req.alias, displayName: req.displayName.trim() },
+          );
           return { connection: connectionToProto((await connections.get(req.id))!) };
         });
       }
@@ -803,6 +819,18 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       );
       if (referenced) {
         throw new ConnectError("connection is still granted to a profile", Code.FailedPrecondition);
+      }
+      if (connection?.provider === "mcp") {
+        const actor = await requireMcpHumanAdmin(ctx, getSession);
+        const credentials = requireMcpHook(requireMcp(deps?.mcp).credentials);
+        return mcpOperation(async () => ({
+          deleted: await credentials.remove(
+            req.id,
+            req.expectedRevision,
+            req.expectedGeneration,
+            actor.id,
+          ),
+        }));
       }
       return { deleted: await connections.delete(req.id) };
     },

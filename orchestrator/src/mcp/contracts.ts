@@ -1,3 +1,5 @@
+import { credentialHandlers } from "./credential-rpc.ts";
+import type { CredentialAdmin } from "./credential-admin.ts";
 import { Code, ConnectError, type ServiceImpl } from "@connectrpc/connect";
 import type { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type {
@@ -20,13 +22,8 @@ export interface McpServices {
   validateDestination?: (config: McpConfig) => Promise<void>;
   validateSchemas?: (tools: readonly McpReviewedTool[]) => Promise<void>;
   discovery?: { discover(connection: IntegrationConnectionRow): Promise<McpDiscoveredTool[]> };
-  authorization?: {
-    begin(
-      connection: IntegrationConnectionRow,
-      actorId: string,
-    ): Promise<{ authorizationUrl: string }>;
-    disconnect(connection: IntegrationConnectionRow): Promise<void>;
-  };
+  credentials?: CredentialAdmin;
+  destinations?: { zoneId: string; endpoint: string }[];
   runtime?: {
     cancel(executionId: string): Promise<void>;
     /** Must authorize the live owner/admin and acknowledge deny policy before activation. */
@@ -138,6 +135,10 @@ function parseSchema(value: string): Record<string, unknown> {
   }
 }
 type Methods =
+  | "putMcpCredential"
+  | "getMcpSetup"
+  | "completeMcpAuthorization"
+  | "recoverMcpCredential"
   | "discoverMcp"
   | "publishMcp"
   | "authorizeMcp"
@@ -162,6 +163,7 @@ export function mcpHandlers(deps: {
     return row;
   }
   return {
+    ...credentialHandlers(deps),
     async discoverMcp(req, ctx) {
       const actor = await requireAdmin(ctx, deps.getSession);
       const service = services();
@@ -169,6 +171,8 @@ export function mcpHandlers(deps: {
       return mcpOperation(async () => {
         const row = await connection(req.connectionId);
         if (row.mcp!.configRevision !== req.expectedRevision) throw new Error("stale connection");
+        if (row.mcp!.revoked || !row.mcp!.credentialIdentity)
+          throw new Error("credential setup required");
         const tools = await discover.discover(row);
         return {
           catalog: catalogToProto(
@@ -211,35 +215,6 @@ export function mcpHandlers(deps: {
             ),
           ),
         };
-      });
-    },
-    async authorizeMcp(req, ctx) {
-      const actor = await requireAdmin(ctx, deps.getSession);
-      const service = services();
-      const authorization = requireMcpHook(service.authorization);
-      return mcpOperation(async () => {
-        const row = await connection(req.connectionId);
-        const config = validateMcpConfig(row.config);
-        if (!req.shareWithOrgSessions || config.auth.kind !== "oauth")
-          throw new ConnectError(
-            "explicit consent to organization session sharing is required",
-            Code.InvalidArgument,
-          );
-        if (row.mcp!.authGeneration !== req.expectedGeneration)
-          throw new Error("stale authorization");
-        return authorization.begin(row, actor.id);
-      });
-    },
-    async disconnectMcp(req, ctx) {
-      await requireAdmin(ctx, deps.getSession);
-      const service = services();
-      const authorization = requireMcpHook(service.authorization);
-      return mcpOperation(async () => {
-        const row = await connection(req.connectionId);
-        // Revoke local authority before external cleanup, which can fail.
-        await service.repository.disconnect(row.id, req.expectedGeneration, deps.now());
-        await authorization.disconnect(row);
-        return { connection: deps.connectionToProto(await connection(row.id)) };
       });
     },
     async listMcpApprovals(req, ctx) {

@@ -48,6 +48,13 @@ the frozen operation; a new identity lookup cannot replace a frozen boot identit
 Worker boot binds an operation, not durable credential authority. After a worker
 restart, fresh operations can use the current boot with the same sealed authority.
 
+The credential delivery deadline is at most ten seconds. The separately frozen
+operation deadline is at most five minutes and remains the worker deadline.
+Admission must cover that full operation deadline. Credential control echoes both
+deadlines; the orchestrator validates them and dispatches before delivery expires.
+Status returns NotFound only for absent authority metadata. Transport and service
+failures remain unavailable and cannot justify recovery or replacement.
+
 ### Reviewed catalogs and session binding
 
 Reuse named integration connections and profile integration grants. Discovery
@@ -127,6 +134,14 @@ kinds, references, or registrations, the orchestrator serializes the connection
 transition and revokes the old authority with its exact identity and version. It
 verifies the durable revocation receipt before acquisition and publication of the
 replacement. Failed publication cannot restore the old authority.
+
+The existing connection row holds only credential metadata and a durable transition
+token. A transition reserves its final config revision before the coordinator seals
+a replacement. Publication uses that same revision and compares the transition
+token and authorization generation. Recovery changes the token and leaves old
+authority revoked. Late control replies and callbacks cannot publish through an
+old token. A lost fresh-reference response can leave a sealed orphan; recovery
+cannot publish an unknown reference or restore the previous credential.
 
 ### Authorization and irreversible dispatch
 

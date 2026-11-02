@@ -31,6 +31,7 @@ export function makeMcpRepository(db = getDb()) {
           and(
             eq(connection.id, id),
             eq(connection.provider, "mcp"),
+            sql`${connection.mcpCredential}->'transition' IS NULL`,
             eq(connection.configRevision, expectedRevision),
           ),
         )
@@ -62,6 +63,7 @@ export function makeMcpRepository(db = getDb()) {
           and(
             eq(connection.id, id),
             eq(connection.provider, "mcp"),
+            sql`${connection.mcpCredential}->'transition' IS NULL`,
             eq(connection.authGeneration, expectedGeneration),
             eq(connection.configRevision, expectedConfigRevision),
           ),
@@ -84,6 +86,7 @@ export function makeMcpRepository(db = getDb()) {
           and(
             eq(connection.id, id),
             eq(connection.provider, "mcp"),
+            sql`${connection.mcpCredential}->'transition' IS NULL`,
             eq(connection.authGeneration, expectedGeneration),
           ),
         )

@@ -27,7 +27,9 @@ export function compileBindings(
   const bindings = connections.map((connection) => {
     if (ids.has(connection.id)) throw new Error("duplicate MCP connection");
     ids.add(connection.id);
+    const config = validateMcpConfig(connection.config);
     if (
+      (config.auth.kind === "api_key" && !config.auth.secretRef) ||
       !connection.enabled ||
       connection.state.revoked ||
       !connection.state.credentialIdentity ||
@@ -52,7 +54,7 @@ export function compileBindings(
     const binding = {
       connectionId: connection.id,
       ...connection.state,
-      config: validateMcpConfig(connection.config),
+      config,
       tools,
       policyHash: canonicalDigest(connection.grants),
     };

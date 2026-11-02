@@ -54,6 +54,10 @@ service IntegrationService {
   rpc GetGoogleCloudSetup(GetGoogleCloudSetupRequest) returns (GetGoogleCloudSetupResponse);
   rpc DiscoverMcp(DiscoverMcpRequest) returns (DiscoverMcpResponse);
   rpc PublishMcp(PublishMcpRequest) returns (PublishMcpResponse);
+  rpc PutMcpCredential(PutMcpCredentialRequest) returns (McpCredentialResponse);
+  rpc GetMcpSetup(GetMcpSetupRequest) returns (GetMcpSetupResponse);
+  rpc CompleteMcpAuthorization(CompleteMcpAuthorizationRequest) returns (McpCredentialResponse);
+  rpc RecoverMcpCredential(RecoverMcpCredentialRequest) returns (McpCredentialResponse);
   rpc AuthorizeMcp(AuthorizeMcpRequest) returns (AuthorizeMcpResponse);
   rpc DisconnectMcp(DisconnectMcpRequest) returns (DisconnectMcpResponse);
   rpc ListMcpApprovals(ListMcpApprovalsRequest) returns (ListMcpApprovalsResponse);
@@ -112,6 +116,7 @@ message CreateConnectionResponse {
 }
 
 message UpdateConnectionRequest {
+  uint32 expected_generation = 7;
   uint32 expected_revision = 6;
   string id = 1;
   string alias = 2;
@@ -124,6 +129,8 @@ message UpdateConnectionResponse {
 }
 
 message DeleteConnectionRequest {
+  uint32 expected_revision = 2;
+  uint32 expected_generation = 3;
   string id = 1;
 }
 message DeleteConnectionResponse {
@@ -379,14 +386,20 @@ message PublishMcpResponse {
   McpCatalog catalog = 1;
 }
 message AuthorizeMcpRequest {
+  uint32 expected_revision = 4;
   string connection_id = 1;
   uint32 expected_generation = 2;
   bool share_with_org_sessions = 3;
 }
 message AuthorizeMcpResponse {
+  uint32 config_revision = 4;
+  uint32 auth_generation = 5;
+  string flow_id = 2;
+  string expires_at = 3;
   string authorization_url = 1;
 }
 message DisconnectMcpRequest {
+  uint32 expected_revision = 3;
   string connection_id = 1;
   uint32 expected_generation = 2;
 }
@@ -436,4 +449,67 @@ message RebindMcpRequest {
 }
 message RebindMcpResponse {
   string binding_hash = 1;
+}
+
+// Entered values are request-only; responses contain metadata and references.
+message PutMcpCredentialRequest {
+  string connection_id = 1;
+  uint32 expected_revision = 2;
+  uint32 expected_generation = 3;
+  string kind = 4;
+  string header = 5;
+  string value = 6;
+}
+message McpCredentialStatus {
+  string status = 1;
+  string reference = 2;
+  string kind = 3;
+  string credential_identity = 4;
+  int64 version = 5;
+  int64 reservation_generation = 6;
+}
+message McpCredentialResponse {
+  IntegrationConnection connection = 1;
+  McpCredentialStatus credential = 2;
+}
+message McpApprovedDestination {
+  string zone_id = 1;
+  string endpoint = 2;
+}
+message McpClientRegistration {
+  string id = 1;
+  string client_id = 2;
+  bool confidential = 3;
+  string redirect_uri = 4;
+  string issuer = 5;
+  McpApprovedDestination resource = 6;
+  repeated string scopes = 7;
+}
+message GetMcpSetupRequest {
+  string connection_id = 1;
+}
+message GetMcpSetupResponse {
+  bool enabled = 1;
+  repeated McpClientRegistration registrations = 2;
+  repeated McpApprovedDestination destinations = 3;
+  McpCredentialResponse current = 4;
+  bool transition_pending = 5;
+  string flow_id = 6;
+  string flow_expires_at = 7;
+  bool client_secret_configured = 8;
+}
+message CompleteMcpAuthorizationRequest {
+  string connection_id = 1;
+  uint32 expected_revision = 2;
+  uint32 expected_generation = 3;
+  string flow_id = 4;
+  string state = 5;
+  string code = 6;
+  optional string issuer = 7;
+  string redirect_uri = 8;
+}
+message RecoverMcpCredentialRequest {
+  string connection_id = 1;
+  uint32 expected_revision = 2;
+  uint32 expected_generation = 3;
 }

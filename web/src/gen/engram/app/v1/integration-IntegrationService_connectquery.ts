@@ -127,6 +127,26 @@ export const discoverMcp = IntegrationService.method.discoverMcp;
 export const publishMcp = IntegrationService.method.publishMcp;
 
 /**
+ * @generated from rpc engram.app.v1.IntegrationService.PutMcpCredential
+ */
+export const putMcpCredential = IntegrationService.method.putMcpCredential;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.GetMcpSetup
+ */
+export const getMcpSetup = IntegrationService.method.getMcpSetup;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.CompleteMcpAuthorization
+ */
+export const completeMcpAuthorization = IntegrationService.method.completeMcpAuthorization;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationService.RecoverMcpCredential
+ */
+export const recoverMcpCredential = IntegrationService.method.recoverMcpCredential;
+
+/**
  * @generated from rpc engram.app.v1.IntegrationService.AuthorizeMcp
  */
 export const authorizeMcp = IntegrationService.method.authorizeMcp;

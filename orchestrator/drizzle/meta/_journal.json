@@ -729,6 +729,13 @@
       "when": 1793585592275,
       "tag": "0103_mcp_session_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1793585592276,
+      "tag": "0104_mcp_credential_metadata",
+      "breakpoints": true
     }
   ]
 }

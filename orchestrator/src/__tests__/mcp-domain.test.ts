@@ -250,3 +250,26 @@ test("child intersections preserve independent local references with colliding d
     maximum: 5,
   });
 });
+test("API-key draft has no reference and cannot produce a ready binding", () => {
+  const draft = { ...config, auth: { kind: "api_key" as const, secretRef: "" } };
+  expect(validateMcpConfig(draft)).toEqual(draft);
+  expect(
+    validateMcpConfig({
+      ...config,
+      auth: { kind: "api_key", secretRef: "mcp-coordinator_generated" },
+    }).auth.kind,
+  ).toBe("api_key");
+  expect(() =>
+    compileBindings([
+      {
+        id: "c1",
+        alias: "tools",
+        enabled: true,
+        state,
+        config: draft,
+        grants: [grant],
+        tools: reviewCatalog([tool]),
+      },
+    ]),
+  ).toThrow("unavailable");
+});

@@ -1745,6 +1745,10 @@ export const integrationConnection = pgTable(
   {
     id: text("id").primaryKey(),
     alias: text("alias").notNull().unique(),
+    mcpCredential: jsonb("mcp_credential")
+      .$type<import("../mcp/credential-store.ts").CredentialMetadata>()
+      .notNull()
+      .default({}),
     configRevision: integer("config_revision").notNull().default(1),
     authGeneration: integer("auth_generation").notNull().default(1),
     credentialIdentity: text("credential_identity").notNull().default(""),
