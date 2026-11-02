@@ -31,6 +31,12 @@ use support::{wire_exec_request, wire_reap_stats};
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
+    let _ = engram_protocol::managed_policy::decode::<
+        engram_core::types::managed_deny::ManagedPolicyApply,
+    >(bytes);
+    let _ = engram_protocol::managed_policy::decode::<
+        Option<engram_core::types::managed_deny::ManagedAppliedState>,
+    >(bytes);
     // Crate-local payloads.
     let _ = bincode::deserialize::<WireExecRequest>(bytes);
     let _ = bincode::deserialize::<WireReapStats>(bytes);

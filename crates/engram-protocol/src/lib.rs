@@ -27,3 +27,7 @@ pub use heartbeat::*;
 pub use wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
 
 pub mod mcp;
+
+pub mod host_tls;
+
+pub mod managed_policy;

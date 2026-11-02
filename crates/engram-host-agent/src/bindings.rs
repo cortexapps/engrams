@@ -106,6 +106,21 @@ impl BindingStore {
         })
     }
 
+    pub(crate) fn managed_required(&self, session: SessionId) -> bool {
+        self.dir
+            .join(format!("{session}.managed-required"))
+            .try_exists()
+            .unwrap_or(true)
+            || self
+                .dir
+                .join(format!("{session}.managed"))
+                .try_exists()
+                .unwrap_or(true)
+    }
+    pub(crate) fn directory(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     fn path_for(&self, session_id: SessionId) -> PathBuf {
         self.dir.join(format!("{session_id}.json"))
     }
@@ -302,6 +317,23 @@ impl BindingStore {
                 }
             }
         }
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("managed-required") {
+                continue;
+            }
+            let sid: SessionId = entry
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| std::io::Error::other("invalid managed filename"))?
+                .parse()
+                .map_err(std::io::Error::other)?;
+            let record = crate::managed_policy::read_record(self, sid)?
+                .ok_or_else(|| std::io::Error::other("managed record missing"))?;
+            out.retain(|p| p.session_id != sid);
+            out.push(record.egress);
+        }
         Ok(out)
     }
 
@@ -402,6 +434,7 @@ mod tests {
         sandbox_id: SandboxId,
     ) -> engram_core::types::egress::SessionEgressPolicy {
         engram_core::types::egress::SessionEgressPolicy {
+            managed_deny: None,
             session_id,
             sandbox_id,
             guest_ip: std::net::Ipv4Addr::new(10, 200, 0, 2),

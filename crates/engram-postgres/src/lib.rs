@@ -8225,24 +8225,79 @@ impl MetadataStore for PostgresStore {
 
     // ---- session integration policy (ADR 0056 B′) ----
 
+    async fn managed_policy_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<engram_core::types::managed_deny::ManagedPolicyTarget, MetaError> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT host_id, sandbox_id, binding_epoch FROM sessions WHERE id=$1 AND host_id IS NOT NULL AND sandbox_id IS NOT NULL AND binding_epoch > 0 AND status NOT IN ('dead','failed','completed')")
+            .bind(session_id.as_uuid()).fetch_optional(&self.pool).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
+        Ok(engram_core::types::managed_deny::ManagedPolicyTarget {
+            session_id,
+            host_id: HostId(row.try_get("host_id").map_err(db_err)?),
+            sandbox_id: SandboxId(row.try_get("sandbox_id").map_err(db_err)?),
+            binding_epoch: u64::try_from(row.try_get::<i64, _>("binding_epoch").map_err(db_err)?)
+                .map_err(|e| MetaError::Serialization(e.to_string()))?,
+        })
+    }
+    async fn retain_managed_deny(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+        policy: &engram_core::types::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        use sqlx::Row;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query("SELECT host_id, sandbox_id, binding_epoch FROM sessions WHERE id=$1 AND status NOT IN ('dead','failed','completed') FOR UPDATE")
+            .bind(target.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
+        if row
+            .try_get::<Option<uuid::Uuid>, _>("host_id")
+            .map_err(db_err)?
+            != Some(target.host_id.as_uuid())
+            || row
+                .try_get::<Option<uuid::Uuid>, _>("sandbox_id")
+                .map_err(db_err)?
+                != Some(target.sandbox_id.as_uuid())
+            || row.try_get::<i64, _>("binding_epoch").map_err(db_err)?
+                != i64::try_from(target.binding_epoch)
+                    .map_err(|e| MetaError::Serialization(e.to_string()))?
+        {
+            return Err(MetaError::Conflict("managed placement changed".into()));
+        }
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT policy_json FROM session_integration_policy WHERE session_id=$1",
+        )
+        .bind(target.session_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let next = engram_core::types::managed_deny::retain_in_policy_json(old.as_deref(), policy)
+            .map_err(MetaError::Conflict)?;
+        sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(target.session_id.as_uuid()).bind(next).execute(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
     async fn bind_session_integration_policy(
         &self,
         session_id: SessionId,
         policy_json: &str,
     ) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO session_integration_policy (session_id, policy_json)
-            VALUES ($1, $2)
-            ON CONFLICT (session_id) DO UPDATE SET policy_json = EXCLUDED.policy_json
-            "#,
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT policy_json FROM session_integration_policy WHERE session_id=$1",
         )
         .bind(session_id.as_uuid())
-        .bind(policy_json)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        engram_core::types::managed_deny::validate_policy_replacement(old.as_deref(), policy_json)
+            .map_err(MetaError::Conflict)?;
+        sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(session_id.as_uuid()).bind(policy_json).execute(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
     }
 
     async fn get_session_integration_policy(

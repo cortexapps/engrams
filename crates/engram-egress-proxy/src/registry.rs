@@ -27,6 +27,7 @@ use crate::policy::HostList;
 /// arriving from a given guest IP.
 #[derive(Clone, Debug)]
 pub struct SessionState {
+    pub managed_deny: Option<engram_core::types::managed_deny::ManagedDenyPolicy>,
     pub session_id: SessionId,
     /// The sandbox this session is bound to. Carried so the ADR 0118 short
     /// circuit can dial a guest port without a session→sandbox lookup — the
@@ -474,19 +475,43 @@ pub struct Registry {
 struct RegistryInner {
     by_guest_ip: HashMap<Ipv4Addr, Arc<SessionState>>,
     by_session: HashMap<SessionId, Ipv4Addr>,
+    controls: HashMap<SessionId, Arc<crate::connections::Connections>>,
+    managed_floor: HashMap<SessionId, engram_core::types::managed_deny::ManagedDenyPolicy>,
 }
 
 impl Registry {
+    pub fn managed_sessions(&self) -> Vec<SessionId> {
+        let state = self.inner.read();
+        state
+            .by_session
+            .keys()
+            .filter(|id| state.managed_floor.contains_key(id))
+            .copied()
+            .collect()
+    }
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Replaces any prior registration for this `session_id`.
     pub fn register(&self, state: SessionState) {
+        // Synchronous registration is for an initial/ordinary policy. Managed
+        // replacement must use apply, which closes and drains old sockets.
+        let mut g = self.inner.write();
+        if state.managed_deny.is_some() || g.managed_floor.contains_key(&state.session_id) {
+            return;
+        }
+        Self::publish(&mut g, state);
+    }
+
+    fn publish(g: &mut RegistryInner, state: SessionState) {
         let guest_ip = state.guest_ip;
         let session_id = state.session_id;
+        if let Some(policy) = &state.managed_deny {
+            g.managed_floor.insert(session_id, policy.clone());
+        }
         let arc = Arc::new(state);
-        let mut g = self.inner.write();
+        g.controls.entry(session_id).or_default();
         // Remove any stale guest_ip mapping if the session moved
         // (shouldn't happen — sandbox ids are stable — but defensive).
         if let Some(old_ip) = g.by_session.insert(session_id, guest_ip) {
@@ -497,15 +522,109 @@ impl Registry {
         g.by_guest_ip.insert(guest_ip, arc);
     }
 
+    pub fn enroll(
+        &self,
+        guest_ip: Ipv4Addr,
+    ) -> Option<(Arc<SessionState>, crate::connections::ConnectionLease)> {
+        let g = self.inner.read();
+        let state = g.by_guest_ip.get(&guest_ip)?.clone();
+        let lease = g.controls.get(&state.session_id)?.enroll()?;
+        Some((state, lease))
+    }
+
+    pub async fn apply(&self, state: SessionState) -> Result<(), String> {
+        if let Some(policy) = &state.managed_deny {
+            policy.validate()?;
+            if !state.tunnels.is_empty() {
+                return Err("managed policy does not support tunnels".into());
+            }
+            if state.guest_ip.is_unspecified()
+                || state.guest_ip.is_multicast()
+                || state.session_id.as_uuid().is_nil()
+                || state.sandbox_id.as_uuid().is_nil()
+            {
+                return Err("managed policy has no guest identity".into());
+            }
+        }
+        let control = self
+            .inner
+            .write()
+            .controls
+            .entry(state.session_id)
+            .or_default()
+            .clone();
+        let _apply = control.apply.lock().await;
+        {
+            let g = self.inner.read();
+            if let Some(old) = g.managed_floor.get(&state.session_id) {
+                let new = state
+                    .managed_deny
+                    .as_ref()
+                    .ok_or("managed policy cannot be removed")?;
+                if new.revision < old.revision
+                    || !new.contains(old)
+                    || (new.revision == old.revision && new != old)
+                {
+                    return Err("managed policy regressed".into());
+                }
+            }
+        }
+        if state.managed_deny.is_some() {
+            control.close();
+            control.drain().await;
+        }
+        Self::publish(&mut self.inner.write(), state);
+        control.open();
+        Ok(())
+    }
+
+    pub async fn quarantine_and_drain(&self, session_id: SessionId) {
+        let control = self
+            .inner
+            .write()
+            .controls
+            .entry(session_id)
+            .or_default()
+            .clone();
+        let _apply = control.apply.lock().await;
+        control.close();
+        control.drain().await;
+    }
+    pub fn lookup_session(&self, session_id: SessionId) -> Option<Arc<SessionState>> {
+        let g = self.inner.read();
+        let ip = g.by_session.get(&session_id)?;
+        g.controls
+            .get(&session_id)?
+            .is_open()
+            .then(|| g.by_guest_ip.get(ip).cloned())
+            .flatten()
+    }
+    pub fn quarantine(&self, session_id: SessionId) {
+        self.inner
+            .write()
+            .controls
+            .entry(session_id)
+            .or_default()
+            .close();
+    }
+
     pub fn unregister(&self, session_id: SessionId) {
         let mut g = self.inner.write();
+        if let Some(control) = g.controls.get(&session_id) {
+            control.close();
+        }
         if let Some(ip) = g.by_session.remove(&session_id) {
             g.by_guest_ip.remove(&ip);
         }
     }
 
     pub fn lookup(&self, guest_ip: Ipv4Addr) -> Option<Arc<SessionState>> {
-        self.inner.read().by_guest_ip.get(&guest_ip).cloned()
+        let g = self.inner.read();
+        let state = g.by_guest_ip.get(&guest_ip)?;
+        g.controls
+            .get(&state.session_id)?
+            .is_open()
+            .then(|| state.clone())
     }
 
     pub fn live_count(&self) -> usize {
@@ -533,6 +652,13 @@ impl SessionState {
     /// straight through — the guest could trade its session token for a
     /// credential this proxy no longer bounds.
     pub fn decide(&self, hostname: &str) -> Decision<'_> {
+        if self
+            .managed_deny
+            .as_ref()
+            .is_some_and(|p| p.denies(hostname))
+        {
+            return Decision::Reject;
+        }
         // ADR 0118: checked FIRST, before the deny-list and the allow-list. A
         // sibling app is not an egress destination — the connection is spliced
         // back into this same sandbox and never leaves the host — so it is not
@@ -573,7 +699,8 @@ impl SessionState {
             // spliced: the rule reads the request line, which only an
             // intercepted connection produces. Interception with an empty
             // policy relays the connection as before and lets the rule run.
-            if crate::google_denylist::requires_inspection(hostname) {
+            if self.managed_deny.is_some() || crate::google_denylist::requires_inspection(hostname)
+            {
                 return Decision::Intercept {
                     secrets: Vec::new(),
                     injects: Vec::new(),
@@ -649,8 +776,121 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn managed_denies_win_over_every_existing_rule() {
+        let mut s = state();
+        s.allow_all = true;
+        s.apps.push(AppEndpoint {
+            hostname: "api.openai.com".into(),
+            port: 8080,
+        });
+        s.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(
+                1,
+                [
+                    "api.openai.com",
+                    "api.datadoghq.com",
+                    "api.github.com",
+                    "registry.npmjs.org",
+                    "alias.example",
+                ]
+                .map(String::from),
+            )
+            .unwrap(),
+        );
+        for host in [
+            "API.OPENAI.COM.",
+            "api.datadoghq.com",
+            "api.github.com",
+            "registry.npmjs.org",
+            "alias.example",
+        ] {
+            assert!(matches!(s.decide(host), Decision::Reject), "{host}");
+        }
+        assert!(matches!(
+            s.decide("near.alias.example"),
+            Decision::Intercept { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_apply_drains_old_arc_sockets_before_return() {
+        use tokio::io::AsyncReadExt;
+        let registry = Arc::new(Registry::new());
+        let initial = state();
+        let ip = initial.guest_ip;
+        let mut next = initial.clone();
+        registry.register(initial);
+        let retained = registry.lookup(ip).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (_, lease) = registry.enroll(ip).unwrap();
+        let task = tokio::spawn(lease.run(async move {
+            let mut b = [0];
+            let _ = socket.read(&mut b).await;
+        }));
+        next.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["api.openai.com".into()])
+                .unwrap(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            registry.apply(next).await.unwrap();
+            task.await.unwrap();
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        })
+        .await
+        .expect("socket drain is bounded");
+        assert!(matches!(
+            retained.decide("api.openai.com"),
+            Decision::Intercept { .. }
+        ));
+        assert!(matches!(
+            registry.lookup(ip).unwrap().decide("api.openai.com"),
+            Decision::Reject
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_drain_does_not_lock_other_sessions() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let registry = Arc::new(Registry::new());
+            let mut first = state();
+            let mut second = state();
+            second.guest_ip = "10.200.0.3".parse().unwrap();
+            registry.register(first.clone());
+            registry.register(second.clone());
+            let (_, held) = registry.enroll(first.guest_ip).unwrap();
+            first.managed_deny = Some(
+                engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                    .unwrap(),
+            );
+            second.managed_deny = first.managed_deny.clone();
+            let first_ip = first.guest_ip;
+            let other_ip = second.guest_ip;
+            let worker = registry.clone();
+            let applying = tokio::spawn(async move { worker.apply(first).await });
+            while registry.lookup(first_ip).is_some() {
+                tokio::task::yield_now().await;
+            }
+            registry.apply(second).await.unwrap();
+            assert!(registry.lookup(other_ip).is_some());
+            assert!(
+                !applying.is_finished(),
+                "first drain must still wait for its lease"
+            );
+            drop(held);
+            applying.await.unwrap().unwrap();
+        })
+        .await
+        .expect("per-session drain has no global wait");
+    }
+
     fn state() -> SessionState {
         SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::from_str("10.200.0.2").unwrap(),

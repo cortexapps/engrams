@@ -69,6 +69,7 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 /// `HostAdminHandler` services ReapMaterializeDir.
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
+    managed_tls: bool,
     admin: Option<Arc<dyn HostAdminHandler>>,
     /// ADR 0079: per-session fencing-epoch high-water, durable under
     /// work_dir. Gates every session-scoped lifecycle RPC.
@@ -84,6 +85,7 @@ impl HostServiceImpl {
     pub fn new(inner: Arc<dyn HostClient>, epochs: SessionEpochStore) -> Self {
         Self {
             inner,
+            managed_tls: false,
             admin: None,
             epochs,
             peer: None,
@@ -175,6 +177,39 @@ pub async fn boot(
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
+    serve(listen_addr, inner, admin, epochs, peer, None).await
+}
+
+/// Serve one authenticated listener for all lifecycle operations in managed mode.
+pub async fn boot_with_managed_tls(
+    listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    admin: Option<Arc<dyn HostAdminHandler>>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    tls: Option<crate::managed_tls::ManagedHostTls>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tls = tls
+        .map(|config| {
+            let server = config.server_config().map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>((server, config.coordinator_pins))
+        })
+        .transpose()?;
+    serve(listen_addr, inner, admin, epochs, peer, tls).await?;
+    Ok(())
+}
+
+async fn serve(
+    listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    admin: Option<Arc<dyn HostAdminHandler>>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    tls: Option<(
+        tonic::transport::ServerTlsConfig,
+        std::collections::BTreeSet<String>,
+    )>,
+) -> Result<(), tonic::transport::Error> {
     let mut svc = HostServiceImpl::new(inner, epochs);
     if let Some(a) = admin {
         svc = svc.with_admin_handler(a);
@@ -182,8 +217,42 @@ pub async fn boot(
     if let Some(p) = peer {
         svc = svc.with_peer_serve(p);
     }
+    svc.managed_tls = tls.is_some();
+    let (server, pins) = match tls {
+        Some((config, pins)) => (
+            tonic::transport::Server::builder().tls_config(config)?,
+            Some(pins),
+        ),
+        None => (tonic::transport::Server::builder(), None),
+    };
+    let service = HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024);
+    let authenticated =
+        tonic::service::interceptor::InterceptedService::new(service, move |req: Request<()>| {
+            if let Some(pins) = &pins {
+                let certificates = req
+                    .peer_certs()
+                    .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+                let leaf = certificates
+                    .first()
+                    .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+                if !pins.contains(&engram_protocol::host_tls::certificate_pin(leaf.as_ref())) {
+                    return Err(Status::unauthenticated("client certificate not authorized"));
+                }
+                let version = req
+                    .metadata()
+                    .get(engram_protocol::wire::WIRE_VERSION_METADATA_KEY)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u32>().ok());
+                if version != Some(engram_protocol::WIRE_VERSION) {
+                    return Err(Status::failed_precondition(
+                        "host protocol version required",
+                    ));
+                }
+            }
+            Ok(req)
+        });
     tracing::info!(addr = %listen_addr, "gRPC HostService listening");
-    tonic::transport::Server::builder()
+    server
         // ADR 0013: HTTP/2 multiplexes many concurrent streams over
         // one TCP connection per coord pod. 256 is well above the
         // running_sandboxes ceiling — we don't expect to hit it.
@@ -197,7 +266,7 @@ pub async fn boot(
         .initial_stream_window_size(Some(16 * 1024 * 1024))
         .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_adaptive_window(Some(true))
-        .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
+        .add_service(authenticated)
         .serve(listen_addr)
         .await
 }
@@ -997,6 +1066,60 @@ impl HostService for HostServiceImpl {
     /// warm-lease path doesn't reach here — it goes through
     /// `WarmPool::launch` (which has its own histogram emission
     /// labelled `kind="warm"`).
+    async fn read_managed_policy(
+        &self,
+        req: Request<engram_protocol::grpc::ReadManagedPolicyRequest>,
+    ) -> Result<Response<engram_protocol::grpc::ReadManagedPolicyResponse>, Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed policy requires authenticated host mode",
+            ));
+        }
+        if req.get_ref().target_bincode.len() > 4096 {
+            return Err(Status::resource_exhausted("managed request too large"));
+        }
+        let target = engram_protocol::managed_policy::decode(&req.into_inner().target_bincode)
+            .map_err(|_| Status::invalid_argument("invalid managed target"))?;
+        let state = self
+            .inner
+            .read_managed_policy(target)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ReadManagedPolicyResponse {
+                state_bincode: bincode::serialize(&state)
+                    .map_err(|_| Status::internal("managed response encoding failed"))?,
+            },
+        ))
+    }
+    async fn apply_managed_policy(
+        &self,
+        req: Request<engram_protocol::grpc::ApplyManagedPolicyRequest>,
+    ) -> Result<Response<engram_protocol::grpc::ApplyManagedPolicyResponse>, Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed policy requires authenticated host mode",
+            ));
+        }
+        if req.get_ref().request_bincode.len() > 4 * 1024 * 1024 {
+            return Err(Status::resource_exhausted("managed request too large"));
+        }
+        let request = engram_protocol::managed_policy::decode(&req.into_inner().request_bincode)
+            .map_err(|_| Status::invalid_argument("invalid managed request"))?;
+        let state = self
+            .inner
+            .apply_managed_policy(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ApplyManagedPolicyResponse {
+                state_bincode: bincode::serialize(&state)
+                    .map_err(|_| Status::internal("managed response encoding failed"))?,
+            },
+        ))
+    }
     async fn start_agent(
         &self,
         req: Request<StartAgentRequest>,

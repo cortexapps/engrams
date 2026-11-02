@@ -4293,15 +4293,72 @@ impl MetadataStore for SimMetadataStore {
             .unwrap_or_default())
     }
 
+    async fn managed_policy_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<engram_core::types::managed_deny::ManagedPolicyTarget, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let row = db.sessions.get(&session_id).ok_or(MetaError::NotFound)?;
+        if row.session.status.is_terminal() || row.binding_epoch <= 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(engram_core::types::managed_deny::ManagedPolicyTarget {
+            session_id,
+            host_id: row.session.host_id.ok_or(MetaError::NotFound)?,
+            sandbox_id: row.session.sandbox_id.ok_or(MetaError::NotFound)?,
+            binding_epoch: row.binding_epoch as u64,
+        })
+    }
+    async fn retain_managed_deny(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+        policy: &engram_core::types::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let row = db
+            .sessions
+            .get(&target.session_id)
+            .ok_or(MetaError::NotFound)?;
+        if row.session.status.is_terminal() {
+            return Err(MetaError::NotFound);
+        }
+        if row.session.host_id != Some(target.host_id)
+            || row.session.sandbox_id != Some(target.sandbox_id)
+            || u64::try_from(row.binding_epoch).ok() != Some(target.binding_epoch)
+        {
+            return Err(MetaError::Conflict("managed placement changed".into()));
+        }
+        let next = engram_core::types::managed_deny::retain_in_policy_json(
+            db.session_integration_policy
+                .get(&target.session_id)
+                .map(String::as_str),
+            policy,
+        )
+        .map_err(MetaError::Conflict)?;
+        db.session_integration_policy
+            .insert(target.session_id, next);
+        Ok(())
+    }
     async fn bind_session_integration_policy(
         &self,
         session_id: SessionId,
         policy_json: &str,
     ) -> Result<(), MetaError> {
         self.gate()?;
-        self.db
-            .lock()
-            .session_integration_policy
+        let mut db = self.db.lock();
+        if !db.sessions.contains_key(&session_id) {
+            return Err(MetaError::NotFound);
+        }
+        engram_core::types::managed_deny::validate_policy_replacement(
+            db.session_integration_policy
+                .get(&session_id)
+                .map(String::as_str),
+            policy_json,
+        )
+        .map_err(MetaError::Conflict)?;
+        db.session_integration_policy
             .insert(session_id, policy_json.to_string());
         Ok(())
     }

@@ -224,19 +224,26 @@ impl Proxy {
             let observe_sink = self.cfg.observe_sink.clone();
             let inject_refresher = self.cfg.inject_refresher.clone();
             let guest_port_dialer = self.cfg.guest_port_dialer.clone();
+            let SocketAddr::V4(peer_v4) = peer else {
+                continue;
+            };
+            let Some((session, lease)) = registry.enroll(*peer_v4.ip()) else {
+                continue;
+            };
             tokio::spawn(async move {
-                if let Err(e) = handle(
-                    stream,
-                    peer,
-                    registry,
-                    resolver,
-                    server_cfg,
-                    client_cfg,
-                    observe_sink,
-                    inject_refresher,
-                    guest_port_dialer,
-                )
-                .await
+                if let Some(Err(e)) = lease
+                    .run(handle(
+                        stream,
+                        peer,
+                        session,
+                        resolver,
+                        server_cfg,
+                        client_cfg,
+                        observe_sink,
+                        inject_refresher,
+                        guest_port_dialer,
+                    ))
+                    .await
                 {
                     tracing::debug!(peer = %peer, error = %e, "connection handler ended with error");
                 }
@@ -257,8 +264,8 @@ pub struct Listeners {
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: TcpStream,
-    peer: SocketAddr,
-    registry: Arc<Registry>,
+    _peer: SocketAddr,
+    session: Arc<crate::SessionState>,
     resolver: Arc<dyn UpstreamResolver>,
     server_cfg: Arc<rustls::ServerConfig>,
     client_cfg: Arc<rustls::ClientConfig>,
@@ -266,12 +273,6 @@ async fn handle(
     inject_refresher: Option<Arc<dyn InjectRefresher>>,
     guest_port_dialer: Option<crate::app_relay::SharedGuestPortDialer>,
 ) -> Result<(), HandleError> {
-    let guest_ip = match peer.ip() {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => return Err(HandleError::NoSession),
-    };
-    let session = registry.lookup(guest_ip).ok_or(HandleError::NoSession)?;
-
     // Pre-REDIRECT destination — useful only for logs. We don't
     // dial it; the upstream is resolved fresh by SNI on the host.
     // On non-Linux this errors (no SO_ORIGINAL_DST) — fine, we
@@ -372,6 +373,7 @@ async fn handle(
                 peeked,
                 resolver,
                 intercept::StreamContext {
+                    strict_authority: session.managed_deny.is_some(),
                     sni: &sni,
                     port,
                     secrets: &secrets,
@@ -438,7 +440,6 @@ async fn handle(
 
 #[derive(Debug)]
 enum HandleError {
-    NoSession,
     SniPeek(crate::sni::PeekError),
     Bypass(crate::bypass::BypassError),
     Intercept(crate::intercept::InterceptError),
@@ -450,7 +451,6 @@ enum HandleError {
 impl std::fmt::Display for HandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoSession => write!(f, "no session for source IP"),
             Self::SniPeek(e) => write!(f, "sni peek: {e}"),
             Self::Bypass(e) => write!(f, "bypass: {e}"),
             Self::Intercept(e) => write!(f, "intercept: {e}"),

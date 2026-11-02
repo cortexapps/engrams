@@ -363,6 +363,9 @@ pub(crate) async fn boot_on_reserved_host(
     let egress_secret_count = egress_secrets.len();
     let inject_count = injects.len();
     let resolved_policy = ResolvedEgressPolicy {
+        managed_deny: integration_policy
+            .as_ref()
+            .and_then(|p| p.managed_deny.clone()),
         secrets: egress_secrets,
         injects,
         observes,
@@ -493,6 +496,15 @@ pub(crate) async fn boot_on_reserved_host(
     // the next thing that trips this is as invisible as the VZ boot race
     // was (a 2s guest-IP timeout that lost to a 2.5s guest boot; fixed in
     // `engram-sandbox-vz`'s `guest_endpoints`, which now waits).
+    if egress_policy.is_none()
+        && integration_policy
+            .as_ref()
+            .is_some_and(|p| p.managed_deny.is_some())
+    {
+        return Err(BootError::NotStarted(ApiError::BadRequest(
+            "managed policy requires an enforceable guest identity".into(),
+        )));
+    }
     let policy = egress_policy.unwrap_or_else(|| {
         tracing::warn!(
             %session_id,
@@ -505,6 +517,7 @@ pub(crate) async fn boot_on_reserved_host(
              guest traffic as UnknownGuest and brokered credentials will not substitute",
         );
         engram_core::types::egress::SessionEgressPolicy {
+            managed_deny: None,
             session_id,
             sandbox_id,
             guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
@@ -674,6 +687,7 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// IP (process backend / some VZ configs) — the caller synthesizes an
 /// unspecified-IP fallback.
 struct ResolvedEgressPolicy {
+    managed_deny: Option<engram_core::types::managed_deny::ManagedDenyPolicy>,
     secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
@@ -692,6 +706,7 @@ async fn assemble_egress_policy(
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: resolved.managed_deny,
         session_id,
         sandbox_id,
         guest_ip,
@@ -753,6 +768,7 @@ pub(crate) fn assemble_capture_egress_policy(
         return None;
     }
     Some(engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         // Stamped by the host at registration (the capture VM doesn't
         // exist yet when this is assembled).

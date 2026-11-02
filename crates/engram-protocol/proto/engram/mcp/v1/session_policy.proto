@@ -5,6 +5,8 @@ import "engram/app/v1/session.proto";
 
 // Dedicated pinned mTLS only. Create reuses the ordinary creation core.
 service SessionPolicyService {
+  rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
+  rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
   rpc CreatePolicySession(CreatePolicySessionRequest) returns (CreatePolicySessionResponse);
   rpc ReadWritePolicy(ReadWritePolicyRequest) returns (ReadWritePolicyResponse);
   rpc AcceptPlanExit(AcceptPlanExitRequest) returns (AcceptPlanExitResponse);
@@ -69,4 +71,62 @@ message ValidateExecutionIdentityRequest {
 message ValidateExecutionIdentityResponse {
   uint32 protocol = 1;
   string status = 2;
+}
+
+// These messages describe a host receipt, not permission to expose guest tools.
+enum ManagedPolicyPhase {
+  MANAGED_POLICY_PHASE_UNSPECIFIED = 0;
+  MANAGED_POLICY_PHASE_BOOTSTRAP = 1;
+  MANAGED_POLICY_PHASE_FINAL = 2;
+}
+message ManagedPolicyTarget {
+  string session_id = 1;
+  string sandbox_id = 2;
+  string host_id = 3;
+  uint64 binding_epoch = 4;
+}
+message ManagedPolicyContext {
+  ManagedPolicyTarget target = 1;
+  uint64 operator_generation = 2;
+  string operator_identity = 3;
+  ManagedPolicyPhase phase = 4;
+  optional string binding_hash = 5;
+}
+message ManagedDenyPolicy {
+  uint32 version = 1;
+  uint64 revision = 2;
+  repeated string hosts = 3;
+  string digest = 4;
+}
+message ManagedAppliedState {
+  ManagedPolicyContext context = 1;
+  ManagedDenyPolicy policy = 2;
+  string host_incarnation = 3;
+  string proxy_incarnation = 4;
+  string state_id = 5;
+  optional ManagedNetworkProof network_proof = 6;
+}
+message ReadManagedPolicyRequest {
+  uint32 protocol = 1;
+  ManagedPolicyTarget target = 2;
+}
+message ReadManagedPolicyResponse {
+  uint32 protocol = 1;
+  optional ManagedAppliedState applied = 2;
+}
+message ApplyManagedPolicyRequest {
+  uint32 protocol = 1;
+  ManagedPolicyContext context = 2;
+  ManagedDenyPolicy policy = 3;
+  optional ManagedAppliedState expected = 4;
+}
+message ApplyManagedPolicyResponse {
+  uint32 protocol = 1;
+  ManagedAppliedState applied = 2;
+}
+
+message ManagedNetworkProof {
+  ManagedPolicyTarget target = 1;
+  string guest_ip = 2;
+  string network_identity = 3;
 }

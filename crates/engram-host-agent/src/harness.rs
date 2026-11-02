@@ -213,6 +213,10 @@ impl HarnessHub {
     /// record, so a restarted host-agent rebuilds its proxy registry
     /// from a local read. Called on the `start_agent` path AFTER the
     /// in-memory registration succeeds and BEFORE the ack returns.
+    pub(crate) fn binding_store(&self) -> crate::bindings::BindingStore {
+        self.inner.bindings.clone()
+    }
+
     pub fn persist_egress_policy(
         &self,
         policy: &engram_core::types::egress::SessionEgressPolicy,

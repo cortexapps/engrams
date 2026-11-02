@@ -319,13 +319,19 @@ pub(crate) async fn build_resume_egress_policy(
     sandbox_id: engram_core::SandboxId,
     image: &str,
 ) -> Result<Option<engram_core::types::egress::SessionEgressPolicy>, ApiError> {
+    let policy = load_session_policy(state, session_id).await?;
     let Some(guest_ip) = state.services.host.guest_ip(sandbox_id).await else {
+        if policy.as_ref().is_some_and(|p| p.managed_deny.is_some()) {
+            return Err(ApiError::BadRequest(
+                "managed policy requires an enforceable guest identity".into(),
+            ));
+        }
         return Ok(None);
     };
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
-    let policy = load_session_policy(state, session_id).await?;
+
     let (repo, tag) = split_image_ref(image);
     let secret_ctx = SecretContext {
         repo,
@@ -352,7 +358,7 @@ pub(crate) async fn build_resume_egress_policy(
         .await?
         .map(|rs| rs.apps)
         .unwrap_or_default();
-    Ok(Some(assemble_resume_egress_policy(
+    let mut result = assemble_resume_egress_policy(
         session_id,
         sandbox_id,
         guest_ip,
@@ -369,7 +375,9 @@ pub(crate) async fn build_resume_egress_policy(
             .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
         apps,
-    )))
+    );
+    result.managed_deny = policy.and_then(|p| p.managed_deny);
+    Ok(Some(result))
 }
 
 /// Pure synchronous assembly path for the resume egress policy.
@@ -392,6 +400,7 @@ pub(crate) fn assemble_resume_egress_policy(
     apps: Vec<engram_core::types::egress::AppEndpoint>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip,

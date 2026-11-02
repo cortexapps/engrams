@@ -381,6 +381,22 @@ pub trait HostClient: Send + Sync {
     /// eliminates the WS-era frame-ordering invariant that the
     /// stateless transport can't honour. Local impl applies in-proc;
     /// the gRPC impl ships both fields in a single `StartAgent` RPC.
+    async fn read_managed_policy(
+        &self,
+        _target: crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<crate::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "managed host mode unavailable".into(),
+        ))
+    }
+    async fn apply_managed_policy(
+        &self,
+        _request: crate::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<crate::types::managed_deny::ManagedAppliedState, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "managed host mode unavailable".into(),
+        ))
+    }
     async fn start_agent(
         &self,
         id: SandboxId,

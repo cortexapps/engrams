@@ -85,6 +85,50 @@ servers must authenticate writes.
 
 ### Network containment
 
+Managed policy has a durable monotone host union. The coordinator saves the
+desired union in the session integration policy before host I/O. The host saves
+the desired state before proxy application, drains existing session connections,
+then saves an applied marker before ACK. Read and compare-and-apply bind the exact
+session, sandbox, physical epoch, host and proxy incarnations, binding hash,
+operator identity, revision and digest. A lost ACK cannot remove retained hosts.
+Managed host mode requires mTLS for the whole host mutation listener, exact
+coordinator certificate pins, and host-specific server identity verification.
+There is no simultaneous plaintext mutation listener or downgrade fallback.
+
+A managed host owns the durable policy directory with one lifetime exclusive OS
+lock. The lock file keeps its inode and is never removed during handoff. The
+lock releases on process exit or crash. A successor quarantines every managed
+session reported by the surviving proxy before it reads durable records or
+replays ordinary policies. Missing or corrupt records fail startup and keep
+admission closed. Valid replay checks the physical target and live network
+capability before it produces a new receipt for the successor incarnation.
+Managed control requests use separate local proxy streams; a session drain does
+not hold a global network lock. Directory ownership requires a persistent host
+volume and one managed host generation per directory in deployment.
+
+Until the strict restore producer exists, known managed sessions reject restore,
+base restore, resume, and agent start. The management marker is trusted host
+state, and a corrupt marker does not make the session ordinary. A fresh target
+host has no local marker: coordinator classification and pre-restore fencing are
+still required before cross-host migration can be enabled.
+
+Fresh create and restore use a durable coordinator pre-start gate at the real
+physical binding epoch. The orchestrator pulls preparation state, compiles and
+commits a final candidate, then finalizes the exact manifest and host receipt.
+The coordinator never holds a transaction waiting for the orchestrator. Initial
+prompts remain durable and blocked until finalization. The native-only manifest
+is an immutable creation input with authenticated session association. Restore
+must quarantine guest execution and network before it can run saved state.
+
+The complete deny superset includes every operator-declared selectable authority
+and alias in every zone, including unused zones. A durable operator generation
+stages additions, closes new managed boot admission, and requires all affected
+sessions to ACK the union or have a proved network fence before publication.
+The worker configuration digest and deployment/network identity are separate
+inputs. Missing capabilities and mixed generations stay closed. Network policy,
+boot finalization, and operator publication are separate implementation slices;
+the feature stays disabled until all producers and their composition are verified.
+
 Accept canonical HTTPS URLs with exact approved authority and port (443 by
 default). Reject userinfo, query, fragment, IP literals, and redirects. A public
 zone denies private and reserved ranges. An internal zone allows only exact
@@ -275,3 +319,25 @@ the implementation commit chain.
 - [Streamable HTTP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
 - [Official TypeScript SDK 2.4.0](https://github.com/modelcontextprotocol/typescript-sdk/releases/tag/v2.4.0)
 - [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
+
+### Managed network producer limits
+
+Managed sessions inspect otherwise allowed external TLS through the existing
+HTTP interceptor. Literal mode does not add credentials. HTTP authority must
+match the normalized TLS SNI and port. The proxy rejects opaque protocols,
+HTTP CONNECT, upgrades, and chunked HTTP/1 requests that this adapter cannot
+bound. Clients must trust the guest proxy CA; certificate-pinned clients and
+custom non-HTTP TLS can fail. Ordinary sessions keep their current behavior.
+Managed sessions cannot use connector-owned tunnels because the current
+connector contract does not prove the external authority. The gateway and TLS
+proxy share session connection cancellation and drain.
+
+A proxy acknowledgement alone does not prove complete guest enforcement. The
+backend must supply a strict network proof tied to the exact host, sandbox,
+physical epoch, guest IP, and network identity before a final binding ACK.
+The default backend proof is absent. The existing Firecracker rules redirect
+TCP 443 and DNS; they do not establish all-port enforcement. The next producer
+slice must install pre-execution host controls for all TCP ports and close
+unobserved UDP paths, including restore. Bootstrap receipts have no final
+binding hash and cannot authorize tool exposure. Local socket tests do not
+establish Firecracker, VZ, or harness compatibility acceptance.

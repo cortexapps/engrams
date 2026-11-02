@@ -107,6 +107,120 @@ fn creation(request: &wire::CreatePolicySessionRequest) -> Result<McpPolicyCreat
 }
 #[tonic::async_trait]
 impl SessionPolicyService for PolicyControl {
+    async fn read_managed_policy(
+        &self,
+        req: Request<wire::ReadManagedPolicyRequest>,
+    ) -> Result<Response<wire::ReadManagedPolicyResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let target: engram_core::types::managed_deny::ManagedPolicyTarget =
+            required(req.into_inner().target)?
+                .try_into()
+                .map_err(Status::invalid_argument)?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed policy unavailable"))?;
+        check_managed_target(state, &target).await?;
+        let applied = state
+            .services
+            .host
+            .read_managed_policy(target.clone())
+            .await
+            .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
+        check_managed_target(state, &target).await?;
+        if let Some(receipt) = &applied {
+            receipt.validate().map_err(Status::failed_precondition)?;
+            if receipt.context.target != target {
+                return Err(Status::failed_precondition("host policy identity changed"));
+            }
+        }
+        Ok(Response::new(wire::ReadManagedPolicyResponse {
+            protocol: wire::PROTOCOL,
+            applied: applied.map(Into::into),
+        }))
+    }
+    async fn apply_managed_policy(
+        &self,
+        req: Request<wire::ApplyManagedPolicyRequest>,
+    ) -> Result<Response<wire::ApplyManagedPolicyResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let r = req.into_inner();
+        let context: engram_core::types::managed_deny::ManagedPolicyContext = required(r.context)?
+            .try_into()
+            .map_err(Status::invalid_argument)?;
+        let policy: engram_core::types::managed_deny::ManagedDenyPolicy = required(r.policy)?
+            .try_into()
+            .map_err(Status::invalid_argument)?;
+        let expected = r
+            .expected
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(Status::invalid_argument)?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed policy unavailable"))?;
+        let target = &context.target;
+        check_managed_target(state, target).await?;
+        // The desired union commits before any host call. A lost ACK cannot discard it on migration.
+        state
+            .services
+            .meta
+            .retain_managed_deny(target, &policy)
+            .await
+            .map_err(err)?;
+        let session = state
+            .services
+            .meta
+            .get_session(target.session_id)
+            .await
+            .map_err(err)?;
+        let egress = crate::api::sessions::build_resume_egress_policy(
+            state,
+            target.session_id,
+            target.sandbox_id,
+            &session.image.to_string(),
+        )
+        .await
+        .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
+        .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?;
+        if !egress.tunnels.is_empty() {
+            return Err(Status::failed_precondition(
+                "managed policy does not support tunnels",
+            ));
+        }
+        if egress.managed_deny.as_ref() != Some(&policy) {
+            return Err(Status::failed_precondition("desired policy changed"));
+        }
+        check_managed_target(state, target).await?;
+        let applied = state
+            .services
+            .host
+            .apply_managed_policy(engram_core::types::managed_deny::ManagedPolicyApply {
+                expected,
+                context: context.clone(),
+                egress,
+            })
+            .await
+            .map_err(|_| Status::failed_precondition("host policy unavailable"))?;
+        check_managed_target(state, target).await?;
+        applied.validate().map_err(Status::failed_precondition)?;
+        if applied.context != context || applied.policy != policy {
+            return Err(Status::failed_precondition("host acknowledgement mismatch"));
+        }
+        Ok(Response::new(wire::ApplyManagedPolicyResponse {
+            protocol: wire::PROTOCOL,
+            applied: Some(applied.into()),
+        }))
+    }
     async fn create_policy_session(
         &self,
         req: Request<wire::CreatePolicySessionRequest>,
@@ -307,6 +421,24 @@ impl SessionPolicyService for PolicyControl {
         }))
     }
 }
+
+async fn check_managed_target(
+    state: &SharedState,
+    target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+) -> Result<(), Status> {
+    if state
+        .services
+        .meta
+        .managed_policy_target(target.session_id)
+        .await
+        .map_err(err)?
+        != *target
+    {
+        return Err(Status::failed_precondition("physical placement changed"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

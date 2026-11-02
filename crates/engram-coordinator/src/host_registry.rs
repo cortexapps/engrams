@@ -706,6 +706,24 @@ impl HostClient for HostRegistry {
         result
     }
 
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        self.backend_for(target.host_id)
+            .await?
+            .read_managed_policy(target)
+            .await
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        self.backend_for(request.context.target.host_id)
+            .await?
+            .apply_managed_policy(request)
+            .await
+    }
     async fn start_agent(
         &self,
         id: SandboxId,

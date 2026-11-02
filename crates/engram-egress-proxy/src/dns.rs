@@ -349,6 +349,9 @@ fn decide(registry: &Registry, guest_ip: Ipv4Addr, query: &Message) -> Decision 
 ///
 /// A credential-exchange host is refused outright, matching `decide()`.
 fn name_allowed(state: &SessionState, qname: &str) -> bool {
+    if state.managed_deny.as_ref().is_some_and(|p| p.denies(qname)) {
+        return false;
+    }
     // ADR 0118: the session's OWN apps resolve unconditionally — before the
     // deny-list and before the allow-list. A sibling app is not an egress
     // destination at all: the TCP connection never leaves the host, so
@@ -417,6 +420,7 @@ mod tests {
     #[test]
     fn allows_exact_match_in_network_allow() {
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -452,6 +456,7 @@ mod tests {
             cred: crate::registry::RefreshableCred::new("token".into(), None),
         };
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -475,6 +480,7 @@ mod tests {
     #[test]
     fn refuses_to_resolve_a_credential_exchange_host() {
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -503,6 +509,7 @@ mod tests {
     #[test]
     fn allows_wildcard_pattern() {
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -536,6 +543,7 @@ mod tests {
     #[test]
     fn denies_name_not_in_allow_list() {
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -576,6 +584,7 @@ mod tests {
         // network_allow) should still resolve, mirroring the TCP
         // path's `Intercept` decision.
         let state = SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
@@ -634,6 +643,7 @@ mod tests {
             panic!("client must be v4");
         };
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: client_ip,
@@ -675,6 +685,7 @@ mod tests {
             panic!("client must be v4");
         };
         registry.register(SessionState {
+            managed_deny: None,
             session_id: SessionId::new(),
             sandbox_id: engram_core::SandboxId::new(),
             guest_ip: client_ip,

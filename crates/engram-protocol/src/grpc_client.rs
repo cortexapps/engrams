@@ -1686,6 +1686,38 @@ impl HostClient for GrpcHostClient {
         Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        let response = self
+            .inner
+            .clone()
+            .read_managed_policy(crate::grpc::ReadManagedPolicyRequest {
+                target_bincode: encode_bincode(&target, "managed target")?,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_policy::decode(&response.state_bincode)
+            .map_err(|_| SandboxError::InvalidSpec("invalid managed state".into()))
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        let response = self
+            .inner
+            .clone()
+            .apply_managed_policy(crate::grpc::ApplyManagedPolicyRequest {
+                request_bincode: encode_bincode(&request, "managed apply")?,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_policy::decode(&response.state_bincode)
+            .map_err(|_| SandboxError::InvalidSpec("invalid managed state".into()))
+    }
     async fn start_agent(
         &self,
         id: SandboxId,

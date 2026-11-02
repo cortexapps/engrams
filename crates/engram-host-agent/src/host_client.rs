@@ -11,7 +11,7 @@
 //!   `engram-protocol::server` serves over the WS — so the coord on
 //!   the other end of a `RemoteHostClient` is talking to one of these.
 //!
-//! All sandbox methods are pure delegation to the inner `SandboxBackend`.
+//! Sandbox methods delegate after the applicable host lifecycle guards.
 //! The harness methods (`bind_session`, `unbind_session`,
 //! `send_prompt`) delegate to the `HarnessHub`, mapping its
 //! `HarnessError` into `SandboxError` so the trait surface stays
@@ -38,6 +38,7 @@ use crate::harness::{HarnessError, HarnessHub};
 pub struct LocalHostClient {
     sandbox: Arc<dyn SandboxBackend>,
     harness_hub: Arc<HarnessHub>,
+    managed: Option<Arc<crate::managed_policy::ManagedPolicyHost>>,
 }
 
 impl LocalHostClient {
@@ -45,7 +46,44 @@ impl LocalHostClient {
         Self {
             sandbox,
             harness_hub,
+            managed: None,
         }
+    }
+
+    pub fn with_managed_policy(
+        mut self,
+        host: Arc<crate::managed_policy::ManagedPolicyHost>,
+    ) -> Self {
+        self.managed = Some(host);
+        self
+    }
+
+    fn check_restore_gate(
+        &self,
+        fence: SessionFence,
+        sandbox: Option<SandboxId>,
+    ) -> Result<(), SandboxError> {
+        let bindings = self.harness_hub.binding_store();
+        let mut managed = bindings.managed_required(fence.session_id);
+        if let Some(sandbox) = sandbox {
+            if let Some(binding) = bindings
+                .find_by_sandbox(sandbox)
+                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            {
+                managed |= bindings.managed_required(binding.session_id);
+            }
+        }
+        if managed {
+            return Err(SandboxError::InvalidSpec(
+                "managed restore quarantine unavailable".into(),
+            ));
+        }
+        if self.managed.is_some() && fence.session_id.as_uuid().is_nil() {
+            return Err(SandboxError::InvalidSpec(
+                "restore session identity required".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Convenience constructor for callers that don't need to route
@@ -254,8 +292,9 @@ impl HostClient for LocalHostClient {
     async fn restore(
         &self,
         metadata: SnapshotMetadata,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.check_restore_gate(fence, metadata.source_sandbox_id)?;
         self.sandbox.restore(metadata).await
     }
 
@@ -285,13 +324,34 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.check_restore_gate(fence, metadata.source_sandbox_id)?;
         self.sandbox
             .restore_base_for_session(metadata, session_env, selected_mounts)
             .await
     }
 
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        self.managed
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("managed host mode unavailable".into()))?
+            .read_applied(&target)
+            .await
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        self.managed
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("managed host mode unavailable".into()))?
+            .compare_and_apply(request)
+            .await
+    }
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -299,6 +359,16 @@ impl HostClient for LocalHostClient {
         policy: SessionEgressPolicy,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        if policy.managed_deny.is_some()
+            || self
+                .harness_hub
+                .binding_store()
+                .managed_required(policy.session_id)
+        {
+            return Err(SandboxError::InvalidSpec(
+                "managed session requires acknowledged boot finalization".into(),
+            ));
+        }
         // ADR 0073: persist the binding record BEFORE the harness can
         // dial (the spawn below), so the first attach validates instead
         // of bouncing UnknownBinding. Monotonic: a stale caller's bind
@@ -420,11 +490,8 @@ impl HostClient for LocalHostClient {
         self.sandbox.pause(sandbox_id).await
     }
 
-    async fn resume(
-        &self,
-        sandbox_id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<(), SandboxError> {
+    async fn resume(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.check_restore_gate(fence, Some(sandbox_id))?;
         self.sandbox.resume(sandbox_id).await
     }
 

@@ -44,7 +44,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump on any wire-incompatible change. A mismatch in `Hello`
 /// position is never adopted — the caller kills and respawns.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 /// Frame size cap. `SyncPolicies` carries every live session's policy
 /// (resolved secrets included), so the cap is generous; both ends are
@@ -85,6 +85,9 @@ pub const BUILD_ENV_SOURCE_FINGERPRINT: &str = "ENGRAM_EGRESS_PROXYD_FINGERPRINT
 /// Host-agent → proxyd.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ToProxyd {
+    ListManaged,
+    ReadManaged(engram_core::SessionId),
+    QuarantineManaged(engram_core::SessionId),
     /// First frame on every connection.
     Hello {
         proto_version: u32,
@@ -118,6 +121,8 @@ pub enum ToProxyd {
 /// proxyd → host-agent.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum FromProxyd {
+    ManagedSessions(Vec<SessionId>),
+    ManagedState(Option<engram_core::types::managed_deny::ManagedProxyState>),
     HelloAck(HelloInfo),
     Ok,
     Err(String),
@@ -141,6 +146,8 @@ pub struct GuestSummary {
 /// file, is the authority (the file can be stale or torn).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HelloInfo {
+    #[serde(default)]
+    pub incarnation: String,
     pub proto_version: u32,
     /// The build-time source fingerprint, `None` for local builds.
     pub source_fingerprint: Option<String>,
@@ -320,6 +327,7 @@ mod tests {
             assert_eq!(back, m);
         }
         let m = FromProxyd::HelloAck(HelloInfo {
+            incarnation: "test-incarnation".into(),
             proto_version: PROTO_VERSION,
             source_fingerprint: Some("abc123".into()),
             proxy_port: 8443,

@@ -329,6 +329,13 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
                 (secrets, injects, observes),
                 (guest_services, secret_mode, apps),
             )| SessionEgressPolicy {
+                managed_deny: allow_all.then(|| {
+                    engram_core::types::managed_deny::ManagedDenyPolicy::new(
+                        (session % 1000) as u64,
+                        ["mcp.example".into()],
+                    )
+                    .unwrap()
+                }),
                 session_id: SessionId::from(uuid::Uuid::from_u128(session)),
                 sandbox_id: SandboxId::from(uuid::Uuid::from_u128(sandbox)),
                 guest_ip: std::net::Ipv4Addr::from(ip),

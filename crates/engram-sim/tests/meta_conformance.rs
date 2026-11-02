@@ -8811,3 +8811,61 @@ conformance!(
     t_mcp_read_execution_identity,
     super::mcp_read_execution_identity
 );
+
+async fn managed_deny_retention(ctx: &Ctx) {
+    use engram_core::types::managed_deny::*;
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("test.invalid/managed:latest"))
+        .await
+        .unwrap();
+    let hid = HostId::new();
+    meta.upsert_host(host_record(hid, "managed-host", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    meta.assign_session_host(sid, Some(hid)).await.unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = meta.transition_session_created(sid, sandbox).await.unwrap();
+    let target = ManagedPolicyTarget {
+        session_id: sid,
+        sandbox_id: sandbox,
+        host_id: hid,
+        binding_epoch: epoch,
+    };
+    assert_eq!(meta.managed_policy_target(sid).await.unwrap(), target);
+    let one = ManagedDenyPolicy::new(1, ["a.example".into()]).unwrap();
+    meta.retain_managed_deny(&target, &one).await.unwrap();
+    meta.retain_managed_deny(&target, &one).await.unwrap();
+    assert!(meta
+        .bind_session_integration_policy(sid, "{}")
+        .await
+        .is_err());
+    let smaller = ManagedDenyPolicy::new(2, ["b.example".into()]).unwrap();
+    assert!(meta.retain_managed_deny(&target, &smaller).await.is_err());
+    let union = ManagedDenyPolicy::new(2, ["a.example".into(), "b.example".into()]).unwrap();
+    meta.retain_managed_deny(&target, &union).await.unwrap();
+    assert!(meta.retain_managed_deny(&target, &one).await.is_err());
+    let mut stale = target.clone();
+    stale.binding_epoch += 1;
+    assert!(meta.retain_managed_deny(&stale, &union).await.is_err());
+    let stored: engram_core::types::integration::IntegrationPolicy = serde_json::from_str(
+        &meta
+            .get_session_integration_policy(sid)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.managed_deny, Some(union.clone()));
+    assert_eq!(
+        meta.managed_policy_target(sid).await.unwrap(),
+        target,
+        "deny updates must not change physical epoch"
+    );
+    meta.transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert!(meta.managed_policy_target(sid).await.is_err());
+    assert!(meta.retain_managed_deny(&target, &union).await.is_err());
+}
+conformance!(t_managed_deny_retention, super::managed_deny_retention);

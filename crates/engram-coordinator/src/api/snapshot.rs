@@ -56,6 +56,7 @@ pub(crate) fn placeholder_egress_policy(
     sandbox_id: SandboxId,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip: std::net::Ipv4Addr::UNSPECIFIED,

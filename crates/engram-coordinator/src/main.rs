@@ -762,7 +762,13 @@ async fn main() -> Result<(), CoordinatorError> {
     // ADR 0013: per-pod gRPC pool. Empty at construction; populated
     // on `/api/hosts/register` POSTs and (in `run_with_registry`) at
     // startup from already-registered `hosts` rows.
-    let host_pool = Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new());
+    let mut host_pool = engram_protocol::grpc_pool::GrpcHostPool::new();
+    if let Some(tls) =
+        engram_protocol::host_tls::HostClientTls::from_env().map_err(CoordinatorError::Config)?
+    {
+        host_pool = host_pool.with_tls(tls);
+    }
+    let host_pool = Arc::new(host_pool);
     // ADR 0047: let the registry dial hosts this replica has never
     // fielded a heartbeat from (multi-replica routing read-through).
     host_registry.set_dialer(host_pool.clone());

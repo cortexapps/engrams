@@ -222,6 +222,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
 
 fn session_egress_policy() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         session_id: SessionId::from(fixed_uuid(0x30)),
         sandbox_id: SandboxId::from(fixed_uuid(0x31)),
         guest_ip: Ipv4Addr::new(169, 254, 0, 21),
@@ -261,6 +262,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
 /// entry types can't silently drop off the corpus again.
 fn session_egress_policy_minted() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "ghs_minted".into(),
             header_name: "authorization".into(),
@@ -313,6 +315,7 @@ fn session_egress_policy_minted() -> SessionEgressPolicy {
 ///   that #931 fixed stays pinned for a second provider.
 fn session_egress_policy_google() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         network_allow_hosts: vec!["compute.googleapis.com".into()],
         injects: vec![EgressInjectEntry {
             secret: "ya29.minted".into(),
@@ -354,6 +357,7 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
 /// variant's encoding (index 1) inside a fully-populated entry.
 fn session_egress_policy_oauth() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "linear-access-token".into(),
             header_name: "Authorization".into(),
@@ -381,6 +385,7 @@ fn session_egress_policy_oauth() -> SessionEgressPolicy {
 /// fully-populated entry.
 fn session_egress_policy_oauth_user() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "personal-access-token".into(),
             header_name: "Authorization".into(),
@@ -729,8 +734,9 @@ fn wire_version_pinned() {
     // MigrationItem appends HotHint (bincode 3, protobuf 6). Existing item
     // indices stay fixed; the optional hint is separate from immutable disk seals.
     // Existing goldens embed neither payload and keep their bytes.
+    // 37 -> 38: SessionEgressPolicy appends the managed deny envelope.
     assert_eq!(
-        WIRE_VERSION, 37,
+        WIRE_VERSION, 38,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -767,6 +773,7 @@ fn regen_golden() {
         },
     );
     write("session_egress_policy", &session_egress_policy());
+    write("session_egress_policy_managed", &managed_egress_policy());
     write(
         "session_egress_policy_minted",
         &session_egress_policy_minted(),
@@ -907,4 +914,20 @@ fn warm_config_wire_shape_round_trips_only_when_stripped() {
         "tagged CaptureEnvValue became bincode-decodable — retire the coordinator's \
          wire-strip in enabled_images.rs and this pin together"
     );
+}
+
+fn managed_egress_policy() -> SessionEgressPolicy {
+    let mut policy = session_egress_policy();
+    policy.managed_deny = Some(
+        engram_core::types::managed_deny::ManagedDenyPolicy::new(
+            9,
+            ["mcp.example".into(), "alias.example".into()],
+        )
+        .unwrap(),
+    );
+    policy
+}
+#[test]
+fn managed_policy_is_appended_to_egress_wire() {
+    assert_golden("session_egress_policy_managed", &managed_egress_policy());
 }

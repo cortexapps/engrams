@@ -166,6 +166,7 @@ fn agent_spec_with_prompt(prompt_id: &str, text: &str) -> AgentSpec {
 
 fn egress_policy(session_id: SessionId, sandbox_id: SandboxId) -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip: std::net::Ipv4Addr::UNSPECIFIED,

@@ -2,8 +2,8 @@
 // @generated from file engram/mcp/v1/session_policy.proto (package engram.mcp.v1, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv1";
-import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
+import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv1";
+import { enumDesc, fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
 import type { CreateSessionRequest, CreateSessionResponse, GetMcpWritePolicyResponse, McpPlanReview, McpTrustedWritePolicy, McpWritePolicyRef } from "../../app/v1/session_pb";
 import { file_engram_app_v1_session } from "../../app/v1/session_pb";
 import type { Message } from "@bufbuild/protobuf";
@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/mcp/v1/session_policy.proto.
  */
 export const file_engram_mcp_v1_session_policy: GenFile = /*@__PURE__*/
-  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIsICChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSFwoPbW9kZWxfdG9vbF9uYW1lGAggASgJEhoKEm9yaWdpbmFsX2FyZ3VtZW50cxgJIAEoCSJBCh1WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIOCgZzdGF0dXMYAiABKAkiVAobQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEjUKB3Nlc3Npb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZSJSChdSZWFkV3JpdGVQb2xpY3lSZXNwb25zZRI3CgVzdGF0ZRgBIAEoCzIoLmVuZ3JhbS5hcHAudjEuR2V0TWNwV3JpdGVQb2xpY3lSZXNwb25zZSJOChZBY2NlcHRQbGFuRXhpdFJlc3BvbnNlEjQKBnBvbGljeRgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuTWNwVHJ1c3RlZFdyaXRlUG9saWN5IsYCCiBWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRISCgpzZXNzaW9uX2lkGAIgASgJEg4KBnJ1bl9pZBgDIAEoCRIUCgx0b29sX2NhbGxfaWQYBCABKAkSPQoTYWNjZXB0ZWRfcG9saWN5X3JlZhgFIAEoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSIgoaYWNjZXB0ZWRfd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSPgoUYW5jZXN0b3JfcG9saWN5X3JlZnMYByADKAsyIC5lbmdyYW0uYXBwLnYxLk1jcFdyaXRlUG9saWN5UmVmEhcKD21vZGVsX3Rvb2xfbmFtZRgIIAEoCRIaChJvcmlnaW5hbF9hcmd1bWVudHMYCSABKAkiRQohVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEg4KBnN0YXR1cxgCIAEoCTK5BAoUU2Vzc2lvblBvbGljeVNlcnZpY2USbAoTQ3JlYXRlUG9saWN5U2Vzc2lvbhIpLmVuZ3JhbS5tY3AudjEuQ3JlYXRlUG9saWN5U2Vzc2lvblJlcXVlc3QaKi5lbmdyYW0ubWNwLnYxLkNyZWF0ZVBvbGljeVNlc3Npb25SZXNwb25zZRJgCg9SZWFkV3JpdGVQb2xpY3kSJS5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlcXVlc3QaJi5lbmdyYW0ubWNwLnYxLlJlYWRXcml0ZVBvbGljeVJlc3BvbnNlEl0KDkFjY2VwdFBsYW5FeGl0EiQuZW5ncmFtLm1jcC52MS5BY2NlcHRQbGFuRXhpdFJlcXVlc3QaJS5lbmdyYW0ubWNwLnYxLkFjY2VwdFBsYW5FeGl0UmVzcG9uc2USfgoZVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eRIvLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlcXVlc3QaMC5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRXhlY3V0aW9uSWRlbnRpdHlSZXNwb25zZRJyChVWYWxpZGF0ZURpc3BhdGNoRmVuY2USKy5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRGlzcGF0Y2hGZW5jZVJlcXVlc3QaLC5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRGlzcGF0Y2hGZW5jZVJlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_session]);
+  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIsICChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSFwoPbW9kZWxfdG9vbF9uYW1lGAggASgJEhoKEm9yaWdpbmFsX2FyZ3VtZW50cxgJIAEoCSJBCh1WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIOCgZzdGF0dXMYAiABKAkiVAobQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEjUKB3Nlc3Npb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZSJSChdSZWFkV3JpdGVQb2xpY3lSZXNwb25zZRI3CgVzdGF0ZRgBIAEoCzIoLmVuZ3JhbS5hcHAudjEuR2V0TWNwV3JpdGVQb2xpY3lSZXNwb25zZSJOChZBY2NlcHRQbGFuRXhpdFJlc3BvbnNlEjQKBnBvbGljeRgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuTWNwVHJ1c3RlZFdyaXRlUG9saWN5IsYCCiBWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRISCgpzZXNzaW9uX2lkGAIgASgJEg4KBnJ1bl9pZBgDIAEoCRIUCgx0b29sX2NhbGxfaWQYBCABKAkSPQoTYWNjZXB0ZWRfcG9saWN5X3JlZhgFIAEoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSIgoaYWNjZXB0ZWRfd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSPgoUYW5jZXN0b3JfcG9saWN5X3JlZnMYByADKAsyIC5lbmdyYW0uYXBwLnYxLk1jcFdyaXRlUG9saWN5UmVmEhcKD21vZGVsX3Rvb2xfbmFtZRgIIAEoCRIaChJvcmlnaW5hbF9hcmd1bWVudHMYCSABKAkiRQohVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEg4KBnN0YXR1cxgCIAEoCSJlChNNYW5hZ2VkUG9saWN5VGFyZ2V0EhIKCnNlc3Npb25faWQYASABKAkSEgoKc2FuZGJveF9pZBgCIAEoCRIPCgdob3N0X2lkGAMgASgJEhUKDWJpbmRpbmdfZXBvY2gYBCABKAQi4AEKFE1hbmFnZWRQb2xpY3lDb250ZXh0EjIKBnRhcmdldBgBIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeVRhcmdldBIbChNvcGVyYXRvcl9nZW5lcmF0aW9uGAIgASgEEhkKEW9wZXJhdG9yX2lkZW50aXR5GAMgASgJEjAKBXBoYXNlGAQgASgOMiEuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5UGhhc2USGQoMYmluZGluZ19oYXNoGAUgASgJSACIAQFCDwoNX2JpbmRpbmdfaGFzaCJVChFNYW5hZ2VkRGVueVBvbGljeRIPCgd2ZXJzaW9uGAEgASgNEhAKCHJldmlzaW9uGAIgASgEEg0KBWhvc3RzGAMgAygJEg4KBmRpZ2VzdBgEIAEoCSKWAgoTTWFuYWdlZEFwcGxpZWRTdGF0ZRI0Cgdjb250ZXh0GAEgASgLMiMuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5Q29udGV4dBIwCgZwb2xpY3kYAiABKAsyIC5lbmdyYW0ubWNwLnYxLk1hbmFnZWREZW55UG9saWN5EhgKEGhvc3RfaW5jYXJuYXRpb24YAyABKAkSGQoRcHJveHlfaW5jYXJuYXRpb24YBCABKAkSEAoIc3RhdGVfaWQYBSABKAkSPgoNbmV0d29ya19wcm9vZhgGIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZE5ldHdvcmtQcm9vZkgAiAEBQhAKDl9uZXR3b3JrX3Byb29mImAKGFJlYWRNYW5hZ2VkUG9saWN5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIyCgZ0YXJnZXQYAiABKAsyIi5lbmdyYW0ubWNwLnYxLk1hbmFnZWRQb2xpY3lUYXJnZXQicwoZUmVhZE1hbmFnZWRQb2xpY3lSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRI4CgdhcHBsaWVkGAIgASgLMiIuZW5ncmFtLm1jcC52MS5NYW5hZ2VkQXBwbGllZFN0YXRlSACIAQFCCgoIX2FwcGxpZWQi3QEKGUFwcGx5TWFuYWdlZFBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SNAoHY29udGV4dBgCIAEoCzIjLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeUNvbnRleHQSMAoGcG9saWN5GAMgASgLMiAuZW5ncmFtLm1jcC52MS5NYW5hZ2VkRGVueVBvbGljeRI5CghleHBlY3RlZBgEIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZEFwcGxpZWRTdGF0ZUgAiAEBQgsKCV9leHBlY3RlZCJjChpBcHBseU1hbmFnZWRQb2xpY3lSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIzCgdhcHBsaWVkGAIgASgLMiIuZW5ncmFtLm1jcC52MS5NYW5hZ2VkQXBwbGllZFN0YXRlInUKE01hbmFnZWROZXR3b3JrUHJvb2YSMgoGdGFyZ2V0GAEgASgLMiIuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5VGFyZ2V0EhAKCGd1ZXN0X2lwGAIgASgJEhgKEG5ldHdvcmtfaWRlbnRpdHkYAyABKAkqfgoSTWFuYWdlZFBvbGljeVBoYXNlEiQKIE1BTkFHRURfUE9MSUNZX1BIQVNFX1VOU1BFQ0lGSUVEEAASIgoeTUFOQUdFRF9QT0xJQ1lfUEhBU0VfQk9PVFNUUkFQEAESHgoaTUFOQUdFRF9QT0xJQ1lfUEhBU0VfRklOQUwQAjKMBgoUU2Vzc2lvblBvbGljeVNlcnZpY2USZgoRUmVhZE1hbmFnZWRQb2xpY3kSJy5lbmdyYW0ubWNwLnYxLlJlYWRNYW5hZ2VkUG9saWN5UmVxdWVzdBooLmVuZ3JhbS5tY3AudjEuUmVhZE1hbmFnZWRQb2xpY3lSZXNwb25zZRJpChJBcHBseU1hbmFnZWRQb2xpY3kSKC5lbmdyYW0ubWNwLnYxLkFwcGx5TWFuYWdlZFBvbGljeVJlcXVlc3QaKS5lbmdyYW0ubWNwLnYxLkFwcGx5TWFuYWdlZFBvbGljeVJlc3BvbnNlEmwKE0NyZWF0ZVBvbGljeVNlc3Npb24SKS5lbmdyYW0ubWNwLnYxLkNyZWF0ZVBvbGljeVNlc3Npb25SZXF1ZXN0GiouZW5ncmFtLm1jcC52MS5DcmVhdGVQb2xpY3lTZXNzaW9uUmVzcG9uc2USYAoPUmVhZFdyaXRlUG9saWN5EiUuZW5ncmFtLm1jcC52MS5SZWFkV3JpdGVQb2xpY3lSZXF1ZXN0GiYuZW5ncmFtLm1jcC52MS5SZWFkV3JpdGVQb2xpY3lSZXNwb25zZRJdCg5BY2NlcHRQbGFuRXhpdBIkLmVuZ3JhbS5tY3AudjEuQWNjZXB0UGxhbkV4aXRSZXF1ZXN0GiUuZW5ncmFtLm1jcC52MS5BY2NlcHRQbGFuRXhpdFJlc3BvbnNlEn4KGVZhbGlkYXRlRXhlY3V0aW9uSWRlbnRpdHkSLy5lbmdyYW0ubWNwLnYxLlZhbGlkYXRlRXhlY3V0aW9uSWRlbnRpdHlSZXF1ZXN0GjAuZW5ncmFtLm1jcC52MS5WYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVzcG9uc2UScgoVVmFsaWRhdGVEaXNwYXRjaEZlbmNlEisuZW5ncmFtLm1jcC52MS5WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0GiwuZW5ncmFtLm1jcC52MS5WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.mcp.v1.CreatePolicySessionRequest
@@ -320,11 +320,323 @@ export const ValidateExecutionIdentityResponseSchema: GenMessage<ValidateExecuti
   messageDesc(file_engram_mcp_v1_session_policy, 9);
 
 /**
+ * @generated from message engram.mcp.v1.ManagedPolicyTarget
+ */
+export type ManagedPolicyTarget = Message<"engram.mcp.v1.ManagedPolicyTarget"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string sandbox_id = 2;
+   */
+  sandboxId: string;
+
+  /**
+   * @generated from field: string host_id = 3;
+   */
+  hostId: string;
+
+  /**
+   * @generated from field: uint64 binding_epoch = 4;
+   */
+  bindingEpoch: bigint;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedPolicyTarget.
+ * Use `create(ManagedPolicyTargetSchema)` to create a new message.
+ */
+export const ManagedPolicyTargetSchema: GenMessage<ManagedPolicyTarget> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 10);
+
+/**
+ * @generated from message engram.mcp.v1.ManagedPolicyContext
+ */
+export type ManagedPolicyContext = Message<"engram.mcp.v1.ManagedPolicyContext"> & {
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyTarget target = 1;
+   */
+  target?: ManagedPolicyTarget;
+
+  /**
+   * @generated from field: uint64 operator_generation = 2;
+   */
+  operatorGeneration: bigint;
+
+  /**
+   * @generated from field: string operator_identity = 3;
+   */
+  operatorIdentity: string;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyPhase phase = 4;
+   */
+  phase: ManagedPolicyPhase;
+
+  /**
+   * @generated from field: optional string binding_hash = 5;
+   */
+  bindingHash?: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedPolicyContext.
+ * Use `create(ManagedPolicyContextSchema)` to create a new message.
+ */
+export const ManagedPolicyContextSchema: GenMessage<ManagedPolicyContext> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 11);
+
+/**
+ * @generated from message engram.mcp.v1.ManagedDenyPolicy
+ */
+export type ManagedDenyPolicy = Message<"engram.mcp.v1.ManagedDenyPolicy"> & {
+  /**
+   * @generated from field: uint32 version = 1;
+   */
+  version: number;
+
+  /**
+   * @generated from field: uint64 revision = 2;
+   */
+  revision: bigint;
+
+  /**
+   * @generated from field: repeated string hosts = 3;
+   */
+  hosts: string[];
+
+  /**
+   * @generated from field: string digest = 4;
+   */
+  digest: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedDenyPolicy.
+ * Use `create(ManagedDenyPolicySchema)` to create a new message.
+ */
+export const ManagedDenyPolicySchema: GenMessage<ManagedDenyPolicy> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 12);
+
+/**
+ * @generated from message engram.mcp.v1.ManagedAppliedState
+ */
+export type ManagedAppliedState = Message<"engram.mcp.v1.ManagedAppliedState"> & {
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyContext context = 1;
+   */
+  context?: ManagedPolicyContext;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedDenyPolicy policy = 2;
+   */
+  policy?: ManagedDenyPolicy;
+
+  /**
+   * @generated from field: string host_incarnation = 3;
+   */
+  hostIncarnation: string;
+
+  /**
+   * @generated from field: string proxy_incarnation = 4;
+   */
+  proxyIncarnation: string;
+
+  /**
+   * @generated from field: string state_id = 5;
+   */
+  stateId: string;
+
+  /**
+   * @generated from field: optional engram.mcp.v1.ManagedNetworkProof network_proof = 6;
+   */
+  networkProof?: ManagedNetworkProof;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedAppliedState.
+ * Use `create(ManagedAppliedStateSchema)` to create a new message.
+ */
+export const ManagedAppliedStateSchema: GenMessage<ManagedAppliedState> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 13);
+
+/**
+ * @generated from message engram.mcp.v1.ReadManagedPolicyRequest
+ */
+export type ReadManagedPolicyRequest = Message<"engram.mcp.v1.ReadManagedPolicyRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyTarget target = 2;
+   */
+  target?: ManagedPolicyTarget;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadManagedPolicyRequest.
+ * Use `create(ReadManagedPolicyRequestSchema)` to create a new message.
+ */
+export const ReadManagedPolicyRequestSchema: GenMessage<ReadManagedPolicyRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 14);
+
+/**
+ * @generated from message engram.mcp.v1.ReadManagedPolicyResponse
+ */
+export type ReadManagedPolicyResponse = Message<"engram.mcp.v1.ReadManagedPolicyResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: optional engram.mcp.v1.ManagedAppliedState applied = 2;
+   */
+  applied?: ManagedAppliedState;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadManagedPolicyResponse.
+ * Use `create(ReadManagedPolicyResponseSchema)` to create a new message.
+ */
+export const ReadManagedPolicyResponseSchema: GenMessage<ReadManagedPolicyResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 15);
+
+/**
+ * @generated from message engram.mcp.v1.ApplyManagedPolicyRequest
+ */
+export type ApplyManagedPolicyRequest = Message<"engram.mcp.v1.ApplyManagedPolicyRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyContext context = 2;
+   */
+  context?: ManagedPolicyContext;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedDenyPolicy policy = 3;
+   */
+  policy?: ManagedDenyPolicy;
+
+  /**
+   * @generated from field: optional engram.mcp.v1.ManagedAppliedState expected = 4;
+   */
+  expected?: ManagedAppliedState;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ApplyManagedPolicyRequest.
+ * Use `create(ApplyManagedPolicyRequestSchema)` to create a new message.
+ */
+export const ApplyManagedPolicyRequestSchema: GenMessage<ApplyManagedPolicyRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 16);
+
+/**
+ * @generated from message engram.mcp.v1.ApplyManagedPolicyResponse
+ */
+export type ApplyManagedPolicyResponse = Message<"engram.mcp.v1.ApplyManagedPolicyResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedAppliedState applied = 2;
+   */
+  applied?: ManagedAppliedState;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ApplyManagedPolicyResponse.
+ * Use `create(ApplyManagedPolicyResponseSchema)` to create a new message.
+ */
+export const ApplyManagedPolicyResponseSchema: GenMessage<ApplyManagedPolicyResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 17);
+
+/**
+ * @generated from message engram.mcp.v1.ManagedNetworkProof
+ */
+export type ManagedNetworkProof = Message<"engram.mcp.v1.ManagedNetworkProof"> & {
+  /**
+   * @generated from field: engram.mcp.v1.ManagedPolicyTarget target = 1;
+   */
+  target?: ManagedPolicyTarget;
+
+  /**
+   * @generated from field: string guest_ip = 2;
+   */
+  guestIp: string;
+
+  /**
+   * @generated from field: string network_identity = 3;
+   */
+  networkIdentity: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedNetworkProof.
+ * Use `create(ManagedNetworkProofSchema)` to create a new message.
+ */
+export const ManagedNetworkProofSchema: GenMessage<ManagedNetworkProof> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 18);
+
+/**
+ * These messages describe a host receipt, not permission to expose guest tools.
+ *
+ * @generated from enum engram.mcp.v1.ManagedPolicyPhase
+ */
+export enum ManagedPolicyPhase {
+  /**
+   * @generated from enum value: MANAGED_POLICY_PHASE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: MANAGED_POLICY_PHASE_BOOTSTRAP = 1;
+   */
+  BOOTSTRAP = 1,
+
+  /**
+   * @generated from enum value: MANAGED_POLICY_PHASE_FINAL = 2;
+   */
+  FINAL = 2,
+}
+
+/**
+ * Describes the enum engram.mcp.v1.ManagedPolicyPhase.
+ */
+export const ManagedPolicyPhaseSchema: GenEnum<ManagedPolicyPhase> = /*@__PURE__*/
+  enumDesc(file_engram_mcp_v1_session_policy, 0);
+
+/**
  * Dedicated pinned mTLS only. Create reuses the ordinary creation core.
  *
  * @generated from service engram.mcp.v1.SessionPolicyService
  */
 export const SessionPolicyService: GenService<{
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadManagedPolicy
+   */
+  readManagedPolicy: {
+    methodKind: "unary";
+    input: typeof ReadManagedPolicyRequestSchema;
+    output: typeof ReadManagedPolicyResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ApplyManagedPolicy
+   */
+  applyManagedPolicy: {
+    methodKind: "unary";
+    input: typeof ApplyManagedPolicyRequestSchema;
+    output: typeof ApplyManagedPolicyResponseSchema;
+  },
   /**
    * @generated from rpc engram.mcp.v1.SessionPolicyService.CreatePolicySession
    */

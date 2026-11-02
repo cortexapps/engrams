@@ -167,6 +167,14 @@ pub enum AgentRefresh {
 
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
+    /// Strict host-owned network enforcement for this exact placement. Unavailable
+    /// until the backend can prove all egress paths are controlled before execution.
+    async fn managed_network_proof(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Option<crate::types::managed_deny::ManagedNetworkProof> {
+        None
+    }
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
 
     /// Start the long-running agent process for this sandbox (the
@@ -240,6 +248,11 @@ pub trait SandboxBackend: Send + Sync {
     /// authenticate or intercept the guest caller. Other policies remain a
     /// no-op for Process and in-test fixtures. ADR 0006 and ADR 0109.
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        if policy.managed_deny.is_some() {
+            return Err(SandboxError::InvalidSpec(
+                "managed policy requires a host proxy".into(),
+            ));
+        }
         if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
             return Err(SandboxError::InvalidSpec(
                 "guest services and tunnels require a session-scoped guest gateway".to_string(),

@@ -3414,6 +3414,25 @@ pub trait MetadataStore: Send + Sync {
     // injects without the orchestrator. One blob per session (upsert). Default
     // impls (no-op / None) so test doubles compile; `PostgresStore` is the
     // authority.
+    /// Exact current physical placement. Missing and unbound sessions fail closed.
+    async fn managed_policy_target(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<crate::types::managed_deny::ManagedPolicyTarget, MetaError> {
+        Err(MetaError::Conflict(
+            "managed policy producer unavailable".into(),
+        ))
+    }
+    /// Save the monotone desired union before host I/O, without changing placement.
+    async fn retain_managed_deny(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+        _policy: &crate::types::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict(
+            "managed policy producer unavailable".into(),
+        ))
+    }
     async fn bind_session_integration_policy(
         &self,
         session_id: SessionId,

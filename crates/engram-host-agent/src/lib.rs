@@ -74,6 +74,7 @@ pub use config::HostAgentConfig;
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
+    managed_ownership: Option<Arc<managed_policy::ManagedOwnership>>,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
     /// ADR 0006: local egress proxy. The production host-agent binary
@@ -131,6 +132,7 @@ impl HostAgent {
     ) -> Self {
         Self {
             cfg,
+            managed_ownership: None,
             sandbox,
             cloud,
             egress: None,
@@ -226,6 +228,14 @@ impl HostAgent {
         self
     }
 
+    pub fn with_managed_ownership(
+        mut self,
+        ownership: Option<Arc<managed_policy::ManagedOwnership>>,
+    ) -> Self {
+        self.managed_ownership = ownership;
+        self
+    }
+
     /// Run the host agent's background loops until shutdown.
     ///
     /// Phase 3a: if `coordinator_endpoint` is set, runs the WS dialer
@@ -234,6 +244,27 @@ impl HostAgent {
     /// in standalone dev where the binary just hosts a local backend
     /// without phoning home.
     pub async fn run(self) -> Result<(), HostAgentError> {
+        let managed_ownership = match self.managed_ownership.clone() {
+            Some(owner) => Some(owner),
+            None => managed_policy::ManagedOwnership::for_mode(
+                &self.cfg.work_dir.join("bindings"),
+                self.cfg.managed_tls.is_some(),
+            )?,
+        };
+        if let Some(tls) = &self.cfg.managed_tls {
+            if self.cfg.grpc_listen_addr.is_none()
+                || !self
+                    .cfg
+                    .grpc_advertise_addr
+                    .as_ref()
+                    .is_some_and(|a| a.starts_with("https://"))
+                || self.egress.is_none()
+                || self.host_id.is_none()
+            {
+                return Err(HostAgentError::Config("managed host mode requires an HTTPS lifecycle listener, stable host identity, and egress proxy".into()));
+            }
+            tls.server_config().map_err(HostAgentError::Config)?;
+        }
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
 
@@ -771,6 +802,29 @@ impl HostAgent {
                 .expect("open binding store under work_dir (ADR 0073)");
             let harness_hub =
                 std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink, bindings));
+            let managed_policy = if self.cfg.managed_tls.is_some() {
+                use engram_core::traits::Entropy;
+                let managed = crate::managed_policy::ManagedPolicyHost::new(
+                    host_id,
+                    engram_core::traits::OsEntropy.uuid().to_string(),
+                    harness_hub.binding_store(),
+                    pooled.clone(),
+                    self.egress.clone().expect("managed configuration checked"),
+                    managed_ownership
+                        .clone()
+                        .expect("managed ownership acquired"),
+                )?;
+                Some(Arc::new(managed))
+            } else {
+                None
+            };
+            if let Some(managed) = &managed_policy {
+                managed
+                    .recover_all()
+                    .await
+                    .map_err(|e| HostAgentError::Config(e.to_string()))?;
+            }
+
             // Plumb the hub into the FC/VZ backend's vsock-accept
             // sink so inbound harness connections land on the local
             // hub's adapter loop. Without this the FC backend drops
@@ -792,6 +846,9 @@ impl HostAgent {
             match harness_hub.persisted_egress_policies() {
                 Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
                 Err(e) => {
+                    if self.cfg.managed_tls.is_some() {
+                        return Err(HostAgentError::Io(e));
+                    }
                     tracing::warn!(error = %e, "list persisted egress policies failed");
                 }
             }
@@ -811,11 +868,19 @@ impl HostAgent {
                 // persisted policies. Not armed until here because the
                 // replay needs the pooled backend.
                 let hub_for_replay = harness_hub.clone();
+                let managed_for_replay = managed_policy.clone();
                 let pooled_for_replay = pooled.clone();
                 egress.spawn_supervisor(std::sync::Arc::new(move || {
                     let hub = hub_for_replay.clone();
+                    let managed = managed_for_replay.clone();
                     let pooled = pooled_for_replay.clone();
                     Box::pin(async move {
+                        if let Some(managed) = managed {
+                            if let Err(error) = managed.recover_all().await {
+                                tracing::error!(%error, "managed proxy recovery failed; admission remains closed");
+                                return;
+                            }
+                        }
                         match hub.persisted_egress_policies() {
                             Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
                             Err(e) => {
@@ -915,9 +980,12 @@ impl HostAgent {
             pooled.set_upload_sink(upload_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
-            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone()),
-            );
+            let mut local =
+                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone());
+            if let Some(managed) = managed_policy {
+                local = local.with_managed_policy(managed);
+            }
+            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(local);
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
             // intersects this against expected-active sessions to
@@ -1243,6 +1311,7 @@ impl HostAgent {
             // `grpc_listen_addr=None`.
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
+                let managed_tls = self.cfg.managed_tls.clone();
                 let admin_for_grpc = admin_handler.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
@@ -1252,12 +1321,13 @@ impl HostAgent {
                 )
                 .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) = grpc_server::boot(
+                    if let Err(e) = grpc_server::boot_with_managed_tls(
                         addr,
                         local_for_grpc,
                         admin_for_grpc,
                         epochs,
                         peer_for_grpc,
+                        managed_tls,
                     )
                     .await
                     {
@@ -2440,3 +2510,7 @@ mod tests {
         assert!(adopt_handoff_marker(dir.path()).is_none());
     }
 }
+
+pub mod managed_policy;
+
+pub mod managed_tls;

@@ -18,6 +18,8 @@ syntax = "proto3";
 package engram.host.v1;
 
 service HostService {
+  rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
+  rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
   // ---- sandbox lifecycle ----
   //
   // ADR 0079 (wire v12): every session-scoped lifecycle RPC carries a
@@ -866,3 +868,9 @@ message FlushSandboxResponse {
   // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
   bytes manifest_ref_bincode = 1;
 }
+
+// These operations are served only in mandatory managed mTLS mode.
+message ReadManagedPolicyRequest { bytes target_bincode = 1; }
+message ReadManagedPolicyResponse { bytes state_bincode = 1; }
+message ApplyManagedPolicyRequest { bytes request_bincode = 1; }
+message ApplyManagedPolicyResponse { bytes state_bincode = 1; }

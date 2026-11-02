@@ -311,6 +311,8 @@ async fn main() -> Result<(), HostAgentError> {
     let (migrate_peer_listen_addr, _) = parse_grpc_listen(&cli.migrate_peer_listen_addr);
 
     let cfg = HostAgentConfig {
+        managed_tls: engram_host_agent::managed_tls::ManagedHostTls::from_env()
+            .map_err(engram_host_agent::HostAgentError::Config)?,
         work_dir: cli.work_dir.clone(),
         coordinator_endpoint: cli.coordinator.clone(),
         coordinator_token: cli.coordinator_token.clone(),
@@ -326,6 +328,11 @@ async fn main() -> Result<(), HostAgentError> {
         },
         ..HostAgentConfig::default()
     };
+
+    let managed_ownership = engram_host_agent::managed_policy::ManagedOwnership::for_mode(
+        &cli.work_dir.join("bindings"),
+        cfg.managed_tls.is_some(),
+    )?;
 
     // ADR 0007 Phase 5: resolve the HostId early so the FC config can
     // stamp it on snapshots' `trace_host_hint` and pass it as
@@ -651,6 +658,7 @@ async fn main() -> Result<(), HostAgentError> {
     let observe_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
+        .with_managed_ownership(managed_ownership)
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
         .with_dirty_root(cli.dirty_root.clone())

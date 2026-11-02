@@ -193,6 +193,7 @@ pub async fn run(args: DaemonArgs) -> i32 {
     // durable-at-the-point-it's-known rule, PR #1383 / ADR 0121).
     let identity = engram_egress_proto::manifest::self_identity();
     let hello = engram_egress_proto::HelloInfo {
+        incarnation: engram_core::SessionId::new().to_string(),
         proto_version: engram_egress_proto::PROTO_VERSION,
         source_fingerprint: SOURCE_FINGERPRINT.map(str::to_string),
         proxy_port: args.proxy_port,

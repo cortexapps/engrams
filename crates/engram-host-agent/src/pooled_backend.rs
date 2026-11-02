@@ -9967,6 +9967,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.set_upload_sink(sink);
     }
 
+    async fn managed_network_proof(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Option<engram_core::types::managed_deny::ManagedNetworkProof> {
+        self.inner.managed_network_proof(target).await
+    }
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
@@ -9987,7 +9993,10 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
+            if policy.managed_deny.is_some()
+                || !policy.guest_services.is_empty()
+                || !policy.tunnels.is_empty()
+            {
                 return Err(SandboxError::InvalidSpec(
                     "guest services and tunnels require a host egress proxy".into(),
                 ));
@@ -11181,6 +11190,7 @@ mod tests {
         for (guest_services, tunnels) in cases {
             let error = pooled
                 .notify_session_policy(SessionEgressPolicy {
+                    managed_deny: None,
                     session_id: SessionId::new(),
                     sandbox_id: SandboxId::new(),
                     guest_ip: std::net::Ipv4Addr::LOCALHOST,
@@ -15598,6 +15608,7 @@ mod tests {
             allow: &[&str],
         ) -> SessionEgressPolicy {
             SessionEgressPolicy {
+                managed_deny: None,
                 session_id,
                 sandbox_id,
                 guest_ip,
