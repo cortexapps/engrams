@@ -2400,3 +2400,44 @@ export const mcpAdmission = pgTable(
     check("mcp_admission_state_check", sql`${t.state} IN ('queued','admitted','released')`),
   ],
 );
+
+/** Single-use administrative discovery. Contains authority metadata only. */
+export const mcpDiscoveryAdmission = pgTable(
+  "mcp_discovery_admission",
+  {
+    requestId: text("request_id").primaryKey(),
+    intentId: text("intent_id").notNull(),
+    deploymentId: text("deployment_id")
+      .notNull()
+      .references(() => mcpAdmissionScope.id),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id),
+    actorId: text("actor_id").notNull(),
+    configRevision: integer("config_revision").notNull(),
+    authGeneration: integer("auth_generation").notNull(),
+    credentialIdentity: text("credential_identity").notNull(),
+    identity: jsonb("identity")
+      .$type<import("../../../mcp-worker/src/contracts.ts").WorkerIdentity>()
+      .notNull(),
+    destination: text("destination").notNull(),
+    requestDigest: text("request_digest").notNull(),
+    statusDigest: text("status_digest").notNull(),
+    state: text("state").$type<"reserved" | "dispatched" | "finished">().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("mcp_discovery_admission_intent_idx").on(t.intentId),
+    index("mcp_discovery_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
+    index("mcp_discovery_admission_connection_idx").on(t.connectionId, t.state, t.expiresAt),
+    check(
+      "mcp_discovery_admission_state_check",
+      sql`${t.state} IN ('reserved','dispatched','finished')`,
+    ),
+    check(
+      "mcp_discovery_admission_expiry_check",
+      sql`${t.expiresAt} = ${t.createdAt} + interval '30 seconds'`,
+    ),
+  ],
+);
