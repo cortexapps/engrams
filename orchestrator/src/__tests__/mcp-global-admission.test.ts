@@ -35,14 +35,12 @@ for (const limit of ["session", "connection"] as const) {
             id: crypto.randomUUID(),
             sessionId: crypto.randomUUID(),
           };
-          await f.db
-            .insert(schema.taskSession)
-            .values({
-              taskId: f.taskId,
-              sessionId: independentSessionCall.sessionId,
-              profileId: f.profileId,
-              integrationPrincipalId: f.actorId,
-            });
+          await f.db.insert(schema.taskSession).values({
+            taskId: f.taskId,
+            sessionId: independentSessionCall.sessionId,
+            profileId: f.profileId,
+            integrationPrincipalId: f.actorId,
+          });
           await f.db.insert(schema.mcpExecution).values(independentSessionCall);
           calls.push(independentSessionCall);
           continue;
@@ -81,3 +79,89 @@ for (const limit of ["session", "connection"] as const) {
     }
   });
 }
+
+// Exercise the production reserve and cancellation transactions, including the
+// connection FOR KEY SHARE lock PostgreSQL takes for the first admission INSERT.
+test("initial admission and cancellation keep connection before execution without an FK deadlock", async () => {
+  const { app } = await verifyMcpTestDatabases();
+  const f = await reviewFixture();
+  const pool = new Pool({ connectionString: app, max: 2 });
+  const first = await pool.connect(),
+    second = await pool.connect();
+  const { makeMcpJournal } = await import("../mcp/journal.ts");
+  function signal() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+  const executionLocked = signal(),
+    cancellationConnectionAttempt = signal(),
+    cancellationExecutionAttempt = signal();
+  let admissionHasConnectionLock = false;
+  function intercept(client: typeof first, lane: "admission" | "cancel") {
+    return new Proxy(client, {
+      get(target, key, receiver) {
+        if (key !== "query") return Reflect.get(target, key, receiver);
+        return async (query: string | import("pg").QueryConfig, values?: unknown[]) => {
+          const text = typeof query === "string" ? query : query.text;
+          const locksConnection =
+            text.includes('from "integration_connection"') && text.includes(" for ");
+          const locksExecution =
+            text.includes('from "mcp_execution"') && text.endsWith(" for update");
+          if (lane === "cancel" && locksConnection) cancellationConnectionAttempt.resolve();
+          if (lane === "cancel" && locksExecution) cancellationExecutionAttempt.resolve();
+          const result = await target.query(query, values);
+          if (lane === "admission" && locksConnection) admissionHasConnectionLock = true;
+          if (lane === "admission" && locksExecution) {
+            executionLocked.resolve();
+            // With connection-first locking cancellation waits on the connection.
+            // Without it, let cancellation lock the connection and wait on this
+            // execution before the admission INSERT checks its connection FK.
+            await (admissionHasConnectionLock
+              ? cancellationConnectionAttempt.promise
+              : cancellationExecutionAttempt.promise);
+          }
+          return result;
+        };
+      },
+    });
+  }
+  try {
+    await first.query("set statement_timeout = '3s'");
+    await second.query("set statement_timeout = '3s'");
+    const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+    const admission = makeMcpAdmission(drizzle(intercept(first, "admission"), { schema }));
+    const cancellation = makeMcpJournal(drizzle(intercept(second, "cancel"), { schema }));
+    const reserved = admission.reserve(call.id, f.deploymentId, "schema", f.now);
+    const canceled = executionLocked.promise.then(() =>
+      cancellation.cancelInternal(call.id, "interrupt", f.now),
+    );
+    const results = await Promise.allSettled([reserved, canceled]);
+    function errorCode(error: unknown): string {
+      if (error && typeof error === "object") {
+        if ("code" in error && typeof error.code === "string") return error.code;
+        if ("cause" in error) return errorCode(error.cause);
+      }
+      return "unknown";
+    }
+    expect(
+      results.map((result) =>
+        result.status === "fulfilled" ? "fulfilled" : errorCode(result.reason),
+      ),
+    ).toEqual(["fulfilled", "fulfilled"]);
+    expect(admissionHasConnectionLock).toBe(true);
+    expect(await f.journal.getAdmission(call.id)).toBeNull();
+    const [stored] = await f.db
+      .select()
+      .from(schema.mcpExecution)
+      .where(eq(schema.mcpExecution.id, call.id));
+    expect(stored!.state).toBe("canceled");
+  } finally {
+    first.release();
+    second.release();
+    await pool.end();
+    await f.cleanup();
+  }
+}, 8_000);

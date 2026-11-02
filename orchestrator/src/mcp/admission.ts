@@ -4,6 +4,7 @@ import {
   mcpAdmission as admission,
   mcpAdmissionScope as scope,
   mcpExecution as execution,
+  integrationConnection as connection,
 } from "../db/schema.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import type { JournalTx } from "./journal-review.ts";
@@ -30,9 +31,23 @@ export function makeMcpAdmission(db = getDb()) {
         throw new Error("invalid tool deadline");
       return db.transaction(async (tx) => {
         await lockAdmissionScope(tx, deploymentId);
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call is not ready for admission");
+        // The first admission INSERT also locks this parent for its FK check.
+        // Match cancellation: scope -> connection -> execution -> admission.
+        await tx
+          .select()
+          .from(connection)
+          .where(eq(connection.id, identity.connectionId))
+          .for("share");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
         if (
           !call ||
+          call.connectionId !== identity.connectionId ||
+          call.sessionId !== identity.sessionId ||
+          call.requestDigest !== identity.requestDigest ||
+          call.configRevision !== identity.configRevision ||
+          call.authGeneration !== identity.authGeneration ||
           !call.requestContext ||
           call.originalArguments === null ||
           call.deadline <= now ||
