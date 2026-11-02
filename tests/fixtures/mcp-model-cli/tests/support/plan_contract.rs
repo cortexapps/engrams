@@ -1051,3 +1051,126 @@ fn absent_exposure_does_not_convert_other_responses_into_denial_proof() {
         }
     }
 }
+
+fn rebind_plan() -> Value {
+    json!({"steps":[
+        {"marker":"before","tool":"mcp_read_counter","arguments":{},"callId":"probe-call","resultFormat":"mcp"},
+        {"marker":"after","tool":"mcp_read_counter","arguments":{},"callId":"probe-call","resultFormat":"mcp","expectExposure":"absent"}
+    ]})
+}
+
+#[test]
+fn rebind_pair_repeats_only_the_same_immutable_request_after_actual_absence() {
+    for claude in [false, true] {
+        let state = State::new("rebind-exposure");
+        let plan = rebind_plan();
+        for absent in [false, true] {
+            let mut cmd = plan_command(&state, claude, &plan, "read");
+            let proof_path = state.0.join(if absent {
+                "negative.json"
+            } else {
+                "positive.json"
+            });
+            cmd.env("ENGRAM_FIXTURE_PROOF", &proof_path);
+            let exposed = if absent { json!([]) } else { tools() };
+            std::fs::write(state.0.join("exposed-tools.json"), exposed.to_string()).unwrap();
+            let response = if absent {
+                if claude {
+                    json!({"error":{"code":-32602,"message":"Unknown tool"}})
+                } else {
+                    json!({"result":{"success":false,"contentItems":[{"type":"inputText","text":"undeclared dynamic tool: mcp_read_counter"}]}})
+                }
+            } else {
+                json!({"result":native(claude,false)})
+            };
+            std::fs::write(state.0.join("native-response.json"), response.to_string()).unwrap();
+            let mut child = Fixture(cmd.spawn().unwrap());
+            let rx = output(&mut child.0);
+            initialize(&mut child.0, &rx, claude, exposed);
+            prompt(
+                &mut child.0,
+                claude,
+                if absent {
+                    "[[fixture:after]]"
+                } else {
+                    "[[fixture:before]]"
+                },
+            );
+            let request = call(&rx, claude);
+            assert_eq!(request[if claude { "id" } else { "callId" }], "probe-call");
+            assert_eq!(
+                request[if claude { "input" } else { "arguments" }],
+                json!({})
+            );
+            assert_eq!(
+                request[if claude { "name" } else { "tool" }],
+                if claude {
+                    "mcp__engrams__mcp_read_counter"
+                } else {
+                    "mcp_read_counter"
+                }
+            );
+            complete(&mut child.0, &rx, claude, response["result"].clone());
+            finish(&mut child.0);
+            let record: Value =
+                serde_json::from_slice(&std::fs::read(&proof_path).unwrap()).unwrap();
+            assert_eq!(record["callId"], "probe-call");
+            assert_eq!(record["planSha256"], hash(&plan));
+            if absent {
+                assert_eq!(record["expectExposure"], "absent");
+                assert_eq!(record["protocolDenialCode"], "unknown_tool");
+                assert!(record.get("resultReceived").is_none());
+            } else {
+                assert_eq!(record["resultReceived"], true);
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_call_ids_require_exact_ordered_present_absent_pair() {
+    let plan = rebind_plan();
+    assert_plan_configuration(&plan, true);
+    let mut explicit = plan.clone();
+    explicit["steps"][0]["expectExposure"] = json!("present");
+    explicit["steps"][0]["expectedResult"] = json!({});
+    assert_plan_configuration(&explicit, true);
+    for case in [
+        "tool",
+        "arguments",
+        "format",
+        "order",
+        "third",
+        "both-present",
+        "both-absent",
+        "projection",
+        "non-mcp",
+    ] {
+        let mut bad = plan.clone();
+        match case {
+            "tool" => bad["steps"][1]["tool"] = json!("mcp_write_counter"),
+            "arguments" => bad["steps"][1]["arguments"] = json!({"different":true}),
+            "format" => bad["steps"][0]["resultFormat"] = json!("json"),
+            "order" => bad["steps"].as_array_mut().unwrap().reverse(),
+            "third" => {
+                let mut third = bad["steps"][1].clone();
+                third["marker"] = json!("third");
+                bad["steps"].as_array_mut().unwrap().push(third);
+            }
+            "both-present" => bad["steps"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("expectExposure")
+                .map(|_| ())
+                .unwrap(),
+            "both-absent" => bad["steps"][0]["expectExposure"] = json!("absent"),
+            "projection" => bad["steps"][0]["completionProjection"] = json!("premature"),
+            "non-mcp" => {
+                bad["steps"][0]["tool"] = json!("native_tool");
+                bad["steps"][1]["tool"] = json!("native_tool");
+            }
+            _ => unreachable!(),
+        }
+        assert_plan_configuration(&bad, false);
+    }
+}

@@ -80,8 +80,7 @@ impl Plan {
             return Err("invalid plan length".into());
         }
         let mut markers = BTreeSet::new();
-        let mut ids = BTreeSet::new();
-        let mut parsed = Vec::new();
+        let mut parsed: Vec<Step> = Vec::new();
         for step in steps {
             exact_keys(
                 step,
@@ -95,7 +94,6 @@ impl Plan {
                 || !identifier(&call_id)
                 || !tool_name(&tool)
                 || !markers.insert(marker.clone())
-                || !ids.insert(call_id.clone())
             {
                 return Err("invalid or duplicate plan identity".into());
             }
@@ -125,6 +123,21 @@ impl Plan {
                 || absent && premature
             {
                 return Err("invalid evidence step".into());
+            }
+            let duplicates: Vec<_> = parsed
+                .iter()
+                .filter(|prior| prior.call_id == call_id)
+                .collect();
+            if !duplicates.is_empty()
+                && (duplicates.len() != 1
+                    || !absent
+                    || duplicates[0].absent
+                    || duplicates[0].premature
+                    || duplicates[0].native_json
+                    || duplicates[0].tool != tool
+                    || digest(&duplicates[0].arguments)? != digest(&arguments)?)
+            {
+                return Err("invalid repeated call identity".into());
             }
             parsed.push(Step {
                 marker,

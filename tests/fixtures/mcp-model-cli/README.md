@@ -91,7 +91,8 @@ mode. The plan is at most 65536 UTF-8 bytes and has exactly a `steps` array of
 1 to 16 objects. Each step has `marker`, `tool`, `arguments`, `callId`,
 `resultFormat` (`mcp` or `json`), and optional `expectedResult`, `expectExposure`,
 and `completionProjection`. Unknown fields
-are rejected. Markers and call IDs use the call-ID grammar and must be unique.
+are rejected. Markers and call IDs use the call-ID grammar. Markers must be
+unique. Call IDs must be unique except for the fixed rebind pair below.
 Arguments have the scalar size and depth bounds. The whole-plan size limit also
 bounds the optional literal expected native objects.
 
@@ -146,6 +147,15 @@ the native request path. Claude must return JSON-RPC error `-32602` with message
 `Unknown tool`. Codex must return `success: false` with the single native text
 `undeclared dynamic tool: <alias>`. Any other response fails closed. This does
 not relax the positive tool-list checks.
+
+Exactly two ordered steps may share a call ID for a rebind probe. The first
+expects present exposure (explicitly or by default); the second explicitly
+expects absent exposure. Both must have the same `mcp_` tool, exact canonical
+arguments and MCP result format, with no completion projection. The first may
+have an expected result; the second must not. All other duplicate IDs fail.
+The runner must establish the actual rebind, then use the new marked prompt
+and actual current exposed list. Select the new negative proof by its position
+and `expectExposure`, so the prior positive proof cannot satisfy the check.
 
 Absent proof has `expectExposure: "absent"`, `requestAttempted: true`, and
 `protocolDenialCode: "unknown_tool"`, plus the existing call, tool, plan and
