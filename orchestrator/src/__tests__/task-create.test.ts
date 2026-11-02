@@ -2155,3 +2155,89 @@ describe("connector settings (the administrator-chosen API host)", () => {
     expect(JSON.stringify(input)).toContain("api.getcortexapp.com");
   });
 });
+
+/** Exercise the real closed MCP adapter at the injected session-client boundary.
+ * The production profile compiler's MCP activation guard remains unchanged. */
+async function mismatchedMcpSessions() {
+  const { create } = await import("@bufbuild/protobuf");
+  const { CreatePolicySessionResponseSchema } =
+    await import("../gen/engram/mcp/v1/session_policy_pb.ts");
+  const { compileBoundSessionCandidate, createReservedTaskSession, makeBoundSessionCreator } =
+    await import("../mcp/session-create.ts");
+  const { bindingAuthority } = await import("./mcp-binding-fixture.ts");
+  const authority = bindingAuthority();
+  const sessions = fakeSessions();
+  const createdIds: string[] = [];
+  sessions.createSession = async (request) => {
+    sessions.createReqs.push(request);
+    const candidate = compileBoundSessionCandidate(request, {
+      launchPolicy: { profileId: authority.profileId, integrationGrants: authority.profileGrants },
+      liveAuthority: authority,
+      bindingEpoch: 0,
+    });
+    const creator = makeBoundSessionCreator({
+      control: {
+        createPolicySession: async () => {
+          createdIds.push("actual-mcp-session");
+          return create(CreatePolicySessionResponseSchema, {
+            session: { sessionId: "actual-mcp-session" },
+          });
+        },
+      },
+      readReservation: async () => ({
+        principalId: "u",
+        parentSessionId: null,
+        envelope: candidate.mcpBindingEnvelope!,
+        connections: candidate.integrationConnections!,
+      }),
+      authorizeInput: async () => {},
+      readAuthority: async () => authority,
+      readParentCurrent: async () => {
+        throw new Error("no parent");
+      },
+      enforceManagedDeny: async (expected) => expected,
+    });
+    return createReservedTaskSession(
+      {
+        sessions: {
+          createSession: async () => {
+            throw new Error("MCP must not use generic creation");
+          },
+        },
+        boundSessionCreator: creator,
+      },
+      candidate,
+      { actorId: "u", inputId: request.requestedSessionId! },
+    );
+  };
+  return { sessions, createdIds };
+}
+
+test("new task compensates the actual session ID from an MCP adapter mismatch", async () => {
+  const { sessions, createdIds } = await mismatchedMcpSessions();
+  const deletes: string[] = [];
+  await expect(
+    createTaskWithSession(createDeps(sessions, recordingDb([], false, undefined, { deletes })), {
+      type: "chat",
+      ownerUserId: "u",
+      profileId: "p1",
+    }),
+  ).rejects.toThrow("MCP policy session response mismatch");
+  expect(createdIds).toEqual(["actual-mcp-session"]);
+  expect(sessions.deletedIds).toEqual(["actual-mcp-session"]);
+  expect(deletes).toEqual(["task"]);
+});
+
+test("existing task compensates the actual session ID from an MCP adapter mismatch", async () => {
+  const { sessions, createdIds } = await mismatchedMcpSessions();
+  const deletes: string[] = [];
+  await expect(
+    createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, undefined, { deletes })),
+      { taskId: "task-existing", profileId: "p1", role: "finder", ownerUserId: "u" },
+    ),
+  ).rejects.toThrow("MCP policy session response mismatch");
+  expect(createdIds).toEqual(["actual-mcp-session"]);
+  expect(sessions.deletedIds).toEqual(["actual-mcp-session"]);
+  expect(deletes).toEqual(["task_session"]);
+});

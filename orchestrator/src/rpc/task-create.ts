@@ -17,7 +17,11 @@
  * policy.
  */
 
-import { createReservedTaskSession, type makeBoundSessionCreator } from "../mcp/session-create.ts";
+import {
+  createReservedTaskSession,
+  McpSessionCreationMismatchError,
+  type makeBoundSessionCreator,
+} from "../mcp/session-create.ts";
 
 import { resolveIntegrationHost } from "../integrations/run-op.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
@@ -1075,6 +1079,7 @@ export async function createSessionForExistingTask(
       });
     }
   } catch (err) {
+    if (err instanceof McpSessionCreationMismatchError) createdSessionId = err.createdSessionId;
     // Compensation must never mask the original failure: guard every step and
     // log what it could not undo. On an ID mismatch, the session that leaks is
     // the one the coordinator ACTUALLY created, so delete that one.
@@ -1304,6 +1309,7 @@ export async function createTaskWithSession(
       await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
+    if (err instanceof McpSessionCreationMismatchError) createdSessionId = err.createdSessionId;
     // Compensation must never mask the original failure: guard every step and
     // log what it could not undo. On an ID mismatch, the session that leaks is
     // the one the coordinator ACTUALLY created, so delete that one.

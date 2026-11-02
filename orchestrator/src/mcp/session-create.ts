@@ -78,6 +78,13 @@ export interface BoundSessionCreatorDeps {
   readParentCurrent(sessionId: string): Promise<McpSessionBindingSnapshot>;
   enforceManagedDeny?(expected: ManagedDenyAck, policy: ManagedDenyPolicy): Promise<ManagedDenyAck>;
 }
+/** Retain the actual created session so callers can compensate a rejected response. */
+export class McpSessionCreationMismatchError extends Error {
+  constructor(readonly createdSessionId: string) {
+    super("MCP policy session response mismatch");
+    this.name = "McpSessionCreationMismatchError";
+  }
+}
 /** Closed adapter for Task 6 composition. Generic create never initializes write authority. */
 export function makeBoundSessionCreator(deps: BoundSessionCreatorDeps) {
   return {
@@ -143,8 +150,9 @@ export function makeBoundSessionCreator(deps: BoundSessionCreatorDeps) {
           },
         },
       });
-      if (response.session?.sessionId !== sessionId)
-        throw new Error("MCP policy session response mismatch");
+      if (!response.session?.sessionId) throw new Error("MCP policy session response mismatch");
+      if (response.session.sessionId !== sessionId)
+        throw new McpSessionCreationMismatchError(response.session.sessionId);
       return response.session;
     },
   };

@@ -197,3 +197,39 @@ test("clearing child harness mode cannot detach the stored parent policy", async
   await creator.create(input, { actorId: "actor", inputId: "child-input" });
   expect(receivedParent).toBe("actual-parent");
 });
+
+test("MCP response mismatch carries the actual created ID for compensation", async () => {
+  const authority = bindingAuthority();
+  const input = compileBoundSessionCandidate(
+    { imageUri: "image", mode: "agent", harness: "claude", requestedSessionId: "reserved" },
+    {
+      launchPolicy: { profileId: authority.profileId, integrationGrants: authority.profileGrants },
+      liveAuthority: authority,
+      bindingEpoch: 0,
+    },
+  );
+  const creator = makeBoundSessionCreator({
+    control: {
+      createPolicySession: async () =>
+        create(CreatePolicySessionResponseSchema, { session: { sessionId: "actual-created" } }),
+    },
+    readReservation: async () => ({
+      principalId: "actor",
+      parentSessionId: null,
+      envelope: input.mcpBindingEnvelope!,
+      connections: input.integrationConnections!,
+    }),
+    authorizeInput: async () => {},
+    readAuthority: async () => authority,
+    readParentCurrent: async () => {
+      throw new Error("no parent");
+    },
+    enforceManagedDeny: async (expected) => expected,
+  });
+  await expect(
+    creator.create(input, { actorId: "actor", inputId: "source" }),
+  ).rejects.toMatchObject({
+    message: "MCP policy session response mismatch",
+    createdSessionId: "actual-created",
+  });
+});
