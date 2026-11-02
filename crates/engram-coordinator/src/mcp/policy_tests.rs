@@ -423,6 +423,7 @@ async fn managed_retry_denies_requeued_nonzero_epoch() {
         runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
         oauth_binding: None,
     };
+    engram_testkit::operator::publish_empty(meta.as_ref()).await;
     meta.reserve_and_persist_create(ws.clone(), &[], 0)
         .await
         .unwrap();
@@ -464,7 +465,14 @@ async fn managed_retry_denies_requeued_nonzero_epoch() {
         tonic::Code::FailedPrecondition
     );
     assert_eq!(
-        require_managed_create_admission().unwrap_err().code(),
+        {
+            let empty =
+                SimMetadataStore::new(ManualClock::new(), Arc::new(SimEntropy::seeded(334)));
+            require_managed_create_admission(empty.as_ref())
+                .await
+                .unwrap_err()
+                .code()
+        },
         tonic::Code::Unavailable
     );
 }

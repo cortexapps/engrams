@@ -133,6 +133,20 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             .connect()
             .await
             .unwrap();
+        assert_eq!(
+            wire::operator_publication_service_client::OperatorPublicationServiceClient::new(
+                channel.clone()
+            )
+            .stage(wire::OperatorPublicationServiceStageRequest {
+                protocol: 1,
+                expected_generation: None,
+                configured_candidate_identity: String::new()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::Unimplemented
+        );
         let mut policy_client =
             wire::session_policy_service_client::SessionPolicyServiceClient::new(channel.clone());
         let sid = meta
@@ -232,6 +246,37 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
             policy: policy.clone(),
             input_digest: reserve.input_digest.clone(),
         };
+        assert_eq!(
+            policy_client
+                .read_published_operator(wire::ReadPublishedOperatorRequest { protocol: 1 })
+                .await
+                .unwrap_err()
+                .code(),
+            if pinned {
+                tonic::Code::Unavailable
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        );
+        engram_testkit::operator::publish_empty(meta.as_ref()).await;
+        let projection = policy_client
+            .read_published_operator(wire::ReadPublishedOperatorRequest { protocol: 1 })
+            .await;
+        if pinned {
+            let projection: engram_core::types::managed_operator::OperatorPublication =
+                serde_json::from_slice(&projection.unwrap().into_inner().publication_json).unwrap();
+            assert!(projection.admission_open);
+            assert_eq!(
+                projection.published.unwrap().candidate,
+                engram_testkit::operator::candidate()
+            );
+        } else {
+            assert_eq!(
+                projection.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+
         meta.reserve_and_persist_create(
             engram_core::traits::SessionCreateWriteSet {
                 managed_initial_prompt: None,

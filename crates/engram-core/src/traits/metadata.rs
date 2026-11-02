@@ -274,6 +274,48 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- sessions ----
+    /// Read durable configured publication and pending barrier state.
+    async fn read_operator_publication(
+        &self,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("read_operator_publication")
+    }
+    async fn stage_operator_publication(
+        &self,
+        _expected: Option<u64>,
+        _candidate: crate::types::managed_operator::OperatorCandidate,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("stage_operator_publication")
+    }
+    async fn list_operator_participants(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        unimplemented!("list_operator_participants")
+    }
+    async fn retain_operator_participant(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+        _session: SessionId,
+    ) -> Result<crate::types::managed_operator::OperatorParticipant, MetaError> {
+        unimplemented!("retain_operator_participant")
+    }
+    async fn record_operator_readiness(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+        _participant: &crate::types::managed_operator::OperatorParticipant,
+        _proof: crate::types::managed_operator::OperatorReadiness,
+    ) -> Result<(), MetaError> {
+        unimplemented!("record_operator_readiness")
+    }
+    async fn publish_operator_generation(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("publish_operator_generation")
+    }
+
     /// Read the current boot under the complete immutable creation association.
     /// A held creation has no boot; a missing creation authority is an error.
     async fn get_managed_boot(

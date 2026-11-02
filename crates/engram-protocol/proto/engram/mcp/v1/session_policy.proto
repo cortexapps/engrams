@@ -5,6 +5,7 @@ import "engram/app/v1/session.proto";
 
 // Dedicated pinned mTLS only. Create reuses the ordinary creation core.
 service SessionPolicyService {
+  rpc ReadPublishedOperator(ReadPublishedOperatorRequest) returns (ReadPublishedOperatorResponse);
   rpc ReadManagedBoot(ReadManagedBootRequest) returns (ReadManagedBootResponse);
   rpc FinalizeManagedBoot(FinalizeManagedBootRequest) returns (ReadManagedBootResponse);
   rpc ReserveManagedCreate(ReserveManagedCreateRequest) returns (ReserveManagedCreateResponse);
@@ -184,3 +185,11 @@ message ReadManagedBootRequest { uint32 protocol = 1; ManagedCreateIdentity iden
 message ReadManagedBootResponse { uint32 protocol = 1; optional bytes boot_json = 2; }
 // Exact typed ManagedBootFinalizeInput JSON. No guest or profile input is read.
 message FinalizeManagedBootRequest { uint32 protocol = 1; bytes input_json = 2; }
+
+message ReadPublishedOperatorRequest {
+  uint32 protocol = 1;
+}
+message ReadPublishedOperatorResponse {
+  uint32 protocol = 1;
+  bytes publication_json = 2;
+}

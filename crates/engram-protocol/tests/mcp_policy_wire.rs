@@ -9,6 +9,8 @@ fn app_reflection_excludes_internal_policy_and_credential_services() {
         "engram/mcp/v1/session_policy.proto",
         "SessionPolicyService",
         "CredentialControlService",
+        "OperatorPublicationService",
+        "engram/mcp/v1/operator.proto",
     ] {
         assert!(!bytes
             .windows(private.len())
@@ -34,6 +36,14 @@ proptest! {
         let _=mcp::ReadManagedBootRequest::decode(bytes.as_slice());
         let _=mcp::ReadManagedBootResponse::decode(bytes.as_slice());
         let _=mcp::FinalizeManagedBootRequest::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceStageRequest::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceReadRequest::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceReadResponse::decode(bytes.as_slice());
+        let _=mcp::OperatorPublicationServiceStageResponse::decode(bytes.as_slice());
+        let _=mcp::ReadPublishedOperatorRequest::decode(bytes.as_slice());
+        let _=mcp::ReadPublishedOperatorResponse::decode(bytes.as_slice());
+        let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorCandidate>(&bytes);
+        let _=serde_json::from_slice::<engram_core::types::managed_operator::OperatorPublication>(&bytes);
     }
 }
 

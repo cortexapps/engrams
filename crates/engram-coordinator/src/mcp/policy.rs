@@ -201,15 +201,50 @@ async fn managed_creation_retry(
     }
 }
 
-/// No operator admission producer exists yet. This must precede all mutations.
-fn require_managed_create_admission() -> Result<(), Status> {
-    Err(Status::unavailable(
-        "managed creation admission unavailable",
-    ))
+/// Read-only preflight. The create transaction repeats this under the generation lock.
+async fn require_managed_create_admission(
+    meta: &dyn engram_core::traits::MetadataStore,
+) -> Result<(), Status> {
+    let publication = meta.read_operator_publication().await.map_err(err)?;
+    if !publication.admission_open
+        || publication.pending.is_some()
+        || publication.published.is_none()
+    {
+        return Err(Status::unavailable(
+            "managed creation admission unavailable",
+        ));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
 impl SessionPolicyService for PolicyControl {
+    async fn read_published_operator(
+        &self,
+        req: Request<wire::ReadPublishedOperatorRequest>,
+    ) -> Result<Response<wire::ReadPublishedOperatorResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        let publication = self
+            .control
+            .authority
+            .manager
+            .meta
+            .read_operator_publication()
+            .await
+            .map_err(err)?;
+        if !publication.admission_open
+            || publication.pending.is_some()
+            || publication.published.is_none()
+        {
+            return Err(Status::unavailable("operator publication unavailable"));
+        }
+        Ok(Response::new(wire::ReadPublishedOperatorResponse {
+            protocol: wire::PROTOCOL,
+            publication_json: serde_json::to_vec(&publication)
+                .map_err(|_| Status::internal("publication encoding failed"))?,
+        }))
+    }
+
     async fn read_managed_boot(
         &self,
         req: Request<wire::ReadManagedBootRequest>,
@@ -268,7 +303,6 @@ impl SessionPolicyService for PolicyControl {
             .enabled()
             .map_err(|_| Status::unavailable("policy unavailable"))?;
         let (frozen, create) = managed_creation(req.get_ref())?;
-        require_managed_create_admission()?;
         let state = self
             .state
             .as_ref()
@@ -276,6 +310,7 @@ impl SessionPolicyService for PolicyControl {
         let identity = frozen.identity.clone();
         // The exact retry is independent of current image/profile resolution.
         if !managed_creation_retry(self.control.authority.manager.meta.as_ref(), &frozen).await? {
+            require_managed_create_admission(self.control.authority.manager.meta.as_ref()).await?;
             let identity_env = create.harness_env.clone().into_iter().collect();
             let mut api = crate::grpc_app::convert::create_request_from_proto(create)
                 .map_err(|_| Status::invalid_argument("invalid creation request"))?;
@@ -750,10 +785,6 @@ mod tests {
         let mut wrong = original;
         wrong.creation_request.push(0);
         assert!(managed_creation(&wrong).is_err());
-        assert_eq!(
-            require_managed_create_admission().unwrap_err().code(),
-            tonic::Code::Unavailable
-        );
     }
 
     #[test]
