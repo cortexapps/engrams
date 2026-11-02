@@ -12,6 +12,7 @@ import type { CredentialControlClient } from "./control-client.ts";
 
 export interface McpResourceWorker {
   identity(): Promise<WorkerIdentity>;
+  /** Fixed send only. Put awaited policy checks in the broker beforeDispatch hook. */
   dispatch(request: WorkerRequest): Promise<WorkerResponse>;
 }
 type ResourceOperation = Extract<WorkerOperation, { kind: "execute" | "discover" }>;
@@ -30,6 +31,8 @@ export function makeCredentialBroker(deps: {
   worker: McpResourceWorker;
   admission: McpResourceAdmission;
   now: () => number;
+  /** Final authority fence; receives no credentials and runs before the last delivery-expiry check. */
+  beforeDispatch?(): Promise<void>;
 }) {
   if (!deps.admission?.assertAdmitted) throw new Error("MCP global admission is required");
   return {
@@ -114,6 +117,7 @@ export function makeCredentialBroker(deps: {
       });
       if (deps.now() >= deliveryExpiry) throw new Error("credential delivery expired");
       await deps.admission.assertAdmitted(structuredClone(frozen));
+      if (deps.beforeDispatch) await deps.beforeDispatch();
       if (deps.now() >= deliveryExpiry) throw new Error("credential delivery expired");
       let response: WorkerResponse;
       try {

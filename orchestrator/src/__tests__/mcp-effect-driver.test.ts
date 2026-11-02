@@ -583,3 +583,31 @@ test("credential assertion rejects an altered execution reservation after leasin
     await f.cleanup();
   }
 }, 20000);
+
+test("credential delivery expiry during only the final fence prevents send and replay", async () => {
+  const f = await effectFixture({ classification: "write" });
+  try {
+    const call = await f.driver.acceptToolRequest(f.request);
+    await f.driver.driveOnce(call.id);
+    const approval = await f.journal.requestApproval(call.id, f.deploymentId, new Date());
+    await f.journal.decide(call.id, f.actorId, true, reviewContext(call, approval), new Date());
+    let postLeaseFences = 0;
+    f.beforeFence(async () => {
+      if (f.leases && ++postLeaseFences === 2) f.advanceNow(11000);
+    });
+    const result = await f.driver.driveOnce(call.id);
+    expect(postLeaseFences).toBe(2);
+    // Only the ten-second credential handoff expires; the full tool deadline stays live.
+    expect(result.intentExpiresAt!.getTime() - (Date.now() + 11000)).toBeGreaterThan(45000);
+    expect(result.state).toBe("outcome_unknown");
+    expect(f.leases).toBe(1);
+    expect((await f.command("stats")).credentialRequests).toBe(0);
+    expect((await f.command("stats")).calls).toBe(0);
+    expect((await f.driver.acceptToolRequest(f.request)).id).toBe(call.id);
+    expect((await f.driver.driveOnce(call.id)).state).toBe("outcome_unknown");
+    expect(f.leases).toBe(1);
+    expect((await f.command("stats")).credentialRequests).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);

@@ -140,6 +140,7 @@ export async function effectFixture(
       token = "known-literal-token",
       leases = 0;
     let enabled = true;
+    let clockOffsetMs = 0;
     let beforeFence: (() => Promise<void>) | undefined;
     let beforeLease: (() => Promise<void>) | undefined;
     let afterLease: (() => Promise<void>) | undefined;
@@ -272,7 +273,7 @@ export async function effectFixture(
         serverFingerprint: tls.fingerprint,
       }),
       enabled: () => enabled,
-      now: () => new Date(),
+      now: () => new Date(Date.now() + clockOffsetMs),
     });
     return {
       ...f,
@@ -285,6 +286,9 @@ export async function effectFixture(
       events,
       policies,
       operatorPolicies,
+      advanceNow(milliseconds: number) {
+        clockOffsetMs += milliseconds;
+      },
       setEnabled(value: boolean) {
         enabled = value;
       },

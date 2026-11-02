@@ -36,7 +36,7 @@ const status = create(CredentialStatusSchema, {
   status: "connected",
   version: 1n,
 });
-function fixture(expire = false) {
+function fixture(expire = false, finalFenceMs = 0) {
   let time = now,
     deliveries = 0,
     leases = 0;
@@ -66,6 +66,9 @@ function fixture(expire = false) {
   const broker = makeCredentialBroker({
     control,
     now: () => time,
+    async beforeDispatch() {
+      time += finalFenceMs;
+    },
     admission: {
       async assertAdmitted() {
         return;
@@ -288,3 +291,17 @@ test("worker transport errors cannot expose the transient credential", async () 
   });
   await expect(broker.dispatch(f.input)).rejects.toThrow("MCP worker operation unavailable");
 });
+
+for (const finalFenceMs of [9999, 10000, 11000])
+  test(`final fence at ${finalFenceMs} ms preserves the delivery boundary and full operation deadline`, async () => {
+    const f = fixture(false, finalFenceMs);
+    if (finalFenceMs < 10000) {
+      await f.broker.dispatch(f.input);
+      expect(f.counters()).toEqual({ deliveries: 1, leases: 1 });
+    } else {
+      await expect(f.broker.dispatch(f.input)).rejects.toThrow("credential delivery expired");
+      expect(f.counters()).toEqual({ deliveries: 0, leases: 1 });
+    }
+    expect(f.seen[0]).toMatchObject({ expiresAt: 110000n, operationExpiresAt: 160000n });
+    expect(f.input.intent.expiresAt).toBe(160000);
+  });

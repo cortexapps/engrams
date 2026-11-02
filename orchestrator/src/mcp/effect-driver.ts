@@ -467,20 +467,16 @@ export function makeMcpEffectDriver(deps: {
               await journal.assertDispatchCurrent(id, proof, deps.now());
             },
           },
-          worker: {
-            identity: () => worker.identity(),
-            async dispatch(request) {
-              enabled(resolved, signal);
-              await fence(
-                requestPolicyContext(dispatched.requestContext!),
-                resolved,
-                dispatched.originalArguments!,
-              );
-              // Recheck synchronous kill/cancel inputs after the awaited coordinator response.
-              enabled(resolved, signal);
-              // No intervening await, identity refresh or socket replacement after this fence.
-              return worker.dispatch(request);
-            },
+          worker,
+          async beforeDispatch() {
+            enabled(resolved, signal);
+            await fence(
+              requestPolicyContext(dispatched.requestContext!),
+              resolved,
+              dispatched.originalArguments!,
+            );
+            // The broker checks delivery expiry next, then sends on the retained socket.
+            enabled(resolved, signal);
           },
         });
         let outcome: ReturnType<typeof verifiedExecutionResult>;
