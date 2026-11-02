@@ -253,6 +253,16 @@ pub trait MetadataStore: Send + Sync {
         unimplemented!("read_managed_creation")
     }
 
+    /// Read the original source and held state in one store snapshot. Exact
+    /// retries require queued, no host/sandbox and epoch zero. Only a missing
+    /// source returns NotFound; an existing non-held source returns Conflict.
+    async fn read_held_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_held_managed_creation")
+    }
+
     /// Read durable server policy and all current ancestors in one locked snapshot.
     async fn read_mcp_write_policy(
         &self,

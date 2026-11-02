@@ -352,6 +352,48 @@ impl SimMetadataStore {
     }
 }
 
+fn managed_creation_source(
+    db: &SimDb,
+    identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    require_held: bool,
+) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+    identity.validate()?;
+    let session = db
+        .sessions
+        .get(&identity.session_id)
+        .ok_or(MetaError::NotFound)?;
+    let stored = db
+        .managed_creations
+        .get(&identity.session_id)
+        .ok_or(MetaError::NotFound)?;
+    let conflict =
+        || MetaError::Conflict("managed creation association changed or unavailable".into());
+    if require_held
+        && (session.session.status != SessionState::Queued
+            || session.session.host_id.is_some()
+            || session.session.sandbox_id.is_some()
+            || session.binding_epoch != 0)
+    {
+        return Err(conflict());
+    }
+    if matches!(
+        session.session.status,
+        SessionState::Dead | SessionState::Completed | SessionState::Failed
+    ) || session.mcp_policy_parent_id != stored.identity.policy.parent_session_id
+    {
+        return Err(if require_held {
+            conflict()
+        } else {
+            MetaError::NotFound
+        });
+    }
+    if stored.identity != *identity {
+        return Err(conflict());
+    }
+    stored.native.validate()?;
+    Ok(stored.clone())
+}
+
 #[async_trait]
 impl MetadataStore for SimMetadataStore {
     async fn session_binding_generations(&self, id: SessionId) -> Result<(u64, u64), MetaError> {
@@ -850,32 +892,15 @@ impl MetadataStore for SimMetadataStore {
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
     ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
         self.gate()?;
-        identity.validate()?;
-        let db = self.db.lock();
-        let session = db
-            .sessions
-            .get(&identity.session_id)
-            .ok_or(MetaError::NotFound)?;
-        if matches!(
-            session.session.status,
-            SessionState::Dead | SessionState::Completed | SessionState::Failed
-        ) {
-            return Err(MetaError::NotFound);
-        }
-        let stored = db
-            .managed_creations
-            .get(&identity.session_id)
-            .ok_or(MetaError::NotFound)?;
-        if session.mcp_policy_parent_id != stored.identity.policy.parent_session_id {
-            return Err(MetaError::NotFound);
-        }
-        if stored.identity != *identity {
-            return Err(MetaError::Conflict(
-                "managed creation association changed".into(),
-            ));
-        }
-        stored.native.validate()?;
-        Ok(stored.clone())
+        managed_creation_source(&self.db.lock(), identity, false)
+    }
+
+    async fn read_held_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.gate()?;
+        managed_creation_source(&self.db.lock(), identity, true)
     }
 
     /// One transaction: session row, held authority and all satellites.
@@ -900,14 +925,8 @@ impl MetadataStore for SimMetadataStore {
         let now = self.now();
         let mut db = self.db.lock();
         if let Some(creation) = &ws.managed_creation {
-            if let Some(stored) = db.managed_creations.get(&ws.session_id) {
-                let held = db.sessions.get(&ws.session_id).is_some_and(|s| {
-                    s.session.status == SessionState::Queued
-                        && s.session.host_id.is_none()
-                        && s.session.sandbox_id.is_none()
-                        && s.binding_epoch == 0
-                });
-                if stored != creation || !held {
+            if db.managed_creations.contains_key(&ws.session_id) {
+                if managed_creation_source(&db, &creation.identity, true)? != *creation {
                     return Err(MetaError::Conflict(
                         "managed creation association changed".into(),
                     ));

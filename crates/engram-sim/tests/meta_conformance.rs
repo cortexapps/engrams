@@ -9228,3 +9228,75 @@ conformance!(
     t_managed_creation_denies_stale_session,
     super::managed_creation_denies_stale_session
 );
+
+async fn managed_creation_held_retry_denies_requeued_epoch(ctx: &Ctx) {
+    let ws = managed_creation_ws(SessionId::new());
+    let frozen = ws.managed_creation.clone().unwrap();
+    let id = ws.session_id;
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&frozen.identity).await,
+        Err(MetaError::NotFound)
+    ));
+    ctx.meta
+        .reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .read_held_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    let mut wrong = frozen.identity.clone();
+    wrong.task_id = "another-task".into();
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&wrong).await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .transition_session(
+            id,
+            SessionState::Pending,
+            BindingDisposition::RequireUnbound,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .transition_session_created(id, engram_core::SandboxId::new())
+            .await
+            .unwrap(),
+        1
+    );
+    ctx.meta
+        .transition_session(id, SessionState::Idle, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(id, SessionState::Queued, BindingDisposition::RequireUnbound)
+        .await
+        .unwrap();
+    let session = ctx.meta.get_session(id).await.unwrap();
+    assert_eq!(session.status, SessionState::Queued);
+    assert!(session.host_id.is_none() && session.sandbox_id.is_none());
+    assert_eq!(
+        ctx.meta
+            .read_managed_creation(&frozen.identity)
+            .await
+            .unwrap(),
+        frozen
+    );
+    assert!(matches!(
+        ctx.meta.read_held_managed_creation(&frozen.identity).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta.reserve_and_persist_create(ws, &[], 0).await,
+        Err(MetaError::Conflict(_))
+    ));
+}
+conformance!(
+    t_managed_creation_held_retry_denies_requeued_epoch,
+    super::managed_creation_held_retry_denies_requeued_epoch
+);

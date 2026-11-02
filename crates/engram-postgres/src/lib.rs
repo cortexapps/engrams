@@ -1613,7 +1613,14 @@ impl MetadataStore for PostgresStore {
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,
     ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
-        self.managed_creation(identity).await
+        self.managed_creation(identity, false).await
+    }
+
+    async fn read_held_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity, true).await
     }
 
     async fn reserve_and_persist_create(

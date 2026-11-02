@@ -13,14 +13,37 @@ fn conflict() -> MetaError {
 pub(crate) async fn read(
     conn: &mut PgConnection,
     identity: &ManagedCreateIdentity,
+    require_held: bool,
 ) -> Result<ManagedCreation, MetaError> {
     identity.validate()?;
-    let row = sqlx::query("SELECT c.* FROM session_managed_creations c JOIN sessions s ON s.id=c.session_id WHERE c.session_id=$1 AND s.status NOT IN ('dead','completed','failed') AND s.mcp_policy_parent_id IS NOT DISTINCT FROM c.parent_session_id")
-        .bind(identity.session_id.as_uuid())
-        .fetch_optional(conn)
-        .await
-        .map_err(db_err)?
-        .ok_or(MetaError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT c.*, s.status AS session_status,
+            s.mcp_policy_parent_id IS NOT DISTINCT FROM c.parent_session_id AS parent_matches,
+            (c.state='held' AND s.status='queued' AND s.host_id IS NULL
+                AND s.sandbox_id IS NULL AND s.binding_epoch=0) AS held
+         FROM session_managed_creations c JOIN sessions s ON s.id=c.session_id
+         WHERE c.session_id=$1",
+    )
+    .bind(identity.session_id.as_uuid())
+    .fetch_optional(conn)
+    .await
+    .map_err(db_err)?
+    .ok_or(MetaError::NotFound)?;
+    if require_held && !row.try_get::<bool, _>("held").map_err(db_err)? {
+        return Err(conflict());
+    }
+    if !row.try_get::<bool, _>("parent_matches").map_err(db_err)?
+        || matches!(
+            row.try_get::<&str, _>("session_status").map_err(db_err)?,
+            "dead" | "completed" | "failed"
+        )
+    {
+        return Err(if require_held {
+            conflict()
+        } else {
+            MetaError::NotFound
+        });
+    }
     let policy = McpPolicyCreation {
         actor_id: row.try_get("actor_id").map_err(db_err)?,
         input_id: row.try_get("input_id").map_err(db_err)?,
@@ -71,13 +94,7 @@ pub(crate) async fn reserve(
     if n == 1 {
         return Ok(true);
     }
-    if read(conn, i).await? != *creation {
-        return Err(conflict());
-    }
-    // An exact lost-response retry never restarts a session or changes placement.
-    let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions s JOIN session_managed_creations c ON c.session_id=s.id WHERE s.id=$1 AND c.state='held' AND s.status='queued' AND s.host_id IS NULL AND s.sandbox_id IS NULL AND s.binding_epoch=0)")
-        .bind(i.session_id.as_uuid()).fetch_one(&mut *conn).await.map_err(db_err)?;
-    if !held {
+    if read(conn, i, true).await? != *creation {
         return Err(conflict());
     }
     Ok(false)
@@ -87,7 +104,13 @@ impl PostgresStore {
     pub(crate) async fn managed_creation(
         &self,
         identity: &ManagedCreateIdentity,
+        require_held: bool,
     ) -> Result<ManagedCreation, MetaError> {
-        read(&mut *self.pool.acquire().await.map_err(db_err)?, identity).await
+        read(
+            &mut *self.pool.acquire().await.map_err(db_err)?,
+            identity,
+            require_held,
+        )
+        .await
     }
 }

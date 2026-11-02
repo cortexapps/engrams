@@ -375,3 +375,95 @@ fn host_record(
         lease_epoch: 0,
     }
 }
+
+#[tokio::test]
+async fn managed_retry_denies_requeued_nonzero_epoch() {
+    use engram_core::types::{
+        managed_create::digest, runtime_spec::RuntimeSpec, BindingDisposition, SessionState,
+    };
+    let meta = SimMetadataStore::new(ManualClock::new(), Arc::new(SimEntropy::seeded(333)));
+    let id = SessionId::from(uuid::Uuid::from_u128(333));
+    let policy = McpPolicyCreation {
+        actor_id: "owner-a".into(),
+        input_id: "create-a".into(),
+        parent_session_id: None,
+        eligibility: WriteEligibility::ReadOnly,
+    };
+    let frozen = ManagedCreation {
+        identity: ManagedCreateIdentity {
+            session_id: id,
+            task_id: "task-a".into(),
+            policy: policy.clone(),
+            input_digest: digest(b"original"),
+        },
+        native: FrozenNativeManifest {
+            version: 1,
+            bytes: b"[]".to_vec(),
+            digest: digest(b"[]"),
+        },
+    };
+    assert!(!managed_creation_retry(meta.as_ref(), &frozen)
+        .await
+        .unwrap());
+    let ws = engram_core::traits::SessionCreateWriteSet {
+        managed_creation: Some(frozen.clone()),
+        mcp_policy: Some(policy),
+        nbd_slot_need: 1,
+        session_id: id,
+        spec: SessionSpec {
+            image: "test.invalid/managed:latest".into(),
+            mode: Default::default(),
+        },
+        mem_budget_mib: 512,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: RuntimeSpec::new(Vec::new(), Some("claude".into()), None, Vec::new()),
+        oauth_binding: None,
+    };
+    meta.reserve_and_persist_create(ws.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert!(managed_creation_retry(meta.as_ref(), &frozen)
+        .await
+        .unwrap());
+    meta.transition_session(
+        id,
+        SessionState::Pending,
+        BindingDisposition::RequireUnbound,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.transition_session_created(id, SandboxId::from(uuid::Uuid::from_u128(334)))
+            .await
+            .unwrap(),
+        1
+    );
+    meta.transition_session(id, SessionState::Idle, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    meta.transition_session(id, SessionState::Queued, BindingDisposition::RequireUnbound)
+        .await
+        .unwrap();
+    let session = meta.get_session(id).await.unwrap();
+    assert_eq!(session.status, SessionState::Queued);
+    assert!(session.host_id.is_none() && session.sandbox_id.is_none());
+    assert_eq!(
+        meta.read_managed_creation(&frozen.identity).await.unwrap(),
+        frozen
+    );
+    assert!(meta.reserve_and_persist_create(ws, &[], 0).await.is_err());
+    assert_eq!(
+        managed_creation_retry(meta.as_ref(), &frozen)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        require_managed_create_admission().unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+}

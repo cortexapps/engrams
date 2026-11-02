@@ -188,6 +188,19 @@ fn managed_creation(
     Ok((frozen, create))
 }
 
+/// A missing creation may enter preparation; an existing creation must still be held.
+async fn managed_creation_retry(
+    meta: &dyn engram_core::traits::MetadataStore,
+    frozen: &ManagedCreation,
+) -> Result<bool, Status> {
+    match meta.read_held_managed_creation(&frozen.identity).await {
+        Ok(existing) if existing == *frozen => Ok(true),
+        Ok(_) => Err(Status::failed_precondition("creation input changed")),
+        Err(engram_core::MetaError::NotFound) => Ok(false),
+        Err(e) => Err(err(e)),
+    }
+}
+
 /// No operator admission producer exists yet. This must precede all mutations.
 fn require_managed_create_admission() -> Result<(), Status> {
     Err(Status::unavailable(
@@ -214,44 +227,15 @@ impl SessionPolicyService for PolicyControl {
             .ok_or_else(|| Status::unavailable("creation unavailable"))?;
         let identity = frozen.identity.clone();
         // The exact retry is independent of current image/profile resolution.
-        match self
-            .control
-            .authority
-            .manager
-            .meta
-            .read_managed_creation(&identity)
-            .await
-        {
-            Ok(existing) if existing == frozen => {
-                let session = self
-                    .control
-                    .authority
-                    .manager
-                    .meta
-                    .get_session(identity.session_id)
-                    .await
-                    .map_err(err)?;
-                if session.status != engram_core::types::SessionState::Queued
-                    || session.host_id.is_some()
-                    || session.sandbox_id.is_some()
-                {
-                    return Err(Status::failed_precondition(
-                        "creation reservation is no longer held",
-                    ));
-                }
-            }
-            Ok(_) => return Err(Status::failed_precondition("creation input changed")),
-            Err(engram_core::MetaError::NotFound) => {
-                let identity_env = create.harness_env.clone().into_iter().collect();
-                let mut api = crate::grpc_app::convert::create_request_from_proto(create)
-                    .map_err(|_| Status::invalid_argument("invalid creation request"))?;
-                api.mcp_creation = Some(identity.policy.clone());
-                api.managed_creation = Some(frozen);
-                crate::api::sessions::create_session_core(state, identity_env, api, None)
-                    .await
-                    .map_err(|_| Status::failed_precondition("session reservation unavailable"))?;
-            }
-            Err(e) => return Err(err(e)),
+        if !managed_creation_retry(self.control.authority.manager.meta.as_ref(), &frozen).await? {
+            let identity_env = create.harness_env.clone().into_iter().collect();
+            let mut api = crate::grpc_app::convert::create_request_from_proto(create)
+                .map_err(|_| Status::invalid_argument("invalid creation request"))?;
+            api.mcp_creation = Some(identity.policy.clone());
+            api.managed_creation = Some(frozen);
+            crate::api::sessions::create_session_core(state, identity_env, api, None)
+                .await
+                .map_err(|_| Status::failed_precondition("session reservation unavailable"))?;
         }
         Ok(Response::new(wire::ReserveManagedCreateResponse {
             protocol: wire::PROTOCOL,
