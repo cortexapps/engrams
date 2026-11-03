@@ -547,7 +547,7 @@ export class Stack {
     );
     const core = await put(
       join(this.root, "Corefile"),
-      `.:53 {\n hosts /projection/hosts {\n ttl 1\n }\n template ANY ANY {\n rcode NXDOMAIN\n }\n }\n`,
+      `.:53 {\n hosts /projection/hosts {\n ttl 1\n }\n }\n`,
     );
     const hosts = await put(
       join(this.root, "dns-hosts"),
