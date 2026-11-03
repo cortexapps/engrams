@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { assertOriginalArguments } from "../mcp/journal-review.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
 import { MCP_LIMITS } from "../mcp/limits.ts";
@@ -99,3 +100,35 @@ test("missing numeric source fails closed", () => {
     patched.mockRestore();
   }
 });
+
+test("near-budget internal and trailing zero runs finish in a bounded child", () => {
+  const parser = new URL("../mcp/arguments.ts", import.meta.url).href;
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--no-env-file",
+      "--no-install",
+      "--eval",
+      `
+    import { parseArgumentJson } from ${JSON.stringify(parser)};
+    const limit = ${MCP_LIMITS.argumentBytes};
+    const accepted = '{"x":0.1' + "0".repeat(limit - 9) + '}';
+    const rejected = '{"x":0.1' + "0".repeat(limit - 10) + '1}';
+    if (Buffer.byteLength(accepted) !== limit || Buffer.byteLength(rejected) !== limit)
+      throw Error("fixture byte count changed");
+    if (JSON.stringify(parseArgumentJson(accepted)) !== '{"x":0.1}')
+      throw Error("trailing-zero value changed");
+    let denied = false;
+    try { parseArgumentJson(rejected); }
+    catch (error) { denied = error instanceof Error && error.message === "numeric argument loses precision"; }
+    if (!denied) throw Error("internal-zero precision loss accepted");
+    console.log("checked two full-limit numeric tokens");
+  `,
+    ],
+    { encoding: "utf8", timeout: 10000, killSignal: "SIGKILL" },
+  );
+  expect(child.error).toBeUndefined();
+  expect(child.status).toBe(0);
+  expect(child.stderr).toBe("");
+  expect(child.stdout.trim()).toBe("checked two full-limit numeric tokens");
+}, 15000);

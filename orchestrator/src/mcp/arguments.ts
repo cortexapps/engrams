@@ -11,7 +11,9 @@ function decimal(token: string, value: number): string {
   // A finite nonzero value cannot need a larger exponent after its digits cancel.
   if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > token.length + 400)
     throw Error("numeric argument exponent exceeds limit");
-  const coefficient = digits.replace(/0+$/, "");
+  let end = digits.length;
+  while (end > 0 && digits[end - 1] === "0") end--;
+  const coefficient = digits.slice(0, end);
   return `${match[1]}${coefficient}e${exponent - fraction.length + digits.length - coefficient.length}`;
 }
 
