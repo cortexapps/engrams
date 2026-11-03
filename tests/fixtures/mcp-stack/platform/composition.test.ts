@@ -1374,6 +1374,148 @@ test("FC launch uses the declared configuration, private namespace and original 
   }
 });
 
+for (const failInspect of [false, true]) {
+  test(`guest publication uses writable scratch and cleans up after ${failInspect ? "inspect failure" : "success"}`, async () => {
+    const { publishGuest } = await import("./assets.ts");
+    const root = await mkdtemp(join(process.cwd(), "var/mcp-platform-composition/publish-"));
+    try {
+      const archive = await put(join(root, "guest.tar"), "owned archive");
+      const config = Buffer.from('{"architecture":"arm64","os":"linux"}');
+      const image = {
+        archive,
+        id: `sha256:${hash(config)}`,
+        manifestDigest: "",
+      };
+      const manifest = Buffer.from(
+        JSON.stringify({ schemaVersion: 2, config: { digest: image.id }, layers: [] }),
+      );
+      image.manifestDigest = `sha256:${hash(manifest)}`;
+      const inputs = parseInputs(
+        {
+          version: 1,
+          backend: "vz",
+          architecture: "arm64",
+          sourceCommit: "b".repeat(40),
+          engineSocket: "/owned/socket",
+          engineConfig: "/owned/config",
+          engineId: "engine-identity-123",
+          registryPort: 32000,
+          subnet: "10.42.3.0/24",
+          nativeHostIp: "10.42.4.1",
+          proxy: archive,
+          nativeProbe: archive,
+          binaries: Object.fromEntries(BINARIES.map((key) => [key, archive])),
+          images: Object.fromEntries(IMAGES.map((key) => [key, image])),
+        },
+        "vz",
+      );
+      const calls: { args: string[]; stdin: string | undefined; timeout: number | undefined }[] =
+        [];
+      const removed: string[] = [];
+      const launches: unknown[] = [];
+      const id = "a".repeat(64),
+        guard = "e".repeat(64);
+      const runId = "mcp-123456789012345678901234";
+      class PublicationEngine extends Engine {
+        override async create(
+          role: string,
+          image: string,
+          options: string[],
+          args?: string[],
+          entrypoint?: string,
+        ): Promise<string> {
+          launches.push({ role, image, options, args, entrypoint });
+          return id;
+        }
+        override async call(args: string[], stdin?: string, timeout?: number): Promise<Buffer> {
+          calls.push({ args, stdin, timeout });
+          if (failInspect) throw new Error("inspect failed");
+          return args.includes("--config") ? config : manifest;
+        }
+        override async remove(role: string) {
+          removed.push(role);
+        }
+      }
+      const engine = new PublicationEngine(inputs, root, runId);
+      engine.guardIds.set("coordinator", guard);
+      const uri = `127.0.0.1:32000/${runId}/guest`;
+      const provenance = join(root, "image-provenance.json");
+      if (failInspect) {
+        await expect(publishGuest(inputs, root, engine)).rejects.toThrow("inspect failed");
+        await expect(stat(provenance)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(await publishGuest(inputs, root, engine)).toBe(`${uri}@${image.manifestDigest}`);
+        expect(JSON.parse(await readFile(provenance, "utf8"))).toEqual({
+          version: 1,
+          archiveSha256: archive.sha256,
+          manifestDigest: image.manifestDigest,
+          configDigest: image.id,
+          imageUri: `${uri}@${image.manifestDigest}`,
+        });
+      }
+      expect(removed).toEqual(["image-copy"]);
+      expect(launches).toEqual([
+        {
+          role: "image-copy",
+          image: inputs.images.guard.id,
+          options: [
+            "--network",
+            `container:${guard}`,
+            "--user",
+            `${process.getuid?.()}:${process.getgid?.()}`,
+            "--read-only",
+            "--mount",
+            `type=bind,src=${archive.path},dst=/input/guest.tar,readonly`,
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+          ],
+          args: ["infinity"],
+          entrypoint: "/bin/sleep",
+        },
+      ]);
+      const prefix = ["exec", id, "/usr/bin/skopeo", "--tmpdir", "/tmp"];
+      const expected = [
+        {
+          args: [...prefix, "inspect", "--raw", "oci-archive:/input/guest.tar"],
+          stdin: undefined,
+          timeout: undefined,
+        },
+        {
+          args: [...prefix, "inspect", "--raw", "--config", "oci-archive:/input/guest.tar"],
+          stdin: undefined,
+          timeout: undefined,
+        },
+        {
+          args: [
+            ...prefix,
+            "copy",
+            "--preserve-digests",
+            "--dest-tls-verify=false",
+            "oci-archive:/input/guest.tar",
+            `docker://${uri}:fixture`,
+          ],
+          stdin: undefined,
+          timeout: 120000,
+        },
+        {
+          args: [
+            ...prefix,
+            "inspect",
+            "--tls-verify=false",
+            "--raw",
+            `docker://${uri}@${image.manifestDigest}`,
+          ],
+          stdin: undefined,
+          timeout: undefined,
+        },
+      ];
+      expect(calls).toEqual(failInspect ? expected.slice(0, 1) : expected);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
 test("archive provenance rejects a swapped config, manifest, or multi-platform index", async () => {
   const { verifyArchiveIdentity } = await import("./assets.ts");
   const config = Buffer.from('{"architecture":"arm64","os":"linux"}');
