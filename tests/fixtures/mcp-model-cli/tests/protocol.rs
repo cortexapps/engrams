@@ -632,6 +632,116 @@ fn codex_write_denied_and_unavailable_calls_keep_the_native_result() {
 }
 
 #[test]
+fn proof_launch_token_claims_distinct_files_with_native_result_observations() {
+    use scalar_contract::{command, finish, output, receive};
+    let state = State::new("proof-launch");
+    let mut retained = Vec::new();
+    for _ in 0..2 {
+        let mut child = Fixture(
+            command(&state, false, "read")
+                .env("ENGRAM_FIXTURE_PROOF", state.0.join("proof-{launch}.json"))
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let rx = output(&mut child.0);
+        send(
+            &mut child.0,
+            json!({"id":1,"method":"initialize","params":{}}),
+        );
+        assert_eq!(receive(&rx)["id"], 1);
+        let files: Vec<_> = std::fs::read_dir(&state.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| !retained.iter().any(|(old, _)| old == path))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().unwrap().to_str().unwrap();
+        let nonce = name
+            .strip_prefix(&format!("proof-{pid}-"))
+            .unwrap()
+            .strip_suffix(".json")
+            .unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        send(
+            &mut child.0,
+            json!({"id":2,"method":"thread/start","params":{"dynamicTools":[{"name":"remote_inventory","description":"test","inputSchema":{"type":"object"}}]}}),
+        );
+        assert_eq!(receive(&rx)["id"], 2);
+        send(
+            &mut child.0,
+            json!({"id":3,"method":"turn/start","params":{"threadId":"fixture-thread"}}),
+        );
+        assert_eq!(receive(&rx)["id"], 3);
+        let call = receive(&rx);
+        assert_eq!(call["method"], "item/tool/call");
+        assert_eq!(call["params"]["callId"], "fixture-call");
+        send(
+            &mut child.0,
+            json!({"id":call["id"],"result":{"success":true,"contentItems":[{"type":"inputText","text":"sentinel"},{"type":"inputText","text":"{\"delivery\":\"available\",\"outcome\":\"succeeded\",\"resultUnavailable\":false,\"isError\":false}"}]}}),
+        );
+        assert_eq!(receive(&rx)["method"], "item/completed");
+        assert_eq!(receive(&rx)["method"], "turn/completed");
+        finish(&mut child.0);
+        let bytes = std::fs::read(&files[0]).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let record: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["resultReceived"], true);
+        assert_eq!(record["success"], true);
+        assert_eq!(record["textSentinel"], true);
+        assert_eq!(record["tool"], "remote_inventory");
+        assert_eq!(record["callId"], "fixture-call");
+        assert_eq!(record["delivery"], "available");
+        assert_eq!(record["outcome"], "succeeded");
+        retained.push((files[0].clone(), bytes));
+        for (path, bytes) in &retained {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    assert_eq!(std::fs::read_dir(&state.0).unwrap().count(), 2);
+}
+
+#[test]
+fn proof_templates_reject_unknown_mixed_duplicate_and_malformed_tokens_before_protocol() {
+    for name in [
+        "proof-{launch}-{pid}.json",
+        "proof-{launch}-{launch}.json",
+        "proof-{pid}-{pid}.json",
+        "proof-{nonce}.json",
+        "proof-{launch.json",
+        "proof-launch}.json",
+        "proof-{{launch}}.json",
+        "proof-{PID}.json",
+    ] {
+        let state = State::new("proof-invalid-token");
+        let mut child = Fixture(
+            scalar_contract::command(&state, false, "read")
+                .env("ENGRAM_FIXTURE_PROOF", state.0.join(name))
+                .spawn()
+                .unwrap(),
+        );
+        // Rejection can close stdin before this request is written.
+        let _ = writeln!(
+            child.0.stdin.as_mut().unwrap(),
+            "{}",
+            json!({"id":1,"method":"initialize","params":{}})
+        );
+        drop(child.0.stdin.take());
+        wait_for_failure(&mut child.0);
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+        assert_eq!(error, "fixture protocol failure\n", "{name}");
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(&mut child.0.stdout.take().unwrap(), &mut stdout).unwrap();
+        assert!(stdout.is_empty(), "{name}");
+        assert_eq!(std::fs::read_dir(&state.0).unwrap().count(), 0, "{name}");
+    }
+}
+
+#[test]
 fn proof_pid_token_is_expanded_only_in_the_direct_child_basename() {
     let state = State::new("proof-pid");
     for _ in 0..2 {
@@ -645,11 +755,12 @@ fn proof_pid_token_is_expanded_only_in_the_direct_child_basename() {
                 .env("ENGRAM_FIXTURE_PROOF", state.0.join("proof-{pid}.json"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
         let pid = child.0.id();
-        assert!(child.0.wait().unwrap().success());
+        scalar_contract::finish(&mut child.0);
         assert!(state.0.join(format!("proof-{pid}.json")).is_file());
     }
     assert_eq!(std::fs::read_dir(&state.0).unwrap().count(), 2);

@@ -28,10 +28,20 @@ Set these variables for each fixture process:
 - `ENGRAM_FIXTURE_STATE_DIR`: an absolute, private mode-0700 directory owned by
   the test. No component may be a symlink.
 - `ENGRAM_FIXTURE_PROOF`: a new direct child of that directory. The fixture
-  creates it exclusively. An optional single `{pid}` in the basename expands
-  to the decimal fixture process ID. The parent is checked before expansion.
-  This creates distinct proofs when a wrapper restarts its CLI; it is not a
-  production process identity. Without the token, existing behavior is unchanged.
+  creates it exclusively. An optional single `{launch}` in the basename expands
+  to `<decimal actual PID>-<32 lowercase hex characters>`. The hex suffix uses
+  16 fresh bytes from the operating system's `/dev/urandom`. Failure to open or
+  read all 16 bytes fails closed. For example, `proof-{launch}.json` produces
+  `proof-42-000102030405060708090a0b0c0d0e0f.json`. A new launch can retain
+  earlier proof files even when a cold boot reuses the process ID.
+  The existing optional single `{pid}` still expands to the decimal fixture
+  process ID; a literal basename is unchanged. PID-only names can collide after
+  a cold boot. Tokens cannot mix or repeat. Unknown or unmatched braces are
+  rejected before protocol output. The parent is checked before expansion.
+  A collision fails closed; the fixture never retries, replaces, or deletes an
+  existing proof. Launch names are local observations, not credentials or
+  session, call, run, or binding identities. No environment variable can supply
+  the PID, random bytes, or random source.
 - `ENGRAM_FIXTURE_BARRIER`: optional direct child of that directory. While it is
   absent, a call waits for up to 30 seconds; an interrupt can end the wait.
   Create a regular file at that path to release it. A symlink is rejected.
@@ -121,9 +131,13 @@ not decode those text strings or assert that a child was actually created.
 Each actual response appends one JSON line to the same process proof file and
 flushes it before the native tool-complete frame, then the turn-complete frame.
 Barrier and adversarial observations use separate lines. A live reader must
-parse only complete newline-terminated records. With `{pid}` in the filename,
-a restarted process gets a new file. Read proof as JSONL when there are multiple
-turns; use the call ID and plan digest to select the required observation.
+parse only complete newline-terminated records. Use `{launch}` to claim a new
+file for each process launch when the state directory survives a cold boot.
+For `proof-{launch}.json`, discovery must match
+`^proof-[0-9]+-[a-f0-9]{32}\.json$` with no PID-only fallback. A filename alone
+cannot select an observation or advance a plan. Read proof as JSONL when there
+are multiple turns; use the call ID and plan digest to select the required
+observation. Never merge proof files.
 
 A direct child of the private state directory, `plan-selection.json`, contains
 only planSha256, harness, mode, marker and pending. The fixture writes this

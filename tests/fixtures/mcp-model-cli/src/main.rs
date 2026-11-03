@@ -46,6 +46,47 @@ fn direct_child(root: &Path, path: &Path) -> bool {
     path.parent() == Some(root)
         && matches!(path.file_name(), Some(name) if !name.is_empty() && name != "." && name != "..")
 }
+fn proof_file<R: io::Read>(
+    root: &Path,
+    path: &Path,
+    pid: u32,
+    entropy: impl FnOnce() -> io::Result<R>,
+) -> Result<File> {
+    if !direct_child(root, path) {
+        return Err("proof must be a direct child of the state directory".into());
+    }
+    let basename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid proof name")?;
+    let token = ["{launch}", "{pid}"]
+        .into_iter()
+        .find(|token| basename.contains(token));
+    let literal = token.map_or_else(
+        || basename.to_owned(),
+        |token| basename.replacen(token, "", 1),
+    );
+    if literal.contains(['{', '}']) {
+        return Err("invalid proof token".into());
+    }
+    // Launch-local observation only, never a session, call, or run identity.
+    let basename = match token {
+        Some("{launch}") => {
+            let mut bytes = [0; 16];
+            entropy()?.read_exact(&mut bytes)?;
+            basename.replace(
+                "{launch}",
+                &format!("{pid}-{:032x}", u128::from_be_bytes(bytes)),
+            )
+        }
+        Some(_) => basename.replace("{pid}", &pid.to_string()),
+        None => basename.to_owned(),
+    };
+    Ok(OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(basename))?)
+}
 fn config() -> Result<Config> {
     let root = PathBuf::from(std::env::var("ENGRAM_FIXTURE_STATE_DIR")?);
     if !root.is_absolute() {
@@ -65,21 +106,7 @@ fn config() -> Result<Config> {
     if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
         return Err("state directory must be private".into());
     }
-    let mut proof_path = PathBuf::from(std::env::var("ENGRAM_FIXTURE_PROOF")?);
-    if !direct_child(&root, &proof_path) {
-        return Err("proof must be a direct child of the state directory".into());
-    }
-    // Optional launch-local observation, never a production identity or authority.
-    let basename = proof_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or("invalid proof name")?;
-    if basename.contains("{pid}") {
-        if basename.matches("{pid}").count() != 1 {
-            return Err("invalid proof PID token".into());
-        }
-        proof_path = root.join(basename.replace("{pid}", &std::process::id().to_string()));
-    }
+    let proof_path = PathBuf::from(std::env::var("ENGRAM_FIXTURE_PROOF")?);
     let barrier = std::env::var_os("ENGRAM_FIXTURE_BARRIER").map(PathBuf::from);
     if barrier
         .as_ref()
@@ -124,10 +151,9 @@ fn config() -> Result<Config> {
         return Err("invalid fixture call ID".into());
     }
     let arguments = arguments.unwrap_or_else(|| json!({"fixture":mode}));
-    let proof = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(proof_path)?;
+    let proof = proof_file(&root, &proof_path, std::process::id(), || {
+        File::open("/dev/urandom")
+    })?;
     Ok(Config {
         tool,
         mode,
@@ -885,5 +911,124 @@ fn main() {
     if result.is_err() {
         eprintln!("fixture protocol failure");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use std::io::Read;
+
+    struct State(PathBuf);
+    impl State {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("proof-unit-{}-{name}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn same_pid_launches_claim_distinct_files_and_collision_preserves_prior_bytes() {
+        let state = State::new("same-pid");
+        let template = state.0.join("proof-{launch}.json");
+        let first = state
+            .0
+            .join("proof-42-000102030405060708090a0b0c0d0e0f.json");
+        let second = state
+            .0
+            .join("proof-42-ffffffffffffffffffffffffffffffff.json");
+        let nonce = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut initial =
+            proof_file(&state.0, &template, 42, || Ok(io::Cursor::new(nonce))).unwrap();
+        initial.write_all(b"retained prior observation\n").unwrap();
+        initial.flush().unwrap();
+        drop(initial);
+        let mut fresh =
+            proof_file(&state.0, &template, 42, || Ok(io::Cursor::new([255; 16]))).unwrap();
+        fresh.write_all(b"fresh observation\n").unwrap();
+        fresh.flush().unwrap();
+        drop(fresh);
+        let error = proof_file(&state.0, &template, 42, || Ok(io::Cursor::new(nonce))).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"retained prior observation\n");
+        assert_eq!(fs::read(&second).unwrap(), b"fresh observation\n");
+        assert_eq!(fs::read_dir(&state.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn launch_entropy_failure_and_short_reads_claim_no_file() {
+        let state = State::new("entropy");
+        let template = state.0.join("proof-{launch}.json");
+        for bytes in 0..16 {
+            let error = proof_file(&state.0, &template, 42, || {
+                Ok(io::Cursor::new(vec![0; bytes]))
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(fs::read_dir(&state.0).unwrap().count(), 0);
+        }
+        let error = proof_file::<File>(&state.0, &template, 42, || {
+            Err(io::Error::other("entropy unavailable"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(fs::read_dir(&state.0).unwrap().count(), 0);
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("entropy read failed"))
+            }
+        }
+        let error = proof_file(&state.0, &template, 42, || {
+            Ok(io::repeat(0).take(8).chain(FailedRead))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(fs::read_dir(&state.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn literal_and_pid_paths_need_no_entropy_and_never_replace_existing_files() {
+        let state = State::new("legacy");
+        for (template, name) in [
+            ("proof.json", "proof.json"),
+            ("proof-{pid}.json", "proof-42.json"),
+        ] {
+            let path = state.0.join(template);
+            let mut file =
+                proof_file::<File>(&state.0, &path, 42, || panic!("unexpected entropy read"))
+                    .unwrap();
+            file.write_all(b"preserve\n").unwrap();
+            file.flush().unwrap();
+            drop(file);
+            let error =
+                proof_file::<File>(&state.0, &path, 42, || panic!("unexpected entropy read"))
+                    .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(fs::read(state.0.join(name)).unwrap(), b"preserve\n");
+        }
     }
 }
