@@ -113,15 +113,15 @@ returns 401, wrong authority returns 421, unknown routes or methods return 404,
 and invalid input returns 400. POST requests use JSON and reject unknown keys.
 Bodies are limited to 4 KiB. Responses have `Cache-Control: no-store`.
 
-| Method and route    | Request                                      | Response or effect                                                                              |
-| ------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| GET `/v1/ready`     | No body                                      | `version:1`, `ready`, resource URL, issuer origin                                               |
-| GET `/v1/observe`   | No body                                      | `version:1`, durability health, effect state, read/held/cancellation counts, OAuth observations |
-| POST `/v1/case`     | Any subset of the case keys above            | Applies checked controls; returns 409 while any call is held                                    |
-| POST `/v1/release`  | `{}`                                         | Sends all held responses; future calls still use the selected hold mode                         |
-| POST `/v1/cancel`   | `{}`                                         | Closes all held responses; each close increments cancellation count                             |
-| POST `/v1/oauth`    | Optional `account`, `scope`, and/or `issuer` | Sets neutral account and scope returned on the next token issue or refresh                      |
-| POST `/v1/shutdown` | `{}`                                         | Replies, then closes both listeners and all held connections                                    |
+| Method and route    | Request                                                          | Response or effect                                                                              |
+| ------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| GET `/v1/ready`     | No body                                                          | `version:1`, `ready`, resource URL, issuer origin                                               |
+| GET `/v1/observe`   | No body                                                          | `version:1`, durability health, effect state, read/held/cancellation counts, OAuth observations |
+| POST `/v1/case`     | Any subset of the case keys above                                | Applies checked controls; returns 409 while any call is held                                    |
+| POST `/v1/release`  | `{}`                                                             | Sends all held responses; future calls still use the selected hold mode                         |
+| POST `/v1/cancel`   | `{}`                                                             | Closes all held responses; each close increments cancellation count                             |
+| POST `/v1/oauth`    | Optional `account`, `scope`, `issuer`, and/or `expiresInSeconds` | Sets neutral controls for future token issue or refresh                                         |
+| POST `/v1/shutdown` | `{}`                                                             | Replies, then closes both listeners and all held connections                                    |
 
 OAuth accounts are `account-one` or `account-two`. Issuer mode is `configured`
 (the configured issuer) or `mismatch` (the existing neutral wrong-issuer case,
@@ -129,10 +129,22 @@ OAuth accounts are `account-one` or `account-two`. Issuer mode is `configured`
 `tools:read`, `tools:write`, or `tools:read tools:write`. The scope control can
 produce an account/scope change for the consumer to detect. It does not confer
 production authority. Observations contain only the selected account, scope
-override (or null), and counts of authorizations, code exchanges, rotations,
+override (or null), configured `expiresInSeconds`, and counts of authorizations, code exchanges, rotations,
 and rejected token/authorization requests. Issued codes/tokens, client secrets,
 headers, arguments, and results are absent. OAuth grants are process-local; only
 external write effects persist across fixture restarts.
+
+`expiresInSeconds` accepts integers 1 through 3600 and defaults to 3600. The
+configured value applies to each future authorization-code exchange or refresh
+response as `expires_in`. Each issued access token keeps its own private deadline.
+A control change never shortens or extends a token that was already issued.
+Expired bearer access returns 401; the refresh grant can still rotate through
+the existing token endpoint. Set `{"expiresInSeconds":2}` before issue or refresh
+to exercise expiry in a bounded acceptance run. Invalid values (including
+strings, fractions, zero, and values outside the range) or unknown control keys
+return 400 before any account, scope, issuer, or lifetime change. The observer
+shows the configured value, without token values or issuance deadlines. The
+fixture uses real elapsed wall-clock time; it exposes no clock control.
 
 Existing public/confidential clients, PKCE S256 checks, exact resource and
 redirect checks, single-use state/code checks, rotating refresh tokens, and

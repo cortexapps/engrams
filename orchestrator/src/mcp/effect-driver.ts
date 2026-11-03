@@ -413,6 +413,8 @@ export function makeMcpEffectDriver(deps: {
         : session.integrationPrincipalId.startsWith("automation:")
           ? { kind: "automation" as const, grant: resolved.effectiveGrant }
           : { kind: "approval" as const };
+      if (authorization.kind === "automation" && !authorization.grant.automationWrite)
+        throw new McpRequestDenied("write_not_allowed");
       const now = deps.now();
       // Both phase queues and approval share this first immutable outer cap.
       const cap =

@@ -100,7 +100,7 @@ async function main() {
           if (value.revision !== undefined)
             fixture.setCatalogRevision(value.revision);
         } else if (route === "/v1/oauth") {
-          keys(body, ["account", "scope", "issuer"], []);
+          keys(body, ["account", "scope", "issuer", "expiresInSeconds"], []);
           if (
             body.account !== undefined &&
             (typeof body.account !== "string" ||
@@ -121,11 +121,22 @@ async function main() {
             body.issuer !== "mismatch"
           )
             throw new Error("Invalid issuer mode");
+          if (
+            body.expiresInSeconds !== undefined &&
+            (typeof body.expiresInSeconds !== "number" ||
+              !Number.isInteger(body.expiresInSeconds) ||
+              body.expiresInSeconds < 1 ||
+              body.expiresInSeconds > 3600)
+          )
+            throw new Error("Invalid token lifetime");
           const value: {
+            expiresInSeconds?: number;
             account?: string;
             scope?: string;
             issuer?: "configured" | "mismatch";
           } = {};
+          if (typeof body.expiresInSeconds === "number")
+            value.expiresInSeconds = body.expiresInSeconds;
           if (body.issuer === "configured" || body.issuer === "mismatch")
             value.issuer = body.issuer;
           if (typeof body.account === "string") value.account = body.account;
