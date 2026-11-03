@@ -32,9 +32,12 @@ The default driver must support image loading and the local exporter.
 For source images, the producer uses `--load` and retains build metadata in
 its private work root. It accepts only `containerimage.config.digest`, checks
 the exact loaded image ID, Linux architecture, source revision and run label,
-then saves that config ID to the owned Docker archive. It converts that
-archive to OCI, checks its raw config against the build config ID, and runs
-the same archive and import checks as other images.
+then saves that config ID to the owned Docker archive. Before conversion,
+the saved raw config must hash to the build config ID. After conversion to
+OCI, the full config must match with JSON object keys sorted; value types
+and list order must stay the same. The final OCI image ID and manifest digest
+come from its actual raw bytes through the same strict archive and import
+checks as other images.
 Missing or invalid metadata or image facts stop the producer before save.
 The local-directory export path stays unchanged. No tag or new builder is used.
 Do not start Docker Desktop, Lima, Colima or another engine from the job.

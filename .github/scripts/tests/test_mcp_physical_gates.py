@@ -1,5 +1,6 @@
 import importlib.util
 from contextlib import contextmanager
+import hashlib
 import io
 import json
 import os
@@ -15,8 +16,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
-BUILD_CONFIG = b'{"os":"linux","architecture":"arm64"}'
-BUILD_CONFIG_ID = 'sha256:c21740f5cb55c7e3a2197b08ebd0ba12f673ff5aa9869bf892b0c85dcaf5c413'
+BUILD_CONFIG = b'{"os":"linux","architecture":"arm64","config":{"Tty":true,"StopTimeout":1,"Env":["A=1","B=2"]}}'
+BUILD_CONFIG_ID = 'sha256:e1c93a3ed1766bed27c966f53476dd47fde4ae1f2cd16f933f3d989a55d0f789'
 SPEC = importlib.util.spec_from_file_location('physical_assets', ROOT / '.github/scripts/mcp-stack-assets.py')
 assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(assets)
@@ -163,13 +164,15 @@ class PhysicalGates(unittest.TestCase):
             root = Path(directory).resolve()
             sock.bind(str(root / 'engine.sock'))
             script = f'''#!{sys.executable}
-import json, os, sys
+import hashlib, json, os, sys
 from pathlib import Path
 root = Path({str(root)!r})
 kind, args = Path(sys.argv[0]).name, sys.argv[1:]
 with (root / 'calls').open('a') as out:
     out.write(json.dumps([kind, *args]) + '\\n')
-operation = args[4:6] if kind == 'docker' else [kind, 'inspect' if 'inspect' in args else 'copy']
+operation = (args[4:6] if kind == 'docker' else
+             [kind, 'inspect-' + ('docker' if args[-1].startswith('docker-archive:') else 'oci')
+              if 'inspect' in args else 'copy'])
 if (root / 'fail').exists() and operation == json.loads((root / 'fail').read_text()):
     raise SystemExit(42)
 def emit(path, data, stage):
@@ -197,22 +200,41 @@ if kind == 'docker':
             assert output.startswith('type=local,dest=')
             Path(output.split('dest=', 1)[1]).mkdir()
     elif args[:2] == ['image', 'inspect']:
-        assert args[2:] == [{BUILD_CONFIG_ID!r}]
-        sys.stdout.buffer.write((root / 'inspect').read_bytes())
+        actual = json.loads((root / 'inspect').read_bytes())
+        identity = {BUILD_CONFIG_ID!r}
+        if (root / 'loaded').exists():
+            identity = 'sha256:' + hashlib.sha256((root / 'config-bytes').read_bytes()).hexdigest()
+            actual[0]['Id'] = identity
+        assert args[2:] == [identity]
+        print(json.dumps(actual))
     elif args[:2] == ['image', 'save']:
         assert args[2] == '--output' and args[4:] == [{BUILD_CONFIG_ID!r}]
         emit(Path(args[3]), b'controlled-docker-archive', 'save')
+    elif args[0] == 'load':
+        assert args[1] == '--input' and Path(args[2]).read_bytes() == b'controlled-docker-load'
+        (root / 'loaded').touch()
     else:
         raise AssertionError(args)
 else:
     assert kind == 'skopeo'
     if 'inspect' in args:
-        assert '--raw' in args and '--config' in args
-        sys.stdout.buffer.write((root / 'config-bytes').read_bytes())
+        assert '--raw' in args
+        if args[-1].startswith('docker-archive:'):
+            assert '--config' in args
+            sys.stdout.buffer.write((root / 'saved-config-bytes').read_bytes())
+        elif '--config' in args:
+            sys.stdout.buffer.write((root / 'config-bytes').read_bytes())
+        else:
+            config = (root / 'config-bytes').read_bytes()
+            print(json.dumps({{'schemaVersion': 2, 'config': {{'digest': 'sha256:' + hashlib.sha256(config).hexdigest()}}}}))
     else:
         assert 'copy' in args
-        assert Path(args[-2].removeprefix('docker-archive:')).read_bytes() == b'controlled-docker-archive'
-        Path(args[-1].removeprefix('oci-archive:')).write_bytes(b'controlled-oci-archive')
+        if args[-2].startswith('docker-archive:'):
+            assert Path(args[-2].removeprefix('docker-archive:')).read_bytes() == b'controlled-docker-archive'
+            Path(args[-1].removeprefix('oci-archive:')).write_bytes(b'controlled-oci-archive')
+        else:
+            assert Path(args[-2].removeprefix('oci-archive:')).read_bytes() == b'controlled-oci-archive'
+            Path(args[-1].removeprefix('docker-archive:')).write_bytes(b'controlled-docker-load')
 '''
             tools = {}
             for name in ['docker', 'skopeo']:
@@ -223,6 +245,7 @@ else:
             p = assets.Producer('vz', root, {'engineSocket': str(root / 'engine.sock'), 'tools': tools})
             p.engine_identity, p.head = 'controlled-engine-identity', 'b' * 40
             (root / 'config-bytes').write_bytes(BUILD_CONFIG)
+            (root / 'saved-config-bytes').write_bytes(BUILD_CONFIG)
             (root / 'metadata').write_text(json.dumps({
                 'containerimage.config.digest': BUILD_CONFIG_ID,
                 'containerimage.digest': 'sha256:' + 'c' * 64}))
@@ -344,19 +367,58 @@ else:
 
     def test_archive_rejects_converted_config_mismatch(self):
         with self.archive_fixture() as (p, _):
-            (p.root / 'config-bytes').write_bytes(b'foreign-config')
+            (p.root / 'config-bytes').write_bytes(b'{"os":"foreign"}')
             with self.assertRaisesRegex(RuntimeError, 'build_archive_config'):
                 p.archive('worker', 'docker/mcp-worker.Dockerfile')
 
+    def test_archive_saved_config_digest_must_match_before_conversion(self):
+        with self.archive_fixture() as (p, _):
+            # The same values in a different byte representation do not have the build ID.
+            (p.root / 'saved-config-bytes').write_bytes(json.dumps(json.loads(BUILD_CONFIG)).encode())
+            with self.assertRaisesRegex(RuntimeError, 'build_saved_config'):
+                p.archive('worker', 'docker/mcp-worker.Dockerfile')
+            calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+            self.assertFalse(any(call[0] == 'skopeo' and 'copy' in call for call in calls))
+            self.assertFalse((p.files / 'worker.oci.tar').exists())
+
+    def test_archive_accepts_object_key_order_and_imports_actual_converted_id(self):
+        with self.archive_fixture() as (p, _):
+            converted = json.dumps(json.loads(BUILD_CONFIG), sort_keys=True, separators=(',', ':')).encode()
+            self.assertNotEqual(converted, BUILD_CONFIG)
+            converted_id = 'sha256:' + hashlib.sha256(converted).hexdigest()
+            self.assertNotEqual(converted_id, BUILD_CONFIG_ID)
+            (p.root / 'config-bytes').write_bytes(converted)
+            archive = p.archive('worker', 'docker/mcp-worker.Dockerfile')
+            facts = p.import_image('worker', archive)
+            self.assertEqual(facts['id'], converted_id)
+            self.assertEqual(p.images['worker']['id'], converted_id)
+            calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+            inspections = [call[7:] for call in calls if call[0] == 'docker' and call[5:7] == ['image', 'inspect']]
+            self.assertEqual(inspections, [[BUILD_CONFIG_ID], [converted_id]])
+
+    def test_archive_rejects_config_value_type_or_list_order_changes(self):
+        for key, value in [('Tty', 1), ('StopTimeout', True), ('StopTimeout', 1.0),
+                           ('StopTimeout', '1'), ('Env', ['B=2', 'A=1']), ('Env', 'A=1'),
+                           ('NewField', None), ('StopTimeout', float('nan'))]:
+            with self.subTest(key=key, value=value), self.archive_fixture() as (p, _):
+                config = json.loads(BUILD_CONFIG)
+                config['config'][key] = value
+                (p.root / 'config-bytes').write_text(json.dumps(config))
+                with self.assertRaises((RuntimeError, ValueError)):
+                    p.archive('worker', 'docker/mcp-worker.Dockerfile')
+
     def test_archive_command_errors_stop_without_fallback(self):
-        operations = [['buildx', 'build'], ['image', 'inspect'], ['image', 'save'], ['skopeo', 'copy']]
+        operations = [['buildx', 'build'], ['image', 'inspect'], ['image', 'save'],
+                      ['skopeo', 'inspect-docker'], ['skopeo', 'copy'], ['skopeo', 'inspect-oci']]
         for index, operation in enumerate(operations):
             with self.subTest(operation=operation), self.archive_fixture() as (p, _):
                 (p.root / 'fail').write_text(json.dumps(operation))
                 with self.assertRaisesRegex(RuntimeError, 'producer_command'):
                     p.archive('worker', 'docker/mcp-worker.Dockerfile')
                 calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
-                actual = [call[5:7] if call[0] == 'docker' else ['skopeo', 'copy'] for call in calls
+                actual = [call[5:7] if call[0] == 'docker' else
+                          ['skopeo', 'inspect-' + ('docker' if call[-1].startswith('docker-archive:') else 'oci')
+                           if 'inspect' in call else 'copy'] for call in calls
                           if call[0] != 'docker' or call[5] != 'info']
                 self.assertEqual(actual, operations[:index + 1])
 

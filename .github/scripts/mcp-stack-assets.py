@@ -367,10 +367,14 @@ class Producer:
                 labels.get(LABEL) == self.run, 'build_image_labels')
         self.engine('image', 'save', '--output', str(output), identity)
         canonical(str(output))
+        saved = self.skopeo('inspect', '--raw', '--config', 'docker-archive:' + str(output))
+        require(digest(saved) == identity, 'build_saved_config')
         archive = self.files / f'{role}.oci.tar'
         self.skopeo('copy', 'docker-archive:' + str(output), 'oci-archive:' + str(archive))
         config = self.skopeo('inspect', '--raw', '--config', 'oci-archive:' + str(archive))
-        require(digest(config) == identity, 'build_archive_config')
+        normalized = [json.dumps(json.loads(raw), sort_keys=True, separators=(',', ':'), allow_nan=False)
+                      for raw in (saved, config)]
+        require(normalized[0] == normalized[1], 'build_archive_config')
         return archive
 
     def import_image(self, role, archive):
