@@ -22,6 +22,7 @@ description = "macOS Apple Silicon SandboxBackend driving Apple's Virtualization
 unsafe_code = "allow"
 
 [dependencies]
+tempfile = "3"
 engram-core.workspace = true
 engram-egress-proto.workspace = true
 sha2.workspace = true
@@ -54,7 +55,6 @@ libc = "0.2"
 
 [dev-dependencies]
 futures.workspace = true
-tempfile = "3"
 tracing-subscriber.workspace = true
 # e2e_vz live lifecycle test: a host-local blob store backs the chunk
 # store the VZ snapshot path chunks into.

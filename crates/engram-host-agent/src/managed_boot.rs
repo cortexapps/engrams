@@ -1,5 +1,7 @@
 //! One host owner for each managed boot. No ordinary backend map can adopt it.
-use crate::{bindings::BindingStore, egress::HostEgress, harness::HarnessHub};
+use crate::{
+    bindings::BindingStore, egress::HostEgress, harness::HarnessHub, managed_assets::hash_file,
+};
 use engram_core::{
     traits::{HarnessSink, SandboxBackend},
     types::{
@@ -17,10 +19,7 @@ use engram_egress_proto::private::{Allocation, RegisteredPrivateNetwork};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 use tokio::sync::Mutex;
 
@@ -44,18 +43,25 @@ impl ManagedBackend {
         request: &ManagedBootPrepare,
         spec: engram_core::types::sandbox::SandboxSpec,
         network: RegisteredPrivateNetwork,
+        staging: tempfile::TempDir,
     ) -> Result<Owner, SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Firecracker(backend) => Ok(Owner::Firecracker(Box::new(
                 backend
-                    .prepare_managed_cold(request.cold.clone(), spec, network)
+                    .prepare_managed_cold(request.cold.clone(), spec, network, staging)
                     .await?,
             ))),
             #[cfg(target_os = "macos")]
             Self::Vz { backend, helper } => Ok(Owner::Vz(Box::new(
                 backend
-                    .prepare_managed_cold(request.cold.clone(), spec, network, helper.clone())
+                    .prepare_managed_cold(
+                        request.cold.clone(),
+                        spec,
+                        network,
+                        helper.clone(),
+                        staging,
+                    )
                     .await?,
             ))),
         }
@@ -164,7 +170,13 @@ impl Owner {
     async fn close(self) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
-            Self::ExecTest(_) => Ok(()),
+            Self::ExecTest(owner) => {
+                if owner.close_fails {
+                    Err(invalid("test close failed"))
+                } else {
+                    Ok(())
+                }
+            }
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => (*owner).close().await,
             #[cfg(target_os = "macos")]
@@ -198,6 +210,7 @@ struct Record {
 }
 struct Entry {
     record: Record,
+    close_failed: bool,
     attach_owner: Option<crate::harness::ManagedHarnessOwner>,
     owner: Option<Owner>,
     agent: Option<AgentSpec>,
@@ -207,6 +220,43 @@ pub struct ManagedBootHostConfig {
     pub host_id: HostId,
     pub incarnation: String,
     pub directory: PathBuf,
+}
+
+/// Address slots and attachment identities have separate lifetimes.
+struct NetworkSlots {
+    generation: u64,
+    slots: Vec<Option<u64>>,
+}
+impl NetworkSlots {
+    fn new(capacity: usize) -> Self {
+        Self {
+            generation: 0,
+            slots: vec![None; capacity],
+        }
+    }
+    fn reserve(&mut self) -> Result<(usize, u64), SandboxError> {
+        let slot = self.slots.iter().position(Option::is_none).ok_or_else(|| {
+            SandboxError::Unavailable("managed network address capacity exhausted".into())
+        })?;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("attachment generation exhausted"))?;
+        self.slots[slot] = Some(self.generation);
+        Ok((slot, self.generation))
+    }
+    fn contains(&self, generation: u64) -> bool {
+        self.slots.contains(&Some(generation))
+    }
+    fn release(&mut self, generation: u64) {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| **slot == Some(generation))
+        {
+            *slot = None;
+        }
+    }
 }
 
 pub struct ManagedBootHost {
@@ -219,7 +269,7 @@ pub struct ManagedBootHost {
     bindings: BindingStore,
     directory: PathBuf,
     chunks: engram_chunk_store::ChunkStore,
-    next_network: AtomicU32,
+    networks: std::sync::Mutex<NetworkSlots>,
     binding_lock: std::sync::Mutex<()>,
     entries: dashmap::DashMap<SandboxId, Arc<Mutex<Entry>>>,
 }
@@ -254,7 +304,7 @@ impl ManagedBootHost {
             hub,
             directory,
             chunks,
-            next_network: AtomicU32::new(0),
+            networks: std::sync::Mutex::new(NetworkSlots::new(512)),
             binding_lock: std::sync::Mutex::new(()),
             entries: Default::default(),
         })
@@ -394,6 +444,72 @@ impl ManagedBootHost {
             self.hub.unbind_session(key.creation.session_id);
         }
     }
+    async fn close_resources(&self, entry: &mut Entry) -> Result<(), SandboxError> {
+        if entry.close_failed {
+            return Err(invalid("prior owner cleanup was uncertain"));
+        }
+        if let Some(owner) = entry.owner.take() {
+            // A retry must not treat a consumed, failed owner as a clean absence.
+            entry.close_failed = true;
+            owner.close().await?;
+            entry.close_failed = false;
+        }
+        let Some(allocation) = &entry.record.allocation else {
+            return Ok(());
+        };
+        // Recovered records do not own this process's address reservations.
+        if allocation.host_incarnation != self.incarnation
+            || entry.record.incarnation != self.incarnation
+        {
+            return Ok(());
+        }
+        if !self
+            .networks
+            .lock()
+            .expect("network slots")
+            .contains(allocation.attachment_generation)
+        {
+            return Ok(());
+        }
+        let handle = self.egress.handle();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2 * engram_egress_proto::private::HANDOFF_SECONDS),
+            async {
+                if handle.hello().await.map_err(invalid)?.incarnation
+                    != allocation.proxy_incarnation
+                {
+                    return Err(invalid("proxy changed during cleanup"));
+                }
+                if let Some(current) = handle
+                    .read_managed(allocation.session_id)
+                    .await
+                    .map_err(invalid)?
+                {
+                    if current.incarnation != allocation.proxy_incarnation
+                        || current.session_id != allocation.session_id
+                        || current.sandbox_id != allocation.sandbox_id
+                        || current.guest_ip != allocation.guest_ip
+                    {
+                        return Err(invalid("proxy registration changed during cleanup"));
+                    }
+                }
+                // The ACK requires ingress EOF, all flow joins, and registration removal.
+                // A poisoned or lost reply retains the slot until cleanup can be proved.
+                handle
+                    .remove_session(allocation.session_id)
+                    .await
+                    .map_err(invalid)?;
+                Ok::<_, SandboxError>(())
+            },
+        )
+        .await
+        .map_err(|_| invalid("proxy cleanup timed out"))??;
+        self.networks
+            .lock()
+            .expect("network slots")
+            .release(allocation.attachment_generation);
+        Ok(())
+    }
     async fn fail(&self, entry: &mut Entry) {
         entry.attach_owner = None;
         entry.record.state = ManagedBootHostState::Failed {
@@ -402,9 +518,7 @@ impl ManagedBootHost {
         entry.agent = None;
         let _ = self.persist(&entry.record);
         self.unbind_owned(&entry.record.request.key);
-        if let Some(owner) = entry.owner.take() {
-            let _ = owner.close().await;
-        }
+        let _ = self.close_resources(entry).await;
     }
     pub async fn prepare(
         self: &Arc<Self>,
@@ -493,6 +607,7 @@ impl ManagedBootHost {
                 self.persist(&record)?;
                 entry
                     .insert(Arc::new(Mutex::new(Entry {
+                        close_failed: false,
                         record,
                         attach_owner: None,
                         owner: None,
@@ -537,9 +652,10 @@ impl ManagedBootHost {
             return Err(invalid("ordinary source"));
         }
         let result = async {
-            let work = self.directory.join(id.to_string());
-            std::fs::create_dir(&work)?;
-            let rootfs = work.join("selected.ext4");
+            let staging = tempfile::Builder::new()
+                .prefix("staging-")
+                .tempdir_in(&self.directory)?;
+            let rootfs = staging.path().join("selected.ext4");
             let manifest = self
                 .chunks
                 .get_manifest(request.cold.disk.manifest)
@@ -551,27 +667,43 @@ impl ManagedBootHost {
                 .map_err(invalid)?;
             spec.rootfs_source = Some(rootfs);
             let handle = self.egress.handle();
-            let (guest_ip, gateway_ip, generation) = loop {
-                let slot = self.next_network.fetch_add(1, Ordering::SeqCst);
-                if slot >= 512 {
-                    return Err(invalid("allocation budget"));
-                }
+            let proxy_incarnation = handle.hello().await.map_err(invalid)?.incarnation;
+            let mut unavailable = Vec::new();
+            let selected = loop {
+                let reserved = self.networks.lock().expect("network slots").reserve();
+                let (slot, generation) = match reserved {
+                    Ok(value) => value,
+                    Err(error) => break Err(error),
+                };
                 let second = 18 + (slot / 256) as u8;
                 let third = (slot % 256) as u8;
                 let guest = std::net::Ipv4Addr::new(198, second, third, 2);
-                if handle.lookup_guest(guest).await.map_err(invalid)?.is_none() {
-                    break (
-                        guest,
-                        std::net::Ipv4Addr::new(198, second, third, 1),
-                        u64::from(slot) + 1,
-                    );
+                unavailable.push(generation);
+                match handle.lookup_guest(guest).await.map_err(invalid) {
+                    Ok(None) => {
+                        unavailable.pop();
+                        break Ok((
+                            guest,
+                            std::net::Ipv4Addr::new(198, second, third, 1),
+                            generation,
+                        ));
+                    }
+                    Ok(Some(_)) => (),
+                    Err(error) => break Err(error),
                 }
             };
+            for generation in unavailable {
+                self.networks
+                    .lock()
+                    .expect("network slots")
+                    .release(generation);
+            }
+            let (guest_ip, gateway_ip, generation) = selected?;
             let allocation = Allocation {
                 version: 1,
                 host_id: self.host_id,
                 host_incarnation: self.incarnation.clone(),
-                proxy_incarnation: handle.hello().await.map_err(invalid)?.incarnation,
+                proxy_incarnation,
                 session_id: key.creation.session_id,
                 sandbox_id: id,
                 boot_attempt: key.boot_attempt.clone(),
@@ -591,7 +723,10 @@ impl ManagedBootHost {
                 .register_private_network(&allocation)
                 .await
                 .map_err(invalid)?;
-            let mut owner = self.backend.prepare(&request, spec, network).await?;
+            let mut owner = self
+                .backend
+                .prepare(&request, spec, network, staging)
+                .await?;
             let network_identity = owner.closed_identity().await?;
             let mut receipt = ManagedBootPreparedReceipt {
                 request: request.clone(),
@@ -904,9 +1039,7 @@ impl ManagedBootHost {
             receipt: Box::new(receipt),
         };
         self.persist(&entry.record)?;
-        if let Some(owner) = entry.owner.take() {
-            owner.close().await?;
-        }
+        self.close_resources(entry).await?;
         Ok(())
     }
     async fn verify_retired(&self, record: &Record) -> Result<(), SandboxError> {
@@ -1142,6 +1275,7 @@ impl ManagedBootHost {
                     .entry(request.key.context.target.sandbox_id)
                     .or_insert_with(|| {
                         Arc::new(Mutex::new(Entry {
+                            close_failed: false,
                             record,
                             attach_owner: None,
                             owner: None,
@@ -1256,9 +1390,7 @@ impl ManagedBootHost {
                 authority: authority.clone(),
             };
             self.persist(&entry.record)?;
-            if let Some(owner) = entry.owner.take() {
-                owner.close().await?;
-            }
+            self.close_resources(&mut entry).await?;
             Ok(authority)
         }
         .await;
@@ -1291,7 +1423,7 @@ impl ManagedBootHost {
                 )
             {
                 // The physical source is already gone. Preserve its durable proof.
-                return Ok(());
+                return this.close_resources(&mut entry).await;
             }
             entry.attach_owner = None;
             entry.record.state = ManagedBootHostState::Failed {
@@ -1300,9 +1432,7 @@ impl ManagedBootHost {
             this.persist(&entry.record)?;
             entry.agent = None;
             this.unbind_owned(&entry.record.request.key);
-            if let Some(owner) = entry.owner.take() {
-                owner.close().await?;
-            }
+            this.close_resources(&mut entry).await?;
             Ok(())
         })
         .await
@@ -1551,28 +1681,6 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     )?
     .sync_all()
 }
-async fn hash_file(path: &Path) -> Result<(String, u64), SandboxError> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        use sha2::{Digest, Sha256};
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
-        let size = file.metadata()?.len();
-        let mut hash = Sha256::new();
-        let mut buffer = [0; 65536];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buffer[..n]);
-        }
-        Ok::<_, std::io::Error>((hex::encode(hash.finalize()), size))
-    })
-    .await
-    .map_err(invalid)?
-    .map_err(Into::into)
-}
 
 async fn publish_capture_manifest(
     chunks: &engram_chunk_store::ChunkStore,
@@ -1603,6 +1711,7 @@ mod tests {
     };
 
     pub(super) struct ExecOwner {
+        pub(super) close_fails: bool,
         epoch: u64,
         live: bool,
         pub(super) blocked: bool,
@@ -1661,9 +1770,11 @@ mod tests {
             intent: intent.clone(),
         };
         let entry = Arc::new(Mutex::new(Entry {
+            close_failed: false,
             record,
             attach_owner: Some(host.hub.managed_owner(intent)),
             owner: Some(Owner::ExecTest(Box::new(ExecOwner {
+                close_fails: false,
                 epoch: 1,
                 live: true,
                 blocked: false,
@@ -1968,6 +2079,266 @@ mod tests {
         );
         (host, request)
     }
+    #[test]
+    fn address_slots_reuse_retired_capacity_without_reusing_attachment_identity() {
+        let mut slots = NetworkSlots::new(2);
+        let live = slots.reserve().unwrap();
+        let mut previous = live.1;
+        for _ in 0..8 {
+            let current = slots.reserve().expect("retired capacity is reusable");
+            assert_ne!(current.0, live.0);
+            assert!(current.1 > previous);
+            assert!(slots.reserve().is_err(), "live slots must remain exclusive");
+            if previous != live.1 {
+                slots.release(previous);
+            }
+            assert!(
+                slots.contains(current.1),
+                "stale release must not retire a replacement"
+            );
+            slots.release(current.1);
+            previous = current.1;
+        }
+    }
+
+    #[test]
+    fn concurrent_address_reservations_are_unique() {
+        let slots = Arc::new(std::sync::Mutex::new(NetworkSlots::new(8)));
+        let owners: Vec<_> = (0..8)
+            .map(|_| {
+                let slots = slots.clone();
+                std::thread::spawn(move || slots.lock().unwrap().reserve().unwrap())
+            })
+            .collect();
+        let reservations: std::collections::HashSet<_> = owners
+            .into_iter()
+            .map(|owner| owner.join().unwrap().0)
+            .collect();
+        assert_eq!(reservations.len(), 8);
+        assert!(slots.lock().unwrap().reserve().is_err());
+    }
+
+    fn reserve_test_network(host: &ManagedBootHost, entry: &mut Entry) -> u64 {
+        let (slot, generation) = host.networks.lock().unwrap().reserve().unwrap();
+        let request = &entry.record.request;
+        entry.record.allocation = Some(Allocation {
+            version: 1,
+            host_id: host.host_id,
+            host_incarnation: host.incarnation.clone(),
+            proxy_incarnation: "proxy-1".into(),
+            session_id: request.key.creation.session_id,
+            sandbox_id: request.cold.sandbox_id,
+            boot_attempt: request.cold.boot_attempt.clone(),
+            attachment_generation: generation,
+            guest_ip: std::net::Ipv4Addr::new(198, 18, slot as u8, 2),
+            gateway_ip: std::net::Ipv4Addr::new(198, 18, slot as u8, 1),
+            policy_revision: request.bootstrap_policy.revision,
+            policy_digest: request.bootstrap_policy.digest.clone(),
+        });
+        generation
+    }
+
+    #[tokio::test]
+    async fn address_release_waits_for_successful_proxy_retirement() {
+        use engram_egress_proto::{FromProxyd, ToProxyd};
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let generation = reserve_test_network(&host, &mut *entry.lock().await);
+        let listener = tokio::net::UnixListener::bind(temp.path().join("absent.sock")).unwrap();
+        let (pending, mut removals) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<FromProxyd>>(1);
+        let (registered, mut registrations) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let pending = pending.clone();
+                let registered = registered.clone();
+                tasks.spawn(async move {
+                    while let Ok(message) =
+                        engram_egress_proto::read_frame::<_, ToProxyd>(&mut stream).await
+                    {
+                        let reply = match message {
+                            ToProxyd::Hello { .. } => {
+                                FromProxyd::HelloAck(engram_egress_proto::HelloInfo {
+                                    incarnation: "proxy-1".into(),
+                                    proto_version: engram_egress_proto::PROTO_VERSION,
+                                    source_fingerprint: None,
+                                    proxy_port: 1,
+                                    dns_port: 2,
+                                    gateway_port: 3,
+                                    ca_fingerprint: "test".into(),
+                                    coord_url: "test".into(),
+                                })
+                            }
+                            ToProxyd::LookupGuest(_) => FromProxyd::Guest(None),
+                            ToProxyd::ApplyPolicy(_) => FromProxyd::Ok,
+                            ToProxyd::PrivateNetwork => {
+                                use engram_egress_proto::private;
+                                let allocation: Allocation =
+                                    private::read(&mut stream).await.unwrap();
+                                private::write(
+                                    &mut stream,
+                                    &private::Reply {
+                                        version: 1,
+                                        sequence: 0,
+                                        epoch: 0,
+                                        state: "closed".into(),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                registered.send(allocation).await.unwrap();
+                                private::drain_to_eof(&stream).await.unwrap();
+                                return;
+                            }
+                            ToProxyd::ReadManaged(_) => FromProxyd::ManagedState(None),
+                            ToProxyd::RemoveSession(_) => {
+                                let (reply, wait) = tokio::sync::oneshot::channel();
+                                pending.send(reply).await.unwrap();
+                                wait.await.unwrap()
+                            }
+                            _ => panic!("unexpected cleanup request"),
+                        };
+                        engram_egress_proto::write_frame(&mut stream, &reply)
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        for succeed in [false, true] {
+            let h = host.clone();
+            let e = entry.clone();
+            let close = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), removals.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                host.networks.lock().unwrap().contains(generation),
+                "no address reuse before cleanup ACK"
+            );
+            reply
+                .send(if succeed {
+                    FromProxyd::Ok
+                } else {
+                    FromProxyd::Err("cleanup uncertain".into())
+                })
+                .unwrap();
+            assert_eq!(close.await.unwrap().is_ok(), succeed);
+            assert_eq!(host.networks.lock().unwrap().contains(generation), !succeed);
+        }
+        // Real host prepares reach the actual backend pin and fail verification.
+        // With one live address and capacity two, retries must reuse only the
+        // other slot, even after more attempts than the capacity.
+        host.networks.lock().unwrap().slots.truncate(2);
+        let held = host.networks.lock().unwrap().reserve().unwrap();
+        host.chunks
+            .put_manifest(
+                request.cold.disk.manifest,
+                &engram_chunk_store::Manifest::empty(engram_chunk_store::ManifestKind::Disk, 4),
+            )
+            .await
+            .unwrap();
+        let mut previous = held.1;
+        for n in 0..6 {
+            let mut next = request.clone();
+            let session = engram_core::SessionId::new();
+            let sandbox = SandboxId::new();
+            next.key.creation.session_id = session;
+            next.key.context.target.session_id = session;
+            next.key.context.target.sandbox_id = sandbox;
+            next.cold.session_id = session;
+            next.cold.sandbox_id = sandbox;
+            next.key.boot_attempt = format!("failed-{n}");
+            next.cold.boot_attempt = next.key.boot_attempt.clone();
+            let h = host.clone();
+            let prepared = tokio::spawn(async move { h.prepare(next).await });
+            let allocation =
+                tokio::time::timeout(std::time::Duration::from_secs(5), registrations.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(allocation.guest_ip, std::net::Ipv4Addr::new(198, 18, 1, 2));
+            assert!(allocation.attachment_generation > previous);
+            previous = allocation.attachment_generation;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), removals.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(host.networks.lock().unwrap().contains(previous));
+            reply.send(FromProxyd::Ok).unwrap();
+            assert!(prepared.await.unwrap().is_err());
+            assert!(!host.networks.lock().unwrap().contains(previous));
+            assert!(host.networks.lock().unwrap().contains(held.1));
+            assert!(std::fs::read_dir(&host.directory)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_type().unwrap().is_dir()));
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_destroy_never_releases_an_address_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let mut owned = entry.lock().await;
+        let generation = reserve_test_network(&host, &mut owned);
+        if let Some(Owner::ExecTest(owner)) = &mut owned.owner {
+            owner.close_fails = true;
+        }
+        drop(owned);
+        for _ in 0..2 {
+            assert!(host
+                .destroy(
+                    request.cold.sandbox_id,
+                    engram_core::traits::SessionFence {
+                        session_id: request.key.creation.session_id,
+                        epoch: 1,
+                    }
+                )
+                .await
+                .is_err());
+            assert!(host.networks.lock().unwrap().contains(generation));
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_record_cannot_release_current_incarnation_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let mut entry = entry.lock().await;
+        let generation = reserve_test_network(&host, &mut entry);
+        entry.owner = None;
+        entry.record.incarnation = "old-host".into();
+        entry.record.allocation.as_mut().unwrap().host_incarnation = "old-host".into();
+        host.close_resources(&mut entry).await.unwrap();
+        assert!(host.networks.lock().unwrap().contains(generation));
+    }
+
+    #[tokio::test]
+    async fn failed_materialization_removes_disposable_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        assert!(host.prepare(request).await.is_err());
+        assert!(
+            !host.directory.join(id.to_string()).exists(),
+            "failed prepare retained old staging"
+        );
+        assert!(
+            std::fs::read_dir(&host.directory)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_type().unwrap().is_dir()),
+            "failed prepare retained staging"
+        );
+    }
+
     #[tokio::test]
     async fn cold_assets_hash_exact_sparse_disk_and_configured_files_without_owner() {
         use engram_chunk_store::{ChunkRef, ChunkSize, Manifest, ManifestKind};
@@ -2036,7 +2407,7 @@ mod tests {
             engram_core::types::managed_assets::ManagedColdBackend::Firecracker
         );
         assert!(host.entries.is_empty());
-        assert_eq!(host.next_network.load(Ordering::SeqCst), 0);
+        assert_eq!(host.networks.lock().unwrap().generation, 0);
         assert!(host.ordinary.list().await.unwrap().is_empty());
         assert_eq!(std::fs::read_dir(&host.directory).unwrap().count(), 0);
         std::fs::write(temp.path().join("kernel"), b"changed kernel").unwrap();
@@ -2140,6 +2511,7 @@ mod tests {
         };
         host.persist(&record).unwrap();
         let entry = Arc::new(Mutex::new(Entry {
+            close_failed: false,
             record,
             attach_owner: Some(host.hub.managed_owner(intent)),
             owner: None,
@@ -2309,6 +2681,7 @@ mod tests {
             }),
         };
         let entry = Arc::new(Mutex::new(Entry {
+            close_failed: false,
             record,
             attach_owner: None,
             owner: None,
@@ -2671,6 +3044,7 @@ mod tests {
             Some(ManagedDenyPolicy::new(2, ["other.example".into()]).unwrap());
         assert!(!bootstrap_retirement_allowed(&record, &changed));
         let entry = Arc::new(Mutex::new(Entry {
+            close_failed: false,
             record,
             attach_owner: None,
             owner: None,
@@ -2765,6 +3139,7 @@ mod tests {
         host.entries.insert(
             id,
             Arc::new(Mutex::new(Entry {
+                close_failed: false,
                 record,
                 attach_owner: None,
                 owner: None,

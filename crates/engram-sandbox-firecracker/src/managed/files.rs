@@ -33,6 +33,7 @@ impl PinnedFiles {
         cfg: &crate::FirecrackerConfig,
         request: &engram_core::types::managed_cold::ManagedColdPrepare,
         spec: &engram_core::types::sandbox::SandboxSpec,
+        _staging: tempfile::TempDir,
     ) -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::create_dir_all(work)?;
@@ -153,10 +154,42 @@ pub(super) mod tests {
         (cfg, request, spec)
     }
     #[test]
+    fn staging_is_removed_after_pin_success_or_verification_failure() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, mut spec) = inputs(dir.path());
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            let path = staging.path().to_owned();
+            let disk = path.join("selected.ext4");
+            std::fs::write(&disk, if valid { b"disk-a" } else { b"bad-aa" }).unwrap();
+            spec.rootfs_source = Some(disk);
+            let result =
+                PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec, staging);
+            assert!(!path.exists(), "staging must end with the pin operation");
+            if valid {
+                let files = result.unwrap();
+                assert_eq!(
+                    std::fs::read(files.path.join("rootfs.ext4")).unwrap(),
+                    b"disk-a"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
     fn retirement_failure_retains_exact_private_source_disk() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, request, spec) = inputs(dir.path());
-        let files = PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec).unwrap();
+        let files = PinnedFiles::prepare(
+            &dir.path().join("owned"),
+            &cfg,
+            &request,
+            &spec,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
         let path = files.path.clone();
         files
             .retain
@@ -169,7 +202,14 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, mut request, spec) = inputs(dir.path());
         request.boot_attempt = "12345678-1234-1234-1234-123456789abc".into();
-        let files = PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec).unwrap();
+        let files = PinnedFiles::prepare(
+            &dir.path().join("owned"),
+            &cfg,
+            &request,
+            &spec,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
         let runtime_path = Path::new("/var/lib/engrams")
             .join(files.path.file_name().unwrap())
             .join("firecracker.sock");
@@ -183,15 +223,23 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, request, spec) = inputs(dir.path());
         let work = dir.path().join("owned");
-        let files = PinnedFiles::prepare(&work, &cfg, &request, &spec).unwrap();
+        let files =
+            PinnedFiles::prepare(&work, &cfg, &request, &spec, tempfile::tempdir().unwrap())
+                .unwrap();
         let owned = files.path.clone();
         std::fs::write(dir.path().join("disk"), b"disk-b").unwrap();
         assert_eq!(std::fs::read(owned.join("rootfs.ext4")).unwrap(), b"disk-a");
-        assert!(PinnedFiles::prepare(&work, &cfg, &request, &spec).is_err());
+        assert!(
+            PinnedFiles::prepare(&work, &cfg, &request, &spec, tempfile::tempdir().unwrap())
+                .is_err()
+        );
         assert!(owned.exists());
         drop(files);
         assert!(!owned.exists());
-        assert!(PinnedFiles::prepare(&work, &cfg, &request, &spec).is_err());
+        assert!(
+            PinnedFiles::prepare(&work, &cfg, &request, &spec, tempfile::tempdir().unwrap())
+                .is_err()
+        );
         assert!(!owned.exists());
     }
     #[test]

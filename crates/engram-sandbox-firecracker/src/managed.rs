@@ -54,11 +54,14 @@ struct Prepared {
     streams: tokio::task::JoinSet<()>,
 }
 impl crate::FirecrackerBackend {
+    /// Transfer disposable staging to the blocking pin operation. Cancellation
+    /// can close ingress while that operation still owns its input files.
     pub async fn prepare_managed_cold(
         &self,
         request: ManagedColdPrepare,
         spec: SandboxSpec,
         network: RegisteredPrivateNetwork,
+        staging: tempfile::TempDir,
     ) -> Result<PreparedManagedFc, SandboxError> {
         request.validate(&spec).map_err(SandboxError::InvalidSpec)?;
         let allocation = network.allocation();
@@ -73,11 +76,11 @@ impl crate::FirecrackerBackend {
         let shape = network::NetworkShape::new(allocation.guest_ip, allocation.gateway_ip)?;
         #[cfg(target_os = "linux")]
         {
-            prepare(self, request, spec, network, shape).await
+            prepare(self, request, spec, network, shape, staging).await
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = shape;
+            let _ = (shape, staging);
             Err(SandboxError::InvalidSpec(
                 "managed Firecracker preparation requires Linux".into(),
             ))
@@ -325,6 +328,7 @@ async fn prepare(
     spec: SandboxSpec,
     registered: RegisteredPrivateNetwork,
     shape: network::NetworkShape,
+    staging: tempfile::TempDir,
 ) -> Result<PreparedManagedFc, SandboxError> {
     use std::{io, sync::Arc};
     let allocation = registered.allocation().clone();
@@ -335,7 +339,8 @@ async fn prepare(
         let req = request.clone();
         let spec = spec.clone();
         let pin = tokio::task::spawn_blocking(move || {
-            files::PinnedFiles::prepare(&work, &cfg, &req, &spec)
+            // A cancelled prepare cannot remove input still used by this task.
+            files::PinnedFiles::prepare(&work, &cfg, &req, &spec, staging)
         });
         tokio::select! { biased;
             _ = wait_for_stop(&private) => return Err(io::Error::other("private allocation stopped").into()),
