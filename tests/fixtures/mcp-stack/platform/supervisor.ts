@@ -75,7 +75,9 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
     "supervisor_role_configuration",
   );
   check(
-    ctx.supervisor.configurations[role][configurationId],
+    role === "orchestrator"
+      ? ctx.supervisor.configurations.orchestrator[configurationId]
+      : ctx.supervisor.configurations[role].normal,
     "supervisor_configuration",
   );
   return {
@@ -131,7 +133,9 @@ export function verifyStatus(ctx: Context, value: unknown): SupervisorStatus {
               role.role === "fixture-modern" ? "modern" : "legacy"
             ].configuration
           : undefined
-        : ctx.supervisor.configurations[role.role][role.configurationId];
+        : role.role === "orchestrator"
+          ? ctx.supervisor.configurations.orchestrator[role.configurationId]
+          : ctx.supervisor.configurations[role.role].normal;
     check(
       config &&
         config.sha256 === role.configurationSha256 &&
@@ -235,9 +239,11 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
       );
       if (operation.operation === "restart") {
         const configuration =
-          ctx.supervisor.configurations[operation.role][
-            operation.configurationId
-          ];
+          operation.role === "orchestrator"
+            ? ctx.supervisor.configurations.orchestrator[
+                operation.configurationId
+              ]
+            : ctx.supervisor.configurations[operation.role].normal;
         check(configuration, "supervisor_configuration");
         await verifyPin(configuration);
       }

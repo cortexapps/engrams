@@ -52,6 +52,7 @@ export const IMAGES = [
 export interface ImagePin {
   archive: Pin;
   id: string;
+  manifestDigest: string;
 }
 export interface Inputs {
   version: 1;
@@ -65,9 +66,10 @@ export interface Inputs {
   subnet: string;
   nativeHostIp: string;
   binaries: Record<(typeof BINARIES)[number], Pin>;
-  images: Record<(typeof IMAGES)[number], ImagePin>;
+  images: Record<(typeof IMAGES)[number], ImagePin> & { hostAgent?: ImagePin };
   firecracker?: Pin;
-  proxy?: Pin;
+  proxy: Pin;
+  nativeProbe?: Pin;
 }
 function text(value: unknown, pattern: RegExp, seam: string): string {
   check(typeof value === "string" && pattern.test(value), seam);
@@ -98,8 +100,9 @@ export function parseInputs(
       "nativeHostIp",
       "binaries",
       "images",
+      "proxy",
     ],
-    ["firecracker", "proxy"],
+    ["firecracker", "nativeProbe"],
   );
   check(
     o.version === 1 &&
@@ -109,10 +112,10 @@ export function parseInputs(
   );
   if (backend === "vz")
     check(
-      o.architecture === "arm64" && !o.firecracker && !o.proxy,
+      o.architecture === "arm64" && !o.firecracker && o.nativeProbe,
       "vz_architecture",
     );
-  else check(o.firecracker && o.proxy, "fc_artifacts");
+  else check(o.firecracker && !o.nativeProbe, "fc_artifacts");
   check(
     Number.isInteger(o.registryPort) &&
       Number(o.registryPort) >= 20000 &&
@@ -120,21 +123,35 @@ export function parseInputs(
     "registry_port",
   );
   const rawBins = record(o.binaries, BINARIES),
-    rawImages = record(o.images, IMAGES);
+    rawImages = record(
+      o.images,
+      backend === "firecracker" ? [...IMAGES, "hostAgent"] : IMAGES,
+    );
   const binaries = Object.fromEntries(
     BINARIES.map((key) => [key, pin(rawBins[key])]),
   ) as Inputs["binaries"];
   const images = Object.fromEntries(
-    IMAGES.map((key) => {
-      const image = record(rawImages[key], ["archive", "id"]);
-      return [
-        key,
-        {
-          archive: pin(image.archive),
-          id: text(image.id, /^sha256:[a-f0-9]{64}$/, "image_digest"),
-        },
-      ];
-    }),
+    (backend === "firecracker" ? [...IMAGES, "hostAgent"] : [...IMAGES]).map(
+      (key) => {
+        const image = record(rawImages[key], [
+          "archive",
+          "id",
+          "manifestDigest",
+        ]);
+        return [
+          key,
+          {
+            archive: pin(image.archive),
+            id: text(image.id, /^sha256:[a-f0-9]{64}$/, "image_digest"),
+            manifestDigest: text(
+              image.manifestDigest,
+              /^sha256:[a-f0-9]{64}$/,
+              "image_manifest_digest",
+            ),
+          },
+        ];
+      },
+    ),
   ) as Inputs["images"];
   const subnet = text(
     o.subnet,
@@ -169,9 +186,10 @@ export function parseInputs(
     nativeHostIp,
     binaries,
     images,
+    proxy: pin(o.proxy),
     ...(backend === "firecracker"
-      ? { firecracker: pin(o.firecracker), proxy: pin(o.proxy) }
-      : {}),
+      ? { firecracker: pin(o.firecracker) }
+      : { nativeProbe: pin(o.nativeProbe) }),
   };
 }
 export function engineArguments(
@@ -302,7 +320,11 @@ export async function validateExecutables(inputs: Inputs): Promise<void> {
   if (inputs.backend === "firecracker") {
     check(inputs.firecracker && inputs.proxy, "fc_artifacts");
     await validate(inputs.firecracker, "linux");
-    await validate(inputs.proxy, "linux");
+  }
+  await validate(inputs.proxy, inputs.backend === "vz" ? "darwin" : "linux");
+  if (inputs.backend === "vz") {
+    check(inputs.nativeProbe, "native_probe");
+    await validate(inputs.nativeProbe, "darwin");
   }
 }
 export async function preflight(
@@ -330,7 +352,8 @@ export async function preflight(
     ...Object.values(inputs.binaries),
     ...Object.values(inputs.images).map((v) => v.archive),
     ...(inputs.firecracker ? [inputs.firecracker] : []),
-    ...(inputs.proxy ? [inputs.proxy] : []),
+    inputs.proxy,
+    ...(inputs.nativeProbe ? [inputs.nativeProbe] : []),
   ])
     await verifyPin(item);
   await validateExecutables(inputs);
@@ -408,7 +431,15 @@ export async function preflight(
         actual?.Architecture === inputs.architecture,
       "image_platform",
     );
-    if (["coordinator", "orchestrator", "worker", "fixture"].includes(role))
+    if (
+      [
+        "coordinator",
+        "orchestrator",
+        "worker",
+        "fixture",
+        "hostAgent",
+      ].includes(role)
+    )
       check(
         actual?.Config?.Labels?.["org.opencontainers.image.revision"] ===
           inputs.sourceCommit,

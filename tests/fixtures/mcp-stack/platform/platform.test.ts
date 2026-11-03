@@ -70,6 +70,8 @@ function input(): Inputs {
     {
       version: 1,
       backend: "vz",
+      proxy: pin,
+      nativeProbe: pin,
       architecture: "arm64",
       sourceCommit: "b".repeat(40),
       engineSocket: "/owned/engine.sock",
@@ -82,7 +84,11 @@ function input(): Inputs {
       images: Object.fromEntries(
         IMAGES.map((v) => [
           v,
-          { archive: pin, id: `sha256:${"c".repeat(64)}` },
+          {
+            archive: pin,
+            id: `sha256:${"c".repeat(64)}`,
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          },
         ]),
       ),
     },
@@ -988,8 +994,11 @@ test("supervisor rejects declared non-O disable requests before lifecycle access
       "zone-disabled",
     ] as const) {
       const ctx = await context();
-      ctx.supervisor.configurations[role][configurationId] =
-        ctx.supervisor.configurations[role].normal;
+      Reflect.set(
+        ctx.supervisor.configurations[role],
+        configurationId,
+        ctx.supervisor.configurations[role].normal,
+      );
       let reads = 0,
         mutations = 0;
       const current = status(ctx);
@@ -1034,8 +1043,11 @@ test("supervisor rejects declared non-O disable status", async () => {
       "global-disabled",
       "zone-disabled",
     ] as const) {
-      ctx.supervisor.configurations[role][configurationId] =
-        ctx.supervisor.configurations[role].normal;
+      Reflect.set(
+        ctx.supervisor.configurations[role],
+        configurationId,
+        ctx.supervisor.configurations[role].normal,
+      );
       const current = status(ctx);
       current.roles.find((v) => v.role === role)!.configurationId =
         configurationId;
