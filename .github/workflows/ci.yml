@@ -127,6 +127,7 @@ jobs:
       # change to how CI runs re-runs everything.
       test_rust: ${{ steps.lanes.outputs.test_rust }}
       test_mcp_worker: ${{ steps.lanes.outputs.test_mcp_worker }}
+      test_mcp_physical: ${{ steps.lanes.outputs.test_mcp_physical }}
       test_netstack: ${{ steps.lanes.outputs.test_netstack }}
       test_cross: ${{ steps.lanes.outputs.test_cross }}
       test_fc: ${{ steps.lanes.outputs.test_fc }}
@@ -1064,6 +1065,15 @@ jobs:
           grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
           grep -Eq '^[[:space:]]*0 fail$' "$result"
           grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files?\.' "$result"
+      - name: MCP Inputs writer source tests
+        run: |
+          set -euo pipefail
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          node --experimental-transform-types --test --test-isolation=none ../.github/scripts/tests/mcp-stack-inputs.test.mts 2>&1 | tee "$result"
+          grep -Eq '^# pass [1-9][0-9]*$' "$result"
+          grep -Eq '^# fail 0$' "$result"
+          grep -Eq '^# cancelled 0$' "$result"
       - name: apply orchestrator migrations
         run: bun run migrate
       - name: bun test
@@ -2685,6 +2695,76 @@ jobs:
           # never exports to gha anyway; it stays warm through Blacksmith's
           # colocated BuildKit cache.
 
+  # Each dedicated runner has a qualified existing Linux engine and native
+  # DNS/routes. See platform/ci/README.md. Missing prerequisites fail hard.
+  mcp-physical-fc:
+    name: MCP physical Firecracker (24 cases)
+    concurrency:
+      group: mcp-physical-fc-${{ github.repository }}
+      cancel-in-progress: false
+    needs: detect
+    if: needs.detect.outputs.test_mcp_physical == 'true'
+    runs-on: [self-hosted, Linux, X64, engram-mcp-firecracker]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Produce and run physical Firecracker assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mcp-physical-fc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}
+          finish() {
+            if sudo test -f "$root/summary.json"; then
+              sudo install -m 0644 "$root/summary.json" var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/firecracker.json
+            fi
+          }
+          trap finish EXIT
+          sudo --preserve-env=GITHUB_TOKEN python3 -I .github/scripts/mcp-stack-assets.py --backend firecracker --operator /etc/engrams/mcp-physical-firecracker.json --work-root "$root"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcp-physical-fc-safe-summary
+          path: var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/firecracker.json
+          if-no-files-found: error
+
+  mcp-physical-vz:
+    name: MCP physical VZ (24 cases)
+    concurrency:
+      group: mcp-physical-vz-${{ github.repository }}
+      cancel-in-progress: false
+    needs: detect
+    if: needs.detect.outputs.test_mcp_physical == 'true'
+    runs-on: [self-hosted, macOS, ARM64, engram-mcp-vz]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Produce and run physical VZ assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mcp-physical-vz-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}
+          finish() {
+            if test -f "$root/summary.json"; then
+              install -m 0644 "$root/summary.json" var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/vz.json
+            fi
+          }
+          trap finish EXIT
+          python3 -I .github/scripts/mcp-stack-assets.py --backend vz --operator '/Library/Application Support/engrams/mcp-physical-vz.json' --work-root "$root"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mcp-physical-vz-safe-summary
+          path: var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/vz.json
+          if-no-files-found: error
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2698,6 +2778,8 @@ jobs:
       - site
       - orchestrator
       - mcp-worker
+      - mcp-physical-fc
+      - mcp-physical-vz
       - netstack
       - buf
       - test-fc-unprivileged

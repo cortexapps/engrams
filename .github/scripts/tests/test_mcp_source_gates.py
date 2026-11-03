@@ -95,6 +95,31 @@ class NativeSourceGate(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
                     self.assertTrue((root / 'var/mcp-stack-runner').is_dir())
 
+    def test_inputs_writer_gate_rejects_zero_failure_and_cancel(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        step = workflow.split('      - name: MCP Inputs writer source tests', 1)[1]
+        body = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'bin'
+            commands.mkdir()
+            node = commands / 'node'
+            node.write_text(f'#!{sys.executable}\n'
+                            'import os, sys\n'
+                            'assert sys.argv[1:] == ["--experimental-transform-types", "--test", "--test-isolation=none", "../.github/scripts/tests/mcp-stack-inputs.test.mts"]\n'
+                            'print(os.environ["FAKE_SUMMARY"])\n'
+                            'sys.exit(int(os.environ["FAKE_EXIT"]))\n')
+            node.chmod(0o700)
+            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root))
+            good = '# pass 38\n# fail 0\n# cancelled 0'
+            for summary, code, expected in [(good, 0, True), (good.replace('38', '0'), 0, False),
+                                             (good.replace('fail 0', 'fail 1'), 0, False),
+                                             (good.replace('cancelled 0', 'cancelled 1'), 0, False),
+                                             (good, 42, False), ('No tests', 0, False)]:
+                env.update(FAKE_SUMMARY=summary, FAKE_EXIT=str(code))
+                result = subprocess.run(['bash', '-c', body], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+
     def test_platform_gate_requires_openssl_three_and_nonzero_tests(self):
         # Command stubs only: actual platform source tests run in the CI job.
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()

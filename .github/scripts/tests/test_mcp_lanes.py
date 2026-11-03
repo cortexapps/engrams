@@ -140,6 +140,21 @@ class McpLanes(unittest.TestCase):
         for lane in ['orchestrator', 'mcp-worker', 'test-linux', 'test-macos']:
             self.assertIn(f'      - {lane}\n', gate)
 
+    def test_complete_physical_producer_selector(self):
+        for path in ['tests/fixtures/mcp-stack/platform/ci/linux-assets.Dockerfile',
+                     '.github/scripts/mcp-stack-assets.py', '.github/scripts/mcp-stack-inputs.mts',
+                     '.github/scripts/mcp-stack-fc.sh', 'docker/coordinator.Dockerfile',
+                     'deploy/bundles/agentd/build.sh', 'deploy/demo/Dockerfile',
+                     'deploy/kernel/build-fc-kernel.sh', 'third_party/firecracker',
+                     'sandbox-netstack/build.sh', '.sqlx/query.json', 'deploy/migrations/100.sql',
+                     'orchestrator/scripts/mcp-stack/run.ts', 'mcp-worker/package-lock.json',
+                     'crates/engram-host-agent/src/lib.rs', '.bun-version', '.github/workflows/ci.yml']:
+            with self.subTest(path=path):
+                self.assertEqual(detect(path)['test_mcp_physical'], 'true')
+        for path in ['README.md', 'web/src/App.tsx', 'site/src/content/docs/index.mdx']:
+            with self.subTest(path=path):
+                self.assertEqual(detect(path)['test_mcp_physical'], 'false')
+
     def test_unrelated_path_does_not_run_new_lanes(self):
         result = detect('README.md')
         self.assertEqual(result['test_mcp_worker'], 'false')

@@ -268,7 +268,8 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  ".github/actions/",
                  ".github/scripts/detect-rebake-lanes.py",
                  ".github/scripts/tests/",
-                 ".github/scripts/mcp-acceptance-"]
+                 ".github/scripts/mcp-acceptance-",
+                 ".github/scripts/mcp-stack-"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # The public docs + landing site (site/, Astro + Starlight). Its content is
@@ -568,6 +569,14 @@ def main():
         or any_path(changed, ["mcp-worker/", "sandbox-netstack/"])
     )
     test_mcp_worker = ci_self or proto or any_path(changed, ["mcp-worker/", "docker/mcp-worker.Dockerfile"] + MCP_STACK_FIXTURE_PATHS)
+    # Self-contained producers use one selector: no skipped artifact dependency.
+    test_mcp_physical = (
+        ci_self or proto or test_rust or any_path(changed, ORCH_PATHS + [
+            "crates/", ".sqlx/", "deploy/migrations/", "docker/", "deploy/bundles/",
+            "deploy/demo/", "deploy/kernel/", "third_party/firecracker",
+            "sandbox-netstack/", ".bun-version",
+        ])
+    )
     test_netstack = test_rust
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries or fixture_changed or harness_changed
@@ -707,6 +716,7 @@ def main():
             # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
             f.write(f"test_rust={b(test_rust)}\n")
             f.write(f"test_mcp_worker={b(test_mcp_worker)}\n")
+            f.write(f"test_mcp_physical={b(test_mcp_physical)}\n")
             f.write(f"test_netstack={b(test_netstack)}\n")
             f.write(f"test_cross={b(test_cross)}\n")
             f.write(f"test_fc={b(test_fc)}\n")
