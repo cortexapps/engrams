@@ -95,7 +95,7 @@ impl McpAuthority {
             {
                 return Err(McpError::Invalid);
             }
-            Self::canonical_endpoint(&r.issuer)?;
+            Self::canonical_issuer(&r.issuer)?;
             Self::canonical_endpoint(&r.redirect_uri)?;
             for d in [
                 &r.resource,
@@ -118,6 +118,16 @@ impl McpAuthority {
     }
     pub(crate) fn random(&self) -> Result<String> {
         Ok(URL_SAFE_NO_PAD.encode(self.security.bytes()?))
+    }
+    fn canonical_issuer(issuer: &str) -> Result<()> {
+        let url = url::Url::parse(issuer).map_err(|_| McpError::Invalid)?;
+        // Issuer identifiers can be canonical origins without a trailing slash.
+        // Validate the URL, but keep the registered bytes for exact OAuth checks.
+        if url.origin().ascii_serialization() == issuer {
+            Self::canonical_endpoint(url.as_str())
+        } else {
+            Self::canonical_endpoint(issuer)
+        }
     }
     pub(crate) fn canonical_endpoint(endpoint: &str) -> Result<()> {
         let url = url::Url::parse(endpoint).map_err(|_| McpError::Invalid)?;
@@ -369,3 +379,135 @@ impl McpAuthority {
 }
 
 pub mod operator;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::traits::StaticSecretStore;
+    use engram_sim::{ManualClock, SimEntropy, SimMetadataStore};
+    use std::collections::{BTreeSet, HashMap};
+
+    struct NoWorkerIo;
+    #[async_trait::async_trait]
+    impl WorkerTransport for NoWorkerIo {
+        async fn identity(&self) -> Result<WorkerIdentity> {
+            panic!("authority construction must not contact a worker")
+        }
+        async fn rpc(
+            &self,
+            _: &WorkerIdentity,
+            _: &WorkerIntent,
+            _: &WorkerOperation,
+        ) -> Result<serde_json::Value> {
+            panic!("authority construction must not contact a worker")
+        }
+    }
+
+    fn authority_with_issuer(issuer: &str) -> Result<McpAuthority> {
+        let clock = ManualClock::new();
+        let entropy = Arc::new(SimEntropy::seeded(9));
+        let manager = crate::oauth::OAuthManager::new(
+            SimMetadataStore::new(clock.clone(), entropy.clone()),
+            Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [8; 32], "test",
+            )),
+            clock,
+            entropy,
+            Arc::new(StaticSecretStore::new(HashMap::new())),
+        );
+        let destination = Destination {
+            zone_id: "public".into(),
+            endpoint: "https://resource.example/mcp".into(),
+        };
+        let registration = ClientRegistration {
+            id: "registration-a".into(),
+            client_id: "client-a".into(),
+            confidential: false,
+            redirect_uri: "https://client.example/callback".into(),
+            issuer: issuer.into(),
+            resource: destination.clone(),
+            resource_metadata: destination.clone(),
+            authorization_metadata: destination.clone(),
+            authorization: destination.clone(),
+            token: destination,
+            scopes: BTreeSet::new(),
+            issuer_parameter_required: true,
+            account_field: None,
+        };
+        McpAuthority::new(
+            manager,
+            Arc::new(SystemSecurityEntropy),
+            Registry {
+                enabled: true,
+                deployment_id: "deployment-a".into(),
+                zones: BTreeMap::from([(
+                    "public".into(),
+                    Zone {
+                        policy_digest: "a".repeat(64),
+                        policy_revision: "1".into(),
+                        endpoints: BTreeSet::from(["https://resource.example/mcp".into()]),
+                    },
+                )]),
+                registrations: BTreeMap::from([("registration-a".into(), registration)]),
+            },
+            BTreeMap::from([(
+                "public".into(),
+                Arc::new(NoWorkerIo) as Arc<dyn WorkerTransport>,
+            )]),
+        )
+    }
+
+    #[test]
+    fn constructor_preserves_canonical_issuer_identifiers() {
+        for issuer in [
+            "https://issuer.fixture.example:8443",
+            "https://issuer.fixture.example",
+            "https://issuer.fixture.example:8443/",
+            "https://issuer.fixture.example:8443/tenant",
+        ] {
+            let authority = authority_with_issuer(issuer)
+                .unwrap_or_else(|error| panic!("canonical issuer {issuer} rejected: {error:?}"));
+            assert_eq!(
+                authority.registry.registrations["registration-a"].issuer,
+                issuer
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_denies_invalid_or_noncanonical_issuers() {
+        for issuer in [
+            "not a URL",
+            "http://issuer.fixture.example",
+            "https://user@issuer.fixture.example",
+            "https://user:pass@issuer.fixture.example/",
+            "https://issuer.fixture.example?query",
+            "https://issuer.fixture.example/#fragment",
+            "https://127.0.0.1",
+            "https://[::1]/",
+            "https://%69ssuer.fixture.example",
+            "https://Issuer.fixture.example",
+            "HTTPS://issuer.fixture.example/",
+            "https://issuer.fixture.example:443",
+            "https://issuer.fixture.example:443/",
+            "https://issuer.fixture.example/a/../tenant",
+        ] {
+            assert!(
+                matches!(authority_with_issuer(issuer), Err(McpError::Invalid)),
+                "accepted {issuer}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoints_still_require_exact_canonical_urls() {
+        assert_eq!(
+            McpAuthority::canonical_endpoint("https://issuer.fixture.example:8443"),
+            Err(McpError::Invalid)
+        );
+        assert_eq!(
+            McpAuthority::canonical_endpoint("https://issuer.fixture.example:8443/"),
+            Ok(())
+        );
+    }
+}
