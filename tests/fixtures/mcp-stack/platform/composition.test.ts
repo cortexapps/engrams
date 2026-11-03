@@ -167,7 +167,7 @@ test("cancelled engine control runs no command and drains its control lease", as
   expect(called).toBe(true);
 });
 
-test("effective container audit rejects added authority and environment", async () => {
+function inspectedContainer() {
   const id = "a".repeat(64),
     image = "sha256:" + "b".repeat(64),
     runId = "mcp-123456789012345678901234";
@@ -192,7 +192,7 @@ test("effective container audit rejects added authority and environment", async 
       PidMode: "",
       IpcMode: "private",
       CapDrop: ["ALL"],
-      CapAdd: [],
+      CapAdd: Array<string>(),
       SecurityOpt: ["no-new-privileges"],
       Binds: [],
       VolumesFrom: [],
@@ -226,6 +226,93 @@ test("effective container audit rejects added authority and environment", async 
     }
   }
   const engine = new Inspector({} as Inputs, "/owned/run", runId);
+  const options = [
+    "--network",
+    "none",
+    "--user",
+    "1000:1000",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,size=4m",
+  ];
+  return { engine, state, id, image, options };
+}
+
+test.each(["dns", "denied-dns"])(
+  "%s requires exactly NET_BIND_SERVICE in its effective audit",
+  async (role) => {
+    const { engine, state, id, image, options } = inspectedContainer();
+    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+    await engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    );
+    await expect(engine.audit(id)).resolves.toBeDefined();
+    for (const capabilities of [
+      [],
+      ["NET_ADMIN"],
+      ["NET_BIND_SERVICE", "NET_ADMIN"],
+      ["NET_BIND_SERVICE", "NET_BIND_SERVICE"],
+    ]) {
+      state.HostConfig.CapAdd = capabilities;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    const missing = inspectedContainer();
+    await expect(
+      missing.engine.create(
+        role,
+        missing.image,
+        missing.options,
+        ["infinity"],
+        "/bin/sleep",
+      ),
+    ).rejects.toThrow("container_capabilities");
+    const extra = inspectedContainer();
+    extra.state.HostConfig.CapAdd = ["NET_BIND_SERVICE", "NET_ADMIN"];
+    await expect(
+      extra.engine.create(
+        role,
+        extra.image,
+        [
+          ...extra.options,
+          "--cap-add",
+          "NET_BIND_SERVICE",
+          "--cap-add",
+          "NET_ADMIN",
+        ],
+        ["infinity"],
+        "/bin/sleep",
+      ),
+    ).rejects.toThrow("container_capabilities");
+  },
+);
+
+test.each([
+  "worker",
+  "orchestrator",
+  "coordinator",
+  "probe",
+  "dns-other",
+  "denied-dns-other",
+])("%s cannot request the fixture DNS capability", async (role) => {
+  const { engine, state, image, options } = inspectedContainer();
+  state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+  await expect(
+    engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    ),
+  ).rejects.toThrow("container_capabilities");
+});
+
+test("effective container audit rejects added authority and environment", async () => {
+  const { engine, state, id, image } = inspectedContainer();
   await engine.create(
     "probe",
     image,
@@ -587,6 +674,22 @@ test("FC launch uses the declared configuration, private namespace and original 
       entrypoint: string | undefined;
     }[] = [];
     class LaunchEngine extends Engine {
+      override networkName() {
+        return "owned-network";
+      }
+      override networkOptions() {
+        return ["--network", this.networkName()];
+      }
+      override async project(role: string): Promise<string> {
+        return `${this.runId}-${role}`;
+      }
+      override async call(args: string[]): Promise<Buffer> {
+        if (args[0] === "exec" && args[2] === "/usr/bin/dig")
+          return Buffer.from("10.42.3.40\n");
+        if (args[0] === "exec") return Buffer.from("");
+        throw new Error("unexpected dependency command");
+      }
+      override async remove() {}
       override async create(
         role: string,
         image: string,
@@ -701,6 +804,28 @@ test("FC launch uses the declared configuration, private namespace and original 
       `/mcp_${identity.runId.replaceAll("-", "_")}`,
     );
     expect(coordinatorDsn).toBe(orchestratorDsn);
+    engine.guardIds.set("worker", "f".repeat(64));
+    await stack.startRole(ctx, "worker", "normal");
+    const workerLaunch = launches.find((v) => v.role === "worker")!;
+    expect(workerLaunch.options).not.toContain("--cap-add");
+    await stack.dependencies();
+    for (const role of ["dns", "denied-dns"]) {
+      const dnsLaunch = launches.find((v) => v.role === role)!;
+      expect(dnsLaunch.entrypoint).toBe("/coredns");
+      expect(dnsLaunch.options).toContain("--read-only");
+      expect(dnsLaunch.options[dnsLaunch.options.indexOf("--user") + 1]).toBe(
+        "1000:1000",
+      );
+      expect(
+        dnsLaunch.options.flatMap((v, i) =>
+          v === "--cap-add" ? [dnsLaunch.options[i + 1]] : [],
+        ),
+      ).toEqual(["NET_BIND_SERVICE"]);
+    }
+    for (const launch of launches.filter(
+      (v) => !["dns", "denied-dns"].includes(v.role),
+    ))
+      expect(launch.options).not.toContain("NET_BIND_SERVICE");
   } finally {
     await rm(root, { recursive: true });
   }

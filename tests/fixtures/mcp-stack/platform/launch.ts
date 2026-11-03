@@ -559,6 +559,8 @@ export class Stack {
       this.inputs.images.dns.id,
       [
         ...e.networkOptions("dns"),
+        "--cap-add",
+        "NET_BIND_SERVICE",
         "--user",
         "1000:1000",
         "--read-only",
@@ -593,6 +595,8 @@ export class Stack {
       [
         "--network",
         `container:${sink}`,
+        "--cap-add",
+        "NET_BIND_SERVICE",
         "--user",
         "1000:1000",
         "--read-only",

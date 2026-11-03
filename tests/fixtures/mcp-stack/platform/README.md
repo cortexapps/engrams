@@ -104,6 +104,13 @@ prove migration compatibility.
 Blob uses `/bin/fake-gcs-server` on HTTP 4443 with UID 1000 and `/data` storage.
 Registry uses its inspected entrypoint, UID 1000, and `/var/lib/registry`.
 CoreDNS uses `/coredns`, UID 1000, and the generated no-forward Corefile.
+Only the fixed `dns` and `denied-dns` fixture roles add NET_BIND_SERVICE after
+all default capabilities are dropped. The pinned executable has a file
+capability that requires this capability in its bounding set, even when port
+53 is unprivileged. Each effective audit requires exactly this one added
+capability for these two roles and rejects it for every other role. Both DNS
+roles retain read-only roots, no-new-privileges, default seccomp, and private
+config projections. Worker and application capabilities do not change.
 The TLS edge uses `/usr/sbin/nginx`, generated config, and writable `/tmp`.
 Select upstream image bytes that meet these explicit user, path, environment,
 and volume contracts. Automatic image volumes and unexpected image environment

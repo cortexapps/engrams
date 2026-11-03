@@ -694,10 +694,14 @@ export class Engine {
           : !h.CgroupnsMode || h.CgroupnsMode === "private"),
       "container_namespace",
     );
+    const addedCapabilities = values("--cap-add").sort();
     check(
-      JSON.stringify([...(h.CapDrop ?? [])].sort()) === '["ALL"]' &&
+      (spec.role === "dns" || spec.role === "denied-dns"
+        ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
+        : !addedCapabilities.includes("NET_BIND_SERVICE")) &&
+        JSON.stringify([...(h.CapDrop ?? [])].sort()) === '["ALL"]' &&
         JSON.stringify([...(h.CapAdd ?? [])].sort()) ===
-          JSON.stringify(values("--cap-add").sort()) &&
+          JSON.stringify(addedCapabilities) &&
         JSON.stringify(h.SecurityOpt ?? []) === '["no-new-privileges"]',
       "container_capabilities",
     );
