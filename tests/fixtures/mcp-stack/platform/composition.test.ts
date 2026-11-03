@@ -368,11 +368,61 @@ test("pinned image defaults allow both Bun entries together but preserve image i
   await expect(engine.audit(id)).rejects.toThrow("container_image");
 });
 
+test("resolver-stage compares equivalent capability names exactly", async () => {
+  const { engine, state, id, image, options } = inspectedContainer();
+  const requested = ["CHOWN", "DAC_OVERRIDE", "FOWNER"];
+  state.HostConfig.CapAdd = requested.map((capability) => "CAP_" + capability);
+  await engine.create(
+    "resolver-stage",
+    image,
+    [
+      ...options,
+      ...requested.flatMap((capability) => ["--cap-add", capability]),
+    ],
+    ["infinity"],
+    "/bin/sleep",
+  );
+  state.HostConfig.CapAdd = requested;
+  await expect(engine.audit(id)).resolves.toBeDefined();
+  for (const capabilities of [
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE"],
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_NET_ADMIN"],
+    [...requested, "CAP_NET_ADMIN"],
+    [...requested, "CAP_FOWNER"],
+    ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FOWNER"],
+    ["CAP_CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"],
+  ]) {
+    state.HostConfig.CapAdd = capabilities;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.CapAdd = requested.map((capability) => "CAP_" + capability);
+  for (const dropped of [
+    [],
+    ["CAP_ALL"],
+    ["ALL", "NET_ADMIN"],
+    ["ALL", "ALL"],
+  ]) {
+    state.HostConfig.CapDrop = dropped;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.CapDrop = ["ALL"];
+  for (const security of [
+    [],
+    ["no-new-privileges:true"],
+    ["no-new-privileges", "seccomp=unconfined"],
+  ]) {
+    state.HostConfig.SecurityOpt = security;
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+  }
+  state.HostConfig.SecurityOpt = ["no-new-privileges"];
+  await expect(engine.audit(id)).resolves.toBeDefined();
+});
+
 test.each(["dns", "denied-dns"])(
   "%s requires exactly NET_BIND_SERVICE in its effective audit",
   async (role) => {
     const { engine, state, id, image, options } = inspectedContainer();
-    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+    state.HostConfig.CapAdd = ["CAP_NET_BIND_SERVICE"];
     await engine.create(
       role,
       image,
@@ -380,12 +430,16 @@ test.each(["dns", "denied-dns"])(
       ["infinity"],
       "/bin/sleep",
     );
+    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
     await expect(engine.audit(id)).resolves.toBeDefined();
     for (const capabilities of [
       [],
       ["NET_ADMIN"],
       ["NET_BIND_SERVICE", "NET_ADMIN"],
       ["NET_BIND_SERVICE", "NET_BIND_SERVICE"],
+      ["CAP_NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE"],
+      ["NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE"],
+      ["CAP_CAP_NET_BIND_SERVICE"],
     ]) {
       state.HostConfig.CapAdd = capabilities;
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");

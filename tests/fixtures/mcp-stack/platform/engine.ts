@@ -701,8 +701,11 @@ export class Engine {
         ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
         : !addedCapabilities.includes("NET_BIND_SERVICE")) &&
         JSON.stringify([...(h.CapDrop ?? [])].sort()) === '["ALL"]' &&
-        JSON.stringify([...(h.CapAdd ?? [])].sort()) ===
-          JSON.stringify(addedCapabilities) &&
+        JSON.stringify(
+          (h.CapAdd ?? [])
+            .map((capability: string) => capability.replace(/^CAP_/, ""))
+            .sort(),
+        ) === JSON.stringify(addedCapabilities) &&
         JSON.stringify(h.SecurityOpt ?? []) === '["no-new-privileges"]',
       "container_capabilities",
     );
