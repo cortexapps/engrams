@@ -191,6 +191,7 @@ struct CaptureProgress {
     manifest: ManifestRef,
     /// Present only after retirement, durable file sync and exact hash read.
     artifact: Option<(String, u64)>,
+    /// Published only after exact backend and proxy cleanup succeed.
     authority: Option<ManagedCaptureAuthority>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -457,57 +458,35 @@ impl ManagedBootHost {
         let Some(allocation) = &entry.record.allocation else {
             return Ok(());
         };
-        // Recovered records do not own this process's address reservations.
-        if allocation.host_incarnation != self.incarnation
-            || entry.record.incarnation != self.incarnation
+        // Recovery must still prove old proxy cleanup before capture. It must
+        // never release a current reservation with the same generation number.
+        let current_incarnation = allocation.host_incarnation == self.incarnation
+            && entry.record.incarnation == self.incarnation;
+        if current_incarnation
+            && !self
+                .networks
+                .lock()
+                .expect("network slots")
+                .contains(allocation.attachment_generation)
         {
             return Ok(());
         }
-        if !self
-            .networks
-            .lock()
-            .expect("network slots")
-            .contains(allocation.attachment_generation)
-        {
-            return Ok(());
-        }
-        let handle = self.egress.handle();
+        // Each operation owns its control stream and compares the allocation
+        // under the daemon's lifecycle locks. A late request cannot remove a
+        // replacement, and its late ACK cannot complete a different request.
         tokio::time::timeout(
             std::time::Duration::from_secs(2 * engram_egress_proto::private::HANDOFF_SECONDS),
-            async {
-                if handle.hello().await.map_err(invalid)?.incarnation
-                    != allocation.proxy_incarnation
-                {
-                    return Err(invalid("proxy changed during cleanup"));
-                }
-                if let Some(current) = handle
-                    .read_managed(allocation.session_id)
-                    .await
-                    .map_err(invalid)?
-                {
-                    if current.incarnation != allocation.proxy_incarnation
-                        || current.session_id != allocation.session_id
-                        || current.sandbox_id != allocation.sandbox_id
-                        || current.guest_ip != allocation.guest_ip
-                    {
-                        return Err(invalid("proxy registration changed during cleanup"));
-                    }
-                }
-                // The ACK requires ingress EOF, all flow joins, and registration removal.
-                // A poisoned or lost reply retains the slot until cleanup can be proved.
-                handle
-                    .remove_session(allocation.session_id)
-                    .await
-                    .map_err(invalid)?;
-                Ok::<_, SandboxError>(())
-            },
+            self.egress.handle().retire_private_network(allocation),
         )
         .await
-        .map_err(|_| invalid("proxy cleanup timed out"))??;
-        self.networks
-            .lock()
-            .expect("network slots")
-            .release(allocation.attachment_generation);
+        .map_err(|_| invalid("proxy cleanup timed out"))?
+        .map_err(invalid)?;
+        if current_incarnation {
+            self.networks
+                .lock()
+                .expect("network slots")
+                .release(allocation.attachment_generation);
+        }
         Ok(())
     }
     async fn fail(&self, entry: &mut Entry) {
@@ -1384,13 +1363,15 @@ impl ManagedBootHost {
             };
             authority.record_digest = authority.digest().map_err(invalid)?;
             authority.validate().map_err(invalid)?;
+            // Replacement authority is durable only after exact owner and
+            // proxy cleanup succeed. A failed attempt leaves an artifact to retry.
+            self.close_resources(&mut entry).await?;
             progress.authority = Some(authority.clone());
             entry.record.capture = Some(progress);
             entry.record.state = ManagedBootHostState::Captured {
                 authority: authority.clone(),
             };
             self.persist(&entry.record)?;
-            self.close_resources(&mut entry).await?;
             Ok(authority)
         }
         .await;
@@ -2138,17 +2119,18 @@ mod tests {
         generation
     }
 
-    #[tokio::test]
-    async fn address_release_waits_for_successful_proxy_retirement() {
+    fn cleanup_proxy(
+        path: &Path,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<engram_egress_proto::FromProxyd>>,
+        tokio::sync::mpsc::Receiver<Allocation>,
+    ) {
         use engram_egress_proto::{FromProxyd, ToProxyd};
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
-        let (host, request) = fixture(temp.path());
-        let entry = install_exec_owner(&host, &request);
-        let generation = reserve_test_network(&host, &mut *entry.lock().await);
-        let listener = tokio::net::UnixListener::bind(temp.path().join("absent.sock")).unwrap();
-        let (pending, mut removals) =
+        let listener = tokio::net::UnixListener::bind(path.join("absent.sock")).unwrap();
+        let (pending, removals) =
             tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<FromProxyd>>(1);
-        let (registered, mut registrations) = tokio::sync::mpsc::channel(1);
+        let (registered, registrations) = tokio::sync::mpsc::channel(1);
         let server = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -2194,20 +2176,59 @@ mod tests {
                                 return;
                             }
                             ToProxyd::ReadManaged(_) => FromProxyd::ManagedState(None),
-                            ToProxyd::RemoveSession(_) => {
+                            ToProxyd::RetirePrivateNetwork(_) => {
                                 let (reply, wait) = tokio::sync::oneshot::channel();
                                 pending.send(reply).await.unwrap();
                                 wait.await.unwrap()
                             }
                             _ => panic!("unexpected cleanup request"),
                         };
-                        engram_egress_proto::write_frame(&mut stream, &reply)
+                        if engram_egress_proto::write_frame(&mut stream, &reply)
                             .await
-                            .unwrap();
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 });
             }
         });
+        (server, removals, registrations)
+    }
+
+    #[tokio::test]
+    async fn address_release_waits_for_successful_proxy_retirement() {
+        use engram_egress_proto::FromProxyd;
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let generation = reserve_test_network(&host, &mut *entry.lock().await);
+        let (server, mut removals, mut registrations) = cleanup_proxy(temp.path());
+        // Once a written removal times out, its late ACK must never complete
+        // the next removal, whose drain is still held by the daemon.
+        let h = host.clone();
+        let e = entry.clone();
+        let first = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+        let late = removals.recv().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        assert!(first.await.unwrap().is_err());
+        tokio::time::resume();
+        assert!(host.networks.lock().unwrap().contains(generation));
+        late.send(FromProxyd::Ok).unwrap();
+        let h = host.clone();
+        let e = entry.clone();
+        let mut second = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+        let held = removals.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut second)
+                .await
+                .is_err(),
+            "a late ACK must not complete the next removal"
+        );
+        assert!(host.networks.lock().unwrap().contains(generation));
+        held.send(FromProxyd::Err("still draining".into())).unwrap();
+        assert!(second.await.unwrap().is_err());
         for succeed in [false, true] {
             let h = host.clone();
             let e = entry.clone();
@@ -2282,6 +2303,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_retry_waits_for_cleanup_after_a_timed_out_removal() {
+        use engram_egress_proto::FromProxyd;
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let capture = ManagedCaptureRequest {
+            key: request.key.clone(),
+            capture_id: engram_core::SnapshotId::new(),
+        };
+        let path = host.directory.join(format!("{}.disk", capture.capture_id));
+        durable_write(&path, b"disk cut").unwrap();
+        let artifact = hash_file(&path).await.unwrap();
+        let generation = {
+            let mut entry = entry.lock().await;
+            entry.record.capture = Some(CaptureProgress {
+                request: capture.clone(),
+                manifest: capture.disk_manifest(),
+                artifact: Some(artifact),
+                authority: None,
+            });
+            reserve_test_network(&host, &mut entry)
+        };
+        let (server, mut removals, _) = cleanup_proxy(temp.path());
+        let h = host.clone();
+        let c = capture.clone();
+        let first = tokio::spawn(async move { h.capture(c).await });
+        let late = removals.recv().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        tokio::time::resume();
+        let _ = late.send(FromProxyd::Ok);
+        // The failure path retries cleanup, but that also cannot prove drain.
+        let failure_cleanup = removals.recv().await.unwrap();
+        failure_cleanup
+            .send(FromProxyd::Err("still draining".into()))
+            .unwrap();
+        assert!(first.await.unwrap().is_err());
+        assert!(host.networks.lock().unwrap().contains(generation));
+        let stored = host.read_record(request.cold.sandbox_id).unwrap().unwrap();
+        assert!(
+            stored.capture.unwrap().authority.is_none(),
+            "replacement authority must not precede cleanup"
+        );
+        assert!(!matches!(
+            host.read(request.key.clone()).await.unwrap(),
+            ManagedBootHostState::Captured { .. }
+        ));
+        let h = host.clone();
+        let c = capture.clone();
+        let mut retry = tokio::spawn(async move { h.capture(c).await });
+        let current = removals.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut retry)
+                .await
+                .is_err()
+        );
+        assert!(host.networks.lock().unwrap().contains(generation));
+        current.send(FromProxyd::Ok).unwrap();
+        let authority = retry.await.unwrap().unwrap();
+        assert_eq!(authority.request, capture);
+        assert!(!host.networks.lock().unwrap().contains(generation));
+        assert_eq!(host.capture(capture).await.unwrap(), authority);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn uncertain_destroy_never_releases_an_address_on_retry() {
         let temp = tempfile::tempdir().unwrap();
         let (host, request) = fixture(temp.path());
@@ -2309,7 +2397,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovered_record_cannot_release_current_incarnation_slot() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let (host, request) = fixture(temp.path());
         let entry = install_exec_owner(&host, &request);
         let mut entry = entry.lock().await;
@@ -2317,8 +2405,26 @@ mod tests {
         entry.owner = None;
         entry.record.incarnation = "old-host".into();
         entry.record.allocation.as_mut().unwrap().host_incarnation = "old-host".into();
-        host.close_resources(&mut entry).await.unwrap();
+        assert!(
+            host.close_resources(&mut entry).await.is_err(),
+            "recovery cannot assume missing cleanup proof"
+        );
         assert!(host.networks.lock().unwrap().contains(generation));
+        let (server, mut removals, _) = cleanup_proxy(temp.path());
+        let cleanup = host.close_resources(&mut entry);
+        let ack = async {
+            removals
+                .recv()
+                .await
+                .unwrap()
+                .send(engram_egress_proto::FromProxyd::Ok)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(cleanup, ack);
+        result.unwrap();
+        assert!(host.networks.lock().unwrap().contains(generation));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

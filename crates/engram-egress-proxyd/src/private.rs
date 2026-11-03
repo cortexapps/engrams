@@ -67,6 +67,46 @@ impl Ingress {
         result.await.map_err(|_| "closed policy handoff stopped")?
     }
 
+    pub(crate) async fn retire(
+        &self,
+        allocation: &Allocation,
+        registry: &Registry,
+        host: HostId,
+        incarnation: &str,
+    ) -> Result<(), String> {
+        allocation
+            .validate()
+            .map_err(|_| "invalid private allocation")?;
+        if allocation.host_id != host || allocation.proxy_incarnation != incarnation {
+            return Err("private allocation owner changed".into());
+        }
+        let slot = self
+            .slots
+            .lock()
+            .await
+            .entry(allocation.session_id)
+            .or_insert_with(|| Arc::new(Mutex::new(SlotState::default())))
+            .clone();
+        // Registration takes this same lock before it enrolls a new allocation.
+        // Keep it until the registry's session lock has drained and removed the
+        // expected sandbox. Completion never deletes replay history.
+        let slot = slot.lock().await;
+        if slot
+            .live
+            .as_ref()
+            .is_some_and(|live| live.allocation != *allocation)
+        {
+            return Err("private allocation changed during retirement".into());
+        }
+        registry
+            .retire_managed(
+                allocation.session_id,
+                allocation.sandbox_id,
+                allocation.guest_ip,
+            )
+            .await
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
@@ -511,6 +551,50 @@ mod tests {
                 ),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn retirement_checks_exact_attachment_and_waits_for_cleanup_eof() {
+        let f = Fixture::new().await;
+        let mut allocation = f.allocation.clone();
+        allocation.attachment_generation = 2;
+        let (mut client, serving) = f.start(allocation.clone());
+        assert_eq!(reply(&mut client).await.state, "closed");
+        assert!(f
+            .ingress
+            .retire(&f.allocation, &f.registry, allocation.host_id, "proxy-1")
+            .await
+            .is_err());
+        assert!(f.registry.lookup_session(allocation.session_id).is_some());
+        let ingress = f.ingress.clone();
+        let registry = f.registry.clone();
+        let expected = allocation.clone();
+        let mut retirement = tokio::spawn(async move {
+            ingress
+                .retire(&expected, &registry, expected.host_id, "proxy-1")
+                .await
+        });
+        // The real private handler closes its output only after its flow joins.
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut retirement)
+                .await
+                .is_err()
+        );
+        assert!(f.registry.lookup_session(allocation.session_id).is_none());
+        drop(client);
+        serving.await.unwrap().unwrap();
+        retirement.await.unwrap().unwrap();
+        assert!(!f.registry.session_ids().contains(&allocation.session_id));
+        // Exact retirement is idempotent, but never deletes replay history.
+        f.ingress
+            .retire(&allocation, &f.registry, allocation.host_id, "proxy-1")
+            .await
+            .unwrap();
+        let (mut replay, rejected) = f.start(allocation);
+        assert!(wire::read::<_, Reply>(&mut replay).await.is_err());
+        assert!(rejected.await.unwrap().is_err());
     }
 
     #[tokio::test]

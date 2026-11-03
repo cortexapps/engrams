@@ -130,6 +130,7 @@ impl ProxydHandle {
             ToProxyd::ListManaged
                 | ToProxyd::ReadManaged(_)
                 | ToProxyd::QuarantineManaged(_)
+                | ToProxyd::RetirePrivateNetwork(_)
                 | ToProxyd::Hello { .. }
         ) || matches!(msg, ToProxyd::ApplyPolicy(policy) if policy.managed_deny.is_some());
         if managed {
@@ -188,6 +189,19 @@ impl ProxydHandle {
         engram_egress_proto::private::register(stream, allocation)
             .await
             .map_err(|e| ProxydError(format!("private network register: {e}")))
+    }
+
+    /// The response is for this exact allocation on a disposable stream.
+    /// Cancellation drops that stream; the daemon can finish only this retirement.
+    pub async fn retire_private_network(
+        &self,
+        allocation: &engram_egress_proto::private::Allocation,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::RetirePrivateNetwork(Box::new(allocation.clone())),
+            "retire private network",
+        )
+        .await
     }
 
     pub async fn handoff_closed_private(

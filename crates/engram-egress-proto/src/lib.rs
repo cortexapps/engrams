@@ -45,7 +45,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump on any wire-incompatible change. A mismatch in `Hello`
 /// position is never adopted — the caller kills and respawns.
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 /// Frame size cap. `SyncPolicies` carries every live session's policy
 /// (resolved secrets included), so the cap is generous; both ends are
@@ -89,6 +89,8 @@ pub enum ToProxyd {
     /// Upgrade this host-only connection. A bounded private Allocation follows.
     PrivateNetwork,
     HandoffClosedPrivate(Box<private::ClosedPolicyHandoff>),
+    /// Drain and remove only the expected private allocation and registration.
+    RetirePrivateNetwork(Box<private::Allocation>),
     ListManaged,
     ReadManaged(engram_core::SessionId),
     QuarantineManaged(engram_core::SessionId),
@@ -313,6 +315,40 @@ pub fn recv_fd(sock: &std::os::unix::net::UnixStream) -> std::io::Result<std::os
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exact_retirement_frame_round_trip_and_torn_frames_fail_closed() {
+        let allocation = private::Allocation {
+            version: private::VERSION,
+            host_id: engram_core::HostId::new(),
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: "proxy-1".into(),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: "a".repeat(64),
+        };
+        allocation.validate().unwrap();
+        let message = ToProxyd::RetirePrivateNetwork(Box::new(allocation));
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &message).await.unwrap();
+        assert_eq!(
+            read_frame::<_, ToProxyd>(&mut bytes.as_slice())
+                .await
+                .unwrap(),
+            message
+        );
+        for end in 0..bytes.len() {
+            assert!(read_frame::<_, ToProxyd>(&mut &bytes[..end]).await.is_err());
+        }
+        let mut malformed = serde_json::to_value(&message).unwrap();
+        malformed["RetirePrivateNetwork"]["attachment_generation"] = serde_json::json!("bad");
+        assert!(serde_json::from_value::<ToProxyd>(malformed).is_err());
+    }
 
     #[tokio::test]
     async fn frames_round_trip_async() {
