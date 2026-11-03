@@ -5702,7 +5702,7 @@ mod adapter {
             // starts clean instead of `--resume`-ing a conversation this fake
             // cannot replay. (State-dir isolation is `test_cli`'s job.)
             body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
-            body.push_str("while IFS= read -r _line; do\n");
+            body.push_str("while IFS= read -r _line; do\n  :\n");
             for l in per_turn {
                 body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
             }
