@@ -1,0 +1,100 @@
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = ROOT / '.github/scripts/mcp-acceptance-native.sh'
+DEADLINE = 'evidence::tests::expired_deadline_cannot_consume_a_release'
+
+
+class NativeSourceGate(unittest.TestCase):
+    def test_binary_protocol_and_deadline_guards(self):
+        # Command stubs only: no Rust test, fixture, or harness process runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'bin'
+            commands.mkdir()
+            target = root / 'target'
+            (target / 'debug').mkdir(parents=True)
+            fixture = target / 'debug/engram-mcp-model-fixture'
+            fixture.write_text('#!/bin/sh\nprintf "engram-mcp-model-fixture 1\\n"\n')
+            fixture.chmod(0o700)
+            cargo = commands / 'cargo'
+            cargo.write_text(f'#!{sys.executable}\n'
+                             'import json, os, sys\n'
+                             'from pathlib import Path\n'
+                             'with Path(os.environ["FAKE_CARGO_ARGS"]).open("a") as log:\n'
+                             '    log.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                             'if "--test" in sys.argv:\n'
+                             '    print(os.environ["FAKE_CARGO_SUMMARY"])\n'
+                             '    sys.exit(int(os.environ.get("FAKE_CARGO_EXIT", "0")))\n'
+                             'if "test" in sys.argv:\n'
+                             '    print("test result: ok. 1 passed; 0 failed; 0 ignored")\n')
+            cargo.chmod(0o700)
+            args_file = root / 'args.jsonl'
+            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin',
+                       CARGO_TARGET_DIR=str(target), FAKE_CARGO_ARGS=str(args_file))
+            good = ('Running unittests src/main.rs (target/debug/deps/fixture)\n'
+                    f'test {DEADLINE} ... ok\n'
+                    'test result: ok. 4 passed; 0 failed; 0 ignored\n'
+                    'Running tests/protocol.rs (target/debug/deps/protocol)\n'
+                    'test result: ok. 38 passed; 0 failed; 0 ignored\n')
+            for name, summary, exit_code, expected in [
+                ('positive', good, 0, True),
+                ('zero-protocol', good.replace('38 passed', '0 passed'), 0, False),
+                ('missing-deadline', good.replace(f'test {DEADLINE} ... ok\n', ''), 0, False),
+                ('failed-protocol', good.replace('38 passed; 0 failed', '37 passed; 1 failed'), 0, False),
+                ('failed-command', good, 42, False),
+            ]:
+                with self.subTest(name=name):
+                    args_file.unlink(missing_ok=True)
+                    env.update(FAKE_CARGO_SUMMARY=summary, FAKE_CARGO_EXIT=str(exit_code))
+                    result = subprocess.run(['bash', str(SCRIPT)], cwd=root, env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+                    args = [json.loads(line) for line in args_file.read_text().splitlines()]
+                    self.assertEqual(args[0], [
+                        'test', '--locked', '--manifest-path',
+                        'tests/fixtures/mcp-model-cli/Cargo.toml', '--bins', '--test', 'protocol',
+                    ])
+                    self.assertEqual(len(args), 4 if expected else 1)
+
+    def test_bun_source_gate_rejects_zero_and_failed_runs(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        step = workflow.split('      - name: MCP acceptance scripts unit tests', 1)[1]
+        body = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'orchestrator').mkdir()
+            commands = root / 'bin'
+            commands.mkdir()
+            bun = commands / 'bun'
+            bun.write_text(f'#!{sys.executable}\n'
+                           'import os, sys\n'
+                           'assert sys.argv[1:] == ["test", "scripts/mcp-stack"]\n'
+                           'print(os.environ["FAKE_BUN_SUMMARY"])\n'
+                           'sys.exit(int(os.environ["FAKE_BUN_EXIT"]))\n')
+            bun.chmod(0o700)
+            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root))
+            for summary, exit_code, expected in [
+                (' 64 pass\n 0 fail\nRan 64 tests across 6 files. [80ms]', 0, True),
+                (' 0 pass\n 0 fail\nRan 0 tests across 6 files. [80ms]', 0, False),
+                (' 63 pass\n 1 fail\nRan 64 tests across 6 files. [80ms]', 0, False),
+                ('No tests found', 0, False),
+                (' 64 pass\n 0 fail\nRan 64 tests across 6 files. [80ms]', 42, False),
+            ]:
+                with self.subTest(summary=summary, exit_code=exit_code):
+                    env.update(FAKE_BUN_SUMMARY=summary, FAKE_BUN_EXIT=str(exit_code))
+                    result = subprocess.run(['bash', '-c', body], cwd=root / 'orchestrator',
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+                    self.assertTrue((root / 'var/mcp-stack-runner').is_dir())
+
+
+if __name__ == '__main__':
+    unittest.main()

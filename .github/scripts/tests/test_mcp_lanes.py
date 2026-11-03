@@ -90,6 +90,43 @@ class McpLanes(unittest.TestCase):
                 self.assertEqual(result['test_rust'], 'true')
                 self.assertEqual(result['test_netstack'], 'true')
 
+    def test_stack_fixture_selects_worker_and_orchestrator_gates(self):
+        for path in ['tests/fixtures/mcp-stack/main.mts',
+                     'tests/fixtures/mcp-stack/durable.test.mts',
+                     'tests/fixtures/mcp-stack/process.test.mts',
+                     'tests/fixtures/mcp-stack/tsconfig.json']:
+            with self.subTest(path=path):
+                result = detect(path)
+                self.assertEqual(result['test_mcp_worker'], 'true')
+                self.assertEqual(result['test_orchestrator'], 'true')
+
+    def test_source_gate_paths_select_required_jobs(self):
+        for path in ['orchestrator/scripts/mcp-stack/run.ts',
+                     'orchestrator/scripts/mcp-stack/tsconfig.json',
+                     '.github/scripts/mcp-acceptance-native.sh',
+                     '.github/scripts/tests/test_mcp_source_gates.py',
+                     '.github/workflows/ci.yml']:
+            with self.subTest(path=path):
+                self.assertEqual(detect(path)['test_orchestrator'], 'true')
+        workflow = (SCRIPT.parents[1] / 'workflows/ci.yml').read_text()
+        worker = workflow.split('  mcp-worker:', 1)[1].split('  netstack:', 1)[0]
+        self.assertIn("if: needs.detect.outputs.test_mcp_worker == 'true'", worker)
+        self.assertIn('node-version: 24.22.2', worker)
+        self.assertIn('mkdir -p var/mcp-stack-fixture', worker)
+        self.assertIn('node --test --test-concurrency=1 --test-timeout=30000', worker)
+        self.assertIn('tests/fixtures/mcp-stack/durable.test.mts', worker)
+        self.assertIn('tests/fixtures/mcp-stack/process.test.mts', worker)
+        self.assertNotIn('mcp-worker/test/fixture.test.ts', worker)
+        orch = workflow.split('  orchestrator:', 1)[1].split('  buf:', 1)[0]
+        self.assertIn("if: needs.detect.outputs.test_orchestrator == 'true'", orch)
+        self.assertIn('run: bun run typecheck', orch)
+        self.assertIn('run: bun run tsc -p scripts/mcp-stack/tsconfig.json --noEmit', orch)
+        self.assertIn('bun test scripts/mcp-stack', orch)
+        self.assertIn('0 fail', orch)
+        gate = workflow.split('  ci-gate:', 1)[1]
+        for lane in ['orchestrator', 'mcp-worker', 'test-linux', 'test-macos']:
+            self.assertIn(f'      - {lane}\n', gate)
+
     def test_unrelated_path_does_not_run_new_lanes(self):
         result = detect('README.md')
         self.assertEqual(result['test_mcp_worker'], 'false')

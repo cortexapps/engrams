@@ -890,6 +890,13 @@ jobs:
       - run: npm run format:check
       - run: npm run typecheck
       - run: npm test
+      - name: Standalone MCP stack fixture tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p var/mcp-stack-fixture
+          node --test --test-concurrency=1 --test-timeout=30000 \
+            tests/fixtures/mcp-stack/durable.test.mts \
+            tests/fixtures/mcp-stack/process.test.mts
       - run: npm run build
 
   netstack:
@@ -909,7 +916,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.2'
+          go-version: "1.26.2"
           cache: false
       - name: Test, vet, verify modules, and race
         run: |
@@ -1031,6 +1038,18 @@ jobs:
           NODE_ENV=test bun scripts/dbos-workflow-hashes.ts
       - name: bun typecheck
         run: bun run typecheck
+      - name: MCP acceptance scripts typecheck
+        run: bun run tsc -p scripts/mcp-stack/tsconfig.json --noEmit
+      - name: MCP acceptance scripts unit tests
+        run: |
+          set -euo pipefail
+          mkdir -p ../var/mcp-stack-runner
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          bun test scripts/mcp-stack 2>&1 | tee "$result"
+          grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
+          grep -Eq '^[[:space:]]*0 fail$' "$result"
+          grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files\.' "$result"
       - name: apply orchestrator migrations
         run: bun run migrate
       - name: bun test
@@ -1543,7 +1562,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
           target: x86_64-unknown-linux-musl
 
       - name: Install protoc
@@ -1821,7 +1840,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
           target: x86_64-unknown-linux-musl
 
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
@@ -1995,7 +2014,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rustflags: ''
+          rustflags: ""
 
       # nextest is what every other test step in this workflow uses.
       - uses: taiki-e/install-action@nextest
@@ -2323,7 +2342,7 @@ jobs:
     name: engram-sandbox-vz unit tests
     needs: [detect, netstack]
     if: needs.detect.outputs.test_rust == 'true'
-    runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
+    runs-on: blacksmith-6vcpu-macos-15 # arm64, has Xcode CLT pre-installed
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8

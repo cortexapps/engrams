@@ -284,10 +284,11 @@ SITE_PATHS = ["site/", "crates/engram-protocol/proto/engram/app/"]
 # version it ships on. They were absent here, so a change to either skipped
 # this lane entirely — which is half of how prod came to run a Bun the tests
 # never saw (the other half was the Dockerfile floating on `oven/bun:1`).
+MCP_STACK_FIXTURE_PATHS = ["tests/fixtures/mcp-stack/"]
 ORCH_PATHS = ["orchestrator/", "mcp-worker/",
               "docker/orchestrator.Dockerfile",
               ".bun-version",
-              "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
+              "crates/engram-egress-proxy/policy/google-credential-denylist.json"] + MCP_STACK_FIXTURE_PATHS
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
@@ -566,7 +567,7 @@ def main():
         or any_path(changed, HARNESS_PATHS)
         or any_path(changed, ["mcp-worker/", "sandbox-netstack/"])
     )
-    test_mcp_worker = ci_self or proto or any_path(changed, ["mcp-worker/", "docker/mcp-worker.Dockerfile"])
+    test_mcp_worker = ci_self or proto or any_path(changed, ["mcp-worker/", "docker/mcp-worker.Dockerfile"] + MCP_STACK_FIXTURE_PATHS)
     test_netstack = test_rust
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries or fixture_changed or harness_changed
