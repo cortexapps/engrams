@@ -297,16 +297,37 @@ them when the last sharer goes.
 
 ### The macOS backend
 
-The VZ backend already follows this design: `engram-sandbox-vz/disk.rs`
-clones the bake image per sandbox with APFS `clonefile` and the
-hypervisor opens the file. This ADR gives the host-core seam a name for
-what both backends do: a `SessionDisk` provider that stages a manifest
-into a device, snapshots it, and lists the dirty 16 MiB chunks since a
-previous snapshot. The Linux implementation is the thin pool. The macOS
-implementation keeps its clone and computes the dirty set by comparing
-the clone to the staged base, which is a development-only cost.
-Production drives the design; the trait exists so that VZ exercises the
-same capture code, not so that it can diverge.
+The VZ backend already follows this design one step short of the end.
+`engram-sandbox-vz/disk.rs` clones the bake image per sandbox with APFS
+`clonefile`, the hypervisor opens the file, and a snapshot is a clone
+of the file followed by `chunk_file` of the whole file into the chunk
+store. Restore still clones a host-local snapshot file instead of
+staging a manifest; the code marks that as a retirement that never
+landed. This ADR lands it.
+
+The host-core seam gets a `SessionDisk` provider with two
+implementations and one shared body of capture, checkpoint-record,
+publish and resume code above it:
+
+| Operation | Linux (thin pool) | macOS (APFS file) |
+|---|---|---|
+| Stage an image version | write chunks into a thin volume | write chunks into a file, one per version |
+| Create a session | thin snapshot | `clonefile` of the image file |
+| Resume from a manifest | snapshot of base, write dirty chunks | `clonefile` of base, write dirty chunks |
+| Checkpoint | pause, sync, thin snapshot, resume | pause, sync, `clonefile`, resume |
+| Dirty set for upload | `thin_delta` | hash every 16 MiB window of the clone; the store dedups by hash |
+| Delete | `dmsetup message delete` | unlink |
+
+The "write chunks to a path" step is one function; the path is a
+device on Linux and a file on macOS. The macOS dirty set is a full
+hash of the clone on every checkpoint. That is slower by tens of
+seconds for a development-sized image and uploads only new chunks,
+because the chunk store dedups by hash. It is `chunk_file`, which
+exists and is what VZ calls today, so macOS needs no extent or delta
+code. Production drives the design; the file implementation exists so
+that VZ runs the same shared code, not so that it can diverge. The
+`rootfs_source` restore input and the host-local snapshot-file
+dependency are retired with it.
 
 ### Development and CI
 
