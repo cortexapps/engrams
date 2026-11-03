@@ -39,6 +39,7 @@ import {
   binaryArchitecture,
   engineArguments,
   validateEngineConfig,
+  validateExecutables,
   cli,
   IMAGES,
   parseInputs,
@@ -939,4 +940,207 @@ test("engine inspection uses only explicit Unix endpoint and private empty CLI c
   await expect(validateEngineConfig(config, initial)).rejects.toThrow(
     "real_path",
   );
+});
+
+test("supervisor rejects array role and configuration values before lifecycle access", async () => {
+  const observed: { code: number; reads: number; mutations: number }[] = [];
+  for (const fields of [
+    { operation: "restart", role: ["worker"], configurationId: "normal" },
+    { operation: "restart", role: "worker", configurationId: ["normal"] },
+    { operation: "stop", role: ["worker"] },
+  ]) {
+    const ctx = await context();
+    let reads = 0,
+      mutations = 0;
+    const server = await startSupervisor(ctx, {
+      status: async () => {
+        reads++;
+        return status(ctx);
+      },
+      restart: async () => {
+        mutations++;
+      },
+      stop: async () => {
+        mutations++;
+      },
+    });
+    try {
+      const result = await control(ctx, {
+        version: 1,
+        runId: ctx.runId,
+        ...fields,
+      });
+      observed.push({ code: result.code, reads, mutations });
+    } finally {
+      await server.close();
+    }
+  }
+  expect(observed).toEqual(
+    Array.from({ length: 3 }, () => ({ code: 400, reads: 0, mutations: 0 })),
+  );
+});
+
+test("supervisor rejects declared non-O disable requests before lifecycle access", async () => {
+  const observed: { code: number; reads: number; mutations: number }[] = [];
+  for (const role of ["coordinator", "worker", "host-agent"] as const) {
+    for (const configurationId of [
+      "global-disabled",
+      "zone-disabled",
+    ] as const) {
+      const ctx = await context();
+      ctx.supervisor.configurations[role][configurationId] =
+        ctx.supervisor.configurations[role].normal;
+      let reads = 0,
+        mutations = 0;
+      const current = status(ctx);
+      const server = await startSupervisor(ctx, {
+        status: async () => {
+          reads++;
+          return structuredClone(current);
+        },
+        restart: async (selected, variant) => {
+          mutations++;
+          const entry = current.roles.find((v) => v.role === selected)!;
+          entry.bootId += "-next";
+          entry.configurationId = variant;
+        },
+        stop: async () => {
+          mutations++;
+        },
+      });
+      try {
+        const result = await control(ctx, {
+          version: 1,
+          runId: ctx.runId,
+          operation: "restart",
+          role,
+          configurationId,
+        });
+        observed.push({ code: result.code, reads, mutations });
+      } finally {
+        await server.close();
+      }
+    }
+  }
+  expect(observed).toEqual(
+    Array.from({ length: 6 }, () => ({ code: 400, reads: 0, mutations: 0 })),
+  );
+});
+
+test("supervisor rejects declared non-O disable status", async () => {
+  const ctx = await context();
+  for (const role of ["coordinator", "worker", "host-agent"] as const) {
+    for (const configurationId of [
+      "global-disabled",
+      "zone-disabled",
+    ] as const) {
+      ctx.supervisor.configurations[role][configurationId] =
+        ctx.supervisor.configurations[role].normal;
+      const current = status(ctx);
+      current.roles.find((v) => v.role === role)!.configurationId =
+        configurationId;
+      expect(() => verifyStatus(ctx, current)).toThrow(
+        "supervisor_role_configuration",
+      );
+    }
+  }
+});
+
+test("command waits for retained same-group descendants after leader exit", async () => {
+  const marker = join(root, "command-descendant");
+  const descendant =
+    "process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(process.argv[1],JSON.stringify({group:Number(process.argv[2]),child:process.pid}),{mode:384});setInterval(()=>{},1000)";
+  const leader =
+    "const fs=require('node:fs');const child=require('node:child_process').spawn(process.execPath,['-e',process.argv[1],process.argv[2],String(process.pid)],{stdio:'ignore'});child.unref();const timer=setInterval(()=>{if(fs.existsSync(process.argv[2])){clearInterval(timer);process.exit(0)}},5)";
+  let group: number | undefined;
+  try {
+    await command(
+      node,
+      ["-e", leader, descendant, marker],
+      root,
+      childEnvironment(root),
+    );
+    const receipt = JSON.parse((await readOwned(marker)).toString());
+    group = receipt.group;
+    expect(Number.isSafeInteger(group) && Number(group) > 1).toBe(true);
+    expect(() => process.kill(-Number(group), 0)).toThrow("ESRCH");
+  } finally {
+    if (group === undefined) {
+      try {
+        group = JSON.parse((await readOwned(marker)).toString()).group;
+      } catch {}
+    }
+    if (Number.isSafeInteger(group) && Number(group) > 1) {
+      try {
+        process.kill(-Number(group), "SIGKILL");
+      } catch (error) {
+        if (
+          !(error instanceof Error && "code" in error && error.code === "ESRCH")
+        )
+          throw error;
+      }
+      const deadline = performance.now() + 1500;
+      let gone = false;
+      while (performance.now() < deadline) {
+        try {
+          process.kill(-Number(group), 0);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "ESRCH"
+          ) {
+            gone = true;
+            break;
+          }
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (!gone) throw new Error("controlled descendant cleanup failed");
+    }
+  }
+});
+
+test("FC executable prerequisites reject invalid headers, architecture, platform and mode", async () => {
+  const elf = Buffer.alloc(64);
+  Buffer.from([0x7f, 69, 76, 70, 2, 1]).copy(elf);
+  elf.writeUInt16LE(183, 18);
+  const valid = await put(join(root, "fc-valid"), elf, true);
+  const inputs = input();
+  inputs.backend = "firecracker";
+  for (const name of BINARIES) inputs.binaries[name] = valid;
+  inputs.firecracker = valid;
+  inputs.proxy = valid;
+  await validateExecutables(inputs);
+  const wrongArchitecture = Buffer.from(elf);
+  wrongArchitecture.writeUInt16LE(62, 18);
+  const wrongPlatform = Buffer.alloc(64);
+  wrongPlatform.writeUInt32LE(0xfeedfacf);
+  wrongPlatform.writeUInt32LE(0x0100000c, 4);
+  const rejected: boolean[] = [];
+  for (const role of ["firecracker", "proxy"] as const) {
+    for (const [kind, bytes, executable] of [
+      ["text", Buffer.from("correctly hashed text is not an executable"), true],
+      ["architecture", wrongArchitecture, true],
+      ["platform", wrongPlatform, true],
+      ["mode", elf, false],
+    ] as const) {
+      const pin = await put(
+        join(root, `fc-${role}-${kind}`),
+        bytes,
+        executable,
+      );
+      await verifyPin(pin);
+      inputs[role] = pin;
+      rejected.push(
+        await validateExecutables(inputs).then(
+          () => false,
+          () => true,
+        ),
+      );
+      inputs[role] = valid;
+    }
+  }
+  expect(rejected).toEqual(Array(8).fill(true));
 });

@@ -51,24 +51,29 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
     "supervisor_operation",
   );
   check(
-    ["orchestrator", "worker", "coordinator", "host-agent"].includes(
-      String(base.role),
-    ),
+    base.role === "orchestrator" ||
+      base.role === "worker" ||
+      base.role === "coordinator" ||
+      base.role === "host-agent",
     "supervisor_role",
   );
-  const role = base.role as MutableRole;
+  const role = base.role;
   if (base.operation === "stop") {
     record(base, ["version", "runId", "operation", "role"]);
     return { version: 1, runId: ctx.runId, operation: "stop", role };
   }
   record(base, ["version", "runId", "operation", "role", "configurationId"]);
   check(
-    ["normal", "global-disabled", "zone-disabled"].includes(
-      String(base.configurationId),
-    ),
+    base.configurationId === "normal" ||
+      base.configurationId === "global-disabled" ||
+      base.configurationId === "zone-disabled",
     "supervisor_configuration",
   );
-  const configurationId = base.configurationId as ConfigurationId;
+  const configurationId = base.configurationId;
+  check(
+    role === "orchestrator" || configurationId === "normal",
+    "supervisor_role_configuration",
+  );
   check(
     ctx.supervisor.configurations[role][configurationId],
     "supervisor_configuration",
@@ -115,6 +120,10 @@ export function verifyStatus(ctx: Context, value: unknown): SupervisorStatus {
     "fixture-legacy": ctx.artifacts.fixture,
   };
   for (const role of status.roles) {
+    check(
+      role.role === "orchestrator" || role.configurationId === "normal",
+      "supervisor_role_configuration",
+    );
     const config =
       role.role === "fixture-modern" || role.role === "fixture-legacy"
         ? role.configurationId === "normal"

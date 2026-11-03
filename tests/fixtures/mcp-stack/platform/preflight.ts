@@ -275,6 +275,36 @@ async function header(path: string): Promise<Buffer> {
     await file.close();
   }
 }
+export async function validateExecutables(inputs: Inputs): Promise<void> {
+  for (const name of ["node", "bun", "docker", "openssl"] as const)
+    await access(inputs.binaries[name].path, constants.X_OK);
+  const validate = async (pin: Pin, os: "linux" | "darwin") => {
+    await access(pin.path, constants.X_OK);
+    const actual = binaryArchitecture(await header(pin.path));
+    check(
+      actual.architecture === inputs.architecture && actual.os === os,
+      "binary_platform",
+    );
+  };
+  for (const role of [
+    "hostAgent",
+    "helper",
+    "claudeHarness",
+    "codexHarness",
+    "modelCli",
+  ] as const) {
+    const os =
+      ["hostAgent", "helper"].includes(role) && inputs.backend === "vz"
+        ? "darwin"
+        : "linux";
+    await validate(inputs.binaries[role], os);
+  }
+  if (inputs.backend === "firecracker") {
+    check(inputs.firecracker && inputs.proxy, "fc_artifacts");
+    await validate(inputs.firecracker, "linux");
+    await validate(inputs.proxy, "linux");
+  }
+}
 export async function preflight(
   backend: Inputs["backend"],
   runRoot: string,
@@ -303,35 +333,7 @@ export async function preflight(
     ...(inputs.proxy ? [inputs.proxy] : []),
   ])
     await verifyPin(item);
-  for (const name of [
-    "node",
-    "bun",
-    "docker",
-    "openssl",
-    "hostAgent",
-    "helper",
-    "claudeHarness",
-    "codexHarness",
-    "modelCli",
-  ] as const)
-    await access(inputs.binaries[name].path, constants.X_OK);
-  for (const role of [
-    "hostAgent",
-    "helper",
-    "claudeHarness",
-    "codexHarness",
-    "modelCli",
-  ] as const) {
-    const actual = binaryArchitecture(await header(inputs.binaries[role].path));
-    const expectedOs =
-      ["hostAgent", "helper"].includes(role) && backend === "vz"
-        ? "darwin"
-        : "linux";
-    check(
-      actual.architecture === inputs.architecture && actual.os === expectedOs,
-      "binary_platform",
-    );
-  }
+  await validateExecutables(inputs);
   const kernel = await header(inputs.binaries.kernel.path);
   if (inputs.architecture === "arm64")
     check(

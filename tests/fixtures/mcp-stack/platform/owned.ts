@@ -193,7 +193,10 @@ export class OwnedProcess {
     args: readonly string[],
     cwd: string,
     env: NodeJS.ProcessEnv,
-    stdio: "ignore" | ["ignore", number, number] = "ignore",
+    stdio:
+      | "ignore"
+      | ["ignore", number, number]
+      | ["pipe", "pipe", "ignore"] = "ignore",
   ) {
     check(isAbsolute(file) && isAbsolute(cwd), "process_path");
     this.child = spawn(file, [...args], { cwd, env, detached: true, stdio });
@@ -265,59 +268,61 @@ export async function command(
     Number.isInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= 120000,
     "command_deadline",
   );
-  const child = spawn(file, [...args], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["pipe", "pipe", "ignore"],
+  const owned = new OwnedProcess(file, args, cwd, env, [
+    "pipe",
+    "pipe",
+    "ignore",
+  ]);
+  const { child } = owned;
+  // These streams are present because this fixed command path selects pipe stdio.
+  const { stdin, stdout } = child;
+  check(stdin && stdout, "command_stdio");
+  const chunks: Buffer[] = [];
+  let bytes = 0,
+    interrupted = false,
+    unavailable = false;
+  let interrupt!: () => void;
+  const interruption = new Promise<void>((resolve) => {
+    interrupt = resolve;
   });
-  return await new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let bytes = 0,
-      timedOut = false,
-      finished = false;
-    let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (failure?: PlatformFailure) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      clearTimeout(cleanupTimer);
-      if (failure) reject(failure);
-      else resolve(Buffer.concat(chunks));
-    };
-    const kill = () => {
-      if (child.pid) {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {}
-      }
-      cleanupTimer ??= setTimeout(() => {
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.unref();
-        finish(new PlatformFailure("FAILED", "command_cleanup"));
-      }, 1500);
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      kill();
-    }, deadlineMs);
-    child.stdout.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes > 4 * 1024 * 1024) kill();
-      else chunks.push(chunk);
-    });
-    child.stdin.on("error", () => {});
-    child.once("error", () =>
-      finish(new PlatformFailure("NEEDS_CONTEXT", "command_unavailable")),
-    );
-    child.once("close", (code) =>
-      finish(
-        code !== 0 || timedOut || bytes > 4 * 1024 * 1024
-          ? new PlatformFailure("FAILED", "command")
-          : undefined,
-      ),
-    );
-    child.stdin.end(input);
+  const timer = setTimeout(() => {
+    interrupted = true;
+    interrupt();
+  }, deadlineMs);
+  stdout.on("data", (chunk: Buffer) => {
+    bytes += chunk.length;
+    if (bytes > 4 * 1024 * 1024) {
+      interrupted = true;
+      interrupt();
+    } else chunks.push(chunk);
   });
+  stdout.on("error", () => {
+    interrupted = true;
+    interrupt();
+  });
+  stdin.on("error", () => {});
+  child.once("error", () => {
+    unavailable = true;
+  });
+  stdin.end(input);
+  try {
+    await Promise.race([owned.done, interruption]);
+    // The leader closing is not group completion. Reuse the retained group's
+    // TERM -> KILL -> wait path before either success or command failure.
+    await owned.stop();
+    if (unavailable)
+      throw new PlatformFailure("NEEDS_CONTEXT", "command_unavailable");
+    if (interrupted || child.exitCode !== 0)
+      throw new PlatformFailure("FAILED", "command");
+    return Buffer.concat(chunks);
+  } catch (error) {
+    if (error instanceof PlatformFailure && error.seam === "process_cleanup")
+      throw new PlatformFailure("FAILED", "command_cleanup");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    stdin.destroy();
+    stdout.destroy();
+    child.unref();
+  }
 }
