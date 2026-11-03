@@ -2029,6 +2029,13 @@ test("VZ link uses private nonoverlapping IPAM and derives its interface from th
     "owned7",
   );
   expect(() =>
+    nativeInterface(
+      [{ ...value[0], addr_info: [{ family: "inet6", local: "172.25.0.2" }] }],
+      "172.25.0.2",
+      "02:42:ac:19:00:02",
+    ),
+  ).toThrow("native_link_interface");
+  expect(() =>
     nativeInterface(value, "172.25.0.3", "02:42:ac:19:00:02"),
   ).toThrow();
   expect(() =>
@@ -2121,7 +2128,7 @@ test("cleanup selects only authenticated fixture or managed-principal sessions o
   ).toEqual([]);
 });
 
-test("VZ guard configures only its owned link after default-drop", async () => {
+test("VZ guard acquires and revalidates its exact link with complete address metadata", async () => {
   const calls: string[][] = [];
   const id = "b".repeat(64),
     network = "d".repeat(64),
@@ -2136,7 +2143,10 @@ test("VZ guard configures only its owned link after default-drop", async () => {
     {
       ifname: "owned7",
       address: endpoint.MacAddress,
-      addr_info: [{ family: "inet", local: "172.25.0.2" }],
+      addr_info: [
+        { family: "inet6", local: "fe80::42:acff:fe19:2" },
+        { family: "inet", local: "172.25.0.2" },
+      ],
     },
   ];
   class VzPlan extends Engine {
@@ -2201,7 +2211,30 @@ test("VZ guard configures only its owned link after default-drop", async () => {
           ]),
         );
       if (args.includes("address"))
-        return Buffer.from(JSON.stringify(interfaces));
+        return Buffer.from(
+          JSON.stringify(
+            args.includes("-4")
+              ? interfaces.map(({ ifname, addr_info }) => ({
+                  ifname,
+                  addr_info: addr_info.filter((info) => info.family === "inet"),
+                }))
+              : interfaces,
+          ),
+        );
+      if (
+        args.includes("route") &&
+        (args.includes("table") || args.includes("get"))
+      )
+        return Buffer.from(
+          JSON.stringify([
+            {
+              dst: "192.168.254.1",
+              gateway: "172.25.0.1",
+              dev: "owned7",
+              ...(args.includes("get") ? { prefsrc: "172.25.0.2" } : {}),
+            },
+          ]),
+        );
       if (args.at(-1) === "default")
         return Buffer.from(
           JSON.stringify([
@@ -2227,6 +2260,7 @@ test("VZ guard configures only its owned link after default-drop", async () => {
     runId,
   );
   await engine.guards({ path: "/owned/ca", sha256: "f".repeat(64) });
+  await engine.verifyNativeRoute();
   const attach = calls.findIndex(
     (args) => args[0] === "network" && args[1] === "connect",
   );

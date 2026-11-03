@@ -1362,7 +1362,6 @@ export class Engine {
           id,
           "/usr/sbin/ip",
           "-j",
-          "-4",
           "address",
           "show",
         ])
@@ -1486,7 +1485,6 @@ export class Engine {
             id,
             "/usr/sbin/ip",
             "-j",
-            "-4",
             "address",
             "show",
           ])
