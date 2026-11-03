@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -8,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -20,9 +22,123 @@ SPEC.loader.exec_module(assets)
 class PhysicalGates(unittest.TestCase):
     def test_source_context_rejects_secrets(self):
         assets.source_paths(['docker/host-agent.Dockerfile', '.env.example', 'orchestrator/src/index.ts'])
-        for path in ['.env', 'orchestrator/.env.local', 'var/key', '.git/config', '../key', '/tmp/key']:
+        for path in ['.env', 'orchestrator/.env.local', 'var/key', '.git/config', '.superpowers/private',
+                     'crates/engram-coordinator/var/key', '../key', '/tmp/key']:
             with self.subTest(path=path), self.assertRaises(RuntimeError):
                 assets.source_paths([path])
+
+    def source_fixture(self, root, extra=()):
+        source, work = root / 'fixture', root / 'work'
+        source.mkdir()
+        work.mkdir(mode=0o700)
+        env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
+               'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
+        def git(*args):
+            return subprocess.run(['/usr/bin/git', '-C', str(source), *args], env=env,
+                                  capture_output=True, check=True)
+        git('init', '--template=')
+        recipes = ['docker/coordinator.Dockerfile', 'docker/orchestrator.Dockerfile',
+                   'docker/mcp-worker.Dockerfile', 'deploy/demo/Dockerfile',
+                   '.github/scripts/mcp-stack-inputs.mts', '.github/scripts/mcp-stack-fc.sh',
+                   '.github/scripts/mcp-stack-vz.sh', 'tests/fixtures/mcp-stack/platform/main.ts',
+                   'tests/fixtures/mcp-stack/platform/fixture.Dockerfile',
+                   'tests/fixtures/mcp-stack/platform/guard.Dockerfile',
+                   'tests/fixtures/mcp-stack/platform/host-agent.Dockerfile']
+        for name in [*recipes, 'tracked.txt', *extra]:
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('public fixture source\n')
+        git('add', '.')
+        git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture')
+        p = object.__new__(assets.Producer)
+        p.root, p.source, p.env = work, work / 'source', env
+        p.counter, p.cancelled, p.child, p.groups = 0, False, None, {}
+        call = p.call
+        p.call = lambda argv, **kwargs: call(argv, cwd=source, **kwargs)
+        return p, source, git
+
+    def test_snapshot_excludes_only_known_legacy_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = 'crates/engram-coordinator/var/snapshots/fixture.bin'
+            safe = ['literal[1].txt', 'line\nbreak.txt',
+                    'crates/engram-coordinator/var-source/fixture.rs']
+            p, source, git = self.source_fixture(Path(directory), [legacy, *safe])
+            (source / 'third_party/fixture').mkdir(parents=True)
+            git('update-index', '--add', '--cacheinfo',
+                '160000,' + git('rev-parse', 'HEAD').stdout.decode().strip() + ',third_party/fixture')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture gitlink')
+            (source / '.env').write_text('untracked fixture secret\n')
+            archives = []
+            call = p.call
+            def capture(argv, **kwargs):
+                result = call(argv, **kwargs)
+                if 'archive' in argv:
+                    archives.append(result)
+                return result
+            p.call = capture
+            p.snapshot()
+            self.assertEqual(p.head, git('rev-parse', 'HEAD').stdout.decode().strip())
+            self.assertEqual((p.source / 'tracked.txt').read_text(), 'public fixture source\n')
+            for name in safe:
+                self.assertTrue((p.source / name).is_file())
+            self.assertFalse((p.source / 'crates/engram-coordinator/var').exists())
+            self.assertFalse((p.source / '.env').exists())
+            self.assertTrue((p.source / 'third_party/fixture').is_dir())
+            self.assertTrue((source / legacy).is_file())
+            self.assertEqual(len(archives), 1)
+            with tarfile.open(fileobj=io.BytesIO(archives[0])) as tar:
+                members = {m.name for m in tar.getmembers()}
+            self.assertIn('tracked.txt', members)
+            self.assertNotIn(legacy, members)
+            self.assertNotIn('crates/engram-coordinator/var', members)
+
+    def test_snapshot_rejects_other_forbidden_tracked_paths(self):
+        for name in ['var/key', 'crates/other/var/key', '.env', 'orchestrator/.env.local',
+                     '.superpowers/private', 'crates/engram-coordinator/var-old/var/key']:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                p, _, _ = self.source_fixture(Path(directory), [name])
+                with self.assertRaisesRegex(RuntimeError, 'secret_source_context'):
+                    p.snapshot()
+                self.assertFalse(p.source.exists())
+
+    def test_snapshot_checks_all_archive_members_before_extraction(self):
+        for name, kind in [('unexpected.txt', tarfile.REGTYPE), ('var/key', tarfile.REGTYPE),
+                           ('.env', tarfile.REGTYPE), ('.git/config', tarfile.REGTYPE),
+                           ('.superpowers/private', tarfile.REGTYPE),
+                           ('crates/engram-coordinator/var/key', tarfile.REGTYPE),
+                           ('../escape', tarfile.REGTYPE), ('/tmp/escape', tarfile.REGTYPE),
+                           ('safe/../../escape', tarfile.REGTYPE), ('./tracked.txt', tarfile.REGTYPE),
+                           ('tracked.txt', tarfile.REGTYPE), ('unexpected', tarfile.DIRTYPE),
+                           ('tracked.txt', tarfile.SYMTYPE), ('tracked.txt', tarfile.LNKTYPE),
+                           ('tracked.txt', tarfile.FIFOTYPE), (None, None)]:
+            with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as directory:
+                p, _, _ = self.source_fixture(Path(directory))
+                call = p.call
+                def corrupt(argv, **kwargs):
+                    result = call(argv, **kwargs)
+                    if 'archive' not in argv:
+                        return result
+                    output = io.BytesIO()
+                    with (tarfile.open(fileobj=io.BytesIO(result)) as original,
+                          tarfile.open(fileobj=output, mode='w') as tar):
+                        for member in original.getmembers():
+                            if member.name == 'tracked.txt' and (name is None or kind != tarfile.REGTYPE):
+                                continue
+                            tar.addfile(member, original.extractfile(member) if member.isfile() else None)
+                        if name is not None:
+                            member = tarfile.TarInfo(name)
+                            member.type = kind
+                            if kind in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
+                                member.linkname = 'tracked.txt'
+                            tar.addfile(member)
+                    return output.getvalue()
+                p.call = corrupt
+                with self.assertRaises(RuntimeError):
+                    p.snapshot()
+                self.assertFalse((p.source / 'tracked.txt').exists())
+                self.assertFalse((p.source / 'docker').exists())
 
     def test_archive_identity_rejects_index_wrong_arch_and_digest(self):
         config = json.dumps({'os': 'linux', 'architecture': 'arm64'}).encode()

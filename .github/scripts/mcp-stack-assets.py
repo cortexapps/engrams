@@ -21,6 +21,7 @@ import time
 REPO = Path(__file__).resolve().parents[2]
 CI = 'tests/fixtures/mcp-stack/platform/ci'
 LABEL = 'io.engrams.mcp.ci'
+LEGACY_RUNTIME = 'crates/engram-coordinator/var'
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
 SOURCE_IMAGES = {
     'coordinator': 'docker/coordinator.Dockerfile',
@@ -382,11 +383,36 @@ class Producer:
         require(not self.call(['/usr/bin/git', 'status', '--porcelain', '--untracked-files=no']), 'source_dirty')
         self.head = self.call(['/usr/bin/git', 'rev-parse', 'HEAD']).decode().strip()
         require(re.fullmatch('[a-f0-9]{40}', self.head), 'source_head')
-        names = self.call(['/usr/bin/git', 'ls-tree', '-r', '--name-only', self.head]).decode().splitlines()
-        source_paths(names)
-        self.source.mkdir(mode=0o700)
-        archive = self.call(['/usr/bin/git', 'archive', '--format=tar', self.head])
+        entries = {}
+        for entry in self.call(['/usr/bin/git', 'ls-tree', '-r', '-z', self.head]).split(b'\0')[:-1]:
+            metadata, name = entry.split(b'\t', 1)
+            name = os.fsdecode(name)
+            # This exact upstream directory contains legacy runtime files.
+            if name == LEGACY_RUNTIME or name.startswith(LEGACY_RUNTIME + '/'):
+                continue
+            mode = metadata.split()[0].decode()
+            require(mode in {'100644', '100755', '160000'}, 'source_entry_type')
+            entries[name] = mode
+        source_paths(entries)
+        require(entries, 'source_empty')
+        # Literal names keep selection and archive bytes identical, including
+        # names with newlines or Git pathspec metacharacters.
+        archive = self.call(['/usr/bin/git', '--literal-pathspecs', 'archive', '--format=tar',
+                             self.head, '--', *entries])
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            expected = {name: mode == '160000' for name, mode in entries.items()}
+            for name in entries:
+                for parent in Path(name).parents:
+                    if parent != Path('.'):
+                        expected[str(parent)] = True
+            seen = set()
+            for member in tar.getmembers():
+                source_paths([member.name])
+                require(member.name in expected and member.name not in seen and
+                        (member.isdir() if expected[member.name] else member.isfile()), 'source_archive_member')
+                seen.add(member.name)
+            require(seen == set(expected), 'source_archive_selection')
+            self.source.mkdir(mode=0o700)
             tar.extractall(self.source, filter='data')
         # Outputs are private and outside this tracked-only build context.
         for role in [*SOURCE_IMAGES.values(), '.github/scripts/mcp-stack-inputs.mts',

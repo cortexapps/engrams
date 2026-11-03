@@ -131,8 +131,14 @@ root retains bootstrap logs and safe summary; the private checkout is at
 The inner stage accepts its private flag only with that owned canonical layout.
 
 The producer verifies clean exact HEAD and exports only its tracked source
-with git archive into a new private directory. It rejects secret/var/.git paths;
-it never sends the checkout, node_modules, runtime files, `.env` or Docker
+with git archive into a new private directory. It excludes only the known legacy
+runtime directory `crates/engram-coordinator/var` before validation and archive
+creation. All other secret/var/.git paths fail validation. The archive uses the
+same finite list of literal tracked names. Before extraction, the producer checks
+all archive member paths and types against that selection, including parent
+directories and empty submodule directories. Missing, extra, duplicate, linked,
+or unsafe members fail before any file is extracted. Safe tar extraction remains
+enabled. It never sends the checkout, node_modules, runtime files, `.env` or Docker
 configuration as a build context. Dependency installation uses private cache,
 explicit empty npm configuration and XDG Bun configuration, with lifecycle
 scripts disabled; no user package-manager config or inherited token is used. It uses actual production Dockerfiles for
