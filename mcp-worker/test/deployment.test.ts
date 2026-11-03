@@ -40,6 +40,36 @@ test("worker chart defaults off and image pins maintained Node 24", () => {
   assert.ok(dockerfile.includes("ulimit -c 0"));
 });
 
+test("orchestrator image includes locked worker production dependencies beside worker source", () => {
+  const dockerfile = readFileSync(
+    new URL("../../docker/orchestrator.Dockerfile", import.meta.url),
+    "utf8",
+  );
+  const stages = dockerfile.split(/^FROM /m);
+  const deps = stages.find((stage) =>
+    stage.startsWith("node:24.22.2-bookworm-slim AS worker-deps\n"),
+  );
+  assert.ok(deps, "worker dependencies need a separate locked install stage");
+  assert.match(deps, /^WORKDIR \/app\/mcp-worker$/m);
+  assert.match(
+    deps,
+    /^COPY mcp-worker\/package.json mcp-worker\/package-lock.json \.\/$/m,
+  );
+  assert.match(deps, /^RUN npm ci --omit=dev --ignore-scripts$/m);
+  const runtime = stages.at(-1)!;
+  assert.match(
+    runtime,
+    /^COPY --from=worker-deps \/app\/mcp-worker\/node_modules \/app\/mcp-worker\/node_modules$/m,
+  );
+  assert.match(
+    runtime,
+    /^COPY --from=worker-deps \/app\/mcp-worker\/package.json \/app\/mcp-worker\/package-lock.json \/app\/mcp-worker\/$/m,
+  );
+  assert.match(runtime, /^COPY mcp-worker\/src\/ \/app\/mcp-worker\/src\/$/m);
+  assert.match(runtime, /^USER bun$/m);
+  assert.match(runtime, /^CMD \["bun", "run", "start"\]$/m);
+});
+
 test("both zone deployments have fixed identity, mounts, namespace and network limits", (t) => {
   const chart = new URL("../../deploy/helm/engram", import.meta.url).pathname;
   const dir = mkdtempSync(join(tmpdir(), "mcp-render-"));
