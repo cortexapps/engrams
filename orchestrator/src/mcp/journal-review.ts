@@ -1,3 +1,4 @@
+import { parseArgumentJson } from "./arguments.ts";
 import { McpAuthorityStale } from "./authority-error.ts";
 import {
   create,
@@ -111,7 +112,7 @@ export function assertOriginalArguments(original: string, expectedHash: string) 
     throw new Error("invalid argument bytes");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(original);
+    parsed = parseArgumentJson(original);
   } catch {
     throw new Error("invalid argument JSON");
   }
