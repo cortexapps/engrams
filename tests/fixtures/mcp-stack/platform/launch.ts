@@ -697,7 +697,7 @@ export class Stack {
       const port = role === "orchestrator" ? 8787 : 8080;
       const config = await put(
         join(this.root, `${role}-edge.conf`),
-        `pid /tmp/nginx.pid;\nerror_log /dev/stderr error;\nevents {}\nhttp { access_log off; client_body_temp_path /tmp/client; proxy_temp_path /tmp/proxy; server { listen 443 ssl; ssl_certificate /projection/tls.crt; ssl_certificate_key /projection/tls.key; ssl_protocols TLSv1.3; location / { proxy_pass http://127.0.0.1:${port}; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection upgrade; } } }\n`,
+        `pid /tmp/nginx.pid;\nerror_log /dev/stderr error;\nevents {}\nhttp { access_log off; client_body_temp_path /tmp/client; proxy_temp_path /tmp/proxy; fastcgi_temp_path /tmp/fastcgi; uwsgi_temp_path /tmp/uwsgi; scgi_temp_path /tmp/scgi; server { listen 443 ssl; ssl_certificate /projection/tls.crt; ssl_certificate_key /projection/tls.key; ssl_protocols TLSv1.3; location / { proxy_pass http://127.0.0.1:${port}; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection upgrade; } } }\n`,
       );
       const volume = await this.engine.project(`${role}-edge`, {
         "edge.conf": config,

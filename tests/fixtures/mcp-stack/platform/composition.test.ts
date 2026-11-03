@@ -12,7 +12,7 @@ import {
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
-import { hash, PlatformFailure, put } from "./owned.ts";
+import { hash, PlatformFailure, put, type Pin } from "./owned.ts";
 import { BINARIES, IMAGES, parseInputs, type Inputs } from "./preflight.ts";
 
 test("engine operations pin socket/config and exclude parent credentials", async () => {
@@ -1161,6 +1161,7 @@ test("FC launch uses the declared configuration, private namespace and original 
       args: string[] | undefined;
       entrypoint: string | undefined;
     }[] = [];
+    const projections = new Map<string, Record<string, Pin>>();
     class LaunchEngine extends Engine {
       override networkName() {
         return "owned-network";
@@ -1168,7 +1169,11 @@ test("FC launch uses the declared configuration, private namespace and original 
       override networkOptions() {
         return ["--network", this.networkName()];
       }
-      override async project(role: string): Promise<string> {
+      override async project(
+        role: string,
+        files: Record<string, Pin>,
+      ): Promise<string> {
+        projections.set(role, files);
         return `${this.runId}-${role}`;
       }
       override async call(args: string[]): Promise<Buffer> {
@@ -1297,6 +1302,56 @@ test("FC launch uses the declared configuration, private namespace and original 
     const workerLaunch = launches.find((v) => v.role === "worker")!;
     expect(workerLaunch.options).not.toContain("--cap-add");
     await stack.dependencies();
+    engine.guardIds.set("orchestrator", "d".repeat(64));
+    await stack.edges();
+    for (const role of ["orchestrator", "coordinator"] as const) {
+      const files = projections.get(`${role}-edge`)!;
+      const config = await readFile(files["edge.conf"]!.path, "utf8");
+      expect(hash(config)).toBe(files["edge.conf"]!.sha256);
+      expect(
+        [...config.matchAll(/(\w+)_temp_path\s+([^;]+);/g)].map(
+          ([, module, path]) => [module, path],
+        ),
+      ).toEqual([
+        ["client_body", "/tmp/client"],
+        ["proxy", "/tmp/proxy"],
+        ["fastcgi", "/tmp/fastcgi"],
+        ["uwsgi", "/tmp/uwsgi"],
+        ["scgi", "/tmp/scgi"],
+      ]);
+      expect(config).toContain("pid /tmp/nginx.pid;");
+      expect(config).toContain("ssl_protocols TLSv1.3;");
+      expect(config).toContain(
+        `proxy_pass http://127.0.0.1:${role === "orchestrator" ? 8787 : 8080};`,
+      );
+      const edge = launches.find((v) => v.role === `${role}-edge`)!;
+      expect(edge.image).toBe(inputs.images.edge.id);
+      expect(edge.entrypoint).toBe("/usr/sbin/nginx");
+      expect(edge.args).toEqual([
+        "-c",
+        "/projection/edge.conf",
+        "-g",
+        "daemon off;",
+      ]);
+      expect(edge.options).toEqual([
+        "--network",
+        `container:${engine.guardIds.get(role)}`,
+        "--user",
+        "1000:1000",
+        "--read-only",
+        "--mount",
+        `type=volume,src=${identity.runId}-${role}-edge,dst=/projection,readonly`,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+      ]);
+      expect(files["tls.crt"]).toEqual(
+        identity.leaves[role === "orchestrator" ? "app" : "coordinator"]
+          .certificate,
+      );
+      expect(files["tls.key"]).toEqual(
+        identity.leaves[role === "orchestrator" ? "app" : "coordinator"].key,
+      );
+    }
     for (const role of ["dns", "denied-dns"]) {
       const dnsLaunch = launches.find((v) => v.role === role)!;
       expect(dnsLaunch.entrypoint).toBe("/coredns");
