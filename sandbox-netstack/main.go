@@ -307,8 +307,7 @@ func run(packet, control, private *net.UnixConn) error {
 		finished := make(chan struct{})
 		go func() { _, _ = io.Copy(upstream, c); upstream.CloseWrite(); close(finished) }()
 		_, _ = io.Copy(c, upstream)
-		c.Close()
-		upstream.Close()
+		c.CloseWrite()
 		<-finished
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, forward.HandlePacket)
