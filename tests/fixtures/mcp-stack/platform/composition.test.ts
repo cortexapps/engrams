@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, spyOn } from "bun:test";
 import {
   mkdtemp,
   mkdir,
@@ -11,7 +11,7 @@ import {
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
-import { hash } from "./owned.ts";
+import { hash, PlatformFailure } from "./owned.ts";
 import type { Inputs } from "./preflight.ts";
 
 test("engine operations pin socket/config and exclude parent credentials", async () => {
@@ -415,6 +415,195 @@ test("entrypoint rejects a foreign backend before creating output or invoking a 
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+for (const failedLookup of [false, true]) {
+  test(`real startup prefix checks DNS after dependencies and stops on failure (${failedLookup})`, async () => {
+    const { bootPlatform } = await import("./main.ts");
+    const { Stack } = await import("./launch.ts");
+    const { FixtureObserver } =
+      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
+    const inputs = {
+      backend: "vz",
+      images: { fixture: { id: "fixture-image" } },
+    } as Inputs;
+    const ctx = {
+      protocolFixtures: {
+        modern: { runRoot: "/owned/modern", configuration: { path: "/owned/modern/config" } },
+        legacy: { runRoot: "/owned/legacy", configuration: { path: "/owned/legacy/config" } },
+      },
+    } as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
+    const steps: string[] = [];
+    const step = async (name: string) => {
+      steps.push(name);
+    };
+    const engine = new Engine(inputs, "/owned", "mcp-123456789012345678901234");
+    engine.reserveRegistryPort = () => step("registry-port");
+    engine.reserveHostPort = () => step("host-port");
+    engine.qualifyTools = () => step("tools");
+    engine.network = () => step("network");
+    engine.networkOptions = () => [];
+    engine.create = async (role) => {
+      steps.push(role);
+      return role;
+    };
+    engine.nativeDns = async () => {
+      steps.push("native-dns");
+      if (!steps.includes("dependencies"))
+        throw new PlatformFailure("NEEDS_CONTEXT", "dns_before_dependencies");
+      if (failedLookup) throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup");
+    };
+    engine.guards = () => step("guards");
+    engine.verifyNetwork = async (probes) => {
+      steps.push(`verify-network:${probes}`);
+      return {
+        generation: "test-generation",
+        enforcementSha256: "a".repeat(64),
+        fixtureOnlyEgress: true,
+        externalDnsBlocked: true,
+        roles: ["orchestrator", "coordinator", "worker"],
+      };
+    };
+    const stack = new Stack(
+      inputs,
+      "/owned",
+      {} as ConstructorParameters<typeof Stack>[2],
+      {} as ConstructorParameters<typeof Stack>[3],
+      {} as ConstructorParameters<typeof Stack>[4],
+      engine,
+    );
+    stack.dependencies = () => step("dependencies");
+    stack.edges = () => step("edges");
+    stack.startRole = (_ctx, role) => step(`start:${role}`);
+    stack.readyRole = (_ctx, role) => step(`ready:${role}`);
+    stack.migrateOrchestrator = () => step("migrate");
+    // Replace only the native I/O boundary; retain the real fixture launch and DNS gate.
+    const ready = spyOn(FixtureObserver.prototype, "ready").mockImplementation(() =>
+      step("observer"),
+    );
+    try {
+      const boot = bootPlatform(engine, { path: "/owned/ca", sha256: "a".repeat(64) }, async () => {
+        steps.push("prepare");
+        return { stack, ctx };
+      });
+      const prefix = [
+        "registry-port",
+        "host-port",
+        "tools",
+        "prepare",
+        "network",
+        "dependencies",
+        "fixture-modern",
+        "fixture-legacy",
+        "native-dns",
+      ];
+      if (failedLookup) {
+        await expect(boot).rejects.toMatchObject({
+          code: "NEEDS_CONTEXT",
+          seam: "native_dns_lookup",
+        });
+        expect(steps).toEqual(prefix);
+      } else {
+        await expect(boot).resolves.toBe(ctx);
+        expect(steps).toEqual([
+          ...prefix,
+          "observer",
+          "observer",
+          "guards",
+          "verify-network:true",
+          "edges",
+          "start:worker",
+          "ready:worker",
+          "start:coordinator",
+          "ready:coordinator",
+          "migrate",
+          "start:orchestrator",
+          "ready:orchestrator",
+          "start:host-agent",
+          "ready:host-agent",
+        ]);
+      }
+    } finally {
+      ready.mockRestore();
+    }
+  });
+}
+
+test("native DNS accepts only the expected addresses for every fixture name", async () => {
+  const engine = new Engine(
+    { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+    "/owned",
+    "mcp-123456789012345678901234",
+  );
+  const records: Record<string, string> = {
+    "postgres.fixture.example": "10.42.3.10",
+    "app.fixture.example": "10.42.3.20",
+    "coordinator.fixture.example": "10.42.3.21",
+    "operator.fixture.example": "10.42.3.21",
+    "control.fixture.example": "10.42.3.21",
+    "worker.fixture.example": "10.42.3.22",
+    "host.fixture.example": "10.42.4.1",
+    "resource.modern.fixture.example": "10.42.3.30",
+    "issuer.modern.fixture.example": "10.42.3.30",
+    "authorization.modern.fixture.example": "10.42.3.30",
+    "token.modern.fixture.example": "10.42.3.30",
+    "observer.modern.fixture.example": "10.42.3.30",
+    "resource.legacy.fixture.example": "10.42.3.31",
+    "issuer.legacy.fixture.example": "10.42.3.31",
+    "authorization.legacy.fixture.example": "10.42.3.31",
+    "token.legacy.fixture.example": "10.42.3.31",
+    "observer.legacy.fixture.example": "10.42.3.31",
+  };
+  const names: string[] = [];
+  await engine.nativeDns(async (name, options) => {
+    expect(options).toEqual({ all: true });
+    expect(records[name]).toBeDefined();
+    names.push(name);
+    return [{ address: records[name]!, family: 4 }];
+  });
+  expect(names).toEqual(Object.keys(records));
+});
+
+for (const actual of [
+  [],
+  [{ address: "10.42.3.11", family: 4 }],
+  [
+    { address: "10.42.3.10", family: 4 },
+    { address: "10.42.3.11", family: 4 },
+  ],
+]) {
+  test(`native DNS rejects empty or wrong successful answers (${actual.length})`, async () => {
+    const engine = new Engine(
+      { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+      "/owned",
+      "mcp-123456789012345678901234",
+    );
+    await expect(engine.nativeDns(async () => actual)).rejects.toMatchObject({
+      code: "NEEDS_CONTEXT",
+      seam: "native_dns_route",
+    });
+  });
+}
+
+test("native DNS lookup rejection exposes only the static safe seam", async () => {
+  const engine = new Engine(
+    { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+    "/owned",
+    "mcp-123456789012345678901234",
+  );
+  let failure: unknown;
+  try {
+    await engine.nativeDns(async () => {
+      throw new Error("secret-marker lookup postgres.fixture.example at 10.42.3.10");
+    });
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(PlatformFailure);
+  expect(failure).toMatchObject({ code: "NEEDS_CONTEXT", seam: "native_dns_lookup" });
+  expect(String(failure)).toBe("Error: NEEDS_CONTEXT:native_dns_lookup");
+  expect(JSON.stringify(failure)).not.toMatch(/secret-marker|fixture\.example|10\.42\.3\.10/);
+  expect(failure).not.toHaveProperty("cause");
 });
 
 test("fixed boot graph waits for worker, coordinator and real migration before app and host", async () => {

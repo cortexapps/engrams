@@ -1,6 +1,7 @@
 import { FcRuntime, type FcInventory } from "./fc-runtime.ts";
 import { randomBytes, X509Certificate } from "node:crypto";
 import { lookup } from "node:dns/promises";
+import type { LookupAddress } from "node:dns";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -1824,9 +1825,16 @@ export class Engine {
       await this.remove("tool-check");
     }
   }
-  async nativeDns(): Promise<void> {
+  async nativeDns(
+    resolve: (name: string, options: { all: true }) => Promise<LookupAddress[]> = lookup,
+  ): Promise<void> {
     for (const [name, expected] of Object.entries(dnsRecords(this.inputs))) {
-      const actual = await lookup(name, { all: true });
+      let actual: LookupAddress[];
+      try {
+        actual = await resolve(name, { all: true });
+      } catch {
+        throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup");
+      }
       if (!actual.length || actual.some((entry) => entry.address !== expected))
         throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_route");
     }

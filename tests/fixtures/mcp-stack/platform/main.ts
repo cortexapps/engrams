@@ -144,6 +144,40 @@ async function enableGuest(
   );
 }
 
+/** Prepare dependencies before fixture checks and application startup. */
+export async function bootPlatform(
+  engine: Pick<
+    Engine,
+    | "reserveRegistryPort"
+    | "reserveHostPort"
+    | "qualifyTools"
+    | "network"
+    | "guards"
+    | "verifyNetwork"
+  >,
+  ca: Identity["ca"],
+  prepare: () => Promise<{
+    stack: Pick<
+      Stack,
+      "dependencies" | "fixtures" | "edges" | "startRole" | "readyRole" | "migrateOrchestrator"
+    >;
+    ctx: Context;
+  }>,
+) {
+  await engine.reserveRegistryPort();
+  await engine.reserveHostPort();
+  await engine.qualifyTools();
+  const { stack, ctx } = await prepare();
+  await engine.network();
+  await stack.dependencies();
+  await stack.fixtures(ctx);
+  await engine.guards(ca);
+  await engine.verifyNetwork(true);
+  await stack.edges();
+  await bootApplications(stack, ctx);
+  return ctx;
+}
+
 /** Fixed production boot order. Migration and readiness failures stop the graph. */
 export async function bootApplications(
   stack: Pick<Stack, "startRole" | "readyRole" | "migrateOrchestrator">,
@@ -362,22 +396,14 @@ export async function main(args: string[]) {
     );
     timer = setTimeout(signal, 7200000);
     await engine.controlled(abort.signal, async () => {
-      await engine!.reserveRegistryPort();
-      await engine!.reserveHostPort();
-      await engine!.nativeDns();
-      await engine!.qualifyTools();
-      const assets = await stageAssets(inputs, root, engine!);
-      const configuration = await generateConfiguration(inputs, root, identity);
-      stack = new Stack(inputs, root, identity, assets, configuration, engine!);
-      const ctx = await stack.prepare();
-      context = ctx;
-      await engine!.network();
-      await stack.dependencies();
-      await stack.fixtures(ctx);
-      await engine!.guards(identity.ca);
-      await engine!.verifyNetwork(true);
-      await stack.edges();
-      await bootApplications(stack, ctx);
+      const ctx = await bootPlatform(engine!, identity.ca, async () => {
+        const assets = await stageAssets(inputs, root, engine!);
+        const configuration = await generateConfiguration(inputs, root, identity);
+        stack = new Stack(inputs, root, identity, assets, configuration, engine!);
+        const ctx = await stack.prepare();
+        context = ctx;
+        return { stack, ctx };
+      });
       if (engine!.fc) {
         observing = true;
         observer = (async () => {
@@ -410,7 +436,7 @@ export async function main(args: string[]) {
         stop: (role, signal) =>
           engine!.controlled(signal, () => stack!.stop(role)),
       });
-      await stack.status(ctx);
+      await stack!.status(ctx);
     });
     const contextPath = join(root, "context.json");
     const logPath = join(root, "matrix.log");
