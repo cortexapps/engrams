@@ -96,6 +96,7 @@ class NativeSourceGate(unittest.TestCase):
                     self.assertTrue((root / 'var/mcp-stack-runner').is_dir())
 
     def test_inputs_writer_gate_rejects_zero_failure_and_cancel(self):
+        # Source contract: select TAP for the shell summary guards.
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         step = workflow.split('      - name: MCP Inputs writer source tests', 1)[1]
         body = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
@@ -106,8 +107,13 @@ class NativeSourceGate(unittest.TestCase):
             node = commands / 'node'
             node.write_text(f'#!{sys.executable}\n'
                             'import os, sys\n'
-                            'assert sys.argv[1:] == ["--experimental-transform-types", "--test", "--test-isolation=none", "../.github/scripts/tests/mcp-stack-inputs.test.mts"]\n'
-                            'print(os.environ["FAKE_SUMMARY"])\n'
+                            'args = sys.argv[1:]\n'
+                            'tap = "--test-reporter=tap" in args\n'
+                            'if tap:\n'
+                            '    args.remove("--test-reporter=tap")\n'
+                            'assert args == ["--experimental-transform-types", "--test", "--test-isolation=none", "../.github/scripts/tests/mcp-stack-inputs.test.mts"]\n'
+                            'summary = os.environ["FAKE_SUMMARY"]\n'
+                            'print(summary if tap else summary.replace("# ", "ℹ "))\n'
                             'sys.exit(int(os.environ["FAKE_EXIT"]))\n')
             node.chmod(0o700)
             env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root))
@@ -121,12 +127,16 @@ class NativeSourceGate(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 
     def test_platform_gate_requires_openssl_three_and_nonzero_tests(self):
-        # Command stubs only: actual platform source tests run in the CI job.
+        # Source contract with command stubs; actual platform tests run in CI.
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         step = workflow.split('      - name: MCP platform source unit tests', 1)[1]
+        header = step.split('        run: |\n', 1)[0]
         body = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            (root / 'orchestrator').mkdir()
+            cwd = (root if '        working-directory: ${{ github.workspace }}\n' in header
+                   else root / 'orchestrator')
             commands = root / 'bin'
             commands.mkdir()
             openssl = commands / 'openssl'
@@ -140,12 +150,20 @@ class NativeSourceGate(unittest.TestCase):
             bun.write_text(f'#!{sys.executable}\n'
                            'import os, sys\n'
                            'from pathlib import Path\n'
-                           'assert sys.argv[1:] == ["test", "../tests/fixtures/mcp-stack/platform"]\n'
+                           'assert Path.cwd() == Path(os.environ["FAKE_REPO_ROOT"]), "platform tests require repository root"\n'
+                           'assert sys.argv[1:] == ["test", "tests/fixtures/mcp-stack/platform"]\n'
+                           'scratch = Path("var/mcp-platform-composition")\n'
+                           'assert scratch.is_dir(), "fresh checkout requires scratch parent"\n'
+                           'assert scratch.stat().st_mode & 0o777 == 0o700, "scratch parent must be private"\n'
+                           'import tempfile\n'
+                           'with tempfile.TemporaryDirectory(dir=scratch):\n'
+                           '    pass\n'
                            'assert os.environ["MCP_PLATFORM_TEST_OPENSSL"] == str(Path(__file__).with_name("openssl"))\n'
                            'print(os.environ["FAKE_BUN_SUMMARY"])\n'
                            'sys.exit(int(os.environ["FAKE_BUN_EXIT"]))\n')
             bun.chmod(0o700)
-            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root))
+            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root),
+                       FAKE_REPO_ROOT=str(root))
             good = ' 22 pass\n 0 fail\nRan 22 tests across 1 file. [80ms]'
             for name, version, openssl_exit, summary, bun_exit, expected in [
                 ('positive', 'OpenSSL 3.0.13', 0, good, 0, True),
@@ -155,12 +173,19 @@ class NativeSourceGate(unittest.TestCase):
                 ('zero-tests', 'OpenSSL 3.0.13', 0, ' 0 pass\n 0 fail\nRan 0 tests across 1 file.', 0, False),
                 ('failed-test', 'OpenSSL 3.0.13', 0, ' 21 pass\n 1 fail\nRan 22 tests across 1 file.', 0, False),
                 ('no-tests', 'OpenSSL 3.0.13', 0, 'No tests found', 0, False),
+                ('zero-count', 'OpenSSL 3.0.13', 0, good.replace('Ran 22 tests', 'Ran 0 tests'), 0, False),
+                ('zero-files', 'OpenSSL 3.0.13', 0, good.replace('1 file.', '0 files.'), 0, False),
+                ('missing-count', 'OpenSSL 3.0.13', 0, ' 22 pass\n 0 fail', 0, False),
                 ('failed-command', 'OpenSSL 3.0.13', 0, good, 42, False),
             ]:
                 with self.subTest(name=name):
+                    scratch = root / 'var/mcp-platform-composition'
+                    if scratch.exists():
+                        scratch.rmdir()
+                    self.assertFalse(scratch.exists())
                     env.update(FAKE_OPENSSL_VERSION=version, FAKE_OPENSSL_EXIT=str(openssl_exit),
                                FAKE_BUN_SUMMARY=summary, FAKE_BUN_EXIT=str(bun_exit))
-                    result = subprocess.run(['bash', '-c', body], cwd=root, env=env,
+                    result = subprocess.run(['bash', '-c', 'umask 022\n' + body], cwd=cwd, env=env,
                                             capture_output=True, text=True)
                     self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 

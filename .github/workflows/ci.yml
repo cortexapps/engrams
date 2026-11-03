@@ -1054,14 +1054,17 @@ jobs:
       - name: MCP platform source typecheck
         run: bun run tsc -p ../tests/fixtures/mcp-stack/platform/tsconfig.json --noEmit
       - name: MCP platform source unit tests
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+          umask 077
+          mkdir -p var/mcp-platform-composition
           MCP_PLATFORM_TEST_OPENSSL=$(command -v openssl)
           export MCP_PLATFORM_TEST_OPENSSL
           "$MCP_PLATFORM_TEST_OPENSSL" version | grep -Eq '^OpenSSL 3\.'
           result=$(mktemp)
           trap 'rm -f "$result"' EXIT
-          bun test ../tests/fixtures/mcp-stack/platform 2>&1 | tee "$result"
+          bun test tests/fixtures/mcp-stack/platform 2>&1 | tee "$result"
           grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
           grep -Eq '^[[:space:]]*0 fail$' "$result"
           grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files?\.' "$result"
@@ -1070,7 +1073,7 @@ jobs:
           set -euo pipefail
           result=$(mktemp)
           trap 'rm -f "$result"' EXIT
-          node --experimental-transform-types --test --test-isolation=none ../.github/scripts/tests/mcp-stack-inputs.test.mts 2>&1 | tee "$result"
+          node --experimental-transform-types --test --test-isolation=none --test-reporter=tap ../.github/scripts/tests/mcp-stack-inputs.test.mts 2>&1 | tee "$result"
           grep -Eq '^# pass [1-9][0-9]*$' "$result"
           grep -Eq '^# fail 0$' "$result"
           grep -Eq '^# cancelled 0$' "$result"
