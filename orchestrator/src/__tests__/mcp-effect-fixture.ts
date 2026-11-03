@@ -2,7 +2,6 @@ import { operatorPublication } from "./mcp-binding-fixture.ts";
 import { expect } from "bun:test";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { once } from "node:events";
 import { create, toJson } from "@bufbuild/protobuf";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { eq } from "drizzle-orm";
@@ -58,16 +57,64 @@ export async function effectFixture(
   child.stderr.on("data", (data) => {
     stderr += String(data);
   });
-  child.stdin.write(`${JSON.stringify({ tls, response: options.response })}\n`);
-  async function next() {
-    const line = await lines.next();
-    if (line.done) throw Error(`fixture exited: ${stderr}`);
-    return JSON.parse(line.value);
+  // Register completion before setup so spawn errors and early exits cannot miss cleanup.
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  let childError: Error | undefined;
+  child.on("error", (error) => {
+    childError = error;
+  });
+  child.stdin.on("error", (error) => {
+    childError = error;
+  });
+  let setupFixture: Awaited<ReturnType<typeof reviewFixture>> | undefined;
+  async function stopWorker(graceful: boolean) {
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        if (graceful) child.stdin.end("close\n");
+        else child.kill("SIGKILL");
+      }
+      await closed;
+    } finally {
+      clearTimeout(timeout);
+      output.close();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
   }
-  const ready: { port: number; identity: WorkerIdentity; node: string } = await next();
-  expect(ready.node.startsWith("24.")).toBe(true);
-  const f = await reviewFixture(options.constraints, options.classification === "write" ? 2 : 1);
+  async function cleanup(graceful: boolean) {
+    try {
+      await setupFixture?.cleanup();
+    } finally {
+      await stopWorker(graceful);
+    }
+    if (graceful) expect(stderr).toBe("");
+  }
+  async function next() {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const line = await Promise.race([
+        lines.next(),
+        closed.then(() => {
+          throw Error("fixture worker exited");
+        }),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(Error("fixture worker response timeout")), 5000);
+        }),
+      ]);
+      if (childError || line.done) throw Error("fixture worker unavailable");
+      return JSON.parse(line.value);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
   try {
+    child.stdin.write(`${JSON.stringify({ tls, response: options.response })}\n`);
+    const ready: { port: number; identity: WorkerIdentity; node: string } = await next();
+    expect(ready.node.startsWith("24.")).toBe(true);
+    const f = await reviewFixture(options.constraints, options.classification === "write" ? 2 : 1);
+    setupFixture = f;
     const classification = options.classification ?? "read";
     const tools = f.authority.profileGrants.map((grant) => ({
       upstreamName: grant.mcp!.upstreamName,
@@ -361,33 +408,11 @@ export async function effectFixture(
         return next();
       },
       async cleanup() {
-        try {
-          await f.cleanup();
-        } finally {
-          const exited = once(child, "exit");
-          const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
-          child.stdin.end("close\n");
-          try {
-            await exited;
-          } finally {
-            clearTimeout(timeout);
-            output.close();
-          }
-          expect(stderr).toBe("");
-        }
+        await cleanup(true);
       },
     };
   } catch (error) {
-    try {
-      await f.cleanup();
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) {
-        const exited = once(child, "exit");
-        child.kill("SIGKILL");
-        await exited;
-      }
-      output.close();
-    }
+    await cleanup(false);
     throw error;
   }
 }
