@@ -574,7 +574,7 @@ def main():
         ci_self or proto or test_rust or any_path(changed, ORCH_PATHS + [
             "crates/", ".sqlx/", "deploy/migrations/", "docker/", "deploy/bundles/",
             "deploy/demo/", "deploy/kernel/", "third_party/firecracker",
-            "sandbox-netstack/", ".bun-version",
+            "sandbox-netstack/", ".bun-version", ".dockerignore", ".cargo/config.toml",
         ])
     )
     test_netstack = test_rust

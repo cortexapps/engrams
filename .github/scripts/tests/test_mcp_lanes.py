@@ -148,7 +148,8 @@ class McpLanes(unittest.TestCase):
                      'deploy/kernel/build-fc-kernel.sh', 'third_party/firecracker',
                      'sandbox-netstack/build.sh', '.sqlx/query.json', 'deploy/migrations/100.sql',
                      'orchestrator/scripts/mcp-stack/run.ts', 'mcp-worker/package-lock.json',
-                     'crates/engram-host-agent/src/lib.rs', '.bun-version', '.github/workflows/ci.yml']:
+                     'crates/engram-host-agent/src/lib.rs', '.bun-version', '.github/workflows/ci.yml',
+                     '.dockerignore', '.cargo/config.toml']:
             with self.subTest(path=path):
                 self.assertEqual(detect(path)['test_mcp_physical'], 'true')
         for path in ['README.md', 'web/src/App.tsx', 'site/src/content/docs/index.mdx']:

@@ -1,12 +1,15 @@
 import importlib.util
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location('physical_assets', ROOT / '.github/scripts/mcp-stack-assets.py')
@@ -86,7 +89,7 @@ class PhysicalGates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             p = object.__new__(assets.Producer)
             p.root = Path(directory)
-            p.counter, p.cancelled, p.child = 0, False, None
+            p.counter, p.cancelled, p.child, p.groups = 0, False, None, {}
             p.env = {'PATH': '/usr/bin:/bin', 'LANG': 'C'}
             with self.assertRaises(RuntimeError):
                 p.call([sys.executable, '-c', 'raise SystemExit(42)'])
@@ -99,6 +102,150 @@ class PhysicalGates(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 p.call([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=0.02)
             self.assertIsNone(p.child)
+
+    def test_private_checkout_covers_git_ownership_without_shared_trust(self):
+        # Actual Git's ownership-test switch models runner UID -> root UID.
+        # No sudo/chown/foreign account or global configuration is used.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'runner-checkout'
+            source.mkdir()
+            env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
+                   'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null',
+                   'GIT_OPTIONAL_LOCKS': '0', 'GIT_NO_LAZY_FETCH': '1'}
+            def git(*args, **kwargs):
+                return subprocess.run(['/usr/bin/git', *args], env=kwargs.pop('env', env),
+                                      capture_output=True, text=True, check=True, **kwargs)
+            empty = root / 'empty-template'
+            empty.mkdir()
+            git('init', '--template=' + str(empty), str(source))
+            (source / 'tracked.txt').write_text('exact public source\n')
+            git('-C', str(source), 'add', 'tracked.txt')
+            git('-C', str(source), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture')
+            head = git('-C', str(source), 'rev-parse', 'HEAD').stdout.strip()
+            # A configuration credential and hook are not part of the checkout.
+            git('-C', str(source), 'config', '--local', 'http.extraHeader', 'fixture-sensitive-header')
+            (source / '.git/hooks').mkdir(exist_ok=True)
+            (source / '.git/hooks/post-checkout').write_text('fixture hook must not copy')
+            config_before = (source / '.git/config').read_bytes()
+            index_before = (source / '.git/index').read_bytes()
+            refused = subprocess.run(['/usr/bin/git', '-C', str(source), 'status', '--porcelain'],
+                                     env={**env, 'GIT_TEST_ASSUME_DIFFERENT_OWNER': '1'}, capture_output=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(b'dubious ownership', refused.stderr)
+            work = root / 'private'
+            work.mkdir(mode=0o700)
+            p = object.__new__(assets.Producer)
+            p.root, p.env = work, env
+            p.counter, p.cancelled, p.child, p.groups = 0, False, None, {}
+            upload = root / 'owned-upload-pack'
+            upload.write_text('#!/bin/sh\nexec env GIT_TEST_ASSUME_DIFFERENT_OWNER=1 /usr/bin/git upload-pack "$@"\n')
+            upload.chmod(0o700)
+            original_call = p.call
+            def ownership_call(argv, **kwargs):
+                words = [str(x) for x in argv]
+                if '-C' in words and words[words.index('-C') + 1] == str(source):
+                    kwargs['env'] = {**env, 'GIT_TEST_ASSUME_DIFFERENT_OWNER': '1'}
+                if 'fetch' in words:
+                    words.insert(words.index('fetch') + 1, '--upload-pack=' + str(upload))
+                return original_call(words, **kwargs)
+            p.call = ownership_call
+            checkout, actual = p.private_checkout(source)
+            self.assertEqual(actual, head)
+            self.assertEqual(checkout.stat().st_uid, os.getuid())
+            self.assertEqual(checkout.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(git('-C', str(checkout), 'rev-parse', 'HEAD').stdout.strip(), head)
+            self.assertFalse(git('-C', str(checkout), 'status', '--porcelain').stdout)
+            self.assertEqual((checkout / 'tracked.txt').read_bytes(), (source / 'tracked.txt').read_bytes())
+            self.assertFalse((checkout / '.git/hooks/post-checkout').exists())
+            self.assertEqual((source / '.git/config').read_bytes(), config_before)
+            self.assertEqual((source / '.git/index').read_bytes(), index_before)
+            self.assertNotEqual((source / 'tracked.txt').stat().st_ino, (checkout / 'tracked.txt').stat().st_ino)
+            self.assertEqual((checkout / 'tracked.txt').stat().st_nlink, 1)
+            local = git('-C', str(checkout), 'config', '--local', '--list').stdout
+            self.assertNotIn('fixture-sensitive-header', local)
+            self.assertNotIn('safe.directory', local)
+            # Same cleared environment the adapter uses succeeds without trust.
+            self.assertEqual(git('-C', str(checkout), 'show', 'HEAD:tracked.txt').stdout, 'exact public source\n')
+            self.assertEqual(git('-C', str(source), '-c', 'safe.directory=' + str(source),
+                                 'config', '--local', '--get', 'http.extraHeader').stdout.strip(), 'fixture-sensitive-header')
+
+    def test_owned_group_drains_redirected_term_ignoring_descendant(self):
+        # Controlled Python children only. The descendant closes every stream.
+        for mode in ['success', 'error', 'timeout']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                p = object.__new__(assets.Producer)
+                p.root, p.env = root, {'PATH': '/usr/bin:/bin', 'LANG': 'C'}
+                p.counter, p.cancelled, p.child, p.groups = 0, False, None, {}
+                pidfile = root / 'descendant.pid'
+                descendant = ('import os,signal,time; from pathlib import Path; '
+                              'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                              f'Path({str(pidfile)!r}).write_text(str(os.getpid())); '
+                              'time.sleep(20)')
+                leader = ('import subprocess,sys,time; from pathlib import Path; '
+                          f'p=subprocess.Popen([sys.executable,"-c",{descendant!r}], '
+                          'stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); '
+                          f'path=Path({str(pidfile)!r}); '
+                          '\nwhile not path.exists(): time.sleep(0.005)\n' +
+                          ('time.sleep(20)' if mode == 'timeout' else
+                           'raise SystemExit(42)' if mode == 'error' else 'raise SystemExit(0)'))
+                try:
+                    if mode == 'success':
+                        p.call([sys.executable, '-c', leader], grace=0.05, timeout=0.5)
+                    else:
+                        with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                            p.call([sys.executable, '-c', leader], grace=0.05, timeout=0.5)
+                    pid = int(pidfile.read_text())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    self.assertEqual(p.groups, {})
+                    self.assertIsNone(p.child)
+                finally:
+                    # This exact test-owned PID/group is retained for RED cleanup.
+                    if pidfile.exists():
+                        try:
+                            pgid = os.getpgid(int(pidfile.read_text()))
+                            os.killpg(pgid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    if p.child is not None:
+                        p.child.communicate(timeout=2)
+                    if pidfile.exists():
+                        deadline = time.monotonic() + 2
+                        while True:
+                            try:
+                                os.kill(int(pidfile.read_text()), 0)
+                            except ProcessLookupError:
+                                break
+                            self.assertLess(time.monotonic(), deadline, 'controlled descendant survived test cleanup')
+                            time.sleep(0.01)
+
+    def test_inaccessible_group_is_remaining_not_absent(self):
+        p = object.__new__(assets.Producer)
+        p.groups = {123: object()}
+        with patch.object(os, 'killpg', side_effect=PermissionError):
+            self.assertTrue(p.group_exists(123))
+        with patch.object(os, 'killpg', side_effect=ProcessLookupError):
+            self.assertFalse(p.group_exists(123))
+        self.assertIn(123, p.groups)
+
+    def test_failed_group_drain_retains_owner_and_blocks_cleanup(self):
+        # A forced drain error tests retained ownership, without any signal call.
+        with tempfile.TemporaryDirectory() as directory:
+            p = object.__new__(assets.Producer)
+            p.root, p.names = Path(directory), []
+            child = type('RetainedChild', (), {'pid': 123})()
+            p.groups, p.child = {123: child}, child
+            with patch.object(p, 'drain_group', side_effect=RuntimeError('controlled drain failure')):
+                with self.assertRaises(RuntimeError):
+                    p.cleanup()
+            self.assertIs(p.groups[123], child)
+            self.assertIs(p.child, child)
+            failed = json.loads((p.root / 'producer-cleanup.json').read_bytes())['failed']
+            self.assertIn('process-group-123', failed)
+            self.assertIn('process-groups', failed)
 
     def test_fake_engine_uses_explicit_selection_and_rejects_identity_change(self):
         with tempfile.TemporaryDirectory() as directory:

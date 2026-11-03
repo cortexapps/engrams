@@ -14,7 +14,9 @@ and these labels:
 
 These labels are a prerequisite, not evidence of a registered runner. The
 repository runner inventory had no registered runners when this source was
-prepared. Do not run untrusted jobs on a persistent machine with credentials.
+prepared. Privileged FC public-source jobs require an ephemeral, disposable dedicated
+runner VM with no standing platform, cloud or user credentials. Do not run
+untrusted jobs on a persistent machine with credentials.
 The workflows do not register runners or change repository settings.
 
 The Linux producer and adapter run as root. The VZ producer and adapter run
@@ -115,6 +117,19 @@ selected engine's build resolver must reach that same loopback publication.
 This registry publishes no external image. Do not add credentials, commands,
 scripts, environment maps or PASS booleans to operator JSON.
 
+Before any asset operation, the producer makes a fresh private checkout owned
+by its executing UID and reexecutes the fixed producer there. This also puts the
+actual adapter, its Git reads and private dependency installation under the same
+principal. The bootstrap reads only the exact canonical original source with
+command-local `safe.directory` trust, disables optional index writes, and fetches
+the exact HEAD through local Git into a new repository with an empty template.
+It verifies HEAD, clean files, every file owner and the small generated Git
+config; source credentials, config, hooks and hard links are never copied. No
+global trust entry or shared-checkout ownership change is used. The outer work
+root retains bootstrap logs and safe summary; the private checkout is at
+`checkout/` and actual assets/evidence/private caches are under `execution/`.
+The inner stage accepts its private flag only with that owned canonical layout.
+
 The producer verifies clean exact HEAD and exports only its tracked source
 with git archive into a new private directory. It rejects secret/var/.git paths;
 it never sends the checkout, node_modules, runtime files, `.env` or Docker
@@ -185,6 +200,15 @@ KEK. Producer cleanup removes only exact planned label-owned registry and
 extraction containers and checks absence. It also requires the actual adapter
 completion/cleanup files and queries that run's labels for container/network
 survivors. The adapter owns native/kernel cleanup and its graph cleanup.
+
+Each command starts a new process session. Its group stays in the ownership
+map through success, nonzero exit,
+timeout and cancellation. TERM, then KILL and bounded actual group-absence
+checks drain descendants even after the leader exits or closes its streams.
+Only ESRCH proves group absence; inaccessible groups remain unresolved. A group
+that remains fails cleanup, with its ownership and private event log retained.
+The adapter keeps its240s graceful cleanup allowance.
+
 No global prune or foreign process/resource removal occurs. A missing engine
 query or survivor is failure. A hard runner termination needs operator recovery
 of its exact run-owned resources and private evidence; no source claim can

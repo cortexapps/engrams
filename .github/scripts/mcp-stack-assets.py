@@ -49,6 +49,8 @@ def canonical(path, kind='file', owner=True):
         require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_size > 0, 'regular_file')
     elif kind == 'socket':
         require(stat.S_ISSOCK(s.st_mode), 'engine_socket')
+    elif kind == 'directory':
+        require(stat.S_ISDIR(s.st_mode), 'owned_directory')
     return p
 
 
@@ -130,6 +132,8 @@ class Producer:
         self.counter = 0
         self.cancelled = False
         self.child = None
+        self.groups = {}
+        self.nested_started = False
         self.engine_identity = None
         self.socket = canonical(operator['engineSocket'], 'socket').stat()
         self.tools = operator['tools']
@@ -137,7 +141,8 @@ class Producer:
                                                  ['/usr/bin', '/bin', '/usr/sbin', '/sbin'])),
                     'TMPDIR': str(root), 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
                     'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null',
-                    'GIT_TERMINAL_PROMPT': '0'}
+                    'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
+                    'GIT_NO_LAZY_FETCH': '1'}
         self.config = root / 'producer-engine-config'
         self.config.mkdir(mode=0o700)
         self.adapter_config = root / 'engine-config'
@@ -161,39 +166,133 @@ class Producer:
             f.write(data)
         path.chmod(0o600)
 
+    def group_event(self, child, state):
+        with (self.root / 'process-groups.jsonl').open('a') as journal:
+            journal.write(json.dumps({'pgid': child.pid, 'exit': child.returncode,
+                                      'state': state}) + '\n')
+
+    def group_exists(self, pgid):
+        require(pgid in self.groups, 'unowned_process_group')
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # An inaccessible or exiting group is still unresolved. Only ESRCH
+            # proves absence; keep polling within the retained group's deadline.
+            return True
+
+    def drain_group(self, child, grace):
+        require(self.groups.get(child.pid) is child, 'unowned_process_group')
+        def send(sig):
+            try:
+                os.killpg(child.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                # Retain the group; bounded polling must still prove ESRCH.
+                pass
+        def wait_group(seconds):
+            deadline = time.monotonic() + seconds
+            while True:
+                child.poll()  # Reap the leader even when closed pipes already drained.
+                if not self.group_exists(child.pid):
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+        if self.group_exists(child.pid):
+            send(signal.SIGTERM)
+        if not wait_group(grace):
+            send(signal.SIGKILL)
+        if not wait_group(2):
+            self.group_event(child, 'survivor')
+            raise RuntimeError('producer_process_survivor')
+        child.wait(timeout=2)
+        self.group_event(child, 'absent')
+        del self.groups[child.pid]
+        if self.child is child:
+            self.child = None
+
     def call(self, argv, *, env=None, data=None, timeout=7200, cleanup=False, cwd=None, grace=15):
         require(cleanup or not self.cancelled, 'cancelled')
         self.counter += 1
-        log = self.root / f'command-{self.counter:04d}.log'
-        # Never print command arguments, output, environment or transport bodies.
+        number = self.counter
+        log = self.root / f'command-{number:04d}.log'
         with log.open('xb') as err:
             child = subprocess.Popen([str(x) for x in argv], cwd=cwd or REPO, env=env or self.env, start_new_session=True,
                                      stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=err)
             self.child = child
+            self.groups[child.pid] = child
+            self.group_event(child, 'created')
+            out, failure = b'', None
             try:
                 out, _ = child.communicate(data, timeout=timeout)
-            except BaseException:
-                try:
-                    os.killpg(child.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    child.communicate(timeout=grace)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    child.communicate(timeout=15)
-                raise
+            except BaseException as error:
+                failure = error
+            try:
+                # Leader/pipe completion never proves that this retained session
+                # group has no descendant. Drain on success and every failure.
+                self.drain_group(child, grace)
+                remaining, _ = child.communicate(timeout=2)
+                if failure is not None:
+                    out = remaining
             finally:
-                self.child = None
-            with (self.root / 'commands.jsonl').open('a') as journal:
-                journal.write(json.dumps({'command': self.counter, 'exit': child.returncode,
-                                          'outputBytes': len(out)}) + '\n')
+                with (self.root / 'commands.jsonl').open('a') as journal:
+                    journal.write(json.dumps({'command': number, 'exit': child.returncode,
+                                              'outputBytes': len(out),
+                                              'groupDrained': child.pid not in self.groups}) + '\n')
+            if failure is not None:
+                raise failure
             require(child.returncode == 0, 'producer_command')
             return out
+
+    def private_checkout(self, source):
+        source = Path(source)
+        require(source.is_absolute() and source.resolve() == source and source.is_dir(), 'source_checkout')
+        # Trust only this exact original directory in these bootstrap commands.
+        # No safe.directory value reaches the private repository or the adapter.
+        flags = ['/usr/bin/git', '-c', 'safe.directory=' + str(source),
+                 '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']
+        head = self.call([*flags, '-C', source, 'rev-parse', 'HEAD']).decode().strip()
+        require(re.fullmatch('[a-f0-9]{40}', head), 'source_head')
+        require(not self.call([*flags, '-C', source, 'status', '--porcelain', '--untracked-files=no']), 'source_dirty')
+        template = self.root / 'git-empty-template'
+        template.mkdir(mode=0o700)
+        checkout = self.root / 'checkout'
+        self.call(['/usr/bin/git', 'init', '--template=' + str(template), checkout])
+        checkout.chmod(0o700)
+        self.call([*flags, '-c', 'protocol.file.allow=always', '-C', checkout,
+                   'fetch', '--depth=1', '--no-tags', '--no-write-fetch-head', source, head])
+        self.call(['/usr/bin/git', '-C', checkout, '-c', 'core.hooksPath=/dev/null',
+                   'checkout', '--detach', head])
+        # Every subsequent Git read uses only this principal-owned exact HEAD.
+        require(self.call(['/usr/bin/git', '-C', checkout, 'rev-parse', 'HEAD']).decode().strip() == head,
+                'private_checkout_head')
+        require(not self.call(['/usr/bin/git', '-C', checkout, 'status', '--porcelain']), 'private_checkout_dirty')
+        require(self.call([*flags, '-C', source, 'rev-parse', 'HEAD']).decode().strip() == head, 'source_head_changed')
+        for directory, dirs, files in os.walk(checkout, followlinks=False):
+            for path in [Path(directory), *(Path(directory) / name for name in [*dirs, *files])]:
+                state = path.lstat()
+                require(state.st_uid == os.getuid() and not stat.S_ISLNK(state.st_mode), 'private_checkout_owner')
+        config = self.call(['/usr/bin/git', '-C', checkout, 'config', '--local', '--name-only', '--list']).decode().splitlines()
+        require(all(key in {'core.repositoryformatversion', 'core.filemode', 'core.bare', 'core.logallrefupdates',
+                            'core.ignorecase', 'core.precomposeunicode'}
+                    for key in config), 'private_checkout_config')
+        return checkout, head
+
+    def run_private_checkout(self):
+        checkout, head = self.private_checkout(REPO)
+        script = '.github/scripts/mcp-stack-assets.py'
+        require((checkout / script).read_bytes() == Path(__file__).read_bytes(), 'producer_source_changed')
+        self.nested_started = True
+        env = dict(self.env)
+        if os.environ.get('GITHUB_TOKEN'):
+            env['GITHUB_TOKEN'] = os.environ['GITHUB_TOKEN']
+        self.call([sys.executable, '-I', checkout / script, '--backend', self.backend,
+                   '--operator', self.operator_path, '--work-root', self.root / 'execution',
+                   '--private-checkout'], env=env, cwd=checkout, grace=240)
+        return matrix_result(self.root / 'execution/run', self.backend, head)
 
     def engine(self, *args, cleanup=False):
         s = canonical(self.o['engineSocket'], 'socket').stat()
@@ -496,6 +595,20 @@ class Producer:
 
     def cleanup(self):
         failed = []
+        for child in list(getattr(self, 'groups', {}).values()):
+            try:
+                self.drain_group(child, 0.1)
+                child.communicate(timeout=2)
+            except Exception:
+                failed.append('process-group-' + str(child.pid))
+        if getattr(self, 'groups', {}):
+            failed.append('process-groups')
+        if getattr(self, 'nested_started', False):
+            try:
+                actual = json.loads((self.root / 'execution/summary.json').read_bytes())
+                require(actual.get('cleanup') is True, 'private_producer_cleanup')
+            except Exception:
+                failed.append('private-producer')
         if getattr(self, 'adapter_started', False):
             try:
                 run = self.root / 'run'
@@ -538,6 +651,7 @@ def main():
     parser.add_argument('--backend', choices=['firecracker', 'vz'], required=True)
     parser.add_argument('--operator', required=True)
     parser.add_argument('--work-root', required=True)
+    parser.add_argument('--private-checkout', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
     root = Path(args.work_root)
@@ -548,13 +662,20 @@ def main():
     try:
         o = read_operator(args.operator, args.backend)
         producer = Producer(args.backend, root, o)
+        producer.operator_path = args.operator
+        if args.private_checkout:
+            canonical(str(REPO), kind='directory')
+            canonical(str(REPO / '.git'), kind='directory')
+            require(REPO.name == 'checkout' and REPO.parent == root.parent and
+                    (REPO.parent.stat().st_mode & 0o777) == 0o700, 'private_checkout_layout')
         def cancel(_signum, _frame):
-            producer.cancelled = True
-            raise RuntimeError('cancelled')
+            if not producer.cancelled:
+                producer.cancelled = True
+                raise RuntimeError('cancelled')
         signal.signal(signal.SIGTERM, cancel)
         signal.signal(signal.SIGINT, cancel)
         try:
-            passed = producer.produce()
+            passed = producer.produce() if args.private_checkout else producer.run_private_checkout()
         finally:
             # Drain the interrupted child in call() before owned-resource cleanup.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
