@@ -865,7 +865,14 @@ export class Engine {
           "PKG_RELEASE",
           "DYNPKG_RELEASE",
           "ENGRAM_MKE2FS",
-        ].includes(key),
+        ].includes(key) ||
+          (spec.image === this.inputs.images.guard.id && key === "HOME" && value === "/tmp") ||
+          (spec.image === this.inputs.images.orchestrator.id &&
+            ((key === "BUN_INSTALL_BIN" && value === "/usr/local/bin") ||
+              (key === "BUN_RUNTIME_TRANSPILER_CACHE_PATH" && value === "0"))) ||
+          (spec.image === this.inputs.images.dns.id &&
+            key === "SSL_CERT_FILE" &&
+            value === "/etc/ssl/certs/ca-certificates.crt"),
         "image_environment",
       );
       environment.set(key, value);

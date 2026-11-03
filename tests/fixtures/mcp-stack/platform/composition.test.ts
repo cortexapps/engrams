@@ -12,7 +12,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
 import { hash, PlatformFailure } from "./owned.ts";
-import type { Inputs } from "./preflight.ts";
+import { BINARIES, IMAGES, parseInputs, type Inputs } from "./preflight.ts";
 
 test("engine operations pin socket/config and exclude parent credentials", async () => {
   const root = await mkdtemp(
@@ -167,9 +167,38 @@ test("cancelled engine control runs no command and drains its control lease", as
   expect(called).toBe(true);
 });
 
-function inspectedContainer() {
+function inspectedContainer(imageRole: (typeof IMAGES)[number] = "worker") {
+  const pin = { path: "/owned/binary", sha256: "a".repeat(64) };
+  const inputs = parseInputs(
+    {
+      version: 1,
+      backend: "vz",
+      architecture: "arm64",
+      sourceCommit: "b".repeat(40),
+      engineSocket: "/owned/socket",
+      engineConfig: "/owned/config",
+      engineId: "engine-identity-123",
+      registryPort: 32000,
+      subnet: "10.42.3.0/24",
+      nativeHostIp: "10.42.4.1",
+      proxy: pin,
+      nativeProbe: pin,
+      binaries: Object.fromEntries(BINARIES.map((role) => [role, pin])),
+      images: Object.fromEntries(
+        IMAGES.map((role, index) => [
+          role,
+          {
+            archive: pin,
+            id: `sha256:${index.toString(16).repeat(64)}`,
+            manifestDigest: `sha256:${"d".repeat(64)}`,
+          },
+        ]),
+      ),
+    },
+    "vz",
+  );
   const id = "a".repeat(64),
-    image = "sha256:" + "b".repeat(64),
+    image = inputs.images[imageRole].id,
     runId = "mcp-123456789012345678901234";
   const state = {
     Id: id,
@@ -203,29 +232,25 @@ function inspectedContainer() {
     Mounts: [],
     State: { Running: true, Pid: 42 },
   };
+  const imageState = {
+    Id: image,
+    Config: {
+      Env: ["PATH=/usr/bin:/bin"],
+      Entrypoint: ["/bin/sleep"],
+      Cmd: ["infinity"],
+    },
+  };
   class Inspector extends Engine {
     override async call(args: string[]): Promise<Buffer> {
       if (args[0] === "create") return Buffer.from(id);
       if (args[0] === "container" && args[1] === "inspect")
         return Buffer.from(JSON.stringify([state]));
-      if (args[0] === "image")
-        return Buffer.from(
-          JSON.stringify([
-            {
-              Id: image,
-              Config: {
-                Env: ["PATH=/usr/bin:/bin"],
-                Entrypoint: ["/bin/sleep"],
-                Cmd: ["infinity"],
-              },
-            },
-          ]),
-        );
+      if (args[0] === "image") return Buffer.from(JSON.stringify([imageState]));
       if (args[0] === "start") return Buffer.from(id);
       throw new Error("unexpected fixed test operation");
     }
   }
-  const engine = new Inspector({} as Inputs, "/owned/run", runId);
+  const engine = new Inspector(inputs, "/owned/run", runId);
   const options = [
     "--network",
     "none",
@@ -235,8 +260,113 @@ function inspectedContainer() {
     "--tmpfs",
     "/tmp:rw,nosuid,nodev,size=4m",
   ];
-  return { engine, state, id, image, options };
+  return { engine, state, imageState, id, image, options };
 }
+
+const pinnedImageDefaults = [
+  {
+    imageRole: "guard",
+    entry: "HOME=/tmp",
+    wrong: ["HOME=/root", "HOME=/private/home"],
+  },
+  {
+    imageRole: "orchestrator",
+    entry: "BUN_INSTALL_BIN=/usr/local/bin",
+    wrong: ["BUN_INSTALL_BIN=/tmp/bin"],
+  },
+  {
+    imageRole: "orchestrator",
+    entry: "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+    wrong: ["BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/cache", "BUN_RUNTIME_TRANSPILER_CACHE_PATH=1"],
+  },
+  {
+    imageRole: "dns",
+    entry: "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+    wrong: ["SSL_CERT_FILE=/tmp/ca.pem"],
+  },
+] satisfies {
+  imageRole: (typeof IMAGES)[number];
+  entry: string;
+  wrong: string[];
+}[];
+
+test.each(pinnedImageDefaults)(
+  "pinned image default $entry passes its exact image audit",
+  async ({ imageRole, entry }) => {
+    const { engine, state, imageState, image, options, id } = inspectedContainer(imageRole);
+    imageState.Config.Env.push(entry);
+    state.Config.Env.push(entry);
+    await engine.create("probe", image, options, ["infinity"], "/bin/sleep");
+    await expect(engine.audit(id)).resolves.toBeDefined();
+    state.Config.Env.push("DATABASE_URL=forbidden");
+    await expect(engine.audit(id)).rejects.toThrow("container_environment");
+    state.Config.Env.pop();
+    state.Config.Env[1] = entry + "-changed";
+    await expect(engine.audit(id)).rejects.toThrow("container_environment");
+  },
+);
+
+test.each(pinnedImageDefaults)(
+  "pinned image default $entry rejects other images and values",
+  async ({ imageRole, entry, wrong }) => {
+    for (const [role, value] of [
+      ["worker", entry],
+      ...wrong.map((value): [(typeof IMAGES)[number], string] => [imageRole, value]),
+      [imageRole, "AWS_SECRET_ACCESS_KEY=forbidden"],
+      [imageRole, "HTTPS_PROXY=http://proxy.invalid"],
+    ] satisfies [(typeof IMAGES)[number], string][]) {
+      const { engine, state, imageState, image, options } = inspectedContainer(role);
+      imageState.Config.Env.push(value);
+      state.Config.Env.push(value);
+      if (imageRole === "dns") {
+        state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+        options.push("--cap-add", "NET_BIND_SERVICE");
+      }
+      await expect(
+        engine.create(imageRole, image, options, ["infinity"], "/bin/sleep"),
+      ).rejects.toThrow("image_environment");
+    }
+  },
+);
+
+test.each(["tool-check", "pack-claude", "pack-codex", "probe", "host-tls-probe"])(
+  "pinned image default HOME is available to guard reuse %s",
+  async (role) => {
+    const { engine, state, imageState, image, options } = inspectedContainer("guard");
+    imageState.Config.Env.push("HOME=/tmp");
+    state.Config.Env.push("HOME=/tmp");
+    await engine.create(role, image, options, ["infinity"], "/bin/sleep");
+  },
+);
+
+test.each(["dns", "denied-dns"])(
+  "pinned image default certificate is available to DNS reuse %s",
+  async (role) => {
+    const { engine, state, imageState, image, options } = inspectedContainer("dns");
+    imageState.Config.Env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
+    state.Config.Env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
+    state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
+    await engine.create(
+      role,
+      image,
+      [...options, "--cap-add", "NET_BIND_SERVICE"],
+      ["infinity"],
+      "/bin/sleep",
+    );
+  },
+);
+
+test("pinned image defaults allow both Bun entries together but preserve image identity", async () => {
+  const { engine, state, imageState, image, options, id } = inspectedContainer("orchestrator");
+  const defaults = pinnedImageDefaults
+    .filter(({ imageRole }) => imageRole === "orchestrator")
+    .map(({ entry }) => entry);
+  imageState.Config.Env.push(...defaults);
+  state.Config.Env.push(...defaults);
+  await engine.create("probe", image, options, ["infinity"], "/bin/sleep");
+  imageState.Id = "sha256:" + "f".repeat(64);
+  await expect(engine.audit(id)).rejects.toThrow("container_image");
+});
 
 test.each(["dns", "denied-dns"])(
   "%s requires exactly NET_BIND_SERVICE in its effective audit",
