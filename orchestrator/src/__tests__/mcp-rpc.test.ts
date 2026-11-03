@@ -11,6 +11,7 @@ import type {
   IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import { reviewCatalog } from "../mcp/catalog.ts";
+import { MCP_LIMITS } from "../mcp/limits.ts";
 
 const unavailable = async (): Promise<never> => {
   throw new Error("unexpected service invocation");
@@ -300,7 +301,10 @@ describe("MCP native wire contract", () => {
         {
           upstreamName: "Create.Record",
           description: "Create a record",
-          inputSchemaJson: '{"type":"object","additionalProperties":false}',
+          inputSchemaJson:
+            '{"type":"object","properties":{"count":{"type":"number","minimum":0.1,"maximum":1e3}}}',
+          outputSchemaJson:
+            '{"type":"object","properties":{"count":{"type":"number","minimum":0.1,"maximum":1000}}}',
           classification: "write",
           enabled: true,
         },
@@ -309,7 +313,10 @@ describe("MCP native wire contract", () => {
     try {
       const response = await s.client.publishMcp(request);
       expect(response.catalog?.tools[0]?.classification).toBe("write");
-      expect(response.catalog?.tools[0]?.inputSchemaJson).toBe(request.tools[0]!.inputSchemaJson);
+      expect(response.catalog!.tools[0]!.inputSchemaJson).toBe(request.tools[0]!.outputSchemaJson);
+      expect(response.catalog!.tools[0]!.inputSchemaJson).toBe(
+        response.catalog!.tools[0]!.outputSchemaJson,
+      );
       await code(s.client.publishMcp({ ...request, expectedRevision: 1 }), Code.Aborted);
       await code(
         s.client.publishMcp({
@@ -323,6 +330,54 @@ describe("MCP native wire contract", () => {
       await s.close();
     }
   });
+  for (const field of ["inputSchemaJson", "outputSchemaJson"] as const) {
+    test.each([
+      [
+        "rounded decimal",
+        '{"type":"object","properties":{"count":{"minimum":0.10000000000000001}}}',
+      ],
+      ["unsafe integer", '{"type":"object","properties":{"count":{"maximum":9007199254740993}}}'],
+      ["raw byte limit", '{"type":"object"}'.padStart(MCP_LIMITS.argumentBytes + 1)],
+    ])(
+      `publication rejects ${field} with %s before validation or persistence`,
+      async (_name, raw) => {
+        const service = services();
+        let validations = 0;
+        let publications = 0;
+        service.validateSchemas = async () => {
+          validations++;
+        };
+        service.repository.publish = async () => {
+          publications++;
+          return unavailable();
+        };
+        const s = await spawn(service);
+        try {
+          await code(
+            s.client.publishMcp({
+              connectionId: row.id,
+              draftId: "draft-1",
+              tools: [
+                {
+                  upstreamName: "Create.Record",
+                  description: "Create a record",
+                  inputSchemaJson: '{"type":"object"}',
+                  [field]: raw,
+                  classification: "write",
+                  enabled: true,
+                },
+              ],
+            }),
+            Code.InvalidArgument,
+          );
+          expect(validations).toBe(0);
+          expect(publications).toBe(0);
+        } finally {
+          await s.close();
+        }
+      },
+    );
+  }
 });
 
 test("credential lifecycle requires a human administrator before service access", async () => {

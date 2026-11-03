@@ -72,6 +72,8 @@ import {
 import { sessions as defaultSessions } from "../control-plane/client.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+import { parseArgumentJson } from "../mcp/arguments.ts";
+import { MCP_LIMITS } from "../mcp/limits.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -519,12 +521,23 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (grant.mcp) {
         const documents = grant.mcp.argumentConstraintDocumentsJson.map((json) => {
           let document: unknown;
-          try { document = JSON.parse(json); }
-          catch { throw new ConnectError("MCP constraints must be valid JSON", Code.InvalidArgument); }
-          if (!document || typeof document !== "object" || Array.isArray(document)) throw new ConnectError("MCP constraints must be JSON objects", Code.InvalidArgument);
+          try {
+            if (Buffer.byteLength(json) > MCP_LIMITS.argumentBytes)
+              throw new Error("schema is too large");
+            document = parseArgumentJson(json);
+          } catch {
+            throw new ConnectError("MCP constraints must be valid JSON", Code.InvalidArgument);
+          }
+          if (!document || typeof document !== "object" || Array.isArray(document))
+            throw new ConnectError("MCP constraints must be JSON objects", Code.InvalidArgument);
           return document as Record<string, unknown>;
         });
-        mcp = { upstreamName: grant.mcp.upstreamName, automationWrite: grant.mcp.automationWrite, argumentConstraintDocuments: documents, unrestricted: grant.mcp.unrestricted };
+        mcp = {
+          upstreamName: grant.mcp.upstreamName,
+          automationWrite: grant.mcp.automationWrite,
+          argumentConstraintDocuments: documents,
+          unrestricted: grant.mcp.unrestricted,
+        };
       }
       return {
         ...(mcp ? { mcp } : {}),

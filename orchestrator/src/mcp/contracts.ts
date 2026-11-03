@@ -26,6 +26,7 @@ import { assertSchemaShape } from "./catalog.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import { canonicalJson } from "./hash.ts";
 import { verifiedExecutionResult } from "./effect-driver.ts";
+import { parseArgumentJson } from "./arguments.ts";
 
 /** Internal services use trusted connection identities, never guest destinations. */
 export interface McpServices {
@@ -194,7 +195,8 @@ function catalogToProto(value: Awaited<ReturnType<McpRepository["saveDraft"]>>) 
 }
 function parseSchema(value: string): Record<string, unknown> {
   try {
-    const schema: unknown = JSON.parse(value);
+    if (Buffer.byteLength(value) > MCP_LIMITS.argumentBytes) throw new Error("schema is too large");
+    const schema = parseArgumentJson(value);
     if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new Error();
     return schema as Record<string, unknown>;
   } catch {
