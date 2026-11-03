@@ -1839,3 +1839,64 @@ test("secret projection reads back private file and directory modes and refuses 
     await rm(root, { recursive: true });
   }
 });
+
+for (const partial of [false, true])
+  test(`FC evidence write failure stays fatal after a later sample (${partial ? "partial append" : "missing append"})`, async () => {
+    const { FcRuntime } = await import("./fc-runtime.ts");
+    const { appendFile } = await import("node:fs/promises");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/evidence-fault-"),
+    );
+    const path = join(root, "fc-physical.jsonl");
+    const record =
+      JSON.stringify({
+        sandboxId: "controlled-sandbox",
+        bootAttempt: "controlled-boot",
+        readSectors: "1",
+      }) + "\n";
+    let writes = 0;
+    const runtime = new FcRuntime(
+      {
+        bootId: "controlled",
+        release: "controlled",
+        pidNamespace: "pid:[1]",
+        slots: [],
+        readSectors: {},
+      },
+      {} as Inputs,
+      root,
+      async (file, bytes) => {
+        writes++;
+        if (writes === 1) {
+          if (partial)
+            await appendFile(file, bytes.slice(0, 15), { mode: 0o600 });
+          throw new Error("controlled evidence write failure");
+        }
+        await appendFile(file, bytes, { mode: 0o600 });
+      },
+    );
+    try {
+      await expect(
+        runtime.retainObservation("controlled-sandbox:controlled-boot", record),
+      ).rejects.toThrow("controlled evidence write failure");
+      // This would be a successful unrelated sample if the failure were lost.
+      await expect(runtime.observe()).rejects.toThrow(
+        "fc_physical_evidence_write",
+      );
+      await expect(runtime.requireCoverage()).rejects.toThrow(
+        "fc_physical_evidence_write",
+      );
+      await expect(
+        runtime.retainObservation("another-sandbox:another-boot", record),
+      ).rejects.toThrow("fc_physical_evidence_write");
+      expect(writes).toBe(1);
+      if (partial) {
+        const retained = await readFile(path, "utf8");
+        expect(retained).toBe(record.slice(0, 15));
+        expect(() => JSON.parse(retained)).toThrow();
+      } else
+        await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });

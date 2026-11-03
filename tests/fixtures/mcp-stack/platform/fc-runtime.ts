@@ -281,6 +281,7 @@ export class FcRuntime {
   private readonly cgroups = new Set<string>();
   private readonly processes = new Map<string, FcProcess>();
   private readonly observations = new Set<string>();
+  private evidenceWriteFailed = false;
   private host: FcProcess | undefined;
   private readonly readBaseline = new Map<string, string>();
   private readonly deviceOwners = new Map<string, string>();
@@ -289,6 +290,8 @@ export class FcRuntime {
     readonly inventory: FcInventory,
     private readonly inputs: Inputs,
     private readonly root: string,
+    private readonly appendEvidence = (path: string, bytes: string) =>
+      appendFile(path, bytes, { mode: 0o600 }),
   ) {
     for (const [path, reads] of Object.entries(inventory.readSectors))
       this.readBaseline.set(path, reads);
@@ -388,6 +391,7 @@ export class FcRuntime {
     );
   }
   async observe() {
+    check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
     if (!this.host) return;
     const identities = new Map<number, FcProcess>();
     const all = await pids();
@@ -528,9 +532,8 @@ export class FcRuntime {
       const expectedBinding = identities.get(Number(binding));
       check(expectedBinding, "fc_nbd_binding_process");
       verifyFcProcessIdentity(expectedBinding, bindingProcess);
-      this.observations.add(key);
-      await appendFile(
-        join(this.root, "fc-physical.jsonl"),
+      await this.retainObservation(
+        key,
         JSON.stringify({
           sandboxId: name,
           sessionId: boot.request.cold.session_id,
@@ -545,11 +548,26 @@ export class FcRuntime {
           rootfsCanonical: fc.rootfs_canonical,
           bootRecordSha256: hash(bootBytes),
         }) + "\n",
-        { mode: 0o600 },
       );
     }
   }
+  // The path is fixed. This seam permits controlled write-failure tests;
+  // observe calls it only after all physical checks pass.
+  async retainObservation(key: string, bytes: string) {
+    check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
+    if (this.observations.has(key)) return;
+    try {
+      await this.appendEvidence(join(this.root, "fc-physical.jsonl"), bytes);
+    } catch (error) {
+      // A failed append can leave an incomplete record. Preserve that failure
+      // for the whole run; a later successful sample cannot grant coverage.
+      this.evidenceWriteFailed = true;
+      throw error;
+    }
+    this.observations.add(key);
+  }
   async requireCoverage() {
+    check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
     const files = await readdir(join(this.root, "host/managed-boots"));
     const boots = files.filter((v) => /^[a-f0-9-]{36}\.boot$/.test(v));
     check(boots.length > 0 && boots.length <= 4096, "fc_physical_boot_count");
