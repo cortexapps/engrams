@@ -57,7 +57,11 @@ import {
   type ConnectorView,
 } from "../../components/integrations/useConnectorViews";
 import { IconPicker } from "../../components/profiles/IconPicker";
-import { McpGrantEditor, type McpProfileGrant } from "../../components/profiles/McpGrantEditor";
+import { McpGrantEditor } from "../../components/profiles/McpGrantEditor";
+import {
+  integrationGrantSchema,
+  type McpProfileGrant,
+} from "../../components/profiles/profileForm";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
@@ -140,24 +144,7 @@ const schema = z.object({
   programmaticOnly: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
-  integrationGrants: z.array(
-    z.object({
-      connectionId: z.string(),
-      operation: z.string(),
-      resourceConstraints: z.array(z.string()),
-      // ADR 0115: "" | "org" = the shared org credential; "user" = each
-      // member's personal credential (human launches then require it).
-      credentialScope: z.string().optional(),
-      mcp: z
-        .object({
-          upstreamName: z.string(),
-          automationWrite: z.boolean(),
-          unrestricted: z.boolean(),
-          argumentConstraintDocumentsJson: z.array(z.string()),
-        })
-        .optional(),
-    }),
-  ),
+  integrationGrants: z.array(integrationGrantSchema),
   repos: z.array(z.custom<RepoRow>()),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),

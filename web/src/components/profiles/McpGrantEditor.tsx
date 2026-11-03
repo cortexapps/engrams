@@ -3,19 +3,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { getMcpCatalogs } from "@/gen/engram/app/v1/integration-IntegrationService_connectquery";
 import type { IntegrationConnection } from "@/gen/engram/app/v1/integration_pb";
-
-export type McpProfileGrant = {
-  connectionId: string;
-  operation: string;
-  resourceConstraints: string[];
-  credentialScope?: string;
-  mcp?: {
-    upstreamName: string;
-    automationWrite: boolean;
-    unrestricted: boolean;
-    argumentConstraintDocumentsJson: string[];
-  };
-};
+import type { McpProfileGrant } from "./profileForm";
 
 export function McpGrantEditor({
   connection,

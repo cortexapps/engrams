@@ -9,7 +9,8 @@ import {
   IntegrationService,
 } from "@/gen/engram/app/v1/integration_pb";
 import { renderWithProviders } from "@/test-utils";
-import { McpGrantEditor, type McpProfileGrant } from "./McpGrantEditor";
+import { McpGrantEditor } from "./McpGrantEditor";
+import type { McpProfileGrant } from "./profileForm";
 
 it("requires a constraint or explicit unrestricted choice and keeps documents separate", async () => {
   const connection = create(IntegrationConnectionSchema, {
