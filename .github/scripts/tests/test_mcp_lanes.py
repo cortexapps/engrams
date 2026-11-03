@@ -129,7 +129,9 @@ class McpLanes(unittest.TestCase):
         self.assertIn('0 fail', orch)
         self.assertIn('run: bun run tsc -p ../tests/fixtures/mcp-stack/platform/tsconfig.json --noEmit', orch)
         platform = orch.split('      - name: MCP platform source unit tests', 1)[1].split('      - name:', 1)[0]
-        self.assertIn('bun test ../tests/fixtures/mcp-stack/platform', platform)
+        self.assertIn('        working-directory: ${{ github.workspace }}\n', platform)
+        self.assertIn('          umask 077\n          mkdir -p var/mcp-platform-composition\n', platform)
+        self.assertIn('bun test tests/fixtures/mcp-stack/platform', platform)
         self.assertNotIn('        if:', platform)
         project = json.loads((SCRIPT.parents[2] / 'tests/fixtures/mcp-stack/platform/tsconfig.json').read_text())
         self.assertEqual(project['extends'], '../../../../orchestrator/tsconfig.json')
