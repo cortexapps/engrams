@@ -12,12 +12,12 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       bash coreutils findutils ca-certificates nftables bind9-dnsutils \
-      netcat-openbsd curl skopeo squashfs-tools; \
+      netcat-openbsd curl skopeo squashfs-tools iproute2 openssl; \
     rm -rf /var/lib/apt/lists/*; \
     for tool in /bin/sh /bin/bash /bin/sleep /bin/mkdir /bin/chown /bin/chmod \
       /usr/bin/find /usr/bin/sha256sum /usr/bin/skopeo /usr/sbin/nft \
       /usr/bin/dig /usr/bin/nc /usr/bin/curl /usr/bin/mksquashfs \
-      /usr/bin/dirname /usr/bin/rm /usr/bin/cut; do test -x "$tool"; done
+      /usr/bin/dirname /usr/bin/rm /usr/bin/cut /usr/sbin/ip /usr/bin/openssl; do test -x "$tool"; done
 # Numeric packing users need no passwd entry or private home directory.
 ENV HOME=/tmp
 USER 1000:1000

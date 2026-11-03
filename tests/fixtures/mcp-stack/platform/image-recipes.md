@@ -93,3 +93,9 @@ and recipe syntax. They do not establish package installation, final executable
 behavior, arbitrary-user packing, TLS service startup, OCI archive linkage,
 engine loading, or either physical backend result. Image build and physical
 consumer checks must establish those facts before acceptance.
+
+The guard also carries `/usr/sbin/ip` from `iproute2` for the fixed native-host
+/32 route in its own network namespace, and `/usr/bin/openssl` for the short
+coordinator-client mutual TLS probe. Both tools use the same fixed APT snapshot
+and executable checks as the existing tools. These tools add no host route,
+capability, mount or credential to the worker.
