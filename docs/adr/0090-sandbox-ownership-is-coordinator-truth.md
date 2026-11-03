@@ -259,3 +259,7 @@ ADR 0098 addendum of the same date) drives every resting Idle/Created
 session's Resume verb at quiescence — the dead-end-state class (safe forever,
 recoverable never) that motivated all of this is now nightly coverage, not
 review luck.
+
+---
+
+Decision 3 (the quarantined-survivor channel) has a proposed successor in ADR 0125, which removes the channel together with the disk handover it reacted to. Decisions 1, 2, 4, 5 and 6 are unaffected.

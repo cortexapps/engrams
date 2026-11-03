@@ -631,3 +631,7 @@ when it finds "active missing + frozen present" (the mid-freeze crash
 state), and `engram_disk_flush_frozen_pending` is an
 increment/decrement count (a per-session `set()` gauge was
 last-writer-wins across sessions).
+
+---
+
+A successor is proposed in ADR 0125 (the kernel owns the session disk). It removes the disk daemon this ADR made durable, and supersedes this ADR on acceptance.
