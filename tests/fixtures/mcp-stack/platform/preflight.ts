@@ -327,6 +327,40 @@ export async function validateExecutables(inputs: Inputs): Promise<void> {
     await validate(inputs.nativeProbe, "darwin");
   }
 }
+export async function validateVzEntitlement(
+  hostAgent: string,
+  env: NodeJS.ProcessEnv,
+  runCommand: typeof command = command,
+): Promise<void> {
+  await runCommand("/usr/bin/codesign", ["--verify", "--strict", hostAgent], REPO, env);
+  const entitlements = await runCommand(
+    "/usr/bin/codesign",
+    ["--display", "--entitlements", "-", "--xml", hostAgent],
+    REPO,
+    env,
+  );
+  const converted = await runCommand(
+    "/usr/bin/plutil",
+    ["-convert", "json", "-o", "-", "--", "-"],
+    REPO,
+    env,
+    entitlements.toString("utf8"),
+  );
+  let value: unknown;
+  try {
+    value = JSON.parse(converted.toString("utf8"));
+  } catch {
+    throw new PlatformFailure("INVALID_CONTEXT", "vz_entitlement");
+  }
+  check(
+    typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      "com.apple.security.virtualization" in value &&
+      value["com.apple.security.virtualization"] === true,
+    "vz_entitlement",
+  );
+}
 export async function preflight(
   backend: Inputs["backend"],
   runRoot: string,
@@ -464,25 +498,7 @@ export async function preflight(
     const { inspectFcInventory } = await import("./fc-runtime.ts");
     await inspectFcInventory(inputs);
   } else {
-    await command(
-      "/usr/bin/codesign",
-      ["--verify", "--strict", inputs.binaries.hostAgent.path],
-      REPO,
-      env,
-    );
-    // codesign emits entitlements to stdout with this form; it never runs the host binary.
-    const entitlements = await command(
-      "/usr/bin/codesign",
-      ["--display", "--entitlements", "-", inputs.binaries.hostAgent.path],
-      REPO,
-      env,
-    );
-    check(
-      /<key>com\.apple\.security\.virtualization<\/key>\s*<true\s*\/>/.test(
-        entitlements.toString(),
-      ),
-      "vz_entitlement",
-    );
+    await validateVzEntitlement(inputs.binaries.hostAgent.path, env);
     check(
       (await command("/usr/sbin/sysctl", ["-n", "kern.hv_support"], REPO, env))
         .toString()

@@ -28,6 +28,7 @@ import {
   hash,
   newRoot,
   OwnedProcess,
+  PlatformFailure,
   privateRoot,
   put,
   readOwned,
@@ -40,6 +41,7 @@ import {
   engineArguments,
   validateEngineConfig,
   validateExecutables,
+  validateVzEntitlement,
   cli,
   IMAGES,
   parseInputs,
@@ -316,6 +318,65 @@ test("artifact architecture comes from executable bytes", () => {
     "binary_header",
   );
 });
+test("VZ entitlement verifies first and converts explicit XML through bounded commands", async () => {
+  const hostAgent = "/owned/host-agent";
+  const env = childEnvironment(root);
+  const xml =
+    '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>';
+  const calls: Parameters<typeof command>[] = [];
+  const runCommand: typeof command = async (...args) => {
+    calls.push(args);
+    return Buffer.from(["", xml, '{"com.apple.security.virtualization":true}'][calls.length - 1]!);
+  };
+  await validateVzEntitlement(hostAgent, env, runCommand);
+  expect(calls).toEqual([
+    ["/usr/bin/codesign", ["--verify", "--strict", hostAgent], REPO, env],
+    ["/usr/bin/codesign", ["--display", "--entitlements", "-", "--xml", hostAgent], REPO, env],
+    ["/usr/bin/plutil", ["-convert", "json", "-o", "-", "--", "-"], REPO, env, xml],
+  ]);
+  for (const call of calls) expect(call[3]).toBe(env);
+});
+for (const [kind, json] of [
+  ["false", '{"com.apple.security.virtualization":false}'],
+  ["missing", "{}"],
+  ["string", '{"com.apple.security.virtualization":"true"}'],
+  ["number", '{"com.apple.security.virtualization":1}'],
+  ["nested", '{"nested":{"com.apple.security.virtualization":true}}'],
+  ["array", '[{"com.apple.security.virtualization":true}]'],
+  ["null", "null"],
+  ["scalar", "true"],
+  ["malformed", '{"com.apple.security.virtualization":true'],
+  ["text", "[Dict]\n[Key] com.apple.security.virtualization\n[Bool] true"],
+] as const) {
+  test(`VZ entitlement rejects ${kind} conversion output`, async () => {
+    let calls = 0;
+    const runCommand: typeof command = async () => {
+      calls++;
+      // A true XML-looking fragment must not bypass the OS conversion result.
+      return Buffer.from(
+        calls === 3 ? json : "<key>com.apple.security.virtualization</key><true/>",
+      );
+    };
+    await expect(
+      validateVzEntitlement("/owned/host-agent", childEnvironment(root), runCommand),
+    ).rejects.toThrow("INVALID_CONTEXT:vz_entitlement");
+    expect(calls).toBe(3);
+  });
+}
+for (const step of [1, 2, 3]) {
+  test(`VZ entitlement stops after command ${step} fails`, async () => {
+    const failure = new PlatformFailure("FAILED", "command");
+    let calls = 0;
+    const runCommand: typeof command = async () => {
+      if (++calls === step) throw failure;
+      return Buffer.from("<key>com.apple.security.virtualization</key><true/>");
+    };
+    await expect(
+      validateVzEntitlement("/owned/host-agent", childEnvironment(root), runCommand),
+    ).rejects.toBe(failure);
+    expect(calls).toBe(step);
+  });
+}
 test("controlled child sees no parent secret or runtime injection", async () => {
   process.env.MCP_PLATFORM_TEST_SECRET = "must-not-cross";
   try {
