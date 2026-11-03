@@ -94,7 +94,11 @@ class McpLanes(unittest.TestCase):
         for path in ['tests/fixtures/mcp-stack/main.mts',
                      'tests/fixtures/mcp-stack/durable.test.mts',
                      'tests/fixtures/mcp-stack/process.test.mts',
-                     'tests/fixtures/mcp-stack/tsconfig.json']:
+                     'tests/fixtures/mcp-stack/tsconfig.json',
+                     'tests/fixtures/mcp-stack/platform/supervisor.ts',
+                     'tests/fixtures/mcp-stack/platform/platform.test.ts',
+                     'tests/fixtures/mcp-stack/platform/composition.test.ts',
+                     'tests/fixtures/mcp-stack/platform/tsconfig.json']:
             with self.subTest(path=path):
                 result = detect(path)
                 self.assertEqual(result['test_mcp_worker'], 'true')
@@ -123,6 +127,15 @@ class McpLanes(unittest.TestCase):
         self.assertIn('run: bun run tsc -p scripts/mcp-stack/tsconfig.json --noEmit', orch)
         self.assertIn('bun test scripts/mcp-stack', orch)
         self.assertIn('0 fail', orch)
+        self.assertIn('run: bun run tsc -p ../tests/fixtures/mcp-stack/platform/tsconfig.json --noEmit', orch)
+        platform = orch.split('      - name: MCP platform source unit tests', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('bun test ../tests/fixtures/mcp-stack/platform', platform)
+        self.assertNotIn('        if:', platform)
+        project = json.loads((SCRIPT.parents[2] / 'tests/fixtures/mcp-stack/platform/tsconfig.json').read_text())
+        self.assertEqual(project['extends'], '../../../../orchestrator/tsconfig.json')
+        self.assertEqual(project['include'], ['./*.ts'])
+        settings = json.loads((SCRIPT.parents[2] / 'orchestrator/tsconfig.json').read_text())
+        self.assertTrue(settings['compilerOptions']['strict'])
         gate = workflow.split('  ci-gate:', 1)[1]
         for lane in ['orchestrator', 'mcp-worker', 'test-linux', 'test-macos']:
             self.assertIn(f'      - {lane}\n', gate)

@@ -95,6 +95,50 @@ class NativeSourceGate(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
                     self.assertTrue((root / 'var/mcp-stack-runner').is_dir())
 
+    def test_platform_gate_requires_openssl_three_and_nonzero_tests(self):
+        # Command stubs only: actual platform source tests run in the CI job.
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        step = workflow.split('      - name: MCP platform source unit tests', 1)[1]
+        body = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'bin'
+            commands.mkdir()
+            openssl = commands / 'openssl'
+            openssl.write_text(f'#!{sys.executable}\n'
+                               'import os, sys\n'
+                               'assert sys.argv[1:] == ["version"]\n'
+                               'print(os.environ["FAKE_OPENSSL_VERSION"])\n'
+                               'sys.exit(int(os.environ["FAKE_OPENSSL_EXIT"]))\n')
+            openssl.chmod(0o700)
+            bun = commands / 'bun'
+            bun.write_text(f'#!{sys.executable}\n'
+                           'import os, sys\n'
+                           'from pathlib import Path\n'
+                           'assert sys.argv[1:] == ["test", "../tests/fixtures/mcp-stack/platform"]\n'
+                           'assert os.environ["MCP_PLATFORM_TEST_OPENSSL"] == str(Path(__file__).with_name("openssl"))\n'
+                           'print(os.environ["FAKE_BUN_SUMMARY"])\n'
+                           'sys.exit(int(os.environ["FAKE_BUN_EXIT"]))\n')
+            bun.chmod(0o700)
+            env = dict(PATH=f'{commands}{os.pathsep}/usr/bin:/bin', TMPDIR=str(root))
+            good = ' 22 pass\n 0 fail\nRan 22 tests across 1 file. [80ms]'
+            for name, version, openssl_exit, summary, bun_exit, expected in [
+                ('positive', 'OpenSSL 3.0.13', 0, good, 0, True),
+                ('libressl', 'LibreSSL 3.3.6', 0, good, 0, False),
+                ('old-openssl', 'OpenSSL 1.1.1', 0, good, 0, False),
+                ('failed-openssl', 'OpenSSL 3.0.13', 42, good, 0, False),
+                ('zero-tests', 'OpenSSL 3.0.13', 0, ' 0 pass\n 0 fail\nRan 0 tests across 1 file.', 0, False),
+                ('failed-test', 'OpenSSL 3.0.13', 0, ' 21 pass\n 1 fail\nRan 22 tests across 1 file.', 0, False),
+                ('no-tests', 'OpenSSL 3.0.13', 0, 'No tests found', 0, False),
+                ('failed-command', 'OpenSSL 3.0.13', 0, good, 42, False),
+            ]:
+                with self.subTest(name=name):
+                    env.update(FAKE_OPENSSL_VERSION=version, FAKE_OPENSSL_EXIT=str(openssl_exit),
+                               FAKE_BUN_SUMMARY=summary, FAKE_BUN_EXIT=str(bun_exit))
+                    result = subprocess.run(['bash', '-c', body], cwd=root, env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

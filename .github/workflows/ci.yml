@@ -1050,6 +1050,20 @@ jobs:
           grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
           grep -Eq '^[[:space:]]*0 fail$' "$result"
           grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files\.' "$result"
+      - name: MCP platform source typecheck
+        run: bun run tsc -p ../tests/fixtures/mcp-stack/platform/tsconfig.json --noEmit
+      - name: MCP platform source unit tests
+        run: |
+          set -euo pipefail
+          MCP_PLATFORM_TEST_OPENSSL=$(command -v openssl)
+          export MCP_PLATFORM_TEST_OPENSSL
+          "$MCP_PLATFORM_TEST_OPENSSL" version | grep -Eq '^OpenSSL 3\.'
+          result=$(mktemp)
+          trap 'rm -f "$result"' EXIT
+          bun test ../tests/fixtures/mcp-stack/platform 2>&1 | tee "$result"
+          grep -Eq '^[[:space:]]*[1-9][0-9]* pass$' "$result"
+          grep -Eq '^[[:space:]]*0 fail$' "$result"
+          grep -Eq '^Ran [1-9][0-9]* tests across [1-9][0-9]* files?\.' "$result"
       - name: apply orchestrator migrations
         run: bun run migrate
       - name: bun test
