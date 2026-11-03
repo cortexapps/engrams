@@ -38,7 +38,7 @@ impl Adapter {
         dns: UdpSocket,
         guest: Ipv4Addr,
         gateway: Ipv4Addr,
-        terminal: Option<std::sync::mpsc::Sender<()>>,
+        terminal: Option<std::sync::mpsc::Sender<super::child::Control>>,
     ) -> io::Result<Self> {
         use std::os::fd::AsFd;
         let probe = Arc::new(std::sync::Mutex::new(Some(
@@ -111,7 +111,7 @@ impl Adapter {
             let _ = result;
             state_worker.store(DEAD, Ordering::Release);
             if let Some(signal) = &lifetime.terminal {
-                let _ = signal.send(());
+                let _ = signal.send(super::child::Control::Stop);
             }
             // Listeners and every accepted guest/Unix socket close before the
             // private write half returns cleanup EOF to the policy lease.
@@ -245,7 +245,7 @@ impl Drop for Adapter {
 struct Lifetime {
     state: Arc<AtomicU8>,
     probe: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
-    terminal: Option<std::sync::mpsc::Sender<()>>,
+    terminal: Option<std::sync::mpsc::Sender<super::child::Control>>,
     reader: Option<tokio::task::AbortHandle>,
 }
 impl Drop for Lifetime {
@@ -260,7 +260,7 @@ impl Drop for Lifetime {
             reader.abort();
         }
         if let Some(signal) = &self.terminal {
-            let _ = signal.send(());
+            let _ = signal.send(super::child::Control::Stop);
         }
     }
 }
