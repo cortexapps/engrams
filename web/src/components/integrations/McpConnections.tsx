@@ -205,12 +205,15 @@ function McpConnection({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const current = status.data?.current?.connection ?? connection;
+  async function refreshConnection() {
+    await Promise.all([status.refetch(), refresh()]);
+  }
   async function run(action: () => Promise<unknown>) {
     setBusy(true);
     setMessage("");
     try {
       await action();
-      await Promise.all([status.refetch(), refresh()]);
+      await refreshConnection();
     } catch {
       setMessage(
         "The action could not be completed. Reload the connection and try again or recover it.",
@@ -586,6 +589,7 @@ function McpConnection({
         revision={current.configRevision}
         authGeneration={current.authGeneration}
         discoveryAvailable={setup.discoveryAvailable}
+        refreshConnection={refreshConnection}
       />
       <div className="text-xs text-muted-foreground">
         If this tab has lost authorization context, recover the connection and clear this tab before

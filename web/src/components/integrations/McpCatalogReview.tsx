@@ -10,11 +10,13 @@ export function McpCatalogReview({
   revision,
   authGeneration,
   discoveryAvailable,
+  refreshConnection,
 }: {
   connectionId: string;
   revision: number;
   authGeneration: number;
   discoveryAvailable: boolean;
+  refreshConnection: () => Promise<void>;
 }) {
   const client = createClient(IntegrationService, useTransport());
   const catalogs = useQuery(getMcpCatalogs, { connectionId });
@@ -56,11 +58,11 @@ export function McpCatalogReview({
     try {
       await client.publishMcp({ connectionId, draftId, expectedRevision, tools: review });
       setReview(null);
-      await catalogs.refetch();
+      await Promise.all([catalogs.refetch(), refreshConnection()]);
       setMessage("Catalog published. Review the connection before enabling it.");
     } catch {
       setReview(null);
-      await catalogs.refetch();
+      await Promise.all([catalogs.refetch(), refreshConnection()]);
       setMessage(
         "Could not publish. The connection or catalog may have changed. Reload and review the draft again.",
       );

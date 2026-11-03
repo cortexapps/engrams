@@ -37,7 +37,13 @@ describe("MCP catalog review", () => {
       }),
     );
     renderWithProviders(
-      <McpCatalogReview connectionId="c1" revision={1} authGeneration={1} discoveryAvailable />,
+      <McpCatalogReview
+        connectionId="c1"
+        revision={1}
+        authGeneration={1}
+        discoveryAvailable
+        refreshConnection={async () => {}}
+      />,
       { transport },
     );
     const user = userEvent.setup();
@@ -81,7 +87,13 @@ describe("MCP catalog review", () => {
       }),
     );
     renderWithProviders(
-      <McpCatalogReview connectionId="c1" revision={1} authGeneration={1} discoveryAvailable />,
+      <McpCatalogReview
+        connectionId="c1"
+        revision={1}
+        authGeneration={1}
+        discoveryAvailable
+        refreshConnection={async () => {}}
+      />,
       { transport },
     );
     const user = userEvent.setup();

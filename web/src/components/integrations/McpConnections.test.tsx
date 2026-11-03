@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { create } from "@bufbuild/protobuf";
-import { createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "@/test-utils";
 import { GetMcpSetupResponseSchema, IntegrationService } from "@/gen/engram/app/v1/integration_pb";
 import { McpConnections } from "./McpConnections";
@@ -223,3 +223,84 @@ it("keeps configured recovery and disconnect available while new dispatch is dis
   await user.click(screen.getByRole("button", { name: "Disconnect" }));
   await waitFor(() => expect(calls).toEqual(["recover", "disconnect"]));
 });
+
+it.each([false, true])(
+  "refreshes the connection state after catalog publication (conflict: %s)",
+  async (conflict) => {
+    let connection = {
+      id: "c1",
+      provider: "mcp",
+      alias: "tools",
+      displayName: "Tools",
+      enabled: true,
+      configRevision: 1,
+      authGeneration: 1,
+      catalogRevision: 2,
+      mcp: { endpoint: "https://tools.example/mcp", zone: "public", authKind: "api_key" },
+    };
+    let published = false;
+    const transport = createRouterTransport((router) =>
+      router.service(IntegrationService, {
+        listConnections: () => ({ connections: [connection] }),
+        getMcpSetup: () => ({ current: { connection } }),
+        getMcpCatalogs: () => ({
+          configRevision: connection.configRevision,
+          catalogRevision: connection.catalogRevision,
+          draft:
+            !published || conflict
+              ? {
+                  id: published ? "new-draft" : "draft",
+                  configRevision: connection.configRevision,
+                  authGeneration: connection.authGeneration,
+                  tools: [{ upstreamName: "read.item", inputSchemaJson: '{"type":"object"}' }],
+                }
+              : undefined,
+        }),
+        publishMcp: () => {
+          published = true;
+          connection = {
+            ...connection,
+            enabled: false,
+            configRevision: 2,
+            authGeneration: 2,
+            catalogRevision: 3,
+          };
+          if (conflict) throw new ConnectError("stale", Code.Aborted);
+          return {};
+        },
+        setConnectionEnabled: (request) => {
+          if (request.expectedRevision !== connection.configRevision) {
+            throw new ConnectError("stale", Code.Aborted);
+          }
+          connection = { ...connection, enabled: request.enabled };
+          return { connection };
+        },
+      }),
+    );
+    renderWithProviders(
+      <McpConnections
+        setup={create(GetMcpSetupResponseSchema, { enabled: true, discoveryAvailable: true })}
+      />,
+      { transport },
+    );
+    const user = userEvent.setup();
+    await screen.findByRole("button", { name: "Disable" });
+    await user.click(await screen.findByRole("button", { name: "Review draft" }));
+    await user.selectOptions(screen.getByLabelText("Classification for read.item"), "read");
+    await user.click(screen.getByRole("button", { name: "Publish reviewed catalog" }));
+    await screen.findByText(conflict ? /reload and review the draft again/i : /catalog published/i);
+    expect(screen.getByText(/public · https:\/\/tools.example\/mcp · Disabled/)).toBeTruthy();
+    expect(screen.getByText(/Published revision 3/)).toBeTruthy();
+    const enable = screen.getByRole("button", { name: "Enable" });
+    expect((enable as HTMLButtonElement).disabled).toBe(false);
+    if (conflict) {
+      expect(
+        (screen.getByRole("button", { name: "Review draft" }) as HTMLButtonElement).disabled,
+      ).toBe(false);
+      expect(screen.queryByText(/this draft is stale/i)).toBeNull();
+    }
+    await user.click(enable);
+    await screen.findByRole("button", { name: "Disable" });
+    expect(screen.getByText(/public · https:\/\/tools.example\/mcp · Enabled/)).toBeTruthy();
+  },
+);
