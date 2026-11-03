@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { checkDb, getDb } from "../db/client.ts";
 import { task, taskSession } from "../db/schema.ts";
 import { compileSessionBindings } from "../mcp/session-bindings.ts";
@@ -68,41 +68,35 @@ test.skipIf(!reachable)(
       source = fixture.connections[0]!;
     const grants = fixture.profileGrants.map((grant) => ({ ...grant, connectionId: cid }));
     try {
-      await db
-        .insert(profile)
-        .values({
-          id: pid,
-          name: "Binding test",
-          imageId: "image",
-          harness: "claude",
-          integrationGrants: grants,
-        });
-      await db
-        .insert(integrationConnection)
-        .values({
-          id: cid,
-          alias: `docs-${cid}`,
-          provider: "mcp",
-          displayName: "Docs",
-          config: source.config,
-          enabled: true,
-          ...source.state,
-        });
-      await db
-        .insert(mcpCatalog)
-        .values({
-          id: catalogId,
-          connectionId: cid,
-          kind: "published",
-          revision: 1,
-          configRevision: 1,
-          authGeneration: 1,
-          credentialIdentity: source.state.credentialIdentity,
-          tools: source.tools,
-          fingerprint: canonicalDigest(source.tools),
-          actorId: "test-operator",
-          createdAt: new Date(),
-        });
+      await db.insert(profile).values({
+        id: pid,
+        name: "Binding test",
+        imageId: "image",
+        harness: "claude",
+        integrationGrants: grants,
+      });
+      await db.insert(integrationConnection).values({
+        id: cid,
+        alias: `docs-${cid}`,
+        provider: "mcp",
+        displayName: "Docs",
+        config: source.config,
+        enabled: true,
+        ...source.state,
+      });
+      await db.insert(mcpCatalog).values({
+        id: catalogId,
+        connectionId: cid,
+        kind: "published",
+        revision: 1,
+        configRevision: 1,
+        authGeneration: 1,
+        credentialIdentity: source.state.credentialIdentity,
+        tools: source.tools,
+        fingerprint: canonicalDigest(source.tools),
+        actorId: "test-operator",
+        createdAt: new Date(),
+      });
       const authority = await readLiveBindingAuthority(pid, fixture.operatorPolicies, db);
       const snapshot = compileSessionBindings({
         launchPolicy: { profileId: pid, integrationGrants: grants },
@@ -168,6 +162,163 @@ test.skipIf(!reachable)(
     } finally {
       await db.delete(mcpCatalog).where(eq(mcpCatalog.id, catalogId));
       await db.delete(integrationConnection).where(eq(integrationConnection.id, cid));
+      await db.delete(profile).where(eq(profile.id, pid));
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "live authority reads all current catalogs in two queries and retains unavailable connections",
+  async () => {
+    const { drizzle } = await import("drizzle-orm/node-postgres");
+    const { getPool } = await import("../db/client.ts");
+    const schema = await import("../db/schema.ts");
+    const { profile, integrationConnection, mcpCatalog } = schema;
+    const { readLiveBindingAuthority } = await import("../mcp/binding-store.ts");
+    const { canonicalDigest } = await import("../mcp/hash.ts");
+    const { reviewCatalog } = await import("../mcp/catalog.ts");
+    const { checkBindingCurrent } = await import("../mcp/session-bindings.ts");
+    const queries: string[] = [];
+    const db = drizzle(getPool(), {
+      schema,
+      logger: { logQuery: (query) => queries.push(query) },
+    });
+    const pid = crypto.randomUUID();
+    const ids = {
+      current: crypto.randomUUID(),
+      stale: crypto.randomUUID(),
+      draft: crypto.randomUUID(),
+      credentials: crypto.randomUUID(),
+      revoked: crypto.randomUUID(),
+      missing: crypto.randomUUID(),
+      other: crypto.randomUUID(),
+    };
+    const fixture = bindingAuthority(),
+      source = fixture.connections[0]!;
+    const grants = [ids.current, ids.revoked].map((connectionId) => ({
+      ...fixture.profileGrants[0]!,
+      connectionId,
+    }));
+    const updatedTools = reviewCatalog([
+      { ...source.tools[0]!, description: "Search current documents" },
+    ]);
+    const catalogs = [
+      { connectionId: ids.current, revision: 1, kind: "published" as const },
+      { connectionId: ids.current, revision: 2, kind: "published" as const },
+      { connectionId: ids.stale, revision: 1, kind: "published" as const },
+      { connectionId: ids.draft, revision: 0, kind: "draft" as const },
+      { connectionId: ids.credentials, revision: 1, kind: "published" as const },
+      { connectionId: ids.revoked, revision: 1, kind: "published" as const },
+      { connectionId: ids.current, revision: 3, kind: "published" as const },
+    ].map((value) => {
+      const tools =
+        value.revision === 3
+          ? [{ ...updatedTools[0]!, fingerprint: "invalid" }]
+          : value.revision === 2
+            ? updatedTools
+            : source.tools;
+      return {
+        ...value,
+        id: crypto.randomUUID(),
+        configRevision: 1,
+        authGeneration: value.connectionId === ids.credentials ? 2 : 1,
+        credentialIdentity: source.state.credentialIdentity,
+        tools,
+        fingerprint: canonicalDigest(tools),
+        actorId: "test-operator",
+        createdAt: new Date(),
+      };
+    });
+    async function read() {
+      queries.length = 0;
+      const authority = await readLiveBindingAuthority(pid, fixture.operatorPolicies, db);
+      expect(queries).toHaveLength(2);
+      return authority;
+    }
+    try {
+      await db.insert(profile).values({
+        id: pid,
+        name: "Catalog join test",
+        imageId: "image",
+        harness: "claude",
+        integrationGrants: grants,
+      });
+      await db.insert(integrationConnection).values(
+        Object.entries(ids).map(([name, id]) => ({
+          id,
+          alias: `docs-${id}`,
+          provider: name === "other" ? "github" : "mcp",
+          displayName: "Docs",
+          config: name === "other" ? {} : source.config,
+          enabled: true,
+          ...source.state,
+          catalogRevision: name === "stale" ? 2 : name === "draft" ? 0 : 1,
+        })),
+      );
+      await db.insert(mcpCatalog).values(catalogs);
+      const authority = await read();
+      const connections = new Map(
+        authority.connections.map((connection) => [connection.id, connection]),
+      );
+      expect(connections.has(ids.other)).toBe(false);
+      expect(connections.get(ids.current)).toMatchObject({
+        catalogId: catalogs[0]!.id,
+        enabled: true,
+        tools: source.tools,
+      });
+      for (const id of [ids.stale, ids.draft, ids.missing]) {
+        expect(connections.get(id)).toMatchObject({ catalogId: "", enabled: false, tools: [] });
+      }
+      expect(connections.get(ids.credentials)).toMatchObject({
+        catalogId: catalogs[4]!.id,
+        enabled: false,
+        tools: [],
+      });
+      const snapshot = compileSessionBindings({
+        launchPolicy: { profileId: pid, integrationGrants: grants },
+        liveAuthority: authority,
+        bindingEpoch: 0,
+      });
+      expect(checkBindingCurrent({ snapshot, liveAuthority: authority }).current).toBe(true);
+      await db
+        .update(integrationConnection)
+        .set({ catalogRevision: 2 })
+        .where(eq(integrationConnection.id, ids.current));
+      await db
+        .update(integrationConnection)
+        .set({ revoked: true })
+        .where(eq(integrationConnection.id, ids.revoked));
+      const current = await read();
+      expect(current.connections.find((connection) => connection.id === ids.current)).toMatchObject(
+        {
+          catalogId: catalogs[1]!.id,
+          enabled: true,
+          tools: updatedTools,
+          state: { catalogRevision: 2 },
+        },
+      );
+      expect(current.connections.find((connection) => connection.id === ids.revoked)).toMatchObject(
+        {
+          catalogId: catalogs[5]!.id,
+          state: { revoked: true },
+        },
+      );
+      expect(checkBindingCurrent({ snapshot, liveAuthority: current })).toMatchObject({
+        current: false,
+        staleReasons: expect.arrayContaining(["catalogRevision", "connection_unavailable"]),
+      });
+      await db
+        .update(integrationConnection)
+        .set({ catalogRevision: 3 })
+        .where(eq(integrationConnection.id, ids.current));
+      await expect(readLiveBindingAuthority(pid, fixture.operatorPolicies, db)).rejects.toThrow(
+        "MCP catalog fingerprint mismatch",
+      );
+    } finally {
+      await db.delete(mcpCatalog).where(inArray(mcpCatalog.connectionId, Object.values(ids)));
+      await db
+        .delete(integrationConnection)
+        .where(inArray(integrationConnection.id, Object.values(ids)));
       await db.delete(profile).where(eq(profile.id, pid));
     }
   },

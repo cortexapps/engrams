@@ -108,21 +108,19 @@ export async function readLiveBindingAuthority(
   if (!currentProfile || currentProfile.deletedAt)
     throw new McpAuthorityStale("MCP profile unavailable");
   const rows = await db
-    .select()
+    .select({ connection: integrationConnection, catalog: mcpCatalog })
     .from(integrationConnection)
+    .leftJoin(
+      mcpCatalog,
+      and(
+        eq(mcpCatalog.connectionId, integrationConnection.id),
+        eq(mcpCatalog.kind, "published"),
+        eq(mcpCatalog.revision, integrationConnection.catalogRevision),
+      ),
+    )
     .where(eq(integrationConnection.provider, "mcp"));
   const connections: McpLiveAuthority["connections"] = [];
-  for (const row of rows) {
-    const [catalog] = await db
-      .select()
-      .from(mcpCatalog)
-      .where(
-        and(
-          eq(mcpCatalog.connectionId, row.id),
-          eq(mcpCatalog.kind, "published"),
-          eq(mcpCatalog.revision, row.catalogRevision),
-        ),
-      );
+  for (const { connection: row, catalog } of rows) {
     const available =
       catalog &&
       catalog.configRevision === row.configRevision &&
