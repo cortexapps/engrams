@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, writeFile, symlink, rm } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, symlink, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   ContextSchema,
@@ -304,6 +304,7 @@ test("owned file rejects traversal and symlink", async () => {
 });
 test("owned file rejects loose permissions and oversize", async () => {
   await writeFile(join(root, "loose"), "neutral", { mode: 0o644 });
+  await chmod(join(root, "loose"), 0o644);
   await expect(privateFile(root, join(root, "loose"))).rejects.toThrow(
     "private_file",
   );
