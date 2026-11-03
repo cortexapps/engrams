@@ -530,6 +530,23 @@ class Producer:
         self.images.pop('hostBase')
         return result
 
+    def discover_native_sdk(self):
+        try:
+            output = self.call(['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'], timeout=30)
+            lines = output.decode().splitlines()
+            require(len(lines) == 1 and lines[0] == lines[0].strip() and
+                    '\0' not in lines[0] and Path(lines[0]).is_absolute(), 'native_macos_sdk_path')
+            # The selected system SDK can be an alias to its installed version.
+            sdk = Path(lines[0]).resolve(strict=True)
+            info = sdk.stat()
+            header = sdk / 'usr/include/TargetConditionals.h'
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, os.getuid()} and
+                    info.st_mode & 0o022 == 0 and header.is_file() and
+                    header.stat().st_size > 0 and os.access(header, os.R_OK), 'native_macos_sdk_unusable')
+        except (OSError, ValueError, RuntimeError) as error:
+            raise RuntimeError('native_macos_sdk_unusable') from error
+        return str(sdk)
+
     def native_host(self):
         build = self.root / 'native-build'
         build.mkdir(mode=0o700)
@@ -537,7 +554,8 @@ class Producer:
             (build / name).mkdir(mode=0o700)
         # Real cargo/rustc toolchain binaries, never credential-reading rustup shims.
         env = {**self.env, 'CARGO_HOME': str(build / 'cargo'), 'CARGO_TARGET_DIR': str(build / 'target'),
-               'RUSTC': self.tools['rustc'], 'SQLX_OFFLINE': 'true'}
+               'RUSTC': self.tools['rustc'], 'SQLX_OFFLINE': 'true',
+               'SDKROOT': self.native_sdk, 'CARGO_BUILD_JOBS': '2'}
         version = self.call([self.tools['rustc'], '--version']).decode().split()
         require(version[1] == '1.99.0', 'native_rust_toolchain')
         fp = self.call([sys.executable, '-I', self.source / 'docker/egress-proxyd-fingerprint.py'], env=env, cwd=self.source).decode().strip()
@@ -552,7 +570,7 @@ class Producer:
         self.call(['/usr/bin/codesign', '--verify', '--strict', host['path']])
         self.call([self.tools['cc'], '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
                    self.source / 'tests/fixtures/mcp-stack/platform/native-process-identity.c',
-                   '-o', self.files / 'nativeProbe'])
+                   '-o', self.files / 'nativeProbe'], env=env)
         (self.files / 'nativeProbe').chmod(0o700)
         # build.sh creates its own exact private caches and verifies Go1.26.2.
         (build / 'netstack').rmdir()
@@ -579,6 +597,7 @@ class Producer:
                 require(stat.S_ISCHR(p.stat().st_mode) and os.access(p, os.R_OK | os.W_OK), 'fc_device')
         else:
             require(self.call(['/usr/sbin/sysctl', '-n', 'kern.hv_support']).strip() == b'1', 'vz_hypervisor')
+            self.native_sdk = self.discover_native_sdk()
         require(self.call([self.tools['node'], '--version']).decode().startswith('v24.'), 'node24')
         require(self.call([self.tools['openssl'], 'version']).decode().startswith('OpenSSL 3.'), 'openssl3')
         expected_bun = (REPO / '.bun-version').read_text().strip()

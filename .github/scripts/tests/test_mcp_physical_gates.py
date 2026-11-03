@@ -469,6 +469,126 @@ else:
             finally:
                 sock.close()
 
+    @contextmanager
+    def native_sdk_fixture(self, backend='vz'):
+        # Controlled command responses only; no compiler, engine or VM runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            sdk = root / 'MacOSX.sdk'
+            header = sdk / 'usr/include/TargetConditionals.h'
+            header.parent.mkdir(parents=True)
+            header.write_text('/* installed SDK header */\n')
+            alias = root / 'selected.sdk'
+            alias.symlink_to(sdk, target_is_directory=True)
+            work = root / 'work'
+            work.mkdir(mode=0o700)
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.bind(str(root / 'engine.sock'))
+                tools = assets.TOOLS | ({'cargo', 'rustc', 'cc', 'go'} if backend == 'vz' else set())
+                p = assets.Producer(backend, work, {'engineSocket': str(root / 'engine.sock'),
+                                                 'tools': {key: '/tools/' + key for key in tools}})
+                p.sdk_output = (str(alias) + '\n').encode()
+                p.commands = []
+                def call(argv, **kwargs):
+                    p.commands.append((argv, dict(kwargs.get('env', p.env))))
+                    if argv[0] == '/usr/bin/xcrun':
+                        if isinstance(p.sdk_output, Exception):
+                            raise p.sdk_output
+                        return p.sdk_output
+                    if argv[0] == '/usr/sbin/sysctl':
+                        return b'1\n'
+                    if argv[0] == '/tools/rustc':
+                        return b'rustc 1.99.0 (fixture)\n'
+                    if argv[0] == sys.executable:
+                        return b'a' * 64
+                    if argv[0] == '/tools/cc':
+                        (p.files / 'nativeProbe').write_bytes(b'fixture probe')
+                    return {'/tools/node': b'v24.0.0', '/tools/openssl': b'OpenSSL 3.0',
+                            '/tools/bun': (ROOT / '.bun-version').read_bytes()}.get(argv[0], b'')
+                p.call = call
+                p.engine = lambda command, *args: json.dumps(
+                    {'OSType': 'linux', 'Architecture': p.arch, 'ID': 'fixture-engine-id'} if command == 'info'
+                    else {'Server': {'Version': '29.0', 'ApiVersion': '1.45'}}).encode()
+                p.stage = lambda path, name, executable: {'path': str(path)}
+                with patch.object(assets.platform, 'system', return_value='Darwin' if backend == 'vz' else 'Linux'), \
+                     patch.object(assets.platform, 'machine', return_value='arm64' if backend == 'vz' else 'x86_64'), \
+                     patch.object(p, 'snapshot', side_effect=RuntimeError('before_images')) as snapshot:
+                    yield p, sdk, header, snapshot
+
+    def test_native_sdk_selected_alias_reaches_cargo_and_probe_without_ambient_config(self):
+        with patch.dict(os.environ, {'SDKROOT': '/poison/sdk', 'CC': '/poison/cc', 'CFLAGS': '-poison',
+                                     'DEVELOPER_DIR': '/poison/developer', 'CARGO_BUILD_JOBS': '99'}), \
+             self.native_sdk_fixture() as (p, sdk, header, snapshot):
+            with self.assertRaisesRegex(RuntimeError, 'before_images'):
+                p.produce()
+            snapshot.assert_called_once()
+            p.native_host()
+            discovery = [entry for entry in p.commands if entry[0][0] == '/usr/bin/xcrun']
+            self.assertEqual(len(discovery), 1)
+            self.assertEqual(discovery[0][0], ['/usr/bin/xcrun', '--sdk', 'macosx', '--show-sdk-path'])
+            self.assertFalse({'SDKROOT', 'CC', 'CFLAGS', 'DEVELOPER_DIR'}.intersection(discovery[0][1]))
+            cargo = next(env for argv, env in p.commands if argv[0] == '/tools/cargo')
+            probe = next(env for argv, env in p.commands if argv[0] == '/tools/cc')
+            self.assertEqual(cargo.get('SDKROOT'), str(sdk))
+            self.assertEqual(probe.get('SDKROOT'), str(sdk))
+            self.assertEqual(cargo.get('CARGO_BUILD_JOBS'), '2')
+            self.assertEqual(cargo['RUSTC'], '/tools/rustc')
+            self.assertEqual(cargo['ENGRAM_EGRESS_PROXYD_FINGERPRINT'], 'a' * 64)
+            self.assertFalse({'CC', 'CFLAGS', 'DEVELOPER_DIR'}.intersection(cargo))
+            self.assertNotIn('SDKROOT', p.env)
+
+    def test_native_sdk_rejects_bad_selection_before_images(self):
+        for case in ['empty', 'relative', 'multiple', 'encoding', 'nul', 'missing', 'file', 'writable',
+                     'foreign_owner', 'missing_header', 'empty_header', 'header_directory', 'unreadable_header',
+                     'symlink_loop', 'xcrun_missing', 'xcrun_failure']:
+            with self.subTest(case=case), self.native_sdk_fixture() as (p, sdk, header, snapshot):
+                if case in ['empty', 'relative', 'multiple', 'encoding', 'nul', 'missing', 'file']:
+                    p.sdk_output = {'empty': b'', 'relative': b'relative.sdk\n', 'multiple': b'/one\n/two\n',
+                                    'encoding': b'\xff', 'nul': b'/sdk\x00', 'missing': str(sdk / 'missing').encode(),
+                                    'file': str(header).encode()}[case]
+                elif case == 'writable':
+                    sdk.chmod(0o777)
+                elif case == 'missing_header':
+                    header.unlink()
+                elif case == 'empty_header':
+                    header.write_bytes(b'')
+                elif case == 'header_directory':
+                    header.unlink()
+                    header.mkdir()
+                elif case == 'symlink_loop':
+                    loop = sdk.parent / 'loop.sdk'
+                    loop.symlink_to(loop)
+                    p.sdk_output = str(loop).encode()
+                elif case in ['xcrun_missing', 'xcrun_failure']:
+                    p.sdk_output = FileNotFoundError('xcrun') if case == 'xcrun_missing' else RuntimeError('producer_command')
+                real_stat, real_access = Path.stat, os.access
+                def sdk_stat(path, *args, **kwargs):
+                    value = real_stat(path, *args, **kwargs)
+                    if case == 'foreign_owner' and path == sdk:
+                        fields = list(value)
+                        fields[4] = os.getuid() + 10000
+                        return os.stat_result(fields)
+                    return value
+                with patch.object(Path, 'stat', autospec=True, side_effect=sdk_stat), \
+                     patch.object(assets.os, 'access', side_effect=lambda path, mode:
+                                  False if case == 'unreadable_header' and path == header else real_access(path, mode)):
+                    with self.assertRaisesRegex(RuntimeError, 'native_macos_sdk|producer_command'):
+                        p.produce()
+                snapshot.assert_not_called()
+                self.assertFalse(any(argv[0] == '/tools/cargo' for argv, env in p.commands))
+
+    def test_firecracker_preflight_does_not_discover_or_export_native_sdk(self):
+        with self.native_sdk_fixture('firecracker') as (p, sdk, header, snapshot), \
+             patch.object(assets.os, 'getuid', return_value=0), \
+             patch.object(assets, 'canonical', return_value=header), \
+             patch.object(assets.stat, 'S_ISCHR', return_value=True):
+            with self.assertRaisesRegex(RuntimeError, 'before_images'):
+                p.produce()
+            snapshot.assert_called_once()
+            self.assertFalse(any(argv[0] == '/usr/bin/xcrun' for argv, env in p.commands))
+            self.assertNotIn('SDKROOT', p.env)
+            self.assertNotIn('CARGO_BUILD_JOBS', p.env)
+
     def test_command_failure_and_cancellation_stop_production(self):
         # Fake CLI child only. No engine, application, helper or VM is executed.
         with tempfile.TemporaryDirectory() as directory:
