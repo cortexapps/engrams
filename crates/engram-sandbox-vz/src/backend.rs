@@ -525,6 +525,13 @@ impl VzBackend {
         let Some(w) = manifest.warm.clone() else {
             return Err("manifest has no warm block (pre-D7 snapshot, or the save failed)".into());
         };
+        if w.configuration_revision != crate::snapshot::CONFIGURATION_REVISION {
+            return Err(format!(
+                "configuration revision differs (saved {}, current {})",
+                w.configuration_revision,
+                crate::snapshot::CONFIGURATION_REVISION
+            ));
+        }
         if !src.join(crate::snapshot::MACHINE_STATE_FILENAME).exists() {
             return Err("machine.vzs missing from the snapshot dir".into());
         }
@@ -1511,6 +1518,7 @@ impl SandboxBackend for VzBackend {
             let state_path = dest.join(crate::snapshot::MACHINE_STATE_FILENAME);
             match vm.save(&state_path).await {
                 Ok(()) => Some(crate::snapshot::WarmMachineState {
+                    configuration_revision: crate::snapshot::CONFIGURATION_REVISION,
                     machine_identifier: machine_identifier.clone(),
                     mac_address: mac_address.clone(),
                     // The cmdline the saved VM booted with — recomputed
@@ -2166,6 +2174,66 @@ mod tests {
 
         assert!(matches!(stream.next().await, Some(ExecEvent::Exit(None))));
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn warm_gate_requires_current_configuration_revision() {
+        let work = tempfile::tempdir().unwrap();
+        let kernel = tempfile::NamedTempFile::new().unwrap();
+        let backend =
+            VzBackend::new(work.path().join("sb"), VzConfig::with_kernel(kernel.path())).unwrap();
+        std::fs::write(
+            work.path().join(crate::snapshot::MACHINE_STATE_FILENAME),
+            [],
+        )
+        .unwrap();
+        let mut value = serde_json::json!({
+            "configuration_revision": 1,
+            "machine_identifier": [1, 2, 3],
+            "mac_address": "02:00:00:00:00:02",
+            "kernel_cmdline": backend.current_kernel_cmdline(),
+            "aux_ro_drives": [],
+            "memory_mib": 1024,
+            "vcpus": 2,
+            "swap_mib": null
+        });
+        let manifest_for = |value| {
+            crate::snapshot::VzSnapshotManifest::new(
+                SandboxId::new(),
+                SandboxSpec {
+                    image: "warm-test".into(),
+                    rootfs_source: None,
+                    image_uri: None,
+                    rootfs_manifest: None,
+                    cpu: engram_core::types::sandbox::CpuLimit { vcpus: 2 },
+                    memory: engram_core::types::sandbox::MemoryLimit { max_mib: 1024 },
+                    disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
+                    ttl: None,
+                    env: HashMap::new(),
+                    workdir: None,
+                    network: Default::default(),
+                    aux_ro_drives: vec![],
+                    swap_mib: None,
+                    swap_source: None,
+                    swap_manifest: None,
+                },
+                Some(serde_json::from_value(value).unwrap()),
+            )
+        };
+        let current = manifest_for(value.clone());
+        assert!(backend.warm_gate(&current, work.path()).is_ok());
+        for revision in [0, u32::MAX] {
+            value["configuration_revision"] = revision.into();
+            let manifest = manifest_for(value.clone());
+            let error = backend.warm_gate(&manifest, work.path()).unwrap_err();
+            assert!(error.contains("configuration revision"), "{error}");
+        }
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration_revision");
+        let legacy = manifest_for(value);
+        assert!(backend.warm_gate(&legacy, work.path()).is_err());
     }
 
     #[test]

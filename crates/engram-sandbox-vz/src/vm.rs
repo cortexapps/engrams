@@ -20,10 +20,11 @@ use objc2::AnyThread;
 use objc2_foundation::NSFileHandle;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSerialPortAttachment,
-    VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZBootLoader, VZDiskImageStorageDeviceAttachment, VZEntropyDeviceConfiguration,
+    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZSerialPortAttachment, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
     VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
@@ -915,6 +916,12 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         vz_cfg.setCPUCount(cfg.vcpus as objc2_foundation::NSUInteger);
         vz_cfg.setMemorySize((cfg.memory_mib as u64) * 1024 * 1024);
 
+        // Supply boot entropy before guest services need their random generators.
+        let entropy_device: Retained<VZEntropyDeviceConfiguration> =
+            Retained::cast_unchecked(VZVirtioEntropyDeviceConfiguration::new());
+        let entropy_devices = NSArray::from_retained_slice(&[entropy_device]);
+        vz_cfg.setEntropyDevices(&entropy_devices);
+
         // ADR 0096 spike: pinned machine identifier. Save/restore
         // requires the restoring VM's identifier to match the saved
         // one; the implicit default platform mints a fresh random one
@@ -1255,6 +1262,21 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn configuration_has_one_virtio_entropy_device() {
+        let kernel = tempfile::NamedTempFile::new().unwrap();
+        let rootfs = tempfile::NamedTempFile::new().unwrap();
+        let cfg = VmConfig::new(kernel.path(), rootfs.path(), 512, 1);
+        let configuration = build_configuration(&cfg).unwrap();
+        // SAFETY: fresh local configuration, no VM or queue access.
+        let devices = unsafe { configuration.entropyDevices() };
+        assert_eq!(devices.len(), 1);
+        assert!(devices
+            .objectAtIndex(0)
+            .downcast::<objc2_virtualization::VZVirtioEntropyDeviceConfiguration>()
+            .is_ok());
     }
 
     #[test]

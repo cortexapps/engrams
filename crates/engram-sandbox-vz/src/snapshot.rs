@@ -74,12 +74,19 @@ pub(crate) struct VzSnapshotManifest {
     pub(crate) warm: Option<WarmMachineState>,
 }
 
+/// Default VZ device layout. Increase for incompatible device changes.
+/// Revision 1 adds the virtio entropy device.
+pub(crate) const CONFIGURATION_REVISION: u32 = 1;
+
 /// ADR 0096 D7: the identity + effective config of the SAVED VM. One
 /// nested optional block (all-or-nothing) rather than loose fields —
 /// a partially-present identity is useless and shouldn't parse as
 /// warm-eligible.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WarmMachineState {
+    /// Missing legacy metadata is revision 0 and cannot use current warm state.
+    #[serde(default)]
+    pub(crate) configuration_revision: u32,
     /// `VZGenericMachineIdentifier.dataRepresentation` bytes — the
     /// restore contract requires the restoring VM's identifier to
     /// match the saved one.
@@ -259,10 +266,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_warm_configuration_revision_defaults_to_zero() {
+        let value = serde_json::json!({
+            "machine_identifier": [1, 2, 3],
+            "mac_address": "02:00:00:00:00:02",
+            "kernel_cmdline": "console=hvc0",
+            "aux_ro_drives": [],
+            "memory_mib": 1024,
+            "vcpus": 2
+        });
+        let warm: WarmMachineState = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(warm).unwrap();
+        assert_eq!(encoded["configuration_revision"], 0);
+    }
+
     /// ADR 0096 D7: the warm block round-trips intact.
     #[test]
     fn warm_block_round_trips() {
         let warm = WarmMachineState {
+            configuration_revision: CONFIGURATION_REVISION,
             machine_identifier: vec![1, 2, 3],
             mac_address: "0a:00:00:00:00:01".into(),
             kernel_cmdline: "console=hvc0 ENGRAM_EGRESS=1:2:3".into(),
@@ -275,6 +298,7 @@ mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         let parsed: VzSnapshotManifest = serde_json::from_slice(&bytes).unwrap();
         let w = parsed.warm.expect("warm survives");
+        assert_eq!(w.configuration_revision, CONFIGURATION_REVISION);
         assert_eq!(w.machine_identifier, vec![1, 2, 3]);
         assert_eq!(w.mac_address, "0a:00:00:00:00:01");
         assert_eq!(w.memory_mib, 1024);
