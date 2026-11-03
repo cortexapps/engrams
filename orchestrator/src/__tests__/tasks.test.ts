@@ -540,7 +540,20 @@ function okDb(taskId = "fake-task", listFixture?: ListDbFixture): Db {
   };
   return {
     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
-      const tx = { insert: () => ({ values: async () => undefined }) };
+      const tx = {
+        insert: (table: unknown) => ({
+          values: () => {
+            const result = Promise.resolve();
+            return Object.assign(result, {
+              onConflictDoNothing: ({ target }: { target: unknown }) => {
+                expect(table).toBe(sessionListenerTable);
+                expect(target).toBe(sessionListenerTable.sessionId);
+                return result;
+              },
+            });
+          },
+        }),
+      };
       return fn(tx);
     },
     select: () => makeSelectChain(),
