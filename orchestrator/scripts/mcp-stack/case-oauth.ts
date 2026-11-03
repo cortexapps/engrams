@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { authorizeOAuth, waitFor } from "./bootstrap.ts";
 import type { CallPlan } from "./call-plan.ts";
 import { requireThat, RunnerFailure } from "./context.ts";
@@ -16,7 +17,41 @@ import {
   startScenario,
   verifiedCounterResult,
 } from "./scenario-runtime.ts";
-import { assertNoDispatch, policyObservation } from "./case-grants.ts";
+import {
+  assertNoDispatch,
+  assertPolicyDenial,
+  policyObservation,
+} from "./case-grants.ts";
+
+export function assertOAuthRefusal(
+  proof: Parameters<typeof assertPolicyDenial>[0],
+) {
+  assertPolicyDenial(proof);
+}
+
+export function assertOAuthRefreshFailure(
+  proof: Parameters<typeof assertPolicyDenial>[0] & {
+    resultUnavailable?: boolean | null;
+  },
+  result: { state: string; resultUnavailable: boolean; resultJson?: string },
+) {
+  requireThat(
+    proof.resultReceived === true &&
+      proof.outcome === "failed" &&
+      proof.delivery === "unavailable" &&
+      proof.isError === null &&
+      proof.resultUnavailable === false &&
+      result.state === "failed" &&
+      !result.resultUnavailable &&
+      result.resultJson !== undefined,
+    "oauth_refresh_trigger_unavailable_read_failure",
+  );
+  z.strictObject({
+    outcome: z.literal("failed"),
+    delivery: z.literal("unavailable"),
+    reason: z.literal("upstream_failure"),
+  }).parse(JSON.parse(result.resultJson));
+}
 
 type Authority = {
   bindingHash: string;
@@ -51,10 +86,13 @@ export function oauthCallPlan(alias: string): CallPlan {
       "initial",
       "rotation",
       "account",
+      "account-stale",
       "account-rebound",
       "scope",
+      "scope-stale",
       "scope-rebound",
       "reconnect",
+      "reconnect-stale",
       "reconnect-rebound",
       "credential-probe",
     ].map((marker) => ({
@@ -292,12 +330,27 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           tool: scenario.alias,
           planSha256: scenario.planSha256,
         });
-        requireThat(
-          proofs.length === 1 &&
-            proofs[0]!.proof.resultReceived &&
-            proofs[0]!.proof.outcome !== "succeeded",
-          "changed_oauth_call_refused",
-        );
+        requireThat(proofs.length === 1, "single_changed_oauth_completion");
+        if (change === "reconnect") {
+          assertOAuthRefusal(proofs[0]!.proof);
+        } else {
+          const trigger = await execution(
+            ctx,
+            scenario,
+            true,
+            `oauth-${change}`,
+          );
+          requireThat(
+            trigger?.state === "failed",
+            "oauth_refresh_trigger_journal_failed",
+          );
+          const result =
+            await scenario.reviewClient.integration.getMcpExecutionResult({
+              sessionId: scenario.sessionId,
+              executionId: trigger.executionId,
+            });
+          assertOAuthRefreshFailure(proofs[0]!.proof, result);
+        }
         const stale = await waitFor(
           ctx,
           "oauth_binding_invalidated",
@@ -312,7 +365,25 @@ export const oauthAuthorityDriver: CaseDriver = async ({
             after.oauth.rotations > before.oauth.rotations,
             "changed_authority_actual_refresh_attempt",
           );
-          // The expanded response is refused. Restore the reviewed scope for a new explicit authorization.
+        }
+        // After trusted invalidation, require a separate available refusal from a new call.
+        await sendScenarioPrompt(scenario, false, `${change}-stale`);
+        const refusals = await pollProof(ctx, scenario, {
+          callId: `oauth-${change}-stale`,
+          tool: scenario.alias,
+          planSha256: scenario.planSha256,
+        });
+        requireThat(refusals.length === 1, "single_stale_oauth_refusal");
+        assertOAuthRefusal(refusals[0]!.proof);
+        const afterRefusal = await fixture.observe();
+        assertNoDispatch(after, afterRefusal);
+        requireThat(
+          afterRefusal.oauth.rotations === after.oauth.rotations,
+          "stale_oauth_refusal_does_not_refresh_again",
+        );
+        assertInvalidatedAuthority(old.bindingHash, await authority());
+        if (change !== "reconnect") {
+          // Restore the reviewed scope for a new explicit authorization.
           if (change === "scope") await fixture.oauth({ scope: "tools:read" });
           await authorizeOAuth(ctx, principals.admin, scenario.connection.id);
         }
@@ -376,14 +447,23 @@ export const oauthAuthorityDriver: CaseDriver = async ({
               },
               resultHash: read.resultHash,
             }),
+            policyObservation(
+              "guest-proof",
+              scenario.sessionId,
+              change === "reconnect" ? "denied" : "failed",
+              {
+                hash: proofs[0]!.sha256,
+                delivery: change === "reconnect" ? "available" : "unavailable",
+              },
+            ),
             policyObservation("guest-proof", scenario.sessionId, "denied", {
-              hash: proofs[0]!.sha256,
+              hash: refusals[0]!.sha256,
             }),
             policyObservation(
               "fixture-observer",
               scenario.connection.id,
               "denied",
-              { before, after },
+              { before, after, afterRefusal },
               0,
             ),
           ],

@@ -31,6 +31,14 @@ import {
   type StartedScenario,
 } from "./scenario-runtime.ts";
 
+export function assertReadOnlyPolicy(
+  policy: { writeEligibility: string } | undefined,
+) {
+  requireThat(
+    policy?.writeEligibility === "read_only",
+    "generic_plan_preserves_observed_read_only_policy",
+  );
+}
 export function assertPolicyDenial(proof: {
   resultReceived?: boolean;
   delivery?: string;
@@ -362,10 +370,7 @@ export const unattendedGrantDriver: CaseDriver = async (input) => {
         const afterPlan = await principals.admin.sessions.getMcpWritePolicy({
           sessionId: scenario.sessionId,
         });
-        requireThat(
-          afterPlan.policy?.writeEligibility !== "write_eligible",
-          "generic_plan_does_not_grant_mcp_authority",
-        );
+        assertReadOnlyPolicy(afterPlan.policy);
         assertions.push({
           assertion: "plan-approval-insufficient",
           observations: await deniedCall(

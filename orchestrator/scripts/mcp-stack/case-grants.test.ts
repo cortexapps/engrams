@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertPolicyDenial,
+  assertReadOnlyPolicy,
   assertNoDispatch,
   grantUpdateRequest,
   fixedPolicyPlan,
@@ -164,4 +165,18 @@ test("intersection retains independent repeated schema roots without widening", 
   expect(() =>
     assertDeltaOneConstraints([schema, JSON.stringify({ type: "object" })]),
   ).toThrow();
+});
+
+test("generic plan approval requires an observed exact read-only MCP policy", () => {
+  expect(() =>
+    assertReadOnlyPolicy({ writeEligibility: "read_only" }),
+  ).not.toThrow();
+  for (const policy of [
+    undefined,
+    { writeEligibility: "" },
+    { writeEligibility: "unknown" },
+    { writeEligibility: "write_eligible" },
+  ]) {
+    expect(() => assertReadOnlyPolicy(policy)).toThrow();
+  }
 });
