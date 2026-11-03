@@ -25,6 +25,7 @@ export function dnsRecords(
   inputs: Pick<Inputs, "subnet" | "nativeHostIp">,
 ): Record<string, string> {
   const records: Record<string, string> = {
+    "postgres.fixture.example": address(inputs, "postgres"),
     "app.fixture.example": address(inputs, "orchestrator"),
     "coordinator.fixture.example": address(inputs, "coordinator"),
     "operator.fixture.example": address(inputs, "coordinator"),
