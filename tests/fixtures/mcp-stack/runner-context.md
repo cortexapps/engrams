@@ -1,9 +1,9 @@
 # Shared stack runner context, version 1
 
-Status: source contract in progress. The helper modules are implemented under
-`orchestrator/scripts/mcp-stack`. There is no complete runnable physical matrix
-at this checkpoint. In particular, the required-case manifest is not a set of
-passing tests. Platform adapters must not treat it as acceptance evidence.
+Status: complete source assembly, pending independent review and real platform
+execution. The runner and all twelve driver families are implemented under
+`orchestrator/scripts/mcp-stack`. The required-case manifest and unit tests are
+not physical results. Platform adapters must not treat them as acceptance evidence.
 
 The proposed command is:
 
@@ -13,10 +13,12 @@ bun orchestrator/scripts/mcp-stack/run.ts --context /owned/run/context.json --ma
 
 The parser requires both flags exactly once. It accepts only `all`, which selects
 12 cases for Claude and the same 12 for Codex. A result cannot pass if a case or
-required subassertion is absent. The final entrypoint still awaits integration
-of the separately reviewed policy drivers. Common fidelity, approval, recovery
-and physical drivers now exist. Do not wire this command into CI until the
-complete assembly passes review.
+required subassertion is absent. The entrypoint validates the exact driver set,
+context, fixed supervisor controls, scoped database schema and both fixtures
+before publication or signup. Public enabled-image and enrolled-host checks
+precede all cases. It stops on the first failed case and leaves incomplete
+evidence. A total watchdog exits 124; the adapter must tear down owned services
+on every exit. Do not activate physical CI until the assembly passes review.
 
 ## Context fields
 
@@ -108,22 +110,23 @@ The adapter computes network evidence from actual installed routes, firewall and
 DNS policy. The hash is not itself enforcement proof: physical acceptance must
 also observe explicit guest probe denial and the corresponding network event.
 No arbitrary command, URL, environment override, SQL, process ID or proxy is
-accepted. `restart` additionally accepts only `configurationId`: `normal`,
-`global-disabled`, or `zone-disabled`. The requested variant must exist in
-`supervisor.configurations[role]` as an exact file/hash. Each role requires its
-normal variant. The adapter hashes and validates these files before service
-startup. Disabled variants can only change enable switches, and must retain the
-same destinations, CIDRs, CAs, identities and network enforcement. Status attests
-the selected configuration ID and hash. A missing variant is a failed
-prerequisite, never an arbitrary path or environment fallback.
+accepted. Only the orchestrator has `global-disabled` and `zone-disabled`
+configuration IDs. Global changes only `MCP_ENABLED` to false and retains its
+runtime configuration. Zone keeps the global flag true and changes only the
+matching configured `workers[].enabled` to false. Both fixed files/hashes are
+required before the first mutation. Other roles accept only `normal`; their
+configuration and process boot identities remain unchanged during these kills.
+The adapter validates byte-identical destinations, CIDRs, CAs, identities and
+all settings other than the selected enable switch. Status attests the selected
+configuration ID and hash. A missing variant fails the prerequisite.
 
-`supervisor.operatorCandidates` enumerates `normal` and optional disabled
-variants as `{file:{path,sha256},identity}`. They are adapter-owned candidate
-files from the corresponding predeclared coordinator/operator configuration.
-The runner cannot upload a candidate. After the selected fixed restart, the
-runner sends exact Stage identity/expected generation, and polls Read. Candidate
-changes can disable scope but cannot widen destinations/CIDRs/CAs. The adapter
-must reject a variant with any change outside this fixed disable contract.
+`supervisor.operatorCandidates` contains only `normal` as
+`{file:{path,sha256},identity}`. The runner stages that exact configured identity
+once at bootstrap. Global/zone kill and restoration restart only the
+orchestrator and read the actual operator publication before and after. Its
+identity, generation and admission state must remain unchanged. Neither kill
+publishes a new candidate. Coordinator Zone and OperatorCandidate do not have
+enable fields, and the runner does not invent one.
 
 ## Read-only observations
 
@@ -162,9 +165,9 @@ It does not print exceptions, credentials, cookies, codes, arguments or results.
 4. Modern and legacy MCP protocol is fixed for a standalone fixture lifetime.
    The context now requires two independent fixture instances. The adapters
    still need to implement both real lifetimes.
-5. No public global/zone flag setter exists in the accepted contract. Operator
-   Stage reads only its configured candidate. The fixed configuration/candidate
-   variant contract above is approved; the adapters must implement and verify it.
+5. No public global/zone flag setter exists. The fixed orchestrator-only
+   configuration contract above uses the actual startup switches. Adapters
+   must implement it without changing operator publication or network trust.
 6. Child grant intersection needs an actual native child-task invocation.
    The separately owned fixed plan supports an exact native spawn step and a
    child message marker. Its implementation must be integrated first.
@@ -183,6 +186,15 @@ alias. Such a step must observe a real protocol denial and cannot include an
 expected result or premature completion. `completionProjection: "premature"`
 is a separate adversarial step for an exposed MCP call and cannot include an
 expected result. Barrier records are observations, never result receipts.
+
+Acceptance profiles freeze `ENGRAM_FIXTURE_PROOF` with a single `{launch}`
+token. The CLI expands it to its decimal PID and a fresh 128-bit OS-random
+nonce, separated by a hyphen. Discovery accepts only
+`<scenario suffix>-<PID>-<32 lowercase hex>.json`. It has no PID-only fallback.
+Exclusive creation preserves every old proof across disk recovery even when
+the new guest reuses a PID. Nonces are observation filenames, not authority.
+The CLI implementation of this additive token must be reviewed and integrated
+before physical execution; legacy literal and `{pid}` modes are not used here.
 
 The common runner exposes only two release files under the fixed guest state
 root: `completion-release` and `premature-release`. Profile options enable the

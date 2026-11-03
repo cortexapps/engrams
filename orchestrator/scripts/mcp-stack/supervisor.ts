@@ -151,8 +151,16 @@ export class Supervisor {
           "fixture_configuration",
         );
       } else {
+        requireThat(
+          entry.role === "orchestrator" || entry.configurationId === "normal",
+          "only_orchestrator_has_disable_variants",
+        );
         const configuration =
-          this.ctx.supervisor.configurations[entry.role][entry.configurationId];
+          entry.role === "orchestrator"
+            ? this.ctx.supervisor.configurations.orchestrator[
+                entry.configurationId
+              ]
+            : this.ctx.supervisor.configurations[entry.role].normal;
         requireThat(
           configuration && configuration.sha256 === entry.configurationSha256,
           "supervisor_configuration",
@@ -169,7 +177,9 @@ export class Supervisor {
     configurationId: ConfigurationId = "normal",
   ) {
     requireThat(
-      this.ctx.supervisor.configurations[role][configurationId],
+      role === "orchestrator"
+        ? this.ctx.supervisor.configurations.orchestrator[configurationId]
+        : configurationId === "normal",
       "declared_configuration",
     );
     const before = await this.status();

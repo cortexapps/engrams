@@ -93,6 +93,21 @@ export class Evidence {
     });
     return digest;
   }
+  async prerequisites(input: {
+    supervisorSha256: string;
+    publicationSha256: string;
+    publicStateSha256: string;
+  }) {
+    const hash = z.string().regex(/^[a-f0-9]{64}$/);
+    const value = z
+      .strictObject({
+        supervisorSha256: hash,
+        publicationSha256: hash,
+        publicStateSha256: hash,
+      })
+      .parse(input);
+    await this.line({ version: 1, kind: "prerequisites", ...value });
+  }
   async result(result: CaseResult) {
     const expected = REQUIRED_CASES.find((c) => c.key === result.key);
     requireThat(

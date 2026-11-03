@@ -18,6 +18,10 @@ import { credentialHeaders } from "./transport.ts";
 import { modelToolName } from "./bootstrap.ts";
 import { StatusSchema } from "./supervisor.ts";
 import { Evidence } from "./evidence.ts";
+import { requirePrerequisites } from "./preflight.ts";
+import { safeFailure, validateDrivers } from "./runner.ts";
+import { drivers } from "./run.ts";
+import { isProofFilename } from "./guest.ts";
 import { parseArgs } from "./cli.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -165,6 +169,44 @@ test("manifest has exactly twelve cases for each real harness", () => {
       12,
     );
   expect(() => selectMatrix("claude")).toThrow("matrix_all_required");
+});
+test("preflight rejects incomplete fixed controls before publication or signup", () => {
+  const ctx = ContextSchema.parse(validContext());
+  expect(() => requirePrerequisites(ctx)).toThrow(
+    "guest_tls_request_deadline_6000ms",
+  );
+  ctx.deadlines = { requestMs: 6000, stepMs: 6000, totalMs: 10000 };
+  expect(() => requirePrerequisites(ctx)).toThrow(
+    "supervisor_orchestrator_global-disabled_configuration",
+  );
+  for (const variant of ["global-disabled", "zone-disabled"] as const) {
+    ctx.supervisor.configurations.orchestrator[variant] = artifact();
+  }
+  expect(() => requirePrerequisites(ctx)).not.toThrow();
+  ctx.supervisor.operatorCandidates.normal.identity = `sha256:${"b".repeat(64)}`;
+  expect(() => requirePrerequisites(ctx)).toThrow(
+    "normal_candidate_publication_identity",
+  );
+});
+test("runner refuses missing drivers and removes raw error payloads", () => {
+  expect(() => validateDrivers(drivers)).not.toThrow();
+  expect(() => validateDrivers({})).toThrow("complete_driver_registry");
+  const failure = safeFailure(new Error("private-token-value"));
+  expect(failure.seam).toBe("unexpected_runner_error");
+  expect(JSON.stringify(failure)).not.toContain("private-token-value");
+});
+test("acceptance proof discovery requires a fresh launch nonce, never PID-only fallback", () => {
+  expect(
+    isProofFilename("claude-cold", `claude-cold-12-${"a".repeat(32)}.json`),
+  ).toBe(true);
+  for (const name of [
+    "claude-cold-12.json",
+    `claude-cold-12-${"A".repeat(32)}.json`,
+    `other-12-${"a".repeat(32)}.json`,
+    `claude-cold-12-${"a".repeat(31)}.json`,
+    `../claude-cold-12-${"a".repeat(32)}.json`,
+  ])
+    expect(isProofFilename("claude-cold", name)).toBe(false);
 });
 test("CLI requires an explicit private context and complete matrix", () => {
   expect(

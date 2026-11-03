@@ -348,6 +348,10 @@ printf '{"harnesses":%s,"models":%s,"manifests":%s,"credentialFound":false}\\n' 
   return { ...parsed.data, sha256: sha256(result.stdout) };
 }
 
+export function isProofFilename(suffix: string, name: string) {
+  requireThat(/^[a-z0-9-]{1,40}$/.test(suffix), "guest_proof_suffix");
+  return new RegExp(`^${suffix}-[0-9]+-[a-f0-9]{32}\\.json$`).test(name);
+}
 export async function proofPaths(
   ctx: Context,
   client: PublicClient,
@@ -365,7 +369,7 @@ export async function proofPaths(
     .toString("utf8")
     .trim()
     .split("\n")
-    .filter((name) => new RegExp(`^${suffix}-[0-9]+\\.json$`).test(name))
+    .filter((name) => isProofFilename(suffix, name))
     .map((name) => `${ctx.guest.stateDirectory}/${name}`);
 }
 

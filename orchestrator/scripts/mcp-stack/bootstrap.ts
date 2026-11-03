@@ -8,7 +8,6 @@ import {
   sha256,
   type Context,
   type FixtureKind,
-  type ConfigurationId,
 } from "./context.ts";
 import {
   jsonRequest,
@@ -172,40 +171,38 @@ export async function bootstrapHumans(ctx: Context) {
   };
 }
 
-export async function publishOperator(ctx: Context, variant?: ConfigurationId) {
+function parseOperatorPublication(bytes: Uint8Array) {
+  try {
+    const generation = z.object({
+      identity: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+      generation: z.number().int().positive().safe(),
+      candidate: z.object({
+        deployment_identity: z.string(),
+        network_identity: z.string(),
+        trust_identity: z.string(),
+      }),
+    });
+    return z
+      .strictObject({
+        admission_open: z.boolean(),
+        pending: generation.nullable(),
+        published: generation.nullable(),
+      })
+      .parse(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    throw new RunnerFailure("ASSERTION_FAILED", "operator_publication_json");
+  }
+}
+export async function readOperatorPublication(ctx: Context) {
+  const response = await (await operatorClient(ctx)).read({ protocol: 1 });
+  requireThat(response.protocol === 1, "operator_protocol");
+  return parseOperatorPublication(response.publicationJson);
+}
+export async function publishOperator(ctx: Context) {
   const client = await operatorClient(ctx);
-  const parse = (bytes: Uint8Array) => {
-    try {
-      const generation = z.object({
-        identity: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-        generation: z.number().int().positive().safe(),
-        candidate: z.object({
-          deployment_identity: z.string(),
-          network_identity: z.string(),
-          trust_identity: z.string(),
-        }),
-      });
-      return z
-        .strictObject({
-          admission_open: z.boolean(),
-          pending: generation.nullable(),
-          published: generation.nullable(),
-        })
-        .parse(JSON.parse(new TextDecoder().decode(bytes)));
-    } catch {
-      throw new RunnerFailure("ASSERTION_FAILED", "operator_publication_json");
-    }
-  };
-  const before = await client.read({ protocol: 1 });
-  requireThat(before.protocol === 1, "operator_protocol");
-  const prior = parse(before.publicationJson);
-  const candidateIdentity = variant
-    ? ctx.supervisor.operatorCandidates[variant]?.identity
-    : ctx.publication.candidateIdentity;
-  requireThat(candidateIdentity, "declared_operator_candidate");
-  const expectedGeneration = variant
-    ? (prior.published?.generation ?? null)
-    : ctx.publication.expectedGeneration;
+  const prior = await readOperatorPublication(ctx);
+  const candidateIdentity = ctx.publication.candidateIdentity;
+  const expectedGeneration = ctx.publication.expectedGeneration;
   requireThat(
     prior.pending === null &&
       (prior.published?.generation ?? null) === expectedGeneration,
@@ -224,7 +221,7 @@ export async function publishOperator(ctx: Context, variant?: ConfigurationId) {
     async () => {
       const response = await client.read({ protocol: 1 });
       requireThat(response.protocol === 1, "operator_protocol");
-      return parse(response.publicationJson);
+      return parseOperatorPublication(response.publicationJson);
     },
     (value) =>
       value.pending === null &&
@@ -238,13 +235,6 @@ export async function publishOperator(ctx: Context, variant?: ConfigurationId) {
       value.published.candidate.trust_identity ===
         ctx.publication.trustIdentity,
   );
-}
-
-export async function publishOperatorVariant(
-  ctx: Context,
-  configurationId: ConfigurationId,
-) {
-  return publishOperator(ctx, configurationId);
 }
 
 export async function createCatalog(
@@ -581,7 +571,7 @@ export async function createFixtureProfile(
     input.connectionAlias,
     input.upstreamName,
   );
-  const proof = `${ctx.guest.stateDirectory}/${input.suffix}-{pid}.json`;
+  const proof = `${ctx.guest.stateDirectory}/${input.suffix}-{launch}.json`;
   const argumentsJson = JSON.stringify(input.arguments);
   requireThat(
     Buffer.byteLength(argumentsJson) <= 4096 &&

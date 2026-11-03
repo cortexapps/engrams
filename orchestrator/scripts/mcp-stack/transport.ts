@@ -16,6 +16,8 @@ import { TaskService } from "../../src/gen/engram/app/v1/task_pb.ts";
 import { SessionService } from "../../src/gen/engram/app/v1/session_pb.ts";
 import { OrgSecretService } from "../../src/gen/engram/app/v1/org_secret_pb.ts";
 import { ModelRouterService } from "../../src/gen/engram/app/v1/model_router_pb.ts";
+import { FleetService } from "../../src/gen/engram/app/v1/fleet_pb.ts";
+import { ImageService } from "../../src/gen/engram/app/v1/image_pb.ts";
 import { OperatorPublicationService } from "../../src/gen/engram/mcp/v1/operator_pb.ts";
 import {
   privateFile,
@@ -91,6 +93,8 @@ export async function publicClient(ctx: Context, credential: Credential) {
     sessions: createClient(SessionService, transport),
     secrets: createClient(OrgSecretService, transport),
     models: createClient(ModelRouterService, transport),
+    fleet: createClient(FleetService, transport),
+    images: createClient(ImageService, transport),
   };
 }
 export type PublicClient = Awaited<ReturnType<typeof publicClient>>;

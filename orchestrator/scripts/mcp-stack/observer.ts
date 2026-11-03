@@ -168,6 +168,7 @@ export class DatabaseObserver {
   private constructor(
     private readonly coordinator: pg.Pool,
     private readonly orchestrator: pg.Pool,
+    private readonly databaseName: string,
   ) {}
   static async connect(ctx: Context) {
     const pool = async (path: string) => {
@@ -200,7 +201,80 @@ export class DatabaseObserver {
     return new DatabaseObserver(
       await pool(ctx.observer.coordinatorDsnFile),
       await pool(ctx.observer.orchestratorDsnFile),
+      `mcp_${ctx.runId.replaceAll("-", "_")}`,
     );
+  }
+  /** Fixed schema-only prerequisites, before public signup or publication. No authority rows are read. */
+  async prerequisites() {
+    const expected = {
+      coordinator: [
+        "session_managed_creations.session_id:uuid",
+        "session_managed_creations.task_id:text",
+        "session_managed_creations.native_version:integer",
+        "session_managed_creations.native_bytes:bytea",
+        "session_managed_creations.native_digest:text",
+        "session_managed_boots.session_id:uuid",
+        "session_managed_boots.host_id:uuid",
+        "session_managed_boots.binding_epoch:bigint",
+        "session_managed_boots.boot_attempt:text",
+        "session_managed_boots.phase:text",
+        "session_managed_boots.record:jsonb",
+        "session_managed_boot_intents.intent_id:text",
+        "session_managed_boot_intents.session_id:uuid",
+        "session_managed_boot_intents.binding_epoch:bigint",
+        "session_managed_boot_intents.completed:boolean",
+        "session_managed_boot_intents.record:jsonb",
+        "session_outbox.session_id:uuid",
+        "session_outbox.prompt_id:text",
+        "session_outbox.kind:text",
+        "session_outbox.attempts:integer",
+        "session_outbox.delivered_at:timestamp with time zone",
+        "session_outbox.acked_at:timestamp with time zone",
+        "session_events.session_id:uuid",
+        "session_events.idx:bigint",
+        "session_events.kind:text",
+        "session_events.payload:jsonb",
+        "session_managed_interrupted_targets.session_id:uuid",
+        "session_managed_interrupted_targets.event_floor:bigint",
+      ],
+      orchestrator: [
+        "task_session.task_id:text",
+        "task_session.session_id:text",
+        "task_session.mcp_managed_lifecycle:jsonb",
+      ],
+    };
+    for (const role of ["coordinator", "orchestrator"] as const) {
+      const pool = this[role];
+      const tables = [...new Set(expected[role].map((v) => v.split(".")[0]!))];
+      const result = await pool.query(
+        "SELECT current_database() AS database,table_name,column_name,data_type FROM information_schema.columns WHERE table_schema='public' AND table_name=ANY($1::text[])",
+        [tables],
+      );
+      const rows = z
+        .array(
+          z.strictObject({
+            database: z.string(),
+            table_name: z.string(),
+            column_name: z.string(),
+            data_type: z.string(),
+          }),
+        )
+        .max(256)
+        .parse(result.rows);
+      requireThat(
+        rows.every((v) => v.database === this.databaseName),
+        "observer_actual_database",
+      );
+      const actual = new Set(
+        rows.map((v) => `${v.table_name}.${v.column_name}:${v.data_type}`),
+      );
+      for (const column of expected[role])
+        if (!actual.has(column))
+          throw new RunnerFailure(
+            "NEEDS_CONTEXT",
+            `${role}_schema_${column.split(":")[0]}`,
+          );
+    }
   }
   own(taskId: string, sessionId: string) {
     requireThat(

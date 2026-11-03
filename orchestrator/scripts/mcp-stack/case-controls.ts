@@ -1,4 +1,5 @@
-import { publishOperatorVariant, waitFor } from "./bootstrap.ts";
+import { readOperatorPublication, waitFor } from "./bootstrap.ts";
+import { canonicalJson } from "./guest.ts";
 import { requireThat, RunnerFailure } from "./context.ts";
 import {
   completeAssertions,
@@ -18,18 +19,26 @@ import { Supervisor } from "./supervisor.ts";
 import { deltaOne, deniedCall, policyObservation } from "./case-grants.ts";
 
 export function requireKillVariants(supervisor: {
-  configurations: { coordinator: object };
-  operatorCandidates: object;
+  configurations: { orchestrator: object };
 }) {
   for (const variant of ["normal", "global-disabled", "zone-disabled"])
-    if (
-      !(variant in supervisor.configurations.coordinator) ||
-      !(variant in supervisor.operatorCandidates)
-    )
+    if (!(variant in supervisor.configurations.orchestrator))
       throw new RunnerFailure(
         "NEEDS_CONTEXT",
-        `supervisor_coordinator_${variant}_configuration_and_candidate`,
+        `supervisor_orchestrator_${variant}_configuration`,
       );
+}
+export function assertKillPublication(
+  before: Awaited<ReturnType<typeof readOperatorPublication>>,
+  after: Awaited<ReturnType<typeof readOperatorPublication>>,
+) {
+  requireThat(
+    before.admission_open &&
+      before.pending === null &&
+      before.published &&
+      canonicalJson(before) === canonicalJson(after),
+    "kill_preserves_actual_operator_publication",
+  );
 }
 export function cancellationRequest(call: {
   executionId: string;
@@ -115,6 +124,9 @@ export const killCancelDriver: CaseDriver = async (input) => {
       }),
     });
     let variantChanged = false;
+    let publicationBefore:
+      | Awaited<ReturnType<typeof readOperatorPublication>>
+      | undefined;
     try {
       await scenario.fixture.configure({
         reply: "json",
@@ -173,11 +185,18 @@ export const killCancelDriver: CaseDriver = async (input) => {
       );
       let mutation: unknown;
       if (control === "global" || control === "zone") {
+        publicationBefore = await readOperatorPublication(ctx);
+        requireThat(
+          publicationBefore.published?.identity ===
+            ctx.publication.candidateIdentity,
+          "kill_normal_publication",
+        );
         variantChanged = true;
         const variant =
           control === "global" ? "global-disabled" : "zone-disabled";
-        const status = await supervisor.restart("coordinator", variant);
-        const publication = await publishOperatorVariant(ctx, variant);
+        const status = await supervisor.restart("orchestrator", variant);
+        const publication = await readOperatorPublication(ctx);
+        assertKillPublication(publicationBefore, publication);
         mutation = { configuration: variant, roles: status.roles, publication };
       } else if (control === "connection") {
         const setup = await principals.admin.integration.getMcpSetup({
@@ -311,8 +330,12 @@ export const killCancelDriver: CaseDriver = async (input) => {
       } finally {
         try {
           if (variantChanged) {
-            await supervisor.restart("coordinator", "normal");
-            await publishOperatorVariant(ctx, "normal");
+            await supervisor.restart("orchestrator", "normal");
+            requireThat(publicationBefore, "kill_publication_baseline");
+            assertKillPublication(
+              publicationBefore,
+              await readOperatorPublication(ctx),
+            );
           }
         } finally {
           await closeScenario(principals, scenario);

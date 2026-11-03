@@ -131,14 +131,12 @@ export const ContextSchema = z.strictObject({
     tokenFile: path,
     configurations: z.strictObject({
       orchestrator: variants,
-      worker: variants,
-      coordinator: variants,
-      "host-agent": variants,
+      worker: z.strictObject({ normal: file }),
+      coordinator: z.strictObject({ normal: file }),
+      "host-agent": z.strictObject({ normal: file }),
     }),
     operatorCandidates: z.strictObject({
       normal: z.strictObject({ file, identity: digest }),
-      "global-disabled": z.strictObject({ file, identity: digest }).optional(),
-      "zone-disabled": z.strictObject({ file, identity: digest }).optional(),
     }),
   }),
   observer: z.strictObject({
