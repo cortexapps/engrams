@@ -46,6 +46,46 @@ function observe(
   };
 }
 
+export function selectColdDenial(
+  positive: Awaited<ReturnType<typeof pollProof>>,
+  records: Awaited<ReturnType<typeof pollProof>>,
+) {
+  requireThat(positive.length === 1, "cold_positive_proof_count");
+  const original = positive[0]!;
+  requireThat(
+    original.proof.resultReceived === true &&
+      original.proof.delivery === "available" &&
+      original.proof.outcome === "succeeded" &&
+      original.proof.isError === false &&
+      original.proof.planSha256 !== undefined,
+    "cold_positive_proof_success",
+  );
+  // Raw JSONL hashes identify retained records regardless of launch filename order.
+  requireThat(
+    records.length === positive.length + 1 &&
+      records.filter((record) => record.sha256 === original.sha256).length ===
+        1,
+    "cold_positive_proof_retained",
+  );
+  const denied = records.filter((record) => record.sha256 !== original.sha256);
+  requireThat(
+    denied.length === 1 &&
+      denied.every(
+        ({ proof }) =>
+          proof.callId === original.proof.callId &&
+          proof.tool === original.proof.tool &&
+          proof.planSha256 === original.proof.planSha256 &&
+          proof.expectExposure === "absent" &&
+          proof.protocolDenialCode === "unknown_tool" &&
+          proof.requestAttempted === true &&
+          proof.exposedMcpToolNamesSha256 ===
+            `sha256:${sha256(canonicalJson([]))}`,
+      ),
+    "cold_old_execution_actual_denial",
+  );
+  return denied;
+}
+
 export const credentialNetworkIsolationDriver: CaseDriver = async ({
   ctx,
   principals,
@@ -288,24 +328,13 @@ export const diskOnlyColdRebindDriver: CaseDriver = async ({
       "actual_cold_guest_and_frozen_bytes",
     );
     await sendScenarioPrompt(scenario, false, "after");
-    const denied = await pollProof(ctx, scenario, {
+    const records = await pollProof(ctx, scenario, {
       callId: scenario.input.callId,
       tool: scenario.alias,
       planSha256: scenario.planSha256,
       afterCount: positive.length,
     });
-    requireThat(
-      denied.length > 0 &&
-        denied.every(
-          (v) =>
-            v.proof.expectExposure === "absent" &&
-            v.proof.protocolDenialCode === "unknown_tool" &&
-            v.proof.requestAttempted &&
-            v.proof.exposedMcpToolNamesSha256 ===
-              `sha256:${sha256(canonicalJson([]))}`,
-        ),
-      "cold_old_execution_actual_denial",
-    );
+    const denied = selectColdDenial(positive, records);
     const after = await fixture.observe();
     requireThat(
       after.reads === before.reads + 1 &&
@@ -353,7 +382,7 @@ export const diskOnlyColdRebindDriver: CaseDriver = async ({
       {
         assertion: "no-old-execution",
         observations: [
-          observe(identity, "guest-proof", "denied", denied),
+          observe(identity, "guest-proof", "denied", { positive, denied }),
           observe(identity, "fixture-observer", "current", after),
         ],
       },

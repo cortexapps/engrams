@@ -345,13 +345,24 @@ export async function verifiedCounterResult(
   };
 }
 export async function toolCompletionEvents(
-  scenario: StartedScenario,
+  scenario: {
+    input: Pick<StartedScenario["input"], "harness" | "callId">;
+    alias: string;
+    sessionId: string;
+    reviewClient: {
+      sessions: Pick<PublicClient["sessions"], "listSessionEvents">;
+    };
+  },
   callId = scenario.input.callId,
 ) {
+  const nativeName =
+    scenario.input.harness === "claude"
+      ? `mcp__engrams__${scenario.alias}`
+      : scenario.alias;
   const page = await scenario.reviewClient.sessions.listSessionEvents({
     sessionId: scenario.sessionId,
     kinds: ["tool_call_completed"],
-    toolNames: [scenario.alias],
+    toolNames: [nativeName],
     limit: 129n,
   });
   requireThat(page.events.length < 129, "completion_event_bound");
@@ -369,7 +380,7 @@ export async function toolCompletionEvents(
       })
       .safeParse(JSON.parse(event.payloadJson));
     requireThat(
-      parsed.success && parsed.data.tool_name === scenario.alias,
+      parsed.success && parsed.data.tool_name === nativeName,
       "completion_event_shape",
     );
     return parsed.data.tool_call_id === callId

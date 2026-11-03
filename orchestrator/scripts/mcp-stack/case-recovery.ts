@@ -58,6 +58,22 @@ async function completions(
   );
 }
 
+export function assertNewIdWriteDenial(
+  denied: Awaited<ReturnType<typeof completions>>,
+) {
+  requireThat(
+    denied.length > 0 &&
+      denied.every(
+        ({ proof }) =>
+          proof.resultReceived === true &&
+          proof.delivery === "available" &&
+          proof.outcome === null &&
+          proof.isError === true,
+      ),
+    "new_id_actual_runtime_policy_refusal",
+  );
+}
+
 export const heldWriteRestartDriver: CaseDriver = async ({
   ctx,
   principals,
@@ -196,14 +212,7 @@ export const heldWriteRestartDriver: CaseDriver = async ({
       () => completions(ctx, scenario, "held-write-2"),
       (records) => records.length > 0,
     );
-    requireThat(
-      denied.every(
-        (record) =>
-          record.proof.delivery === "unavailable" &&
-          record.proof.outcome !== "succeeded",
-      ),
-      "new_id_not_success",
-    );
+    assertNewIdWriteDenial(denied);
     const state = await scenario.reviewClient.integration.getSessionMcpState({
       sessionId: scenario.sessionId,
       omitBindings: true,
