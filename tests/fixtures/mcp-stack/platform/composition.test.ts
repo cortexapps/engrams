@@ -6,12 +6,13 @@ import {
   writeFile,
   readFile,
   realpath,
+  stat,
   rm,
 } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
-import { hash, PlatformFailure } from "./owned.ts";
+import { hash, PlatformFailure, put } from "./owned.ts";
 import { BINARIES, IMAGES, parseInputs, type Inputs } from "./preflight.ts";
 
 test("engine operations pin socket/config and exclude parent credentials", async () => {
@@ -64,6 +65,120 @@ test("engine operations pin socket/config and exclude parent credentials", async
     if (old === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
     else process.env.AWS_SECRET_ACCESS_KEY = old;
     await new Promise<void>((r) => server.close(() => r()));
+    await rm(root, { recursive: true });
+  }
+});
+
+test("private cleanup logs capture stderr with shared bounds and owned cancellation", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/private-logs-"),
+  );
+  const config = join(root, "config");
+  await mkdir(config, { mode: 0o700 });
+  const socket = join(root, "engine.sock");
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  const script = join(root, "docker"),
+    started = join(root, "started"),
+    descendant = join(root, "descendant");
+  await writeFile(
+    script,
+    `#!${Bun.which("node")}
+const fs = require("node:fs");
+const args = process.argv.slice(2 + 4);
+const mode = args[0] === "fail" ? "d" : args[0] === "logs" ? args[3]?.[0] : "a";
+if (mode !== "e") fs.writeFileSync(${JSON.stringify(started)}, String(process.pid));
+if (mode === "b") {
+  process.stderr.write(Buffer.alloc(4 * 1024 * 1024 + 1, 120));
+} else if (mode === "c") {
+  process.stdout.write(Buffer.alloc(2 * 1024 * 1024 + 1, 120));
+  process.stderr.write(Buffer.alloc(2 * 1024 * 1024, 120));
+} else if (mode === "e") {
+  const child = require("node:child_process").spawn("/bin/sleep", ["30"]);
+  fs.writeFileSync(${JSON.stringify(descendant)}, String(child.pid));
+  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  child.on("exit", () => process.exit(0));
+  process.stderr.write("private-stderr-marker");
+  setInterval(() => process.stderr.write("private-stderr-marker"), 10);
+} else {
+  process.stdout.write("private-stdout-marker");
+  process.stderr.write("private-stderr-marker");
+  if (mode === "d") process.exitCode = 1;
+}
+if (mode === "e") fs.writeFileSync(${JSON.stringify(started)}, String(process.pid));
+`,
+    { mode: 0o700 },
+  );
+  const inputs = {
+    engineSocket: socket,
+    engineConfig: config,
+    binaries: {
+      docker: { path: script, sha256: hash(await readFile(script)) },
+    },
+  } as Inputs;
+  const controller = new AbortController();
+  try {
+    const engine = new Engine(inputs, root, "mcp-123456789012345678901234");
+    const logs = (mode: string) => ["logs", "--tail", "10000", mode.repeat(64)];
+    const bytes = await engine.call(logs("a"));
+    const artifact = join(root, "retained-probe.log");
+    await put(artifact, bytes);
+    const retained = await readFile(artifact, "utf8");
+    expect(retained).toContain("private-stdout-marker");
+    expect(retained).toContain("private-stderr-marker");
+    expect((await stat(artifact)).mode & 0o777).toBe(0o600);
+    for (const args of [
+      ["info"],
+      ["exec", "a".repeat(64), "probe"],
+      ["logs", "--tail", "10000", "A".repeat(64)],
+      ["logs", "--tail", "9999", "a".repeat(64)],
+      [...logs("a"), "extra"],
+    ])
+      expect((await engine.call(args)).toString()).toBe(
+        "private-stdout-marker",
+      );
+    for (const args of [logs("b"), logs("c"), logs("d"), ["fail"], logs("e")]) {
+      await expect(
+        engine.call(args, undefined, args[3]?.[0] === "e" ? 500 : 2000),
+      ).rejects.toThrow(/^INVALID_CONTEXT:engine_command$/);
+      const pid = Number(await readFile(started, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(() => process.kill(-pid, 0)).toThrow();
+    }
+    const deadlineChild = Number(await readFile(descendant, "utf8"));
+    expect(() => process.kill(deadlineChild, 0)).toThrow();
+    await rm(started);
+    const running = engine.controlled(controller.signal, () =>
+      engine.call(logs("e"), undefined, 30000),
+    );
+    const outcome = running.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const deadline = performance.now() + 2000;
+    while (!(await readFile(started).catch(() => undefined))) {
+      if (performance.now() >= deadline)
+        throw new Error("controlled child did not start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pid = Number(await readFile(started, "utf8"));
+    controller.abort();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(PlatformFailure);
+    expect(String(error)).toBe("Error: INVALID_CONTEXT:engine_command");
+    expect(String(error)).not.toContain("private-stderr-marker");
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(() => process.kill(-pid, 0)).toThrow();
+    const childPid = Number(await readFile(descendant, "utf8"));
+    expect(() => process.kill(childPid, 0)).toThrow();
+    await expect(
+      engine.controlled(new AbortController().signal, () =>
+        engine.call(logs("a")),
+      ),
+    ).resolves.toHaveLength(bytes.length);
+  } finally {
+    controller.abort();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true });
   }
 });

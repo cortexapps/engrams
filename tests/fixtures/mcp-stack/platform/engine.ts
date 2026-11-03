@@ -427,7 +427,18 @@ export class Engine {
     await verifyPin(this.inputs.binaries.docker);
     const prefix = engineArguments(this.inputs).slice(0, 4);
     try {
-      const bytes = await this.runEngine([...prefix, ...args], stdin, timeout);
+      const captureStderr =
+        args.length === 4 &&
+        args[0] === "logs" &&
+        args[1] === "--tail" &&
+        args[2] === "10000" &&
+        /^[a-f0-9]{64}$/.test(args[3]!);
+      const bytes = await this.runEngine(
+        [...prefix, ...args],
+        stdin,
+        timeout,
+        captureStderr,
+      );
       return bytes;
     } finally {
       await this.engineIdentity();
@@ -437,6 +448,7 @@ export class Engine {
     args: string[],
     input: string | undefined,
     timeout: number,
+    captureStderr = false,
   ): Promise<Buffer> {
     check(
       Number.isInteger(timeout) && timeout > 0 && timeout <= 120000,
@@ -448,9 +460,9 @@ export class Engine {
       args,
       REPO,
       childEnvironment(this.root),
-      ["pipe", "pipe", "ignore"],
+      captureStderr ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "ignore"],
     );
-    const { stdin, stdout } = process.child;
+    const { stdin, stdout, stderr } = process.child;
     check(stdin && stdout, "engine_stdio");
     const chunks: Buffer[] = [];
     let size = 0,
@@ -466,12 +478,15 @@ export class Engine {
     const timer = setTimeout(interrupt, timeout);
     const signal = this.signal;
     signal?.addEventListener("abort", interrupt, { once: true });
-    stdout.on("data", (bytes: Buffer) => {
+    const collect = (bytes: Buffer) => {
       size += bytes.length;
       if (size > 4 * 1024 * 1024) interrupt();
       else chunks.push(bytes);
-    });
+    };
+    stdout.on("data", collect);
+    stderr?.on("data", collect);
     stdout.once("error", interrupt);
+    stderr?.once("error", interrupt);
     stdin.once("error", () => {});
     process.child.once("error", interrupt);
     stdin.end(input);
@@ -486,6 +501,7 @@ export class Engine {
       signal?.removeEventListener("abort", interrupt);
       stdin.destroy();
       stdout.destroy();
+      stderr?.destroy();
       process.child.unref();
     }
   }

@@ -196,7 +196,8 @@ export class OwnedProcess {
     stdio:
       | "ignore"
       | ["ignore", number, number]
-      | ["pipe", "pipe", "ignore"] = "ignore",
+      | ["pipe", "pipe", "ignore"]
+      | ["pipe", "pipe", "pipe"] = "ignore",
   ) {
     check(isAbsolute(file) && isAbsolute(cwd), "process_path");
     this.child = spawn(file, [...args], { cwd, env, detached: true, stdio });
