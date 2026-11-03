@@ -658,7 +658,8 @@ def main():
             ])
         if name == "orchestrator":
             return bake_all_l or proto_l or any_path(
-                cs, ["orchestrator/", "mcp-worker/src/", "docker/orchestrator.Dockerfile"])
+                cs, ["orchestrator/", "mcp-worker/src/", "mcp-worker/package.json",
+                     "mcp-worker/package-lock.json", "docker/orchestrator.Dockerfile"])
         if name == "mcp-worker":
             return bake_all_l or any_path(cs, ["mcp-worker/", "docker/mcp-worker.Dockerfile"])
         raise ValueError(name)

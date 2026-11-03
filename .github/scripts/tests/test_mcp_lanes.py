@@ -37,6 +37,16 @@ class McpLanes(unittest.TestCase):
         self.assertEqual(json.loads(result['images_matrix']), ['orchestrator', 'mcp-worker'])
         self.assertEqual(result['node_assets'], 'false')
 
+    def test_worker_dependency_files_rebuild_both_images(self):
+        for path in ['mcp-worker/package.json', 'mcp-worker/package-lock.json']:
+            with self.subTest(path=path):
+                result = detect(path)
+                self.assertEqual(json.loads(result['images_matrix']), ['orchestrator', 'mcp-worker'])
+
+    def test_worker_test_changes_do_not_rebuild_orchestrator(self):
+        result = detect('mcp-worker/test/deployment.test.ts')
+        self.assertEqual(json.loads(result['images_matrix']), ['mcp-worker'])
+
     def test_fixture_selects_native_and_static_gates(self):
         result = detect('tests/fixtures/mcp-model-cli/src/main.rs')
         self.assertEqual(result['test_rust'], 'true')
