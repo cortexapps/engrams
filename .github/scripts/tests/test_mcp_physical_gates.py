@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import contextmanager
 import io
 import json
 import os
@@ -14,6 +15,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
+BUILD_CONFIG = b'{"os":"linux","architecture":"arm64"}'
+BUILD_CONFIG_ID = 'sha256:c21740f5cb55c7e3a2197b08ebd0ba12f673ff5aa9869bf892b0c85dcaf5c413'
 SPEC = importlib.util.spec_from_file_location('physical_assets', ROOT / '.github/scripts/mcp-stack-assets.py')
 assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(assets)
@@ -152,6 +155,210 @@ class PhysicalGates(unittest.TestCase):
         ]:
             with self.assertRaises(RuntimeError):
                 assets.image_facts(value, cfg, arch)
+
+    @contextmanager
+    def archive_fixture(self):
+        # Only controlled executables run. No Docker daemon or image is used.
+        with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as sock:
+            root = Path(directory).resolve()
+            sock.bind(str(root / 'engine.sock'))
+            script = f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+root = Path({str(root)!r})
+kind, args = Path(sys.argv[0]).name, sys.argv[1:]
+with (root / 'calls').open('a') as out:
+    out.write(json.dumps([kind, *args]) + '\\n')
+operation = args[4:6] if kind == 'docker' else [kind, 'inspect' if 'inspect' in args else 'copy']
+if (root / 'fail').exists() and operation == json.loads((root / 'fail').read_text()):
+    raise SystemExit(42)
+def emit(path, data, stage):
+    mode = (root / (stage + '-kind')).read_text() if (root / (stage + '-kind')).exists() else 'normal'
+    if mode in ['symlink', 'hardlink']:
+        target = root / (stage + '-target')
+        target.write_bytes(data)
+        path.symlink_to(target) if mode == 'symlink' else os.link(target, path)
+    else:
+        path.write_bytes(b'' if mode == 'empty' else data)
+if kind == 'docker':
+    assert not {{'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'GITHUB_TOKEN', 'REGISTRY_AUTH_FILE'}}.intersection(os.environ)
+    assert args[:4] == ['--config', str(root / 'producer-engine-config'), '--host', 'unix://' + str(root / 'engine.sock')]
+    args = args[4:]
+    if args[0] == 'info':
+        print(json.dumps({{'ID': 'controlled-engine-identity'}}))
+    elif args[:2] == ['buildx', 'build']:
+        assert args[2:4] == ['--builder', 'default']
+        if '--load' in args:
+            path = root / 'metadata'
+            if path.exists():
+                emit(Path(args[args.index('--metadata-file') + 1]), path.read_bytes(), 'metadata')
+        else:
+            output = args[args.index('--output') + 1]
+            assert output.startswith('type=local,dest=')
+            Path(output.split('dest=', 1)[1]).mkdir()
+    elif args[:2] == ['image', 'inspect']:
+        assert args[2:] == [{BUILD_CONFIG_ID!r}]
+        sys.stdout.buffer.write((root / 'inspect').read_bytes())
+    elif args[:2] == ['image', 'save']:
+        assert args[2] == '--output' and args[4:] == [{BUILD_CONFIG_ID!r}]
+        emit(Path(args[3]), b'controlled-docker-archive', 'save')
+    else:
+        raise AssertionError(args)
+else:
+    assert kind == 'skopeo'
+    if 'inspect' in args:
+        assert '--raw' in args and '--config' in args
+        sys.stdout.buffer.write((root / 'config-bytes').read_bytes())
+    else:
+        assert 'copy' in args
+        assert Path(args[-2].removeprefix('docker-archive:')).read_bytes() == b'controlled-docker-archive'
+        Path(args[-1].removeprefix('oci-archive:')).write_bytes(b'controlled-oci-archive')
+'''
+            tools = {}
+            for name in ['docker', 'skopeo']:
+                path = root / name
+                path.write_text(script)
+                path.chmod(0o700)
+                tools[name] = str(path)
+            p = assets.Producer('vz', root, {'engineSocket': str(root / 'engine.sock'), 'tools': tools})
+            p.engine_identity, p.head = 'controlled-engine-identity', 'b' * 40
+            (root / 'config-bytes').write_bytes(BUILD_CONFIG)
+            (root / 'metadata').write_text(json.dumps({
+                'containerimage.config.digest': BUILD_CONFIG_ID,
+                'containerimage.digest': 'sha256:' + 'c' * 64}))
+            actual = {'Id': BUILD_CONFIG_ID, 'Os': 'linux', 'Architecture': 'arm64',
+                      'Config': {'Labels': {'org.opencontainers.image.revision': p.head, assets.LABEL: p.run}}}
+            (root / 'inspect').write_text(json.dumps([actual]))
+            yield p, actual
+
+    def test_archive_loads_then_saves_exact_config_before_oci_conversion(self):
+        with self.archive_fixture() as (p, _):
+            context = p.root / 'custom-context'
+            archive = p.archive('hostAgent', 'Dockerfile', context, {'HOST_IMAGE': 'controlled-base'})
+            self.assertEqual(archive.read_bytes(), b'controlled-oci-archive')
+            calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+            operations = [call[5:] for call in calls if call[0] == 'docker' and call[5] != 'info']
+            self.assertEqual([call[:2] for call in operations],
+                             [['buildx', 'build'], ['image', 'inspect'], ['image', 'save']])
+            build, inspect, save = operations
+            self.assertIn('--load', build)
+            self.assertNotIn('--output', build)
+            self.assertNotIn('--push', build)
+            self.assertIn('--provenance=false', build)
+            self.assertIn('--sbom=false', build)
+            self.assertIn('org.opencontainers.image.revision=' + p.head, build)
+            self.assertIn(assets.LABEL + '=' + p.run, build)
+            self.assertIn('SOURCE_COMMIT=' + p.head, build)
+            self.assertEqual(build[build.index('--platform') + 1], 'linux/arm64')
+            metadata = Path(build[build.index('--metadata-file') + 1])
+            self.assertEqual(metadata.parent, p.root)
+            self.assertEqual(metadata.read_bytes(), (p.root / 'metadata').read_bytes())
+            self.assertEqual(build[build.index('--file') + 1], str(context / 'Dockerfile'))
+            self.assertIn('HOST_IMAGE=controlled-base', build)
+            self.assertEqual(build[-1], str(context))
+            self.assertEqual(inspect[2:], [BUILD_CONFIG_ID])
+            self.assertEqual(save, ['image', 'save', '--output', str(p.files / 'hostAgent.docker.tar'),
+                                    BUILD_CONFIG_ID])
+            self.assertEqual(calls[-1][0], 'skopeo')
+            for call in operations:
+                self.assertNotIn('--tag', call)
+                self.assertNotIn('-t', call)
+                self.assertNotIn('--iidfile', call)
+            self.assertEqual(p.names, [])
+
+    def test_archive_rejects_missing_or_invalid_config_metadata_before_inspect(self):
+        for metadata in [None, b'not-json', b'[]', b'{}',
+                         json.dumps({'containerimage.digest': BUILD_CONFIG_ID}).encode(),
+                         *[json.dumps({'containerimage.config.digest': value}).encode()
+                           for value in [None, 7, 'a' * 64, 'sha256:' + 'A' * 64,
+                                         'sha256:' + 'a' * 63, BUILD_CONFIG_ID + '\n']]]:
+            with self.subTest(metadata=metadata), self.archive_fixture() as (p, _):
+                if metadata is None:
+                    (p.root / 'metadata').unlink()
+                else:
+                    (p.root / 'metadata').write_bytes(metadata)
+                with self.assertRaises((RuntimeError, ValueError, FileNotFoundError)) as failure:
+                    p.archive('worker', 'docker/mcp-worker.Dockerfile')
+                if isinstance(failure.exception, RuntimeError):
+                    self.assertEqual(str(failure.exception), 'build_image_config_digest')
+                calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+                self.assertFalse(any(call[0] == 'skopeo' or call[5:7] in
+                                     [['image', 'inspect'], ['image', 'save']] for call in calls))
+                self.assertFalse((p.files / 'worker.docker.tar').exists())
+
+    def test_archive_rejects_inspect_mismatch_before_save_or_conversion(self):
+        for field, value in [('Id', 'sha256:' + 'c' * 64), ('Os', 'darwin'), ('Architecture', 'amd64'),
+                             ('revision', 'c' * 40), ('run', 'foreign'), ('Config', {}),
+                             ('Labels', None)]:
+            with self.subTest(field=field), self.archive_fixture() as (p, actual):
+                if field in ['revision', 'run']:
+                    key = 'org.opencontainers.image.revision' if field == 'revision' else assets.LABEL
+                    actual['Config']['Labels'][key] = value
+                elif field == 'Labels':
+                    actual['Config']['Labels'] = value
+                else:
+                    actual[field] = value
+                (p.root / 'inspect').write_text(json.dumps([actual]))
+                seam = 'build_image_platform' if field in ['Id', 'Os', 'Architecture'] else 'build_image_labels'
+                with self.assertRaisesRegex(RuntimeError, seam):
+                    p.archive('worker', 'docker/mcp-worker.Dockerfile')
+                calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+                self.assertFalse(any(call[0] == 'skopeo' or call[5:7] == ['image', 'save'] for call in calls))
+                self.assertFalse((p.files / 'worker.docker.tar').exists())
+
+    def test_archive_local_directory_output_keeps_default_driver_path(self):
+        with self.archive_fixture() as (p, _):
+            output = p.archive('linux-assets', assets.CI + '/linux-assets.Dockerfile', local=True)
+            self.assertEqual(output, p.files / 'linux-assets')
+            self.assertTrue(output.is_dir())
+            calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+            builds = [call[5:] for call in calls if call[0] == 'docker' and call[5] != 'info']
+            self.assertEqual(len(builds), 1)
+            build = builds[0]
+            self.assertEqual(build[build.index('--output') + 1], 'type=local,dest=' + str(output))
+            self.assertNotIn('--load', build)
+            self.assertNotIn('--metadata-file', build)
+            self.assertFalse(any(call[0] == 'skopeo' for call in calls))
+
+    def test_archive_requires_one_inspected_image(self):
+        for response in [[], [{}, {}]]:
+            with self.subTest(response=response), self.archive_fixture() as (p, actual):
+                if response:
+                    response = [actual, actual]
+                (p.root / 'inspect').write_text(json.dumps(response))
+                with self.assertRaisesRegex(RuntimeError, 'build_image_inspect'):
+                    p.archive('worker', 'docker/mcp-worker.Dockerfile')
+                self.assertFalse((p.files / 'worker.docker.tar').exists())
+
+    def test_archive_requires_owned_regular_metadata_and_saved_file(self):
+        for stage in ['metadata', 'save']:
+            for kind in ['symlink', 'hardlink', 'empty']:
+                with self.subTest(stage=stage, kind=kind), self.archive_fixture() as (p, _):
+                    (p.root / (stage + '-kind')).write_text(kind)
+                    with self.assertRaises(RuntimeError):
+                        p.archive('worker', 'docker/mcp-worker.Dockerfile')
+                    calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+                    self.assertFalse(any(call[0] == 'skopeo' for call in calls))
+                    if stage == 'metadata':
+                        self.assertFalse((p.files / 'worker.docker.tar').exists())
+
+    def test_archive_rejects_converted_config_mismatch(self):
+        with self.archive_fixture() as (p, _):
+            (p.root / 'config-bytes').write_bytes(b'foreign-config')
+            with self.assertRaisesRegex(RuntimeError, 'build_archive_config'):
+                p.archive('worker', 'docker/mcp-worker.Dockerfile')
+
+    def test_archive_command_errors_stop_without_fallback(self):
+        operations = [['buildx', 'build'], ['image', 'inspect'], ['image', 'save'], ['skopeo', 'copy']]
+        for index, operation in enumerate(operations):
+            with self.subTest(operation=operation), self.archive_fixture() as (p, _):
+                (p.root / 'fail').write_text(json.dumps(operation))
+                with self.assertRaisesRegex(RuntimeError, 'producer_command'):
+                    p.archive('worker', 'docker/mcp-worker.Dockerfile')
+                calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+                actual = [call[5:7] if call[0] == 'docker' else ['skopeo', 'copy'] for call in calls
+                          if call[0] != 'docker' or call[5] != 'info']
+                self.assertEqual(actual, operations[:index + 1])
 
     def test_matrix_requires_actual_nonzero_output_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:

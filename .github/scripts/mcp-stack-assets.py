@@ -339,19 +339,38 @@ class Producer:
 
     def archive(self, role, dockerfile, context=None, build_args=None, local=False):
         output = self.files / role if local else self.files / f'{role}.docker.tar'
+        metadata = self.root / f'build-{role}.json'
         args = ['buildx', 'build', '--builder', 'default', '--platform', 'linux/' + self.arch,
                 '--provenance=false', '--sbom=false', '--label', 'org.opencontainers.image.revision=' + self.head,
                 '--label', f'{LABEL}={self.run}', '--build-arg', 'SOURCE_COMMIT=' + self.head,
-                '--file', str((context or self.source) / dockerfile), '--output',
-                ('type=local,dest=' if local else 'type=docker,dest=') + str(output)]
+                '--file', str((context or self.source) / dockerfile)]
+        args += (['--output', 'type=local,dest=' + str(output)] if local else
+                 ['--load', '--metadata-file', str(metadata)])
         for key, value in (build_args or {}).items():
             args += ['--build-arg', key + '=' + value]
         args += [str(context or self.source)]
         self.engine(*args)
         if local:
             return output
+        built = json.loads(canonical(str(metadata)).read_bytes())
+        identity = built.get('containerimage.config.digest') if isinstance(built, dict) else None
+        require(isinstance(identity, str) and DIGEST.fullmatch(identity), 'build_image_config_digest')
+        inspected = json.loads(self.engine('image', 'inspect', identity))
+        require(isinstance(inspected, list) and len(inspected) == 1 and isinstance(inspected[0], dict),
+                'build_image_inspect')
+        actual = inspected[0]
+        require(actual.get('Id') == identity and actual.get('Os') == 'linux' and
+                actual.get('Architecture') == self.arch, 'build_image_platform')
+        config = actual.get('Config')
+        labels = config.get('Labels') if isinstance(config, dict) else None
+        require(isinstance(labels, dict) and labels.get('org.opencontainers.image.revision') == self.head and
+                labels.get(LABEL) == self.run, 'build_image_labels')
+        self.engine('image', 'save', '--output', str(output), identity)
+        canonical(str(output))
         archive = self.files / f'{role}.oci.tar'
         self.skopeo('copy', 'docker-archive:' + str(output), 'oci-archive:' + str(archive))
+        config = self.skopeo('inspect', '--raw', '--config', 'oci-archive:' + str(archive))
+        require(digest(config) == identity, 'build_archive_config')
         return archive
 
     def import_image(self, role, archive):

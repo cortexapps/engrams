@@ -26,7 +26,17 @@ no symlink components, and stay at the same inode/device. Docker CLI/server
 must satisfy composition preflight (at least26, API1.45). Install buildx as a
 system CLI plugin; the producer uses the engine's default Docker driver with
 explicit `--config`, `--host` and `--builder default`. It creates no extra
-BuildKit daemon. The driver must support Docker archive and local exporters.
+BuildKit daemon. Provision the classic image store with raw config SHA256
+image IDs. A store that exposes manifest IDs fails the strict image checks.
+The default driver must support image loading and the local exporter.
+For source images, the producer uses `--load` and retains build metadata in
+its private work root. It accepts only `containerimage.config.digest`, checks
+the exact loaded image ID, Linux architecture, source revision and run label,
+then saves that config ID to the owned Docker archive. It converts that
+archive to OCI, checks its raw config against the build config ID, and runs
+the same archive and import checks as other images.
+Missing or invalid metadata or image facts stop the producer before save.
+The local-directory export path stays unchanged. No tag or new builder is used.
 Do not start Docker Desktop, Lima, Colima or another engine from the job.
 
 For FC reserve the entire dedicated Linux kernel for this job. Preload the
