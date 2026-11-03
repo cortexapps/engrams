@@ -1,3 +1,5 @@
+import { canonicalDigest } from "../mcp/hash.ts";
+import { mcpExecution } from "../db/schema.ts";
 import { expect, test } from "bun:test";
 import { effectFixture } from "./mcp-effect-fixture.ts";
 import { reviewContext } from "../mcp/journal-review.ts";
@@ -763,6 +765,59 @@ test("a late old-run acceptance is canceled by independent reconciliation", asyn
     expect((await f.command("stats")).calls).toBe(0);
   } finally {
     await f.db.delete(consumerCursor).where(eq(consumerCursor.sessionId, f.sessionId));
+    await f.cleanup();
+  }
+}, 20000);
+
+test("unsafe raw write arguments reject before journal, lease or worker I/O", async () => {
+  const f = await effectFixture({ classification: "write" });
+  try {
+    for (const token of ["9007199254740993", "-9007199254740993", "9.007199254740993e15"]) {
+      const request = { ...f.request, originalArguments: `{"x":${token}}` };
+      f.requests.set(request.toolCallId, request);
+      await expect(f.driver.acceptToolRequest(request)).rejects.toMatchObject({
+        code: "invalid_arguments",
+      });
+      await expect(
+        f.journal.create(
+          {
+            ...f.input,
+            originalArguments: request.originalArguments,
+            argumentHash: canonicalDigest(JSON.parse(request.originalArguments)),
+          },
+          { kind: "approval" },
+          f.now,
+        ),
+      ).rejects.toThrow("invalid argument JSON");
+      expect(
+        await f.db.select().from(mcpExecution).where(eq(mcpExecution.sessionId, f.sessionId)),
+      ).toHaveLength(0);
+      expect(f.leases).toBe(0);
+      expect(await f.command("stats")).toMatchObject({
+        calls: 0,
+        credentialRequests: 0,
+      });
+    }
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
+
+test("safe boundary write reaches the serialized provider operation unchanged", async () => {
+  const f = await effectFixture({ classification: "write" });
+  try {
+    f.request.originalArguments = '{ "x": 9007199254740991 }';
+    const call = await f.driver.acceptToolRequest(f.request);
+    expect(call.originalArguments).toBe(f.request.originalArguments);
+    await f.driver.driveOnce(call.id);
+    const approval = await f.journal.requestApproval(call.id, f.deploymentId, new Date());
+    await f.journal.decide(call.id, f.actorId, true, reviewContext(call, approval), new Date());
+    expect((await f.driver.driveOnce(call.id)).state).toBe("succeeded");
+    const stats = await f.command("stats");
+    expect(stats.calls).toBe(1);
+    expect(JSON.parse(stats.lastCall).params.arguments.x).toBe(9007199254740991);
+    expect(stats.lastCall).toContain('"x":9007199254740991');
+  } finally {
     await f.cleanup();
   }
 }, 20000);

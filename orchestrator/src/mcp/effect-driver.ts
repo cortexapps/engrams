@@ -1,3 +1,4 @@
+import { parseArgumentJson } from "./arguments.ts";
 import { McpAuthorityStale } from "./authority-error.ts";
 import { fromJson } from "@bufbuild/protobuf";
 import { and, eq } from "drizzle-orm";
@@ -77,7 +78,7 @@ function argumentsValue(raw: string): Record<string, unknown> {
   try {
     if (Buffer.byteLength(raw) > MCP_LIMITS.argumentBytes)
       throw new McpRequestDenied("invalid_arguments");
-    const value: unknown = JSON.parse(raw);
+    const value: unknown = parseArgumentJson(raw);
     if (!object(value)) throw new McpRequestDenied("invalid_arguments");
     return value;
   } catch {

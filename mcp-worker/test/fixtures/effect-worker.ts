@@ -7,6 +7,7 @@ const lines = createInterface({ input: process.stdin });
 const input = lines[Symbol.asyncIterator]();
 const { tls, response = "normal" } = JSON.parse((await input.next()).value!);
 const held: (() => void)[] = [];
+let lastCall: string | undefined;
 let calls = 0,
   credentialRequests = 0;
 const provider = createServer(tls, (req, res) => {
@@ -37,6 +38,7 @@ const provider = createServer(tls, (req, res) => {
       };
     else if (message.method === "tools/call") {
       calls++;
+      lastCall = raw;
       if (response === "hold") {
         held.push(() => {
           res.writeHead(200, { "content-type": "application/json" });
@@ -119,10 +121,11 @@ const make = () =>
   });
 let worker = make();
 const port = await worker.listen(0, "127.0.0.1");
-const send = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const send = (value: unknown) =>
+  process.stdout.write(`${JSON.stringify(value)}\n`);
 send({ port, identity: worker.identity, node: process.versions.node });
 for await (const command of { [Symbol.asyncIterator]: () => input }) {
-  if (command === "stats") send({ calls, credentialRequests });
+  if (command === "stats") send({ calls, credentialRequests, lastCall });
   else if (command === "release") {
     for (const release of held.splice(0)) release();
     send({ released: true });
