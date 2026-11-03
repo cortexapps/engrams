@@ -16,6 +16,7 @@ description = "Production SandboxBackend driving Firecracker microVMs over its H
 unsafe_code = "allow"
 
 [dependencies]
+tempfile = "3"
 engram-chunk-store.workspace = true
 engram-core.workspace = true
 engram-egress-proto.workspace = true
@@ -61,4 +62,3 @@ rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
-tempfile = "3"

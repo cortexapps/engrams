@@ -673,6 +673,51 @@ impl Registry {
         Ok(())
     }
 
+    /// Compare even a CLOSED registration under the same lock as policy apply.
+    /// Keep that lock through drain and removal so a late old operation cannot
+    /// quarantine or unregister a replacement sandbox.
+    pub async fn retire_managed(
+        &self,
+        session: SessionId,
+        sandbox: engram_core::SandboxId,
+        guest: Ipv4Addr,
+    ) -> Result<(), String> {
+        let control = self
+            .inner
+            .write()
+            .controls
+            .entry(session)
+            .or_default()
+            .clone();
+        let _apply = control.apply.lock().await;
+        let matches = |g: &RegistryInner| -> Result<(), String> {
+            if let Some(ip) = g.by_session.get(&session) {
+                if *ip != guest
+                    || !g.by_guest_ip.get(ip).is_some_and(|state| {
+                        state.session_id == session
+                            && state.sandbox_id == sandbox
+                            && state.managed_deny.is_some()
+                    })
+                {
+                    return Err("private registration changed during retirement".into());
+                }
+            }
+            Ok(())
+        };
+        matches(&self.inner.read())?;
+        control.close();
+        control.drain().await;
+        if control.is_poisoned() {
+            return Err("private network cleanup failed; replace proxy before replay".into());
+        }
+        let mut g = self.inner.write();
+        matches(&g)?;
+        if let Some(ip) = g.by_session.remove(&session) {
+            g.by_guest_ip.remove(&ip);
+        }
+        Ok(())
+    }
+
     pub async fn quarantine_and_drain(&self, session_id: SessionId) {
         let control = self
             .inner

@@ -81,6 +81,23 @@ async fn serve_conn(
                     Err(error) => FromProxyd::Err(error),
                 }
             }
+            ToProxyd::RetirePrivateNetwork(allocation) => {
+                // Managed registrations reject tunnels. Only ordinary removal
+                // needs the session-wide gateway callback.
+                match state
+                    .private
+                    .retire(
+                        &allocation,
+                        &state.registry,
+                        state.host_id,
+                        &state.hello.incarnation,
+                    )
+                    .await
+                {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
+            }
             ToProxyd::ListManaged => FromProxyd::ManagedSessions(state.registry.managed_sessions()),
             ToProxyd::QuarantineManaged(session) => {
                 state.registry.quarantine_and_drain(session).await;
@@ -487,6 +504,66 @@ mod tests {
                 coord_url: "http://coord".into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn late_managed_removal_cannot_retire_a_same_session_replacement() {
+        let state = Arc::new(state());
+        let session = SessionId::new();
+        let mut old = policy(session, "192.0.2.2".parse().unwrap());
+        old.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap(),
+        );
+        register_policy(&state.registry, old.clone()).await.unwrap();
+        let (_, mut lease) = state.registry.enroll(old.guest_ip).unwrap();
+        let mut replacement = old.clone();
+        replacement.sandbox_id = SandboxId::new();
+        let registry = state.registry.clone();
+        let next = replacement.clone();
+        let apply = tokio::spawn(async move { register_policy(&registry, next).await });
+        // Replacement owns the existing session lifecycle lock and waits for
+        // the old lease. The old removal will execute only after replacement.
+        lease.cancelled().await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let serving = state.clone();
+        let removal = tokio::spawn(async move { serve_conn(server, serving).await });
+        let allocation = engram_egress_proto::private::Allocation {
+            version: engram_egress_proto::private::VERSION,
+            host_id: state.host_id,
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: state.hello.incarnation.clone(),
+            session_id: session,
+            sandbox_id: old.sandbox_id,
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: old.guest_ip,
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: old.managed_deny.as_ref().unwrap().digest.clone(),
+        };
+        engram_egress_proto::write_frame(
+            &mut client,
+            &ToProxyd::RetirePrivateNetwork(Box::new(allocation)),
+        )
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            engram_egress_proto::read_frame::<_, FromProxyd>(&mut client),
+        )
+        .await
+        .is_err());
+        drop(client);
+        drop(lease);
+        apply.await.unwrap().unwrap();
+        let _ = removal.await.unwrap();
+        let current = state
+            .registry
+            .lookup_session(session)
+            .expect("late removal must preserve replacement");
+        assert_eq!(current.sandbox_id, replacement.sandbox_id);
+        assert_eq!(current.guest_ip, replacement.guest_ip);
     }
 
     #[tokio::test]

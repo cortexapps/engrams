@@ -119,7 +119,7 @@ async fn hash_zeros(hash: &mut Sha256, mut count: u64, zeros: &[u8]) {
     }
 }
 
-async fn hash_file(path: &Path) -> Result<(String, u64), SandboxError> {
+pub(crate) async fn hash_file(path: &Path) -> Result<(String, u64), SandboxError> {
     use std::os::unix::fs::MetadataExt;
     let mut file = tokio::fs::OpenOptions::new()
         .read(true)

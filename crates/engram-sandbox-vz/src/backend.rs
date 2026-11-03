@@ -247,15 +247,26 @@ impl VzBackend {
     }
 
     /// Prepare exact disk-only managed inputs with closed host networking.
-    /// The returned owner has no release API and is outside ordinary lifecycles.
+    /// The returned owner is outside ordinary lifecycles. The blocking pin
+    /// operation owns disposable staging until the input copy is complete.
     pub async fn prepare_managed_cold(
         &self,
         request: engram_core::types::managed_cold::ManagedColdPrepare,
         spec: SandboxSpec,
         network: engram_egress_proto::private::RegisteredPrivateNetwork,
         helper: crate::managed::ManagedHelperArtifact,
+        staging: tempfile::TempDir,
     ) -> Result<crate::managed::PreparedManagedVz, SandboxError> {
-        crate::managed::prepare(&self.work_dir, &self.cfg, request, spec, network, helper).await
+        crate::managed::prepare(
+            &self.work_dir,
+            &self.cfg,
+            request,
+            spec,
+            network,
+            helper,
+            staging,
+        )
+        .await
     }
 
     /// Attach a chunk store. Once set, every `snapshot()` chunks

@@ -266,6 +266,7 @@ pub(crate) async fn prepare(
     spec: engram_core::types::sandbox::SandboxSpec,
     network: engram_egress_proto::private::RegisteredPrivateNetwork,
     artifact: ManagedHelperArtifact,
+    staging: tempfile::TempDir,
 ) -> Result<PreparedManagedVz, engram_core::SandboxError> {
     use engram_core::{
         types::managed_cold::{ManagedColdPrepared, ManagedColdState},
@@ -289,7 +290,7 @@ pub(crate) async fn prepare(
         let work_dir = work_dir.to_owned();
         let artifact = artifact.clone();
         tokio::task::spawn_blocking(move || {
-            PinnedFiles::prepare(&work_dir, &cfg, &request, &spec, &artifact)
+            PinnedFiles::prepare(&work_dir, &cfg, &request, &spec, &artifact, staging)
         })
     };
     // Before a helper exists, this stream owns no packet or flow work. Return
@@ -422,6 +423,7 @@ impl PinnedFiles {
         request: &engram_core::types::managed_cold::ManagedColdPrepare,
         spec: &engram_core::types::sandbox::SandboxSpec,
         artifact: &ManagedHelperArtifact,
+        _staging: tempfile::TempDir,
     ) -> Result<Self, engram_core::SandboxError> {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::create_dir_all(work_dir)?;
@@ -593,13 +595,50 @@ mod tests {
     }
 
     #[test]
+    fn staging_is_removed_after_pin_success_or_verification_failure() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, mut spec, artifact) = inputs(dir.path());
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            let path = staging.path().to_owned();
+            let disk = path.join("selected.ext4");
+            std::fs::write(&disk, if valid { b"disk-a" } else { b"bad-aa" }).unwrap();
+            spec.rootfs_source = Some(disk);
+            let result = PinnedFiles::prepare(
+                &dir.path().join("owned"),
+                &cfg,
+                &request,
+                &spec,
+                &artifact,
+                staging,
+            );
+            assert!(!path.exists(), "staging must end with the pin operation");
+            if valid {
+                let files = result.unwrap();
+                assert_eq!(
+                    std::fs::read(files.path.join("rootfs.ext4")).unwrap(),
+                    b"disk-a"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
     fn retirement_failure_retains_source_and_untrusted_helper_mode_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (cfg, request, spec, artifact) = inputs(dir.path());
-        let files =
-            PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec, &artifact)
-                .unwrap();
+        let files = PinnedFiles::prepare(
+            &dir.path().join("owned"),
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
         let path = files.path.clone();
         files
             .retain
@@ -607,10 +646,15 @@ mod tests {
         drop(files);
         assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
         std::fs::set_permissions(&artifact.path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(
-            PinnedFiles::prepare(&dir.path().join("other"), &cfg, &request, &spec, &artifact)
-                .is_err()
-        );
+        assert!(PinnedFiles::prepare(
+            &dir.path().join("other"),
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
     }
     #[test]
     fn all_selected_boot_files_are_private_and_failed_attempts_leave_no_files() {
@@ -618,7 +662,15 @@ mod tests {
         let (cfg, request, spec, artifact) = inputs(dir.path());
         request.validate(&spec).unwrap();
         let work = dir.path().join("work");
-        let files = PinnedFiles::prepare(&work, &cfg, &request, &spec, &artifact).unwrap();
+        let files = PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
         let path = files.path.clone();
         assert_eq!(std::fs::read(path.join("kernel")).unwrap(), b"kernel-a");
         assert_eq!(std::fs::read(path.join("netstack")).unwrap(), b"helper-a");
@@ -627,7 +679,15 @@ mod tests {
             request.aux_ro_drives[1].sha256.as_ref().unwrap()
         );
         assert_eq!(std::fs::read(path.join(name)).unwrap(), b"bundle-a");
-        assert!(PinnedFiles::prepare(&work, &cfg, &request, &spec, &artifact).is_err());
+        assert!(PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
         assert!(
             path.join("rootfs.ext4").exists(),
             "collision must not remove the first owner"
@@ -635,7 +695,15 @@ mod tests {
         drop(files);
         assert!(!path.exists());
         std::fs::write(&cfg.kernel_path, b"kernel-b").unwrap();
-        assert!(PinnedFiles::prepare(&work, &cfg, &request, &spec, &artifact).is_err());
+        assert!(PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
         assert!(
             !path.exists(),
             "failed pin must remove the private partial copy"
@@ -647,7 +715,12 @@ mod tests {
     async fn allocation_mismatch_stops_before_artifacts_or_helper() {
         use engram_egress_proto::private::{self, Allocation, Reply};
         let dir = tempfile::tempdir().unwrap();
-        let (cfg, request, spec, artifact) = inputs(dir.path());
+        let (cfg, request, mut spec, artifact) = inputs(dir.path());
+        let staging = tempfile::tempdir_in(dir.path()).unwrap();
+        let staging_path = staging.path().to_owned();
+        let staged_disk = staging_path.join("selected.ext4");
+        std::fs::copy(spec.rootfs_source.as_ref().unwrap(), &staged_disk).unwrap();
+        spec.rootfs_source = Some(staged_disk);
         let allocation = Allocation {
             version: 1,
             host_id: engram_core::HostId::new(),
@@ -683,18 +756,100 @@ mod tests {
         let capability = private::register(client, &allocation).await.unwrap();
         let mut peer = peer.await.unwrap();
         let work = dir.path().join("work");
-        let result = prepare(&work, &cfg, request, spec, capability, artifact).await;
+        let result = prepare(&work, &cfg, request, spec, capability, artifact, staging).await;
         assert!(matches!(
             result,
             Err(engram_core::SandboxError::InvalidSpec(_))
         ));
         assert!(!work.exists());
+        assert!(
+            !staging_path.exists(),
+            "backend rejection must remove staging"
+        );
         use tokio::io::AsyncReadExt;
         assert_eq!(
             peer.read(&mut [0]).await.unwrap(),
             0,
             "rejected capability must close"
         );
+    }
+
+    #[test]
+    fn cancelled_prepare_keeps_staging_until_queued_pin_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use engram_egress_proto::private::{self, Allocation, Reply};
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, mut spec, artifact) = inputs(dir.path());
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            let staging_path = staging.path().to_owned();
+            let disk = staging_path.join("selected.ext4");
+            std::fs::write(&disk, b"disk-a").unwrap();
+            spec.rootfs_source = Some(disk);
+            let allocation = Allocation {
+                version: 1,
+                host_id: engram_core::HostId::new(),
+                host_incarnation: "host-1".into(),
+                proxy_incarnation: "proxy-1".into(),
+                session_id: request.session_id,
+                sandbox_id: request.sandbox_id,
+                boot_attempt: request.boot_attempt.clone(),
+                attachment_generation: 1,
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                gateway_ip: "192.0.2.1".parse().unwrap(),
+                policy_revision: 1,
+                policy_digest: format!("sha256:{}", "a".repeat(64)),
+            };
+            let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let _: engram_egress_proto::ToProxyd =
+                    engram_egress_proto::read_frame(&mut server).await.unwrap();
+                let _: Allocation = private::read(&mut server).await.unwrap();
+                private::write(
+                    &mut server,
+                    &Reply {
+                        version: 1,
+                        sequence: 0,
+                        epoch: 0,
+                        state: "closed".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                server
+            });
+            let capability = private::register(client, &allocation).await.unwrap();
+            let peer = peer.await.unwrap();
+            let (release, held) = std::sync::mpsc::channel();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let work = dir.path().join("work");
+            let task = tokio::spawn(async move {
+                prepare(&work, &cfg, request, spec, capability, artifact, staging).await
+            });
+            tokio::task::yield_now().await;
+            drop(peer);
+            let result = task.await.unwrap();
+            let retained_while_queued = staging_path.join("selected.ext4").is_file();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            // The queued pin runs before this queue barrier can complete.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(result.is_err());
+            assert!(
+                retained_while_queued,
+                "cancel must not unlink a pending pin input"
+            );
+            assert!(!staging_path.exists(), "finished pin must remove staging");
+        });
     }
 
     #[test]
