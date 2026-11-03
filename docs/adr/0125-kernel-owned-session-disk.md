@@ -206,8 +206,11 @@ userland. Nothing outside the in-tree kernel is needed.
 9. **This ADR is documented as facts.** On acceptance, DESIGN.md gains
    a "Session disk" fact page written in the present tense with a dated
    "verified against" line naming the tests and metrics that prove each
-   fact. ADR 0110, ADR 0090 and ADR 0049 get a footer pointing at it.
-   Code comments in the new path say what the code does; they cite this
+   fact. ADR 0110, ADR 0090 and ADR 0049 are collapsed to a stub: their
+   status line, three sentences on what they decided and why it stopped
+   being true, and a link to the fact page; the full text stays in git
+   history. AGENTS.md names the fact pages as the current truth and the
+   ADRs as the record of how it came to be. Code comments in the new path say what the code does; they cite this
    ADR only as a pointer to the reasoning, never as a lineage. Every
    phase PR updates the fact page in the same change.
 
