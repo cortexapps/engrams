@@ -3703,13 +3703,22 @@ impl PooledBackend {
     }
 
     /// Keep the root recovery reference until the whole device set is served.
+    ///
+    /// The quarantine entry is written only from the OUTCOME of the
+    /// recovery (an error, or a device set that is still not fully
+    /// served). It is never written before the recovery runs: the
+    /// heartbeat task advertises this map every 5 s, independently of
+    /// the registration task that runs the rehydrate passes, and the
+    /// coordinator reacts to the first advertise by enqueueing an
+    /// `evict_local` (ADR 0090). A pre-recovery mark for a sandbox that
+    /// then recovers a few seconds later still evicts a healthy VM
+    /// mid-build on every host-agent restart (every deploy, 2026-10).
     #[cfg(any(test, target_os = "linux"))]
     async fn track_rehydrate(
         &self,
         session_id: SessionId,
         sandbox_id: SandboxId,
         disk_manifest: engram_core::ManifestRef,
-        expects_secondary: bool,
         recovery: impl std::future::Future<Output = Result<bool, SandboxError>>,
         served: impl Fn() -> Option<bool>,
     ) -> Result<bool, SandboxError> {
@@ -3724,9 +3733,6 @@ impl PooledBackend {
                     reason: engram_protocol::heartbeat::QuarantineReason::Rehydrate,
                 });
         };
-        if expects_secondary {
-            quarantine();
-        }
         let result = recovery.await;
         match served() {
             _ if result.is_err() => quarantine(),
@@ -10262,9 +10268,6 @@ impl PooledBackend {
             session_id,
             sandbox_id,
             disk_manifest,
-            self.recovery_owners
-                .values()
-                .any(|o| o.sandbox_id == sandbox_id && o.role == DiskRole::Swap),
             self.rehydrate_all_devices(session_id, sandbox_id, disk_manifest),
             || {
                 self.nbd_sandboxes
@@ -10935,7 +10938,7 @@ mod tests {
             Ok(true)
         };
         assert!(pooled
-            .track_rehydrate(session, id, root_ref, true, recover(), served)
+            .track_rehydrate(session, id, root_ref, recover(), served)
             .await
             .is_err());
         assert_eq!(*served_roles.lock(), [Root].into_iter().collect());
@@ -10950,13 +10953,72 @@ mod tests {
                 retry.session_id,
                 id,
                 retry.disk_manifest.unwrap(),
-                true,
                 recover(),
                 served
             )
             .await
             .unwrap());
         assert_eq!(*served_roles.lock(), expected);
+        assert!(pooled.quarantined_survivors().is_empty());
+    }
+
+    /// Regression (2026-11): a survivor whose recovery is still in
+    /// flight must not be advertised as quarantined. The heartbeat
+    /// task reads `quarantined_survivors` on its own 5 s cadence while
+    /// the registration task runs the rehydrate passes one sandbox at
+    /// a time, so any pre-recovery mark is visible to the coordinator
+    /// and evicts a VM that recovers moments later.
+    #[tokio::test]
+    async fn in_flight_rehydrate_is_not_advertised_as_quarantined() {
+        use engram_core::DiskRole::{Root, Swap};
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(FakeCaptureBackend {
+            payload: vec![],
+            staging_root: dir.path().join("snapshots"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        });
+        let pooled = Arc::new(PooledBackend::new(inner));
+        let id = SandboxId::new();
+        let session = SessionId::new();
+        let root_ref = engram_core::ManifestRef::new();
+        let expected: std::collections::BTreeSet<_> = [Root, Swap].into_iter().collect();
+        let served_roles = Arc::new(PlMutex::new(std::collections::BTreeSet::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let tracked = {
+            let pooled = Arc::clone(&pooled);
+            let served_roles = Arc::clone(&served_roles);
+            tokio::spawn(async move {
+                let served_view = Arc::clone(&served_roles);
+                let served = move || {
+                    Some(engram_host_core::all_disk_roles_served(
+                        &expected,
+                        served_view.lock().iter().copied(),
+                    ))
+                };
+                let recover = async {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    served_roles.lock().insert(Root);
+                    served_roles.lock().insert(Swap);
+                    Ok(true)
+                };
+                pooled
+                    .track_rehydrate(session, id, root_ref, recover, served)
+                    .await
+            })
+        };
+
+        // Recovery has begun (a swap device is expected) and is parked.
+        started_rx.await.unwrap();
+        assert!(
+            pooled.quarantined_survivors().is_empty(),
+            "an in-flight recovery must not be advertised"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(tracked.await.unwrap().unwrap());
         assert!(pooled.quarantined_survivors().is_empty());
     }
 
