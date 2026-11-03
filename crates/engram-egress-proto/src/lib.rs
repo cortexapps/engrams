@@ -330,7 +330,7 @@ mod tests {
             guest_ip: "192.0.2.2".parse().unwrap(),
             gateway_ip: "192.0.2.1".parse().unwrap(),
             policy_revision: 1,
-            policy_digest: "a".repeat(64),
+            policy_digest: format!("sha256:{}", "a".repeat(64)),
         };
         allocation.validate().unwrap();
         let message = ToProxyd::RetirePrivateNetwork(Box::new(allocation));
