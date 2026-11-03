@@ -46,6 +46,7 @@ pub struct PreparedManagedVz {
     released_epoch: Option<u64>,
     started: bool,
     bridge: Option<crate::vsock_bridge::VsockBridge>,
+    connector: Option<crate::vsock_bridge::VsockConnector>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -133,6 +134,7 @@ impl PreparedManagedVz {
         .await
         .map_err(io::Error::other)?;
         self.bridge = Some(bridge);
+        self.connector = Some(connector.clone());
         let mut conn = connector.connect_stream(1024).await?;
         let request =
             engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
@@ -149,6 +151,58 @@ impl PreparedManagedVz {
         self.helper.check_ready(epoch)?;
         self.failed = false;
         Ok(())
+    }
+    pub fn owns(&self, request: &engram_core::types::managed_cold::ManagedColdPrepare) -> bool {
+        &self.receipt.prepared.request == request
+    }
+    async fn exec_connection(
+        &mut self,
+        epoch: u64,
+    ) -> Result<engram_core::traits::HarnessByteStream, engram_core::SandboxError> {
+        self.check_ready(epoch).await?;
+        if !self.started {
+            return Err(io::Error::other("managed execution requires a started owner").into());
+        }
+        Ok(self
+            .connector
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed connector unavailable"))?
+            .connect_stream(1024)
+            .await?)
+    }
+    pub async fn exec_stream(
+        &mut self,
+        epoch: u64,
+        cmd: engram_core::types::sandbox::ExecRequest,
+    ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError> {
+        let probe = self.exec_connection(epoch).await?;
+        let durable = crate::backend::probe_durable_exec(probe).await?;
+        let connection = self.exec_connection(epoch).await?;
+        let (reader, writer) = tokio::io::split(connection);
+        crate::backend::drive_exec_protocol(
+            self.receipt.prepared.request.sandbox_id,
+            reader,
+            writer,
+            cmd,
+            durable,
+        )
+        .await
+    }
+    pub async fn cancel_exec(
+        &mut self,
+        epoch: u64,
+        exec_id: String,
+    ) -> Result<(), engram_core::SandboxError> {
+        let mut connection = self.exec_connection(epoch).await?;
+        engram_agentd::write_msg(
+            &mut connection,
+            &engram_agentd::WireRequest::CancelExec { exec_id },
+        )
+        .await?;
+        match engram_agentd::read_msg::<_, engram_agentd::WireResponse>(&mut connection).await? {
+            engram_agentd::WireResponse::ExecCancelled => Ok(()),
+            _ => Err(io::Error::other("managed execution cancellation failed").into()),
+        }
     }
     /// Pause, retire the source, sync its disk, then copy the exact durable cut.
     /// This makes no claim about unflushed guest page-cache data.
@@ -304,6 +358,7 @@ pub(crate) async fn prepare(
         released_epoch: None,
         started: false,
         bridge: None,
+        connector: None,
         receipt: ManagedVzClosedReceipt {
             prepared: ManagedColdPrepared {
                 version: 1,

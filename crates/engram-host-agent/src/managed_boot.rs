@@ -3,8 +3,13 @@ use crate::{bindings::BindingStore, egress::HostEgress, harness::HarnessHub};
 use engram_core::{
     traits::{HarnessSink, SandboxBackend},
     types::{
-        egress::SessionEgressPolicy, image::SecretMode, managed_boot::*, managed_create::digest,
-        managed_deny::*, manifest::ManifestRef, sandbox::AgentSpec,
+        egress::SessionEgressPolicy,
+        image::SecretMode,
+        managed_boot::*,
+        managed_create::digest,
+        managed_deny::*,
+        manifest::ManifestRef,
+        sandbox::{AgentSpec, ExecRequest, ExecStream},
     },
     HostId, SandboxError, SandboxId,
 };
@@ -42,29 +47,33 @@ impl ManagedBackend {
     ) -> Result<Owner, SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Firecracker(backend) => Ok(Owner::Firecracker(
+            Self::Firecracker(backend) => Ok(Owner::Firecracker(Box::new(
                 backend
                     .prepare_managed_cold(request.cold.clone(), spec, network)
                     .await?,
-            )),
+            ))),
             #[cfg(target_os = "macos")]
-            Self::Vz { backend, helper } => Ok(Owner::Vz(
+            Self::Vz { backend, helper } => Ok(Owner::Vz(Box::new(
                 backend
                     .prepare_managed_cold(request.cold.clone(), spec, network, helper.clone())
                     .await?,
-            )),
+            ))),
         }
     }
 }
 enum Owner {
+    #[cfg(test)]
+    ExecTest(Box<tests::ExecOwner>),
     #[cfg(target_os = "linux")]
-    Firecracker(engram_sandbox_firecracker::managed::PreparedManagedFc),
+    Firecracker(Box<engram_sandbox_firecracker::managed::PreparedManagedFc>),
     #[cfg(target_os = "macos")]
-    Vz(engram_sandbox_vz::PreparedManagedVz),
+    Vz(Box<engram_sandbox_vz::PreparedManagedVz>),
 }
 impl Owner {
     async fn closed_identity(&mut self) -> Result<String, SandboxError> {
         let bytes = match self {
+            #[cfg(test)]
+            Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => serde_json::to_vec(&owner.closed_receipt().await?),
             #[cfg(target_os = "macos")]
@@ -75,6 +84,8 @@ impl Owner {
     }
     async fn release(&mut self, epoch: u64) -> Result<(), SandboxError> {
         match self {
+            #[cfg(test)]
+            Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.release(epoch).await,
             #[cfg(target_os = "macos")]
@@ -83,6 +94,13 @@ impl Owner {
     }
     async fn ready(&mut self, epoch: u64) -> Result<(), SandboxError> {
         match self {
+            #[cfg(test)]
+            Self::ExecTest(owner) => {
+                if owner.blocked {
+                    futures::future::pending::<()>().await;
+                }
+                owner.ready(epoch)
+            }
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.check_ready(epoch).await,
             #[cfg(target_os = "macos")]
@@ -91,14 +109,52 @@ impl Owner {
     }
     async fn start(&mut self, agent: AgentSpec, sink: HarnessSink) -> Result<(), SandboxError> {
         match self {
+            #[cfg(test)]
+            Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.start_agent(agent, sink).await,
             #[cfg(target_os = "macos")]
             Self::Vz(owner) => owner.start_agent(agent, sink).await,
         }
     }
+    fn owns(&self, request: &engram_core::types::managed_cold::ManagedColdPrepare) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => owner.owns(request),
+            #[cfg(target_os = "macos")]
+            Self::Vz(owner) => owner.owns(request),
+            #[cfg(test)]
+            Self::ExecTest(owner) => &owner.request == request,
+        }
+    }
+    async fn exec_stream(
+        &mut self,
+        epoch: u64,
+        cmd: ExecRequest,
+    ) -> Result<ExecStream, SandboxError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => owner.exec_stream(epoch, cmd).await,
+            #[cfg(target_os = "macos")]
+            Self::Vz(owner) => owner.exec_stream(epoch, cmd).await,
+            #[cfg(test)]
+            Self::ExecTest(owner) => owner.exec_stream(cmd),
+        }
+    }
+    async fn cancel_exec(&mut self, epoch: u64, exec_id: String) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => owner.cancel_exec(epoch, exec_id).await,
+            #[cfg(target_os = "macos")]
+            Self::Vz(owner) => owner.cancel_exec(epoch, exec_id).await,
+            #[cfg(test)]
+            Self::ExecTest(owner) => owner.cancel_exec(exec_id),
+        }
+    }
     async fn retire_disk(&mut self, path: &Path) -> Result<(), SandboxError> {
         match self {
+            #[cfg(test)]
+            Self::ExecTest(_) => panic!("unexpected execution-test lifecycle call"),
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.retire_disk(path).await,
             #[cfg(target_os = "macos")]
@@ -107,10 +163,12 @@ impl Owner {
     }
     async fn close(self) -> Result<(), SandboxError> {
         match self {
+            #[cfg(test)]
+            Self::ExecTest(_) => Ok(()),
             #[cfg(target_os = "linux")]
-            Self::Firecracker(owner) => owner.close().await,
+            Self::Firecracker(owner) => (*owner).close().await,
             #[cfg(target_os = "macos")]
-            Self::Vz(owner) => owner.close().await,
+            Self::Vz(owner) => (*owner).close().await,
         }
     }
 }
@@ -1307,6 +1365,75 @@ impl ManagedBootHost {
         }
         Ok(())
     }
+    /// Execution is authorized by the exact live start and durable binding.
+    /// Keep the lifecycle lock through submission, with bounded guest I/O.
+    async fn execution_owner<'a>(
+        &self,
+        id: SandboxId,
+        entry: &'a mut Entry,
+    ) -> Result<(u64, &'a mut Owner), SandboxError> {
+        let key = &entry.record.request.key;
+        self.check_key(entry, key)?;
+        let target = &key.context.target;
+        if target.host_id != self.host_id
+            || target.sandbox_id != id
+            || !matches!(&entry.record.state, ManagedBootHostState::Started { intent } if intent.receipt.key == *key)
+            || entry.attach_owner.is_none()
+            || !self
+                .bindings
+                .read(target.session_id)
+                .map_err(invalid)?
+                .is_some_and(|binding| {
+                    binding.sandbox_id == id && binding.binding_epoch == target.binding_epoch
+                })
+        {
+            return Err(invalid("execution owner"));
+        }
+        let epoch = target.binding_epoch;
+        let owner = entry.owner.as_mut().ok_or_else(|| invalid("owner"))?;
+        if !owner.owns(&entry.record.request.cold) {
+            return Err(invalid("execution owner identity"));
+        }
+        owner.ready(epoch).await?;
+        Ok((epoch, owner))
+    }
+    pub async fn exec_stream(
+        &self,
+        id: SandboxId,
+        cmd: ExecRequest,
+    ) -> Result<ExecStream, SandboxError> {
+        let entry = self
+            .entries
+            .get(&id)
+            .map(|e| e.clone())
+            .ok_or_else(|| invalid("owner"))?;
+        let mut entry = entry.lock().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (epoch, owner) = self.execution_owner(id, &mut entry).await?;
+            owner.exec_stream(epoch, cmd).await
+        })
+        .await
+        .map_err(|_| {
+            SandboxError::Unavailable(
+                "managed execution submission timed out; retry with the same execution ticket"
+                    .into(),
+            )
+        })?
+    }
+    pub async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let entry = self
+            .entries
+            .get(&id)
+            .map(|e| e.clone())
+            .ok_or_else(|| invalid("owner"))?;
+        let mut entry = entry.lock().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (epoch, owner) = self.execution_owner(id, &mut entry).await?;
+            owner.cancel_exec(epoch, exec_id).await
+        })
+        .await
+        .map_err(|_| SandboxError::Unavailable("managed execution cancellation timed out".into()))?
+    }
     pub async fn guard_running(&self, id: SandboxId) -> Result<(), SandboxError> {
         let entry = self
             .entries
@@ -1474,6 +1601,249 @@ mod tests {
             sandbox::AuxRoDrive,
         },
     };
+
+    pub(super) struct ExecOwner {
+        epoch: u64,
+        live: bool,
+        pub(super) blocked: bool,
+        id: SandboxId,
+        pub(super) request: ManagedColdPrepare,
+    }
+    impl ExecOwner {
+        pub(super) fn exec_stream(&self, cmd: ExecRequest) -> Result<ExecStream, SandboxError> {
+            Ok(ExecStream {
+                sandbox_id: self.id,
+                exec_id: cmd.exec_id.clone().unwrap(),
+                events: Box::pin(futures::stream::iter([
+                    engram_core::types::sandbox::ExecEvent::Stdout(bytes::Bytes::from(
+                        serde_json::to_vec(&cmd).unwrap(),
+                    )),
+                ])),
+            })
+        }
+        pub(super) fn cancel_exec(&self, exec_id: String) -> Result<(), SandboxError> {
+            if exec_id == "ticket-1" {
+                Ok(())
+            } else {
+                Err(invalid("wrong cancel ticket"))
+            }
+        }
+        pub(super) fn ready(&self, epoch: u64) -> Result<(), SandboxError> {
+            if self.live && self.epoch == epoch {
+                Ok(())
+            } else {
+                Err(invalid("test owner closed or epoch changed"))
+            }
+        }
+    }
+
+    fn install_exec_owner(
+        host: &Arc<ManagedBootHost>,
+        request: &ManagedBootPrepare,
+    ) -> Arc<Mutex<Entry>> {
+        let key = &request.key;
+        let id = key.context.target.sandbox_id;
+        durable_write(
+            &host
+                .bindings
+                .directory()
+                .join(format!("{id}.managed-sandbox")),
+            b"1",
+        )
+        .unwrap();
+        host.hub
+            .bind_session(key.creation.session_id, id, 1)
+            .unwrap();
+        let intent = issued_start(request);
+        let mut record = failed(request.clone());
+        record.incarnation = host.incarnation.clone();
+        record.state = ManagedBootHostState::Started {
+            intent: intent.clone(),
+        };
+        let entry = Arc::new(Mutex::new(Entry {
+            record,
+            attach_owner: Some(host.hub.managed_owner(intent)),
+            owner: Some(Owner::ExecTest(Box::new(ExecOwner {
+                epoch: 1,
+                live: true,
+                blocked: false,
+                id,
+                request: request.cold.clone(),
+            }))),
+            agent: None,
+        }));
+        host.entries.insert(id, entry.clone());
+        entry
+    }
+    fn exec_request() -> ExecRequest {
+        ExecRequest {
+            command: vec!["printf".into(), "ready".into()],
+            stdin: Some(b"input".to_vec()),
+            env: [("CHECK".into(), "value".into())].into(),
+            workdir: Some("/workspace".into()),
+            timeout: Some(std::time::Duration::from_secs(3)),
+            exec_id: Some("ticket-1".into()),
+            stdout_offset: Some(7),
+            stderr_offset: Some(2),
+            wake: Some(false),
+        }
+    }
+    #[tokio::test]
+    async fn managed_exec_uses_current_live_owner() {
+        use futures::StreamExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        install_exec_owner(&host, &request);
+        let local =
+            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                .with_managed_boot(host);
+        let mut stream = local
+            .exec_stream(id, exec_request())
+            .await
+            .expect("marked managed execution uses its live owner");
+        assert_eq!(stream.sandbox_id, id);
+        assert_eq!(stream.exec_id, "ticket-1");
+        let Some(engram_core::types::sandbox::ExecEvent::Stdout(bytes)) =
+            stream.events.next().await
+        else {
+            panic!("owner output missing")
+        };
+        let routed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            routed,
+            serde_json::json!({
+                "command": ["printf", "ready"], "stdin": [105, 110, 112, 117, 116],
+                "env": {"CHECK": "value"}, "workdir": "/workspace", "timeout": {"secs": 3, "nanos": 0},
+                "exec_id": "ticket-1", "stdout_offset": 7, "stderr_offset": 2, "wake": false,
+            })
+        );
+        local.cancel_exec(id, "ticket-1".into()).await.unwrap();
+        assert!(local.cancel_exec(id, "wrong-ticket".into()).await.is_err());
+        assert!(matches!(
+            local.probe_sandbox(id).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            local.exec_stream(SandboxId::new(), exec_request()).await,
+            Err(SandboxError::NotFound)
+        ));
+        assert!(matches!(
+            local.cancel_exec(SandboxId::new(), "ticket-1".into()).await,
+            Err(SandboxError::NotFound)
+        ));
+        local
+            .destroy(
+                id,
+                engram_core::traits::SessionFence::new(request.key.creation.session_id, 1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            local.exec_stream(id, exec_request()).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            local.cancel_exec(id, "ticket-1".into()).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+    }
+    #[tokio::test]
+    async fn managed_exec_denies_stale_closed_and_recovered_owners() {
+        for case in 0..11 {
+            let temp = tempfile::tempdir().unwrap();
+            let (host, request) = fixture(temp.path());
+            let id = request.key.context.target.sandbox_id;
+            let entry = install_exec_owner(&host, &request);
+            {
+                let mut entry = entry.lock().await;
+                match case {
+                    0 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.live = false;
+                        }
+                    }
+                    1 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.epoch = 2;
+                        }
+                    }
+                    2 => entry.owner = None,
+                    3 => entry.record.incarnation = "old-host".into(),
+                    4 => {
+                        entry.record.state = ManagedBootHostState::Failed {
+                            key: request.key.clone(),
+                        }
+                    }
+                    5 => host
+                        .hub
+                        .bind_session(request.key.creation.session_id, id, 2)
+                        .unwrap(),
+                    6 => {
+                        if let ManagedBootHostState::Started { intent } = &mut entry.record.state {
+                            intent.receipt.key.boot_attempt = "other-boot".into();
+                        }
+                    }
+                    7 => entry.attach_owner = None,
+                    8 => entry.record.request.key.context.target.host_id = HostId::new(),
+                    9 => entry.record.request.key.context.target.sandbox_id = SandboxId::new(),
+                    _ => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.request.boot_attempt = "other-owner".into();
+                        }
+                    }
+                }
+            }
+            let local =
+                crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                    .with_managed_boot(host.clone());
+            assert!(
+                matches!(
+                    local.exec_stream(id, exec_request()).await,
+                    Err(SandboxError::InvalidSpec(_))
+                ),
+                "case {case}"
+            );
+            assert!(
+                matches!(
+                    local.cancel_exec(id, "ticket-1".into()).await,
+                    Err(SandboxError::InvalidSpec(_))
+                ),
+                "case {case}"
+            );
+            host.entries.remove(&id);
+            assert!(
+                matches!(
+                    local.exec_stream(id, exec_request()).await,
+                    Err(SandboxError::InvalidSpec(_))
+                ),
+                "lost owner {case}"
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn managed_exec_submission_timeout_releases_lifecycle_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
+            owner.blocked = true;
+        }
+        let local =
+            crate::host_client::LocalHostClient::new(host.ordinary.clone(), host.hub.clone())
+                .with_managed_boot(host);
+        assert!(matches!(
+            local.exec_stream(id, exec_request()).await,
+            Err(SandboxError::Unavailable(_))
+        ));
+        assert!(entry.try_lock().is_ok());
+        assert!(matches!(
+            local.cancel_exec(id, "ticket-1".into()).await,
+            Err(SandboxError::Unavailable(_))
+        ));
+        assert!(entry.try_lock().is_ok());
+    }
 
     fn fixture(path: &Path) -> (Arc<ManagedBootHost>, ManagedBootPrepare) {
         let host_id = HostId::new();

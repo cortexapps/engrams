@@ -201,6 +201,50 @@ impl PreparedManagedFc {
         Ok(())
     }
     #[cfg(target_os = "linux")]
+    pub fn owns(&self, request: &engram_core::types::managed_cold::ManagedColdPrepare) -> bool {
+        &self.inner.receipt.prepared.request == request
+    }
+    #[cfg(target_os = "linux")]
+    async fn exec_connection(
+        &mut self,
+        epoch: u64,
+    ) -> Result<tokio::net::UnixStream, SandboxError> {
+        self.check_ready(epoch).await?;
+        if !self.inner.started {
+            return Err(std::io::Error::other("managed execution requires a started owner").into());
+        }
+        crate::FirecrackerBackend::connect_fc_vsock_once(
+            &self.inner.files.path.join("guest.vsock"),
+            1024,
+        )
+        .await
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn exec_stream(
+        &mut self,
+        epoch: u64,
+        cmd: engram_core::types::sandbox::ExecRequest,
+    ) -> Result<engram_core::types::sandbox::ExecStream, SandboxError> {
+        let probe = self.exec_connection(epoch).await?;
+        let durable = crate::probe_durable_exec(Box::new(probe)).await?;
+        let connection = self.exec_connection(epoch).await?;
+        // Never hand a reconnect capability out of this live owner. On EOF,
+        // the caller retries the same journal ticket through current ownership.
+        crate::drive_exec_protocol(
+            self.inner.receipt.prepared.request.sandbox_id,
+            Box::new(connection),
+            cmd,
+            durable,
+            None,
+        )
+        .await
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn cancel_exec(&mut self, epoch: u64, exec_id: String) -> Result<(), SandboxError> {
+        let connection = self.exec_connection(epoch).await?;
+        crate::cancel_exec_roundtrip(Box::new(connection), &exec_id).await
+    }
+    #[cfg(target_os = "linux")]
     pub async fn retire_disk(&mut self, destination: &std::path::Path) -> Result<(), SandboxError> {
         if self.inner.failed {
             return Err(std::io::Error::other("managed capture source unavailable").into());

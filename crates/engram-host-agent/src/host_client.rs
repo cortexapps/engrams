@@ -192,11 +192,27 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.exec_stream(id, cmd).await;
+        }
         self.ordinary_only(id)?;
         self.sandbox.exec_stream(id, cmd).await
     }
 
     async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.cancel_exec(id, exec_id).await;
+        }
         self.ordinary_only(id)?;
         self.sandbox.cancel_exec(id, exec_id).await
     }

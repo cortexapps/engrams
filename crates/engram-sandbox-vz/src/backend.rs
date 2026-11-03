@@ -794,7 +794,7 @@ impl VzBackend {
 /// defined in `engram-agentd`'s wire types), so the implementation
 /// is identical bar the connection setup. Future refactor:
 /// hoist this into a shared crate.
-async fn drive_exec_protocol<R, W>(
+pub(crate) async fn drive_exec_protocol<R, W>(
     sandbox_id: SandboxId,
     mut reader: R,
     mut writer: W,
@@ -914,7 +914,9 @@ where
     })
 }
 
-async fn probe_durable_exec(mut stream: UnixStream) -> Result<bool, SandboxError> {
+pub(crate) async fn probe_durable_exec<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+) -> Result<bool, SandboxError> {
     write_msg(
         &mut stream,
         &WireRequest::CancelExec {
