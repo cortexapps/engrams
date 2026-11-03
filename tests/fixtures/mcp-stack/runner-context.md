@@ -13,9 +13,10 @@ bun orchestrator/scripts/mcp-stack/run.ts --context /owned/run/context.json --ma
 
 The parser requires both flags exactly once. It accepts only `all`, which selects
 12 cases for Claude and the same 12 for Codex. A result cannot pass if a case or
-required subassertion is absent. The entrypoint and actual scenario drivers are
-pending the fixture CLI and adapter seams below. Do not wire this command into
-CI until those drivers exist and pass review.
+required subassertion is absent. The final entrypoint still awaits integration
+of the separately reviewed policy drivers. Common fidelity, approval, recovery
+and physical drivers now exist. Do not wire this command into CI until the
+complete assembly passes review.
 
 ## Context fields
 
@@ -35,7 +36,7 @@ API key, environment file, image, or primary-checkout path is used.
   hostAgent, fixture, kernel, guestImage, claudeHarness, codexHarness, modelCli,
   claudeBundle, codexBundle, helper. File hashes use bare lowercase hex.
   These identify bytes; they do not prove that a guest ran them.
-- `endpoints.app`, `coordinator`, `operator`: canonical HTTPS origins
+- `endpoints.app`, `coordinator`, `operator`, `workerControl`: canonical HTTPS origins
   under `.fixture.example`, CA file/hash, uppercase colon-separated leaf SHA-256
   fingerprint. TLS still verifies the CA and DNS name. Operator additionally
   needs a separate certificate file/hash and private key file. No redirects or
@@ -60,13 +61,18 @@ API key, environment file, image, or primary-checkout path is used.
 - `observer`: separate private coordinator and orchestrator DSN files. Each
   points to a fixture DNS host and database `mcp_<runId with hyphens changed to
 underscores>`. Only fixed read-only queries are implemented. The two services
-  can use different database servers with that database name.
+  can use different database servers with that database name. `hostManagedRoot`
+  is the actual host-agent `work_dir/managed-boots` directory, owned and mode 0700. `hostLogFile` is its actual JSON tracing log, owned regular mode 0600
+  with one link. Both are direct paths below the run root, not worker mounts
+  or adapter-created observation files.
 - `guest`: owned `/tmp/mcp-stack-fixture` directory and absolute immutable model
   CLI path ending in `/engram-mcp-model-fixture`. The image/init owner prepares
   this directory as 0700 before CLI launch. The runner cannot create it after a
   CLI has already read its startup configuration.
 - `deadlines`: request 100–30000 ms, step up to 120000 ms, total up to 7200000 ms;
   request <= step <= total. `evidenceFile`: new private output file.
+  The required TLS probe needs request >= 6000 ms for its fixed five-second
+  OpenSSL deadline and result framing.
 
 Before any admin mutation, the final runner must check context artifacts,
 supervisor identities/network enforcement, fixture readiness and full source
@@ -200,3 +206,60 @@ Delivery checks combine the actual native result proof, public
 `tool_call_completed` event, and coordinator outbox ACK with the current managed
 delivery target. An outbox ACK alone is insufficient: the coordinator also ACKs
 an old delivery after managed cold recovery retires its target.
+
+## Physical observations and platform prerequisites
+
+The runner reads the sealed host `<sandbox UUID>.boot` record directly. It
+requires schema 1, an exact body hash and sandbox identity, a version 1 record,
+and the current creation/source key. Reads use no-follow file descriptors,
+0600 owner-only single-link files and stable descriptor/path metadata. Envelope
+and body bounds are 16 MiB and 8 MiB, with depth at most 64. The completed
+capture authority must identify a destroyed source and exactly match the new
+cold request. The runner hashes the actual `<capture UUID>.disk` bytes with a
+16 GiB fixture limit and the step deadline. That limit is not a product limit.
+
+An exact, read-only coordinator query joins the owned task/session, current
+boot attempt and completed managed boot intent. It selects only the nonsecret
+asset receipt, start intent, native bytes and combined manifest. It never reads
+the sealed agent or credentials. The host Started receipt and incarnation must
+match the coordinator start intent and selected backend, kernel, disk and
+auxiliary drives. The actual guest harness environment must contain the exact
+combined manifest hash, with the unchanged native prefix. Before and after cold
+recovery, the guest supplies its real kernel boot ID. An exclusive disk
+sentinel must survive, while a sentinel on verified `/dev/shm` tmpfs must be
+absent after recovery. This checks loss of the old tmpfs state; it does not
+claim that every physical RAM byte was erased.
+
+The platform adapter must separately establish actual hypervisor availability,
+the exact owned process and executable for the selected backend, immutable
+source/configuration hashes, and the real guest transport. The managed intent
+receipt proves which backend the authenticated production host path selected.
+It does not replace that platform evidence. Configuration strings or supplied
+success booleans do not establish either layer.
+
+For managed-destination denial, the runner records the actual host log inode
+and byte offset, issues a fixed guest TLS probe to the configured resource
+origin, then requires a new exact proxy Reject event for the owned session and
+SNI. The log must not rotate or truncate. The reader allows at most 8 MiB of
+new bytes and 64 KiB per line, and consumes only newline-terminated records.
+Only hashes leave the reader; raw logs are not evidence artifacts.
+
+`endpoints.workerControl` must name the actual private worker control origin.
+The guest must have OpenSSL 3 and `timeout`. The runner copies only the public
+CA into an exclusive private test file and runs one fixed TLS 1.3 handshake
+with CA, hostname, SNI and exact first-leaf verification. It supplies no client
+certificate or key and sends no HTTP request. A received certificate-required
+alert 116 with verified server identity is classified as
+`mtls_authentication_denial`. It is not L3/CNI isolation evidence. Timeout,
+network drop, close and generic TLS failure cannot pass. A deployment that
+drops before TLS needs a separate positive enforcement observation; this
+contract has no such fallback. The worker has no TLS error observer, so this
+runner makes no worker-log corroboration claim.
+
+Adapters must provide both independently owned protocol fixtures, private
+databases and normal public auth, actual enrolled host/image/assets, the fixed
+supervisor variants and candidate files, the actual host record/log paths,
+guest tools/state directory and fixture CLI, and the fixed worker control
+endpoint. They own start/stop/reap and cleanup of every launched resource.
+The source runner does not build images, launch services, migrate databases,
+install routes, mint host credentials or create platform evidence.

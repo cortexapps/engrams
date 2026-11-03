@@ -96,6 +96,7 @@ export const ContextSchema = z.strictObject({
   endpoints: z.strictObject({
     app: endpoint,
     coordinator: endpoint,
+    workerControl: endpoint,
     operator: endpoint.extend({ certificate: file, privateKeyFile: path }),
   }),
   protocolFixtures: z.strictObject({
@@ -143,6 +144,8 @@ export const ContextSchema = z.strictObject({
   observer: z.strictObject({
     orchestratorDsnFile: path,
     coordinatorDsnFile: path,
+    hostManagedRoot: path,
+    hostLogFile: path,
   }),
   guest: z.strictObject({
     stateDirectory: z.literal("/tmp/mcp-stack-fixture"),
@@ -217,7 +220,10 @@ export async function privateFile(
     await handle.close();
   }
 }
-async function verifyArtifact(root: string, artifact: Artifact): Promise<void> {
+export async function verifyArtifact(
+  root: string,
+  artifact: Artifact,
+): Promise<void> {
   await realOwnedPath(root, artifact.path);
   const handle = await open(
     artifact.path,
@@ -334,6 +340,18 @@ export async function loadContext(filename: string): Promise<Context> {
       await verifyArtifact(root, artifact);
   for (const candidate of Object.values(ctx.supervisor.operatorCandidates))
     await verifyArtifact(root, candidate.file);
+  await realOwnedPath(root, ctx.observer.hostManagedRoot);
+  const hostRoot = await lstat(ctx.observer.hostManagedRoot);
+  if (!hostRoot.isDirectory() || (hostRoot.mode & 0o777) !== 0o700)
+    throw new RunnerFailure("INVALID_CONTEXT", "host_managed_private_root");
+  await realOwnedPath(root, ctx.observer.hostLogFile);
+  const hostLog = await lstat(ctx.observer.hostLogFile);
+  if (
+    !hostLog.isFile() ||
+    (hostLog.mode & 0o777) !== 0o600 ||
+    hostLog.nlink !== 1
+  )
+    throw new RunnerFailure("INVALID_CONTEXT", "host_private_log");
   await realOwnedPath(root, ctx.supervisor.socket);
   if (
     !(await lstat(ctx.supervisor.socket)).isSocket() ||

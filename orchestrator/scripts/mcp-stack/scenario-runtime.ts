@@ -157,9 +157,7 @@ export async function startScenario(
     reviewClient,
     callerActorId: principals.actorIds[input.caller],
     reviewActorId:
-      principals.actorIds[
-        input.caller === "unattended" ? "admin" : input.caller
-      ],
+      principals.actorIds[input.caller === "owner" ? "owner" : "admin"],
     fixture,
     connection,
     catalog,

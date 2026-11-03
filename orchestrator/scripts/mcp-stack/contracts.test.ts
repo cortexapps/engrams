@@ -73,6 +73,7 @@ function validContext() {
     endpoints: {
       app: ep("app"),
       coordinator: ep("coordinator"),
+      workerControl: ep("worker-control"),
       operator: {
         ...ep("operator"),
         certificate: artifact(),
@@ -145,6 +146,8 @@ function validContext() {
     },
     observer: {
       coordinatorDsnFile: "/owned/c.dsn",
+      hostManagedRoot: "/owned/host/managed-boots",
+      hostLogFile: "/owned/host.log",
       orchestratorDsnFile: "/owned/o.dsn",
     },
     guest: {

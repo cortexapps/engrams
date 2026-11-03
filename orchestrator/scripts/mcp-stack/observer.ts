@@ -12,7 +12,7 @@ import { canonicalJson } from "./guest.ts";
 
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
-const sourceKeySchema = z.object({
+export const sourceKeySchema = z.object({
   creation: z.object({
     session_id: z.uuid(),
     task_id: z.string(),
@@ -237,6 +237,33 @@ export class DatabaseObserver {
       .safeParse(result.rows[0]);
     requireThat(row.success, "coordinator_managed_boot_shape");
     return row.data;
+  }
+  /** Select only nonsecret assets, start receipt and frozen manifests for the exact current boot. */
+  async physicalBoot(sessionId: string, bootAttempt: string) {
+    const taskId = this.task(sessionId);
+    requireThat(
+      /^[A-Za-z0-9-]{1,128}$/.test(bootAttempt),
+      "physical_boot_attempt",
+    );
+    const result = await this.coordinator.query(
+      "SELECT i.completed,c.native_version,c.native_bytes,c.native_digest,CASE WHEN octet_length((i.record->'assets')::text)<=65536 THEN (i.record->'assets')::text END AS assets,CASE WHEN octet_length((b.record->'start')::text)<=65536 THEN (b.record->'start')::text END AS start,CASE WHEN octet_length((b.record->'finalization'->'combined_manifest')::text)<=8388608 THEN (b.record->'finalization'->'combined_manifest')::text END AS combined_manifest,b.record->'finalization'->>'combined_manifest_digest' AS combined_manifest_digest FROM session_managed_boot_intents i JOIN session_managed_boots b ON b.session_id=i.session_id AND b.boot_attempt=i.intent_id JOIN session_managed_creations c ON c.session_id=i.session_id WHERE i.session_id=$1 AND c.task_id=$2 AND i.intent_id=$3 AND b.phase='started' AND i.binding_epoch=b.binding_epoch",
+      [sessionId, taskId, bootAttempt],
+    );
+    requireThat(result.rowCount === 1, "physical_current_intent_row");
+    return z
+      .strictObject({
+        completed: z.literal(true),
+        native_version: z.literal(1),
+        native_bytes: z
+          .instanceof(Buffer)
+          .refine((v) => v.length > 0 && v.length <= 1048576),
+        native_digest: digest,
+        assets: z.string().min(1).max(65536),
+        start: z.string().min(1).max(65536),
+        combined_manifest: z.string().min(1).max(8388608),
+        combined_manifest_digest: digest,
+      })
+      .parse(result.rows[0]);
   }
   async managedLifecycle(
     sessionId: string,

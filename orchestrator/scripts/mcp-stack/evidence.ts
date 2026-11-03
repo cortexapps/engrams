@@ -9,6 +9,7 @@ const observation = z.strictObject({
     "fixture-observer",
     "coordinator-read-only",
     "orchestrator-read-only",
+    "host-read-only",
     "guest-proof",
     "supervisor",
   ]),
