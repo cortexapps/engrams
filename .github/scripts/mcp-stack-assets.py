@@ -437,6 +437,10 @@ class Producer:
             require(seen == set(expected), 'source_archive_selection')
             self.source.mkdir(mode=0o700)
             tar.extractall(self.source, filter='data')
+        # The data filter leaves directory modes to the private process umask.
+        # Set public source modes only; keep the containing export root private.
+        for name, directory in expected.items():
+            (self.source / name).chmod(0o755 if directory or entries[name] == '100755' else 0o644)
         # Outputs are private and outside this tracked-only build context.
         for role in [*SOURCE_IMAGES.values(), '.github/scripts/mcp-stack-inputs.mts',
                      '.github/scripts/mcp-stack-fc.sh', '.github/scripts/mcp-stack-vz.sh',

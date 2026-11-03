@@ -107,6 +107,34 @@ class PhysicalGates(unittest.TestCase):
                     p.snapshot()
                 self.assertFalse(p.source.exists())
 
+    def test_snapshot_preserves_public_source_modes_under_private_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            files = ['orchestrator/src/db/migrate.ts', 'orchestrator/drizzle/meta/_journal.json',
+                     'scripts/run.sh']
+            p, source, git = self.source_fixture(Path(directory), files)
+            (source / 'scripts/run.sh').chmod(0o755)
+            git('update-index', '--chmod=+x', 'scripts/run.sh')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture executable')
+            (source / '.env').write_text('untracked fixture secret\n')
+            previous_umask = os.umask(0o077)
+            try:
+                p.snapshot()
+            finally:
+                os.umask(previous_umask)
+            for path in [p.root, p.source]:
+                self.assertEqual(path.stat().st_mode & 0o7777, 0o700)
+            for name in ['orchestrator', 'orchestrator/src', 'orchestrator/src/db',
+                         'orchestrator/drizzle', 'orchestrator/drizzle/meta', 'scripts']:
+                with self.subTest(directory=name):
+                    self.assertEqual((p.source / name).stat().st_mode & 0o7777, 0o755)
+            for name, mode in [('tracked.txt', 0o644), (files[0], 0o644),
+                               (files[1], 0o644), (files[2], 0o755)]:
+                with self.subTest(file=name):
+                    self.assertEqual((p.source / name).stat().st_mode & 0o7777, mode)
+                    self.assertEqual((p.source / name).read_bytes(), b'public fixture source\n')
+            self.assertFalse((p.source / '.env').exists())
+
     def test_snapshot_checks_all_archive_members_before_extraction(self):
         for name, kind in [('unexpected.txt', tarfile.REGTYPE), ('var/key', tarfile.REGTYPE),
                            ('.env', tarfile.REGTYPE), ('.git/config', tarfile.REGTYPE),
