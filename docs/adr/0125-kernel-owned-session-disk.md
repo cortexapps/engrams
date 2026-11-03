@@ -305,9 +305,66 @@ store. Restore still clones a host-local snapshot file instead of
 staging a manifest; the code marks that as a retirement that never
 landed. This ADR lands it.
 
-The host-core seam gets a `SessionDisk` provider with two
-implementations and one shared body of capture, checkpoint-record,
-publish and resume code above it:
+The seam is one trait in `engram-host-core`, beside the seams it
+replaces (`device::DeviceSync` and `nbd::NbdKernel`, both of which
+exist only for the daemon and retire with it). Host-core depends only on
+`engram-core`, so the trait speaks in volumes and 16 MiB chunk indices;
+the shared code above it does the manifest work.
+
+```rust
+/// A session disk the kernel owns. One implementation per platform.
+#[async_trait]
+pub trait SessionDisk: Send + Sync {
+    type Volume: Volume;
+
+    /// An empty volume of `bytes` (an image version, or swap).
+    async fn create(&self, name: &VolumeName, bytes: u64) -> Result<Self::Volume>;
+    /// An O(1) point-in-time copy. The origin may be live when the
+    /// caller has paused the guest and called `Volume::sync`.
+    async fn snapshot(&self, origin: &Self::Volume, name: &VolumeName)
+        -> Result<Self::Volume>;
+    /// A volume recorded in `sandbox.json`. Err when it does not exist.
+    async fn open(&self, name: &VolumeName) -> Result<Self::Volume>;
+    async fn delete(&self, name: &VolumeName) -> Result<()>;
+    /// Free data and metadata space, reported in the heartbeat.
+    async fn capacity(&self) -> Result<Capacity>;
+    /// Chunk indices whose bytes differ between two snapshots of one
+    /// origin. The default reads and hashes every chunk of both: correct
+    /// on every platform, slow, and the oracle the fast path is tested
+    /// against.
+    async fn dirty_chunks(&self, a: &Self::Volume, b: &Self::Volume)
+        -> Result<Vec<ChunkIndex>> { /* default: full compare */ }
+}
+
+#[async_trait]
+pub trait Volume: Send + Sync {
+    /// What the hypervisor opens: a device on Linux, a file on macOS.
+    fn path(&self) -> &Path;
+    /// Staging sink: write one 16 MiB chunk at its offset.
+    async fn write_chunk(&self, index: ChunkIndex, bytes: &[u8]) -> Result<()>;
+    /// Hashing source for upload.
+    async fn read_chunk(&self, index: ChunkIndex) -> Result<Bytes>;
+    /// Host page cache to the volume. Called inside the checkpoint pause.
+    async fn sync(&self) -> Result<()>;
+}
+```
+
+Two shared functions in host-core use it and nothing else:
+`stage(disk, manifest, fetch) -> Volume` writes a manifest's chunks into a
+new volume (or into a snapshot of the predecessor version, skipping
+chunks whose hash is unchanged at that offset), and
+`checkpoint(disk, live, previous) -> Manifest` syncs, snapshots, asks for
+the dirty chunks, reads and hashes them, and builds the manifest. The
+capture driver, the checkpoint record, the publish path and resume call
+those two functions. Three implementations:
+
+- `ThinPoolDisk` (Linux, `engram-host-agent`): `dmsetup` and
+  `thin_delta`. `dirty_chunks` overrides the default and is tested
+  against it.
+- `ApfsFileDisk` (macOS, `engram-sandbox-vz`): `clonefile`, keeps the
+  default `dirty_chunks`.
+- `SimDisk` (`engram-dst-host`): in-memory, so the simulator drives the
+  same staging and checkpoint code with fault injection (ADR 0098).
 
 | Operation | Linux (thin pool) | macOS (APFS file) |
 |---|---|---|
@@ -318,9 +375,8 @@ publish and resume code above it:
 | Dirty set for upload | `thin_delta` | hash every 16 MiB window of the clone; the store dedups by hash |
 | Delete | `dmsetup message delete` | unlink |
 
-The "write chunks to a path" step is one function; the path is a
-device on Linux and a file on macOS. The macOS dirty set is a full
-hash of the clone on every checkpoint. That is slower by tens of
+The macOS dirty set is the default `dirty_chunks`: a full hash of the
+clone on every checkpoint. That is slower by tens of
 seconds for a development-sized image and uploads only new chunks,
 because the chunk store dedups by hash. It is `chunk_file`, which
 exists and is what VZ calls today, so macOS needs no extent or delta
