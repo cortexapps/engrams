@@ -1,8 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { FcRuntime, type FcInventory } from "./fc-runtime.ts";
+import { randomBytes, X509Certificate } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
+import { networkInterfaces } from "node:os";
 import {
   childEnvironment,
   check,
@@ -30,6 +32,310 @@ import {
   validateEngineConfig,
 } from "./preflight.ts";
 
+type NativeRoute = { gateway: string; dev: string; source: string };
+const ipv4 = (value: string) => {
+  const parts = value.split(".").map(Number);
+  check(
+    parts.length === 4 &&
+      parts.every((v) => Number.isInteger(v) && v >= 0 && v <= 255) &&
+      parts.join(".") === value,
+    "native_link_ip",
+  );
+  return parts.reduce((a, v) => a * 256 + v, 0);
+};
+export function verifyNativeSubnet(
+  subnet: string,
+  gateway: string,
+  forbidden: string[],
+) {
+  const [ip, prefix, ...rest] = subnet.split("/");
+  check(
+    ip && prefix && !rest.length && /^(?:[1-9]|[12][0-9]|30)$/.test(prefix),
+    "native_link_subnet",
+  );
+  const first = ipv4(ip),
+    count = 2 ** (32 - Number(prefix));
+  check(
+    first % count === 0 &&
+      ((first >= ipv4("10.0.0.0") && first + count <= ipv4("11.0.0.0")) ||
+        (first >= ipv4("172.16.0.0") && first + count <= ipv4("172.32.0.0")) ||
+        (first >= ipv4("192.168.0.0") && first + count <= ipv4("192.169.0.0"))),
+    "native_link_private",
+  );
+  check(
+    ipv4(gateway) > first && ipv4(gateway) < first + count - 1,
+    "native_link_gateway",
+  );
+  for (const entry of forbidden) {
+    const [address, bits = "32"] = entry.split("/");
+    const start = ipv4(address!),
+      end = start + 2 ** (32 - Number(bits));
+    check(first + count <= start || first >= end, "native_link_overlap");
+  }
+}
+export function nativeInterface(
+  value: unknown,
+  address: string,
+  mac: string,
+): string {
+  check(
+    Array.isArray(value) && /^[a-f0-9]{2}(?::[a-f0-9]{2}){5}$/.test(mac),
+    "native_link_shape",
+  );
+  const matches = value.filter(
+    (v) =>
+      v &&
+      v.address === mac &&
+      Array.isArray(v.addr_info) &&
+      v.addr_info.some(
+        (a: { family?: string; local?: string }) =>
+          a.family === "inet" && a.local === address,
+      ),
+  );
+  check(
+    matches.length === 1 && /^[a-zA-Z0-9_-]{1,15}$/.test(matches[0].ifname),
+    "native_link_interface",
+  );
+  return matches[0].ifname;
+}
+export function verifyNativeRouteState(
+  value: unknown,
+  selected: unknown,
+  inputs: Pick<Inputs, "subnet" | "nativeHostIp">,
+  link: NativeRoute = {
+    gateway: inputs.subnet.slice(0, -4) + "1",
+    dev: "eth0",
+    source: address(inputs, "coordinator"),
+  },
+) {
+  check(
+    Array.isArray(value) && Array.isArray(selected) && selected.length === 1,
+    "native_route_shape",
+  );
+  const objects = value.map((route: unknown) => {
+    check(
+      route !== null && typeof route === "object" && !Array.isArray(route),
+      "native_route_shape",
+    );
+    return route as Record<string, unknown>;
+  });
+  check(
+    !objects.some(
+      (route) => route.dst === "default" || route.dst === "0.0.0.0/0",
+    ),
+    "native_route_default",
+  );
+  const exact = objects.filter(
+    (route) =>
+      route.dst === inputs.nativeHostIp ||
+      route.dst === `${inputs.nativeHostIp}/32`,
+  );
+  const { gateway } = link;
+  check(
+    exact.length === 1 &&
+      exact[0]!.gateway === gateway &&
+      exact[0]!.dev === link.dev &&
+      !exact[0]!.multipath &&
+      (!exact[0]!.type || exact[0]!.type === "unicast"),
+    "native_route_exact",
+  );
+  const route = selected[0];
+  check(
+    route !== null &&
+      typeof route === "object" &&
+      !Array.isArray(route) &&
+      route.dst === inputs.nativeHostIp &&
+      route.gateway === gateway &&
+      route.dev === link.dev &&
+      route.prefsrc === link.source &&
+      !route.multipath,
+    "native_route_selected",
+  );
+}
+export function verifyNativeHostTls(
+  output: Uint8Array,
+  expectedFingerprint: string,
+) {
+  const text = Buffer.from(output).toString();
+  check(
+    output.length <= 65536 &&
+      /(?:New,|Protocol\s*:)\s*TLSv1\.3\b/.test(text) &&
+      /Verify return code: 0 \(ok\)/.test(text),
+    "native_host_tls_verification",
+  );
+  const certificate =
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/.exec(text);
+  check(
+    certificate &&
+      new X509Certificate(certificate[0]).fingerprint256 ===
+        expectedFingerprint,
+    "native_host_tls_leaf",
+  );
+  return hash(new X509Certificate(certificate[0]).raw);
+}
+type NativeHostTls = {
+  ca: Pin;
+  clientCertificate: Pin;
+  clientKey: Pin;
+  serverCertificate: Pin;
+};
+
+// Match the fixed production host_startup rules in net.rs. Per-VM SNAT
+// rules live in each VM's own netns and must not appear in these chains.
+export function fcHostFirewall(port: number): Record<string, string[]> {
+  const pool = "10.200.0.0/16";
+  const rule = (
+    chain: string,
+    match: string,
+    action: string,
+    comment: string,
+  ) => `-A ${chain} ${match} -j ${action} -m comment --comment ${comment}`;
+  const input = (protocol: string, p: number, comment: string) =>
+    rule("INPUT", `-s ${pool} -p ${protocol} --dport ${p}`, "ACCEPT", comment);
+  const redirect = (
+    i: string,
+    protocol: string,
+    p: number,
+    to: number,
+    comment: string,
+    dest = "",
+  ) =>
+    rule(
+      "PREROUTING",
+      `-i ${i} -p ${protocol} ${dest} --dport ${p}`,
+      `REDIRECT --to-port ${to}`,
+      comment,
+    );
+  return {
+    INPUT: [
+      input("tcp", port + 3, "engram-guest-gateway-input"),
+      input("tcp", port + 2, "engram-proxy-dns-input"),
+      input("udp", port + 2, "engram-proxy-dns-input"),
+      input("tcp", port + 1, "engram-proxy-input"),
+      rule(
+        "INPUT",
+        `-s ${pool} -m conntrack --ctstate ESTABLISHED,RELATED`,
+        "ACCEPT",
+        "engram-host-input-established",
+      ),
+      rule("INPUT", `-s ${pool}`, "DROP", "engram-host-input"),
+    ],
+    FORWARD: [
+      rule("FORWARD", `-s ${pool} -d ${pool}`, "DROP", "engram-isolate-vm-vm"),
+      ...[
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "127.0.0.0/8",
+      ].map((net) =>
+        rule("FORWARD", `-s ${pool} -d ${net}`, "DROP", "engram-host-lan"),
+      ),
+      rule("FORWARD", `-s ${pool}`, "DROP", "engram-default-deny"),
+    ],
+    PREROUTING: [
+      ...["vh-engr-+", "tap-engr-+"].map((i) =>
+        redirect(
+          i,
+          "tcp",
+          80,
+          port + 3,
+          "engram-guest-gateway-redirect",
+          "-d 169.254.169.254/32",
+        ),
+      ),
+      ...["tap-engr-+", "vh-engr-+"].map((i) =>
+        redirect(i, "tcp", 443, port + 1, "engram-proxy-redirect"),
+      ),
+      ...["udp", "tcp"].flatMap((proto) =>
+        ["tap-engr-+", "vh-engr-+"].map((i) =>
+          redirect(i, proto, 53, port + 2, "engram-dns-redirect"),
+        ),
+      ),
+    ],
+    POSTROUTING: [
+      rule(
+        "POSTROUTING",
+        `-s ${pool} ! -d ${pool}`,
+        "MASQUERADE",
+        "engram-masq",
+      ),
+    ],
+  };
+}
+function firewallRule(line: string): string {
+  const tokens = line.match(/"[^"\r\n]*"|[^\s]+/g) ?? [];
+  const fields: Record<string, string> = {};
+  let negate = false;
+  for (let i = 0; i < tokens.length; i++) {
+    let key = tokens[i]!;
+    if (key === "!") {
+      check(!negate, "fc_firewall_rule");
+      negate = true;
+      continue;
+    }
+    const value = tokens[++i]?.replace(/^"|"$/g, "");
+    check((value && !negate) || (value && key === "-d"), "fc_firewall_rule");
+    if (key === "-m") {
+      check(
+        ["comment", "tcp", "udp", "conntrack"].includes(value!),
+        "fc_firewall_rule",
+      );
+      continue;
+    }
+    if (key === "--to-ports") key = "--to-port";
+    check(
+      [
+        "-A",
+        "-s",
+        "-d",
+        "-i",
+        "-p",
+        "--dport",
+        "-j",
+        "--to-port",
+        "--ctstate",
+        "--comment",
+      ].includes(key),
+      "fc_firewall_rule",
+    );
+    if (negate) key = "!" + key;
+    check(!(key in fields), "fc_firewall_rule");
+    fields[key] =
+      key === "--ctstate" ? value!.split(",").sort().join(",") : value!;
+    negate = false;
+  }
+  check(!negate, "fc_firewall_rule");
+  return JSON.stringify(Object.entries(fields).sort());
+}
+export function verifyFcHostFirewall(
+  actual: Record<string, string>,
+  port: number,
+) {
+  const expected = fcHostFirewall(port);
+  check(
+    Object.keys(actual).sort().join(",") ===
+      Object.keys(expected).sort().join(","),
+    "fc_firewall_chains",
+  );
+  for (const [chain, lines] of Object.entries(expected)) {
+    const current = actual[chain]!.trim().split("\n");
+    check(current.shift() === `-P ${chain} ACCEPT`, "fc_firewall_policy");
+    check(
+      JSON.stringify(current.map(firewallRule)) ===
+        JSON.stringify(lines.map(firewallRule)),
+      "fc_firewall_changed",
+    );
+  }
+}
+export const fcGuardSysctls = (
+  backend: Inputs["backend"],
+  role: string,
+): Record<string, string> =>
+  backend === "firecracker" && role === "coordinator-guard"
+    ? { "net.ipv4.ip_forward": "1", "net.ipv4.conf.all.route_localnet": "1" }
+    : {};
+
 /** Fixed per-run Linux resources. No application request reaches these commands. */
 export class Engine {
   private readonly containers = new Map<string, string>();
@@ -37,6 +343,11 @@ export class Engine {
   private readonly volumes = new Map<string, string>();
   private networkId: string | undefined;
   private plannedNetworkName: string | undefined;
+  private nativeNetworkId: string | undefined;
+  private nativeNetworkName: string | undefined;
+  private nativeLink:
+    | (NativeRoute & { subnet: string; mac: string })
+    | undefined;
   readonly guardIds = new Map<GuardRole, string>();
   private readonly generation = randomBytes(16).toString("hex");
   private baseline: string | undefined;
@@ -46,6 +357,9 @@ export class Engine {
   private socketState: { ino: number; dev: number } | undefined;
   private resolver: Pin | undefined;
   private resolverVolume: string | undefined;
+  private nativeHostProjection:
+    | { volume: string; identity: string }
+    | undefined;
   private readonly specifications = new Map<
     string,
     {
@@ -54,6 +368,7 @@ export class Engine {
       args: string[];
       entrypoint?: string;
       host: boolean;
+      role: string;
     }
   >();
   private signal: AbortSignal | undefined;
@@ -89,11 +404,15 @@ export class Engine {
       );
     else this.socketState = { ino: socket.ino, dev: socket.dev };
   }
+  readonly fc: FcRuntime | undefined;
   constructor(
     readonly inputs: Inputs,
     readonly root: string,
     readonly runId: string,
-  ) {}
+    inventory?: FcInventory,
+  ) {
+    this.fc = inventory ? new FcRuntime(inventory, inputs, root) : undefined;
+  }
   private label() {
     return `engrams.mcp.run=${this.runId}`;
   }
@@ -260,6 +579,7 @@ export class Engine {
       image,
       options,
       host,
+      role,
       args: selectedArgs,
       ...(selectedEntrypoint ? { entrypoint: selectedEntrypoint } : {}),
     });
@@ -272,7 +592,35 @@ export class Engine {
       await this.verifyResolver(id);
       await this.audit(id);
       await this.verifyNetwork(true);
-      if (host) await this.verifyHostImage(id);
+      if (host) {
+        await this.verifyHostImage(id);
+        check(this.fc, "fc_inventory_missing");
+        const actual = await this.inspect(id);
+        await this.fc.qualifyKernel(actual.State.Pid);
+        for (const [path, expected] of [
+          ["/proc/sys/kernel/random/boot_id", this.fc.inventory.bootId],
+          ["/proc/sys/kernel/osrelease", this.fc.inventory.release],
+        ] as const)
+          check(
+            (await this.call(["exec", id, "/bin/cat", path]))
+              .toString()
+              .trim() === expected,
+            "fc_engine_kernel_identity",
+          );
+        check(
+          (
+            await this.call([
+              "exec",
+              id,
+              "/usr/bin/readlink",
+              "/proc/self/ns/pid",
+            ])
+          )
+            .toString()
+            .trim() === this.fc.inventory.pidNamespace,
+          "fc_engine_pid_namespace",
+        );
+      }
       await this.call([
         "exec",
         id,
@@ -336,11 +684,14 @@ export class Engine {
     check(
       c.User === (one("--user") ?? "") &&
         h.NetworkMode === one("--network") &&
-        h.PidMode === "" &&
+        h.PidMode ===
+          (spec.host && this.inputs.backend === "firecracker" ? "host" : "") &&
         h.IpcMode === "private" &&
         !h.UTSMode &&
         !h.UsernsMode &&
-        (!h.CgroupnsMode || h.CgroupnsMode === "private"),
+        (spec.host
+          ? h.CgroupnsMode === "private"
+          : !h.CgroupnsMode || h.CgroupnsMode === "private"),
       "container_namespace",
     );
     check(
@@ -384,7 +735,12 @@ export class Engine {
         !h.PublishAllPorts &&
         (h.ExtraHosts ?? []).length === 0 &&
         !h.CgroupParent &&
-        Object.keys(h.Sysctls ?? {}).length === 0,
+        JSON.stringify(Object.entries(h.Sysctls ?? {}).sort()) ===
+          JSON.stringify(
+            Object.entries(
+              fcGuardSysctls(this.inputs.backend, spec.role),
+            ).sort(),
+          ),
       "container_exposure",
     );
     check(
@@ -687,6 +1043,47 @@ export class Engine {
       "-ec",
       `chown -R ${uid}:${uid} /projection; find /projection -type d -exec chmod ${publicProjection ? "755" : "700"} '{}' ';'; find /projection -type f -exec chmod ${publicProjection ? "644" : "600"} '{}' ';'`,
     ]);
+    const directoryMode = publicProjection ? "755" : "700";
+    const fileMode = publicProjection ? "644" : "600";
+    const directories = new Set(["/projection"]);
+    for (const name of Object.keys(files)) {
+      const parts = name.split("/");
+      parts.pop();
+      for (let i = 1; i <= parts.length; i++)
+        directories.add(`/projection/${parts.slice(0, i).join("/")}`);
+    }
+    for (const directory of directories)
+      check(
+        (
+          await this.call([
+            "exec",
+            id,
+            "/usr/bin/stat",
+            "-c",
+            "%u:%g:%a:%F",
+            directory,
+          ])
+        )
+          .toString()
+          .trim() === `${uid}:${uid}:${directoryMode}:directory`,
+        "projection_directory_mode",
+      );
+    for (const name of Object.keys(files))
+      check(
+        (
+          await this.call([
+            "exec",
+            id,
+            "/usr/bin/stat",
+            "-c",
+            "%u:%g:%a:%F:%h",
+            `/projection/${name}`,
+          ])
+        )
+          .toString()
+          .trim() === `${uid}:${uid}:${fileMode}:regular file:1`,
+        "projection_file_mode",
+      );
     for (const [name, file] of Object.entries(files)) {
       const digest = (
         await this.call([
@@ -732,6 +1129,8 @@ export class Engine {
         "bridge",
         "--subnet",
         this.inputs.subnet,
+        "--gateway",
+        this.inputs.subnet.slice(0, -4) + "1",
         "--label",
         this.label(),
         name,
@@ -749,7 +1148,8 @@ export class Engine {
         actual?.Driver === "bridge" &&
         actual?.Labels?.["engrams.mcp.run"] === this.runId &&
         actual?.IPAM?.Config?.length === 1 &&
-        actual.IPAM.Config[0].Subnet === this.inputs.subnet,
+        actual.IPAM.Config[0].Subnet === this.inputs.subnet &&
+        actual.IPAM.Config[0].Gateway === this.inputs.subnet.slice(0, -4) + "1",
       "network_state",
     );
     this.resolverVolume = await this.project(
@@ -791,6 +1191,9 @@ export class Engine {
         this.inputs.images.guard.id,
         [
           ...this.networkOptions(role),
+          ...Object.entries(
+            fcGuardSysctls(this.inputs.backend, `${role}-guard`),
+          ).flatMap(([key, value]) => ["--sysctl", `${key}=${value}`]),
           "--mount",
           `type=volume,src=${trust},dst=/etc/mcp-probe,readonly`,
           ...(role === "coordinator"
@@ -843,12 +1246,390 @@ export class Engine {
         ["exec", "-i", id, "/usr/sbin/nft", "-j", "-f", "-"],
         JSON.stringify({ nftables: plan.map((item) => ({ add: item })) }),
       );
+      if (role === "coordinator" && this.inputs.backend === "firecracker")
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/ip",
+          "-4",
+          "route",
+          "replace",
+          `${this.inputs.nativeHostIp}/32`,
+          "via",
+          this.inputs.subnet.slice(0, -4) + "1",
+          "dev",
+          "eth0",
+        ]);
+    }
+    if (this.inputs.backend === "vz") await this.connectNativeHost();
+    await this.verifyNetwork(false);
+  }
+  private async connectNativeHost() {
+    const id = this.guardIds.get("coordinator");
+    check(id, "native_route_guard");
+    const name = this.name("native-network");
+    const existing = (
+      await this.call([
+        "network",
+        "ls",
+        "--filter",
+        `name=${name}`,
+        "--format",
+        "{{.Name}}",
+      ])
+    )
+      .toString()
+      .split("\n");
+    check(!existing.includes(name), "native_network_exists");
+    this.nativeNetworkName = name;
+    this.nativeNetworkId = (
+      await this.call([
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--ipv6=false",
+        "--label",
+        this.label(),
+        name,
+      ])
+    )
+      .toString()
+      .trim();
+    check(/^[a-f0-9]{64}$/.test(this.nativeNetworkId), "native_network_id");
+    const [network] = JSON.parse(
+      (
+        await this.call(["network", "inspect", this.nativeNetworkId])
+      ).toString(),
+    );
+    check(
+      network?.Id === this.nativeNetworkId &&
+        network.Internal === false &&
+        network.Driver === "bridge" &&
+        network.EnableIPv6 === false &&
+        network.Labels?.["engrams.mcp.run"] === this.runId &&
+        network.IPAM?.Config?.length === 1 &&
+        Object.keys(network.Containers ?? {}).length === 0,
+      "native_network_state",
+    );
+    const { Subnet: subnet, Gateway: gateway } = network.IPAM.Config[0];
+    check(
+      typeof subnet === "string" && typeof gateway === "string",
+      "native_network_ipam",
+    );
+    verifyNativeSubnet(subnet, gateway, [
+      this.inputs.subnet,
+      this.inputs.nativeHostIp,
+      ...Object.values(networkInterfaces())
+        .flat()
+        .filter((v) => v?.family === "IPv4")
+        .map((v) => v!.address),
+    ]);
+    await this.call(["network", "connect", this.nativeNetworkId, id]);
+    const [connected] = JSON.parse(
+      (
+        await this.call(["network", "inspect", this.nativeNetworkId])
+      ).toString(),
+    );
+    const member = connected.Containers?.[id];
+    check(
+      Object.keys(connected.Containers ?? {}).join(",") === id &&
+        member &&
+        typeof member.IPv4Address === "string" &&
+        typeof member.MacAddress === "string",
+      "native_network_membership",
+    );
+    const source = member.IPv4Address.split("/")[0];
+    const interfaces = JSON.parse(
+      (
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/ip",
+          "-j",
+          "-4",
+          "address",
+          "show",
+        ])
+      ).toString(),
+    );
+    const dev = nativeInterface(interfaces, source, member.MacAddress);
+    this.nativeLink = { subnet, gateway, source, mac: member.MacAddress, dev };
+    // nft default-drop is already installed. Remove only this link's default before any app can share the namespace.
+    const routes = JSON.parse(
+      (
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/ip",
+          "-j",
+          "-4",
+          "route",
+          "show",
+          "default",
+        ])
+      ).toString(),
+    );
+    check(Array.isArray(routes) && routes.length <= 1, "native_link_default");
+    for (const route of routes) {
+      check(
+        route.dst === "default" &&
+          route.gateway === gateway &&
+          route.dev === dev,
+        "native_link_default",
+      );
+      await this.call([
+        "exec",
+        id,
+        "/usr/sbin/ip",
+        "-4",
+        "route",
+        "del",
+        "default",
+        "via",
+        gateway,
+        "dev",
+        dev,
+      ]);
+    }
+    await this.call([
+      "exec",
+      id,
+      "/usr/sbin/ip",
+      "-4",
+      "route",
+      "replace",
+      `${this.inputs.nativeHostIp}/32`,
+      "via",
+      gateway,
+      "dev",
+      dev,
+    ]);
+  }
+  async verifyNativeRoute() {
+    const id = this.guardIds.get("coordinator");
+    check(id, "native_route_guard");
+    const routes = JSON.parse(
+      (
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/ip",
+          "-j",
+          "-4",
+          "route",
+          "show",
+          "table",
+          "all",
+        ])
+      ).toString(),
+    );
+    const selected = JSON.parse(
+      (
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/ip",
+          "-j",
+          "-4",
+          "route",
+          "get",
+          this.inputs.nativeHostIp,
+        ])
+      ).toString(),
+    );
+    if (this.inputs.backend === "vz") {
+      const link = this.nativeLink;
+      check(
+        link && this.nativeNetworkId && this.nativeNetworkName,
+        "native_link_missing",
+      );
+      const [network] = JSON.parse(
+        (
+          await this.call(["network", "inspect", this.nativeNetworkId])
+        ).toString(),
+      );
+      check(
+        network?.Id === this.nativeNetworkId &&
+          network.Name === this.nativeNetworkName &&
+          network.Internal === false &&
+          network.Driver === "bridge" &&
+          network.EnableIPv6 === false &&
+          network.Labels?.["engrams.mcp.run"] === this.runId &&
+          network.IPAM?.Config?.length === 1 &&
+          network.IPAM.Config[0].Subnet === link.subnet &&
+          network.IPAM.Config[0].Gateway === link.gateway &&
+          Object.keys(network.Containers ?? {}).join(",") === id &&
+          network.Containers[id].IPv4Address.split("/")[0] === link.source &&
+          network.Containers[id].MacAddress === link.mac,
+        "native_network_changed",
+      );
+      const interfaces = JSON.parse(
+        (
+          await this.call([
+            "exec",
+            id,
+            "/usr/sbin/ip",
+            "-j",
+            "-4",
+            "address",
+            "show",
+          ])
+        ).toString(),
+      );
+      check(
+        nativeInterface(interfaces, link.source, link.mac) === link.dev,
+        "native_link_changed",
+      );
+      verifyNativeRouteState(routes, selected, this.inputs, link);
+    } else verifyNativeRouteState(routes, selected, this.inputs);
+  }
+  async qualifyFcHost(id: string) {
+    check(this.inputs.backend === "firecracker", "fc_host_backend");
+    const guard = this.guardIds.get("coordinator");
+    check(guard, "fc_host_guard");
+    const namespace = async (container: string) =>
+      (
+        await this.call([
+          "exec",
+          container,
+          "/usr/bin/readlink",
+          "/proc/self/ns/net",
+        ])
+      )
+        .toString()
+        .trim();
+    const expected = await namespace(guard);
+    check(
+      /^net:\[[0-9]+\]$/.test(expected) && (await namespace(id)) === expected,
+      "fc_host_namespace",
+    );
+    for (const container of [guard, id])
+      for (const path of [
+        "/proc/sys/net/ipv4/ip_forward",
+        "/proc/sys/net/ipv4/conf/all/route_localnet",
+      ])
+        check(
+          (
+            await this.call(["exec", container, "/bin/cat", path])
+          ).toString() === "1\n",
+          "fc_host_sysctl",
+        );
+    const actual: Record<string, string> = {};
+    for (const chain of ["INPUT", "FORWARD", "PREROUTING", "POSTROUTING"])
+      actual[chain] = (
+        await this.call([
+          "exec",
+          id,
+          "/usr/sbin/iptables",
+          "-t",
+          ["INPUT", "FORWARD"].includes(chain) ? "filter" : "nat",
+          "-S",
+          chain,
+        ])
+      ).toString();
+    verifyFcHostFirewall(actual, this.inputs.registryPort);
+    await put(
+      join(
+        this.root,
+        `fc-host-firewall-${randomBytes(8).toString("hex")}.json`,
+      ),
+      JSON.stringify({
+        netns: expected,
+        sysctls: fcGuardSysctls(this.inputs.backend, "coordinator-guard"),
+        sha256: hash(JSON.stringify(actual)),
+      }),
+    );
+  }
+  async qualifyNativeHost(tls: NativeHostTls) {
+    for (const pin of Object.values(tls)) {
+      await verifyPin(pin);
+      await readOwned(pin.path);
     }
     await this.verifyNetwork(false);
+    const identity = hash(
+      Object.values(tls)
+        .map((pin) => pin.sha256)
+        .join("\n"),
+    );
+    if (this.nativeHostProjection)
+      check(
+        this.nativeHostProjection.identity === identity,
+        "native_host_probe_identity",
+      );
+    else
+      this.nativeHostProjection = {
+        identity,
+        volume: await this.project("host-probe-tls", {
+          "ca.pem": tls.ca,
+          "client.crt": tls.clientCertificate,
+          "client.key": tls.clientKey,
+        }),
+      };
+    const role = "host-tls-probe";
+    const expected = new X509Certificate(
+      await readOwned(tls.serverCertificate.path),
+    ).fingerprint256;
+    try {
+      const id = await this.create(
+        role,
+        this.inputs.images.guard.id,
+        [
+          "--network",
+          `container:${this.guardIds.get("coordinator")}`,
+          "--user",
+          "1000:1000",
+          "--read-only",
+          "--mount",
+          `type=volume,src=${this.nativeHostProjection.volume},dst=/etc/mcp-host-probe,readonly`,
+          "--tmpfs",
+          "/tmp:rw,noexec,nosuid,nodev,size=4m",
+        ],
+        ["infinity"],
+        "/bin/sleep",
+      );
+      const output = await this.call(
+        [
+          "exec",
+          id,
+          "/usr/bin/openssl",
+          "s_client",
+          "-connect",
+          "host.fixture.example:9101",
+          "-servername",
+          "host.fixture.example",
+          "-verify_hostname",
+          "host.fixture.example",
+          "-verify_return_error",
+          "-tls1_3",
+          "-no_ign_eof",
+          "-showcerts",
+          "-CAfile",
+          "/etc/mcp-host-probe/ca.pem",
+          "-cert",
+          "/etc/mcp-host-probe/client.crt",
+          "-key",
+          "/etc/mcp-host-probe/client.key",
+        ],
+        undefined,
+        5000,
+      );
+      const serverCertificateSha256 = verifyNativeHostTls(output, expected);
+      await put(
+        join(
+          this.root,
+          `native-host-tls-${randomBytes(8).toString("hex")}.json`,
+        ),
+        JSON.stringify({ version: 1, serverCertificateSha256, verified: true }),
+      );
+    } finally {
+      if (this.containers.has(role)) await this.remove(role);
+    }
   }
   async verifyNetwork(probes: boolean) {
     check(this.guardIds.size === 3 && this.networkId, "guard_set");
     const results: string[] = [];
+    await this.verifyNativeRoute();
     const [network] = JSON.parse(
       (await this.call(["network", "inspect", this.networkId])).toString(),
     );
@@ -867,6 +1648,18 @@ export class Engine {
           guard.NetworkSettings?.Networks?.[this.name("network")]?.IPAddress ===
             address(this.inputs, role),
         "guard_identity",
+      );
+      check(
+        JSON.stringify(Object.keys(guard.NetworkSettings.Networks).sort()) ===
+          JSON.stringify(
+            [
+              this.name("network"),
+              ...(role === "coordinator" && this.inputs.backend === "vz"
+                ? [this.name("native-network")]
+                : []),
+            ].sort(),
+          ),
+        "guard_network_membership",
       );
       results.push(
         effectiveRules(
@@ -1011,12 +1804,18 @@ export class Engine {
         id,
         "/bin/sh",
         "-ec",
-        'for tool in /bin/sh /bin/bash /bin/sleep /bin/mkdir /bin/chown /bin/chmod /usr/bin/find /usr/bin/sha256sum /usr/bin/skopeo /usr/sbin/nft /usr/bin/dig /usr/bin/nc /usr/bin/curl /usr/bin/mksquashfs; do test -x "$tool"; done',
+        'for tool in /bin/sh /bin/bash /bin/sleep /bin/mkdir /bin/chown /bin/chmod /usr/bin/find /usr/bin/sha256sum /usr/bin/skopeo /usr/sbin/nft /usr/bin/dig /usr/bin/nc /usr/bin/curl /usr/bin/mksquashfs /usr/sbin/ip /usr/bin/openssl /usr/bin/stat /usr/bin/readlink /bin/cat; do test -x "$tool"; done',
       ]);
       const version = (
         await this.call(["exec", id, "/usr/bin/skopeo", "--version"])
       ).toString();
       check(/^skopeo version [0-9]+\./.test(version), "guard_skopeo");
+      check(
+        (await this.call(["exec", id, "/usr/bin/openssl", "version"]))
+          .toString()
+          .startsWith("OpenSSL 3."),
+        "guard_openssl3",
+      );
     } finally {
       await this.remove("tool-check");
     }
@@ -1029,6 +1828,25 @@ export class Engine {
     }
   }
   async cleanup(): Promise<void> {
+    if (this.fc && this.containers.has("host-agent")) {
+      try {
+        await this.fc.requireReleased();
+      } catch (error) {
+        await put(
+          join(this.root, "fc-cleanup-blocked.json"),
+          JSON.stringify({
+            runId: this.runId,
+            hostContainer: this.containers.get("host-agent"),
+            action: "retained_for_identity_scoped_recovery",
+            reason:
+              error instanceof PlatformFailure
+                ? error.seam
+                : "nbd_state_unknown",
+          }),
+        );
+        throw error;
+      }
+    }
     let failed = false;
     const stopped: string[] = [];
     // A cancelled CLI can lose a successful daemon create response. Recover
@@ -1078,6 +1896,54 @@ export class Engine {
         failed = true;
       }
     }
+    if (!this.nativeNetworkId && this.nativeNetworkName) {
+      try {
+        const ids = (
+          await this.call([
+            "network",
+            "ls",
+            "--no-trunc",
+            "--filter",
+            `label=${this.label()}`,
+            "--filter",
+            `name=${this.nativeNetworkName}`,
+            "--format",
+            "{{.ID}}",
+          ])
+        )
+          .toString()
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        check(
+          ids.length <= 1 && ids.every((id) => /^[a-f0-9]{64}$/.test(id)),
+          "cleanup_native_network_identity",
+        );
+        this.nativeNetworkId = ids[0];
+      } catch {
+        failed = true;
+      }
+    }
+    if (this.nativeNetworkId && this.containers.size === 0) {
+      try {
+        const [network] = JSON.parse(
+          (
+            await this.call(["network", "inspect", this.nativeNetworkId])
+          ).toString(),
+        );
+        check(
+          network?.Id === this.nativeNetworkId &&
+            network.Name === this.nativeNetworkName &&
+            network.Labels?.["engrams.mcp.run"] === this.runId &&
+            Object.keys(network.Containers ?? {}).length === 0,
+          "native_network_cleanup",
+        );
+        await this.call(["network", "rm", this.nativeNetworkId]);
+        this.nativeNetworkId = undefined;
+      } catch {
+        failed = true;
+      }
+    }
     if (!this.networkId && this.plannedNetworkName) {
       try {
         const ids = (
@@ -1123,6 +1989,13 @@ export class Engine {
         failed = true;
       }
     }
+    if (this.fc) {
+      try {
+        await this.fc.requireStopped();
+      } catch {
+        failed = true;
+      }
+    }
     // Named volumes retain database and effect history. The report records them; they are not active resources.
     const survivors = (
       await this.call(["ps", "-aq", "--filter", `label=${this.label()}`]).catch(
@@ -1131,7 +2004,7 @@ export class Engine {
     )
       .toString()
       .trim();
-    if (survivors || this.networkId) failed = true;
+    if (survivors || this.networkId || this.nativeNetworkId) failed = true;
     if (this.plannedNetworkName) {
       const remaining = await this.call([
         "network",
@@ -1152,7 +2025,7 @@ export class Engine {
         stopped,
         retainedVolumes: [...this.volumes.values()],
         containersRemaining: this.containers.size,
-        networkRemaining: !!this.networkId,
+        networkRemaining: !!this.networkId || !!this.nativeNetworkId,
         success: !failed,
       }),
     );

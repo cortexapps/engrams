@@ -13,7 +13,8 @@ The selected Bun must match the manifest's binary hash and `.bun-version`.
 The wrappers select a local Bun, clear the inherited environment, and pass only
 these arguments. `main.ts` qualifies the platform, creates the stack, enables
 the guest image through the public API, writes the strict private context,
-starts the authenticated supervisor, then invokes the unchanged command:
+starts the authenticated supervisor, validates the complete context against that
+real private socket, then invokes the unchanged command:
 
 ```sh
 bun orchestrator/scripts/mcp-stack/run.ts --context /private/absent-run/context.json --matrix all
@@ -76,7 +77,8 @@ manager or changes host DNS, host routes, or global engine settings.
 The guard image must provide `/bin/sh`, `/bin/bash`, `/bin/sleep`, `/bin/mkdir`,
 `/bin/chown`, `/bin/chmod`, `/usr/bin/find`, `/usr/bin/sha256sum`,
 `/usr/bin/skopeo`, `/usr/sbin/nft`, `/usr/bin/dig`, `/usr/bin/nc`,
-`/usr/bin/curl`, and `/usr/bin/mksquashfs`. Production bundle scripts also use
+`/usr/bin/curl`, `/usr/bin/mksquashfs`, `/usr/sbin/ip`, and
+`/usr/bin/openssl` (OpenSSL 3). Production bundle scripts also use
 coreutils. `nc` must use the OpenBSD exit/timeout behavior; `dig` must use BIND
 exit status 9 for unreachable DNS. Tool availability is checked before use.
 Guard archive work runs with the caller's UID. Projection staging uses root
@@ -116,13 +118,34 @@ and entrypoint. Pin the derivative archive/manifest/config. Extract the final
 host, UFFD, and proxy bytes for their binary pins; the launcher checks all four
 baked executable hashes before releasing the host entrypoint.
 
-FC runs in one owned private PID/mount namespace with KVM and TUN devices,
-NET_ADMIN and SYS_ADMIN, bounded resources, and exact run-owned mounts. It
-shares only C's guard network namespace. Its listener is `0.0.0.0:9101` inside
-that namespace; C's guard publishes only `nativeHostIp:9101`. The native address
-and port are checked first. The advertised TLS authority stays
-`host.fixture.example:9101`. VZ binds its verified native address directly.
-No host PID namespace, host network, engine socket, or host root is mounted.
+FC requires a dedicated, exclusive whole Linux/KVM runner and kernel. No other
+NBD user, host agent, Firecracker, or egress proxy can share it. Serialize runs
+on that runner. The launcher verifies the initial PID namespace, same native
+and engine kernel release, and every existing NBD module slot. The module must
+already expose 1 through 4096 usable block devices. Each must have its exact
+kernel major/minor identity, root owner, canonical path, no binding or holders,
+zero size, no process FD, and a successful exclusive read/write open. The
+launcher does not load modules, change device modes, or disconnect a binding.
+
+Only the trusted FC host joins the host PID namespace. It retains a private
+cgroup v2 and mount namespace, C's owned network namespace, default seccomp,
+read-only root/proc-sys/sysfs/cgroup mounts, NET_ADMIN and SYS_ADMIN, and bounded
+resources. Exact verified NBD devices plus KVM and TUN are mapped read/write.
+NBD netlink control remains global; device cgroups do not isolate that control.
+The dedicated runner requirement is an infrastructure assumption, not a proof
+receipt. All other services retain private PID namespaces; worker authority is
+unchanged. No host network, engine socket, or host root is mounted.
+
+The fixed slot range is FIRST_SLOT=0, MAX_SLOTS=the verified module count, and
+WARM_SLOTS=1. Capacity must cover each live root device, optional swap, and
+source/destination restore overlap. The number of matrix cases is not peak
+capacity. Exhaustion fails the run. Rootfs NBD is required even with the actual
+production default File memory restore mode. UFFD helper bytes stay pinned;
+this fixture does not claim UFFD runtime qualification or enable another mode.
+
+FC's listener is `0.0.0.0:9101` only inside its owned namespace. C's guard
+publishes only the verified `nativeHostIp:9101`. The advertised TLS authority
+stays `host.fixture.example:9101`. VZ binds its verified native address directly.
 
 ## Network and startup order
 
@@ -131,6 +154,31 @@ C, and worker join persistent guard namespaces with exact default-drop nft
 rules. The owned registry shares C's guard and is published only on
 `127.0.0.1:<selected-port>` for asset bootstrap. Managed MCP destinations
 retain strict HTTPS and nonloopback checks.
+
+C alone has an exact `/32` route to the native host. FC uses the internal
+bridge gateway, whose target is on that same Linux kernel. VZ has one additional
+run-owned noninternal private IPv4 bridge attached only to C's guard. The
+launcher checks its actual IPAM for overlap with fixture and native host
+addresses, derives the exact interface from its endpoint IP and MAC, removes
+that link's automatic default under the installed nft default-drop policy,
+and installs only the native-host `/32`. Docker's internal bridge forwarding
+rules block destinations outside its subnet, so the internal bridge alone
+cannot reach the native Mac. No global route or firewall is changed. Both
+networks have exact ownership and cleanup checks.
+
+After actual host readiness, a fixed short-lived probe in C's namespace uses
+only a private read-only CA/client certificate/key projection, resolver, and
+bounded tmpfs. OpenSSL verifies TLS 1.3, SNI, hostname, and the actual first host
+leaf fingerprint. Only a sanitized certificate digest is retained. Exact
+probe removal, route/no-default checks, network membership, nft policy, and
+native mTLS qualification repeat for status and restart.
+
+Only the FC C guard has `net.ipv4.ip_forward=1` and
+`net.ipv4.conf.all.route_localnet=1`; other roles have no configured sysctls.
+The actual FC host and guard must share a network namespace and read both
+values as 1. Qualification checks the actual production INPUT, FORWARD,
+PREROUTING, and POSTROUTING rules and their order after readiness, status,
+and restart. Read-only proc/sys remains in place.
 
 A named volume contains only the fixed `resolv.conf`, with file mode 0644 and
 directory mode 0755. A read-only `volume-subpath=resolv.conf,volume-nocopy`
@@ -175,19 +223,37 @@ The supervisor permits only its fixed six-role status/restart/stop protocol.
 O disable variants change only O's enable switch; C, worker, host, operator
 candidate, PG, blob, fixtures, and namespace identities remain normal.
 
-Signals and deadlines stop and drain the common runner and supervisor, then
-the native host and exact owned Linux resources. Engine CLI cancellation
-uses the retained process group's TERM/KILL/wait path. Cleanup also recovers
-exact planned container names if a daemon create succeeded but its response
-was lost. It refuses foreign labels and records survivors as failure.
+Signals and deadlines stop and drain the common runner and supervisor. Final
+teardown uses the authenticated public SessionService DeleteSession path for
+bounded, verified run-owned sessions while the host is alive. It retains task,
+session, operation, journal, capture, and effect history. An API return does
+not prove teardown: the launcher waits for actual VM stop and all reserved NBD
+devices to have no binding, holders, size, or process FDs and to permit exclusive
+open before stopping the FC host. Unknown or stale state fails cleanup and
+retains the host for identity-scoped operator recovery. No blind disconnect,
+module reset, forced adoption, or history deletion is performed.
 
-FC's private PID namespace bounds VM/proxy/helper lifetime; the container must
-be stopped with PID zero before removal. VZ rechecks stable kernel birth,
-UID, executable, and PID before signaling exact owned helper/proxy survivors,
-including separate groups, then requires none remain. It sends no pattern kill.
-Logs, native identity snapshots, matrix output, and cleanup/completion JSON
-stay private. Named volumes retain inactive database and effect history; the
-cleanup receipt names them. No guest/VM result is written by the launcher.
+Deliberate matrix host stop/restart retains sessions and devices and exercises
+real recovery. That path does not use final teardown to make recovery pass.
+Whole-module reservation and old-generation process/cgroup observations remain
+across restarts. Container stop alone does not release persistent NBD bindings.
+
+A read-only FC observer records actual managed boot records, sandbox manifests,
+root NBD paths, binding PIDs, size/read counters, durable device owners, actual
+FC device FDs, and boot/birth/executable/hash/UID/cgroup identities. A successful
+matrix also requires an observation for every managed boot. These observations
+complement the unchanged guest physical return assertions. Final cleanup scans
+retained cgroups and devices after removal; State.Pid=0 alone is insufficient.
+
+Engine CLI cancellation uses the retained process group's TERM/KILL/wait path.
+Cleanup recovers exact planned container and network names after a lost create
+response, refuses foreign labels, and records survivors as failure. VZ rechecks
+stable kernel birth, UID, executable, and PID before signaling exact owned
+helper/proxy survivors, including separate groups, then requires none remain.
+It sends no pattern kill. Logs, identity snapshots, matrix output, and
+cleanup/completion JSON stay private. Named volumes retain inactive database
+and effect history; the cleanup receipt names them. No guest result is written
+by the launcher.
 
 ## Source checks and remaining physical gates
 

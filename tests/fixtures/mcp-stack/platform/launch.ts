@@ -285,6 +285,7 @@ export class Stack {
                 ENGRAM_FIRECRACKER_BIN: "/usr/local/bin/firecracker",
                 ENGRAM_FC_UFFD_HANDLER_BIN:
                   "/usr/local/bin/engram-uffd-handler",
+                ...this.engine.fc?.environment(),
                 MCP_FIXTURE_HOST_LOG: join(work, "host.jsonl"),
               }),
         },
@@ -756,6 +757,7 @@ export class Stack {
     for (const file of Object.values(config.files)) await verifyPin(file);
     if (role === "host-agent") {
       if (this.inputs.backend === "firecracker") {
+        check(this.engine.fc, "fc_inventory_missing");
         const image = this.inputs.images.hostAgent;
         check(image, "fc_host_image");
         const env = config.env;
@@ -771,6 +773,10 @@ export class Stack {
         const id = await this.engine.create("host-agent", image.id, [
           "--network",
           `container:${this.engine.guardIds.get("coordinator")}`,
+          "--pid",
+          "host",
+          "--cgroupns",
+          "private",
           "--user",
           "0:0",
           "--read-only",
@@ -782,6 +788,7 @@ export class Stack {
           "/dev/kvm:/dev/kvm:rw",
           "--device",
           "/dev/net/tun:/dev/net/tun:rw",
+          ...this.engine.fc.deviceOptions(),
           "--env-file",
           envFile.path,
           ...["host", "assets", "bundles", "tls", "configuration"].flatMap(
@@ -896,7 +903,7 @@ export class Stack {
   }
   async stop(role: MutableRole): Promise<void> {
     if (role === "host-agent") {
-      await this.cleanupHost();
+      await this.cleanupHost(false);
     } else await this.engine.remove(role);
     this.stopped.add(role);
     // Keep the last immutable identity for status of the stopped role.
@@ -911,6 +918,14 @@ export class Stack {
     this.stopped.delete(role);
     await this.startRole(ctx, role, configuration);
     await this.readyRole(ctx, role);
+  }
+  private nativeHostTls() {
+    return {
+      ca: this.identity.ca,
+      clientCertificate: this.identity.leaves.coordinator.certificate,
+      clientKey: this.identity.leaves.coordinator.key,
+      serverCertificate: this.identity.leaves.host.certificate,
+    };
   }
   async readyRole(ctx: Context, role: MutableRole): Promise<void> {
     const deadline = performance.now() + 15000;
@@ -1007,6 +1022,17 @@ export class Stack {
           const actual = await this.engine.inspect(active.id);
           check(actual.State.Running === true, "role_running");
         }
+        if (role === "host-agent") {
+          if (this.inputs.backend === "firecracker") {
+            await this.engine.qualifyFcHost(this.hostBoot);
+            check(this.engine.fc, "fc_inventory_missing");
+            await this.engine.fc.adoptHost(
+              (await this.engine.inspect(this.hostBoot)).State.Pid,
+            );
+            await this.engine.fc.observe();
+          }
+          await this.engine.qualifyNativeHost(this.nativeHostTls());
+        }
         return;
       } catch {
         await new Promise((r) => setTimeout(r, 100));
@@ -1081,6 +1107,17 @@ export class Stack {
         } catch (error) {
           throw error;
         }
+      }
+      if (role === "host-agent" && running) {
+        if (this.inputs.backend === "firecracker") {
+          await this.engine.qualifyFcHost(active.id);
+          check(this.engine.fc, "fc_inventory_missing");
+          await this.engine.fc.qualifyKernel(
+            (await this.engine.inspect(active.id)).State.Pid,
+          );
+          await this.engine.fc.observe();
+        }
+        await this.engine.qualifyNativeHost(this.nativeHostTls());
       }
       states.push({
         role,
@@ -1158,10 +1195,13 @@ export class Stack {
     }
     return found;
   }
-  async cleanupHost() {
+  async cleanupHost(requireRelease = true) {
     if (this.inputs.backend === "firecracker") {
+      check(this.engine.fc, "fc_inventory_missing");
+      if (requireRelease) await this.engine.fc.requireReleased();
       if (this.active.has("host-agent") && !this.stopped.has("host-agent"))
         await this.engine.remove("host-agent");
+      if (requireRelease) await this.engine.fc.requireStopped();
       return;
     }
     const before = await this.nativeProcesses();

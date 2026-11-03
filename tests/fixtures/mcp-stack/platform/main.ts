@@ -1,4 +1,4 @@
-import { open, realpath, readFile } from "node:fs/promises";
+import { open, realpath, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -18,7 +18,10 @@ import { generateConfiguration } from "./configuration.ts";
 import { stageAssets, publishGuest } from "./assets.ts";
 import { Engine } from "./engine.ts";
 import { Stack } from "./launch.ts";
-import { startSupervisor } from "./supervisor.ts";
+import { inspectFcInventory } from "./fc-runtime.ts";
+import { parseHostRecord } from "../../../../orchestrator/scripts/mcp-stack/host-observer.ts";
+import type { PublicClient } from "../../../../orchestrator/scripts/mcp-stack/transport.ts";
+import { startSupervisor, type Lifecycle } from "./supervisor.ts";
 import {
   ContextSchema,
   loadContext,
@@ -156,6 +159,159 @@ export async function bootApplications(
   await stack.startRole(ctx, "host-agent", "normal");
   await stack.readyRole(ctx, "host-agent");
 }
+export function ownedCleanupSessions(
+  rows: {
+    session?: { id: string; hostId?: string; status: string };
+    ownerEmail?: string;
+  }[],
+  hostId: string,
+  managed: Map<string, string>,
+  actors: Set<string>,
+) {
+  check(rows.length <= 4096, "cleanup_session_bound");
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const row of rows) {
+    const session = row.session;
+    check(
+      session &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(session.id) &&
+        !seen.has(session.id),
+      "cleanup_session_identity",
+    );
+    seen.add(session.id);
+    if (["completed", "failed", "dead"].includes(session.status)) continue;
+    check(
+      (!session.hostId || session.hostId === hostId) &&
+        ([
+          "admin@fixture.example",
+          "owner@fixture.example",
+          "other@fixture.example",
+          "bootstrap@fixture.example",
+        ].includes(row.ownerEmail ?? "") ||
+          actors.has(managed.get(session.id) ?? "")),
+      "cleanup_foreign_session",
+    );
+    ids.push(session.id);
+  }
+  return ids;
+}
+export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
+  const managed = new Map<string, string>(),
+    actors = new Set<string>();
+  const principal = await admin.identity.whoAmI({});
+  check(
+    principal.email === "bootstrap@fixture.example" &&
+      principal.role === "admin" &&
+      !principal.serviceAccount,
+    "cleanup_admin_identity",
+  );
+  actors.add(principal.userId);
+  for (const role of ["admin", "owner", "other"] as const) {
+    const file = ctx.identities[role].cookieFile;
+    try {
+      const client = await publicClient(ctx, {
+        kind: "cookie",
+        value: (await readOwned(file)).toString(),
+      });
+      const identity = await client.identity.whoAmI({});
+      check(
+        identity.email === ctx.identities[role].email &&
+          !identity.serviceAccount &&
+          identity.userId,
+        "cleanup_fixture_identity",
+      );
+      actors.add(identity.userId);
+    } catch (error) {
+      if (
+        !(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "ENOENT"
+        )
+      )
+        throw error;
+    }
+  }
+  for (const file of [
+    ctx.identities.unattendedKeyFile,
+    ctx.identities.automationKeyFile,
+  ]) {
+    try {
+      const client = await publicClient(ctx, {
+        kind: "api-key",
+        value: (await readOwned(file)).toString().trim(),
+      });
+      const identity = await client.identity.whoAmI({});
+      check(identity.userId, "cleanup_key_identity");
+      actors.add(identity.userId);
+    } catch (error) {
+      if (
+        !(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "ENOENT"
+        )
+      )
+        throw error;
+    }
+  }
+  for (const file of await readdir(ctx.observer.hostManagedRoot)) {
+    if (!/^[a-f0-9-]{36}\.boot$/.test(file)) continue;
+    const record = parseHostRecord(
+      await readOwned(join(ctx.observer.hostManagedRoot, file)),
+      file.slice(0, -5),
+    ).record;
+    check(
+      record.request.key.context.target.host_id === ctx.hostId,
+      "cleanup_managed_host",
+    );
+    managed.set(
+      record.request.cold.session_id,
+      record.request.key.creation.policy.actorId,
+    );
+  }
+  const destroyed = new Set<string>();
+  const deadline = performance.now() + 60000;
+  while (performance.now() < deadline) {
+    const rows = (await admin.sessions.listSessions({})).sessions;
+    const ids = ownedCleanupSessions(rows, ctx.hostId, managed, actors);
+    if (!ids.length) {
+      await put(
+        join(ctx.runRoot, "session-cleanup.json"),
+        JSON.stringify({ destroyed: [...destroyed], remaining: [] }),
+      );
+      return;
+    }
+    for (const sessionId of ids) {
+      await admin.sessions.deleteSession({ sessionId });
+      destroyed.add(sessionId);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new PlatformFailure("FAILED", "cleanup_session_deadline");
+}
+/** Write the exact runner context and retain its real control socket. */
+export async function startContextSupervisor(
+  ctx: Context,
+  lifecycle: Lifecycle,
+) {
+  ContextSchema.parse(ctx);
+  const contextFile = await put(
+    join(ctx.runRoot, "context.json"),
+    JSON.stringify(ctx),
+  );
+  const supervisor = await startSupervisor(ctx, lifecycle);
+  try {
+    await loadContext(contextFile.path);
+    return supervisor;
+  } catch (error) {
+    await supervisor.close();
+    throw error;
+  }
+}
 export async function main(args: string[]) {
   const options = cli(args);
   const inputs = await preflight(
@@ -184,6 +340,10 @@ export async function main(args: string[]) {
   let stack: Stack | undefined,
     engine: Engine | undefined,
     runner: OwnedProcess | undefined;
+  let context: Context | undefined;
+  let observing = false;
+  let observer: Promise<void> | undefined;
+  let observerFailure: unknown;
   let supervisor: Awaited<ReturnType<typeof startSupervisor>> | undefined;
   const signal = () => abort.abort();
   process.once("SIGINT", signal);
@@ -192,7 +352,14 @@ export async function main(args: string[]) {
   let failure: unknown;
   try {
     const identity = await generateIdentity(inputs, root);
-    engine = new Engine(inputs, root, identity.runId);
+    engine = new Engine(
+      inputs,
+      root,
+      identity.runId,
+      inputs.backend === "firecracker"
+        ? await inspectFcInventory(inputs)
+        : undefined,
+    );
     timer = setTimeout(signal, 7200000);
     await engine.controlled(abort.signal, async () => {
       await engine!.reserveRegistryPort();
@@ -203,6 +370,7 @@ export async function main(args: string[]) {
       const configuration = await generateConfiguration(inputs, root, identity);
       stack = new Stack(inputs, root, identity, assets, configuration, engine!);
       const ctx = await stack.prepare();
+      context = ctx;
       await engine!.network();
       await stack.dependencies();
       await stack.fixtures(ctx);
@@ -210,15 +378,29 @@ export async function main(args: string[]) {
       await engine!.verifyNetwork(true);
       await stack.edges();
       await bootApplications(stack, ctx);
+      if (engine!.fc) {
+        observing = true;
+        observer = (async () => {
+          let firstFailure: number | undefined;
+          while (observing) {
+            try {
+              await engine!.fc!.observe();
+              firstFailure = undefined;
+            } catch (error) {
+              firstFailure ??= performance.now();
+              if (performance.now() - firstFailure > 3000) {
+                observerFailure = error;
+                abort.abort();
+                return;
+              }
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        })();
+      }
       const uri = await publishGuest(inputs, root, engine!);
       await enableGuest(ctx, identity, uri, inputs.images.guest.manifestDigest);
-      ContextSchema.parse(ctx);
-      const contextFile = await put(
-        join(root, "context.json"),
-        JSON.stringify(ctx),
-      );
-      await loadContext(contextFile.path);
-      supervisor = await startSupervisor(ctx, {
+      supervisor = await startContextSupervisor(ctx, {
         status: (signal) =>
           engine!.controlled(signal, () => stack!.status(ctx)),
         restart: (role, configuration, signal) =>
@@ -256,6 +438,9 @@ export async function main(args: string[]) {
     });
     await Promise.race([runner.done, aborted]);
     check(runner.child.exitCode === 0, "matrix_exit");
+    if (observerFailure) throw observerFailure;
+    await engine?.fc?.observe();
+    await engine?.fc?.requireCoverage();
     await runner.stop(1500);
     runner = undefined;
   } catch (error) {
@@ -265,6 +450,8 @@ export async function main(args: string[]) {
     process.off("SIGINT", signal);
     process.off("SIGTERM", signal);
     const failed: string[] = [];
+    observing = false;
+    await observer;
     for (const [name, action] of [
       [
         "matrix",
@@ -276,6 +463,46 @@ export async function main(args: string[]) {
         "supervisor",
         async () => {
           if (supervisor) await supervisor.close();
+        },
+      ],
+      [
+        "sessions",
+        async () => {
+          if (!context) return;
+          let cookie: string;
+          try {
+            cookie = (
+              await readOwned(join(root, "bootstrap.cookie"))
+            ).toString();
+          } catch (error) {
+            if (
+              error &&
+              typeof error === "object" &&
+              "code" in error &&
+              error.code === "ENOENT"
+            )
+              return;
+            throw error;
+          }
+          const admin = await publicClient(context, {
+            kind: "cookie",
+            value: cookie,
+          });
+          await destroyRunSessions(context, admin);
+          if (engine?.fc) {
+            const deadline = performance.now() + 15000;
+            let released = false;
+            while (performance.now() < deadline) {
+              try {
+                await engine.fc.requireReleased();
+                released = true;
+                break;
+              } catch {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+            }
+            check(released, "cleanup_nbd_release_deadline");
+          }
         },
       ],
       [

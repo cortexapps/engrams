@@ -260,6 +260,12 @@ test("effective container audit rejects added authority and environment", async 
   state.HostConfig.PidMode = "host";
   await expect(engine.audit(id)).rejects.toThrow("container_namespace");
   state.HostConfig.PidMode = "";
+  Reflect.set(state.HostConfig, "Sysctls", { "net.ipv4.ip_forward": "1" });
+  await expect(engine.audit(id)).rejects.toThrow("container_exposure");
+  Reflect.deleteProperty(state.HostConfig, "Sysctls");
+  Reflect.set(state.HostConfig, "CgroupnsMode", "host");
+  await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  Reflect.deleteProperty(state.HostConfig, "CgroupnsMode");
   await expect(engine.audit(id)).resolves.toBeDefined();
 });
 
@@ -468,7 +474,9 @@ test("cleanup retains a failure receipt and refuses to delete a substituted netw
               Internal: true,
               Driver: "bridge",
               Labels: { "engrams.mcp.run": foreign ? "foreign" : runId },
-              IPAM: { Config: [{ Subnet: "10.42.3.0/24" }] },
+              IPAM: {
+                Config: [{ Subnet: "10.42.3.0/24", Gateway: "10.42.3.1" }],
+              },
               Containers: {},
             },
           ]),
@@ -590,7 +598,16 @@ test("FC launch uses the declared configuration, private namespace and original 
         return "a".repeat(64);
       }
     }
-    const engine = new LaunchEngine(inputs, root, identity.runId);
+    const engine = new LaunchEngine(inputs, root, identity.runId, {
+      bootId: "11111111-1111-4111-8111-111111111111",
+      readSectors: { "/dev/nbd0": "0", "/dev/nbd1": "0" },
+      release: "test-kernel",
+      pidNamespace: "pid:[1]",
+      slots: [
+        { path: "/dev/nbd0", ino: "41", rdev: "11008", device: "43:0", uid: 0 },
+        { path: "/dev/nbd1", ino: "42", rdev: "11009", device: "43:1", uid: 0 },
+      ],
+    });
     engine.guardIds.set("coordinator", "e".repeat(64));
     const stack = new Stack(
       inputs,
@@ -607,7 +624,12 @@ test("FC launch uses the declared configuration, private namespace and original 
     expect(launch.entrypoint).toBeUndefined();
     expect(launch.args).toBeUndefined();
     expect(launch.options).toContain(`container:${"e".repeat(64)}`);
-    expect(launch.options).not.toContain("--pid");
+    expect(launch.options[launch.options.indexOf("--pid") + 1]).toBe("host");
+    expect(launch.options[launch.options.indexOf("--cgroupns") + 1]).toBe(
+      "private",
+    );
+    expect(launch.options).toContain("/dev/nbd0:/dev/nbd0:rw");
+    expect(launch.options).toContain("/dev/nbd1:/dev/nbd1:rw");
     expect(launch.options).toContain("/dev/kvm:/dev/kvm:rw");
     expect(launch.options).toContain("/dev/net/tun:/dev/net/tun:rw");
     const envPath = launch.options[launch.options.indexOf("--env-file") + 1]!;
@@ -797,7 +819,9 @@ test("resolver uses only a readonly named file projection and rejects source, su
               Internal: true,
               Driver: "bridge",
               Labels: { "engrams.mcp.run": runId },
-              IPAM: { Config: [{ Subnet: "10.42.3.0/24" }] },
+              IPAM: {
+                Config: [{ Subnet: "10.42.3.0/24", Gateway: "10.42.3.1" }],
+              },
             },
           ]),
         );
@@ -930,6 +954,887 @@ test("cleanup recovers only a planned owned container after a lost create respon
     expect(
       JSON.parse(await readFile(join(root, "cleanup.json"), "utf8")).success,
     ).toBe(true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+async function handoffFixture(root: string) {
+  const { ContextSchema } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/context.ts"
+  );
+  const { put } = await import("./owned.ts");
+  const pin = await put(join(root, "artifact"), "a".repeat(40));
+  const endpoint = (name: string) => ({
+    origin: `https://${name}.fixture.example`,
+    ca: pin,
+    serverFingerprint: Array(32).fill("AA").join(":"),
+  });
+  const fixture = async (name: "modern" | "legacy") => {
+    const runRoot = join(root, name);
+    await mkdir(runRoot, { mode: 0o700 });
+    const configuration = await put(join(runRoot, "configuration"), "fixture");
+    return {
+      ...endpoint(`observer.${name}`),
+      configuration,
+      runRoot,
+      tokenFile: configuration.path,
+      resourceKeyFile: configuration.path,
+      resourceOrigin: `https://resource.${name}.fixture.example`,
+      issuerOrigin: `https://issuer.${name}.fixture.example`,
+      authorizationOrigin: `https://authorization.${name}.fixture.example`,
+      tokenOrigin: `https://token.${name}.fixture.example`,
+      redirectUri: "https://app.fixture.example/integrations/mcp/callback",
+      protocol: name === "modern" ? "2026-07-28" : "2025-06-18",
+    };
+  };
+  const human = (name: string) => ({
+    email: `${name}@fixture.example`,
+    passwordFile: pin.path,
+    cookieFile: join(root, `${name}.cookie`),
+  });
+  return ContextSchema.parse({
+    version: 1,
+    runId: "mcp-controlled-handoff",
+    runRoot: root,
+    backend: "vz",
+    sourceCommit: "b".repeat(40),
+    hostId: "00000000-0000-4000-8000-000000000001",
+    imageId: "controlled-image",
+    imageDigest: "sha256:" + "c".repeat(64),
+    artifacts: Object.fromEntries(
+      [
+        "coordinator",
+        "orchestrator",
+        "worker",
+        "hostAgent",
+        "fixture",
+        "kernel",
+        "guestImage",
+        "claudeHarness",
+        "codexHarness",
+        "modelCli",
+        "claudeBundle",
+        "codexBundle",
+        "helper",
+      ].map((name) => [name, pin]),
+    ),
+    endpoints: {
+      app: endpoint("app"),
+      coordinator: endpoint("coordinator"),
+      workerControl: endpoint("worker"),
+      operator: {
+        ...endpoint("operator"),
+        certificate: pin,
+        privateKeyFile: pin.path,
+      },
+    },
+    protocolFixtures: {
+      modern: await fixture("modern"),
+      legacy: await fixture("legacy"),
+    },
+    publication: {
+      candidateIdentity: "sha256:" + "d".repeat(64),
+      expectedGeneration: null,
+      deploymentIdentity: "sha256:" + "d".repeat(64),
+      networkIdentity: "sha256:" + "d".repeat(64),
+      trustIdentity: "sha256:" + "d".repeat(64),
+      zone: "fixture-zone",
+    },
+    identities: {
+      admin: human("admin"),
+      owner: human("owner"),
+      other: human("other"),
+      unattendedKeyFile: join(root, "unattended"),
+      automationKeyFile: join(root, "automation"),
+      routerSentinelFile: pin.path,
+    },
+    supervisor: {
+      socket: join(root, "s"),
+      tokenFile: pin.path,
+      configurations: {
+        orchestrator: { normal: pin },
+        coordinator: { normal: pin },
+        worker: { normal: pin },
+        "host-agent": { normal: pin },
+      },
+      operatorCandidates: {
+        normal: { file: pin, identity: "sha256:" + "d".repeat(64) },
+      },
+    },
+    observer: {
+      coordinatorDsnFile: pin.path,
+      orchestratorDsnFile: pin.path,
+      hostManagedRoot: join(root, "managed"),
+      hostLogFile: pin.path,
+    },
+    guest: {
+      stateDirectory: "/tmp/mcp-stack-fixture",
+      cliPath: "/opt/engram/dyn/0/engram-mcp-model-fixture",
+    },
+    deadlines: { requestMs: 1000, stepMs: 3000, totalMs: 10000 },
+    evidenceFile: join(root, "evidence"),
+  });
+}
+
+test("runner handoff validates the complete context with a real private supervisor socket", async () => {
+  const { startContextSupervisor } = await import("./main.ts");
+  const { loadContext } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/context.ts"
+  );
+  const { lstat } = await import("node:fs/promises");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/h-"),
+  );
+  let supervisor:
+    | Awaited<ReturnType<typeof startContextSupervisor>>
+    | undefined;
+  try {
+    const ctx = await handoffFixture(root);
+    await mkdir(ctx.observer.hostManagedRoot, { mode: 0o700 });
+    const unexpected = async (): Promise<never> => {
+      throw new Error("handoff does not need lifecycle access");
+    };
+    supervisor = await startContextSupervisor(ctx, {
+      status: unexpected,
+      restart: unexpected,
+      stop: unexpected,
+    });
+    expect((await lstat(ctx.supervisor.socket)).isSocket()).toBe(true);
+    expect((await lstat(ctx.supervisor.socket)).mode & 0o077).toBe(0);
+    expect(await loadContext(join(root, "context.json"))).toEqual(ctx);
+    await supervisor.close();
+    supervisor = undefined;
+    await expect(lstat(ctx.supervisor.socket)).rejects.toThrow();
+  } finally {
+    if (supervisor) await supervisor.close();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("failed complete context validation drains and removes the real handoff supervisor", async () => {
+  const { startContextSupervisor } = await import("./main.ts");
+  const { lstat } = await import("node:fs/promises");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/h-failed-"),
+  );
+  try {
+    const ctx = await handoffFixture(root);
+    const unexpected = async (): Promise<never> => {
+      throw new Error("handoff does not need lifecycle access");
+    };
+    await expect(
+      startContextSupervisor(ctx, {
+        status: unexpected,
+        restart: unexpected,
+        stop: unexpected,
+      }),
+    ).rejects.toThrow("owned_path");
+    await expect(lstat(ctx.supervisor.socket)).rejects.toThrow();
+    expect((await lstat(join(root, "context.json"))).isFile()).toBe(true);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("only the coordinator guard installs the exact native-host route on the internal bridge", async () => {
+  const calls: string[][] = [];
+  const inputs = {
+    backend: "firecracker",
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+    registryPort: 32000,
+    images: { guard: { id: "sha256:" + "a".repeat(64) } },
+  } as Inputs;
+  const ids = {
+    orchestrator: "a".repeat(64),
+    coordinator: "b".repeat(64),
+    worker: "c".repeat(64),
+  };
+  class GuardPlan extends Engine {
+    override async project(): Promise<string> {
+      return "controlled-probe-trust";
+    }
+    override networkOptions(): string[] {
+      return ["--network", "controlled-internal"];
+    }
+    override async create(role: string): Promise<string> {
+      return ids[role.slice(0, -6) as keyof typeof ids];
+    }
+    override async inspect() {
+      return {
+        HostConfig: {
+          PortBindings: {
+            "32000/tcp": [{ HostIp: "127.0.0.1", HostPort: "32000" }],
+            "9101/tcp": [{ HostIp: "10.42.4.1", HostPort: "9101" }],
+          },
+        },
+      };
+    }
+    override async call(args: string[]): Promise<Buffer> {
+      calls.push(args);
+      return Buffer.from("");
+    }
+    override async verifyNetwork() {
+      return {
+        generation: "controlled",
+        enforcementSha256: "e".repeat(64),
+        fixtureOnlyEgress: true as const,
+        externalDnsBlocked: true as const,
+        roles: ["orchestrator", "coordinator", "worker"] as (
+          | "orchestrator"
+          | "coordinator"
+          | "worker"
+        )[],
+      };
+    }
+  }
+  const engine = new GuardPlan(inputs, "/owned/run", "mcp-controlled-route");
+  await engine.guards({ path: "/owned/ca", sha256: "f".repeat(64) });
+  expect(calls.filter((args) => args.includes("/usr/sbin/ip"))).toEqual([
+    [
+      "exec",
+      ids.coordinator,
+      "/usr/sbin/ip",
+      "-4",
+      "route",
+      "replace",
+      "10.42.4.1/32",
+      "via",
+      "10.42.3.1",
+      "dev",
+      "eth0",
+    ],
+  ]);
+});
+
+test("native-host route qualification rejects default, missing, duplicate and substituted routes", async () => {
+  const { verifyNativeRouteState } = await import("./engine.ts");
+  const inputs = { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" };
+  const route = { dst: "10.42.4.1", gateway: "10.42.3.1", dev: "eth0" };
+  const selected = { ...route, prefsrc: "10.42.3.21" };
+  expect(() =>
+    verifyNativeRouteState([route], [selected], inputs),
+  ).not.toThrow();
+  for (const routes of [
+    [],
+    [route, route],
+    [route, { dst: "default", gateway: "10.42.3.1" }],
+    [{ ...route, gateway: "10.42.3.40" }],
+    [{ ...route, dev: "foreign0" }],
+  ])
+    expect(() => verifyNativeRouteState(routes, [selected], inputs)).toThrow();
+  for (const current of [
+    { ...selected, gateway: "10.42.3.40" },
+    { ...selected, prefsrc: "10.42.3.22" },
+    { ...selected, dev: "foreign0" },
+  ])
+    expect(() => verifyNativeRouteState([route], [current], inputs)).toThrow(
+      "native_route_selected",
+    );
+});
+
+test("native-host TLS qualification pins the actual first leaf and removes its private probe on failure", async () => {
+  const { generateIdentity } = await import("./identity.ts");
+  const { verifyNativeHostTls } = await import("./engine.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/host-tls-"),
+  );
+  const openssl = await realpath(
+    process.env.MCP_PLATFORM_TEST_OPENSSL ?? Bun.which("openssl") ?? "openssl",
+  );
+  const inputs = {
+    subnet: "10.42.3.0/24",
+    nativeHostIp: "10.42.4.1",
+    binaries: {
+      openssl: { path: openssl, sha256: hash(await readFile(openssl)) },
+    },
+    images: { guard: { id: "sha256:" + "a".repeat(64) } },
+  } as Inputs;
+  try {
+    const identity = await generateIdentity(inputs, root),
+      id = "a".repeat(64),
+      calls: string[][] = [];
+    const host = identity.leaves.host,
+      wrong = identity.leaves.worker;
+    const output = async (certificate: string) =>
+      Buffer.from(
+        `New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\n${await readFile(certificate, "utf8")}\nVerify return code: 0 (ok)\n`,
+      );
+    let bytes = await output(host.certificate.path),
+      running = false,
+      removed = true;
+    class TlsProbe extends Engine {
+      override async project(
+        _role: string,
+        files: Record<string, import("./owned.ts").Pin>,
+      ): Promise<string> {
+        expect(Object.keys(files).sort()).toEqual([
+          "ca.pem",
+          "client.crt",
+          "client.key",
+        ]);
+        return "controlled-client-tls";
+      }
+      override async verifyNetwork() {
+        return {
+          generation: "controlled",
+          enforcementSha256: "e".repeat(64),
+          fixtureOnlyEgress: true as const,
+          externalDnsBlocked: true as const,
+          roles: ["orchestrator", "coordinator", "worker"] as (
+            | "orchestrator"
+            | "coordinator"
+            | "worker"
+          )[],
+        };
+      }
+      override async audit(id: string) {
+        return { Id: id };
+      }
+      override async call(args: string[]): Promise<Buffer> {
+        calls.push(args);
+        if (args[0] === "create") {
+          removed = false;
+          return Buffer.from(id);
+        }
+        if (args[0] === "start") {
+          running = true;
+          return Buffer.from(id);
+        }
+        if (args[0] === "exec" && args[2] === "/usr/bin/openssl") return bytes;
+        if (args[0] === "container" && args[1] === "inspect")
+          return Buffer.from(
+            JSON.stringify([
+              {
+                Id: id,
+                Config: { Labels: { "engrams.mcp.run": identity.runId } },
+                State: { Running: running, Pid: running ? 123 : 0 },
+              },
+            ]),
+          );
+        if (args[0] === "stop") {
+          running = false;
+          return Buffer.from(id);
+        }
+        if (args[0] === "rm") {
+          removed = true;
+          return Buffer.from(id);
+        }
+        if (args[0] === "ps") return Buffer.from(removed ? "" : id);
+        throw new Error("unexpected fixed TLS probe command");
+      }
+    }
+    const engine = new TlsProbe(inputs, root, identity.runId);
+    engine.guardIds.set("coordinator", "b".repeat(64));
+    const tls = {
+      ca: identity.ca,
+      clientCertificate: identity.leaves.coordinator.certificate,
+      clientKey: identity.leaves.coordinator.key,
+      serverCertificate: host.certificate,
+    };
+    await engine.qualifyNativeHost(tls);
+    await engine.qualifyNativeHost(tls);
+    expect(removed).toBe(true);
+    const created = calls.find((args) => args[0] === "create")!;
+    expect(created).toContain(`container:${"b".repeat(64)}`);
+    expect(created).toContain(
+      "type=volume,src=controlled-client-tls,dst=/etc/mcp-host-probe,readonly",
+    );
+    expect(created).not.toContain("--env-file");
+    expect(created).not.toContain("--cap-add");
+    expect(created).not.toContain("--device");
+    const invoked = calls.find(
+      (args) => args[0] === "exec" && args[2] === "/usr/bin/openssl",
+    )!;
+    for (const flag of [
+      "-tls1_3",
+      "-verify_return_error",
+      "-verify_hostname",
+      "-servername",
+      "-cert",
+      "-key",
+    ])
+      expect(invoked).toContain(flag);
+    bytes = await output(wrong.certificate.path);
+    await expect(engine.qualifyNativeHost(tls)).rejects.toThrow(
+      "native_host_tls_leaf",
+    );
+    expect(removed).toBe(true);
+    expect(running).toBe(false);
+    const correct = await output(host.certificate.path);
+    expect(() =>
+      verifyNativeHostTls(Buffer.concat([bytes, correct]), host.fingerprint),
+    ).toThrow("native_host_tls_leaf");
+    expect(() =>
+      verifyNativeHostTls(
+        Buffer.from(correct.toString().replace("TLSv1.3", "TLSv1.2")),
+        host.fingerprint,
+      ),
+    ).toThrow("native_host_tls_verification");
+    expect(() =>
+      verifyNativeHostTls(
+        Buffer.from(correct.toString().replace("0 (ok)", "20 (bad)")),
+        host.fingerprint,
+      ),
+    ).toThrow("native_host_tls_verification");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("FC sysctls belong only to its C guard and actual firewall order stays production exact", async () => {
+  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } = await import(
+    "./engine.ts"
+  );
+  expect(fcGuardSysctls("firecracker", "coordinator-guard")).toEqual({
+    "net.ipv4.ip_forward": "1",
+    "net.ipv4.conf.all.route_localnet": "1",
+  });
+  for (const backend of ["firecracker", "vz"] as const)
+    for (const role of [
+      "orchestrator-guard",
+      "worker-guard",
+      "host-agent",
+      "worker",
+      ...(backend === "vz" ? ["coordinator-guard"] : []),
+    ])
+      expect(fcGuardSysctls(backend, role)).toEqual({});
+  const expected = fcHostFirewall(26000);
+  expect(expected.INPUT[0]).toContain("--dport 26003");
+  expect(expected.FORWARD.at(-1)).toContain("engram-default-deny");
+  expect(expected.PREROUTING[0]).toContain("-i vh-engr-+");
+  expect(expected.PREROUTING[2]).toContain("--dport 443");
+  const actual = Object.fromEntries(
+    Object.entries(expected).map(([chain, lines]) => [
+      chain,
+      [
+        `-P ${chain} ACCEPT`,
+        ...lines.map((line) =>
+          line
+            .replace("-p tcp", "-p tcp -m tcp")
+            .replace("-p udp", "-p udp -m udp")
+            .replace("--to-port ", "--to-ports ")
+            .replace(/--comment (\S+)/, '--comment "$1"'),
+        ),
+      ].join("\n") + "\n",
+    ]),
+  );
+  verifyFcHostFirewall(actual, 26000);
+  for (const current of [
+    {
+      ...actual,
+      INPUT: actual.INPUT!.replace("--dport 26003", "--dport 26004"),
+    },
+    { ...actual, INPUT: actual.INPUT!.replace(/-A INPUT[^\n]+\n/, "") },
+    {
+      ...actual,
+      FORWARD: actual.FORWARD!.replace(
+        "-P FORWARD ACCEPT\n",
+        "-P FORWARD ACCEPT\n-A FORWARD -j ACCEPT\n",
+      ),
+    },
+    {
+      ...actual,
+      PREROUTING: actual.PREROUTING!.replace("-i vh-engr-+", "-i tap-engr-+"),
+    },
+    { ...actual, POSTROUTING: "-P POSTROUTING ACCEPT\n" },
+    {
+      ...actual,
+      INPUT: actual
+        .INPUT!.split("\n")
+        .map((line, i, all) => (i === 1 ? all[5] : i === 5 ? all[1] : line))
+        .join("\n"),
+    },
+  ])
+    expect(() => verifyFcHostFirewall(current, 26000)).toThrow();
+});
+
+test("FC qualification reads both actual namespace sysctls and production chains", async () => {
+  const { fcHostFirewall } = await import("./engine.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/fc-net-"),
+  );
+  const calls: string[][] = [];
+  let badNamespace = false,
+    badSysctl = false;
+  class FcProbe extends Engine {
+    override async call(args: string[]) {
+      calls.push(args);
+      if (args[2] === "/usr/bin/readlink")
+        return Buffer.from(
+          badNamespace && args[1] === "host" ? "net:[456]\n" : "net:[123]\n",
+        );
+      if (args[2] === "/bin/cat") return Buffer.from(badSysctl ? "0\n" : "1\n");
+      if (args[2] === "/usr/sbin/iptables") {
+        const chain = args[6]!;
+        return Buffer.from(
+          [`-P ${chain} ACCEPT`, ...fcHostFirewall(26000)[chain]!].join("\n") +
+            "\n",
+        );
+      }
+      throw new Error("unexpected FC qualification command");
+    }
+  }
+  try {
+    const engine = new FcProbe(
+      { backend: "firecracker", registryPort: 26000 } as Inputs,
+      root,
+      "controlled",
+    );
+    engine.guardIds.set("coordinator", "guard");
+    await engine.qualifyFcHost("host");
+    expect(calls.filter((args) => args[2] === "/bin/cat")).toHaveLength(4);
+    expect(
+      calls.filter((args) => args[2] === "/usr/sbin/iptables"),
+    ).toHaveLength(4);
+    await engine.qualifyFcHost("host");
+    badNamespace = true;
+    await expect(engine.qualifyFcHost("host")).rejects.toThrow(
+      "fc_host_namespace",
+    );
+    badNamespace = false;
+    badSysctl = true;
+    await expect(engine.qualifyFcHost("host")).rejects.toThrow(
+      "fc_host_sysctl",
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("VZ link uses private nonoverlapping IPAM and derives its interface from the exact endpoint", async () => {
+  const { verifyNativeSubnet, nativeInterface, verifyNativeRouteState } =
+    await import("./engine.ts");
+  expect(() =>
+    verifyNativeSubnet("172.25.0.0/16", "172.25.0.1", [
+      "10.42.3.0/24",
+      "192.168.1.5",
+    ]),
+  ).not.toThrow();
+  for (const [subnet, gateway, forbidden] of [
+    ["8.8.8.0/24", "8.8.8.1", []],
+    ["172.25.0.0/16", "172.26.0.1", []],
+    ["172.25.0.0/16", "172.25.0.1", ["172.25.3.0/24"]],
+    ["172.25.0.0/16", "172.25.0.1", ["172.25.3.5"]],
+    ["172.25.3.0/16", "172.25.3.1", []],
+  ] as [string, string, string[]][])
+    expect(() => verifyNativeSubnet(subnet, gateway, forbidden)).toThrow();
+  const value = [
+    {
+      ifname: "owned7",
+      address: "02:42:ac:19:00:02",
+      addr_info: [{ family: "inet", local: "172.25.0.2" }],
+    },
+  ];
+  expect(nativeInterface(value, "172.25.0.2", "02:42:ac:19:00:02")).toBe(
+    "owned7",
+  );
+  expect(() =>
+    nativeInterface(value, "172.25.0.3", "02:42:ac:19:00:02"),
+  ).toThrow();
+  expect(() =>
+    nativeInterface([...value, ...value], "172.25.0.2", "02:42:ac:19:00:02"),
+  ).toThrow();
+  expect(() =>
+    nativeInterface(value, "172.25.0.2", "02:42:ac:19:00:03"),
+  ).toThrow();
+  const inputs = { subnet: "10.42.3.0/24", nativeHostIp: "192.168.1.5" };
+  const link = { gateway: "172.25.0.1", dev: "owned7", source: "172.25.0.2" };
+  const route = {
+    dst: inputs.nativeHostIp,
+    gateway: link.gateway,
+    dev: link.dev,
+  };
+  expect(() =>
+    verifyNativeRouteState(
+      [route],
+      [{ ...route, prefsrc: link.source }],
+      inputs,
+      link,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    verifyNativeRouteState(
+      [route, { dst: "default" }],
+      [{ ...route, prefsrc: link.source }],
+      inputs,
+      link,
+    ),
+  ).toThrow();
+});
+
+test("cleanup selects only authenticated fixture or managed-principal sessions on the exact host", async () => {
+  const { ownedCleanupSessions } = await import("./main.ts");
+  const id = "11111111-1111-4111-8111-111111111111";
+  const session = { id, status: "active", hostId: "owned-host" };
+  expect(
+    ownedCleanupSessions(
+      [{ session, ownerEmail: "owner@fixture.example" }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toEqual([id]);
+  expect(
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map([[id, "owned-actor"]]),
+      new Set(["owned-actor"]),
+    ),
+  ).toEqual([id]);
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session, ownerEmail: "foreign@example.test" }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toThrow("cleanup_foreign_session");
+  expect(() =>
+    ownedCleanupSessions(
+      [
+        {
+          session: { ...session, hostId: "foreign-host" },
+          ownerEmail: "owner@fixture.example",
+        },
+      ],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toThrow();
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session }, { session }],
+      "owned-host",
+      new Map([[id, "owned-actor"]]),
+      new Set(["owned-actor"]),
+    ),
+  ).toThrow("cleanup_session_identity");
+  expect(
+    ownedCleanupSessions(
+      [{ session: { ...session, status: "completed" } }],
+      "owned-host",
+      new Map(),
+      new Set(),
+    ),
+  ).toEqual([]);
+});
+
+test("VZ guard configures only its owned link after default-drop", async () => {
+  const calls: string[][] = [];
+  const id = "b".repeat(64),
+    network = "d".repeat(64),
+    runId = "mcp-controlled-vz";
+  let connected = false,
+    removed = false;
+  const endpoint = {
+    IPv4Address: "172.25.0.2/16",
+    MacAddress: "02:42:ac:19:00:02",
+  };
+  const interfaces = [
+    {
+      ifname: "owned7",
+      address: endpoint.MacAddress,
+      addr_info: [{ family: "inet", local: "172.25.0.2" }],
+    },
+  ];
+  class VzPlan extends Engine {
+    override async project() {
+      return "controlled-trust";
+    }
+    override networkOptions() {
+      return ["--network", "controlled-internal"];
+    }
+    override async create(role: string) {
+      return role === "coordinator-guard"
+        ? id
+        : role === "worker-guard"
+          ? "c".repeat(64)
+          : "a".repeat(64);
+    }
+    override async inspect() {
+      return {
+        HostConfig: {
+          PortBindings: {
+            "32000/tcp": [{ HostIp: "127.0.0.1", HostPort: "32000" }],
+          },
+        },
+      };
+    }
+    override async verifyNetwork() {
+      return {
+        generation: "controlled",
+        enforcementSha256: "e".repeat(64),
+        fixtureOnlyEgress: true as const,
+        externalDnsBlocked: true as const,
+        roles: ["orchestrator", "coordinator", "worker"] as (
+          | "orchestrator"
+          | "coordinator"
+          | "worker"
+        )[],
+      };
+    }
+    override async call(args: string[]) {
+      calls.push(args);
+      if (args[0] === "network" && args[1] === "create")
+        return Buffer.from(network);
+      if (args[0] === "network" && args[1] === "connect") {
+        connected = true;
+        return Buffer.from("");
+      }
+      if (args[0] === "network" && args[1] === "inspect")
+        return Buffer.from(
+          JSON.stringify([
+            {
+              Id: network,
+              Name: `${runId}-native-network`,
+              Internal: false,
+              Driver: "bridge",
+              EnableIPv6: false,
+              Labels: { "engrams.mcp.run": runId },
+              IPAM: {
+                Config: [{ Subnet: "172.25.0.0/16", Gateway: "172.25.0.1" }],
+              },
+              Containers: connected ? { [id]: endpoint } : {},
+            },
+          ]),
+        );
+      if (args.includes("address"))
+        return Buffer.from(JSON.stringify(interfaces));
+      if (args.at(-1) === "default")
+        return Buffer.from(
+          JSON.stringify([
+            { dst: "default", gateway: "172.25.0.1", dev: "owned7" },
+          ]),
+        );
+      if (args[0] === "network" && args[1] === "rm") {
+        removed = true;
+        return Buffer.from(network);
+      }
+      return Buffer.from("");
+    }
+  }
+  const engine = new VzPlan(
+    {
+      backend: "vz",
+      subnet: "10.42.3.0/24",
+      nativeHostIp: "192.168.254.1",
+      registryPort: 32000,
+      images: { guard: { id: "sha256:" + "a".repeat(64) } },
+    } as Inputs,
+    "/owned/run",
+    runId,
+  );
+  await engine.guards({ path: "/owned/ca", sha256: "f".repeat(64) });
+  const attach = calls.findIndex(
+    (args) => args[0] === "network" && args[1] === "connect",
+  );
+  expect(
+    calls.slice(0, attach).filter((args) => args.includes("/usr/sbin/nft")),
+  ).toHaveLength(3);
+  expect(calls[attach]).toEqual(["network", "connect", network, id]);
+  expect(calls).toContainEqual([
+    "exec",
+    id,
+    "/usr/sbin/ip",
+    "-4",
+    "route",
+    "del",
+    "default",
+    "via",
+    "172.25.0.1",
+    "dev",
+    "owned7",
+  ]);
+  expect(calls).toContainEqual([
+    "exec",
+    id,
+    "/usr/sbin/ip",
+    "-4",
+    "route",
+    "replace",
+    "192.168.254.1/32",
+    "via",
+    "172.25.0.1",
+    "dev",
+    "owned7",
+  ]);
+  expect(removed).toBe(false);
+});
+
+test("FC process proof rejects a recycled PID, foreign cgroup, UID or executable", async () => {
+  const { verifyFcProcessIdentity } = await import("./fc-runtime.ts");
+  const process = {
+    pid: 42,
+    bootId: "fixed-boot",
+    birth: "100",
+    uid: 0,
+    executable: "/usr/local/bin/firecracker",
+    cgroup: "/owned/container",
+    sha256: "a".repeat(64),
+  };
+  expect(() => verifyFcProcessIdentity(process, { ...process })).not.toThrow();
+  for (const actual of [
+    undefined,
+    { ...process, birth: "101" },
+    { ...process, bootId: "foreign-boot" },
+    { ...process, uid: 1000 },
+    { ...process, executable: "/foreign/firecracker" },
+    { ...process, cgroup: "/foreign/container" },
+    { ...process, sha256: "b".repeat(64) },
+  ])
+    expect(() => verifyFcProcessIdentity(process, actual)).toThrow(
+      "fc_process_identity_changed",
+    );
+});
+
+test("secret projection reads back private file and directory modes and refuses a public key", async () => {
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/private-projection-"),
+  );
+  const { put } = await import("./owned.ts");
+  const file = await put(join(root, "client.key"), "controlled-private-key");
+  let publicKey = false,
+    removed = false;
+  class Projection extends Engine {
+    override async volume() {
+      return "controlled-volume";
+    }
+    override async create() {
+      return "a".repeat(64);
+    }
+    override async remove() {
+      removed = true;
+    }
+    override async call(args: string[]) {
+      if (args.includes("/usr/bin/stat"))
+        return Buffer.from(
+          args.includes("%u:%g:%a:%F:%h")
+            ? `1000:1000:${publicKey ? "644" : "600"}:regular file:1\n`
+            : "1000:1000:700:directory\n",
+        );
+      if (args.includes("/usr/bin/sha256sum"))
+        return Buffer.from(file.sha256 + "  /projection/client.key\n");
+      return Buffer.from("");
+    }
+  }
+  try {
+    const engine = new Projection(
+      { images: { guard: { id: "sha256:" + "a".repeat(64) } } } as Inputs,
+      root,
+      "controlled",
+    );
+    await expect(
+      engine.project("host-tls", { "client.key": file }),
+    ).resolves.toBe("controlled-volume");
+    expect(removed).toBe(true);
+    publicKey = true;
+    await expect(
+      engine.project("host-tls", { "client.key": file }),
+    ).rejects.toThrow("projection_file_mode");
   } finally {
     await rm(root, { recursive: true });
   }

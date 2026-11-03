@@ -1,4 +1,4 @@
-import { access, lstat, open, readdir } from "node:fs/promises";
+import { readFile, access, lstat, open, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { arch, platform } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -447,6 +447,11 @@ export async function preflight(
       );
   }
   if (backend === "firecracker") {
+    check(
+      info.KernelVersion ===
+        (await readFile("/proc/sys/kernel/osrelease", "utf8")).trim(),
+      "fc_engine_kernel_release",
+    );
     if (process.getuid?.() !== 0)
       throw new PlatformFailure("NEEDS_CONTEXT", "fc_privilege");
     try {
@@ -456,6 +461,8 @@ export async function preflight(
     } catch {
       throw new PlatformFailure("NEEDS_CONTEXT", "linux_kvm_tun");
     }
+    const { inspectFcInventory } = await import("./fc-runtime.ts");
+    await inspectFcInventory(inputs);
   } else {
     await command(
       "/usr/bin/codesign",
