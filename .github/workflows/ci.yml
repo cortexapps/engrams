@@ -2064,15 +2064,6 @@ jobs:
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo` image (harness-free; ADR 0062 —
           # the `claude` harness rides the host `current_bundles` stamp).
-          #
-          # Blacksmith's kernel ships NBD built-in (CONFIG_BLK_DEV_NBD=y),
-          # so the root host-agent sizes its NBD pool from the kernel and
-          # NBD-attaches the chunked disk (the teleport variant's two
-          # host-agents get disjoint device ranges from the Tiltfile).
-          # Assert it: a null cow-state here is now a real
-          # regression, not the old "no nbd.ko" environment gap, so the
-          # Phase B chunked-disk tests fail loud instead of skipping.
-          ENGRAM_EXPECT_NBD: "1"
           # suite: "" → the two-host evac test self-skips (and is filtered out
           # below anyway). teleport: "1" → the evac test hard-asserts that >=2
           # hosts registered (a single-host regression fails loud instead of

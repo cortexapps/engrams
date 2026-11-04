@@ -51,7 +51,7 @@ use tonic::codegen::InterceptedService;
 use tonic::transport::Channel;
 
 /// Per-RPC timeout. Cold `CreateSession` on CI runs ~120s on a fresh
-/// chunk cache (FC boot + first NBD page-ins), so this needs to clear
+/// chunk cache (FC boot + first image page-ins), so this needs to clear
 /// that with a little headroom.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -377,26 +377,6 @@ impl Driver {
         let _ = self.sess.delete_session(req).await;
     }
 
-    /// ADR 0016 Phase B commit 4a admin trigger → `FleetService.FlushSession`.
-    /// Forces an immediate `ChunkedDiskBackend::flush()` on the session's
-    /// bound sandbox + publishes the manifest_ref. Returns the parsed
-    /// outcome + new manifest version.
-    async fn flush_now(&mut self, sid: SessionId) -> FlushResult {
-        let req = app::FlushSessionRequest {
-            session_id: sid.to_string(),
-        };
-        let resp = self
-            .fleet
-            .flush_session(req)
-            .await
-            .expect("FlushSession")
-            .into_inner();
-        FlushResult {
-            outcome: resp.outcome,
-            manifest_version: resp.manifest_version,
-        }
-    }
-
     /// `SessionService.Snapshot`. Returns when the snapshot's PG row is
     /// durable. Body discarded — the side effect we care about is the row
     /// existing so resume() has something to find.
@@ -418,8 +398,7 @@ impl Driver {
     }
 
     /// `SessionService.Resume`. Synchronous: returns when the session is
-    /// Active again. The newly-bound sandbox_id is the one that should
-    /// appear in `nbd_sandboxes` (per ADR 0016 Phase B commit 5).
+    /// Active again.
     async fn resume(&mut self, sid: SessionId) {
         let req = app::ResumeRequest {
             session_id: sid.to_string(),
@@ -462,53 +441,6 @@ impl Driver {
             after_idx = Some(resp.next_after_idx);
         }
         out
-    }
-
-    /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
-    /// `Some(state)` when the sandbox is NBD-tracked (Phase B's chunked-disk
-    /// pipeline live), `None` when the host fell back to materialize-to-file
-    /// (no nbd.ko, no nbd_pool, etc.). Used by Phase B tests as a runtime
-    /// probe for whether the chunked-disk-driven assertions are meaningful.
-    async fn cow_state(&mut self, sid: SessionId) -> Option<app::CowStateView> {
-        let req = app::GetCowStateRequest {
-            session_id: sid.to_string(),
-        };
-        match self.sess.get_cow_state(req).await {
-            Ok(resp) => resp.into_inner().state,
-            Err(_) => None,
-        }
-    }
-
-    /// Poll cow-state until `disk_manifest_version > prior` or the deadline
-    /// elapses. Returns the new version on success, None on timeout. This is
-    /// the load-bearing end-state assertion for Phase B e2e tests: a flush
-    /// of dirty bytes — by either the FlushScheduler tick OR the admin
-    /// flush trigger — advances `disk_manifest_version`.
-    /// Wait until the session's disk lineage advances past the given
-    /// baseline. Advancement is either a version tick WITHIN the same
-    /// manifest id, or the id CHANGING entirely: the first flush of a
-    /// session restored from a shared base FORKS to a private manifest
-    /// id whose version restarts at 1 (ADR 0077 phase 2), so version
-    /// numbers are only comparable within one id — a bare
-    /// `version > prior` predicate deadlocks on the fork.
-    async fn wait_for_disk_manifest_advance(
-        &mut self,
-        sid: SessionId,
-        prior_id: &str,
-        prior_version: u64,
-        deadline: Duration,
-    ) -> Option<(String, u64)> {
-        let started = std::time::Instant::now();
-        while started.elapsed() < deadline {
-            if let Some(state) = self.cow_state(sid).await {
-                if state.disk_manifest_id != prior_id || state.disk_manifest_version > prior_version
-                {
-                    return Some((state.disk_manifest_id, state.disk_manifest_version));
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        None
     }
 
     /// `SessionService.GetSession` → the `Session` message. Black-box read:
@@ -778,13 +710,6 @@ struct ExecResult {
     exit_status: Option<i32>,
     stdout: String,
     stderr: String,
-}
-
-/// Collected result of a `FlushSession` RPC.
-#[derive(Debug)]
-struct FlushResult {
-    outcome: String,
-    manifest_version: Option<u64>,
 }
 
 /// Minimal Connect-JSON driver for orchestrator-native RPCs. These services
@@ -1390,298 +1315,6 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
     driver.delete(sid).await;
 }
 
-/// Whether this environment is REQUIRED to exercise the NBD chunked-disk
-/// path. Set `ENGRAM_EXPECT_NBD=1` on runners where NBD is known-available
-/// (Blacksmith ships `CONFIG_BLK_DEV_NBD=y` built-in; the dev VM loads
-/// `nbd.ko`) so a null `cow-state` becomes a hard failure instead of a
-/// silent skip. Unset (local macOS / VZ, any NBD-less box) keeps the
-/// graceful-degrade warning path.
-fn nbd_required() -> bool {
-    matches!(
-        std::env::var("ENGRAM_EXPECT_NBD").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
-/// ADR 0016 Phase B commit 4b: end-to-end exercise of the FlushScheduler
-/// primitive via `FleetService.FlushSession`. Explicit-trigger counterpart
-/// to the scheduler's 30s implicit cadence; the only way to verify the
-/// chunked-disk-write → `backend.flush()` → coord `update_live_disk_manifest`
-/// → PG row round-trip in CI without sleeping a full cadence. Without this
-/// test, the prod-shape chunked-disk write path silently regresses on any
-/// change to `nbd_sandboxes` wiring or the `update_live_disk_manifest` TX
-/// shape — neither covered by the in-process unit tests.
-///
-/// **Environment dependence** (per `[fc_tests_run_in_ci]`):
-///
-/// The chunked-disk write assertions only fire when the host has `nbd_pool`
-/// + `chunk_store` + `chunk_cache` wired AND a chunked-OCI demo image. On
-/// Blacksmith CI runners today, `nbd.ko` isn't in the guest kernel and the
-/// host probe falls back to materialize-to-file — `nbd_sandboxes` stays
-/// empty, `flush_sandbox` returns None for every sandbox. The test detects
-/// this via the Phase A `GetCowState` diagnostic (null state == not
-/// chunk-tracked) and skips the applied/idle assertions with a `::warning::`
-/// so the gap is visible in every run. The always-on assertions (pre-write
-/// idle + sandbox-bound success) still fire on every environment.
-///
-/// Test path:
-/// 1. Cold-create a session against the demo image.
-/// 2. **Always**: `flush_now` pre-write → assert `outcome=idle`.
-/// 3. Probe `cow-state`. If null → `::warning::` + return.
-/// 4. dd + sync into the chunked-disk-backed rootfs.
-/// 5. `flush_now` → assert the disk lineage advances.
-/// 6. Poll cow-state for the manifest-version advance.
-#[tokio::test]
-#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
-async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
-    let mut driver = Driver::from_env().await;
-    let image = Driver::image_uri();
-
-    let sid = driver.create_session_none_harness(&image).await;
-
-    // Step 2: pre-write flush. Environment-independent — the endpoint
-    // should always return idle when nothing's dirty, regardless of
-    // whether the host has NBD wired. idle here proves the RPC is wired,
-    // the session-lookup works, and `flush_sandbox` returns None cleanly.
-    let pre = driver.flush_now(sid).await;
-    assert_eq!(
-        pre.outcome, "idle",
-        "first flush before any writes should be idle; got {pre:?}",
-    );
-    assert!(
-        pre.manifest_version.is_none(),
-        "idle outcome must NOT carry a manifest_version; got {pre:?}",
-    );
-
-    // Step 3: probe whether this environment can actually exercise the
-    // chunked-disk path. `cow-state` returns Some(...) only when the
-    // sandbox is NBD-tracked. Where NBD is known-available
-    // (ENGRAM_EXPECT_NBD set), a null here is a real regression and we
-    // FAIL. Elsewhere we skip with a loud warning.
-    let cow = driver.cow_state(sid).await;
-    if cow.is_none() {
-        assert!(
-            !nbd_required(),
-            "ENGRAM_EXPECT_NBD is set but cow-state is null for session {sid}: the \
-             host-agent fell back to materialize-to-file instead of NBD-attaching the \
-             chunked disk. NBD is available on this runner, so this is a regression in \
-             the chunked-disk wiring, not an environment gap."
-        );
-        eprintln!(
-            "::warning title=Phase B flush-now e2e partial coverage::\
-             cow-state returned null for session {sid} — the runner's host-agent \
-             fell back to materialize-to-file (no nbd.ko / no nbd_pool wired). \
-             Pre-write flush=idle assertion verified the RPC wiring, but the \
-             chunked-disk write → flush → publish round-trip can't be exercised here."
-        );
-        driver.delete(sid).await;
-        return;
-    }
-
-    // Step 4: capture the baseline disk lineage (id + version) BEFORE dd.
-    // The FlushScheduler may already have ticked — or FORKED the shared
-    // base id to the session's private one — between create-session and
-    // now; whatever (id, version) it left behind is what we measure
-    // forward from.
-    let (baseline_id, baseline_version) = cow
-        .as_ref()
-        .map(|s| (s.disk_manifest_id.clone(), s.disk_manifest_version))
-        .unwrap_or_default();
-
-    // Step 5: write enough dirty bytes to materialise at least one full
-    // 16 MiB chunk in the chunked-disk dirty buffer. `/var` is writable +
-    // survives the run. `count=8` keeps the exec inside the default 30s
-    // timeout even on cold-cache CI runs. `/dev/zero` so writes dedupe
-    // cleanly across re-runs.
-    let dd = driver
-        .exec(
-            sid,
-            "dd if=/dev/zero of=/var/dirty.bin bs=1M count=8 status=none",
-        )
-        .await;
-    assert_eq!(
-        dd.exit_status,
-        Some(0),
-        "dd should succeed; stderr=<{}>",
-        dd.stderr,
-    );
-    // `sync` so the writes hit the chunked-disk backend rather than sitting
-    // in the guest page cache.
-    let sync = driver.exec(sid, "sync").await;
-    assert_eq!(sync.exit_status, Some(0), "sync should succeed");
-
-    // Step 6: force the flush via the admin trigger — best-effort. The
-    // outcome can be `applied` (dirty chunks resident) or `idle` (the
-    // FlushScheduler's 30s tick already drained the buffer). Either way,
-    // step 7's end-state check still passes — Phase B's claim is that the
-    // disk lineage advances on writes, regardless of who drained the buffer.
-    let _ = driver.flush_now(sid).await;
-
-    // Step 7: end-state assertion. Poll cow-state until the disk lineage
-    // advances past the baseline (a version tick, or the ADR 0077 fork to
-    // the session's private id). The 90-second deadline covers one full
-    // scheduler tick (30s) + generous CI slack.
-    let advanced = driver
-        .wait_for_disk_manifest_advance(
-            sid,
-            &baseline_id,
-            baseline_version,
-            Duration::from_secs(90),
-        )
-        .await;
-    assert!(
-        advanced.is_some(),
-        "disk lineage never advanced past baseline {baseline_id}@v{baseline_version} in 90s — \
-         chunked-disk publish pipeline regressed",
-    );
-    let (id_after, v_after) = advanced.unwrap();
-    assert!(
-        id_after != baseline_id || v_after > baseline_version,
-        "post-write lineage {id_after}@v{v_after} must exceed baseline \
-         {baseline_id}@v{baseline_version}",
-    );
-
-    driver.delete(sid).await;
-}
-
-/// ADR 0016 Phase B commit 5 regression: a resumed sandbox is a first-class
-/// entry in `nbd_sandboxes`, the FlushScheduler runs against it, and a
-/// subsequent flush + eviction-style snapshot succeeds.
-///
-/// Pre-commit-5 behaviour (the failure mode this test pins):
-/// - `cow-state` on the resumed session returned null (the resumed sandbox
-///   was never inserted into `nbd_sandboxes`).
-/// - A second eviction-snapshot errored with `non-canonical jail layout`
-///   because the resume path materialized to a flat file instead of
-///   rebuilding the chunked-NBD layout the snapshot pipeline expects.
-///
-/// **Environment dependence**: same cow-state-probe skip pattern as
-/// `e2e_flush_now_applies_then_short_circuits_on_no_dirty`. On Blacksmith CI
-/// without `nbd.ko`, the test runs through the flush + snapshot + evict +
-/// resume RPC surface (catches regressions in those handlers) but skips the
-/// cow-state-post-resume + flush-post-resume assertions with a loud warning.
-#[tokio::test]
-#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
-async fn e2e_resume_rejoins_chunked_disk_tracking() {
-    let mut driver = Driver::from_env().await;
-    let image = Driver::image_uri();
-
-    let sid = driver.create_session_none_harness(&image).await;
-
-    // Probe FIRST — if this environment can't exercise the NBD path, every
-    // subsequent assertion below is meaningless.
-    let pre_cow = driver.cow_state(sid).await;
-    if pre_cow.is_none() {
-        assert!(
-            !nbd_required(),
-            "ENGRAM_EXPECT_NBD is set but cow-state is null for session {sid} \
-             (pre-snapshot): the host-agent didn't NBD-attach the chunked disk. \
-             NBD is available on this runner, so this is a regression, not an \
-             environment gap."
-        );
-        eprintln!(
-            "::warning title=Phase B resume regression partial coverage::\
-             cow-state returned null for session {sid} (pre-snapshot) — runner \
-             can't exercise the NBD path. Snapshot+resume RPC wiring will still \
-             be exercised below; cow-state-post-resume + flush-post-resume \
-             assertions skipped."
-        );
-        driver.delete(sid).await;
-        return;
-    }
-
-    // Dirty the disk so the snapshot we take has a non-trivial disk_manifest
-    // the resume path can NBD-attach against.
-    let dd = driver
-        .exec(
-            sid,
-            "dd if=/dev/zero of=/var/dirty.bin bs=1M count=8 status=none",
-        )
-        .await;
-    assert_eq!(
-        dd.exit_status,
-        Some(0),
-        "dd should succeed; stderr=<{}>",
-        dd.stderr,
-    );
-    let sync = driver.exec(sid, "sync").await;
-    assert_eq!(sync.exit_status, Some(0), "sync should succeed");
-
-    // Best-effort flush via the admin trigger (the FlushScheduler may have
-    // already drained). The snapshot below re-flushes via its own
-    // backend.flush() regardless, so the chunks ARE durable in BlobStorage
-    // by the time we evict.
-    let _ = driver.flush_now(sid).await;
-
-    // Snapshot → evict-local → resume. Equivalent to the idle-eviction →
-    // resume cycle prod exercises, minus the 30-second idle wait.
-    driver.snapshot(sid).await;
-    driver.evict_local(sid).await;
-    driver.resume(sid).await;
-
-    // **THE REGRESSION CHECK**: post-resume cow-state must be Some(...).
-    // Pre-commit-5 this returned null. Post-commit-5 the resumed sandbox is
-    // in `nbd_sandboxes` → diagnostic populates.
-    let post_cow = driver.cow_state(sid).await;
-    assert!(
-        post_cow.is_some(),
-        "post-resume cow-state must be Some — commit 5 wired the resumed sandbox \
-         into nbd_sandboxes. Null here means the resume took the materialize-to-file \
-         fallback path or the NBD attach branch silently no-op'd.",
-    );
-
-    // **THE SECOND REGRESSION CHECK**: the FlushScheduler can now produce a
-    // non-trivial flush on the resumed sandbox. Capture the post-resume
-    // baseline and write a NEW file so the assertion can't be satisfied by
-    // stale state.
-    let (post_resume_baseline_id, post_resume_baseline) = post_cow
-        .as_ref()
-        .map(|s| (s.disk_manifest_id.clone(), s.disk_manifest_version))
-        .unwrap_or_default();
-
-    let post_dd = driver
-        .exec(
-            sid,
-            "dd if=/dev/zero of=/var/post-resume.bin bs=1M count=4 status=none",
-        )
-        .await;
-    assert_eq!(
-        post_dd.exit_status,
-        Some(0),
-        "post-resume dd should succeed; stderr=<{}>",
-        post_dd.stderr,
-    );
-    let post_sync = driver.exec(sid, "sync").await;
-    assert_eq!(
-        post_sync.exit_status,
-        Some(0),
-        "post-resume sync should succeed",
-    );
-
-    // Best-effort admin trigger.
-    let _ = driver.flush_now(sid).await;
-
-    // End-state assertion: the resumed sandbox's disk manifest version must
-    // advance past the post-resume baseline. Pre-commit-5 this would hang
-    // forever (resumed sandbox isn't in nbd_sandboxes).
-    let post_advanced = driver
-        .wait_for_disk_manifest_advance(
-            sid,
-            &post_resume_baseline_id,
-            post_resume_baseline,
-            Duration::from_secs(90),
-        )
-        .await;
-    assert!(
-        post_advanced.is_some(),
-        "post-resume disk lineage never advanced past baseline \
-         {post_resume_baseline_id}@v{post_resume_baseline} in 90s — \
-         the resumed sandbox isn't rejoined to chunked-disk tracking",
-    );
-
-    driver.delete(sid).await;
-}
-
 /// Lifecycle e2e: idle→active resume preserves BOTH disk and memory,
 /// proven the only way a user would see it — write through the API, run the
 /// snapshot→evict→resume cycle, read back through the API.
@@ -1690,9 +1323,9 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
 /// guarantees:
 ///
 ///   - **Disk data survives byte-identical.** A UUID sentinel written to
-///     `/var/sentinel.txt` is `cat`'d back after resume and must match. It
-///     holds on any backend (NBD-attached OR materialize-to-file), so the
-///     test does NOT gate on NBD.
+///     `/var/sentinel.txt` is `cat`'d back after resume and must match: the
+///     write reached the session's disk checkpoint and the resume restored
+///     it.
 ///   - **The kernel was memory-restored, not rebooted.**
 ///     `/proc/sys/kernel/random/boot_id` is minted once per kernel boot and
 ///     lives only in kernel memory — the FC memory snapshot captures it, a
@@ -1856,10 +1489,7 @@ async fn e2e_resume_preserves_disk_and_memory() {
 /// e2e value here is the live-image-not-deleted invariant, which the sweep
 /// assertions cover.
 ///
-/// Environment dependence: this test does NOT skip on missing NBD. The
-/// pin-set + sweep paths run against PG + BlobStorage only; session
-/// create+exec works against either NBD-attached or materialize-to-file
-/// rootfs.
+/// The pin-set + sweep paths run against PG + BlobStorage only.
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
@@ -2143,7 +1773,7 @@ async fn e2e_retire_host_relocates_and_grants() {
             !two_hosts_required(),
             "ENGRAM_EXPECT_TWO_HOSTS is set but only {} host(s) registered — the \
              two-host stack didn't come up (check ENGRAM_INTEG_TWO_HOSTS + the \
-             tilt-up-ci.sh >=2 host wait + NBD device split).",
+             tilt-up-ci.sh >=2 host wait).",
             hosts.len(),
         );
         eprintln!(
