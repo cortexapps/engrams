@@ -9,8 +9,8 @@ RUN set -eu; \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20261102T000000Z trixie main' \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20261102T000000Z trixie-security main' \
       > /etc/apt/sources.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 --error-on=any update; \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
       bash coreutils findutils ca-certificates nftables bind9-dnsutils \
       netcat-openbsd curl skopeo squashfs-tools iproute2 openssl; \
     rm -rf /var/lib/apt/lists/*; \
