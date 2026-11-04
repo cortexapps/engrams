@@ -217,6 +217,20 @@ and the site's CLI reference describe the user side.
   between phases with divergences/pitfalls, flip to `Accepted` at the end with the commit
   chain. ADRs are numbered sequentially and are the record for non-obvious decisions.
 
+**Comments**
+- **A comment states a fact a reader needs that the code does not show**: a non-obvious
+  invariant, a kernel or protocol rule the code relies on, a `SAFETY:` argument, the
+  one-line purpose of a module or a public item. Keep each one short and in the present
+  tense. Do not write how the code got here, what it replaced, what a line plainly does,
+  or which campaign or incident produced it. When a change makes a nearby comment, doc
+  comment, or clap help string inaccurate or longer than it needs to be, fix it in the
+  same change, without asking. The aim is clarity, not a smaller line count.
+- **Clean up what you pass.** Touching a struct, a function, or a file means reading its
+  neighbours too. A stale or padded comment, a mutable flag that a `match` expresses
+  better, a bug, or a poor abstraction seen on the way gets fixed in the same change,
+  not noted for later. Keep the fix in its own commit when it is not part of the
+  logical change.
+
 **Code philosophy**
 - **Clean breaks over compat shims.** Favor simple one-path code; backwards-incompatible
   changes (image re-bakes, schema changes) are acceptable. No "deprecated" stubs, no dangling
