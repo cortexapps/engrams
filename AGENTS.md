@@ -230,6 +230,24 @@ and the site's CLI reference describe the user side.
   better, a bug, or a poor abstraction seen on the way gets fixed in the same change,
   not noted for later. Keep the fix in its own commit when it is not part of the
   logical change.
+- **The pre-commit review pass is a separate step, not a side effect.** After the code
+  works and before every commit, read each touched file top to bottom as a reviewer,
+  not as the author. Look for, and fix in the same change (own commit when it is not
+  the logical change):
+  - **Comments** longer than the fact they state, or about history instead of the code.
+  - **Structure**: a function that branches on flags, repeats a neighbour, or holds more
+    than one job; a `mut` plus a flag where a `match` or an early return says it.
+  - **Abstractions**: a type or helper that exists only to shim an older shape; a seam
+    that does not match who owns the data; the same fact computed two ways in two
+    places (two definitions of "alive", two readers of one config). These are where
+    the bugs live, so treat a duplicated definition as a defect, not a style point.
+  - **Correctness**: a silent default where the input was a contract (a spec that asks
+    for swap and gets none must be an error, not `None`); a fallback that hides a
+    failure instead of returning it; an error path that releases less than the success
+    path; a state read from one source and acted on against another; an invariant the
+    code assumes and never checks.
+  Noticing these while writing is not the pass. The pass is a deliberate read with those
+  four lists in hand, and the commit message says what it turned up.
 
 **Code philosophy**
 - **Clean breaks over compat shims.** Favor simple one-path code; backwards-incompatible
