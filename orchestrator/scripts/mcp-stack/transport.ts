@@ -1,6 +1,10 @@
 import { request as httpsRequest } from "node:https";
 import { checkServerIdentity, type ConnectionOptions } from "node:tls";
-import { ConnectError, createClient, type Interceptor } from "@connectrpc/connect";
+import {
+  ConnectError,
+  createClient,
+  type Interceptor,
+} from "@connectrpc/connect";
 import {
   createConnectTransport,
   createGrpcTransport,
@@ -71,11 +75,15 @@ export async function tlsOptions(
 export async function publicClient(ctx: Context, credential: Credential) {
   const headers = credentialHeaders(credential);
   const authenticate: Interceptor = (next) => async (req) => {
-    for (const [key, value] of Object.entries(headers)) req.header.set(key, value);
+    for (const [key, value] of Object.entries(headers))
+      req.header.set(key, value);
     req.header.set("origin", ctx.endpoints.app.origin);
     const method = `${req.service.name}.${req.method.name}`;
     const remember = (error: unknown) => {
-      if (error instanceof ConnectError && /^[A-Za-z0-9_]{1,80}\.[A-Za-z0-9_]{1,80}$/.test(method))
+      if (
+        error instanceof ConnectError &&
+        /^[A-Za-z0-9_]{1,80}\.[A-Za-z0-9_]{1,80}$/.test(method)
+      )
         publicRpcMethods.set(error, method);
     };
     try {
@@ -113,6 +121,10 @@ export async function publicClient(ctx: Context, credential: Credential) {
     useBinaryFormat: true,
   });
   return {
+    uploadGuestFile: (sessionId: string, path: string, bytes: Uint8Array) =>
+      uploadGuestFile(ctx, headers, sessionId, path, bytes),
+    nonOwnerGuestFileStatus: (sessionId: string, path: string) =>
+      fileDenialStatus(ctx, headers, sessionId, path, 404),
     downloadGuestProofFile: (sessionId: string, path: string) =>
       downloadGuestProofFile(ctx, headers, sessionId, path),
     identity: createClient(ApiKeyService, transport),
@@ -174,15 +186,8 @@ async function downloadGuestProofFile(
       },
       (res) => {
         if (res.statusCode !== 200) {
-          const status = res.statusCode;
-          if (!status || !Number.isInteger(status) || status < 100 || status > 599)
-            return fail("guest_file_status");
-          const rpcCode = res.headers["x-engram-rpc-code"];
           return fail(
-            `guest_file_status_http_${status}` +
-              (typeof rpcCode === "string" && /^(?:[1-9]|1[0-6])$/.test(rpcCode)
-                ? `_rpc_code_${Number(rpcCode)}`
-                : ""),
+            fileStatusSeam(res.statusCode, res.headers["x-engram-rpc-code"]),
           );
         }
         const size = res.headers["content-length"];
@@ -217,6 +222,158 @@ async function downloadGuestProofFile(
             reject(error);
           }
         });
+      },
+    );
+    const timer = setTimeout(() => fail(), ctx.deadlines.requestMs);
+    req.on("error", () => fail());
+    req.end();
+  });
+}
+
+function fileStatusSeam(
+  status: number | undefined,
+  rpcCode: string | string[] | undefined,
+) {
+  if (!status || !Number.isInteger(status) || status < 100 || status > 599)
+    return "guest_file_status";
+  return (
+    `guest_file_status_http_${status}` +
+    (typeof rpcCode === "string" && /^(?:[1-9]|1[0-6])$/.test(rpcCode)
+      ? `_rpc_code_${Number(rpcCode)}`
+      : "")
+  );
+}
+
+/** Upload fixed bounded bytes and require the server's completed-transfer receipt. */
+async function uploadGuestFile(
+  ctx: Context,
+  headers: Record<string, string>,
+  sessionId: string,
+  path: string,
+  bytes: Uint8Array,
+): Promise<{ sizeBytes: number; sha256: string }> {
+  requireThat(bytes.length <= 1024 * 1024, "guest_file_upload_size");
+  const payload = Buffer.from(bytes);
+  const hash = sha256(payload);
+  const tls = await tlsOptions(ctx, ctx.endpoints.app);
+  const route = `/api/v1/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(path)}`;
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (detail = "guest_file_upload") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new RunnerFailure("TRANSPORT_FAILED", detail));
+      req.destroy();
+    };
+    const req = httpsRequest(
+      new URL(route, ctx.endpoints.app.origin),
+      {
+        ...tls,
+        method: "POST",
+        agent: false,
+        headers: {
+          ...headers,
+          origin: ctx.endpoints.app.origin,
+          "content-type": "application/octet-stream",
+          "content-length": String(payload.length),
+          "x-upload-size": String(payload.length),
+          "x-upload-sha256": hash,
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200)
+          return fail(
+            fileStatusSeam(res.statusCode, res.headers["x-engram-rpc-code"]),
+          );
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 65536) fail("guest_file_upload_receipt");
+          else chunks.push(chunk);
+        });
+        res.on("error", () => fail());
+        res.on("aborted", () => fail());
+        res.on("end", () => {
+          if (settled) return;
+          let value: unknown;
+          try {
+            value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            return fail("guest_file_upload_receipt");
+          }
+          if (
+            !value ||
+            typeof value !== "object" ||
+            Array.isArray(value) ||
+            Object.keys(value).sort().join(",") !== "path,sha256,size_bytes" ||
+            !("path" in value) ||
+            value.path !== path ||
+            !("size_bytes" in value) ||
+            !Number.isSafeInteger(value.size_bytes) ||
+            value.size_bytes !== payload.length ||
+            !("sha256" in value) ||
+            value.sha256 !== hash
+          )
+            return fail("guest_file_upload_receipt");
+          settled = true;
+          clearTimeout(timer);
+          resolve({ sizeBytes: payload.length, sha256: hash });
+        });
+      },
+    );
+    const timer = setTimeout(() => fail(), ctx.deadlines.requestMs);
+    req.on("error", () => fail());
+    req.end(payload);
+  });
+}
+
+/** The anonymous probe has no credential variant and only accepts a 401 response. */
+export function anonymousGuestFileStatus(
+  ctx: Context,
+  sessionId: string,
+  path: string,
+) {
+  return fileDenialStatus(ctx, {}, sessionId, path, 401);
+}
+
+/** Check guard status without reading or retaining any response body. */
+async function fileDenialStatus<S extends 401 | 404>(
+  ctx: Context,
+  headers: Record<string, string>,
+  sessionId: string,
+  path: string,
+  expected: S,
+): Promise<S> {
+  const tls = await tlsOptions(ctx, ctx.endpoints.app);
+  const route = `/api/v1/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(path)}`;
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (detail = "guest_file_denial") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new RunnerFailure("TRANSPORT_FAILED", detail));
+      req.destroy();
+    };
+    const req = httpsRequest(
+      new URL(route, ctx.endpoints.app.origin),
+      {
+        ...tls,
+        method: "GET",
+        agent: false,
+        headers: { ...headers, origin: ctx.endpoints.app.origin },
+      },
+      (res) => {
+        if (res.statusCode !== expected)
+          return fail(
+            fileStatusSeam(res.statusCode, res.headers["x-engram-rpc-code"]),
+          );
+        settled = true;
+        clearTimeout(timer);
+        res.destroy();
+        resolve(expected);
       },
     );
     const timer = setTimeout(() => fail(), ctx.deadlines.requestMs);

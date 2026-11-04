@@ -8,10 +8,21 @@ import {
   sha256,
   type Context,
 } from "./context.ts";
-import { completeAssertions, type CaseDriver } from "./driver.ts";
+import {
+  completeAssertions,
+  type CaseDriver,
+  type DriverInput,
+} from "./driver.ts";
 import { Evidence } from "./evidence.ts";
 import { canonicalJson } from "./guest.ts";
-import { REQUIRED_CASES, SCENARIOS, type ScenarioId } from "./manifest.ts";
+import { runInfrastructure } from "./infrastructure.ts";
+import {
+  FULL_MATRIX,
+  selectedCases,
+  SCENARIOS,
+  type RunSelection,
+  type ScenarioId,
+} from "./manifest.ts";
 import { DatabaseObserver } from "./observer.ts";
 import { preflight, publicPrerequisites } from "./preflight.ts";
 import { publicRpcMethod } from "./transport.ts";
@@ -44,10 +55,59 @@ export function safeFailure(error: unknown): RunnerFailure {
   return new RunnerFailure("ASSERTION_FAILED", "unexpected_runner_error");
 }
 
-/** A failed or missing case leaves an incomplete artifact and stops the matrix. */
-export async function runMatrix(ctx: Context, drivers: DriverRegistry) {
+/** Dispatch the validated selection through the same complete driver registry. */
+export async function runSelectedCases(
+  drivers: DriverRegistry,
+  selection: RunSelection,
+  input: Omit<DriverInput, "harness">,
+  evidence: Evidence,
+) {
   validateDrivers(drivers);
-  const evidence = await Evidence.create(ctx);
+  for (const selected of selectedCases(selection)) {
+    try {
+      const assertions = completeAssertions(
+        selected.id,
+        await drivers[selected.id]({
+          ...input,
+          harness: selected.harness,
+        }),
+      );
+      const recorded = [];
+      for (const assertion of assertions) {
+        const observationHashes = [];
+        for (const observation of assertion.observations)
+          observationHashes.push(
+            await evidence.observe({ ...observation, caseKey: selected.key }),
+          );
+        recorded.push({ assertion: assertion.assertion, observationHashes });
+      }
+      await evidence.result({
+        key: selected.key,
+        status: "PASS",
+        assertions: recorded,
+      });
+    } catch (error) {
+      const failure = safeFailure(error);
+      await evidence.result({
+        key: selected.key,
+        status: failure.code === "NEEDS_CONTEXT" ? "NEEDS_CONTEXT" : "FAIL",
+        assertions: [],
+        seam: failure.seam,
+      });
+      throw failure;
+    }
+  }
+}
+
+/** A failed or missing case leaves an incomplete artifact and stops the matrix. */
+export async function runMatrix(
+  ctx: Context,
+  drivers: DriverRegistry,
+  selection: RunSelection = FULL_MATRIX,
+) {
+  selectedCases(selection);
+  validateDrivers(drivers);
+  const evidence = await Evidence.create(ctx, selection);
   let database: DatabaseObserver | undefined;
   try {
     database = await DatabaseObserver.connect(ctx);
@@ -60,42 +120,15 @@ export async function runMatrix(ctx: Context, drivers: DriverRegistry) {
       publicationSha256: sha256(canonicalJson(publication)),
       publicStateSha256: sha256(canonicalJson(ready)),
     });
-    for (const selected of REQUIRED_CASES) {
-      try {
-        const assertions = completeAssertions(
-          selected.id,
-          await drivers[selected.id]({
-            ctx,
-            principals,
-            database,
-            harness: selected.harness,
-          }),
-        );
-        const recorded = [];
-        for (const assertion of assertions) {
-          const observationHashes = [];
-          for (const observation of assertion.observations)
-            observationHashes.push(
-              await evidence.observe({ ...observation, caseKey: selected.key }),
-            );
-          recorded.push({ assertion: assertion.assertion, observationHashes });
-        }
-        await evidence.result({
-          key: selected.key,
-          status: "PASS",
-          assertions: recorded,
-        });
-      } catch (error) {
-        const failure = safeFailure(error);
-        await evidence.result({
-          key: selected.key,
-          status: failure.code === "NEEDS_CONTEXT" ? "NEEDS_CONTEXT" : "FAIL",
-          assertions: [],
-          seam: failure.seam,
-        });
-        throw failure;
-      }
-    }
+    await evidence.infrastructure(
+      await runInfrastructure(ctx, principals, database),
+    );
+    await runSelectedCases(
+      drivers,
+      selection,
+      { ctx, principals, database },
+      evidence,
+    );
     await evidence.finish();
   } finally {
     const results = await Promise.allSettled([
@@ -125,12 +158,23 @@ export async function main(drivers: DriverRegistry, args: readonly string[]) {
     const remaining = ctx.deadlines.totalMs - (performance.now() - begun);
     requireThat(remaining > 0, "runner_context_deadline");
     watchdog = setTimeout(expired, remaining);
-    await runMatrix(ctx, drivers);
+    await runMatrix(ctx, drivers, selected.selection);
     process.stdout.write(
       JSON.stringify({
         status: "PASS",
         selected: selected.selected.length,
-        passed: REQUIRED_CASES.length,
+        passed: selected.selected.length,
+        ...selected.selection,
+        stageCompleted: !(
+          selected.selection.stage === "matrix" &&
+          selected.selection.matrix === "all"
+        ),
+        matrixCompleted:
+          selected.selection.stage === "matrix" &&
+          selected.selection.matrix === "all",
+        physicalAcceptance:
+          selected.selection.stage === "matrix" &&
+          selected.selection.matrix === "all",
         evidenceFile: ctx.evidenceFile,
       }) + "\n",
     );

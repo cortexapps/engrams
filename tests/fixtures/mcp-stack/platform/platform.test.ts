@@ -326,13 +326,28 @@ test("VZ entitlement verifies first and converts explicit XML through bounded co
   const calls: Parameters<typeof command>[] = [];
   const runCommand: typeof command = async (...args) => {
     calls.push(args);
-    return Buffer.from(["", xml, '{"com.apple.security.virtualization":true}'][calls.length - 1]!);
+    return Buffer.from(
+      ["", xml, '{"com.apple.security.virtualization":true}'][
+        calls.length - 1
+      ]!,
+    );
   };
   await validateVzEntitlement(hostAgent, env, runCommand);
   expect(calls).toEqual([
     ["/usr/bin/codesign", ["--verify", "--strict", hostAgent], REPO, env],
-    ["/usr/bin/codesign", ["--display", "--entitlements", "-", "--xml", hostAgent], REPO, env],
-    ["/usr/bin/plutil", ["-convert", "json", "-o", "-", "--", "-"], REPO, env, xml],
+    [
+      "/usr/bin/codesign",
+      ["--display", "--entitlements", "-", "--xml", hostAgent],
+      REPO,
+      env,
+    ],
+    [
+      "/usr/bin/plutil",
+      ["-convert", "json", "-o", "-", "--", "-"],
+      REPO,
+      env,
+      xml,
+    ],
   ]);
   for (const call of calls) expect(call[3]).toBe(env);
 });
@@ -354,11 +369,17 @@ for (const [kind, json] of [
       calls++;
       // A true XML-looking fragment must not bypass the OS conversion result.
       return Buffer.from(
-        calls === 3 ? json : "<key>com.apple.security.virtualization</key><true/>",
+        calls === 3
+          ? json
+          : "<key>com.apple.security.virtualization</key><true/>",
       );
     };
     await expect(
-      validateVzEntitlement("/owned/host-agent", childEnvironment(root), runCommand),
+      validateVzEntitlement(
+        "/owned/host-agent",
+        childEnvironment(root),
+        runCommand,
+      ),
     ).rejects.toThrow("INVALID_CONTEXT:vz_entitlement");
     expect(calls).toBe(3);
   });
@@ -372,7 +393,11 @@ for (const step of [1, 2, 3]) {
       return Buffer.from("<key>com.apple.security.virtualization</key><true/>");
     };
     await expect(
-      validateVzEntitlement("/owned/host-agent", childEnvironment(root), runCommand),
+      validateVzEntitlement(
+        "/owned/host-agent",
+        childEnvironment(root),
+        runCommand,
+      ),
     ).rejects.toBe(failure);
     expect(calls).toBe(step);
   });
@@ -1219,9 +1244,8 @@ test("FC executable prerequisites reject invalid headers, architecture, platform
 });
 
 test("FC whole-module inventory rejects invalid counts and uses kernel device numbers and process birth", async () => {
-  const { nbdCount, linuxDevice, procBirth, FcRuntime } = await import(
-    "./fc-runtime.ts"
-  );
+  const { nbdCount, linuxDevice, procBirth, FcRuntime } =
+    await import("./fc-runtime.ts");
   expect(nbdCount("1\n")).toBe(1);
   expect(nbdCount("4096\n")).toBe(4096);
   for (const count of [
@@ -1269,20 +1293,28 @@ test("FC whole-module inventory rejects invalid counts and uses kernel device nu
 test("guest enable accepts an unobserved queued digest and verifies the ready image", async () => {
   const { create } =
     await import("../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js");
-  const { EnableImageResponseSchema, GetEnableJobResponseSchema, ListEnabledImagesResponseSchema } =
+  const {
+    EnableImageResponseSchema,
+    GetEnableJobResponseSchema,
+    ListEnabledImagesResponseSchema,
+  } =
     await import("../../../../orchestrator/src/gen/engram/app/v1/image_pb.ts");
   const { GetHostResponseSchema } =
     await import("../../../../orchestrator/src/gen/engram/app/v1/fleet_pb.ts");
   const { WhoAmIResponseSchema } =
     await import("../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts");
-  const transport = await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
+  const transport =
+    await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
   const { enableGuest } = await import("./main.ts");
   const directory = await mkdtemp(join(root, "enable-identity-"));
   const inputs = input();
   const opensslPath = await realpath(
     process.env.MCP_PLATFORM_TEST_OPENSSL ?? Bun.which("openssl") ?? "openssl",
   );
-  inputs.binaries.openssl = { path: opensslPath, sha256: hash(await readFile(opensslPath)) };
+  inputs.binaries.openssl = {
+    path: opensslPath,
+    sha256: hash(await readFile(opensslPath)),
+  };
   const identity = await generateIdentity(inputs, directory);
   const expectedDigest = `sha256:${"d".repeat(64)}`;
   const wrongDigest = `sha256:${"e".repeat(64)}`;
@@ -1363,9 +1395,14 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
   ]) {
     const ctx = await context();
     ctx.runRoot = dirname(ctx.endpoints.app.ca.path);
-    const admin = await transport.publicClient(ctx, { kind: "cookie", value: "fixture=cookie" });
+    const admin = await transport.publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture=cookie",
+    });
     const responses = [
-      create(GetEnableJobResponseSchema, { job: { id: "job-1", state: "materializing" } }),
+      create(GetEnableJobResponseSchema, {
+        job: { id: "job-1", state: "materializing" },
+      }),
       create(GetEnableJobResponseSchema, {
         job: {
           id: "job-1",
@@ -1406,7 +1443,11 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       ),
       spyOn(admin.images, "enableImage").mockResolvedValue(
         create(EnableImageResponseSchema, {
-          job: { id: scenario.id, state: "pending", manifestDigest: scenario.queuedDigest },
+          job: {
+            id: scenario.id,
+            state: "pending",
+            manifestDigest: scenario.queuedDigest,
+          },
         }),
       ),
       spyOn(admin.images, "getEnableJob").mockImplementation(async () => {
@@ -1416,7 +1457,13 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       }),
       spyOn(admin.images, "listEnabledImages").mockResolvedValue(
         create(ListEnabledImagesResponseSchema, {
-          images: [{ id: "enabled-1", imageUri: uri, manifestDigest: scenario.catalogDigest }],
+          images: [
+            {
+              id: "enabled-1",
+              imageUri: uri,
+              manifestDigest: scenario.catalogDigest,
+            },
+          ],
         }),
       ),
     ];
@@ -1424,11 +1471,18 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       const enabling = enableGuest(ctx, identity, uri, expectedDigest);
       if (scenario.error) {
         await expect(enabling, scenario.name).rejects.toThrow(scenario.error);
-        await expect(readFile(join(ctx.runRoot, "enable-observation.json"))).rejects.toThrow();
+        await expect(
+          readFile(join(ctx.runRoot, "enable-observation.json")),
+        ).rejects.toThrow();
       } else {
         await enabling;
         expect(
-          JSON.parse(await readFile(join(ctx.runRoot, "enable-observation.json"), "utf8")),
+          JSON.parse(
+            await readFile(
+              join(ctx.runRoot, "enable-observation.json"),
+              "utf8",
+            ),
+          ),
         ).toMatchObject({
           jobId: "job-1",
           imageId: "enabled-1",
@@ -1443,4 +1497,33 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       for (const spy of spies) spy.mockRestore();
     }
   }
+});
+
+test("platform validates stage selectors before resource creation and defaults to all", async () => {
+  const base = [
+    "--backend",
+    "vz",
+    "--run-root",
+    "/private/run",
+    "--artifacts",
+    "/private/input",
+  ];
+  expect(cli(base).selection).toEqual({ stage: "matrix", matrix: "all" });
+  expect(cli([...base, "--stage", "infrastructure"]).selection).toEqual({
+    stage: "infrastructure",
+  });
+  const { REQUIRED_CASES } =
+    await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+  expect(cli([...base, "--matrix", REQUIRED_CASES[0]!.key]).selection).toEqual({
+    stage: "matrix",
+    matrix: REQUIRED_CASES[0]!.key,
+  });
+  for (const extra of [
+    ["--stage", "unknown"],
+    ["--matrix", ""],
+    ["--matrix", "unknown"],
+    ["--matrix", `${REQUIRED_CASES[0]!.key},${REQUIRED_CASES[0]!.key}`],
+    ["--stage", "infrastructure", "--matrix", "all"],
+  ])
+    expect(() => cli([...base, ...extra])).toThrow();
 });

@@ -531,21 +531,83 @@ else:
                           if call[0] != 'docker' or call[5] != 'info']
                 self.assertEqual(actual, operations[:index + 1])
 
+    def test_prepare_dispatch_pins_inputs_without_adapter_or_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = object.__new__(assets.Producer)
+            p.root, p.backend, p.head = Path(directory), 'vz', 'a' * 40
+            p.env, p.files = {}, p.root
+            path = p.root / 'inputs.json'
+            path.write_text('{"version":1}')
+            def forbidden(*args, **kwargs):
+                self.fail('preparation must not dispatch an adapter or inspect a matrix')
+            p.call = forbidden
+            with patch.object(assets, 'matrix_result', forbidden):
+                self.assertEqual(p.dispatch(prepare_only=True), 0)
+            receipt = json.loads((p.root / 'assets-prepared.json').read_bytes())
+            self.assertEqual(receipt['kind'], 'assets-prepared')
+            self.assertFalse(receipt['physicalAcceptance'])
+            self.assertFalse(receipt['matrixCompleted'])
+            self.assertEqual(receipt['inputs']['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+            self.assertFalse(getattr(p, 'adapter_started', False))
+            self.assertEqual(assets.prepared_result(p.root, 'vz', p.head), 0)
+            path.chmod(0o600)
+            path.write_text('changed')
+            with self.assertRaises(RuntimeError):
+                assets.prepared_result(p.root, 'vz', p.head)
+
+    def test_private_preparation_propagates_mode_and_verifies_nested_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = object.__new__(assets.Producer)
+            p.root, p.backend, p.operator_path = Path(directory), 'vz', '/owned/operator.json'
+            p.env = {'PATH': '/usr/bin:/bin'}
+            p.private_checkout = lambda source: (assets.REPO, 'a' * 40)
+            calls = []
+            def call(argv, **kwargs):
+                calls.append((list(map(str, argv)), kwargs))
+                nested = object.__new__(assets.Producer)
+                nested.root, nested.backend, nested.head = p.root / 'execution', p.backend, 'a' * 40
+                nested.root.mkdir()
+                (nested.root / 'inputs.json').write_text('{"version":1}')
+                nested.dispatch(prepare_only=True)
+            p.call = call
+            self.assertEqual(p.run_private_checkout(prepare_only=True), 0)
+            argv, kwargs = calls[0]
+            self.assertEqual(argv[-2:], ['--private-checkout', '--prepare-only'])
+            self.assertEqual(kwargs['grace'], 240)
+            self.assertTrue(p.nested_started)
+            self.assertFalse((p.root / 'execution/run').exists())
+
+    def test_prepared_and_filtered_receipts_cannot_satisfy_matrix_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'completion-1.json').write_text(json.dumps({
+                'backend':'vz','sourceCommit':'a' * 40,'matrixCompleted':True,
+                'matrix':'all','physicalAcceptance':True,'stageCompleted':False,'cleanupFailed':[]}))
+            for receipt in [
+                {'status':'ASSETS_PREPARED','selected':0,'passed':0,'physicalAcceptance':False},
+                {'status':'PASS','selected':24,'passed':24,'matrix':'claude/catalog-fidelity','stageCompleted':True,'matrixCompleted':False,'physicalAcceptance':False},
+                {'status':'PASS','selected':24,'passed':24,'matrix':'all','stageCompleted':True,'matrixCompleted':True,'physicalAcceptance':True},
+            ]:
+                (root / 'matrix.log').write_text(json.dumps(receipt) + '\n')
+                with self.assertRaises(RuntimeError):
+                    assets.matrix_result(root, 'vz', 'a' * 40)
+
     def test_matrix_requires_actual_nonzero_output_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             completion = {'backend': 'vz', 'sourceCommit': 'a' * 40,
-                          'matrixCompleted': True, 'cleanupFailed': []}
+                          'matrixCompleted': True, 'physicalAcceptance': True, 'stageCompleted': False, 'matrix': 'all', 'cleanupFailed': []}
             (root / 'completion-1.json').write_text(json.dumps(completion))
             for passed, selected, ok in [(24, 24, True), (0, 0, False), (23, 24, False), (24, 0, False)]:
-                (root / 'matrix.log').write_text(json.dumps({'status': 'PASS', 'selected': selected, 'passed': passed}) + '\n')
+                (root / 'matrix.log').write_text(json.dumps({'status': 'PASS', 'selected': selected, 'passed': passed, 'matrix': 'all', 'physicalAcceptance': True, 'matrixCompleted': True}) + '\n')
                 if ok:
                     self.assertEqual(assets.matrix_result(root, 'vz', 'a' * 40), 24)
                 else:
                     with self.assertRaises(RuntimeError):
                         assets.matrix_result(root, 'vz', 'a' * 40)
-            (root / 'matrix.log').write_text('{"status":"PASS","selected":24,"passed":24}\n')
-            for field, value in [('matrixCompleted', False), ('cleanupFailed', ['host']), ('sourceCommit', 'b' * 40)]:
+            (root / 'matrix.log').write_text(json.dumps({'status':'PASS','selected':24,'passed':24,'matrix':'all','physicalAcceptance':True,'matrixCompleted':True}) + '\n')
+            for field, value in [('matrixCompleted', False), ('matrix', 'claude/catalog-fidelity'), ('stageCompleted', True), ('physicalAcceptance', False), ('cleanupFailed', ['host']), ('sourceCommit', 'b' * 40)]:
                 (root / 'completion-1.json').write_text(json.dumps({**completion, field: value}))
                 with self.assertRaises(RuntimeError):
                     assets.matrix_result(root, 'vz', 'a' * 40)

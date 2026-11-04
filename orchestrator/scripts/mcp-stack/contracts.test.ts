@@ -1,5 +1,12 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { chmod, mkdtemp, writeFile, symlink, rm, readFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  writeFile,
+  symlink,
+  rm,
+  readFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:https";
 import { X509Certificate } from "node:crypto";
@@ -177,7 +184,7 @@ test("manifest has exactly twelve cases for each real harness", () => {
     expect(REQUIRED_CASES.filter((c) => c.harness === harness)).toHaveLength(
       12,
     );
-  expect(() => selectMatrix("claude")).toThrow("matrix_all_required");
+  expect(() => selectMatrix("claude")).toThrow("matrix_selection");
 });
 test("preflight rejects incomplete fixed controls before publication or signup", () => {
   const ctx = ContextSchema.parse(validContext());
@@ -229,6 +236,19 @@ test("CLI requires an explicit private context and complete matrix", () => {
     ["--context", "/owned/context.json", "--key", "secret"],
   ])
     expect(() => parseArgs(args)).toThrow();
+});
+test("CLI rejects a present empty stage while retaining the full default", () => {
+  expect(() =>
+    parseArgs(["--context", "/owned/context.json", "--stage", ""]),
+  ).toThrow("arguments");
+  expect(parseArgs(["--context", "/owned/context.json"]).selection).toEqual({
+    stage: "matrix",
+    matrix: "all",
+  });
+  expect(
+    parseArgs(["--context", "/owned/context.json", "--matrix", "all"])
+      .selection,
+  ).toEqual({ stage: "matrix", matrix: "all" });
 });
 test("zero and missing case results fail", () => {
   expect(() => verifyResults([])).toThrow();
@@ -620,9 +640,8 @@ test("native barrier and absent denial records cannot masquerade as result recei
 });
 
 test("grant replacement preserves public profile state and exact publication CAS", async () => {
-  const { ProfileSchema, UpdateProfileRequestSchema } = await import(
-    "../../src/gen/engram/app/v1/profile_pb.ts"
-  );
+  const { ProfileSchema, UpdateProfileRequestSchema } =
+    await import("../../src/gen/engram/app/v1/profile_pb.ts");
   const { grantUpdateRequest } = await import("./rebind.ts");
   const profile = create(ProfileSchema, {
     id: "profile-1",
@@ -704,7 +723,19 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
   await chmod(certPath, 0o600);
   const cert = await readFile(certPath);
   const bytes = Buffer.from('{"callId":"proof"}\n');
-  const requests: { url: string; cookie?: string; apiKey?: string; origin?: string }[] = [];
+  const requests: {
+    url: string;
+    cookie?: string;
+    apiKey?: string;
+    origin?: string;
+  }[] = [];
+  const uploads: {
+    bytes: Buffer;
+    size?: string;
+    hash?: string;
+    contentType?: string;
+  }[] = [];
+  let receipt: unknown;
   let status = 200;
   let rpcCode: string | string[] | undefined;
   const secret = "private-file-response-token";
@@ -713,28 +744,62 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
   let hash = sha256(body);
   let stall = false;
   let chunked = false;
-  const server = createServer({ key: await readFile(keyPath), cert }, (req, res) => {
-    requests.push({
-      url: req.url ?? "",
-      cookie: req.headers.cookie,
-      apiKey: req.headers["x-api-key"]?.toString(),
-      origin: req.headers.origin,
-    });
-    if (stall) return;
-    res.writeHead(status, {
-      "content-type": "application/octet-stream",
-      ...(chunked ? {} : { "content-length": size }),
-      "x-content-sha256": hash,
-      "x-private": secret,
-      ...(rpcCode === undefined ? {} : { "x-engram-rpc-code": rpcCode }),
-      ...(status === 302 ? { location: "/redirect-target" } : {}),
-    });
-    res.end(body);
-  });
+  const server = createServer(
+    { key: await readFile(keyPath), cert },
+    (req, res) => {
+      requests.push({
+        url: req.url ?? "",
+        cookie: req.headers.cookie,
+        apiKey: req.headers["x-api-key"]?.toString(),
+        origin: req.headers.origin,
+      });
+      if (stall) return;
+      if (req.method === "POST") {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          const uploaded = Buffer.concat(chunks);
+          uploads.push({
+            bytes: uploaded,
+            size: req.headers["x-upload-size"]?.toString(),
+            hash: req.headers["x-upload-sha256"]?.toString(),
+            contentType: req.headers["content-type"],
+          });
+          res.writeHead(status, {
+            "content-type": "application/json",
+            ...(rpcCode === undefined ? {} : { "x-engram-rpc-code": rpcCode }),
+            ...(status === 302 ? { location: "/redirect-target" } : {}),
+          });
+          res.end(
+            JSON.stringify(
+              receipt ?? {
+                path: new URL(req.url!, "https://localhost").searchParams.get(
+                  "path",
+                ),
+                size_bytes: uploaded.length,
+                sha256: sha256(uploaded),
+              },
+            ),
+          );
+        });
+        return;
+      }
+      res.writeHead(status, {
+        "content-type": "application/octet-stream",
+        ...(chunked ? {} : { "content-length": size }),
+        "x-content-sha256": hash,
+        "x-private": secret,
+        ...(rpcCode === undefined ? {} : { "x-engram-rpc-code": rpcCode }),
+        ...(status === 302 ? { location: "/redirect-target" } : {}),
+      });
+      res.end(body);
+    },
+  );
   await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
   try {
     const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server_address");
+    if (!address || typeof address === "string")
+      throw new Error("server_address");
     const ctx = ContextSchema.parse(validContext());
     ctx.runRoot = root;
     ctx.endpoints.app = {
@@ -749,7 +814,9 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
       { kind: "api-key" as const, value: "engk_owner" },
     ]) {
       const client = await publicClient(ctx, credential);
-      expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(bytes);
+      expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(
+        bytes,
+      );
       expect(requests.at(-1)).toEqual({
         url: "/api/v1/sessions/owned-session/files?path=%2Ftmp%2Fmcp-stack-fixture%2Fproof.json",
         cookie: credential.kind === "cookie" ? credential.value : undefined,
@@ -757,7 +824,102 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
         origin: ctx.endpoints.app.origin,
       });
     }
-    const client = await publicClient(ctx, { kind: "cookie", value: "fixture_session=owner" });
+    const fixture = Buffer.alloc(4096, 65);
+    for (const credential of [
+      { kind: "cookie" as const, value: "fixture_session=owner" },
+      { kind: "api-key" as const, value: "engk_owner" },
+    ]) {
+      const uploader = await publicClient(ctx, credential);
+      expect(
+        await uploader.uploadGuestFile("owned-session", path, fixture),
+      ).toEqual({ sizeBytes: 4096, sha256: sha256(fixture) });
+      expect(uploads.at(-1)).toEqual({
+        bytes: fixture,
+        size: "4096",
+        hash: sha256(fixture),
+        contentType: "application/octet-stream",
+      });
+      expect(requests.at(-1)).toMatchObject({
+        cookie: credential.kind === "cookie" ? credential.value : undefined,
+        apiKey: credential.kind === "api-key" ? credential.value : undefined,
+        origin: ctx.endpoints.app.origin,
+      });
+    }
+    const client = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture_session=owner",
+    });
+    for (receipt of [
+      {},
+      { path, size_bytes: 4095, sha256: sha256(fixture) },
+      { path, size_bytes: 4096, sha256: "0".repeat(64) },
+      { path: path + "wrong", size_bytes: 4096, sha256: sha256(fixture) },
+      { path, size_bytes: 4096, sha256: sha256(fixture), extra: secret },
+      secret.repeat(65536),
+    ]) {
+      await expect(
+        client.uploadGuestFile("owned-session", path, fixture),
+      ).rejects.toThrow("guest_file_upload_receipt");
+    }
+    receipt = undefined;
+    const beforeOversize = requests.length;
+    await expect(
+      client.uploadGuestFile(
+        "owned-session",
+        path,
+        Buffer.alloc(1024 * 1024 + 1),
+      ),
+    ).rejects.toThrow("guest_file_upload_size");
+    expect(requests.length).toBe(beforeOversize);
+    const { anonymousGuestFileStatus } = await import("./transport.ts");
+    status = 401;
+    expect(await anonymousGuestFileStatus(ctx, "owned-session", path)).toBe(
+      401,
+    );
+    expect(requests.at(-1)).toMatchObject({
+      cookie: undefined,
+      apiKey: undefined,
+      origin: ctx.endpoints.app.origin,
+    });
+    status = 404;
+    const nonOwner = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture_session=other",
+    });
+    expect(await nonOwner.nonOwnerGuestFileStatus("owned-session", path)).toBe(
+      404,
+    );
+    expect(requests.at(-1)?.cookie).toBe("fixture_session=other");
+    status = 200;
+    await expect(
+      anonymousGuestFileStatus(ctx, "owned-session", path),
+    ).rejects.toThrow("guest_file_status_http_200");
+    status = 400;
+    rpcCode = "3";
+    for (const action of [
+      () => client.uploadGuestFile("owned-session", path, fixture),
+      () => anonymousGuestFileStatus(ctx, "owned-session", path),
+      () => nonOwner.nonOwnerGuestFileStatus("owned-session", path),
+    ]) {
+      const before = requests.length;
+      await expect(action()).rejects.toMatchObject({
+        code: "TRANSPORT_FAILED",
+        seam: "guest_file_status_http_400_rpc_code_3",
+      });
+      expect(requests.length).toBe(before + 1);
+    }
+    status = 302;
+    rpcCode = undefined;
+    const beforeRedirect = requests.length;
+    await expect(
+      client.uploadGuestFile("owned-session", path, fixture),
+    ).rejects.toThrow("guest_file_status_http_302");
+    await expect(
+      anonymousGuestFileStatus(ctx, "owned-session", path),
+    ).rejects.toThrow("guest_file_status_http_302");
+    expect(requests.length).toBe(beforeRedirect + 2);
+    status = 200;
+
     for (const invalid of [
       "../proof",
       path + "/child",
@@ -767,15 +929,17 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
       path + "\n",
     ]) {
       const before = requests.length;
-      await expect(readGuestFile(ctx, client, "owned-session", invalid)).rejects.toThrow(
-        "guest_proof_path",
-      );
+      await expect(
+        readGuestFile(ctx, client, "owned-session", invalid),
+      ).rejects.toThrow("guest_proof_path");
       expect(requests.length).toBe(before);
     }
     for (const denied of [401, 403, 404, 302]) {
       status = denied;
       const before = requests.length;
-      await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toMatchObject({
+      await expect(
+        readGuestFile(ctx, client, "owned-session", path),
+      ).rejects.toMatchObject({
         code: "TRANSPORT_FAILED",
         seam: `guest_file_status_http_${denied}`,
       });
@@ -802,24 +966,34 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
     ];
     for (const [header, seam] of fileErrors) {
       rpcCode = header;
-      let failure: unknown;
-      try {
-        await readGuestFile(ctx, client, "owned-session", path);
-      } catch (error) {
-        failure = error;
+      for (const action of [
+        () => readGuestFile(ctx, client, "owned-session", path),
+        () => client.uploadGuestFile("owned-session", path, fixture),
+        () => anonymousGuestFileStatus(ctx, "owned-session", path),
+        () => nonOwner.nonOwnerGuestFileStatus("owned-session", path),
+      ]) {
+        let failure: unknown;
+        try {
+          await action();
+        } catch (error) {
+          failure = error;
+        }
+        expect(failure).toBeInstanceOf(RunnerFailure);
+        if (!(failure instanceof RunnerFailure))
+          throw new Error("expected_runner_failure");
+        expect(failure.code).toBe("TRANSPORT_FAILED");
+        expect(failure.seam).toBe(seam);
+        expect(failure.message).toBe(`TRANSPORT_FAILED:${seam}`);
+        expect(Object.keys(failure).sort()).toEqual(["code", "seam"]);
+        expect(JSON.stringify(safeFailure(failure))).not.toContain(secret);
+        expect(failure.stack).not.toContain(secret);
       }
-      expect(failure).toBeInstanceOf(RunnerFailure);
-      if (!(failure instanceof RunnerFailure)) throw new Error("expected_runner_failure");
-      expect(failure.code).toBe("TRANSPORT_FAILED");
-      expect(failure.seam).toBe(seam);
-      expect(failure.message).toBe(`TRANSPORT_FAILED:${seam}`);
-      expect(Object.keys(failure).sort()).toEqual(["code", "seam"]);
-      expect(JSON.stringify(safeFailure(failure))).not.toContain(secret);
-      expect(failure.stack).not.toContain(secret);
     }
     status = 600;
     rpcCode = "9";
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toMatchObject({
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toMatchObject({
       code: "TRANSPORT_FAILED",
       seam: "guest_file_status",
     });
@@ -827,53 +1001,73 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
     body = bytes;
     size = String(bytes.length);
     // Success uses file metadata and bytes, regardless of an error diagnostic header.
-    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(bytes);
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(
+      bytes,
+    );
     rpcCode = undefined;
     const pin = ctx.endpoints.app.serverFingerprint;
     ctx.endpoints.app.serverFingerprint = Array(32).fill("00").join(":");
     const beforeBadPin = requests.length;
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_download",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_download");
+    await expect(
+      client.uploadGuestFile("owned-session", path, fixture),
+    ).rejects.toThrow("guest_file_upload");
+    await expect(
+      anonymousGuestFileStatus(ctx, "owned-session", path),
+    ).rejects.toThrow("guest_file_denial");
     expect(requests.length).toBe(beforeBadPin);
     ctx.endpoints.app.serverFingerprint = pin;
     size = String(bytes.length + 1);
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_download",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_download");
     size = String(bytes.length);
     hash = "invalid";
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_metadata",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_metadata");
     hash = "0".repeat(64);
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_integrity",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_integrity");
     hash = sha256(bytes);
     size = String(1024 * 1024 + 1);
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_metadata",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_metadata");
     chunked = true;
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_metadata",
-    );
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_metadata");
     chunked = false;
     body = Buffer.alloc(1024 * 1024, 65);
     hash = sha256(body);
     size = String(body.length);
-    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(body);
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(
+      body,
+    );
     body = Buffer.alloc(0);
     hash = sha256(body);
     size = "0";
-    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(body);
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(
+      body,
+    );
     ctx.deadlines.requestMs = 50;
     stall = true;
-    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-      "guest_file_download",
-    );
-    expect(requests.every((request) => request.url.startsWith("/api/v1/sessions/"))).toBe(true);
+    await expect(
+      client.uploadGuestFile("owned-session", path, fixture),
+    ).rejects.toThrow("guest_file_upload");
+    await expect(
+      anonymousGuestFileStatus(ctx, "owned-session", path),
+    ).rejects.toThrow("guest_file_denial");
+    await expect(
+      readGuestFile(ctx, client, "owned-session", path),
+    ).rejects.toThrow("guest_file_download");
+    expect(
+      requests.every((request) => request.url.startsWith("/api/v1/sessions/")),
+    ).toBe(true);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
@@ -881,7 +1075,6 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
     );
   }
 });
-
 
 test("public RPC diagnostics retain descriptor methods and keep error data private", async () => {
   const keyPath = join(root, "rpc-method.key");
@@ -922,32 +1115,41 @@ test("public RPC diagnostics retain descriptor methods and keep error data priva
   const first = create(ExecOutputSchema, {
     event: { case: "started", value: { execId: "exec-fixed" } },
   });
-  const server = createServer({ key: await readFile(keyPath), cert }, (req, res) => {
-    if (req.url === "/rpc/engram.app.v1.IntegrationService/DiscoverMcp") {
-      res.writeHead(400, { "content-type": "application/json", "x-private": secret });
-      res.end(JSON.stringify(errorBody));
-    } else if (req.url === "/rpc/engram.app.v1.SessionService/Exec") {
-      res.writeHead(200, { "content-type": "application/connect+proto" });
-      res.write(envelope(0, toBinary(ExecOutputSchema, first)));
-      res.end(
-        envelope(
-          2,
-          Buffer.from(
-            JSON.stringify(
-              streamFailure ? { error: errorBody, metadata: { "x-private": [secret] } } : {},
+  const server = createServer(
+    { key: await readFile(keyPath), cert },
+    (req, res) => {
+      if (req.url === "/rpc/engram.app.v1.IntegrationService/DiscoverMcp") {
+        res.writeHead(400, {
+          "content-type": "application/json",
+          "x-private": secret,
+        });
+        res.end(JSON.stringify(errorBody));
+      } else if (req.url === "/rpc/engram.app.v1.SessionService/Exec") {
+        res.writeHead(200, { "content-type": "application/connect+proto" });
+        res.write(envelope(0, toBinary(ExecOutputSchema, first)));
+        res.end(
+          envelope(
+            2,
+            Buffer.from(
+              JSON.stringify(
+                streamFailure
+                  ? { error: errorBody, metadata: { "x-private": [secret] } }
+                  : {},
+              ),
             ),
           ),
-        ),
-      );
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
+        );
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    },
+  );
   await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
   try {
     const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server_address");
+    if (!address || typeof address === "string")
+      throw new Error("server_address");
     const ctx = ContextSchema.parse(validContext());
     ctx.runRoot = root;
     ctx.endpoints.app = {
@@ -966,24 +1168,30 @@ test("public RPC diagnostics retain descriptor methods and keep error data priva
       original = error;
     }
     expect(original).toBeInstanceOf(ConnectError);
-    if (!(original instanceof ConnectError)) throw new Error("expected_connect_error");
+    if (!(original instanceof ConnectError))
+      throw new Error("expected_connect_error");
     expect(original.code).toBe(Code.FailedPrecondition);
     expect(original.rawMessage).toBe(secret);
     expect(original.metadata.get("x-private")).toBe(secret);
-    expect(await expectRejected(() => Promise.reject(original), [Code.FailedPrecondition])).toBe(
-      Code.FailedPrecondition,
-    );
+    expect(
+      await expectRejected(
+        () => Promise.reject(original),
+        [Code.FailedPrecondition],
+      ),
+    ).toBe(Code.FailedPrecondition);
     const failure = safeFailure(original);
-    expect(failure.seam).toBe("public_rpc_IntegrationService.DiscoverMcp_code_9");
+    expect(failure.seam).toBe(
+      "public_rpc_IntegrationService.DiscoverMcp_code_9",
+    );
     expect(safeFailure(original).seam).toBe(failure.seam);
     expect(original.rawMessage).toBe(secret);
     expect(Object.keys(original).sort()).toEqual(
       Object.keys(new ConnectError(secret, Code.FailedPrecondition)).sort(),
     );
     expect(JSON.stringify(failure)).not.toContain("private");
-    expect(safeFailure(new ConnectError(secret, Code.FailedPrecondition)).seam).toBe(
-      "public_rpc_code_9",
-    );
+    expect(
+      safeFailure(new ConnectError(secret, Code.FailedPrecondition)).seam,
+    ).toBe("public_rpc_code_9");
     expect(safeFailure(new Error(secret)).seam).toBe("unexpected_runner_error");
     const stream = client.sessions
       .exec({ sessionId: "private-session", argv: ["private-arg"] })
@@ -996,10 +1204,13 @@ test("public RPC diagnostics retain descriptor methods and keep error data priva
       deferred = error;
     }
     expect(deferred).toBeInstanceOf(ConnectError);
-    if (!(deferred instanceof ConnectError)) throw new Error("expected_stream_error");
+    if (!(deferred instanceof ConnectError))
+      throw new Error("expected_stream_error");
     expect(deferred.rawMessage).toBe(secret);
     expect(deferred.metadata.get("x-private")).toBe(secret);
-    expect(safeFailure(deferred).seam).toBe("public_rpc_SessionService.Exec_code_9");
+    expect(safeFailure(deferred).seam).toBe(
+      "public_rpc_SessionService.Exec_code_9",
+    );
     expect(JSON.stringify(safeFailure(deferred))).not.toContain("private");
     streamFailure = false;
     const complete = [];
@@ -1043,10 +1254,17 @@ test("catalog bootstrap enables the published connection with the authorized rev
   const cert = await readFile(certPath);
   const ctx = ContextSchema.parse(validContext());
   ctx.runRoot = root;
-  ctx.protocolFixtures.modern.resourceKeyFile = join(root, "catalog-resource.key");
-  await writeFile(ctx.protocolFixtures.modern.resourceKeyFile, "fixture-neutral-resource-key", {
-    mode: 0o600,
-  });
+  ctx.protocolFixtures.modern.resourceKeyFile = join(
+    root,
+    "catalog-resource.key",
+  );
+  await writeFile(
+    ctx.protocolFixtures.modern.resourceKeyFile,
+    "fixture-neutral-resource-key",
+    {
+      mode: 0o600,
+    },
+  );
   const created = create(IntegrationConnectionSchema, {
     id: "connection-1",
     alias: "fixture-catalog",
@@ -1128,7 +1346,11 @@ test("catalog bootstrap enables the published connection with the authorized rev
           expect(req.draftId).toBe("draft-1");
           expect(req.expectedRevision).toBe(11);
           expect(
-            req.tools.map((tool) => [tool.upstreamName, tool.classification, tool.enabled]),
+            req.tools.map((tool) => [
+              tool.upstreamName,
+              tool.classification,
+              tool.enabled,
+            ]),
           ).toEqual([
             ["read_counter", "read", true],
             ["write_counter", "write", true],
@@ -1137,7 +1359,14 @@ test("catalog bootstrap enables the published connection with the authorized rev
         },
         setConnectionEnabled(req, rpc) {
           calls.push("enable");
-          expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+          expect(calls).toEqual([
+            "create",
+            "authorize",
+            "discover",
+            "review",
+            "publish",
+            "enable",
+          ]);
           expect(rpc.requestHeader.get("cookie")).toBe("fixture_session=admin");
           expect(rpc.requestHeader.has("x-api-key")).toBe(false);
           expect(req.id).toBe("connection-1");
@@ -1162,23 +1391,47 @@ test("catalog bootstrap enables the published connection with the authorized rev
   await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
   try {
     const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server_address");
+    if (!address || typeof address === "string")
+      throw new Error("server_address");
     ctx.endpoints.app = {
       origin: `https://localhost:${address.port}`,
       ca: { path: certPath, sha256: sha256(cert) },
       serverFingerprint: new X509Certificate(cert).fingerprint256,
     };
-    const client = await publicClient(ctx, { kind: "cookie", value: "fixture_session=admin" });
+    const client = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture_session=admin",
+    });
     const result = await createCatalog(ctx, client, "catalog");
-    expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+    expect(calls).toEqual([
+      "create",
+      "authorize",
+      "discover",
+      "review",
+      "publish",
+      "enable",
+    ]);
     expect(result.connection).toEqual(enabled);
     expect(result.catalog).toEqual(published);
-    for (mode of ["rpc-failure", "wrong-id", "wrong-revision", "disabled", "missing"]) {
+    for (mode of [
+      "rpc-failure",
+      "wrong-id",
+      "wrong-revision",
+      "disabled",
+      "missing",
+    ]) {
       calls.length = 0;
       await expect(createCatalog(ctx, client, "catalog")).rejects.toThrow(
         mode === "rpc-failure" ? "enable refused" : "enabled_connection",
       );
-      expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+      expect(calls).toEqual([
+        "create",
+        "authorize",
+        "discover",
+        "review",
+        "publish",
+        "enable",
+      ]);
     }
   } finally {
     server.closeAllConnections();
@@ -1186,4 +1439,285 @@ test("catalog bootstrap enables the published connection with the authorized rev
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
+});
+
+test("matrix selectors reject empty, unknown and duplicate cases and retain canonical order", () => {
+  const first = REQUIRED_CASES[0]!,
+    last = REQUIRED_CASES.at(-1)!;
+  expect(selectMatrix(`${last.key},${first.key}`)).toEqual([first, last]);
+  for (const value of [
+    "",
+    "claude",
+    "all,all",
+    `${first.key},`,
+    `,${first.key}`,
+    `${first.key},${first.key}`,
+    ` ${first.key}`,
+    "claude/unknown",
+  ])
+    expect(() => selectMatrix(value)).toThrow("matrix_selection");
+  expect(selectMatrix(REQUIRED_CASES.map((c) => c.key).join(","))).toEqual(
+    REQUIRED_CASES,
+  );
+  expect(parseArgs(["--context", "/owned/context.json"]).selection).toEqual({
+    stage: "matrix",
+    matrix: "all",
+  });
+  expect(
+    parseArgs(["--context", "/owned/context.json", "--stage", "infrastructure"])
+      .selection,
+  ).toEqual({ stage: "infrastructure" });
+  expect(
+    parseArgs(["--context", "/owned/context.json", "--matrix", first.key])
+      .selected,
+  ).toEqual([first]);
+  for (const args of [
+    ["--context", "/owned/context.json", "--stage", "other"],
+    [
+      "--context",
+      "/owned/context.json",
+      "--stage",
+      "infrastructure",
+      "--matrix",
+      "all",
+    ],
+  ])
+    expect(() => parseArgs(args)).toThrow();
+});
+
+const infrastructureRows = () =>
+  (["ordinary", "managed"] as const).map((mode) => ({
+    mode,
+    execSha256: h,
+    uploadSha256: h,
+    downloadSha256: h,
+    sizeBytes: 32,
+    unauthenticatedStatus: 401 as const,
+    nonOwnerStatus: 404 as const,
+  }));
+async function recordCases(evidence: Evidence, cases = REQUIRED_CASES) {
+  for (const selected of cases) {
+    const digest = await evidence.observe({
+      source: "guest-proof",
+      caseKey: selected.key,
+      identitySha256: h,
+      state: "succeeded",
+      contentSha256: h,
+    });
+    await evidence.result({
+      key: selected.key,
+      status: "PASS",
+      assertions: selected.assertions.map((assertion) => ({
+        assertion,
+        observationHashes: [digest],
+      })),
+    });
+  }
+}
+test("full evidence needs successful ordered infrastructure before acceptance", async () => {
+  const ctx = ContextSchema.parse(validContext());
+  ctx.evidenceFile = join(root, "full-infrastructure.jsonl");
+  const evidence = await Evidence.create(ctx);
+  try {
+    await recordCases(evidence);
+    await expect(evidence.finish()).rejects.toThrow(
+      "infrastructure_evidence_required",
+    );
+    for (const rows of [
+      [],
+      infrastructureRows().reverse(),
+      infrastructureRows().slice(0, 1),
+      infrastructureRows().map((v) => ({ ...v, unauthenticatedStatus: 200 })),
+      infrastructureRows().map((v) => ({ ...v, execSha256: "A".repeat(64) })),
+      infrastructureRows().map((v) => ({ ...v, physicalAcceptance: true })),
+    ])
+      await expect(evidence.infrastructure(rows)).rejects.toThrow();
+    await evidence.infrastructure(infrastructureRows());
+    await expect(evidence.infrastructure(infrastructureRows())).rejects.toThrow(
+      "infrastructure_evidence_duplicate",
+    );
+    await evidence.finish();
+  } finally {
+    await evidence.close();
+  }
+  const records = (await readFile(ctx.evidenceFile, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(records.at(-1)).toMatchObject({
+    kind: "complete",
+    physicalAcceptance: true,
+    selected: 24,
+    passed: 24,
+  });
+  expect(records.find((v) => v.kind === "infrastructure").rows).toEqual(
+    infrastructureRows(),
+  );
+});
+for (const stage of [
+  "infrastructure",
+  "filtered",
+  "explicit-all-keys",
+] as const) {
+  test(`${stage} evidence cannot claim full acceptance`, async () => {
+    const ctx = ContextSchema.parse(validContext());
+    ctx.evidenceFile = join(root, `${stage}.jsonl`);
+    const matrix =
+      stage === "explicit-all-keys"
+        ? REQUIRED_CASES.map((v) => v.key).join(",")
+        : REQUIRED_CASES[0]!.key;
+    const selection =
+      stage === "infrastructure"
+        ? { stage: "infrastructure" as const }
+        : { stage: "matrix" as const, matrix };
+    const cases = stage === "infrastructure" ? [] : selectMatrix(matrix);
+    const evidence = await Evidence.create(ctx, selection);
+    try {
+      if (stage === "infrastructure") {
+        await expect(evidence.finish()).rejects.toThrow(
+          "infrastructure_evidence_required",
+        );
+        await evidence.infrastructure(infrastructureRows());
+      } else {
+        await expect(evidence.finish()).rejects.toThrow(
+          "selected_cases_incomplete",
+        );
+        await recordCases(evidence, cases);
+        await evidence.infrastructure(infrastructureRows());
+      }
+      await evidence.finish();
+    } finally {
+      await evidence.close();
+    }
+    const records = (await readFile(ctx.evidenceFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(records[0].selected).toBe(cases.length);
+    expect(records.at(-1)).toMatchObject({
+      kind: "stage-complete",
+      stageCompleted: true,
+      matrixCompleted: false,
+      physicalAcceptance: false,
+      selected: cases.length,
+      passed: cases.length,
+    });
+    expect(records.some((v) => v.kind === "complete")).toBe(false);
+    expect(() => verifyResults([])).toThrow("missing_or_duplicate_case");
+  });
+}
+
+test("selected dispatcher executes only canonical selected cases and preserves assertion failures", async () => {
+  const { runSelectedCases } = await import("./runner.ts");
+  const { DatabaseObserver } = await import("./observer.ts");
+  const { SCENARIOS } = await import("./manifest.ts");
+  const ctx = ContextSchema.parse(validContext());
+  ctx.runRoot = root;
+  ctx.observer.coordinatorDsnFile = join(root, "selection-c.dsn");
+  ctx.observer.orchestratorDsnFile = join(root, "selection-o.dsn");
+  for (const path of [
+    ctx.observer.coordinatorDsnFile,
+    ctx.observer.orchestratorDsnFile,
+  ])
+    await writeFile(
+      path,
+      "postgres://fixture:neutral@database.fixture.example/mcp_unit",
+      { mode: 0o600 },
+    );
+  ctx.endpoints.app.ca.path = join(root, "selection-ca.pem");
+  await writeFile(ctx.endpoints.app.ca.path, "unused-neutral-ca", {
+    mode: 0o600,
+  });
+  // Pools and public clients are lazy. No query or request is made by these test drivers.
+  const database = await DatabaseObserver.connect(ctx);
+  const client = await publicClient(ctx, {
+    kind: "cookie",
+    value: "neutral=fixture",
+  });
+  const principals = {
+    admin: client,
+    owner: client,
+    other: client,
+    unattended: client,
+    automation: client,
+    actorIds: {
+      admin: "1",
+      owner: "2",
+      other: "3",
+      unattended: "4",
+      automation: "5",
+    },
+  };
+  const input = { ctx, database, principals };
+  const calls: string[] = [];
+  let incomplete = false;
+  const registry: Record<string, unknown> = Object.fromEntries(
+    SCENARIOS.map((s) => [
+      s.id,
+      async ({ harness }: { harness: string }) => {
+        calls.push(`${harness}/${s.id}`);
+        return incomplete
+          ? []
+          : s.assertions.map((assertion) => ({
+              assertion,
+              observations: [
+                {
+                  source: "guest-proof",
+                  identitySha256: h,
+                  state: "succeeded",
+                  contentSha256: h,
+                },
+              ],
+            }));
+      },
+    ]),
+  );
+  validateDrivers(registry);
+  const selection = {
+    stage: "matrix" as const,
+    matrix: "codex/catalog-fidelity,claude/catalog-fidelity",
+  };
+  ctx.evidenceFile = join(root, "selected-dispatch.jsonl");
+  const evidence = await Evidence.create(ctx, selection);
+  try {
+    await runSelectedCases(registry, selection, input, evidence);
+    expect(calls).toEqual([
+      "claude/catalog-fidelity",
+      "codex/catalog-fidelity",
+    ]);
+    await evidence.infrastructure(infrastructureRows());
+    await evidence.finish();
+  } finally {
+    await evidence.close();
+  }
+  ctx.evidenceFile = join(root, "selected-failure.jsonl");
+  const failed = await Evidence.create(ctx, selection);
+  incomplete = true;
+  calls.length = 0;
+  try {
+    await expect(
+      runSelectedCases(registry, selection, input, failed),
+    ).rejects.toThrow("driver_subassertions_complete");
+    expect(calls).toEqual(["claude/catalog-fidelity"]);
+    await expect(failed.finish()).rejects.toThrow("selected_cases_incomplete");
+  } finally {
+    await failed.close();
+    await database.close();
+  }
+  const records = (await readFile(ctx.evidenceFile, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(records.at(-1)).toMatchObject({
+    kind: "case",
+    key: "claude/catalog-fidelity",
+    status: "FAIL",
+    seam: "driver_subassertions_complete",
+  });
+  expect(
+    records.some(
+      (record) =>
+        record.kind === "complete" || record.kind === "stage-complete",
+    ),
+  ).toBe(false);
 });

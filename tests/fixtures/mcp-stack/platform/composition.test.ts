@@ -315,7 +315,9 @@ async function nativeCleanupFixture() {
   Reflect.set(stack, "nativeProcesses", async () =>
     parseNativeIdentities(scan(), root),
   );
+  const actualKill = process.kill.bind(process);
   const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid < 0) return actualKill(pid, signal);
     expect(pid).toBeGreaterThan(1);
     events.push(`${pid}:${signal}`);
     if (pid === leader.pid) complete();
@@ -608,7 +610,10 @@ const pinnedImageDefaults = [
   {
     imageRole: "orchestrator",
     entry: "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
-    wrong: ["BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/cache", "BUN_RUNTIME_TRANSPILER_CACHE_PATH=1"],
+    wrong: [
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/cache",
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH=1",
+    ],
   },
   {
     imageRole: "dns",
@@ -624,7 +629,8 @@ const pinnedImageDefaults = [
 test.each(pinnedImageDefaults)(
   "pinned image default $entry passes its exact image audit",
   async ({ imageRole, entry }) => {
-    const { engine, state, imageState, image, options, id } = inspectedContainer(imageRole);
+    const { engine, state, imageState, image, options, id } =
+      inspectedContainer(imageRole);
     imageState.Config.Env.push(entry);
     state.Config.Env.push(entry);
     await engine.create("probe", image, options, ["infinity"], "/bin/sleep");
@@ -642,11 +648,15 @@ test.each(pinnedImageDefaults)(
   async ({ imageRole, entry, wrong }) => {
     for (const [role, value] of [
       ["worker", entry],
-      ...wrong.map((value): [(typeof IMAGES)[number], string] => [imageRole, value]),
+      ...wrong.map((value): [(typeof IMAGES)[number], string] => [
+        imageRole,
+        value,
+      ]),
       [imageRole, "AWS_SECRET_ACCESS_KEY=forbidden"],
       [imageRole, "HTTPS_PROXY=http://proxy.invalid"],
     ] satisfies [(typeof IMAGES)[number], string][]) {
-      const { engine, state, imageState, image, options } = inspectedContainer(role);
+      const { engine, state, imageState, image, options } =
+        inspectedContainer(role);
       imageState.Config.Env.push(value);
       state.Config.Env.push(value);
       if (imageRole === "dns") {
@@ -660,21 +670,28 @@ test.each(pinnedImageDefaults)(
   },
 );
 
-test.each(["tool-check", "pack-claude", "pack-codex", "probe", "host-tls-probe"])(
-  "pinned image default HOME is available to guard reuse %s",
-  async (role) => {
-    const { engine, state, imageState, image, options } = inspectedContainer("guard");
-    imageState.Config.Env.push("HOME=/tmp");
-    state.Config.Env.push("HOME=/tmp");
-    await engine.create(role, image, options, ["infinity"], "/bin/sleep");
-  },
-);
+test.each([
+  "tool-check",
+  "pack-claude",
+  "pack-codex",
+  "probe",
+  "host-tls-probe",
+])("pinned image default HOME is available to guard reuse %s", async (role) => {
+  const { engine, state, imageState, image, options } =
+    inspectedContainer("guard");
+  imageState.Config.Env.push("HOME=/tmp");
+  state.Config.Env.push("HOME=/tmp");
+  await engine.create(role, image, options, ["infinity"], "/bin/sleep");
+});
 
 test.each(["dns", "denied-dns"])(
   "pinned image default certificate is available to DNS reuse %s",
   async (role) => {
-    const { engine, state, imageState, image, options } = inspectedContainer("dns");
-    imageState.Config.Env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
+    const { engine, state, imageState, image, options } =
+      inspectedContainer("dns");
+    imageState.Config.Env.push(
+      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+    );
     state.Config.Env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
     state.HostConfig.CapAdd = ["NET_BIND_SERVICE"];
     await engine.create(
@@ -688,7 +705,8 @@ test.each(["dns", "denied-dns"])(
 );
 
 test("pinned image defaults allow both Bun entries together but preserve image identity", async () => {
-  const { engine, state, imageState, image, options, id } = inspectedContainer("orchestrator");
+  const { engine, state, imageState, image, options, id } =
+    inspectedContainer("orchestrator");
   const defaults = pinnedImageDefaults
     .filter(({ imageRole }) => imageRole === "orchestrator")
     .map(({ entry }) => entry);
@@ -944,8 +962,14 @@ for (const failedLookup of [false, true]) {
     } as Inputs;
     const ctx = {
       protocolFixtures: {
-        modern: { runRoot: "/owned/modern", configuration: { path: "/owned/modern/config" } },
-        legacy: { runRoot: "/owned/legacy", configuration: { path: "/owned/legacy/config" } },
+        modern: {
+          runRoot: "/owned/modern",
+          configuration: { path: "/owned/modern/config" },
+        },
+        legacy: {
+          runRoot: "/owned/legacy",
+          configuration: { path: "/owned/legacy/config" },
+        },
       },
     } as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
     const steps: string[] = [];
@@ -966,7 +990,8 @@ for (const failedLookup of [false, true]) {
       steps.push("native-dns");
       if (!steps.includes("dependencies"))
         throw new PlatformFailure("NEEDS_CONTEXT", "dns_before_dependencies");
-      if (failedLookup) throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup");
+      if (failedLookup)
+        throw new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup");
     };
     engine.guards = () => step("guards");
     engine.verifyNetwork = async (probes) => {
@@ -993,14 +1018,18 @@ for (const failedLookup of [false, true]) {
     stack.readyRole = (_ctx, role) => step(`ready:${role}`);
     stack.migrateOrchestrator = () => step("migrate");
     // Replace only the native I/O boundary; retain the real fixture launch and DNS gate.
-    const ready = spyOn(FixtureObserver.prototype, "ready").mockImplementation(() =>
-      step("observer"),
+    const ready = spyOn(FixtureObserver.prototype, "ready").mockImplementation(
+      () => step("observer"),
     );
     try {
-      const boot = bootPlatform(engine, { path: "/owned/ca", sha256: "a".repeat(64) }, async () => {
-        steps.push("prepare");
-        return { stack, ctx };
-      });
+      const boot = bootPlatform(
+        engine,
+        { path: "/owned/ca", sha256: "a".repeat(64) },
+        async () => {
+          steps.push("prepare");
+          return { stack, ctx };
+        },
+      );
       const prefix = [
         "registry-port",
         "host-port",
@@ -1109,15 +1138,22 @@ test("native DNS lookup rejection exposes only the static safe seam", async () =
   let failure: unknown;
   try {
     await engine.nativeDns(async () => {
-      throw new Error("secret-marker lookup postgres.fixture.example at 10.42.3.10");
+      throw new Error(
+        "secret-marker lookup postgres.fixture.example at 10.42.3.10",
+      );
     });
   } catch (error) {
     failure = error;
   }
   expect(failure).toBeInstanceOf(PlatformFailure);
-  expect(failure).toMatchObject({ code: "NEEDS_CONTEXT", seam: "native_dns_lookup" });
+  expect(failure).toMatchObject({
+    code: "NEEDS_CONTEXT",
+    seam: "native_dns_lookup",
+  });
   expect(String(failure)).toBe("Error: NEEDS_CONTEXT:native_dns_lookup");
-  expect(JSON.stringify(failure)).not.toMatch(/secret-marker|fixture\.example|10\.42\.3\.10/);
+  expect(JSON.stringify(failure)).not.toMatch(
+    /secret-marker|fixture\.example|10\.42\.3\.10/,
+  );
   expect(failure).not.toHaveProperty("cause");
 });
 
@@ -1593,7 +1629,9 @@ test("FC launch uses the declared configuration, private namespace and original 
 for (const failInspect of [false, true]) {
   test(`guest publication uses writable scratch and cleans up after ${failInspect ? "inspect failure" : "success"}`, async () => {
     const { publishGuest } = await import("./assets.ts");
-    const root = await mkdtemp(join(process.cwd(), "var/mcp-platform-composition/publish-"));
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/publish-"),
+    );
     try {
       const archive = await put(join(root, "guest.tar"), "owned archive");
       const config = Buffer.from('{"architecture":"arm64","os":"linux"}');
@@ -1603,7 +1641,11 @@ for (const failInspect of [false, true]) {
         manifestDigest: "",
       };
       const manifest = Buffer.from(
-        JSON.stringify({ schemaVersion: 2, config: { digest: image.id }, layers: [] }),
+        JSON.stringify({
+          schemaVersion: 2,
+          config: { digest: image.id },
+          layers: [],
+        }),
       );
       image.manifestDigest = `sha256:${hash(manifest)}`;
       const inputs = parseInputs(
@@ -1625,8 +1667,11 @@ for (const failInspect of [false, true]) {
         },
         "vz",
       );
-      const calls: { args: string[]; stdin: string | undefined; timeout: number | undefined }[] =
-        [];
+      const calls: {
+        args: string[];
+        stdin: string | undefined;
+        timeout: number | undefined;
+      }[] = [];
       const removed: string[] = [];
       const launches: unknown[] = [];
       const id = "a".repeat(64),
@@ -1643,7 +1688,11 @@ for (const failInspect of [false, true]) {
           launches.push({ role, image, options, args, entrypoint });
           return id;
         }
-        override async call(args: string[], stdin?: string, timeout?: number): Promise<Buffer> {
+        override async call(
+          args: string[],
+          stdin?: string,
+          timeout?: number,
+        ): Promise<Buffer> {
           calls.push({ args, stdin, timeout });
           if (failInspect) throw new Error("inspect failed");
           return args.includes("--config") ? config : manifest;
@@ -1657,10 +1706,16 @@ for (const failInspect of [false, true]) {
       const uri = `127.0.0.1:32000/${runId}/guest`;
       const provenance = join(root, "image-provenance.json");
       if (failInspect) {
-        await expect(publishGuest(inputs, root, engine)).rejects.toThrow("inspect failed");
-        await expect(stat(provenance)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(publishGuest(inputs, root, engine)).rejects.toThrow(
+          "inspect failed",
+        );
+        await expect(stat(provenance)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
       } else {
-        expect(await publishGuest(inputs, root, engine)).toBe(`${uri}@${image.manifestDigest}`);
+        expect(await publishGuest(inputs, root, engine)).toBe(
+          `${uri}@${image.manifestDigest}`,
+        );
         expect(JSON.parse(await readFile(provenance, "utf8"))).toEqual({
           version: 1,
           archiveSha256: archive.sha256,
@@ -1697,7 +1752,13 @@ for (const failInspect of [false, true]) {
           timeout: undefined,
         },
         {
-          args: [...prefix, "inspect", "--raw", "--config", "oci-archive:/input/guest.tar"],
+          args: [
+            ...prefix,
+            "inspect",
+            "--raw",
+            "--config",
+            "oci-archive:/input/guest.tar",
+          ],
           stdin: undefined,
           timeout: undefined,
         },
@@ -1986,9 +2047,8 @@ test("cleanup recovers only a planned owned container after a lost create respon
 });
 
 async function handoffFixture(root: string) {
-  const { ContextSchema } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/context.ts"
-  );
+  const { ContextSchema } =
+    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
   const { put } = await import("./owned.ts");
   const pin = await put(join(root, "artifact"), "a".repeat(40));
   const endpoint = (name: string) => ({
@@ -2105,9 +2165,8 @@ async function handoffFixture(root: string) {
 
 test("runner handoff validates the complete context with a real private supervisor socket", async () => {
   const { startContextSupervisor } = await import("./main.ts");
-  const { loadContext } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/context.ts"
-  );
+  const { loadContext } =
+    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
   const { lstat } = await import("node:fs/promises");
   const root = await mkdtemp(
     join(process.cwd(), "var/mcp-platform-composition/h-"),
@@ -2410,9 +2469,8 @@ test("native-host TLS qualification pins the actual first leaf and removes its p
 });
 
 test("FC sysctls belong only to its C guard and actual firewall order stays production exact", async () => {
-  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } = await import(
-    "./engine.ts"
-  );
+  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } =
+    await import("./engine.ts");
   expect(fcGuardSysctls("firecracker", "coordinator-guard")).toEqual({
     "net.ipv4.ip_forward": "1",
     "net.ipv4.conf.all.route_localnet": "1",
@@ -2960,3 +3018,317 @@ for (const partial of [false, true])
       await rm(root, { recursive: true });
     }
   });
+
+test("matrix arguments forward the selected stage without replacing focused selectors", async () => {
+  const { matrixArguments } = await import("./main.ts");
+  const key = "codex/catalog-fidelity";
+  expect(matrixArguments("/owned/context.json").slice(1)).toEqual([
+    "--context",
+    "/owned/context.json",
+    "--matrix",
+    "all",
+  ]);
+  expect(
+    matrixArguments("/owned/context.json", {
+      stage: "matrix",
+      matrix: key,
+    }).slice(1),
+  ).toEqual(["--context", "/owned/context.json", "--matrix", key]);
+  expect(
+    matrixArguments("/owned/context.json", { stage: "infrastructure" }).slice(
+      1,
+    ),
+  ).toEqual(["--context", "/owned/context.json", "--stage", "infrastructure"]);
+});
+
+async function receiptFixture(
+  root: string,
+  selection: import("../../../../orchestrator/scripts/mcp-stack/manifest.ts").RunSelection,
+) {
+  const { Evidence } =
+    await import("../../../../orchestrator/scripts/mcp-stack/evidence.ts");
+  const { selectedCases } =
+    await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+  const ctx = await handoffFixture(root);
+  const evidence = await Evidence.create(ctx, selection);
+  const hash = "a".repeat(64);
+  try {
+    await evidence.prerequisites({
+      supervisorSha256: hash,
+      publicationSha256: hash,
+      publicStateSha256: hash,
+    });
+    await evidence.infrastructure(
+      ["ordinary", "managed"].map((mode) => ({
+        mode,
+        execSha256: hash,
+        uploadSha256: hash,
+        downloadSha256: hash,
+        sizeBytes: 4096,
+        unauthenticatedStatus: 401,
+        nonOwnerStatus: 404,
+      })),
+    );
+    for (const selected of selectedCases(selection)) {
+      const digest = await evidence.observe({
+        source: "guest-proof",
+        caseKey: selected.key,
+        identitySha256: hash,
+        state: "succeeded",
+        contentSha256: hash,
+      });
+      await evidence.result({
+        key: selected.key,
+        status: "PASS",
+        assertions: selected.assertions.map((assertion) => ({
+          assertion,
+          observationHashes: [digest],
+        })),
+      });
+    }
+    await evidence.finish();
+  } finally {
+    await evidence.close();
+  }
+  const source = await readFile(ctx.evidenceFile, "utf8");
+  return {
+    ctx,
+    source,
+    records: source
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+  };
+}
+for (const mode of [
+  "full",
+  "filtered",
+  "infrastructure",
+  "explicit-all-keys",
+] as const) {
+  test(`adapter completion validates real ${mode} Evidence writer output`, async () => {
+    const { verifyRunnerCompletion } = await import("./main.ts");
+    const { REQUIRED_CASES } =
+      await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/receipt-"),
+    );
+    try {
+      const selection =
+        mode === "infrastructure"
+          ? { stage: "infrastructure" as const }
+          : {
+              stage: "matrix" as const,
+              matrix:
+                mode === "full"
+                  ? "all"
+                  : mode === "explicit-all-keys"
+                    ? REQUIRED_CASES.map((c) => c.key).join(",")
+                    : "codex/catalog-fidelity,claude/catalog-fidelity",
+            };
+      const { ctx, source, records } = await receiptFixture(root, selection);
+      await expect(
+        verifyRunnerCompletion(ctx, selection),
+      ).resolves.toBeUndefined();
+      expect(records.at(-1).physicalAcceptance).toBe(mode === "full");
+      if (mode === "full") {
+        expect(records.filter((r) => r.kind === "case")).toHaveLength(24);
+        expect(
+          records
+            .filter((r) => r.kind === "case")
+            .reduce((n, r) => n + r.assertions.length, 0),
+        ).toBe(138);
+        expect(Buffer.byteLength(source)).toBeLessThan(16 * 1024 * 1024);
+      } else
+        await expect(
+          verifyRunnerCompletion(ctx, { stage: "matrix", matrix: "all" }),
+        ).rejects.toThrow("runner_completion");
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+for (const malformed of [
+  "terminal-only",
+  "contradictory-stage-flag",
+  "wrong-stage",
+  "duplicate-completion",
+  "copied-after-failed-case",
+  "missing-infrastructure",
+  "wrong-infrastructure-order",
+  "bad-infrastructure-hash",
+  "missing-case",
+  "failed-case",
+  "unrecorded-provenance",
+  "tampered-observation",
+  "wrong-run-header",
+  "wrong-selector",
+  "trailing-observation",
+  "unknown-record",
+  "empty-stream",
+  "torn-final-line",
+] as const) {
+  test(`adapter completion rejects ${malformed} evidence`, async () => {
+    const { verifyRunnerCompletion } = await import("./main.ts");
+    const root = await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/receipt-"),
+    );
+    try {
+      const selection = { stage: "matrix" as const, matrix: "all" };
+      const { ctx, records } = await receiptFixture(root, selection);
+      const terminal = records.at(-1),
+        observation = records.find((r) => r.kind === "observation"),
+        result = records.find((r) => r.kind === "case"),
+        infra = records.find((r) => r.kind === "infrastructure");
+      let altered = [...records];
+      switch (malformed) {
+        case "terminal-only":
+          altered = [terminal];
+          break;
+        case "contradictory-stage-flag":
+          altered[altered.length - 1] = { ...terminal, stageCompleted: true };
+          break;
+        case "wrong-stage":
+          altered[altered.length - 1] = {
+            ...terminal,
+            stage: "infrastructure",
+          };
+          break;
+        case "duplicate-completion":
+          altered.push(terminal);
+          break;
+        case "copied-after-failed-case":
+          altered.push({ ...result, status: "FAIL", assertions: [] }, terminal);
+          break;
+        case "missing-infrastructure":
+          altered = altered.filter((r) => r.kind !== "infrastructure");
+          break;
+        case "wrong-infrastructure-order":
+          infra.rows.reverse();
+          break;
+        case "bad-infrastructure-hash":
+          infra.rows[0].downloadSha256 = "b".repeat(64);
+          break;
+        case "missing-case":
+          altered = altered.filter((r) => r !== result);
+          break;
+        case "failed-case":
+          result.status = "FAIL";
+          result.assertions = [];
+          break;
+        case "unrecorded-provenance":
+          result.assertions[0].observationHashes = ["b".repeat(64)];
+          break;
+        case "tampered-observation":
+          observation.contentSha256 = "b".repeat(64);
+          break;
+        case "wrong-run-header":
+          altered[0].sourceCommit = "f".repeat(40);
+          break;
+        case "wrong-selector":
+          altered[0].matrix = "claude/catalog-fidelity";
+          break;
+        case "trailing-observation":
+          altered.push(observation);
+          break;
+        case "unknown-record":
+          altered.splice(1, 0, { version: 1, kind: "unknown" });
+          break;
+        case "empty-stream":
+          altered = [];
+          break;
+        case "torn-final-line":
+          break;
+      }
+      let source = altered.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      if (malformed === "torn-final-line") source = source.slice(0, -4);
+      await writeFile(ctx.evidenceFile, source);
+      await expect(verifyRunnerCompletion(ctx, selection)).rejects.toThrow(
+        "runner_completion",
+      );
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+for (const stage of ["infrastructure", "selected-case"] as const) {
+  for (const started of [false, true]) {
+    for (const canceled of [false, true]) {
+      test(`${stage} ${canceled ? "cancellation" : "failure"} ${started ? "after" : "before"} native startup uses shared teardown`, async () => {
+        const { cleanupPlatform } = await import("./main.ts");
+        const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+        const fixture = await nativeCleanupFixture();
+        const unrelated = new OwnedProcess(
+          process.execPath,
+          ["-e", "setInterval(()=>{},1000)"],
+          process.cwd(),
+          childEnvironment(process.cwd()),
+        );
+        const runner = new OwnedProcess(
+          process.execPath,
+          ["-e", "setInterval(()=>{},1000)"],
+          process.cwd(),
+          childEnvironment(process.cwd()),
+        );
+        if (!started) {
+          Reflect.set(fixture.stack, "host", undefined);
+          fixture.setIdentities([]);
+        }
+        const events: string[] = [];
+        const abort = new AbortController();
+        const failure = new PlatformFailure(
+          "FAILED",
+          canceled ? "run_aborted" : `${stage}_failure`,
+        );
+        let failed: string[] = [];
+        try {
+          await expect(
+            (async () => {
+              try {
+                if (canceled) abort.abort();
+                throw failure;
+              } finally {
+                failed = await cleanupPlatform({
+                  stack: fixture.stack,
+                  runner,
+                });
+                events.push("cleanup");
+              }
+            })(),
+          ).rejects.toBe(failure);
+          expect(failed).toEqual([]);
+          expect(events).toEqual(["cleanup"]);
+          expect(fixture.events).toEqual(
+            started ? ["41001:SIGTERM", "host-complete", "41002:SIGTERM"] : [],
+          );
+          expect(fixture.identities()).toEqual([]);
+          expect(unrelated.running()).toBe(true);
+          expect(runner.running()).toBe(false);
+          expect(abort.signal.aborted).toBe(canceled);
+        } finally {
+          // Restore the process signal boundary before retiring the separate real child.
+          await fixture.close();
+          await unrelated.stop(100);
+          await runner.stop(100);
+        }
+      });
+    }
+  }
+}
+
+test("shared teardown reports changed native identity without signaling it or an unrelated child", async () => {
+  const { cleanupPlatform } = await import("./main.ts");
+  const fixture = await nativeCleanupFixture();
+  fixture.setIdentities([
+    { ...fixture.leader, seconds: "1730000001" },
+    fixture.identities()[1]!,
+  ]);
+  try {
+    expect(await cleanupPlatform({ stack: fixture.stack })).toEqual(["host"]);
+    expect(fixture.events).toEqual([]);
+    expect(fixture.identities()).toHaveLength(2);
+  } finally {
+    await fixture.close();
+  }
+});

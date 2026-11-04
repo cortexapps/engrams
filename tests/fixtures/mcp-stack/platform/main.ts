@@ -35,13 +35,46 @@ import { publicPrerequisites } from "../../../../orchestrator/scripts/mcp-stack/
 import { waitFor } from "../../../../orchestrator/scripts/mcp-stack/bootstrap.ts";
 import type { Identity } from "./identity.ts";
 
-export const matrixArguments = (contextPath: string) => [
-  join(REPO, "orchestrator/scripts/mcp-stack/run.ts"),
-  "--context",
-  contextPath,
-  "--matrix",
-  "all",
-];
+import {
+  EVIDENCE_MAX_BYTES,
+  verifyEvidence,
+} from "../../../../orchestrator/scripts/mcp-stack/evidence.ts";
+import {
+  FULL_MATRIX,
+  selectedCases,
+  type RunSelection,
+} from "../../../../orchestrator/scripts/mcp-stack/manifest.ts";
+
+export const matrixArguments = (
+  contextPath: string,
+  selection: RunSelection = FULL_MATRIX,
+) => {
+  selectedCases(selection);
+  return [
+    join(REPO, "orchestrator/scripts/mcp-stack/run.ts"),
+    "--context",
+    contextPath,
+    ...(selection.stage === "infrastructure"
+      ? ["--stage", "infrastructure"]
+      : ["--matrix", selection.matrix]),
+  ];
+};
+
+/** A successful child must leave the completion record for the requested stage. */
+export async function verifyRunnerCompletion(
+  ctx: Context,
+  selection: RunSelection,
+) {
+  try {
+    verifyEvidence(
+      ctx,
+      selection,
+      (await readOwned(ctx.evidenceFile, EVIDENCE_MAX_BYTES)).toString(),
+    );
+  } catch {
+    throw new PlatformFailure("INVALID_CONTEXT", "runner_completion");
+  }
+}
 
 export async function enableGuest(
   ctx: Context,
@@ -107,7 +140,8 @@ export async function enableGuest(
   });
   check(
     job.job?.id &&
-      (job.job.manifestDigest === undefined || job.job.manifestDigest === expectedDigest),
+      (job.job.manifestDigest === undefined ||
+        job.job.manifestDigest === expectedDigest),
     "enable_manifest",
   );
   const result = await waitFor(
@@ -120,7 +154,8 @@ export async function enableGuest(
     },
   );
   check(
-    result.job?.manifestDigest === undefined || result.job.manifestDigest === expectedDigest,
+    result.job?.manifestDigest === undefined ||
+      result.job.manifestDigest === expectedDigest,
     "enable_ready_manifest",
   );
   check(result.job?.materializeHostId === ctx.hostId, "enable_actual_host");
@@ -160,7 +195,12 @@ export async function bootPlatform(
   prepare: () => Promise<{
     stack: Pick<
       Stack,
-      "dependencies" | "fixtures" | "edges" | "startRole" | "readyRole" | "migrateOrchestrator"
+      | "dependencies"
+      | "fixtures"
+      | "edges"
+      | "startRole"
+      | "readyRole"
+      | "migrateOrchestrator"
     >;
     ctx: Context;
   }>,
@@ -347,6 +387,96 @@ export async function startContextSupervisor(
     throw error;
   }
 }
+/** All stages retire the same bounded owned resources, even after partial boot. */
+export async function cleanupPlatform({
+  context,
+  stack,
+  engine,
+  runner,
+  supervisor,
+}: {
+  context?: Context;
+  stack?: Stack;
+  engine?: Engine;
+  runner?: OwnedProcess;
+  supervisor?: Awaited<ReturnType<typeof startSupervisor>>;
+}) {
+  const failed: string[] = [];
+  for (const [name, action] of [
+    [
+      "matrix",
+      async () => {
+        if (runner) await runner.stop(1500);
+      },
+    ],
+    [
+      "supervisor",
+      async () => {
+        if (supervisor) await supervisor.close();
+      },
+    ],
+    [
+      "sessions",
+      async () => {
+        if (!context) return;
+        let cookie: string;
+        try {
+          cookie = (
+            await readOwned(join(context.runRoot, "bootstrap.cookie"))
+          ).toString();
+        } catch (error) {
+          if (
+            error &&
+            typeof error === "object" &&
+            "code" in error &&
+            error.code === "ENOENT"
+          )
+            return;
+          throw error;
+        }
+        const admin = await publicClient(context, {
+          kind: "cookie",
+          value: cookie,
+        });
+        await destroyRunSessions(context, admin);
+        if (engine?.fc) {
+          const deadline = performance.now() + 15000;
+          let released = false;
+          while (performance.now() < deadline) {
+            try {
+              await engine.fc.requireReleased();
+              released = true;
+              break;
+            } catch {
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+          }
+          check(released, "cleanup_nbd_release_deadline");
+        }
+      },
+    ],
+    [
+      "host",
+      async () => {
+        if (stack) await stack.cleanupHost();
+      },
+    ],
+    [
+      "engine",
+      async () => {
+        if (engine) await engine.cleanup();
+      },
+    ],
+  ] as const) {
+    try {
+      await action();
+    } catch {
+      failed.push(name);
+    }
+  }
+  return failed;
+}
+
 export async function main(args: string[]) {
   const options = cli(args);
   const inputs = await preflight(
@@ -399,8 +529,19 @@ export async function main(args: string[]) {
     await engine.controlled(abort.signal, async () => {
       const ctx = await bootPlatform(engine!, identity.ca, async () => {
         const assets = await stageAssets(inputs, root, engine!);
-        const configuration = await generateConfiguration(inputs, root, identity);
-        stack = new Stack(inputs, root, identity, assets, configuration, engine!);
+        const configuration = await generateConfiguration(
+          inputs,
+          root,
+          identity,
+        );
+        stack = new Stack(
+          inputs,
+          root,
+          identity,
+          assets,
+          configuration,
+          engine!,
+        );
         const ctx = await stack.prepare();
         context = ctx;
         return { stack, ctx };
@@ -445,7 +586,7 @@ export async function main(args: string[]) {
     try {
       runner = new OwnedProcess(
         inputs.binaries.bun.path,
-        matrixArguments(contextPath),
+        matrixArguments(contextPath, options.selection),
         REPO,
         childEnvironment(root),
         ["ignore", log.fd, log.fd],
@@ -465,6 +606,8 @@ export async function main(args: string[]) {
     });
     await Promise.race([runner.done, aborted]);
     check(runner.child.exitCode === 0, "matrix_exit");
+    check(context, "runner_context");
+    await verifyRunnerCompletion(context, options.selection);
     if (observerFailure) throw observerFailure;
     await engine?.fc?.observe();
     await engine?.fc?.requireCoverage();
@@ -476,88 +619,39 @@ export async function main(args: string[]) {
     if (timer) clearTimeout(timer);
     process.off("SIGINT", signal);
     process.off("SIGTERM", signal);
-    const failed: string[] = [];
     observing = false;
     await observer;
-    for (const [name, action] of [
-      [
-        "matrix",
-        async () => {
-          if (runner) await runner.stop(1500);
-        },
-      ],
-      [
-        "supervisor",
-        async () => {
-          if (supervisor) await supervisor.close();
-        },
-      ],
-      [
-        "sessions",
-        async () => {
-          if (!context) return;
-          let cookie: string;
-          try {
-            cookie = (
-              await readOwned(join(root, "bootstrap.cookie"))
-            ).toString();
-          } catch (error) {
-            if (
-              error &&
-              typeof error === "object" &&
-              "code" in error &&
-              error.code === "ENOENT"
-            )
-              return;
-            throw error;
-          }
-          const admin = await publicClient(context, {
-            kind: "cookie",
-            value: cookie,
-          });
-          await destroyRunSessions(context, admin);
-          if (engine?.fc) {
-            const deadline = performance.now() + 15000;
-            let released = false;
-            while (performance.now() < deadline) {
-              try {
-                await engine.fc.requireReleased();
-                released = true;
-                break;
-              } catch {
-                await new Promise((resolve) => setTimeout(resolve, 100));
-              }
-            }
-            check(released, "cleanup_nbd_release_deadline");
-          }
-        },
-      ],
-      [
-        "host",
-        async () => {
-          if (stack) await stack.cleanupHost();
-        },
-      ],
-      [
-        "engine",
-        async () => {
-          if (engine) await engine.cleanup();
-        },
-      ],
-    ] as const) {
-      try {
-        await action();
-      } catch {
-        failed.push(name);
-      }
-    }
+    const failed = await cleanupPlatform({
+      context,
+      stack,
+      engine,
+      runner,
+      supervisor,
+    });
     await put(
       join(root, `completion-${randomBytes(6).toString("hex")}.json`),
       JSON.stringify({
         version: 1,
         backend: inputs.backend,
         sourceCommit: inputs.sourceCommit,
-        matrixCompleted: !failure,
+        ...options.selection,
+        stageCompleted:
+          !failure &&
+          !failed.length &&
+          !(
+            options.selection.stage === "matrix" &&
+            options.selection.matrix === "all"
+          ),
+        matrixCompleted:
+          !failure &&
+          !failed.length &&
+          options.selection.stage === "matrix" &&
+          options.selection.matrix === "all",
+        physicalAcceptance:
+          !failure &&
+          !failed.length &&
+          options.selection.stage === "matrix" &&
+          options.selection.matrix === "all",
         cleanupFailed: failed,
       }),
     );

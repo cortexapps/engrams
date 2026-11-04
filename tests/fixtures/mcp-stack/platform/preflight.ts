@@ -1,3 +1,8 @@
+import {
+  FULL_MATRIX,
+  selectedCases,
+  type RunSelection,
+} from "../../../../orchestrator/scripts/mcp-stack/manifest.ts";
 import { readFile, access, lstat, open, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { arch, platform } from "node:os";
@@ -236,9 +241,10 @@ export function cli(args: string[]): {
   backend: Inputs["backend"];
   runRoot: string;
   manifest: string;
+  selection: RunSelection;
 } {
   check(
-    args.length === 6 &&
+    [6, 8].includes(args.length) &&
       args[0] === "--backend" &&
       ["firecracker", "vz"].includes(args[1]!) &&
       args[2] === "--run-root" &&
@@ -247,10 +253,24 @@ export function cli(args: string[]): {
   );
   for (const p of [args[3]!, args[5]!])
     check(isAbsolute(p) && resolve(p) === p, "arguments_path");
+  let selection: RunSelection = FULL_MATRIX;
+  if (args.length === 8) {
+    check(
+      args[6] === "--matrix" ||
+        (args[6] === "--stage" && args[7] === "infrastructure"),
+      "arguments",
+    );
+    selection =
+      args[6] === "--stage"
+        ? { stage: "infrastructure" }
+        : { stage: "matrix", matrix: args[7]! };
+  }
+  selectedCases(selection);
   return {
     backend: args[1] as Inputs["backend"],
     runRoot: args[3]!,
     manifest: args[5]!,
+    selection,
   };
 }
 export function requirePlatform(
@@ -332,7 +352,12 @@ export async function validateVzEntitlement(
   env: NodeJS.ProcessEnv,
   runCommand: typeof command = command,
 ): Promise<void> {
-  await runCommand("/usr/bin/codesign", ["--verify", "--strict", hostAgent], REPO, env);
+  await runCommand(
+    "/usr/bin/codesign",
+    ["--verify", "--strict", hostAgent],
+    REPO,
+    env,
+  );
   const entitlements = await runCommand(
     "/usr/bin/codesign",
     ["--display", "--entitlements", "-", "--xml", hostAgent],

@@ -141,15 +141,30 @@ export const REQUIRED_CASES = HARNESS.flatMap((harness) =>
     key: `${harness}/${scenario.id}`,
   })),
 );
+export type RunSelection =
+  | { stage: "infrastructure" }
+  | { stage: "matrix"; matrix: string };
+export const FULL_MATRIX = { stage: "matrix", matrix: "all" } as const;
 export function selectMatrix(value: string) {
-  if (value !== "all")
-    throw new RunnerFailure("INVALID_CONTEXT", "matrix_all_required");
   if (
     REQUIRED_CASES.length !== 24 ||
     new Set(REQUIRED_CASES.map((v) => v.key)).size !== 24
   )
     throw new RunnerFailure("ASSERTION_FAILED", "required_case_manifest");
-  return REQUIRED_CASES;
+  if (value === "all") return REQUIRED_CASES;
+  const keys = value.split(",");
+  if (
+    !value ||
+    new Set(keys).size !== keys.length ||
+    keys.some((key) => !REQUIRED_CASES.some((c) => c.key === key))
+  )
+    throw new RunnerFailure("INVALID_CONTEXT", "matrix_selection");
+  return REQUIRED_CASES.filter((c) => keys.includes(c.key));
+}
+export function selectedCases(selection: RunSelection) {
+  return selection.stage === "infrastructure"
+    ? []
+    : selectMatrix(selection.matrix);
 }
 export type AssertionEvidence = {
   assertion: string;

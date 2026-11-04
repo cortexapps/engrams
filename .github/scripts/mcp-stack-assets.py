@@ -115,13 +115,28 @@ def matrix_result(root, backend, head):
         if isinstance(value, dict) and value.get('status') == 'PASS' and 'selected' in value:
             results.append(value)
     require(len(results) == 1 and type(results[0].get('selected')) is int and
-            results[0]['selected'] == 24 and type(results[0].get('passed')) is int and results[0]['passed'] == 24, 'matrix_case_count')
+            results[0]['selected'] == 24 and type(results[0].get('passed')) is int and results[0]['passed'] == 24 and
+            results[0].get('matrix') == 'all' and results[0].get('matrixCompleted') is True and
+            results[0].get('physicalAcceptance') is True and results[0].get('stageCompleted', False) is False, 'matrix_case_count')
     completions = list(root.glob('completion-*.json'))
     require(len(completions) == 1, 'matrix_completion')
     done = json.loads(completions[0].read_bytes())
     require(done.get('backend') == backend and done.get('sourceCommit') == head and
-            done.get('matrixCompleted') is True and done.get('cleanupFailed') == [], 'matrix_cleanup')
+            done.get('matrixCompleted') is True and done.get('matrix') == 'all' and
+            done.get('physicalAcceptance') is True and done.get('stageCompleted') is False and
+            done.get('cleanupFailed') == [], 'matrix_cleanup')
     return 24
+
+
+def prepared_result(root, backend, head):
+    receipt = json.loads((root / 'assets-prepared.json').read_bytes())
+    inputs = root / 'inputs.json'
+    require(receipt.get('kind') == 'assets-prepared' and receipt.get('backend') == backend and
+            receipt.get('sourceCommit') == head and receipt.get('physicalAcceptance') is False and
+            receipt.get('matrixCompleted') is False and
+            receipt.get('inputs') == {'path': str(inputs), 'sha256': hashlib.sha256(inputs.read_bytes()).hexdigest()} and
+            inputs.stat().st_mode & 0o777 == 0o400, 'assets_prepared_receipt')
+    return 0
 
 
 class Producer:
@@ -282,7 +297,7 @@ class Producer:
                     for key in config), 'private_checkout_config')
         return checkout, head
 
-    def run_private_checkout(self):
+    def run_private_checkout(self, prepare_only=False):
         checkout, head = self.private_checkout(REPO)
         script = '.github/scripts/mcp-stack-assets.py'
         require((checkout / script).read_bytes() == Path(__file__).read_bytes(), 'producer_source_changed')
@@ -292,8 +307,8 @@ class Producer:
             env['GITHUB_TOKEN'] = os.environ['GITHUB_TOKEN']
         self.call([sys.executable, '-I', checkout / script, '--backend', self.backend,
                    '--operator', self.operator_path, '--work-root', self.root / 'execution',
-                   '--private-checkout'], env=env, cwd=checkout, grace=240)
-        return matrix_result(self.root / 'execution/run', self.backend, head)
+                   '--private-checkout', *(['--prepare-only'] if prepare_only else [])], env=env, cwd=checkout, grace=240)
+        return prepared_result(self.root / 'execution', self.backend, head) if prepare_only else matrix_result(self.root / 'execution/run', self.backend, head)
 
     def engine(self, *args, cleanup=False):
         s = canonical(self.o['engineSocket'], 'socket').stat()
@@ -589,7 +604,7 @@ class Producer:
         helper = self.stage(build / 'netstack/engram-sandbox-netstack', 'helper', True)
         return {'hostAgent': host, 'proxy': proxy, 'helper': helper, 'nativeProbe': {'path': str(self.files / 'nativeProbe')}}
 
-    def produce(self):
+    def produce(self, prepare_only=False):
         require(platform.system() == ('Linux' if self.backend == 'firecracker' else 'Darwin') and
                 platform.machine() in (['x86_64'] if self.backend == 'firecracker' else ['arm64']), 'physical_platform')
         require(self.backend != 'firecracker' or os.getuid() == 0, 'fc_root')
@@ -664,6 +679,17 @@ class Producer:
         self.call([self.tools['npm'], 'ci', '--ignore-scripts'], env=depenv, cwd=REPO / 'mcp-worker')
         self.call([bins['bun']['path'], 'install', '--frozen-lockfile', '--ignore-scripts'], env=depenv, cwd=REPO / 'orchestrator')
         require(not self.call(['/usr/bin/git', 'status', '--porcelain', '--untracked-files=no']), 'source_dirty')
+        return self.dispatch(prepare_only)
+
+    def dispatch(self, prepare_only=False):
+        if prepare_only:
+            inputs = self.root / 'inputs.json'
+            inputs.chmod(0o400)
+            self.put(self.root / 'assets-prepared.json', json.dumps({
+                'version': 1, 'kind': 'assets-prepared', 'backend': self.backend, 'sourceCommit': self.head,
+                'inputs': {'path': str(inputs), 'sha256': hashlib.sha256(inputs.read_bytes()).hexdigest()},
+                'matrixCompleted': False, 'physicalAcceptance': False}).encode())
+            return prepared_result(self.root, self.backend, self.head)
         wrapper = '.github/scripts/mcp-stack-' + ('fc' if self.backend == 'firecracker' else 'vz') + '.sh'
         # The adapter output root MUST NOT exist; its parent is this canonical0700 root.
         require(not (self.root / 'run').exists(), 'run_root_exists')
@@ -730,6 +756,7 @@ def main():
     parser.add_argument('--backend', choices=['firecracker', 'vz'], required=True)
     parser.add_argument('--operator', required=True)
     parser.add_argument('--work-root', required=True)
+    parser.add_argument('--prepare-only', action='store_true', help='Prepare pinned assets without starting the acceptance adapter')
     parser.add_argument('--private-checkout', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
@@ -737,7 +764,7 @@ def main():
     require(root.is_absolute() and root.resolve() == root and root.parent.resolve() == root.parent and not root.exists() and
             not root.is_symlink(), 'work_root')
     root.mkdir(mode=0o700)
-    producer, passed, cleanup = None, 0, False
+    producer, passed, cleanup, completed = None, 0, False, False
     try:
         o = read_operator(args.operator, args.backend)
         producer = Producer(args.backend, root, o)
@@ -754,7 +781,8 @@ def main():
         signal.signal(signal.SIGTERM, cancel)
         signal.signal(signal.SIGINT, cancel)
         try:
-            passed = producer.produce() if args.private_checkout else producer.run_private_checkout()
+            passed = producer.produce(args.prepare_only) if args.private_checkout else producer.run_private_checkout(args.prepare_only)
+            completed = True
         finally:
             # Drain the interrupted child in call() before owned-resource cleanup.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -762,13 +790,14 @@ def main():
             producer.cleanup()
             cleanup = True
     finally:
-        summary = {'version': 1, 'backend': args.backend, 'selected': 24, 'passed': passed,
-                   'cleanup': cleanup, 'status': 'PASS' if passed == 24 and cleanup else 'FAIL'}
+        summary = {'version': 1, 'backend': args.backend, 'selected': 0 if args.prepare_only else 24, 'passed': passed,
+                   'cleanup': cleanup, 'physicalAcceptance': not args.prepare_only and passed == 24 and cleanup,
+                   'status': ('ASSETS_PREPARED' if args.prepare_only else 'PASS') if completed and cleanup and (args.prepare_only or passed == 24) else 'FAIL'}
         path = root / 'summary.json'
         with path.open('x') as out:
             json.dump(summary, out)
         print(json.dumps(summary))
-    require(passed == 24 and cleanup, 'physical_matrix_failed')
+    require(completed and cleanup and (args.prepare_only or passed == 24), 'physical_matrix_failed')
 
 
 if __name__ == '__main__':
