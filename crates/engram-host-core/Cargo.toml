@@ -6,13 +6,29 @@ license.workspace = true
 repository.workspace = true
 description = "Portable host-agent core (ADR 0098 Phase 2): the HostEffects trait seams (CoordControlPlane, HostFs, DeviceSync, NbdKernel) plus their prod-portable impls — the macOS-runnable surface the host-internal simulator drives."
 
-[lints]
-workspace = true
+# `disk::punch_hole` wraps the kernel calls that release a chunk of a
+# volume (`fallocate`, `BLKDISCARD`, `F_PUNCHHOLE`). The safe Rust
+# surface has no binding for them. The workspace's `forbid` cannot be
+# relaxed from inside a file, so this crate lowers it to `deny`: still
+# an error everywhere, except in the functions that carry an explicit
+# `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
+[lints.rust]
+unsafe_code = "deny"
+
+# Replicated from the workspace `[workspace.lints.clippy]` table because
+# `[lints] workspace = true` cannot coexist with the crate-local
+# `unsafe_code` override (cargo forbids mixing); keep in sync with the
+# root Cargo.toml.
+[lints.clippy]
+disallowed_methods = "deny"
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
 engram-core.workspace = true
+# Hole punching (`fallocate` on Linux, `F_PUNCHHOLE` on macOS) for
+# `disk::Volume::zero_chunk`. Platform-portable, so unconditional.
+libc = "0.2"
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
@@ -20,3 +36,4 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
