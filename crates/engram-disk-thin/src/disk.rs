@@ -252,13 +252,32 @@ impl SessionDisk for ThinPoolDisk {
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
         let (thin, sectors) = self.thin_of(&origin.name).await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
-        self.dm.suspend(origin.name.as_str()).await?;
-        let created = self
-            .dm
-            .message(&self.pool, &format!("create_snap {id} {}", thin.id))
-            .await;
-        self.dm.resume(origin.name.as_str()).await?;
-        created?;
+        let dm = self.dm.clone();
+        let pool = self.pool.clone();
+        let origin_name = origin.name.as_str().to_owned();
+        // The origin holds all I/O while it is suspended, so the resume
+        // must run whatever happens to the caller: the three calls are
+        // one owned task.
+        tokio::spawn(async move {
+            dm.suspend(&origin_name).await?;
+            let created = dm
+                .message(&pool, &format!("create_snap {id} {}", thin.id))
+                .await;
+            let resumed = dm.resume(&origin_name).await;
+            match (created, resumed) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(e)) => {
+                    // The snapshot exists but nothing will activate it.
+                    if let Err(error) = dm.message(&pool, &format!("delete {id}")).await {
+                        tracing::warn!(pool = %pool, id, %error, "thin left behind by a failed resume");
+                    }
+                    Err(e)
+                }
+                (Err(e), _) => Err(e),
+            }
+        })
+        .await
+        .map_err(io::Error::other)??;
         self.activate(name, id, sectors).await
     }
 
