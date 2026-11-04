@@ -463,15 +463,24 @@ if sandbox_backend == 'process':
     if process_image_catalog:
         coord_env['ENGRAM_PROCESS_IMAGE_CATALOG'] = process_image_catalog
 
+# ADR 0125: the session disk runs over a dm-thin pool when one is named
+# (`thin-pool.sh` builds one; the fc-dev VM has a 20 GiB one called
+# engram-pool). A dev pool is far under the 16 GiB production floor, so
+# the placement floor drops with it; the host-agent reads the same
+# variable to decide when to reap kept checkpoint volumes.
+dev_thin_pool = env_or('ENGRAM_THIN_POOL', 'engram-pool' if fc_colima_profile else '')
+dev_pool_floor = env_or('ENGRAM_PLACEMENT_POOL_FLOOR_BYTES', '3221225472')
+if dev_thin_pool:
+    coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor
+
 if fc_colima_profile:
-    # The fc-dev VM has a ~19 GiB rootfs and a 20 GiB session-disk
-    # pool, both under the production floors (20 GiB disk cache, 16 GiB
-    # pool). Lower the placement floors (or the VM never takes a
-    # session) and the idle detector's disk floor, in lockstep with the
-    # VM-side host-agent idle-evict override below. Separate env vars on
-    # purpose: prod tunes idle eviction without loosening placement.
+    # The fc-dev VM has a ~19 GiB rootfs, under the production floors
+    # (20 GiB disk cache). Lower the placement floor (or the VM never
+    # takes a session) and the idle detector's disk floor, in lockstep
+    # with the VM-side host-agent idle-evict override below. Separate
+    # env vars on purpose: prod tunes idle eviction without loosening
+    # placement.
     coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
-    coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
 
 if bin_dir:
@@ -631,6 +640,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_po
     # would clobber the host-agent's PATH-lookup default.
     if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
+    # The session-disk pool and its floor, see `dev_thin_pool` above.
+    # Both must be in this map: the Linux host-agent runs under sudo
+    # --preserve-env=<these keys>.
+    if dev_thin_pool:
+        env['ENGRAM_THIN_POOL'] = dev_thin_pool
+        env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor
 
     if fc_colima_profile:
         # ADR 0082: this resource's whole execution model moves into the
