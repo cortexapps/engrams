@@ -38,7 +38,6 @@ members = [
     "crates/engram-git-github",
     "crates/engram-postgres",
     "crates/engram-dst",
-    "crates/engram-dst-host",
     "crates/engram-dst-cosim",
     "crates/engram-sim",
     "crates/engram-testkit",
@@ -117,7 +116,6 @@ engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-coordinator = { path = "crates/engram-coordinator" }
 engram-dst = { path = "crates/engram-dst" }
-engram-dst-host = { path = "crates/engram-dst-host" }
 engram-dst-cosim = { path = "crates/engram-dst-cosim" }
 engram-sim = { path = "crates/engram-sim" }
 engram-testkit = { path = "crates/engram-testkit" }

@@ -6,14 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Per-host daemon: chunked-OCI session create, snapshot manager, resource governor."
 
-# ADR 0007 Phase 4: the NBD daemon's `disk_daemon::runtime` module
-# wraps Linux kernel ioctls (`NBD_SET_SOCK`, `socketpair`, raw fd
-# ownership transfer to the kernel) that the safe Rust surface
-# can't model. We loosen `unsafe_code` from the workspace's
-# `forbid` to `allow` here so the unavoidable kernel-surface
-# blocks pass clippy; each block carries a `// SAFETY:` comment
-# explaining the invariant it relies on. Other lints stay at the
-# workspace default.
+# The host agent calls kernel interfaces the safe Rust surface can't
+# model (pidfd, mmap'd page-idle bitmaps, userfaultfd prefetch, raw
+# sysctls). We loosen `unsafe_code` from the workspace's `forbid` to
+# `allow` here; each block carries a `// SAFETY:` comment explaining
+# the invariant it relies on. Other lints stay at the workspace default.
 [lints.rust]
 unsafe_code = "allow"
 
@@ -58,9 +55,8 @@ async-trait.workspace = true
 base64.workspace = true
 bincode.workspace = true
 bytes.workspace = true
-# Raw libc bindings: the NBD ioctl orchestration in
-# `disk_daemon::runtime` (Linux) and the `hw.memsize` capacity
-# sysctl in `resource` (macOS). Call sites are target_os-gated;
+# Raw libc bindings for the kernel calls above and the `hw.memsize`
+# capacity sysctl in `resource` (macOS). Call sites are target_os-gated;
 # the dep is unconditional because `libc` is platform-portable.
 libc = "0.2"
 rustls.workspace = true

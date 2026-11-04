@@ -2408,7 +2408,6 @@ dependencies = [
  "engram-coordinator",
  "engram-core",
  "engram-crypto",
- "engram-dst-host",
  "engram-host-agent",
  "engram-host-core",
  "engram-oci",
@@ -2429,30 +2428,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "uuid",
- "workspace-hack",
-]
-
-[[package]]
-name = "engram-dst-host"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "engram-chunk-store",
- "engram-core",
- "engram-host-agent",
- "engram-host-core",
- "engram-sim",
- "engram-storage-local",
- "parking_lot 0.13.0",
- "rand 0.10.2",
- "rand_chacha 0.10.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
  "uuid",
  "workspace-hack",
 ]

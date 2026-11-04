@@ -1002,7 +1002,7 @@ impl HostService for HostServiceImpl {
         req: Request<StartAgentRequest>,
     ) -> Result<Response<Empty>, Status> {
         // `agent_handshake` is the suspected dominant cold-boot phase
-        // (in-VM kernel boot + ext4 mount + NBD page-in + agentd dial);
+        // (in-VM kernel boot + ext4 mount + agentd dial);
         // this span makes it visible in the end-to-end trace (ADR 0019).
         let span = tracing::info_span!("host.start_agent", phase = "agent_handshake");
         link_remote_parent(&span, &req);

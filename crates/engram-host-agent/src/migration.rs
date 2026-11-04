@@ -1,4 +1,4 @@
-//! Post-copy source exports hold the checkpoint fence and sealed disk bytes.
+//! Post-copy source exports hold the checkpoint fence and the sealed disk checkpoints.
 //! Capture pauses the source. Commit destroys it; an explicit abort resumes it.
 //! The TTL sweep checks coordinator ownership after serving activity stops.
 //! Once state.bin is served, the sweep must not resume the source.
@@ -60,13 +60,12 @@ pub struct MigrationExport {
     pub sandbox_id: SandboxId,
     /// Holds state.bin + the (patched) sidecar manifest.json.
     pub snapshot_dir: PathBuf,
-    /// ADR 0045 C2 disk post-copy: the sealed dirty/pending disk
-    /// tiers, raw bytes in RAM — served by index over
-    /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
-    /// dropped on commit (the dest drained them).
+    /// The disk checkpoints sealed under the pause, served by index over
+    /// `MigrationFetch::DiskChunkAt`; discarded on abort, released with
+    /// the sandbox on commit.
     pub disk_seal: std::collections::BTreeMap<
         engram_core::types::snapshot::DiskRole,
-        Arc<crate::disk_daemon::PostCopyDiskSeal>,
+        Arc<crate::pooled_backend::DiskSeal>,
     >,
     /// ADR 0098 P8: the TTL clock is the INJECTED monotonic clock
     /// (`now_mono`), not a raw `Instant` — expiry DECIDES destroy/abort,

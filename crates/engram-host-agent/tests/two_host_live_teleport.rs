@@ -1,6 +1,6 @@
 //! Two-host post-copy integration on real KVM. File-mode sources retain
 //! post-checkpoint RAM, a running harness, and held stdin across the move.
-//! NBD probes run after source destruction. A lost source must leave no VM.
+//! Disk probes run after source destruction. A lost source must leave no VM.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
@@ -56,7 +56,6 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
-    nbd_device: &Path,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("teleport-{label}-"))
@@ -80,15 +79,10 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
-        .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+        .with_chunk_store(chunk_store.clone())
+        .with_session_volumes(common::session_volumes(work.path(), chunk_store))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
-    let pooled = pooled.with_nbd_pool(
-        engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(
-            vec![nbd_device.to_path_buf()],
-        )
-        .expect("nbd slot pool"),
-    );
     (Arc::new(pooled), work)
 }
 
@@ -134,7 +128,7 @@ async fn dial(addr: std::net::SocketAddr) -> engram_protocol::grpc_client::GrpcH
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -143,9 +137,9 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -187,7 +181,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -196,7 +189,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -208,13 +200,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         image: "engram-two-host-teleport".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -615,7 +601,7 @@ int main(int argc, char **argv) {
 /// the in-flight turn) is unit-tested in engram-harness-claude's
 /// `connection_bounce_mid_turn_preserves_the_run`.
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_live_teleport_held_stdin_pipe_survives() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -624,9 +610,9 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -692,7 +678,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "pipe-b",
@@ -701,7 +686,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -712,13 +696,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         image: "engram-teleport-pipe".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -903,21 +881,13 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     host_b.peer.abort();
 }
 
-/// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
-/// sessions run on a CHUNKED-NBD rootfs, and both prod teleport
-/// canaries came out the other side with a corrupt disk — zeros /
-/// "Exec format error" on any UNCACHED read — while every memory-side
-/// probe passed. The sibling test above boots on a flat ext4 file
-/// (`rootfs_source`), so the migration's whole disk leg (pause-window
-/// drain, inline-manifest hand-off, dest NBD re-attach, drive
-/// re-point) had no real-VM coverage. Worse, on a single machine the
-/// frozen source's NBD device keeps serving correct bytes until
-/// commit, masking a wrong redirect — so this test COMMITS (source
-/// destroyed) BEFORE probing, then drops the guest page cache and
-/// re-reads through the destination's NBD. Byte-identical or bust.
+/// The disk leg of a move: the destination's root volume holds the
+/// image bytes and the session's own writes after the source is gone.
+/// Commits (source destroyed) BEFORE probing, then drops the guest page
+/// cache so every read goes to the destination's disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
-async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
+async fn two_host_teleport_rootfs_survives_source_destroy() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
         .unwrap_or(false)
@@ -925,9 +895,9 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -960,39 +930,33 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         |_tree| Ok(()),
     )
     .await;
-    let rootfs_manifest = outcome
-        .disk_manifest
-        .expect("ext4 bake produces a chunked disk manifest");
+    let rootfs_manifest = common::fork_lineage(&chunk_store, outcome.disk_manifest).await;
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
     let (pooled_a, _work_a) = build_host(
-        "nbd-a",
+        "disk-a",
         &kernel,
         &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
-        "nbd-b",
+        "disk-b",
         &kernel,
         &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
     let client_b = dial(host_b.addr).await;
 
-    // Create on A through the chunked-NBD rootfs path, exactly like a
-    // prod session (no flat ext4 file).
     let spec = SandboxSpec {
-        image: "engram-teleport-nbd".into(),
+        image: "engram-teleport-disk".into(),
         rootfs_source: None,
         image_uri: None,
         rootfs_manifest: Some(rootfs_manifest),
@@ -1042,7 +1006,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     common::postcopy::drain(&host_b.pooled, moved).await;
     assert!(
         cap.disk_manifest_ref.is_some(),
-        "NBD source advertises its disk base"
+        "the source advertises its disk checkpoint"
     );
     let row = host_b
         .pooled
@@ -1052,9 +1016,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     let durable_ref = row.memory_manifest.expect("durable memory manifest");
     assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
 
-    // COMMIT FIRST: the frozen source — whose NBD device on a
-    // one-machine test would happily keep serving the right bytes —
-    // is destroyed before any probe runs.
+    // Commit first: the frozen source is destroyed before any probe runs.
     client_a
         .migration_commit(
             vm,
@@ -1065,8 +1027,8 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
 
-    // Post-move disk truth, THROUGH the destination's NBD: drop the
-    // guest page cache so nothing is served from the RAM that moved.
+    // Drop the guest page cache so nothing is served from the RAM that
+    // moved.
     let dropped = exec(
         &host_b.pooled,
         moved,
@@ -1094,7 +1056,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     assert_eq!(
         probe_hash_b, probe_hash_a,
         "the session-written rootfs file must survive the move \
-         (travels via the pause-window disk drain)"
+         (travels in the sealed disk checkpoint)"
     );
 
     host_b.pooled.destroy(moved).await.expect("destroy moved");
@@ -1105,7 +1067,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -1114,9 +1076,9 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -1154,7 +1116,6 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "kb",
@@ -1163,7 +1124,6 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -1174,13 +1134,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         image: "engram-kill-source-test".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

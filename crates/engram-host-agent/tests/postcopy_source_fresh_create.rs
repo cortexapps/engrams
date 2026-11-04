@@ -15,9 +15,8 @@
 //! pagemap scan MUST classify those anonymous COW pages as sealed); and
 //! `migration_abort` resumes the guest with the sentinel intact.
 //!
-//! Runs in the NBD CI lane (root, `ENGRAM_TEST_NBD_DEVICE`): presetup
-//! requires the chunked NBD rootfs (the disk half of post-copy), and the
-//! vmstate-only capture needs the forked Firecracker (`ENGRAM_FC_FORK_BIN`).
+//! Runs as root (the pagemap scan); the vmstate-only capture needs the
+//! forked Firecracker (`ENGRAM_FC_FORK_BIN`).
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
@@ -31,7 +30,6 @@ use std::time::{Duration, Instant};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_host_agent::disk_daemon::NbdSlotAllocator;
 use engram_host_agent::migrate_peer::PeerServer;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -41,7 +39,7 @@ use engram_sandbox_firecracker::{
 use futures::StreamExt;
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + ENGRAM_FC_FORK_BIN + /dev/nbd0 (root) + Docker; boots microVMs"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN; boots microVMs"]
 async fn file_mode_fresh_create_is_a_post_copy_source() {
     let Some(env) = TestEnv::gate() else { return };
     let pooled = env.pooled();
@@ -127,7 +125,6 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
 struct TestEnv {
     kernel: std::path::PathBuf,
     fork_bin: std::path::PathBuf,
-    nbd_device: std::path::PathBuf,
     staged: common::StagedAgentdBundle,
     busybox: std::path::PathBuf,
     work: tempfile::TempDir,
@@ -157,21 +154,6 @@ impl TestEnv {
                 return None;
             }
         };
-        let nbd_device = std::path::PathBuf::from(
-            std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
-        );
-        if std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&nbd_device)
-            .is_err()
-        {
-            eprintln!(
-                "SKIP: cannot open {} R/W (needs `modprobe nbd` and root)",
-                nbd_device.display()
-            );
-            return None;
-        }
         let mksquashfs_missing = std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join("mksquashfs").is_file()))
             .unwrap_or(true);
@@ -205,7 +187,6 @@ impl TestEnv {
         Some(Self {
             kernel,
             fork_bin,
-            nbd_device,
             staged,
             busybox,
             work,
@@ -229,22 +210,14 @@ impl TestEnv {
         cache_cfg.budget_bytes = 1024 * 1024 * 1024;
         Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(
-                    self.chunk_store.clone(),
-                    self.work.path().join("materialize"),
-                )
+                .with_chunk_store(self.chunk_store.clone())
+                .with_session_volumes(common::session_volumes(self.work.path(), &self.chunk_store))
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
-                .with_checkpoint_dir(self.work.path().join("checkpoints"))
-                .with_nbd_pool(
-                    NbdSlotAllocator::from_paths(vec![self.nbd_device.clone()])
-                        .expect("nbd slot pool"),
-                ),
+                .with_checkpoint_dir(self.work.path().join("checkpoints")),
         )
     }
 
-    /// The chunked disk manifest of the baked rootfs: the base snapshot
-    /// then captures an NBD-served root, which presetup requires (the
-    /// disk half of post-copy is the NBD seal).
+    /// The sandbox's own lineage of a freshly baked rootfs.
     async fn bake(&self, name: &str) -> engram_core::types::manifest::ManifestRef {
         let outcome = common::bake_fixture_ext4(
             &self.images.path().join(format!("{name}.ext4")),
@@ -258,9 +231,7 @@ impl TestEnv {
             |_tree| Ok(()),
         )
         .await;
-        outcome
-            .disk_manifest
-            .expect("ext4 bake produces a chunked disk manifest")
+        common::fork_lineage(&self.chunk_store, outcome.disk_manifest).await
     }
 
     fn spec(&self, rootfs_manifest: engram_core::types::manifest::ManifestRef) -> SandboxSpec {

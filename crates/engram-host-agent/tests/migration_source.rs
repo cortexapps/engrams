@@ -23,11 +23,11 @@ use futures::StreamExt;
 mod common;
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn migration_capture_freezes_abort_resumes_commit_destroys() {
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     // ---- gating (same as checkpoint_chain) ----
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -123,11 +123,8 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let cache = engram_chunk_store::ChunkCache::new(cache_cfg);
     let pooled = Arc::new(
         PooledBackend::new(inner)
-            .with_nbd_pool(
-                engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
-                    .expect("nbd slot pool"),
-            )
-            .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
             .with_chunk_cache(cache.clone())
             .with_checkpoint_dir(work.path().join("checkpoints")),
     );
@@ -136,13 +133,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         image: "engram-migration-src-test".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

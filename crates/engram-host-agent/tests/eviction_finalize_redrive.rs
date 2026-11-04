@@ -5,7 +5,7 @@
 //! What this pins (the property the whole redesign exists for):
 //!
 //!   1. `snapshot_begin` on a real FC guest durably persists the
-//!      `EvictionFinalizeRecord` (+ any drained NBD disk-pending chunks)
+//!      `EvictionFinalizeRecord` (+ the pending disk checkpoints)
 //!      BEFORE returning.
 //!   2. "Generation A" (the host-agent process that started the
 //!      finalize) is simulated as DYING mid-upload: its spawned
@@ -187,16 +187,19 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     let checkpoint_dir = work.path().join("checkpoints");
     let pooled_a = Arc::new(
         PooledBackend::new(inner_a)
-            .with_chunk_store(gated_chunk_store.clone(), work.path().join("materialize"))
+            .with_chunk_store(gated_chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &gated_chunk_store))
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_a.set_self_ref(&pooled_a);
 
     let spec = SandboxSpec {
         image: "engram-evict-finalize-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(
+            common::fork_lineage(&gated_chunk_store, outcome.disk_manifest).await,
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -262,7 +265,8 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
 
     let pooled_b = Arc::new(
         PooledBackend::new(inner_b)
-            .with_chunk_store(gated_chunk_store, work.path().join("materialize"))
+            .with_chunk_store(gated_chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &gated_chunk_store))
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_b.set_self_ref(&pooled_b);

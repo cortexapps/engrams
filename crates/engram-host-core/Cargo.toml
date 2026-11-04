@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Portable host-agent core (ADR 0098 Phase 2): the HostEffects trait seams (CoordControlPlane, HostFs, DeviceSync, NbdKernel) plus their prod-portable impls — the macOS-runnable surface the host-internal simulator drives."
+description = "Portable host-agent core: the side-effect seams (CoordControlPlane, HostFs, SessionDisk) and the session-volume owner — the macOS-runnable surface the boundary simulator drives."
 
 # The workspace `forbid` cannot be relaxed per function; `deny` can.
 # Only `disk::punch_hole` and `disk::filesystem_space` carry an allow.

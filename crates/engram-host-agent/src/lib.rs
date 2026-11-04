@@ -1,7 +1,7 @@
 //! Per-host daemon. Wraps a [`SandboxBackend`], composes the
-//! chunked-OCI image cache / tiered chunk resolver / egress proxy /
-//! NBD pool, runs the snapshot manager and resource governor, and
-//! heartbeats the coordinator with capacity + local-snapshot state.
+//! chunked-OCI image cache / session volumes / egress proxy, runs the
+//! snapshot manager and resource governor, and heartbeats the
+//! coordinator with capacity + local-snapshot state.
 //!
 //! Phase 1 wires create/exec/destroy through the SandboxBackend trait —
 //! currently `engram-sandbox-process` for fast dev loops, with
@@ -10,7 +10,6 @@
 //! gRPC channel; today they go through an in-process trait object so
 //! the `--mode=all` single-binary path works.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use engram_chunk_store::{ChunkCache, ChunkStore};
@@ -22,7 +21,6 @@ use engram_host_core::CoordControlPlane;
 
 use crate::image_cache::ImageCache;
 
-pub mod admin_handler;
 pub mod base_shm_gc;
 pub mod bindings;
 pub mod bundles;
@@ -31,9 +29,7 @@ pub mod capture_job;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
-pub mod device_sync;
 pub mod dirty_map;
-pub mod disk_daemon;
 pub mod durable_envelope;
 pub mod durable_record;
 pub mod egress;
@@ -58,7 +54,6 @@ pub mod image_volumes;
 pub mod live_attach;
 pub mod materialize;
 pub mod metrics;
-pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod proxy_port;
 pub mod proxy_shell;
@@ -67,7 +62,6 @@ pub mod ram_ledger;
 pub mod resource;
 pub mod teardown_reconcile;
 mod time_source;
-pub mod trace_scope;
 pub mod util;
 pub mod warm_progress;
 
@@ -81,25 +75,19 @@ pub struct HostAgent {
     /// without one; `None` is for in-process tests and the VZ/Process
     /// backends, whose guests have no internet-facing network.
     pub egress: Option<Arc<egress::HostEgress>>,
-    /// Chunk store and the per-host materialization root. `None` keeps
-    /// the OCI-pulled `rootfs.ext4` path.
-    pub chunk_store: Option<(ChunkStore, PathBuf)>,
+    /// `None` keeps the OCI-pulled `rootfs.ext4` path.
+    pub chunk_store: Option<ChunkStore>,
     /// Per-host OCI image cache. `None` means sessions must arrive with
     /// `spec.rootfs_source` set (the dev-only path).
     pub image_cache: Option<ImageCache>,
     /// NVMe-backed chunk cache shared across manifests.
     pub chunk_cache: Option<ChunkCache>,
-    /// Root for per-sandbox sparse dirty files.
-    pub dirty_root: Option<PathBuf>,
-    /// `/dev/nbdN` slots the disk daemon serves chunked rootfs disks
-    /// from. `None` materializes each disk to a file instead.
-    pub nbd_pool: Option<Arc<disk_daemon::NbdSlotAllocator>>,
     /// The concrete Firecracker backend, for the startup reattach pass.
     /// `sandbox` cannot be downcast (the trait does not extend `Any`).
     /// `None` starts clean-slate.
     pub fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>,
     /// Where image and session volumes live. `None` keeps readiness on
-    /// the chunk cache alone.
+    /// the chunk cache alone and leaves the disks to the backend.
     pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
     /// This host's stable id, stamped on snapshot trace hints and passed
     /// to the UFFD handler. `None` generates one at run time.
@@ -123,8 +111,6 @@ impl HostAgent {
             chunk_store: None,
             image_cache: None,
             chunk_cache: None,
-            dirty_root: None,
-            nbd_pool: None,
             fc_for_reattach: None,
             session_disk: None,
             host_id: None,
@@ -137,8 +123,8 @@ impl HostAgent {
         self
     }
 
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
-        self.chunk_store = Some((chunk_store, materialize_dir));
+    pub fn with_chunk_store(mut self, chunk_store: ChunkStore) -> Self {
+        self.chunk_store = Some(chunk_store);
         self
     }
 
@@ -149,16 +135,6 @@ impl HostAgent {
 
     pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
         self.chunk_cache = Some(cache);
-        self
-    }
-
-    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
-        self.dirty_root = Some(root);
-        self
-    }
-
-    pub fn with_nbd_pool(mut self, pool: Arc<disk_daemon::NbdSlotAllocator>) -> Self {
-        self.nbd_pool = Some(pool);
         self
     }
 
@@ -276,8 +252,13 @@ impl HostAgent {
                 if let Some(egress) = self.egress.clone() {
                     p = p.with_egress(egress);
                 }
-                if let Some((cs, dir)) = self.chunk_store.clone() {
-                    p = p.with_chunk_store(cs, dir);
+                if let Some(cs) = self.chunk_store.clone() {
+                    if let Some(disk) = self.session_disk.clone() {
+                        p = p.with_session_volumes(Arc::new(
+                            engram_host_core::SessionVolumes::new(disk, cs.clone()),
+                        ));
+                    }
+                    p = p.with_chunk_store(cs);
                     // ADR 0080 §C: the MaterializeImage scratch root —
                     // gated on the chunk store because a materialize
                     // without one has nowhere durable to land. Same
@@ -292,9 +273,6 @@ impl HostAgent {
                 if let Some(cache) = self.chunk_cache.clone() {
                     p = p.with_chunk_cache(cache);
                 }
-                if let Some(root) = self.dirty_root.clone() {
-                    p = p.with_dirty_root(root);
-                }
                 if let Some(ic) = self.image_cache.clone() {
                     // ADR 0008 Phase 5: also feed the image cache's
                     // OciClient into the pooled backend so chunked-
@@ -303,27 +281,6 @@ impl HostAgent {
                     p = p.with_oci_client(ic.oci_client());
                     p = p.with_image_cache(ic);
                 }
-                if let Some(pool) = self.nbd_pool.clone() {
-                    p = p.with_nbd_pool(pool);
-                    // engrams#1378: the durable device→sandbox owner records
-                    // live beside the sandboxes (the same hostPath volume
-                    // the kernel bindings outlive pod rolls on).
-                    #[cfg(target_os = "linux")]
-                    {
-                        p = p.with_nbd_owner_dir(self.cfg.work_dir.join("nbd-owners"));
-                    }
-                }
-                // ADR 0016 Phase B: wire the coord-bound
-                // live-manifest publisher. The publisher's drain
-                // task is owned by `p` (via
-                // `LiveManifestPublisherHandle`), so it dies with
-                // the host-agent process.
-                let publisher_coord: Arc<dyn CoordControlPlane> =
-                    Arc::new(coord_client::HttpCoordClient::new(
-                        coord_url.clone(),
-                        self.cfg.coordinator_token.clone(),
-                    ));
-                p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
                 // ADR 0028 Fix A: checkpoint chains (rolling memory
                 // images + durable records) live under the work dir.
                 // Gated on (a) a chunk store being wired — nothing
@@ -354,11 +311,7 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
-                // ADR 0110: Reap files whose sandbox did not survive.
-                // Reap temporary files from dead processes.
-                // Run after reattach completes the live set.
-                // Run before registration can create or resume a sandbox.
-                arc.sweep_dirty_root().await;
+                arc.reconcile_volumes().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -536,32 +489,6 @@ impl HostAgent {
                 });
             }
 
-            // 2026-08-02 durability-rollback RCA: the quarantined-survivor
-            // rehydrate retry loop. A survivor whose register-time
-            // rehydrate failed used to stay quarantined until the
-            // coordinator's evict ladder DESTROYED it (the rollback);
-            // now the host keeps re-attempting the re-serve, and the
-            // coordinator's parked quarantine op converges losslessly
-            // once a retry lands. The loop is a thin cadence wrapper;
-            // `retry_quarantined_rehydrates_once` is the run_once step
-            // (ADR 0098). Skips are cheap when the map is empty.
-            #[cfg(target_os = "linux")]
-            {
-                const QUARANTINE_REHYDRATE_RETRY_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(30);
-                let pooled_for_rehydrate_retry = pooled.clone();
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(QUARANTINE_REHYDRATE_RETRY_INTERVAL);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        tick.tick().await;
-                        pooled_for_rehydrate_retry
-                            .retry_quarantined_rehydrates_once()
-                            .await;
-                    }
-                });
-            }
-
             // ADR 0045 C2: re-arm post-copy fences for sandboxes that
             // were mid-move across the host-agent restart. A DEST mid-
             // drain is reaped immediately (its drain state died with
@@ -610,8 +537,8 @@ impl HostAgent {
                                 tick.tick().await;
                                 // Issue #216 Gap 3: NEVER destroy on a
                                 // missing in-memory binding. The binding
-                                // rehydrates via the register task's
-                                // `rehydrate_survivors`, which races this
+                                // arrives with the register task's
+                                // response, which races this
                                 // tick and backs off up to 30 s when the
                                 // coordinator is unreachable — the very
                                 // condition that caused the restart. A
@@ -884,19 +811,6 @@ impl HostAgent {
                 host_total_mib,
                 "capacity reporting seeded from /proc/meminfo"
             );
-            // ADR 0007: surface the reaper to the coord. The host's
-            // gRPC server exposes ReapMaterializeDir; the coord's
-            // POST /api/admin/reap-materialize-dir fans it out
-            // across every connected host. Hosts without a
-            // chunk_store wiring leave admin_handler = None and
-            // the gRPC method returns Unimplemented.
-            let admin_handler: Option<
-                std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>,
-            > = self.chunk_store.as_ref().map(|(_, dir)| {
-                std::sync::Arc::new(admin_handler::MaterializeDirReaper::new(dir.clone()))
-                    as std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>
-            });
-
             // ADR 0068: resolve once, up front — the SAME `ProbeInputs`
             // feeds both the register POST below and every heartbeat
             // tick's re-probe. `bundle_dir` is hoisted here (out of the
@@ -915,6 +829,7 @@ impl HostAgent {
                         uffd_base_dir: cfg.uffd_base_dir.clone(),
                     }
                 }),
+                has_session_disk: pooled.session_volumes().is_some(),
             };
 
             // ADR 0013: per-process HttpCoordClient for HTTP traffic
@@ -930,17 +845,7 @@ impl HostAgent {
             // GrpcHostPool can't dispatch to us until host_addr
             // lands. Background loop with exponential backoff.
             //
-            // Issue #224: capture this task's JoinHandle so the SIGTERM
-            // path can ABORT it. It is the largest insert-after-sweep
-            // source: it awaits `rehydrate_survivors` (a multi-second
-            // pool-claim + GCS manifest fetch + netlink RECONFIGURE per
-            // survivor) AFTER registration succeeds, and an unaborted
-            // rehydrate can `nbd_sandboxes.insert` a survivor's live
-            // data plane after `abandon_nbd_data_planes_for_shutdown`
-            // already swept the (then-absent) entry. The terminal
-            // `abandoning` flag in PooledBackend is the correctness
-            // backstop, but aborting the task removes the race window
-            // entirely for the common case.
+            // The SIGTERM path aborts this task.
             let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
@@ -973,8 +878,7 @@ impl HostAgent {
                     handoff_marker: adopt_handoff_marker(&self.cfg.work_dir),
                 };
                 let cc = coord_client.clone();
-                let pooled_for_rehydrate = pooled.clone();
-                let work_dir_for_rehydrate = self.cfg.work_dir.clone();
+                let pooled_for_bindings = pooled.clone();
                 registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
@@ -1018,128 +922,12 @@ impl HostAgent {
                                          version (issue #229)",
                                     );
                                 }
-                                // ADR 0016 Phase B commit 7: rehydrate
-                                // any survivors PG knew about before
-                                // our restart. Best-effort per row;
-                                // one failure shouldn't block the
-                                // rest. Linux-only NBD path; the
-                                // PooledBackend method short-circuits
-                                // on missing config.
-                                #[cfg(target_os = "linux")]
-                                {
-                                    rehydrate_survivors(
-                                        &pooled_for_rehydrate,
-                                        &resp.rehydrate_sandboxes,
-                                    )
-                                    .await;
-                                    // Local-first backstop (session 731df805,
-                                    // 2026-07-17): the coord's list is derived
-                                    // from PG status and CAN be wrong — it
-                                    // omitted rung-parked survivors, nothing
-                                    // claimed their NBD devices, and the sweep
-                                    // below disconnected the live rootfs under
-                                    // the paused guests. Re-serve any live
-                                    // survivor the list missed from the durable
-                                    // chain-head records before the sweep
-                                    // snapshots the free pool.
-                                    let (local_rehydrated, local_failed) =
-                                        pooled_for_rehydrate.rehydrate_local_survivors().await;
-                                    if local_rehydrated + local_failed > 0 {
-                                        tracing::warn!(
-                                            rehydrated = local_rehydrated,
-                                            failed = local_failed,
-                                            "local survivor rehydrate pass acted on sandboxes \
-                                             the coordinator's rehydrate list missed",
-                                        );
-                                    }
-                                    // #1003 ladder 4 — pass 3: spec-based
-                                    // re-serve for survivors BOTH passes
-                                    // missed (never-flushed sessions: no
-                                    // manifest in the coord row, no spool
-                                    // after SIGKILL). Lineage comes from
-                                    // sandbox.json, the session mapping
-                                    // from the binding record. Before this,
-                                    // such devices stayed RECONNECTABLE
-                                    // with no retry owner.
-                                    match crate::bindings::BindingStore::open(
-                                        work_dir_for_rehydrate.join("bindings"),
-                                    ) {
-                                        Ok(binding_reader) => {
-                                            let (spec_rehydrated, spec_failed, unserved) =
-                                                pooled_for_rehydrate
-                                                    .rehydrate_unserved_from_specs(
-                                                        &work_dir_for_rehydrate,
-                                                        &binding_reader,
-                                                    )
-                                                    .await;
-                                            if spec_rehydrated + spec_failed + unserved > 0 {
-                                                tracing::warn!(
-                                                    rehydrated = spec_rehydrated,
-                                                    failed = spec_failed,
-                                                    unserved,
-                                                    "spec-based rehydrate pass finished; \
-                                                     unserved>0 means a resident VM runs \
-                                                     without its disk served",
-                                                );
-                                            }
-                                        }
-                                        Err(e) => tracing::warn!(
-                                            error = %e,
-                                            "spec-based rehydrate: binding store open failed",
-                                        ),
-                                    }
-                                    // ADR 0044 K2: stale-binding sweep AFTER
-                                    // the survivors have claimed their slots
-                                    // — only still-free devices are probed,
-                                    // so a survivor's live (busy-by-design)
-                                    // device can never be disconnected by
-                                    // this pass. Replaces the old eager
-                                    // sweep at pool construction, which
-                                    // killed a survivor's disk in prod
-                                    // (2026-06-11, /dev/nbd4).
-                                    if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
-                                        // Wave 7b (#784 layers 2–3): the startup
-                                        // classification BARRIER. Before any
-                                        // destructive pass runs, reconcile the
-                                        // KERNEL-DERIVED inventory (connected
-                                        // `/dev/nbdN` × the holder scan) against
-                                        // the tracked records and classify every
-                                        // slot. A survivor invisible to the
-                                        // records is QUARANTINED + alerted
-                                        // (`rehydrate-unknown-device`), never
-                                        // skipped; the sweep then reaps ONLY the
-                                        // `TerminalSafeToReap` subset — the
-                                        // ordering contract enforced by the
-                                        // `ReapList` type, not a comment. The
-                                        // barrier subsumes the old free-paths
-                                        // snapshot (the reap set is a subset of
-                                        // it, kernel-proven stale). Detached so
-                                        // register returns promptly; the
-                                        // per-device claim inside the sweep is
-                                        // still the TOCTOU correctness gate.
-                                        let reap = pooled_for_rehydrate
-                                            .classify_startup_slots(
-                                                &disk_daemon::HostNbdKernel,
-                                                &resp.rehydrate_sandboxes,
-                                            )
-                                            .await
-                                            .reap;
-                                        tokio::spawn(async move {
-                                            disk_daemon::recover_stuck_nbd_devices(&nbd_pool, reap)
-                                                .await;
-                                        });
-                                    }
-                                }
-                                #[cfg(not(target_os = "linux"))]
-                                {
-                                    let _ = pooled_for_rehydrate;
-                                    let _ = &work_dir_for_rehydrate;
-                                    if !resp.rehydrate_sandboxes.is_empty() {
-                                        tracing::info!(
-                                            count = resp.rehydrate_sandboxes.len(),
-                                            "rehydrate list returned but host isn't Linux/NBD; ignoring",
-                                        );
-                                    }
+                                // Survivors run on; the coordinator's row
+                                // is the session binding their next
+                                // checkpoint publishes under.
+                                for entry in &resp.rehydrate_sandboxes {
+                                    pooled_for_bindings
+                                        .record_session_binding(entry.sandbox_id, entry.session_id);
                                 }
                                 break;
                             }
@@ -1188,7 +976,6 @@ impl HostAgent {
             // `grpc_listen_addr=None`.
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
-                let admin_for_grpc = admin_handler.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
@@ -1200,7 +987,7 @@ impl HostAgent {
                     if let Err(e) = grpc_server::boot(
                         addr,
                         local_for_grpc,
-                        admin_for_grpc,
+                        None,
                         epochs,
                         peer_for_grpc,
                     )
@@ -1255,10 +1042,7 @@ impl HostAgent {
             // `enabled_images_tx.is_some()` implicitly stand in for it.
             let stages_images =
                 stages_images_gate(self.chunk_store.is_some(), self.chunk_cache.is_some());
-            let enabled_images_tx = match (
-                self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
-                self.chunk_cache.clone(),
-            ) {
+            let enabled_images_tx = match (self.chunk_store.clone(), self.chunk_cache.clone()) {
                 (Some(chunk_store), Some(chunk_cache)) => {
                     // ADR 0022 Option A / ADR 0092: a fresh create always
                     // restores on the File backend, so the supervisor
@@ -1315,7 +1099,7 @@ impl HostAgent {
             // pinned generations into the same dir.
             let bundle_ext = self.sandbox.bundle_file_ext();
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
-            let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
+            let live_bundles_tx = self.chunk_store.as_ref().map(|cs| {
                 bundles::spawn_supervisor(
                     bundles::BundleStore::new(
                         cs.blob_storage().clone(),
@@ -1332,7 +1116,7 @@ impl HostAgent {
             // a generation a running VM has attached (the 2026-08-10
             // `chain_poisoned` firing). Fire-and-forget: must never
             // gate readiness or heartbeating.
-            if let Some((cs, _)) = self.chunk_store.as_ref() {
+            if let Some(cs) = self.chunk_store.as_ref() {
                 bundles::spawn_startup_publish(
                     bundles::BundleStore::new(
                         cs.blob_storage().clone(),
@@ -1371,7 +1155,6 @@ impl HostAgent {
             let coord_for_heartbeat = coord_client.clone();
             let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
-            let nbd_pool_for_heartbeat = pooled.nbd_pool();
             let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
@@ -1435,19 +1218,6 @@ impl HostAgent {
                     // survive the host sweep + bundle GC until the
                     // first snapshot pins them durably).
                     let sandbox_bundles = pooled_for_heartbeat.aux_bundles_all().await;
-                    if let Some(pool) = &nbd_pool_for_heartbeat {
-                        let slots = pool.slot_counts().await;
-                        for (state, count) in [
-                            ("capacity", slots.capacity),
-                            ("free", slots.free),
-                            ("warm", slots.warm),
-                            ("in_use", slots.in_use),
-                            ("parked", slots.parked),
-                        ] {
-                            ::metrics::gauge!(crate::metrics::NBD_SLOTS, "state" => state)
-                                .set(count as f64);
-                        }
-                    }
                     // ADR 0022 Option A: sample summed guest PSS/RSS across
                     // this host's live FC sandboxes — the density signal
                     // (Σpss/Σrss → ~1.0 under UFFD private copies, < 1.0 as
@@ -1549,16 +1319,7 @@ impl HostAgent {
                             kind: r.kind,
                         })
                         .collect();
-                    let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
-                    if let Some(pool) = &nbd_pool_for_heartbeat {
-                        utilization.nbd_sandboxes = pooled_for_heartbeat.nbd_sandbox_slots();
-                        utilization.nbd_slots_total = pool.capacity() as u32;
-                        // Retain the sampled attachments if one releases while
-                        // the allocator count is read. This can only overcount.
-                        utilization.nbd_slots_in_use =
-                            pool.in_use().max(utilization.nbd_sandboxes.values().sum());
-                    }
-                    pooled_for_heartbeat.publish_disk_co_tenants().await;
+                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
                     // ADR 0068: re-run every probe this tick. Cheap
                     // (statfs/stat/one TCP connect/a memfd-backed uffd
                     // self-test; the FC binary version is cached after
@@ -1570,11 +1331,6 @@ impl HostAgent {
                     // until the coord's ack names it — the
                     // `checkpoints`/`acked_checkpoints` pattern verbatim.
                     let capture_job_reports = capture_jobs_for_heartbeat.current_reports();
-                    // engrams#1378: attributed residue + its known flag (the
-                    // issue-#215 asymmetry — unclassified is "no
-                    // information", not "no residue").
-                    let (device_residue, device_residue_known) =
-                        pooled_for_heartbeat.nbd_residue_report();
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1621,21 +1377,12 @@ impl HostAgent {
                         stages_images: stages_images_for_heartbeat,
                         capabilities,
                         capture_job_reports,
-                        // ADR 0090: re-advertised until the sandbox is
-                        // destroyed; the coord enqueues evict_local (the op
-                        // layer dedups repeats).
-                        quarantined_survivors: pooled_for_heartbeat.quarantined_survivors(),
+                        quarantined_survivors: Vec::new(),
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
-                        // engrams#1378: attributed NBD residue — leftovers of
-                        // interrupted teardowns awaiting a tombstone. The
-                        // coordinator counts these as PRESENT for tombstone
-                        // ack-by-absence and the A5 unbound-entomb arm, so a
-                        // tombstone stays advertised (and gets re-driven into
-                        // `destroy`) until the kernel binding is actually gone.
-                        device_residue_sandboxes: device_residue,
-                        device_residue_known,
+                        device_residue_sandboxes: Vec::new(),
+                        device_residue_known: true,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
@@ -1826,20 +1573,7 @@ impl HostAgent {
             // same ledger numbers, one hop later.
 
             shutdown_signal().await;
-            // 2026-08-02 durability-rollback RCA: raise the terminal
-            // shutdown-abandon mode as the FIRST act after SIGTERM, before
-            // any task abort. From here to process exit, a dropped
-            // `NbdHandle` leaves its kernel config alive instead of
-            // netlink-disconnecting it: the aborts below drop in-flight
-            // task locals (a rehydrate/create mid-await holds a live
-            // handle), and a panic anywhere in the ladder unwinds the
-            // data-plane map — both previously de-configured surviving
-            // guests' devices, making the successor's RECONFIGURE meet
-            // "not configured" and the survivors uncapturable.
-            #[cfg(target_os = "linux")]
-            disk_daemon::enter_shutdown_abandon_mode();
-            // 2026-08-03 `chain_poisoned` alert: quiesce captures with the
-            // same raise-first urgency. From here no capture may START —
+            // Quiesce captures first. From here no capture may START —
             // one that did would consume the KVM dirty bitmap and then die
             // in the runtime teardown, poisoning its checkpoint chain (the
             // surviving VM pays a FULL re-chunk under the successor). The
@@ -1875,18 +1609,6 @@ impl HostAgent {
             if let Some(t) = grpc_task {
                 t.abort();
             }
-            // Issue #224: abort the registration/rehydrate task BEFORE
-            // the abandon sweep below. It is the largest insert-after-
-            // sweep source — its `rehydrate_survivors` await window can
-            // `nbd_sandboxes.insert` a survivor's live data plane after
-            // the sweep, which `NbdHandle::Drop` would then netlink-
-            // disconnect at process exit (the very "Disconnected due to
-            // user request → successor's RECONFIGURE meets 'not
-            // configured'" failure the K2 fix shipped to eliminate).
-            // The terminal `abandoning` flag set inside the sweep is the
-            // correctness backstop for the in-flight-gRPC and
-            // already-past-abort-point cases; this abort removes the
-            // common-case window outright.
             if let Some(t) = registration_task.take() {
                 t.abort();
             }
@@ -1907,97 +1629,23 @@ impl HostAgent {
             // *controlled* node drain migrates active sessions off first
             // (the K3 operator / admin endpoints), so by the time SIGTERM
             // lands there is nothing left here to lose.
-            //
-            // ADR 0044 K2: the NBD data planes must be ABANDONED, not
-            // dropped — process unwind would otherwise run
-            // NbdHandle::Drop → netlink disconnect and tear down the
-            // survivors' disks on the way out (the 2026-06-12 canary:
-            // "Disconnected due to user request" at old-pod SIGTERM,
-            // then the successor's RECONFIGURE met "not configured").
-            // Abandon kills only in-process resources; the kernel
-            // config persists with guest I/O parked under
-            // dead_conn_timeout until the successor reconfigures.
-            #[cfg(target_os = "linux")]
-            {
-                // Issue #225: BEFORE abandoning the data planes, run a
-                // bounded final disk-flush pass. ADR 0110 note: acked
-                // writes now survive process death in the per-sandbox
-                // dirty file, so this pass no longer guards against
-                // rollback — it keeps the published manifest fresh so
-                // the successor's recovery has less to upload. It
-                // retires per the ADR 0110 rollout. The pass drains +
-                // uploads each survivor's dirty chunks and synchronously
-                // republishes its live_disk_manifest so the successor
-                // rehydrates from the current ref. It is budgeted against
-                // the pod's terminationGracePeriodSeconds (minus headroom
-                // for the abandon sweep + detach below); on overrun it
-                // logs the still-dirty survivors loudly and proceeds. The
-                // budget parse+default is the pure `plan_shutdown` decision
-                // (ADR 0098 P4, Flow A) so the simulator drives the same
-                // deadline arithmetic.
-                let plan = engram_host_core::plan_shutdown(
-                    std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<f64>().ok()),
-                    std::env::var("ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<f64>().ok()),
+            // A capture already past FC's snapshot create has consumed the
+            // KVM dirty bitmap: its post-processing (sparse re-chunk, upload,
+            // chain-head persist) must finish before this process exits or
+            // the chain poisons. Bounded by
+            // `ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS`.
+            let deadline = engram_host_core::capture_drain_budget(
+                std::env::var("ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok()),
+            );
+            let stragglers = pooled.drain_captures_for_shutdown(deadline).await;
+            if stragglers > 0 {
+                tracing::warn!(
+                    stragglers,
+                    "SIGTERM: captures still in flight at the capture-drain \
+                     deadline; their chains will poison at process exit",
                 );
-                // CaptureDrain stage (2026-08-03 `chain_poisoned` alert):
-                // wait — bounded — for any capture already past FC's
-                // snapshot create. Its post-processing (sparse re-chunk,
-                // upload, chain-head persist) must complete BEFORE this
-                // process exits, or the consumed dirty bitmap is
-                // unrecoverable and the chain poisons. Runs before the
-                // final flush: a capture holds its guest's pause/flush
-                // path, and the flush pass below wants quiesced planes.
-                // Unwind-isolated like the other rungs — a panic here must
-                // still reach the abandon sweep + spool export.
-                let stragglers = shutdown_stage_unwind_isolated(
-                    "capture_drain",
-                    pooled.drain_captures_for_shutdown(plan.capture_drain_deadline),
-                )
-                .await
-                .unwrap_or(0);
-                if stragglers > 0 {
-                    tracing::warn!(
-                        stragglers,
-                        "SIGTERM: captures still in flight at the capture-drain \
-                         deadline; their chains will poison at process exit",
-                    );
-                }
-                // 2026-08-02 durability-rollback RCA: the flush pass is
-                // best-effort GCS durability; the abandon sweep + spool
-                // export below are the survivors' correctness backstop. A
-                // panic here (the #969 JoinHandle re-poll fired at exactly
-                // this point) must therefore never unwind past the sweep —
-                // isolate it and continue the ladder.
-                shutdown_stage_unwind_isolated(
-                    "final_flush",
-                    pooled.flush_nbd_data_planes_for_shutdown(plan.flush_deadline),
-                )
-                .await;
-                // The abandon sweep also exports any still-un-uploaded
-                // dirty chunks to the node-local shutdown spool (2026-07-16
-                // session-85e0298a RCA) so the successor adopts them
-                // instead of rolling the live guest's disk back. Unwind-
-                // isolated for the same reason as the flush pass: a panic
-                // mid-sweep must still reach the detach step, and the
-                // shutdown-abandon mode keeps the un-swept remainder's
-                // kernel configs alive at process exit.
-                let abandoned = shutdown_stage_unwind_isolated(
-                    "abandon_sweep",
-                    pooled.abandon_nbd_data_planes_for_shutdown(),
-                )
-                .await
-                .unwrap_or(0);
-                if abandoned > 0 {
-                    tracing::info!(
-                        abandoned,
-                        "SIGTERM: abandoned NBD data planes (kernel configs left \
-                         alive for the successor to RECONFIGURE)",
-                    );
-                }
             }
             tracing::info!(
                 "SIGTERM: detaching running microVMs (left alive for the successor \
@@ -2013,29 +1661,6 @@ impl HostAgent {
     }
 }
 
-/// ADR 0016 Phase B commit 7: rebuild chunked-disk tracking for
-/// survivors PG already had bound to this host pre-restart. Called
-/// from the host-registration success branch with the list coord
-/// returned. Best-effort per row: a failure on one survivor logs
-/// + continues; the host doesn't fail registration over it.
-///
-/// Each survivor gets:
-/// 1. NBD slot + ChunkedDiskBackend rebuilt from the effective
-///    disk manifest (newer of `live_disk_manifest_*` and the
-///    latest recoverable snapshot — picked server-side by
-///    `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`).
-/// 2. NBD daemon spawned.
-/// 3. `nbd_sandboxes` entry installed.
-/// 4. FlushScheduler spawned with the (session_id, sandbox_id)
-///    pair. Continuous flush resumes immediately.
-/// 5. `session_bindings` pre-populated so the publisher's
-///    sandbox→session lookup finds the binding on the first
-///    post-rehydrate tick.
-///
-/// Survivors without a chunked disk manifest (legacy sessions, or
-/// hosts where the publisher never landed a value) are skipped
-/// with a debug log. They run "untracked" until the next eviction
-/// snapshot.
 /// ADR 0036 amendment (issue #538): whether this host's heartbeat should
 /// advertise `stages_images: true` — the queue-scanner's prestage-wait
 /// gates on this flag, so it must exactly track whether the
@@ -2045,114 +1670,6 @@ impl HostAgent {
 /// unit-testable without wiring a real supervisor.
 fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
     has_chunk_store && has_chunk_cache
-}
-
-/// 2026-08-02 durability-rollback RCA: run one SIGTERM shutdown-ladder
-/// stage with panic isolation. A panic between the flush pass and the
-/// abandon sweep unwound `main` on 2026-08-02, netlink-disconnected every
-/// survivor's device, and skipped the shutdown-spool export — the acked
-/// writes were unrecoverable and the coordinator destroyed the survivors.
-/// The ladder's later rungs (abandon, spool export, detach) are the
-/// durability backstop for the earlier ones, so no rung may unwind past
-/// them. Returns `None` when the stage panicked; the caller continues the
-/// ladder with the stage's effects partially applied — every rung is
-/// written to tolerate that (the sweep drains whatever is left in the
-/// map; the flag guard on `NbdHandle::Drop` covers what the unwind
-/// already dropped).
-///
-/// `AssertUnwindSafe` is sound here: the shared state a panicked stage
-/// can leave behind (the data-plane map, dirty tiers) is exactly the
-/// state the later rungs are designed to sweep regardless of how the
-/// stage ended.
-//
-// `any(..., test)`: the only src callers are in the linux-gated SIGTERM
-// block, but the regression tests below must compile on macOS too.
-#[cfg(any(target_os = "linux", test))]
-async fn shutdown_stage_unwind_isolated<T>(
-    stage: &'static str,
-    fut: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    use futures::future::FutureExt as _;
-    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
-        Ok(v) => Some(v),
-        Err(payload) => {
-            let panic_msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            tracing::error!(
-                stage,
-                panic = %panic_msg,
-                "SIGTERM shutdown stage PANICKED; contained — the ladder \
-                 continues so the abandon sweep + spool export still run",
-            );
-            ::metrics::counter!(crate::metrics::SHUTDOWN_STAGE_PANIC_TOTAL).increment(1);
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn rehydrate_survivors(
-    pooled: &Arc<pooled_backend::PooledBackend>,
-    survivors: &[coord_client::RehydrateSandboxRef],
-) {
-    if survivors.is_empty() {
-        return;
-    }
-    let mut rehydrated = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-    for entry in survivors {
-        let (Some(mid), Some(ver)) = (entry.disk_manifest_id, entry.disk_manifest_version) else {
-            // #1003 ladder 4: a never-flushed session's row has no
-            // manifest — the spec-based pass owns its re-serve. Loud,
-            // not debug!: this used to be the silent first hop of the
-            // nobody-owns-the-re-serve chain.
-            ::metrics::counter!(
-                "engram_nbd_rehydrate_skipped_total",
-                "reason" => "no_disk_manifest_on_row",
-            )
-            .increment(1);
-            tracing::warn!(
-                session_id = %entry.session_id,
-                sandbox_id = %entry.sandbox_id,
-                "rehydrate skipped: no disk manifest on the survivor row \
-                 (never-flushed session — the spec-based pass will re-serve)",
-            );
-            skipped += 1;
-            continue;
-        };
-        let manifest_ref = engram_core::types::manifest::ManifestRef {
-            manifest_id: mid,
-            version: ver,
-        };
-        match pooled
-            .rehydrate_sandbox(entry.session_id, entry.sandbox_id, manifest_ref)
-            .await
-        {
-            Ok(true) => rehydrated += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %entry.session_id,
-                    sandbox_id = %entry.sandbox_id,
-                    manifest = %manifest_ref,
-                    error = %e,
-                    "rehydrate failed for survivor sandbox; continuing with the rest",
-                );
-                failed += 1;
-            }
-        }
-    }
-    tracing::info!(
-        total = survivors.len(),
-        rehydrated,
-        skipped,
-        failed,
-        "Phase B rehydration pass complete",
-    );
 }
 
 /// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
@@ -2306,25 +1823,6 @@ impl From<std::io::Error> for HostAgentError {
 mod tests {
     use super::*;
     use engram_core::SessionId;
-
-    /// 2026-08-02 durability-rollback RCA regression: a panic inside a
-    /// shutdown-ladder stage must be contained (return `None`), never
-    /// propagate — the abandon sweep + spool export run after it.
-    #[tokio::test]
-    async fn shutdown_stage_panic_is_contained() {
-        let out: Option<()> = shutdown_stage_unwind_isolated("test_stage", async {
-            panic!("boom in the flush pass")
-        })
-        .await;
-        assert_eq!(out, None, "a panicked stage yields None, not an unwind");
-    }
-
-    /// The happy path passes the stage's value through untouched.
-    #[tokio::test]
-    async fn shutdown_stage_ok_passes_value_through() {
-        let out = shutdown_stage_unwind_isolated("test_stage", async { 7usize }).await;
-        assert_eq!(out, Some(7));
-    }
 
     fn noop_hub_over(dir: &std::path::Path) -> harness::HarnessHub {
         harness::HarnessHub::new(

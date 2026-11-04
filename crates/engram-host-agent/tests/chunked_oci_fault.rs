@@ -15,9 +15,6 @@
 //! 2. **Warm path** — the same materialize re-issued after the cold
 //!    path completes. BlobStorage now holds the chunks; the cache
 //!    tier hits, the origin tier is not consulted.
-//! 3. **`PooledBackend::with_oci_client` dispatch** — exercises the
-//!    upgrade path that constructs the tiered resolver when a
-//!    `CachedImage::is_disk_chunked_oci()` artifact is presented.
 //!
 //! Runs in CI with zero external dependencies — the fake registry
 //! is a 60-line `axum` router bound to `127.0.0.1:0`.
@@ -637,102 +634,4 @@ async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty(
     )
     .await
     .expect("second call should be idempotent");
-}
-
-/// `PooledBackend`-level dispatch: when an image is chunked-OCI
-/// shaped AND an OciClient is configured, the upgrade path swaps
-/// in the tiered resolver. Exercises the `is_disk_chunked_oci` +
-/// `build_oci_chunk_index` + tiered-resolver chain via the public
-/// `CachedImage` surface; the actual upgrade method
-/// (`PooledBackend::upgrade_chunk_store_for_chunked_oci`) is
-/// crate-private but the same code path runs on every call to
-/// `resolve_rootfs`.
-#[tokio::test]
-async fn cached_image_chunked_oci_drives_tiered_materialize_end_to_end() {
-    // Same setup as the first test, but instead of constructing
-    // the resolver chain by hand, we go through CachedImage's
-    // Phase 5 helpers. This proves the discovery path
-    // (bootstrap.disk.json sidecar → OciChunkIndex) is consistent
-    // with what hand-built setups exercise.
-    use engram_host_agent::image_cache::CachedImage;
-
-    let (raw_chunks, registry_blobs, bootstrap) = fixture_chunks();
-    let (addr, registry, _shutdown) = spawn_fake_registry(registry_blobs).await;
-    let image_uri = format!("127.0.0.1:{}/chunked:v1", addr.port());
-
-    // Write the bootstrap file out to disk — CachedImage's
-    // build_oci_chunk_index reads it from the cache directory.
-    let cache_root = tempfile::tempdir().unwrap();
-    let bs_path = cache_root.path().join("bootstrap.disk.json");
-    std::fs::write(&bs_path, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
-
-    let cached = CachedImage {
-        manifest_path: cache_root.path().join("manifest.toml"),
-        rootfs_path: None,
-        bundle: None,
-        disk_bootstrap_path: Some(bs_path),
-        digest: "sha256:test_cached".into(),
-    };
-    assert!(cached.is_disk_chunked_oci());
-
-    let index = cached
-        .build_oci_chunk_index()
-        .await
-        .unwrap()
-        .expect("chunked image → index");
-    assert_eq!(index.len(), raw_chunks.len());
-
-    // Build the same tiered chain the upgrade path constructs.
-    let (blob, _blob_dir) = fresh_blob_storage();
-    let oci_client = OciClient::new(Arc::new(AnonymousResolver));
-    let oci_resolver: Arc<dyn ChunkResolver> =
-        Arc::new(OciChunkResolver::new(oci_client, image_uri.clone(), index));
-    let cache_resolver: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(blob.clone()));
-    let tiered = Arc::new(TieredChunkResolver::new(
-        vec![cache_resolver, oci_resolver],
-        Some(blob.clone()),
-    ));
-
-    let store = ChunkStore::new(blob.clone()).with_resolver(tiered);
-    let manifest = Manifest {
-        schema_version: 1,
-        kind: ManifestKind::Disk,
-        total_bytes: bootstrap.total_bytes,
-        chunk_size: bootstrap.chunk_size,
-        chunks: bootstrap
-            .entries
-            .iter()
-            .map(|e| engram_chunk_store::ChunkRef {
-                offset: e.file_offset,
-                hash: e.sha256,
-            })
-            .collect(),
-        parent: None,
-        working_set_trace: None,
-        annotations: serde_json::Value::Null,
-    };
-    let manifest_ref = ManifestRef::new();
-    store.put_manifest(manifest_ref, &manifest).await.unwrap();
-
-    let dest = tempfile::NamedTempFile::new().unwrap();
-    store
-        .materialize_to_file(&manifest, dest.path())
-        .await
-        .expect("materialize via tiered store");
-
-    // The OCI registry was consulted; CDN-fill ran; chunks are now
-    // cached. Re-materialize and confirm zero origin fetches.
-    let after_cold = registry.fetches.load(Ordering::Relaxed);
-    assert_eq!(after_cold, raw_chunks.len());
-
-    let dest2 = tempfile::NamedTempFile::new().unwrap();
-    store
-        .materialize_to_file(&manifest, dest2.path())
-        .await
-        .expect("warm re-materialize");
-    let after_warm = registry.fetches.load(Ordering::Relaxed);
-    assert_eq!(
-        after_warm, after_cold,
-        "warm re-materialize must not consult OCI"
-    );
 }

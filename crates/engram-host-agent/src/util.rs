@@ -114,9 +114,6 @@ impl UtilizationProbe {
             nbd_sandboxes: Default::default(),
             disk_total_mib,
             disk_used_mib,
-            // ADR 0112: filled by the heartbeat loop from
-            // `publish_disk_co_tenants` (needs the backend, which the
-            // probe deliberately doesn't hold).
             mem_total_mib: ledger.mem_total_mib,
             mem_used_mib: ledger
                 .mem_total_mib

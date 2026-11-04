@@ -9,11 +9,11 @@
 //!
 //! The world is deliberately tiny — **1 coordinator replica, 1 host, ≤3 live
 //! sessions** — because the co-simulated state space is the product of the
-//! coordinator's session FSM, the host's device plane, the reconcile world,
+//! coordinator's session FSM, the host's volumes, the reconcile world,
 //! AND the bridge-fault interleavings. A larger world multiplies horizons
 //! without exploring a qualitatively new class at the BOUNDARY (which is what
 //! this rung exists for); the fault profile is biased to the boundary family
-//! (roll / rehydrate / sweep / un-pause / straggler / bind-loss) so the seeds
+//! (restart / register / straggler / bind-loss) so the seeds
 //! spend their steps where the risk lives, not on breadth.
 //!
 //! # The bridge faults (the applied-commit-but-ack-lost window)
@@ -81,22 +81,10 @@ pub enum Step {
     EvictToIdle(usize),
     /// Resume session slot `.0` from Idle.
     Resume(usize),
-    /// Rung-2 park session slot `.0`.
-    Park(usize),
-    /// Un-pause session slot `.0` (the REAL data-plane gate).
-    Unpause(usize),
-    /// Host-agent roll (new generation; survivors resident).
-    Roll,
-    /// Register-rehydrate against the REAL coordinator listing (`.0` = the #739
-    /// local pass on/off).
-    RegisterRehydrate(bool),
-    /// The stale-binding sweep (REAL `sweep_verdict`).
-    StaleSweep,
-    /// The FC guest for session slot `.0` genuinely dies (#806 holder gone).
-    KillGuest(usize),
-    /// Wave 7b (#784 layer 2): lose session slot `.0`'s tracked records (#769
-    /// gap A) — a resident guest holds a device no record accounts for.
-    LoseRecord(usize),
+    /// Host-agent restart (the startup volume reconcile; survivors resident).
+    Restart,
+    /// The registration ack against the REAL coordinator listing.
+    RegisterRehydrate,
     /// One teardown-reconcile tick (`.0` = honor the capture signal).
     ReconcileTick(bool),
     /// One coordinator `host_lost_straggler_sweep` tick (#782/#777).
@@ -111,10 +99,6 @@ pub enum Step {
     ForceTerminal(usize),
     /// Drive one finalize attempt per in-flight capture.
     FinalizePending,
-    /// `try_claim` a spare NBD device (slot-accounting).
-    SlotClaim,
-    /// Release the oldest spare lease (slot-accounting).
-    SlotPopulate,
     /// The idle detector nominates over-idle sessions.
     IdleDetector,
     /// ADR 0035 amendment: the full heartbeat → pin-set → materialize/sweep
@@ -193,21 +177,17 @@ impl CosimSwarm {
         match self.profile {
             Profile::Calm => match roll {
                 0..=6 if self.sessions.len() < MAX_SESSIONS => Step::BootSession,
-                7..=18 => Step::GuestWork(slot, self.rng.random_range(1..3)),
-                19..=24 => Step::PeriodicCheckpoint(slot),
-                25..=32 => Step::EvictToIdle(slot),
-                33..=39 => Step::Resume(slot),
-                40..=45 => Step::Park(slot),
-                46..=51 => Step::Unpause(slot),
-                52..=58 => Step::RegisterRehydrate(true),
-                59..=61 => Step::StaleSweep,
+                7..=20 => Step::GuestWork(slot, self.rng.random_range(1..3)),
+                21..=29 => Step::PeriodicCheckpoint(slot),
+                30..=39 => Step::EvictToIdle(slot),
+                40..=48 => Step::Resume(slot),
+                49..=55 => Step::Restart,
+                56..=61 => Step::RegisterRehydrate,
                 62..=68 => Step::ReconcileTick(true),
                 69..=71 => Step::DropHostBinding(slot),
                 72..=74 => Step::ForceHostLost(slot),
                 75..=77 => Step::StragglerSweep,
-                78..=79 => Step::FinalizePending,
-                80 => Step::SlotClaim,
-                81 => Step::SlotPopulate,
+                78..=81 => Step::FinalizePending,
                 82 => Step::IdleDetector,
                 83 => Step::ForceTerminal(slot),
                 // ADR 0035 amendment: the bundle lifecycle — a frequent
@@ -220,32 +200,24 @@ impl CosimSwarm {
             },
             Profile::Chaos => match roll {
                 0..=4 if self.sessions.len() < MAX_SESSIONS => Step::BootSession,
-                5..=13 => Step::GuestWork(slot, self.rng.random_range(1..3)),
-                14..=18 => Step::PeriodicCheckpoint(slot),
-                19..=24 => Step::EvictToIdle(slot),
-                25..=29 => Step::Resume(slot),
-                30..=35 => Step::Park(slot),
-                36..=40 => Step::Unpause(slot),
-                41..=46 => Step::Roll,
-                47..=53 => Step::RegisterRehydrate(self.rng.random_range(0..4) != 0),
-                54..=57 => Step::StaleSweep,
-                58..=60 => Step::KillGuest(slot),
+                5..=16 => Step::GuestWork(slot, self.rng.random_range(1..3)),
+                17..=23 => Step::PeriodicCheckpoint(slot),
+                24..=31 => Step::EvictToIdle(slot),
+                32..=38 => Step::Resume(slot),
+                39..=48 => Step::Restart,
+                49..=56 => Step::RegisterRehydrate,
+                57..=60 => Step::FinalizePending,
                 61..=66 => Step::ReconcileTick(true),
                 67..=69 => Step::DropHostBinding(slot),
                 70..=72 => Step::ForceHostLost(slot),
                 73..=75 => Step::StragglerSweep,
                 76..=77 => Step::ForceTerminal(slot),
-                78..=79 => Step::FinalizePending,
-                80 => Step::SlotClaim,
-                81 => Step::SlotPopulate,
+                78..=81 => Step::FinalizePending,
                 82 => Step::IdleDetector,
-                // Wave 7b (#784 layer 2): a small-weight record-loss fault so the
-                // gap-A family — a resident survivor invisible to the records —
-                // arises across the boundary and the barrier's oracles guard it.
-                83 => Step::LoseRecord(slot),
+                83 => Step::DropHostBinding(slot),
                 // ADR 0035 amendment: the bundle lifecycle under chaos — the
                 // incident's interleaving (attach → bake roll → sweep → GC →
-                // capture) arises from these composing with Roll/EvictToIdle.
+                // capture) arises from these composing with Restart/EvictToIdle.
                 84..=89 => Step::HostHeartbeat,
                 90..=92 => Step::RollBundleStamp,
                 93..=94 => Step::BundleGcSweep,
@@ -286,42 +258,13 @@ impl CosimSwarm {
                     }
                 }
             }
-            Step::Park(slot) => {
-                if let Some(s) = self.session(slot) {
-                    self.sim.park(s).await;
-                }
+            Step::Restart => {
+                // A restart's startup always reconciles volumes and registers
+                // before the coordinator serves the host any traffic.
+                self.sim.restart_host().await;
+                self.sim.register_rehydrate().await;
             }
-            Step::Unpause(slot) => {
-                if let Some(s) = self.session(slot) {
-                    let _ = self.sim.unpause(s).await;
-                }
-            }
-            Step::Roll => {
-                // A host-agent roll is a process restart whose STARTUP always
-                // rehydrates before the coordinator serves it any traffic
-                // (register → rehydrate → serve). Decoupling the two would leave
-                // an Active session on a rolled host with no live backend — an
-                // unreachable-in-prod state that wedges a later eviction. The
-                // survivor-severing WINDOW lives INSIDE register_rehydrate
-                // (coord-list → #739 local → stale-sweep), where the directed
-                // tests exercise the adversarial missed-survivor variants; the
-                // standalone StaleSweep / RegisterRehydrate(false) steps still
-                // explore the sweep after the safe startup.
-                self.sim.roll_host().await;
-                self.sim.register_rehydrate(true).await;
-            }
-            Step::RegisterRehydrate(local) => self.sim.register_rehydrate(local).await,
-            Step::StaleSweep => self.sim.stale_sweep().await,
-            Step::KillGuest(slot) => {
-                if let Some(s) = self.session(slot) {
-                    self.sim.kill_guest(s).await;
-                }
-            }
-            Step::LoseRecord(slot) => {
-                if let Some(s) = self.session(slot) {
-                    self.sim.lose_record(s).await;
-                }
-            }
+            Step::RegisterRehydrate => self.sim.register_rehydrate().await,
             Step::ReconcileTick(honor) => self.sim.reconcile_tick(honor).await,
             Step::StragglerSweep => self.sim.straggler_sweep_tick().await,
             Step::DropHostBinding(slot) => {
@@ -352,8 +295,6 @@ impl CosimSwarm {
                 }
             }
             Step::FinalizePending => self.sim.finalize_pending().await,
-            Step::SlotClaim => self.sim.slot_claim().await,
-            Step::SlotPopulate => self.sim.slot_populate_tick().await,
             Step::IdleDetector => self.sim.idle_detector().await,
             Step::HostHeartbeat => self.sim.host_heartbeat().await,
             Step::BundleGcSweep => self.sim.bundle_gc_sweep().await,
@@ -385,9 +326,8 @@ impl CosimSwarm {
         ))
     }
 
-    /// The every-step standing oracles (deliverable 3): severed-live-holder
-    /// (#806), no-plane-leak (slot-accounting), and the cross-boundary
-    /// ACTIVE-serve ownership split-brain guard. The idle⇒durable-snapshot
+    /// The every-step standing oracles (deliverable 3): volumes-intact and
+    /// the cross-boundary running-sandbox ownership split-brain guard. The idle⇒durable-snapshot
     /// (#570) oracle is asserted at QUIESCENCE instead: the D5 fast path marks
     /// Idle BEFORE the async finalize lands the durable snapshot row (a real
     /// production window — the heartbeat reconcile lands it), so the property is
@@ -395,28 +335,21 @@ impl CosimSwarm {
     /// checks post-finalize. A cancelled finalize (the #570 loss) still lands NO
     /// snapshot by quiescence, so the detection is preserved.
     async fn check_oracles(&self) -> Result<(), String> {
-        self.sim.assert_no_severed_live_holder().await?;
-        self.sim.assert_quarantine_reconnectable().await?;
-        self.sim.assert_slot_accounting().await?;
+        self.sim.assert_volumes_intact().await?;
         self.sim.assert_ownership_agreement().await?;
         self.sim.assert_bundle_reachability().await?;
         Ok(())
     }
 
-    /// Quiesce: heal every fault (re-serve survivors, drain finalizes, drive
+    /// Quiesce: heal every fault (restart + register, drain finalizes, drive
     /// reconcile + the straggler sweep to a fixed point), then require
-    /// convergence — every session terminal-or-stable, every device classified,
-    /// within bounded rounds — and re-check the standing oracles.
+    /// convergence — every session terminal-or-stable within bounded rounds —
+    /// and re-check the standing oracles.
     async fn quiesce(&mut self) -> Result<(), String> {
-        // Wave 7b (#784): heal the record-loss fault globally (the operator/runbook
-        // reconcile the `rehydrate-unknown-device` alert drives, applied to every
-        // survivor at quiescence like every other healed fault) so the rehydrate
-        // below re-serves every survivor. A quarantined slot MUST reach a terminal
-        // disposition (served or reaped) within bounded rounds, never wedge.
-        self.sim.heal_all_records().await;
-        // A fresh host generation with a clean rehydrate re-serves every
-        // survivor whose session still reserves host memory.
-        self.sim.register_rehydrate(true).await;
+        // A fresh host process with a clean registration re-records every
+        // binding whose session still reserves host memory.
+        self.sim.restart_host().await;
+        self.sim.register_rehydrate().await;
         // Bounded convergence drain: reconcile repairs/reaps, the straggler
         // sweep settles HostLost rows (coarse time crosses the 60 s min-age),
         // and finalizes drain.
@@ -456,7 +389,7 @@ impl CosimSwarm {
             }
         }
         self.check_oracles().await?;
-        // Teardown/ownership completeness: every served device must be
+        // Teardown/ownership completeness: every held sandbox must be
         // coordinator-owned by quiescence (the reconcile/finalize drain
         // converged every leftover).
         self.sim.assert_teardown_complete().await?;

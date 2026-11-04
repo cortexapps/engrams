@@ -44,6 +44,8 @@ pub struct ProbeInputs {
     pub bundle_dir: PathBuf,
     /// `Some` only when `backend == "firecracker"`.
     pub fc: Option<FcProbeInputs>,
+    /// Session volumes are wired (a session disk and a chunk store).
+    pub has_session_disk: bool,
 }
 
 /// FC-only probe inputs.
@@ -239,20 +241,17 @@ pub fn probe_uffd_minor_shmem(_substrate_configured: bool) -> CapStatus {
     CapStatus::NotApplicable
 }
 
-/// The `nbd` kernel module is loaded (`/sys/module/nbd/parameters/nbds_max`
-/// readable). `NotApplicable` off the FC backend. Deliberately does
-/// NOT change `disk_daemon::slot::build_from_kernel`'s
-/// materialize-to-file dev fallback (that stays exactly as it is) —
-/// this only makes a prod misconfiguration (module never loaded on a
-/// host that should have it) visible instead of a silent capability
-/// downgrade.
-pub fn probe_nbd(is_fc_backend: bool) -> CapStatus {
+/// Session disks are owned by the host (`SessionVolumes` wired).
+/// `NotApplicable` off the FC backend. Reported under the `nbd` name the
+/// coordinator's placement gate reads.
+pub fn probe_nbd(is_fc_backend: bool, has_session_disk: bool) -> CapStatus {
     if !is_fc_backend {
         return CapStatus::NotApplicable;
     }
-    match crate::disk_daemon::slot::kernel_nbds_max() {
-        Some(n) => CapStatus::Ok(Some(format!("nbds_max={n}"))),
-        None => CapStatus::Failed("nbd module not loaded (no /sys/module/nbd)".to_string()),
+    if has_session_disk {
+        CapStatus::Ok(Some("session volumes".to_string()))
+    } else {
+        CapStatus::Failed("no session disk configured".to_string())
     }
 }
 
@@ -361,7 +360,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         CapStatus::NotApplicable
     };
     let uffd_minor_shmem = probe_uffd_minor_shmem(substrate_configured);
-    let nbd = probe_nbd(is_fc);
+    let nbd = probe_nbd(is_fc, inputs.has_session_disk);
     let bundle_stamp = probe_bundle_stamp(&inputs.bundle_dir).await;
     let fc_snapshot_version =
         fc_snapshot_version(inputs.fc.as_ref().map(|fc| fc.firecracker_bin.as_path())).await;
@@ -491,8 +490,10 @@ mod tests {
     }
 
     #[test]
-    fn nbd_not_applicable_off_fc_backend() {
-        assert_eq!(probe_nbd(false), CapStatus::NotApplicable);
+    fn session_disk_is_not_applicable_off_the_fc_backend_and_required_on_it() {
+        assert_eq!(probe_nbd(false, false), CapStatus::NotApplicable);
+        assert!(matches!(probe_nbd(true, false), CapStatus::Failed(_)));
+        assert!(matches!(probe_nbd(true, true), CapStatus::Ok(_)));
     }
 
     #[tokio::test]

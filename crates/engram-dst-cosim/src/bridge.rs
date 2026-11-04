@@ -6,16 +6,16 @@
 //! * [`CosimHostClient`] implements the coordinator's [`HostClient`] seam
 //!   (the same surface `engram-dst`'s toy `SimHostClient` implements) but
 //!   routes each verb into the REAL host-agent operations of a shared
-//!   [`CosimHost`] — `restore_base_for_session`/`create` build a real
-//!   `ChunkedDiskBackend`, `snapshot_begin` drives the REAL eviction capture
+//!   [`CosimHost`] — `restore_base_for_session`/`create` provision a real
+//!   session volume, `snapshot_begin` drives the REAL eviction capture
 //!   leg, `destroy` tears the VM down. This is the coordinator→host
 //!   direction.
 //!
 //! * [`CosimCoordControlPlane`] implements the host-agent's
-//!   [`CoordControlPlane`] seam and answers each of its three
-//!   decision-feeding calls by invoking the REAL coordinator handler cores
-//!   (`live_manifest_publish_core`, `sandbox_ownership_core`,
-//!   `sandbox_owner_core`) against a coordinator replica's shared store.
+//!   [`CoordControlPlane`] seam and answers each of its decision-feeding
+//!   calls by invoking the REAL coordinator handler cores
+//!   (`sandbox_ownership_core`, `sandbox_owner_core`) against a
+//!   coordinator replica's shared store.
 //!   This is the host→coordinator direction — and the one the teardown
 //!   reconcile tick reads to decide "is this sandbox still owned?".
 
@@ -24,9 +24,7 @@ use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use engram_coordinator::api::host_http::{
-    live_manifest_publish_core, register_rehydrate_list_core, sandbox_owner_core,
-    sandbox_ownership_core, LiveManifestPublishOutcome as CoordPublishOutcome,
-    LiveManifestPublishRequest as CoordPublishReq,
+    register_rehydrate_list_core, sandbox_owner_core, sandbox_ownership_core,
 };
 use engram_coordinator::state::SharedState;
 use engram_core::error::SandboxError;
@@ -38,10 +36,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_host_core::{
-    CoordControlPlane, CoordError, LiveManifestPublishOutcome, LiveManifestPublishRequest,
-    LiveManifestPublishResponse,
-};
+use engram_host_core::{CoordControlPlane, CoordError};
 use engram_sandbox_firecracker::{drive_exec_protocol, ExecRedial};
 
 use crate::host::{build_base_sandbox, SharedHost};
@@ -71,31 +66,16 @@ fn minimal_snapshot_metadata(id: SnapshotId) -> SnapshotMetadata {
     .expect("minimal snapshot metadata")
 }
 
-/// Build a fresh base sandbox with the host lock held only for the brief
-/// synchronous commit — NEVER across the async manifest build (the
+/// Provision a fresh base sandbox with the host lock held only for the
+/// brief synchronous commit — NEVER across the async provision (the
 /// concurrency rule; see [`crate::host`]).
 async fn create_fresh_sandbox(host: &SharedHost) -> SandboxId {
-    let (store, cache_root, entropy, pool, device) = {
+    let (store, volumes, entropy) = {
         let h = host.lock().await;
-        (
-            h.store_handle(),
-            h.cache_root(),
-            h.entropy_handle(),
-            h.device_pool(),
-            h.next_free_device(),
-        )
+        (h.store_handle(), h.volumes_handle(), h.entropy_handle())
     };
-    let (id, base_ref, backend) = build_base_sandbox(store, cache_root, entropy).await;
-    // Claim the sandbox's rootfs `/dev/nbdN` on the current-generation pool.
-    // Run-step-to-completion scheduling means no two creates race, so this
-    // free device is still free here (see the module concurrency note).
-    let lease = pool
-        .claim(&device)
-        .await
-        .expect("claim of the fresh sandbox's free device");
-    host.lock()
-        .await
-        .commit_created_sandbox(id, base_ref, backend, device, lease);
+    let id = build_base_sandbox(store, volumes, entropy).await;
+    host.lock().await.commit_created_sandbox(id);
     id
 }
 
@@ -106,7 +86,7 @@ impl HostClient for CosimHostClient {
     }
 
     async fn destroy(&self, id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
-        self.host.lock().await.destroy(id);
+        self.host.lock().await.destroy(id).await;
         Ok(())
     }
 
@@ -267,18 +247,19 @@ impl CosimCoordControlPlane {
         Self { state }
     }
 
-    /// The REAL coordinator rehydrate listing for `host_id` (rung 2, #784):
-    /// the exact `register` handler core (`register_rehydrate_list_core`) the
-    /// host-agent reads on startup to learn which VM-resident survivors to
-    /// re-serve. The co-simulated host drives its register-rehydrate leg off
-    /// THIS list, so it re-serves precisely the devices the real coordinator
-    /// would name — including (or, on the pre-#739 bug, OMITTING) rung-parked
-    /// Evicting survivors. A coordinator error degrades to an empty list (the
-    /// host runs blind for survivors — the real non-fatal posture).
-    pub async fn rehydrate_list(&self, host_id: HostId) -> Vec<SandboxId> {
+    /// The REAL coordinator rehydrate listing for `host_id`: the exact
+    /// `register` handler core (`register_rehydrate_list_core`) the
+    /// host-agent reads on startup to learn which VM-resident survivors the
+    /// coordinator still binds. A coordinator error degrades to an empty
+    /// list (the host runs blind for survivors — the real non-fatal posture).
+    pub async fn rehydrate_list(&self, host_id: HostId) -> Vec<(SandboxId, SessionId)> {
         register_rehydrate_list_core(&self.state, host_id)
             .await
-            .map(|rows| rows.into_iter().map(|r| r.sandbox_id).collect())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| (r.sandbox_id, r.session_id))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -291,27 +272,6 @@ fn to_coord_error(e: engram_coordinator::ApiError) -> CoordError {
 
 #[async_trait]
 impl CoordControlPlane for CosimCoordControlPlane {
-    async fn publish_live_manifest(
-        &self,
-        host_id: HostId,
-        req: &LiveManifestPublishRequest,
-    ) -> Result<LiveManifestPublishResponse, CoordError> {
-        let coord_req = CoordPublishReq {
-            session_id: req.session_id,
-            sandbox_id: req.sandbox_id,
-            manifest_id: req.manifest_id,
-            manifest_version: req.manifest_version,
-        };
-        let outcome = live_manifest_publish_core(&self.state, host_id, &coord_req)
-            .await
-            .map_err(to_coord_error)?;
-        let outcome = match outcome {
-            CoordPublishOutcome::Applied => LiveManifestPublishOutcome::Applied,
-            CoordPublishOutcome::Stale => LiveManifestPublishOutcome::Stale,
-        };
-        Ok(LiveManifestPublishResponse { outcome })
-    }
-
     async fn sandbox_ownership(
         &self,
         _host_id: HostId,

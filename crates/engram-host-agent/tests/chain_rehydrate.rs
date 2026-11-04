@@ -174,7 +174,8 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
     let make_pooled = |inner: Arc<FirecrackerBackend>| {
         let p = Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+                .with_chunk_store(chunk_store.clone())
+                .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
                 .with_checkpoint_dir(checkpoint_dir.clone()),
         );
         p.set_self_ref(&p);
@@ -184,9 +185,9 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
 
     let spec = SandboxSpec {
         image: "engram-chain-rehydrate-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

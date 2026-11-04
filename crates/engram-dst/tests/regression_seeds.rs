@@ -334,8 +334,7 @@ fn issue_787_dead_host_false_evict_double_boot() {
 /// row is recorded, so the flag is `true`; only the sim was unfaithful.
 /// The fix makes the sim world faithful (world.rs): the snapshot verb now
 /// writes those blobs to the SAME shared store the coordinator reads and
-/// returns the refs, mirroring engram-dst-host's ledger discipline (model
-/// the artifact, never fake the flag). NOTE the idle_evictor has no
+/// returns the refs (model the artifact, never fake the flag). NOTE the idle_evictor has no
 /// explicit `recoverable`-before-`Idle` guard — it relies on captures always
 /// producing manifests, which prod does; a transiently-unrecoverable
 /// capture would land Idle-but-unrecoverable and only fail at resume

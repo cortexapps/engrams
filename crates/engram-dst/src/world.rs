@@ -979,9 +979,8 @@ impl HostClient for SimHostClient {
         // made every capture record `recoverable = false`, so an idle-evicted
         // session reached `Idle` with no recoverable durable copy and tripped
         // the snapshot-safety oracle. We back the refs with REAL blobs in the
-        // SAME per-world store the coordinator reads, mirroring
-        // engram-dst-host's ledger discipline (model the artifact, never fake
-        // the flag).
+        // SAME per-world store the coordinator reads (model the artifact,
+        // never fake the flag).
         let blob = self.world.blob();
         for key in [
             disk_manifest.storage_key(),

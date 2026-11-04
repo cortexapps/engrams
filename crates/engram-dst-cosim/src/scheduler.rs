@@ -363,50 +363,41 @@ impl Cosim {
         self.log(format!("reconcile_tick(honor={honor_capture_signal})"));
     }
 
-    // ─────────── Rung 2: the NBD device-plane family (#784) ───────────
+    // ─────────── Process restart ───────────
 
-    /// A host-agent process ROLL: fresh generation, RAM disk backends drop, FC
-    /// survivors stay resident. Devices keep their (now-dead-generation) kernel
-    /// owner until the register-rehydrate re-serves or the sweep disconnects.
-    pub async fn roll_host(&mut self) {
-        self.world.host.lock().await.roll();
-        self.log("roll_host (new generation; survivors resident)");
+    /// A host-agent process restart: the successor's startup runs the REAL
+    /// volume reconcile over the resident set and the pending finalizes.
+    pub async fn restart_host(&mut self) {
+        let res = self.world.host.lock().await.startup_reconcile().await;
+        let summary = match &res {
+            Ok(report) => format!(
+                "deleted={} failed={}",
+                report.deleted.len(),
+                report.failed.len()
+            ),
+            Err(e) => format!("ERR {e}"),
+        };
+        self.log(format!("restart_host ({summary})"));
     }
 
-    /// The register-time rehydrate sequence driven against the REAL coordinator
-    /// listing (`register_rehydrate_list_core`): coord-list pass → local
-    /// ChainHeadRecord pass → stale-binding sweep. `local_pass` = the #739
-    /// defense-in-depth pass (safe default `true`; `false` is the adversarial
-    /// ungated variant proving the un-pause gate is the last line).
-    pub async fn register_rehydrate(&mut self, local_pass: bool) {
+    /// The registration ack driven against the REAL coordinator listing
+    /// (`register_rehydrate_list_core`): the host records every binding the
+    /// coordinator still holds for a resident sandbox.
+    pub async fn register_rehydrate(&mut self) {
         let list = self
             .world
             .coord_plane
             .rehydrate_list(self.world.host_id)
             .await;
         let n = list.len();
-        let res = self
-            .world
-            .host
-            .lock()
-            .await
-            .register_rehydrate(&list, local_pass)
-            .await;
-        self.log(format!(
-            "register_rehydrate(local_pass={local_pass}) coord_listed={n} -> {res:?}"
-        ));
+        self.world.host.lock().await.register_rehydrate(&list);
+        self.log(format!("register_rehydrate coord_listed={n}"));
     }
 
     /// Model the VM genuinely departing (the host tears it down out of band) —
     /// after this the host's `probe_sandbox` reports it not-alive.
     pub async fn destroy_sandbox(&self, sandbox: SandboxId) {
-        self.world.host.lock().await.destroy(sandbox);
-    }
-
-    /// Run the stale-binding sweep independently (REAL `sweep_verdict`).
-    pub async fn stale_sweep(&mut self) {
-        self.world.host.lock().await.stale_sweep_tick();
-        self.log("stale_sweep");
+        self.world.host.lock().await.destroy(sandbox).await;
     }
 
     // ─────────── ADR 0035 amendment: the bundle lifecycle ───────────
@@ -538,125 +529,6 @@ impl Cosim {
         Ok(())
     }
 
-    /// Rung-2 PARK a session's sandbox (FC paused, VM resident, device served)
-    /// — the 731df805 pre-condition.
-    pub async fn park(&mut self, session_id: SessionId) {
-        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
-            self.world.host.lock().await.park(sandbox);
-            self.log(format!("park {session_id} sandbox={sandbox}"));
-        }
-    }
-
-    /// Un-pause a session's sandbox over the REAL un-pause data-plane gate.
-    /// Returns whether the guest un-paused (`false` = the gate fired onto an
-    /// unserved plane — correct behavior, routed to recovery).
-    pub async fn unpause(&mut self, session_id: SessionId) -> bool {
-        let Some(sandbox) = self.resolve_sandbox(session_id).await else {
-            return false;
-        };
-        let ok = self.world.host.lock().await.unpause(sandbox);
-        self.log(format!("unpause {session_id} sandbox={sandbox} -> {ok}"));
-        ok
-    }
-
-    /// Model the FC guest for a session genuinely dying (#806): it no longer
-    /// holds its device node open, so a dead-owner sweep may legally DISCONNECT.
-    pub async fn kill_guest(&mut self, session_id: SessionId) {
-        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
-            self.world.host.lock().await.kill_guest(sandbox);
-            self.log(format!("kill_guest {session_id} sandbox={sandbox}"));
-        }
-    }
-
-    /// Wave 7b (#784 layer 2): lose a session's tracked records (#769 gap A) — a
-    /// resident guest ends up holding a device no record accounts for, which the
-    /// classification barrier must QUARANTINE (not skip, not sever).
-    pub async fn lose_record(&mut self, session_id: SessionId) {
-        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
-            self.world.host.lock().await.lose_record(sandbox);
-            self.log(format!("lose_record {session_id} sandbox={sandbox}"));
-        }
-    }
-
-    /// The ADR 0090 heartbeat advertise, against the REAL coordinator arm
-    /// (`quarantined_survivor_advertise_core`): the host reports every
-    /// quarantined survivor it still holds, exactly as prod's 5s heartbeat
-    /// does, and the coordinator reacts by enqueueing the keyed quarantine
-    /// `evict_local`. This is the seam the 2026-07-21 8174b7aa livelock
-    /// lived in — pre-extraction the cosim wrote host liveness straight to
-    /// the store and the advertise → enqueue → skip loop was invisible to
-    /// it. Returns how many survivors were advertised (0 = the advertise
-    /// source is gone; the loop is dead).
-    pub async fn advertise_quarantined(&mut self) -> usize {
-        let survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor> = {
-            let host = self.world.host.lock().await;
-            host.quarantined_unknown()
-                .into_iter()
-                .filter_map(|sandbox_id| {
-                    host.session_of(sandbox_id).map(|session_id| {
-                        engram_protocol::heartbeat::QuarantinedSurvivor {
-                            sandbox_id,
-                            session_id,
-                            // The cosim's survivors model the ADR 0090
-                            // rehydrate flavor.
-                            reason: Default::default(),
-                        }
-                    })
-                })
-                .collect()
-        };
-        engram_coordinator::api::host_http::quarantined_survivor_advertise_core(
-            &self.world.state,
-            self.world.host_id,
-            &survivors,
-        )
-        .await;
-        self.log(format!("advertise_quarantined n={}", survivors.len()));
-        survivors.len()
-    }
-
-    /// Oracle read for op-quiescence (the 8174b7aa livelock class): the
-    /// TOTAL `session_ops` rows ever created for a session. Under a fixed
-    /// world state, repeated advertise/driver ticks must stop growing this —
-    /// unbounded growth is the enqueue → fast-skip → re-enqueue signature
-    /// (prod: ~43k rows in 2.5 days; the ADR 0093 423-row pileup is the
-    /// same class).
-    pub fn session_op_count(&self, session_id: SessionId) -> usize {
-        self.world.meta.with_db(|db| {
-            db.session_ops
-                .values()
-                .filter(|op| op.session_id == session_id)
-                .count()
-        })
-    }
-
-    /// The operator/runbook reconcile the `rehydrate-unknown-device` alert
-    /// drives: restore the record of EVERY quarantined device so the drain's
-    /// register re-serves it. Ensures bounded convergence — a quarantined slot
-    /// reaches a terminal disposition rather than wedging forever.
-    pub async fn reconcile_quarantined(&mut self) {
-        let host = self.world.host.lock().await;
-        let quarantined = host.quarantined_unknown();
-        drop(host);
-        if quarantined.is_empty() {
-            return;
-        }
-        let mut host = self.world.host.lock().await;
-        for id in &quarantined {
-            host.regain_record(*id);
-        }
-        drop(host);
-        self.log(format!("reconcile_quarantined n={}", quarantined.len()));
-    }
-
-    /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss
-    /// fault is healed globally at quiescence, exactly like the re-served
-    /// survivors and drained finalizes, so convergence is required against a
-    /// fully-healed world.
-    pub async fn heal_all_records(&mut self) {
-        self.world.host.lock().await.regain_all_records();
-    }
-
     /// One tick of the coordinator's REAL `host_lost_straggler_sweep`
     /// (#782/#777, tombstone model since ADR 0116 A4): a bound HostLost
     /// row past the 60s min-age is entombed and settled; a SERVING VM
@@ -665,26 +537,6 @@ impl Cosim {
     pub async fn straggler_sweep_tick(&mut self) {
         let _ = engram_coordinator::dead_host::host_lost_straggler_sweep(&self.world.state).await;
         self.log("straggler_sweep_tick");
-    }
-
-    /// `try_claim` a spare NBD device (slot-accounting exercise).
-    pub async fn slot_claim(&mut self) {
-        self.world.host.lock().await.slot_claim().await;
-    }
-
-    /// Release the oldest held spare lease (slot-accounting exercise).
-    pub async fn slot_populate_tick(&mut self) {
-        self.world.host.lock().await.slot_populate_tick();
-    }
-
-    /// The sandbox a session is bound to — the coordinator row if present, else
-    /// the harness's last-known binding (survives a D5 unbind / a HostLost
-    /// clear).
-    async fn resolve_sandbox(&self, session_id: SessionId) -> Option<SandboxId> {
-        if let Some(sb) = self.sandbox_of(session_id).await {
-            return Some(sb);
-        }
-        self.session_sandbox.get(&session_id).copied()
     }
 
     /// Drive one finalize attempt for every in-flight capture; on completion
@@ -753,14 +605,14 @@ impl Cosim {
         self.world.host.lock().await.snapshot_begin(sandbox).await
     }
 
-    /// Delete the in-flight finalize's staging dir so every redrive fails and
-    /// the finalize QUARANTINES (the capture-lock release pin, #784 rung 2).
-    pub async fn sabotage_finalize_staging(&self, sandbox: SandboxId) {
+    /// Delete the in-flight finalize's staging dir and volumes so every
+    /// redrive fails and the finalize QUARANTINES (the capture-lock release pin).
+    pub async fn sabotage_finalize_inputs(&self, sandbox: SandboxId) {
         self.world
             .host
             .lock()
             .await
-            .sabotage_finalize_staging(sandbox)
+            .sabotage_finalize_inputs(sandbox)
             .await;
     }
 
@@ -816,45 +668,6 @@ impl Cosim {
         }
     }
 
-    /// Publish a live disk manifest from the host to the coordinator, via
-    /// the REAL `CoordControlPlane` bridge (→ `live_manifest_publish_core`).
-    /// This is the host→coordinator survivor-publish the flush/finalize legs
-    /// make; the returned outcome is what the host reads back over the wire.
-    pub async fn publish_manifest(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        manifest_id: uuid::Uuid,
-        version: u64,
-    ) -> engram_host_core::LiveManifestPublishOutcome {
-        use engram_host_core::CoordControlPlane as _;
-        let req = engram_host_core::LiveManifestPublishRequest {
-            session_id,
-            sandbox_id,
-            manifest_id,
-            manifest_version: version,
-        };
-        self.world
-            .coord_plane
-            .publish_live_manifest(self.world.host_id, &req)
-            .await
-            .expect("publish reaches the coordinator")
-            .outcome
-    }
-
-    /// The session's persisted live disk manifest ref (the durable survivor
-    /// pointer the publish updates).
-    pub fn live_disk_manifest(
-        &self,
-        session_id: SessionId,
-    ) -> Option<engram_core::types::manifest::ManifestRef> {
-        self.world.meta.with_db(|db| {
-            db.sessions
-                .get(&session_id)
-                .and_then(|r| r.session.live_disk_manifest)
-        })
-    }
-
     /// Is an eviction finalize (capture lock) in flight for a sandbox?
     pub async fn capture_in_flight(&self, sandbox: SandboxId) -> bool {
         self.world.host.lock().await.capture_in_flight(sandbox)
@@ -876,133 +689,43 @@ impl Cosim {
         self.world.view.drop_binding(sandbox);
     }
 
-    // ─────────── Rung 2 device-plane reads + oracles (#784) ───────────
+    // ─────────── Host oracles ───────────
 
-    /// Is a session's sandbox parked (rung-2 evicting-shaped)?
-    pub async fn is_parked(&self, session_id: SessionId) -> bool {
-        match self.resolve_sandbox(session_id).await {
-            Some(sb) => self.world.host.lock().await.is_parked(sb),
-            None => false,
-        }
-    }
-
-    /// Is a session's sandbox device served by the current host generation?
-    pub async fn served_by_current(&self, session_id: SessionId) -> bool {
-        match self.resolve_sandbox(session_id).await {
-            Some(sb) => self.world.host.lock().await.served_by_current(sb),
-            None => false,
-        }
-    }
-
-    /// Sandboxes the sweep PARKed because a live guest held the device (#806).
-    pub async fn sweep_parked_live(&self) -> Vec<SandboxId> {
-        self.world.host.lock().await.sweep_parked_live()
-    }
-
-    /// Sandboxes the classification barrier put in `QuarantinedUnknown` — a
-    /// record-invisible live survivor (#769 gap A). CLASSIFIED, never skipped.
-    pub async fn quarantined_unknown(&self) -> Vec<SandboxId> {
-        self.world.host.lock().await.quarantined_unknown()
-    }
-
-    /// **Oracle — severed-live-holder (#806):** no device is left both
-    /// UNSERVED and UNBOUND (`kernel_owner == None`) while a live guest still
-    /// holds it open. A device in that state was severed out from under a
-    /// reading guest — the 731df805 EIO-on-live-guest corruption. Checked over
-    /// every device slot each quiescence.
-    pub async fn assert_no_severed_live_holder(&self) -> Result<(), String> {
-        let host = self.world.host.lock().await;
-        for id in host.device_slot_ids() {
-            let live = host.guest_holds_device(id);
-            let served = host.served_by_current(id);
-            let bound = host.kernel_owner(id).is_some();
-            if live && !served && !bound {
-                return Err(format!(
-                    "severed-live-holder (#806): sandbox {id}'s device is unserved AND unbound \
-                     (kernel_owner=None) while its guest still holds it open — a live guest's \
-                     data plane was severed (the 731df805 EIO class)"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// **Oracle — record-invisible-survivor-classified (Wave 7b, #784 layers
-    /// 2–3):** every current record-invisible resident survivor (live, unserved,
-    /// dead-owner, no record — the #769 gap-A precondition) that has been through
-    /// a register/sweep MUST have been CLASSIFIED `QuarantinedUnknown`, not
-    /// silently skipped. We assert the barrier's promise directly: any such
-    /// survivor whose device is UNBOUND (kernel_owner cleared) is a severed
-    /// classification failure, and any quarantined device must stay
-    /// RECONNECTABLE. Checked every step. (The strong revert-detecting proof is
-    /// the directed `gap_a_*` pin; this guards the swarm-scale invariant.)
-    pub async fn assert_quarantine_reconnectable(&self) -> Result<(), String> {
-        let host = self.world.host.lock().await;
-        for id in host.quarantined_unknown() {
-            // A quarantined device is served (recovered) OR reconnectable
-            // (kernel-bound). Never both unserved AND unbound while guest-held.
-            let served = host.served_by_current(id);
-            let bound = host.kernel_owner(id).is_some();
-            let live = host.guest_holds_device(id);
-            if !served && live && !bound {
-                return Err(format!(
-                    "quarantine-reconnectable (#784): sandbox {id} was classified \
-                     QuarantinedUnknown but is now unserved, kernel-unbound, and still \
-                     guest-held — a quarantined survivor was severed, not left reconnectable"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// **Oracle — slot-accounting (ADR 0098 P7 oracle #3):** the real
-    /// allocator's `free + warm + held == capacity` identity holds (no leaked
-    /// or double-counted `/dev/nbdN` slot).
-    pub async fn assert_slot_accounting(&self) -> Result<(), String> {
-        // Let any pending async lease-release settle before reading counters.
-        tokio::task::yield_now().await;
-        let (free, warm, held, capacity) = self.world.host.lock().await.slot_accounting().await;
-        if free + warm + held != capacity {
-            return Err(format!(
-                "slot-accounting: free({free}) + warm({warm}) + held({held}) != capacity({capacity})"
-            ));
-        }
-        Ok(())
+    /// **Oracle — volumes intact:** every sandbox the host holds still has
+    /// its live root volume and its latest root checkpoint. A startup
+    /// reconcile that deleted either severed a resident guest (the data
+    /// plane out from under a running VM) or lost the session's lineage.
+    /// Checked after every step.
+    pub async fn assert_volumes_intact(&self) -> Result<(), String> {
+        self.world.host.lock().await.volumes_intact().await
     }
 
     /// **Oracle — cross-boundary ownership agreement (the split-brain guard):**
-    /// for every device this host generation SERVES that is bound to a
-    /// NON-TERMINAL session, the coordinator must agree it still owns the
-    /// session→sandbox (`sandbox_ownership_core`). A served plane whose live
-    /// session the coordinator has RE-HOMED to a different binding is the split
-    /// — the host would keep flushing a plane another binding now owns.
+    /// for every sandbox this host runs that is bound to a NON-TERMINAL
+    /// session, the coordinator must agree it still owns the session→sandbox
+    /// (`sandbox_ownership_core`). A running sandbox whose live session the
+    /// coordinator has RE-HOMED to a different binding is the split — the
+    /// host would keep checkpointing a volume another binding now owns.
     ///
-    /// A TERMINAL session's still-served device is deliberately NOT flagged
+    /// A TERMINAL session's still-held sandbox is deliberately NOT flagged
     /// here: the coordinator ended the session (it was not re-homed), and the
-    /// device is a teardown-in-progress leftover the reconcile reaps. That
+    /// sandbox is a teardown-in-progress leftover the reconcile reaps. That
     /// window is legitimate and transient; its COMPLETION is guaranteed
     /// separately by [`assert_teardown_complete`](Self::assert_teardown_complete)
     /// at quiescence. Scoping the split-brain check to non-terminal sessions
     /// matches the invariant's intent (re-home, not teardown) — it does not
     /// weaken it (RCA'd from the swarm's first firing, seed 7: a `ForceTerminal`
-    /// step left a served device before the reconcile reap ran).
+    /// step left a held sandbox before the reconcile reap ran).
     pub async fn assert_ownership_agreement(&self) -> Result<(), String> {
-        // Only ACTIVELY-serving planes (a live RAM backend) can double-serve /
-        // race a re-home. A paused (capture-in-flight) or post-roll device with
-        // no live backend is mid-lifecycle-transition — its teardown/rehydrate
-        // is checked at quiescence, not flagged here.
-        let active: Vec<SandboxId> = {
-            let host = self.world.host.lock().await;
-            host.device_slot_ids()
-                .into_iter()
-                .filter(|id| host.served_by_current(*id) && host.has_live_backend(*id))
-                .collect()
-        };
+        // Only a running guest can double-serve / race a re-home. A paused
+        // (capture-in-flight) sandbox is mid-lifecycle-transition — its
+        // teardown is checked at quiescence, not flagged here.
+        let active: Vec<SandboxId> = self.world.host.lock().await.active_sandboxes();
         for sandbox in active {
             let Some(session) = self.session_binding(sandbox) else {
-                continue; // a served device with no known session — freshly created, unbound
+                continue; // a sandbox with no known session — freshly created, unbound
             };
-            // A terminal session's device is teardown-in-progress (checked at
+            // A terminal session's sandbox is teardown-in-progress (checked at
             // quiescence), not a re-home split-brain.
             if self
                 .session_state(session)
@@ -1036,10 +759,9 @@ impl Cosim {
                     continue;
                 }
                 return Err(format!(
-                    "ownership-agreement: host ACTIVELY serves sandbox {sandbox} (live backend) \
-                     bound to NON-TERMINAL session {session}, but the coordinator disowns it \
-                     with NO tombstone recorded — a served plane the coordinator has re-homed \
-                     (split-brain)"
+                    "ownership-agreement: host RUNS sandbox {sandbox} bound to NON-TERMINAL \
+                     session {session}, but the coordinator disowns it with NO tombstone \
+                     recorded — a sandbox the coordinator has re-homed (split-brain)"
                 ));
             }
         }
@@ -1047,25 +769,19 @@ impl Cosim {
     }
 
     /// **Oracle — teardown / ownership completeness (quiescence only, the STRONG
-    /// form):** after the reconcile + finalize + straggler drain, EVERY device
-    /// the host still serves for a known session must be OWNED by the
-    /// coordinator. Transiently a leftover lingers — a terminal session's device
-    /// awaiting its reconcile reap, an evicted sandbox mid-finalize (coord
-    /// binding cleared by D5), a re-home window — and the every-step guard
-    /// exempts those non-actively-serving cases. But by quiescence every such
-    /// leftover MUST be resolved (the finalize destroyed it, the reconcile
-    /// reaped it, or the coord re-bound it); a served-yet-disowned device at
-    /// quiescence is a teardown-liveness hole (a plane that never converges).
-    /// This is the strong closure the every-step guard's exemptions rely on.
+    /// form):** after the reconcile + finalize + straggler drain, EVERY sandbox
+    /// the host still holds for a known session must be OWNED by the
+    /// coordinator. Transiently a leftover lingers — a terminal session's
+    /// sandbox awaiting its reconcile reap, an evicted sandbox mid-finalize
+    /// (coord binding cleared by D5), a re-home window — and the every-step
+    /// guard exempts those paused cases. But by quiescence every such leftover
+    /// MUST be resolved (the finalize destroyed it, the reconcile reaped it, or
+    /// the coord re-bound it); a held-yet-disowned sandbox at quiescence is a
+    /// teardown-liveness hole (a sandbox that never converges). This is the
+    /// strong closure the every-step guard's exemptions rely on.
     pub async fn assert_teardown_complete(&self) -> Result<(), String> {
-        let served: Vec<SandboxId> = {
-            let host = self.world.host.lock().await;
-            host.device_slot_ids()
-                .into_iter()
-                .filter(|id| host.served_by_current(*id))
-                .collect()
-        };
-        for sandbox in served {
+        let held: Vec<SandboxId> = self.world.host.lock().await.held_sandboxes();
+        for sandbox in held {
             let Some(session) = self.session_binding(sandbox) else {
                 continue;
             };
@@ -1078,8 +794,8 @@ impl Cosim {
             .unwrap_or(false);
             if !owned {
                 return Err(format!(
-                    "teardown-complete: at quiescence the host still SERVES sandbox {sandbox} \
-                     bound to session {session}, but the coordinator disowns it — a leftover plane \
+                    "teardown-complete: at quiescence the host still HOLDS sandbox {sandbox} \
+                     bound to session {session}, but the coordinator disowns it — a leftover \
                      the reconcile/finalize drain never converged (a teardown-liveness hole)"
                 ));
             }

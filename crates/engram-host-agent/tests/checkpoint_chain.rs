@@ -126,7 +126,8 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = Arc::new(
         PooledBackend::new(inner)
-            .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
             .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
             .with_checkpoint_dir(work.path().join("checkpoints")),
     );
@@ -134,9 +135,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     let spec = SandboxSpec {
         image: "engram-ckpt-chain-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
