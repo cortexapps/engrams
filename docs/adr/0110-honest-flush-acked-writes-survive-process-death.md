@@ -1,6 +1,6 @@
 # ADR 0110: Honest writes — acked disk writes survive process death
 
-Status: Proposed (2026-08-02)
+Status: Proposed (2026-08-02); superseded by [ADR 0125](./0125-kernel-owned-session-disk.md) (proposed 2026-11-03), which removes the disk daemon this ADR made durable
 
 Terms used in this document:
 

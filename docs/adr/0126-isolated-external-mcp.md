@@ -1,4 +1,4 @@
-# ADR 0125 — Isolated external MCP tools
+# ADR 0126 — Isolated external MCP tools
 
 Status: Proposed (2026-11-01)
 
