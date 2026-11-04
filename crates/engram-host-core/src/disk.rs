@@ -21,11 +21,11 @@ use async_trait::async_trait;
 pub struct VolumeName(String);
 
 impl VolumeName {
-    /// `[a-z0-9-]`, 1..=64 bytes: accepted verbatim by device-mapper
-    /// and file systems.
+    /// `[a-z0-9-]`, 1..=127 bytes: accepted verbatim by device-mapper
+    /// (whose names are under 128 bytes) and file systems.
     pub fn new(name: impl Into<String>) -> Result<Self, String> {
         let name = name.into();
-        let ok_len = (1..=64).contains(&name.len());
+        let ok_len = (1..=127).contains(&name.len());
         let ok_chars = name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
@@ -33,7 +33,7 @@ impl VolumeName {
             Ok(Self(name))
         } else {
             Err(format!(
-                "invalid volume name {name:?}: want 1..=64 of [a-z0-9-]"
+                "invalid volume name {name:?}: want 1..=127 of [a-z0-9-]"
             ))
         }
     }
@@ -431,7 +431,8 @@ mod tests {
         assert!(VolumeName::new("").is_err());
         assert!(VolumeName::new("Upper").is_err());
         assert!(VolumeName::new("has/slash").is_err());
-        assert!(VolumeName::new("a".repeat(65)).is_err());
+        assert!(VolumeName::new("a".repeat(127)).is_ok());
+        assert!(VolumeName::new("a".repeat(128)).is_err());
     }
 
     #[tokio::test]

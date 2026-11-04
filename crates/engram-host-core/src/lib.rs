@@ -30,8 +30,10 @@
 //!   backend-identifier kernel ops.
 //! - [`disk::SessionDisk`] — volumes the kernel owns (create, O(1)
 //!   snapshot, delete, dirty-chunk diff); [`disk_flows`] moves chunks
-//!   between a volume and the chunk store. Replaces the two seams above
-//!   once the disk daemon is gone (ADR 0125).
+//!   between a volume and the chunk store; [`image_volumes`] keeps the
+//!   enabled images staged and [`session_volumes`] owns every session's
+//!   volumes. Replaces the two seams above once the disk daemon is gone
+//!   (ADR 0125).
 //!
 //! The data plane (the NBD serve loop, `read_chunk`/`write_chunk`, the
 //! migrate_peer page server, the flush lock ladder) is deliberately NOT
@@ -49,6 +51,7 @@ pub mod fs;
 pub mod image_volumes;
 pub mod nbd;
 pub mod reattach;
+pub mod session_volumes;
 pub mod shutdown;
 pub mod startup;
 pub mod survivor;
@@ -70,6 +73,7 @@ pub use reattach::{
     resume_data_plane_served, sweep_verdict, DeviceHolder, PidLiveness, ReattachPlan, ReattachStep,
     SweepAction,
 };
+pub use session_volumes::SessionVolumes;
 pub use startup::{
     classify_startup_slot, classify_startup_slots, ReapList, SlotClass, StartupClassification,
     StartupSlot,
