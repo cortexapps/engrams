@@ -138,9 +138,25 @@ spec:
               nsenter -t 1 -m -- sh -c \
                 'mkdir -p {{ . }} && { mountpoint -q {{ . }} || mount -t tmpfs -o size={{ $.Values.firecracker.uffdBaseTmpfsSize }} engram-base-shm {{ . }}; }'
               {{- end }}
+              {{- if .Values.thinPool.enabled }}
+              # The node's own dmsetup / thin_check / losetup, in the host
+              # mount namespace; the script arrives on stdin.
+              echo "[node-prep] thin pool {{ .Values.thinPool.name }} in {{ .Values.thinPool.dir }}"
+              nsenter -t 1 -m -- env \
+                POOL_NAME={{ .Values.thinPool.name | quote }} \
+                POOL_DIR={{ .Values.thinPool.dir | quote }} \
+                POOL_DATA_SIZE={{ .Values.thinPool.dataSize | quote }} \
+                POOL_META_SIZE={{ .Values.thinPool.metadataSize | quote }} \
+                POOL_BLOCK_SECTORS={{ .Values.thinPool.blockSizeSectors | quote }} \
+                POOL_LOW_WATER={{ .Values.thinPool.lowWaterMarkBlocks | quote }} \
+                sh -s < /opt/engram/thin-pool.sh
+              {{- end }}
               echo "[node-prep] done"
           volumeMounts:
             - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
+            {{- if .Values.thinPool.enabled }}
+            - {name: thin-pool-script, mountPath: /opt/engram/thin-pool.sh, subPath: thin-pool.sh, readOnly: true}
+            {{- end }}
           resources:
             requests: {cpu: "10m", memory: 32Mi}
             limits: {cpu: "100m", memory: 64Mi}
@@ -340,6 +356,12 @@ spec:
         - {name: dev, hostPath: {path: /dev, type: Directory}}
         {{- if .Values.nodePrep.enabled }}
         - {name: lib-modules, hostPath: {path: /lib/modules, type: Directory}}
+        {{- end }}
+        {{- if and .Values.nodePrep.enabled .Values.thinPool.enabled }}
+        - name: thin-pool-script
+          configMap:
+            name: {{ include "hostfleet.hostAgent.fullname" . }}-thin-pool
+            defaultMode: 0555
         {{- end }}
         # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
         # the node-assets init container — replaces the hostPath `type: File`

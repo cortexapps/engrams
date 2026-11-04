@@ -222,6 +222,22 @@ nodePrep:
     vm.unprivileged_userfaultfd: "1"
     net.ipv4.ip_forward: "1"
 
+# A dm-thin pool over two preallocated files on the work-dir filesystem,
+# attached as loop devices (ADR 0125). node-prep builds it on first boot
+# and re-activates it (after thin_check) on every later one.
+thinPool:
+  enabled: false
+  name: engram-pool
+  dir: /var/lib/engram/thin
+  # Absolute (300G) or a percentage of the filesystem holding `dir`.
+  # Shares that filesystem with the chunk cache until the cache retires.
+  dataSize: "50%"
+  metadataSize: "8G"
+  # 512-byte sectors; 128 = 64 KiB blocks.
+  blockSizeSectors: 128
+  # Blocks; 32768 = 2 GiB at 64 KiB.
+  lowWaterMarkBlocks: 32768
+
 hostAgent:
   grpcPort: 9101
   metricsPort: 9100

@@ -144,14 +144,22 @@ userland. Nothing outside the in-tree kernel is needed.
 
 ## Decision
 
-1. **One thin pool per node.** Node-prep creates it on a dedicated
-   data disk with two partitions: metadata (8 GiB; the estimate for
-   750 GiB of data and 500 volumes at 64 KiB blocks is 383 MiB) and
-   data. Block size 64 KiB, block zeroing on, discard passdown on.
-   Node-prep runs `thin_check` before activation and refuses to
-   activate a pool that fails it. The pool is created once and
-   re-activated on every node boot; it is never recreated while any
-   session volume exists.
+1. **One thin pool per node.** Node-prep builds it from two
+   preallocated files on the node's work-dir filesystem, attached as
+   loop devices with direct I/O: a metadata file (8 GiB; the estimate
+   for 750 GiB of data and 500 volumes at 64 KiB blocks is 383 MiB)
+   and a data file (half the filesystem by default). GKE node pools
+   cannot add a second data disk to the Firecracker pool, and
+   preallocated loop-backed files give the same O(1) snapshot and
+   block-granular delta as a partition. Block size 64 KiB, block
+   zeroing on, discard passdown on. Node-prep runs `thin_check` before
+   activation and refuses to activate a pool that fails it. The pool
+   is created once and re-activated on every node boot; it is never
+   recreated while any session volume exists. One POSIX script,
+   `deploy/helm/engram-host-fleet/files/thin-pool.sh`, does this in
+   production (node-prep enters the host mount namespace and uses the
+   node's `dmsetup`, `thin_check` and `losetup`), on the dev VM and in
+   CI.
 2. **An image version is a thin volume.** Staging an image writes its
    manifest's chunks into a new thin volume. Staging a version whose
    predecessor is already on the node snapshots the predecessor and
@@ -384,9 +392,8 @@ dependency are retired with it.
 
 ### Development and CI
 
-The Linux dev VM and the KVM CI runners build the pool on two loop
-devices over sparse files under the work dir. The `dmsetup` calls are
-identical. Firecracker integration tests (`engram-sandbox-firecracker/
+The Linux dev VM and the KVM CI runners run the same `thin-pool.sh` as
+production with smaller sizes. Firecracker integration tests (`engram-sandbox-firecracker/
 tests/`) get one small test per lifecycle step above, sized to the
 property, wired into `ci.yml` per AGENTS.md.
 
@@ -431,6 +438,13 @@ that adds code without retiring the row it replaces is incomplete.
   placement gate, and 8 GiB of metadata. Today's equivalent is the
   node's stateful partition filling with dirty files, which has no gate
   at all.
+- **The data file's size is the pool's ceiling, and it shares the
+  filesystem with the chunk cache until step 6.** The file is
+  preallocated, so the pool never competes for space after node-prep,
+  but the split between pool and cache is a deploy-time number. Once
+  the daemon's cache directory is gone the data file can take the
+  filesystem. The loop device adds one request-queue hop; the cost is
+  measured against the raw-partition bench in step 3.
 - **Copy-on-first-write is a per-block tax.** A small write into a
   shared block costs about 1.5 ms once, after which the block is private
   and runs at disk speed. Today the same first touch copies 16 MiB. A
@@ -487,10 +501,12 @@ thin-pool host and the reverse.
    `Manifest::delta_from`, `stage` and `checkpoint`, with the round-trip
    and crash-at-every-op tests. Pure Rust, no node change. Retires the
    daemon's duplicated hole-punch helpers.
-2. **Node substrate.** Data disk in the fleet module; node-prep builds
-   and checks the pool; the heartbeat reports pool capacity; the
-   scheduler gates on it. No session uses the pool yet. Dev VM and CI
-   get a loop-device pool.
+2. **Node substrate.** `thin-pool.sh` in the chart, run by node-prep
+   behind `thinPool.enabled`; the dev VM provision runs it too. No
+   session uses the pool yet. Verified on the dev VM: build, idempotent
+   re-run, `thin_check` on re-attach, `thin_delta` reports a single
+   written block, `BLKDISCARD` on a thin unmaps the range and reads
+   back zero.
 3. **The real implementations.** `ThinPoolDisk` with its `dmsetup`
    builder and `thin_delta` parser, tested against the default
    `dirty_chunks` on the KVM runners; VZ switches to `FileDisk` and the
@@ -500,7 +516,8 @@ thin-pool host and the reverse.
    enabled version into a thin volume beside the chunk cache; readiness
    requires the volume.
 5. **Sessions on the pool.** Create, resume, checkpoint, evict and
-   teleport go through `stage` and `checkpoint`. One deploy cycle where
+   teleport go through `stage` and `checkpoint`; the heartbeat reports
+   pool capacity and the scheduler gates on it. One deploy cycle where
    a host-agent runs both paths: new sessions on the pool, the last NBD
    sessions on the daemon until they evict. The small-synchronous-write
    measurement from Tradeoffs runs here on a real image.

@@ -124,7 +124,7 @@ FC_VERSION="$1"
 VM_USER="$2"
 
 # --- apt packages ---
-PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools"
+PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools thin-provisioning-tools"
 MISSING=""
 for p in $PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
@@ -248,6 +248,12 @@ chown -R "${VM_USER}:${VM_USER}" /opt/engram-dev
 echo "==> host prep complete"
 REMOTE
 
+# --- dm-thin pool for session disks (ADR 0125): the same script node-prep
+# runs in production, piped into the VM ---
+echo "==> thin pool inside '$PROFILE'"
+ssh_ sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=20G POOL_META_SIZE=1G sh -s \
+    < deploy/helm/engram-host-fleet/files/thin-pool.sh
+
 # --- guest kernel: build the aarch64 Image inside the VM (ADR 0025 recipe,
 # Task-1 ARCH support). Never build over the virtiofs-mounted repo path —
 # known-bad — so stage deploy/kernel/ into a VM-local directory first. ---
@@ -294,6 +300,7 @@ Provisioned inside the VM:
   - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools
   - /usr/local/bin/firecracker ($FC_VERSION)
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
+  - dm-thin pool engram-pool (20G data / 1G metadata under /var/lib/engram/thin)
   - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no
     shadowing loopback listener — see the script comment for why not socat)
   - /opt/engram-dev/{bin,shared,var}
