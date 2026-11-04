@@ -2629,16 +2629,27 @@ impl PooledBackend {
         const BATCH: usize = 64;
         const IN_FLIGHT: usize = 4;
         let mut in_flight = FuturesUnordered::new();
+        let mut failed = None;
         for batch in blocks.chunks(BATCH) {
             if in_flight.len() >= IN_FLIGHT {
-                in_flight.next().await.transpose()?;
+                if let Some(Err(e)) = in_flight.next().await {
+                    failed = Some(e);
+                    break;
+                }
             }
             in_flight.push(Self::fetch_block_batch(
                 source, export_id, role, batch, volume,
             ));
         }
+        // Every batch lands or fails before this returns: a write still
+        // in flight would land under whatever the caller does next.
         while let Some(done) = in_flight.next().await {
-            done?;
+            if let Err(e) = done {
+                failed.get_or_insert(e);
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         volume
             .sync()
