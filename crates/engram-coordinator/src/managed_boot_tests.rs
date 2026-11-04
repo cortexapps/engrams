@@ -523,6 +523,27 @@ async fn fixture() -> (
         row,
     )
 }
+/// Shared prepared authority for the policy control regression tests.
+/// Keep the claimed request, exact validated prepared receipt, revision, and
+/// created physical placement. Remove only the later finalization/start fields;
+/// the synthetic host is replaced by the caller and supplies no authority.
+pub(crate) async fn prepared_policy_fixture(
+) -> (SharedState, Arc<SimMetadataStore>, ManagedBootRecord) {
+    let (state, meta, _host, mut row) = fixture().await;
+    row.phase = ManagedBootPhase::Prepared;
+    row.revision = 2;
+    row.finalization = None;
+    row.sealed_agent = None;
+    row.write_policy = None;
+    row.receipt = None;
+    row.start = None;
+    meta.with_db_mut(|db| {
+        db.managed_boots
+            .insert(row.request.key.creation.session_id, row.clone());
+    });
+    (state, meta, row)
+}
+
 #[tokio::test]
 async fn managed_boot_lost_start_reply_is_read_only_reconciled() {
     let (state, meta, host, row) = fixture().await;

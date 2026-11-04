@@ -461,4 +461,4 @@ pub async fn capture(
 
 #[cfg(test)]
 #[path = "managed_boot_tests.rs"]
-mod tests;
+pub(crate) mod tests;

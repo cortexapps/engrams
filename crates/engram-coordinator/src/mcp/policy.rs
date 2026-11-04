@@ -764,15 +764,54 @@ async fn apply_managed_policy(
         .get_session(target.session_id)
         .await
         .map_err(err)?;
-    let egress = crate::api::sessions::build_resume_egress_policy(
-        state,
-        target.session_id,
-        target.sandbox_id,
-        &session.image.to_string(),
-    )
-    .await
-    .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
-    .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?;
+    let boot = if state
+        .services
+        .meta
+        .managed_boot_open(target.session_id)
+        .await
+        .map_err(err)?
+        .is_some()
+    {
+        let boot = state
+            .services
+            .meta
+            .read_managed_boot_for_target(target)
+            .await
+            .map_err(err)?;
+        validate_prepared_policy_source(&boot, target)?;
+        Some(boot)
+    } else {
+        None
+    };
+    let egress = if let Some(boot) = &boot {
+        let prepared = boot
+            .prepared
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?;
+        let policy = crate::api::sessions::load_session_policy(state, target.session_id)
+            .await
+            .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?;
+        crate::api::sessions::build_egress_policy_for_guest(
+            state,
+            target.session_id,
+            target.sandbox_id,
+            &session.image.to_string(),
+            prepared.guest_ip,
+            policy,
+        )
+        .await
+        .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
+    } else {
+        crate::api::sessions::build_resume_egress_policy(
+            state,
+            target.session_id,
+            target.sandbox_id,
+            &session.image.to_string(),
+        )
+        .await
+        .map_err(|_| Status::failed_precondition("managed egress source unavailable"))?
+        .ok_or_else(|| Status::failed_precondition("managed guest identity unavailable"))?
+    };
     if !egress.tunnels.is_empty() {
         return Err(Status::failed_precondition(
             "managed policy does not support tunnels",
@@ -782,6 +821,20 @@ async fn apply_managed_policy(
         return Err(Status::failed_precondition("desired policy changed"));
     }
     check_managed_target(state, target).await?;
+    if let Some(boot) = &boot {
+        let current = state
+            .services
+            .meta
+            .read_managed_boot(&boot.request.key)
+            .await
+            .map_err(err)?;
+        validate_prepared_policy_source(&current, target)?;
+        if current.request != boot.request || current.prepared != boot.prepared {
+            return Err(Status::failed_precondition(
+                "managed guest identity changed",
+            ));
+        }
+    }
     let applied = state
         .services
         .host
@@ -801,6 +854,26 @@ async fn apply_managed_policy(
         protocol: wire::PROTOCOL,
         applied: Some(applied.into()),
     }))
+}
+
+fn validate_prepared_policy_source(
+    boot: &engram_core::types::managed_boot::ManagedBootRecord,
+    target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+) -> Result<(), Status> {
+    use engram_core::types::managed_boot::ManagedBootPhase;
+    let invalid = || Status::failed_precondition("managed guest identity unavailable");
+    let prepared = boot.prepared.as_ref().ok_or_else(invalid)?;
+    prepared.validate().map_err(|_| invalid())?;
+    if prepared.request != boot.request
+        || boot.request.key.context.target != *target
+        || matches!(
+            boot.phase,
+            ManagedBootPhase::Claimed | ManagedBootPhase::Interrupted
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 async fn check_managed_target(

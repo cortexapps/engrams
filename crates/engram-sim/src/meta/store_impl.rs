@@ -1503,6 +1503,28 @@ impl MetadataStore for SimMetadataStore {
         self.gate()?;
         managed_boot_read_locked(&self.db.lock(), key)
     }
+    async fn read_managed_boot_for_target(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<ManagedBootRecord, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let session = db
+            .sessions
+            .get(&target.session_id)
+            .ok_or(MetaError::NotFound)?;
+        if session.session.sandbox_id != Some(target.sandbox_id) {
+            return Err(conflict());
+        }
+        let row = db
+            .managed_boots
+            .get(&target.session_id)
+            .ok_or_else(conflict)?;
+        if row.request.key.context.target != *target {
+            return Err(conflict());
+        }
+        managed_boot_read_locked(&db, &row.request.key)
+    }
     async fn advance_managed_boot(
         &self,
         key: &ManagedBootKey,

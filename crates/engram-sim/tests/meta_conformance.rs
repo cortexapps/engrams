@@ -9546,6 +9546,125 @@ async fn managed_boot_prepared_fixture(
         .unwrap();
     (ws, row)
 }
+async fn managed_boot_target_read_is_exact(ctx: &Ctx) {
+    use engram_core::types::managed_deny::ManagedPolicyTarget;
+    let (_ws, row) = managed_boot_prepared_fixture(ctx).await;
+    let target = row.request.key.context.target.clone();
+    let read = ctx
+        .meta
+        .read_managed_boot_for_target(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&read).unwrap(),
+        serde_json::to_value(&row).unwrap()
+    );
+    for field in ["session", "host", "sandbox", "epoch"] {
+        let mut changed = target.clone();
+        match field {
+            "session" => changed.session_id = SessionId::new(),
+            "host" => changed.host_id = HostId::new(),
+            "sandbox" => changed.sandbox_id = engram_core::SandboxId::new(),
+            "epoch" => changed.binding_epoch += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            ctx.meta
+                .read_managed_boot_for_target(&changed)
+                .await
+                .is_err(),
+            "accepted changed {field}"
+        );
+    }
+    // A physical target from an ordinary session supplies no managed boot authority.
+    let ordinary = ctx
+        .meta
+        .create_session(spec("test.invalid/ordinary:latest"))
+        .await
+        .unwrap();
+    ctx.meta
+        .assign_session_host(ordinary, Some(target.host_id))
+        .await
+        .unwrap();
+    let sandbox = engram_core::SandboxId::new();
+    let epoch = ctx
+        .meta
+        .transition_session_created(ordinary, sandbox)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .read_managed_boot_for_target(&ManagedPolicyTarget {
+            session_id: ordinary,
+            host_id: target.host_id,
+            sandbox_id: sandbox,
+            binding_epoch: epoch,
+        })
+        .await
+        .is_err());
+    ctx.meta
+        .advance_managed_boot(
+            &row.request.key,
+            row.revision,
+            engram_core::types::managed_boot::ManagedBootAdvance::Interrupt,
+        )
+        .await
+        .unwrap();
+    // Interruption remains readable as state, never permission to apply or start.
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_for_target(&target)
+            .await
+            .unwrap()
+            .phase,
+        engram_core::types::managed_boot::ManagedBootPhase::Interrupted
+    );
+}
+conformance!(
+    t_managed_boot_target_read_is_exact,
+    super::managed_boot_target_read_is_exact
+);
+
+async fn managed_boot_target_read_finalized_and_stale(ctx: &Ctx) {
+    let row = managed_boot_finalized_fixture(ctx).await;
+    let target = row.request.key.context.target.clone();
+    assert_eq!(
+        ctx.meta
+            .read_managed_boot_for_target(&target)
+            .await
+            .unwrap()
+            .phase,
+        engram_core::types::managed_boot::ManagedBootPhase::Finalized
+    );
+    // A later physical placement makes the retained old receipt unusable.
+    let sandbox = engram_core::SandboxId::new();
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.sessions
+                .get_mut(&target.session_id)
+                .unwrap()
+                .session
+                .sandbox_id = Some(sandbox);
+        });
+    } else {
+        sqlx::query("UPDATE sessions SET sandbox_id=$2 WHERE id=$1")
+            .bind(target.session_id.as_uuid())
+            .bind(sandbox.as_uuid())
+            .execute(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap();
+    }
+    assert!(ctx
+        .meta
+        .read_managed_boot_for_target(&target)
+        .await
+        .is_err());
+}
+conformance!(
+    t_managed_boot_target_read_finalized_and_stale,
+    super::managed_boot_target_read_finalized_and_stale
+);
+
 async fn managed_boot_finalized_fixture(
     ctx: &Ctx,
 ) -> engram_core::types::managed_boot::ManagedBootRecord {

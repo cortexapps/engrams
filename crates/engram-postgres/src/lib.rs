@@ -1734,6 +1734,12 @@ impl MetadataStore for PostgresStore {
     ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
         self.boot_read(key).await
     }
+    async fn read_managed_boot_for_target(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_read_target(target).await
+    }
     async fn advance_managed_boot(
         &self,
         key: &engram_core::types::managed_boot::ManagedBootKey,

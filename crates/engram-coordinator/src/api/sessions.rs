@@ -328,6 +328,20 @@ pub(crate) async fn build_resume_egress_policy(
         }
         return Ok(None);
     };
+    build_egress_policy_for_guest(state, session_id, sandbox_id, image, guest_ip, policy)
+        .await
+        .map(Some)
+}
+
+/// Compile persisted policy with a guest identity obtained from the host authority.
+pub(crate) async fn build_egress_policy_for_guest(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    image: &str,
+    guest_ip: std::net::Ipv4Addr,
+    policy: Option<engram_core::types::IntegrationPolicy>,
+) -> Result<engram_core::types::egress::SessionEgressPolicy, ApiError> {
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
@@ -377,7 +391,7 @@ pub(crate) async fn build_resume_egress_policy(
         apps,
     );
     result.managed_deny = policy.and_then(|p| p.managed_deny);
-    Ok(Some(result))
+    Ok(result)
 }
 
 /// Pure synchronous assembly path for the resume egress policy.

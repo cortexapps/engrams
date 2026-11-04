@@ -12,11 +12,16 @@ use engram_core::types::{host::*, SessionSpec};
 use engram_core::{SandboxError, SandboxId};
 use engram_sim::{ManualClock, MemBlobStorage, SimEntropy, SimMetadataStore};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 struct PolicyHost {
+    prepared: Option<engram_core::types::managed_boot::ManagedBootPreparedReceipt>,
+    guest_ip_calls: AtomicUsize,
     applied: Mutex<Option<ManagedAppliedState>>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
@@ -38,12 +43,21 @@ impl HostClient for PolicyHost {
             *current, request.expected,
             "exact applied receipt must remain the CAS input"
         );
+        let proof = self.prepared.as_ref().map(|prepared| {
+            assert_eq!(request.context.target, prepared.request.key.context.target);
+            assert_eq!(request.egress.guest_ip, prepared.guest_ip);
+            ManagedNetworkProof {
+                target: request.context.target.clone(),
+                guest_ip: prepared.guest_ip,
+                network_identity: prepared.network_identity.clone(),
+            }
+        });
         let ack = ManagedAppliedState::new(
             request.context,
             request.egress.managed_deny.unwrap(),
             "fixture-host".into(),
             "fixture-proxy".into(),
-            None,
+            proof,
         )
         .unwrap();
         *current = Some(ack.clone());
@@ -101,6 +115,10 @@ impl HostClient for PolicyHost {
     }
 
     async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
+        self.guest_ip_calls.fetch_add(1, Ordering::SeqCst);
+        if self.prepared.is_some() {
+            return None;
+        }
         self.entered.notify_one();
         self.release.acquire().await.unwrap().forget();
         Some("10.200.0.42".parse().unwrap())
@@ -167,6 +185,8 @@ async fn retained_recovery(meta: Arc<dyn MetadataStore>, clock: Arc<ManualClock>
     )
     .unwrap();
     let host = Arc::new(PolicyHost {
+        prepared: None,
+        guest_ip_calls: AtomicUsize::new(0),
         applied: Mutex::new(Some(initial_ack.clone())),
         entered: Default::default(),
         release: tokio::sync::Semaphore::new(0),
@@ -476,4 +496,98 @@ async fn managed_retry_denies_requeued_nonzero_epoch() {
         },
         tonic::Code::Unavailable
     );
+}
+
+#[tokio::test]
+async fn managed_prepared_policy_uses_receipt_without_generic_guest_ip() {
+    let (mut state, meta, row) = crate::managed_boot::tests::prepared_policy_fixture().await;
+    let prepared = row.prepared.clone().unwrap();
+    let mut context = row.request.key.context.clone();
+    context.binding_hash = Some(engram_core::types::managed_create::digest(b"binding"));
+    let policy =
+        ManagedDenyPolicy::new(2, ["tools.example".into(), "next.example".into()]).unwrap();
+    let host = Arc::new(PolicyHost {
+        prepared: Some(prepared.clone()),
+        guest_ip_calls: AtomicUsize::new(0),
+        applied: Mutex::new(None),
+        entered: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    Arc::get_mut(&mut state).unwrap().services.host = host.clone();
+    assert_eq!(
+        meta.get_session(context.target.session_id)
+            .await
+            .unwrap()
+            .status,
+        engram_core::types::SessionState::Created
+    );
+    assert!(state
+        .services
+        .host
+        .guest_ip(context.target.sandbox_id)
+        .await
+        .is_none());
+    assert_eq!(host.guest_ip_calls.swap(0, Ordering::SeqCst), 1);
+    let response = apply_managed_policy(&state, context.clone(), policy.clone(), None)
+        .await
+        .unwrap()
+        .into_inner();
+    let applied = ManagedAppliedState::try_from(response.applied.unwrap()).unwrap();
+    assert_eq!(applied.context, context);
+    assert_eq!(applied.policy, policy);
+    assert_eq!(applied.network_proof.unwrap().guest_ip, prepared.guest_ip);
+    assert_eq!(host.guest_ip_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn managed_prepared_policy_rejects_changed_receipt_or_owner() {
+    use engram_core::types::managed_boot::ManagedBootPhase;
+    for change in [
+        "target",
+        "owner",
+        "request",
+        "receipt",
+        "interrupted",
+        "missing",
+    ] {
+        let (mut state, meta, row) = crate::managed_boot::tests::prepared_policy_fixture().await;
+        let mut context = row.request.key.context.clone();
+        context.binding_hash = Some(engram_core::types::managed_create::digest(b"binding"));
+        let host = Arc::new(PolicyHost {
+            prepared: row.prepared.clone(),
+            guest_ip_calls: AtomicUsize::new(0),
+            applied: Mutex::new(None),
+            entered: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        Arc::get_mut(&mut state).unwrap().services.host = host.clone();
+        meta.with_db_mut(|db| {
+            let boot = db
+                .managed_boots
+                .get_mut(&context.target.session_id)
+                .unwrap();
+            match change {
+                "target" => boot.request.key.context.target.binding_epoch += 1,
+                "owner" => boot.request.key.creation.task_id = "other-owner".into(),
+                "request" => {
+                    boot.prepared.as_mut().unwrap().request.key.boot_attempt = "stale".into()
+                }
+                "receipt" => {
+                    boot.prepared.as_mut().unwrap().guest_ip = std::net::Ipv4Addr::UNSPECIFIED
+                }
+                "interrupted" => boot.phase = ManagedBootPhase::Interrupted,
+                "missing" => boot.prepared = None,
+                _ => unreachable!(),
+            }
+        });
+        let result =
+            apply_managed_policy(&state, context, row.request.bootstrap_policy, None).await;
+        assert!(result.is_err(), "accepted {change} managed authority");
+        assert!(host.applied.lock().unwrap().is_none());
+        assert_eq!(
+            host.guest_ip_calls.load(Ordering::SeqCst),
+            0,
+            "used generic identity for {change}"
+        );
+    }
 }

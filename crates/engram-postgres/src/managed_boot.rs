@@ -320,6 +320,36 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
+    pub(crate) async fn boot_read_target(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<ManagedBootRecord, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let sandbox: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT sandbox_id FROM sessions WHERE id=$1 FOR SHARE")
+                .bind(target.session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or(MetaError::NotFound)?;
+        if sandbox != Some(target.sandbox_id.as_uuid()) {
+            return Err(conflict());
+        }
+        let value: serde_json::Value =
+            sqlx::query_scalar("SELECT record FROM session_managed_boots WHERE session_id=$1")
+                .bind(target.session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(conflict)?;
+        let row: ManagedBootRecord = serde_json::from_value(value).map_err(|_| conflict())?;
+        if row.request.key.context.target != *target {
+            return Err(conflict());
+        }
+        let result = read(&mut tx, &row.request.key).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(result)
+    }
     pub(crate) async fn boot_get(
         &self,
         identity: &engram_core::types::managed_create::ManagedCreateIdentity,

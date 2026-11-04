@@ -403,6 +403,14 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
         unimplemented!("read_managed_boot")
     }
+    /// Read the current complete boot authority for an exact physical target.
+    /// Missing, stale, and terminal placements fail closed.
+    async fn read_managed_boot_for_target(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("read_managed_boot_for_target")
+    }
     async fn advance_managed_boot(
         &self,
         _key: &crate::types::managed_boot::ManagedBootKey,
