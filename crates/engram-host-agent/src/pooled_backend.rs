@@ -127,7 +127,7 @@ struct PendingPresetup {
 /// captured state. A `?` return or a dropped handler future inside that
 /// window runs no error arm, so `Drop` does the recovery: discard the
 /// pending disk checkpoints, re-insert a consumed presetup so a
-/// coordinator retry finds it, and resume the guest.
+/// coordinator retry finds it, and resume the guest when it was paused.
 struct CaptureUnwind {
     inner: Arc<dyn SandboxBackend>,
     volumes: Option<Arc<SessionVolumes>>,
@@ -182,15 +182,24 @@ impl Drop for CaptureUnwind {
         let resume_on_drop = self.resume_on_drop;
         let id = self.id;
         let pending = std::mem::take(&mut self.pending);
-        let disk_seal = std::mem::take(&mut self.disk_seal);
+        let mut disk_seal = std::mem::take(&mut self.disk_seal);
         if let Some((pid, presetup, map)) = self.presetup_restore.take() {
-            // A newer presetup wins (the same policy as `migration_presetup`).
-            map.entry(pid).or_insert(presetup);
+            // A newer presetup wins (the same policy as `migration_presetup`);
+            // the superseded one's precopy goes with it.
+            match map.entry(pid) {
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(presetup);
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    disk_seal.extend(presetup.precopy.into_values());
+                }
+            }
         }
         tracing::warn!(
             sandbox_id = %id,
-            "capture unwind: capture failed or was cancelled after the pause; \
-             discarding the pending disk checkpoints and resuming the guest",
+            resume = resume_on_drop,
+            "capture unwind: capture failed or was cancelled; \
+             discarding the pending disk checkpoints and restoring the presetup",
         );
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
@@ -263,12 +272,12 @@ async fn discard_pending(volumes: &SessionVolumes, pending: PendingCheckpoint) {
 async fn discard_seal(volumes: &SessionVolumes, seal: Arc<DiskSeal>) {
     match Arc::try_unwrap(seal) {
         Ok(seal) => discard_pending(volumes, seal.pending).await,
-        // A fetch stream still reads the snapshot; the next startup
-        // reconcile removes it.
+        // A fetch stream still reads the snapshot; the release of the
+        // sandbox's volumes removes it.
         Err(seal) => tracing::debug!(
             sandbox_id = %seal.pending.sandbox(),
             role = %seal.pending.role(),
-            "disk seal still in use at discard; left for the startup reconcile",
+            "disk seal still in use at discard; left for the sandbox's release",
         ),
     }
 }
@@ -1528,35 +1537,44 @@ impl PooledBackend {
         volumes: &SessionVolumes,
         id: SandboxId,
     ) -> Result<std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>, SandboxError> {
-        let mut precopy = std::collections::BTreeMap::new();
-        let taken = async {
+        let mut taken: Vec<(DiskRole, PendingCheckpoint)> = Vec::new();
+        let diffed = async {
+            let mut precopy = std::collections::BTreeMap::new();
             for role in volumes.roles(id).await.map_err(disk_err)? {
                 let pending = volumes
                     .take_precopy(id, role)
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
+                taken.push((role, pending));
+                let pending = &taken.last().expect("just pushed").1;
                 let changed = volumes
-                    .changed_blocks(&pending, MIGRATION_DISK_BLOCK_BYTES)
+                    .changed_blocks(pending, MIGRATION_DISK_BLOCK_BYTES)
                     .await
                     .map_err(|e| {
                         SandboxError::Snapshot(format!("{role} disk precopy diff: {e}"))
                     })?;
-                precopy.insert(
-                    role,
-                    Arc::new(DiskSeal {
-                        pending,
-                        sealed: changed.into_iter().collect(),
-                    }),
-                );
+                precopy.insert(role, changed);
             }
-            Ok::<_, SandboxError>(())
+            Ok::<_, SandboxError>(precopy)
         }
         .await;
-        match taken {
-            Ok(()) => Ok(precopy),
+        match diffed {
+            Ok(mut changed) => Ok(taken
+                .into_iter()
+                .map(|(role, pending)| {
+                    let sealed = changed.remove(&role).expect("one diff per snapshot");
+                    (
+                        role,
+                        Arc::new(DiskSeal {
+                            pending,
+                            sealed: sealed.into_iter().collect(),
+                        }),
+                    )
+                })
+                .collect()),
             Err(error) => {
-                for (_, seal) in precopy {
-                    discard_seal(volumes, seal).await;
+                for (_, pending) in taken {
+                    discard_pending(volumes, pending).await;
                 }
                 Err(error)
             }
@@ -4955,11 +4973,13 @@ impl SandboxBackend for PooledBackend {
                     "no matching presetup for this capture (export id skew?)".into(),
                 ));
             };
-            // Issue #202: keep a copy of the consumed presetup so an
-            // unwind can re-insert it — otherwise a coordinator retry
-            // hits "no matching presetup" and the dest parks until its
-            // 120 s budget burns out.
-            let presetup_restore = pending.clone();
+            // The consumed presetup is the unwind's from here: an exit
+            // before the export exists re-inserts it, so a coordinator
+            // retry finds it; the guest is resumed only once it is paused.
+            let mut unwind = CaptureUnwind::new(self, id);
+            unwind.resume_on_drop = false;
+            unwind.arm();
+            unwind.presetup_restore = Some((id, pending.clone(), self.pending_presetups.clone()));
             let Some((chain_ref, chain_manifest)) = self
                 .checkpoint_chains
                 .get(&id)
@@ -5001,16 +5021,7 @@ impl SandboxBackend for PooledBackend {
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
             let pause_ms = t_pause.elapsed().as_millis() as u64;
-
-            // Issue #202: arm the unwind guard the instant the guest is
-            // paused. Any error/cancel before the export is registered
-            // must resume the guest, clear the fence, re-queue the
-            // (later-taken) seal, AND restore the consumed presetup. The
-            // old `FenceGuard` only lowered the fence — it left the guest
-            // frozen, dropped the seal, and consumed the presetup.
-            let mut unwind = CaptureUnwind::new(self, id);
-            unwind.arm();
-            unwind.presetup_restore = Some((id, presetup_restore, self.pending_presetups.clone()));
+            unwind.resume_on_drop = true;
 
             // Blackout leg 3: vmstate. Fork v3: state.bin + sidecar
             // only — the memory artifact never materializes (the whole
@@ -5730,6 +5741,7 @@ impl SandboxBackend for PooledBackend {
                 let drained_dests = self.drained_dests.clone();
                 let volumes = self.volumes.clone();
                 let pending_finalizes = self.pending_finalizes.clone();
+                let pending_presetups = self.pending_presetups.clone();
                 Box::pin(async move {
                     // Unregister from the egress proxy first, so a still-alive
                     // guest's traffic stops being rewritten. The binding goes
@@ -5746,8 +5758,14 @@ impl SandboxBackend for PooledBackend {
                     let result = inner.destroy(id).await;
                     // The disks go after the VM has closed them. A pending
                     // eviction finalize still publishes from them; it runs
-                    // this destroy again at its terminal step.
+                    // this destroy again at its terminal step. A move that
+                    // never reached its capture holds a precopy of them.
                     if let Some(volumes) = volumes.as_ref() {
+                        if let Some((_, presetup)) = pending_presetups.remove(&id) {
+                            for (_, seal) in presetup.precopy {
+                                discard_seal(volumes, seal).await;
+                            }
+                        }
                         if !pending_finalizes.contains_key(&id) {
                             if let Err(error) = volumes.release(id).await {
                                 tracing::warn!(sandbox_id = %id, %error, "release of the session disks failed");
@@ -8654,6 +8672,7 @@ mod tests {
                 chain_ref: engram_core::types::manifest::ManifestRef::new(),
                 disk_manifest_ref: None,
                 swap_manifest_ref: None,
+                precopy: Default::default(),
                 sidecar_json: Vec::new(),
                 idle_marked: false,
                 hot_chunks: Vec::new(),
@@ -8679,10 +8698,9 @@ mod tests {
             "the surviving presetup must still be E2"
         );
 
-        // The legitimate capture for E2 now gets PAST the presetup gate:
-        // it consumes E2 (so it no longer returns "no matching presetup")
-        // and instead fails at the next check — the checkpoint chain was
-        // never registered for this synthetic sandbox.
+        // The legitimate capture for E2 gets past the presetup gate and
+        // fails at the next check: the checkpoint chain was never
+        // registered for this synthetic sandbox.
         let Err(err) = pooled.migration_capture_postcopy(id, &live_export).await else {
             panic!("E2 capture must proceed past the presetup gate");
         };
@@ -8690,10 +8708,14 @@ mod tests {
             matches!(&err, SandboxError::InvalidSpec(m) if m.contains("checkpoint chain vanished")),
             "expected to pass the presetup gate and fail at the chain check, got: {err:?}"
         );
-        // E2 was consumed by the matching capture.
-        assert!(
-            !pooled.pending_presetups.contains_key(&id),
-            "the matching capture must consume the presetup"
+        // A failed capture puts the presetup back for the coordinator's retry.
+        assert_eq!(
+            pooled
+                .pending_presetups
+                .get(&id)
+                .map(|p| p.export_id.clone()),
+            Some(live_export),
+            "a capture that fails before the export exists restores the presetup"
         );
     }
 
@@ -8902,6 +8924,43 @@ mod tests {
         assert!(resumes.lock().is_empty(), "a defused guard must not resume");
         assert!(owned_elsewhere.is_some());
         volumes.pending(id, DiskRole::Root).await.unwrap();
+    }
+
+    /// A destroy retires the pending presetup of a move that never
+    /// reached its capture, precopy snapshot included.
+    #[tokio::test]
+    async fn destroy_retires_a_pending_presetup_and_its_precopy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let precopy = pooled.take_precopy(&volumes, id).await.unwrap();
+        let seal = std::sync::Arc::downgrade(&precopy[&DiskRole::Root]);
+        pooled.pending_presetups.insert(
+            id,
+            PendingPresetup {
+                export_id: "E1".into(),
+                peer_token: "tok".into(),
+                chain_ref: engram_core::types::manifest::ManifestRef::new(),
+                disk_manifest_ref: None,
+                swap_manifest_ref: None,
+                precopy,
+                sidecar_json: Vec::new(),
+                idle_marked: false,
+                hot_chunks: Vec::new(),
+            },
+        );
+
+        pooled.destroy(id).await.unwrap();
+        assert!(!pooled.pending_presetups.contains_key(&id));
+        assert!(
+            seal.upgrade().is_none(),
+            "nothing holds the precopy snapshot after destroy"
+        );
     }
 
     /// Aborting an export discards its seal, removes the export dir and
