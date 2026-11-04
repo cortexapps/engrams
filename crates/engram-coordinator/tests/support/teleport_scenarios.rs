@@ -525,28 +525,6 @@ async fn rollback_with_a_destroyed_source_fails_the_move(rig: Rig) {
 }
 scenario!(rollback_with_a_destroyed_source_fails_the_move);
 
-/// A disk-only session (live disk manifest, no memory snapshot) is still
-/// recoverable through the cold boot: a lost source settles it Idle, not
-/// Dead, and keeps the manifest.
-async fn rollback_with_a_destroyed_source_keeps_a_disk_only_session_idle(rig: Rig) {
-    let manifest = engram_core::types::manifest::ManifestRef::new();
-    rig.state
-        .services
-        .meta
-        .update_live_disk_manifest(rig.row.session_id, rig.row.source_sandbox_id, manifest)
-        .await
-        .unwrap();
-    rig.source.capture_fails.store(true, Ordering::SeqCst);
-    rig.source.resume_not_found.store(true, Ordering::SeqCst);
-    assert!(matches!(rig.drive().await, OpOutcome::Done));
-    assert_eq!(rig.phase().await, None);
-    let session = meta_session(&rig).await;
-    assert_eq!(session.status, engram_core::types::SessionState::Idle);
-    assert_eq!(session.sandbox_id, None);
-    assert_eq!(session.live_disk_manifest, Some(manifest));
-}
-scenario!(rollback_with_a_destroyed_source_keeps_a_disk_only_session_idle);
-
 async fn another_admission(rig: &Rig) -> engram_core::types::teleport::TeleportAdmitRequest {
     use engram_core::types::teleport::*;
     let meta = &rig.state.services.meta;

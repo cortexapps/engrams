@@ -473,7 +473,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

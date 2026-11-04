@@ -514,7 +514,7 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
             let has_snapshot = db.snapshots.values().any(|snapshot| {
                 snapshot.session_id == Some(row.session.id) && snapshot.recoverable
             });
-            if !has_snapshot && row.session.live_disk_manifest.is_none() {
+            if !has_snapshot {
                 return Err(Violation {
                     invariant: "snapshot-safety",
                     detail: format!(

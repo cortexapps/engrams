@@ -39,22 +39,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
             )));
         }
     };
-    // ADR 0016 Phase B: live_disk_manifest_* columns added in
-    // migration 0034. The both-or-neither CHECK constraint
-    // guarantees these two columns are either both NULL or both
-    // populated, so we collapse them into Option<ManifestRef>.
-    // Older SELECT statements that don't project these columns
-    // get `try_get` errors → fall back to None.
-    let live_disk_manifest_id: Option<Uuid> = row.try_get("live_disk_manifest_id").ok().flatten();
-    let live_disk_manifest_version: Option<i64> =
-        row.try_get("live_disk_manifest_version").ok().flatten();
-    let live_disk_manifest = match (live_disk_manifest_id, live_disk_manifest_version) {
-        (Some(mid), Some(ver)) => Some(engram_core::types::manifest::ManifestRef {
-            manifest_id: mid,
-            version: ver as u64,
-        }),
-        _ => None,
-    };
     // Issue #535 (b): migration 0082's TEXT[] NOT NULL DEFAULT '{}' column.
     // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
     // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
@@ -83,7 +67,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         last_event_at,
-        live_disk_manifest,
         park_rung,
         parked_at,
         suggested_title,

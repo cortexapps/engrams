@@ -638,10 +638,7 @@ mod steps {
                 .latest_snapshot_for_session(row.session_id)
                 .await?
                 .is_some_and(|s| s.recoverable);
-        let target = crate::dead_host::recovery_target(
-            has_recoverable_snapshot,
-            session.live_disk_manifest.is_some(),
-        );
+        let target = crate::dead_host::recovery_target(has_recoverable_snapshot);
         Ok(match (session.status, target) {
             (SessionState::Created, SessionState::Dead) => SessionState::Failed,
             (_, t) => t,

@@ -122,21 +122,11 @@ pub struct RegisterResponse {
     pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
 }
 
-/// ADR 0016 Phase B commit 7: one entry in the rehydration list
-/// the host iterates at startup. Wire format mirrors the columns
-/// `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`
-/// returns; the host's startup hook rebuilds chunked-disk tracking
-/// from these.
+/// One VM-resident binding the host re-registers at startup.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RehydrateSandboxRef {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
-    /// The effective disk manifest the host should rebuild from
-    /// (newer of `sessions.live_disk_manifest_*` and the latest
-    /// recoverable `snapshots.disk_manifest`). `None` means there's
-    /// no chunked-disk lineage to rebuild — host skips this row.
-    pub disk_manifest_id: Option<uuid::Uuid>,
-    pub disk_manifest_version: Option<u64>,
 }
 
 pub async fn register(
@@ -271,19 +261,13 @@ pub async fn register(
         }
     };
 
-    // ADR 0016 Phase B commit 7: rehydration list. PG already
-    // knows which VM-resident sessions are bound to this host (a
-    // host-agent restart drops `nbd_sandboxes` but PG persists the
-    // session→sandbox→host binding). "Resident" = every
-    // `reserves_host_memory` state with a sandbox bound, NOT just
-    // Active: a rung-parked Evicting session's paused VM survives
-    // the pod roll too, and omitting it orphans its NBD device
-    // (session 731df805, 2026-07-17). Hand the list back so the
-    // host can rebuild `ChunkedDiskBackend` + spawn the
-    // FlushScheduler for each, restoring continuous-flush
-    // coverage. Failure non-fatal: a host that doesn't get the
-    // list runs blind for the survivors (same shape as pre-Phase-
-    // B behaviour); operator can manually re-register or evac.
+    // Rehydration list: PG persists the session→sandbox→host binding
+    // across a host-agent restart, so the host re-registers every
+    // VM-resident survivor from it. "Resident" is every
+    // `reserves_host_memory` state with a sandbox bound, not just
+    // Active: a rung-parked Evicting session's paused VM survives the
+    // pod roll too. Failure is non-fatal: a host that does not get the
+    // list runs blind for the survivors.
     let rehydrate_sandboxes = match register_rehydrate_list_core(&state, req.host_id).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -1694,61 +1678,11 @@ pub async fn refresh_inject(
     }))
 }
 
-// ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
-
-#[derive(Deserialize)]
-pub struct LiveManifestPublishRequest {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    pub manifest_id: uuid::Uuid,
-    pub manifest_version: u64,
-}
-
-#[derive(Serialize)]
-pub struct LiveManifestPublishResponse {
-    pub outcome: LiveManifestPublishOutcome,
-}
-
-#[derive(Serialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveManifestPublishOutcome {
-    Applied,
-    Stale,
-}
-
-/// ADR 0016 Phase B: host's FlushScheduler tells us a fresh manifest
-/// version landed for `(session_id, sandbox_id)`. We UPDATE
-/// `sessions.live_disk_manifest_*` gated on `sandbox_id` match; on
-/// `Applied` we also bump `chunk_generation` (the Phase C mid-sweep
-/// barrier) in the same TX via `MetadataStore::update_live_disk_manifest`.
-///
-/// `Stale` (UPDATE matched zero rows) is logged as WARN — the host
-/// shouldn't retry; the staleness is structural (sandbox destroyed
-/// or rebound). Operators chasing repeated WARNs are likely seeing
-/// an issue with sandbox-binding bookkeeping, not Phase B.
-pub async fn live_manifest_publish(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-    Json(req): Json<LiveManifestPublishRequest>,
-) -> Result<Json<LiveManifestPublishResponse>, ApiError> {
-    let outcome = live_manifest_publish_core(&state, host_id, &req).await?;
-    Ok(Json(LiveManifestPublishResponse { outcome }))
-}
-
-/// The pure store-level core of [`live_manifest_publish`] (ADR 0098
-/// R-CoSim, the run_once pattern applied to handlers): the HTTP wrapper
-/// thins to extractor + JSON, this holds the real logic so the boundary
-/// simulator (`engram-dst-cosim`) can drive the exact coordinator code
-/// path the host-agent's `CoordControlPlane::publish_live_manifest` hits.
-/// Zero behavior change.
-/// The store-level core of the [`register`] handler's rehydration list (ADR
-/// 0098 R-CoSim, the run_once pattern applied to handlers). Returns the
-/// VM-resident sandboxes PG has bound to `host_id` — every
-/// `reserves_host_memory` state (Active AND rung-parked Evicting survivors,
-/// per session 731df805) — with the effective disk manifest the host rebuilds
-/// from. The boundary simulator's register-rehydrate leg drives THIS exact
-/// listing, so the co-simulated host re-serves precisely the devices the real
-/// coordinator would name.
+/// The store-level core of the [`register`] handler's rehydration list.
+/// Returns the VM-resident sandboxes PG has bound to `host_id`: every
+/// `reserves_host_memory` state, so rung-parked Evicting survivors count as
+/// well as Active ones. The boundary simulator's register-rehydrate leg
+/// drives this exact listing.
 pub async fn register_rehydrate_list_core(
     state: &SharedState,
     host_id: HostId,
@@ -1756,15 +1690,13 @@ pub async fn register_rehydrate_list_core(
     let rows = state
         .services
         .meta
-        .list_resident_sandboxes_on_host_with_disk_manifest(host_id)
+        .list_resident_sandbox_assignments_on_host(host_id)
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
+        .map(|(session_id, sandbox_id, _)| RehydrateSandboxRef {
             session_id,
             sandbox_id,
-            disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
-            disk_manifest_version: manifest.as_ref().map(|m| m.version),
         })
         .collect())
 }
@@ -1838,46 +1770,6 @@ pub async fn quarantined_survivor_advertise_core(
             // host's quarantine entry clears when the sandbox is
             // destroyed; nothing to drive here.
             _ => {}
-        }
-    }
-}
-
-pub async fn live_manifest_publish_core(
-    state: &SharedState,
-    host_id: HostId,
-    req: &LiveManifestPublishRequest,
-) -> Result<LiveManifestPublishOutcome, ApiError> {
-    let manifest_ref = engram_core::types::manifest::ManifestRef {
-        manifest_id: req.manifest_id,
-        version: req.manifest_version,
-    };
-    let outcome = state
-        .services
-        .meta
-        .update_live_disk_manifest(req.session_id, req.sandbox_id, manifest_ref)
-        .await?;
-    match outcome {
-        engram_core::traits::UpdateOutcome::Applied => {
-            tracing::debug!(
-                %host_id,
-                session_id = %req.session_id,
-                sandbox_id = %req.sandbox_id,
-                manifest_id = %req.manifest_id,
-                manifest_version = req.manifest_version,
-                "live_disk_manifest applied",
-            );
-            Ok(LiveManifestPublishOutcome::Applied)
-        }
-        engram_core::traits::UpdateOutcome::DroppedStale => {
-            tracing::warn!(
-                %host_id,
-                session_id = %req.session_id,
-                sandbox_id = %req.sandbox_id,
-                manifest_id = %req.manifest_id,
-                manifest_version = req.manifest_version,
-                "live_disk_manifest dropped as stale (sandbox_id mismatch)",
-            );
-            Ok(LiveManifestPublishOutcome::Stale)
         }
     }
 }
@@ -2123,7 +2015,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

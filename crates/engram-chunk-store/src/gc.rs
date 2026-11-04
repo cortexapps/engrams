@@ -1,32 +1,30 @@
 //! ADR 0016 Phase C: chunk-GC pin-set collection.
 //!
 //! [`PinSet`] is the union of every chunk hash currently referenced
-//! by a live row in the metadata store. Eight pin-set sources:
+//! by a live row in the metadata store. Seven pin-set sources:
 //!
 //! 1. `enabled_images.disk_manifest_*` — every chunked-disk enabled
 //!    image pins its base manifest's chunks.
-//! 2. `sessions.live_disk_manifest_*` — every Active session pins
-//!    its current `FlushScheduler` manifest version.
-//! 3. `snapshots.disk_manifest_*` WHERE `recoverable=true` — every
+//! 2. `snapshots.disk_manifest_*` WHERE `recoverable=true` — every
 //!    recoverable snapshot pins its captured disk manifest.
-//! 4. `snapshots.memory_manifest_*` WHERE `recoverable=true` —
+//! 3. `snapshots.memory_manifest_*` WHERE `recoverable=true` —
 //!    memory-side mirror.
-//! 5. `enabled_images.base_snapshot_memory_manifest_*` (ADR 0022) —
+//! 4. `enabled_images.base_snapshot_memory_manifest_*` (ADR 0022) —
 //!    the per-template base memfile's backing chunks. Pinned for the
 //!    template's enabled lifetime, independent of the base snapshot
 //!    row's `recoverable` flag (the memfile is a shared inode every
 //!    same-template `session.create` sibling `MAP_PRIVATE`s).
-//! 6. `enabled_images.base_snapshot_disk_manifest_*` (ADR 0022) —
-//!    the disk companion to #5: the rootfs a base `session.create`
+//! 5. `enabled_images.base_snapshot_disk_manifest_*` (ADR 0022) —
+//!    the disk companion to #4: the rootfs a base `session.create`
 //!    restores from, also recoverable-flag-independent.
-//! 7. `cold_bases.{disk,memory}_manifest` (ADR 0084 §B6) — a cold
+//! 6. `cold_bases.{disk,memory}_manifest` (ADR 0084 §B6) — a cold
 //!    base's chunks have NO other root: it never gets its own
 //!    `snapshots` row (only the warm overlay it seeds does), so
 //!    without this a live `cold_bases` row's chunks would be reaped
 //!    right out from under it.
-//! 8. `snapshots.swap_manifest_*` WHERE `recoverable=true` pins swap chunks.
+//! 7. `snapshots.swap_manifest_*` WHERE `recoverable=true` pins swap chunks.
 //!
-//! Sources 5 & 6 frequently dedup against #3/#4 (the base snapshot is
+//! Sources 4 & 5 frequently dedup against #2/#3 (the base snapshot is
 //! usually still `recoverable`); their distinct value is keeping the
 //! memfile + rootfs pinned even if that flag is ever cleared while an
 //! enabled template still has live sharers.
@@ -359,9 +357,6 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     for r in meta.list_enabled_image_disk_manifest_ids().await? {
         refs.insert(r);
     }
-    for r in meta.list_live_session_disk_manifest_ids().await? {
-        refs.insert(r);
-    }
     for (disk, swap) in meta.list_recoverable_snapshot_disk_manifests().await? {
         refs.extend(disk);
         refs.extend(swap);
@@ -418,17 +413,16 @@ mod tests {
     #[derive(Default)]
     struct PinSetMockMeta {
         enabled: Vec<ManifestRef>,
-        live: Vec<ManifestRef>,
         snap_disk: Vec<ManifestRef>,
         snap_swap: Vec<ManifestRef>,
         snap_mem: Vec<ManifestRef>,
         // ADR 0022 sources #5 + #6.
         enabled_base_mem: Vec<ManifestRef>,
         enabled_base_disk: Vec<ManifestRef>,
-        /// Refs revealed on LATER reads, modelling manifests published
-        /// while a collect is in flight. Read `k` (0-indexed) returns
-        /// `live` plus `staged[0..k]`, so read 0 sees none of them and
-        /// each subsequent read reveals one more.
+        /// Snapshot disk refs revealed on LATER reads, modelling snapshots
+        /// recorded while a collect is in flight. Read `k` (0-indexed)
+        /// returns `snap_disk` plus `staged[0..k]`, so read 0 sees none of
+        /// them and each subsequent read reveals one more.
         staged: Vec<ManifestRef>,
         reads: std::sync::atomic::AtomicUsize,
     }
@@ -641,20 +635,16 @@ mod tests {
         ) -> Result<Vec<ManifestRef>, MetaError> {
             Ok(self.enabled.clone())
         }
-        async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
-            let k = self
-                .reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut out = self.live.clone();
-            out.extend(self.staged.iter().take(k).copied());
-            Ok(out)
-        }
         async fn list_recoverable_snapshot_disk_manifests(
             &self,
         ) -> Result<Vec<(Option<ManifestRef>, Option<ManifestRef>)>, MetaError> {
+            let k = self
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self
                 .snap_disk
                 .iter()
+                .chain(self.staged.iter().take(k))
                 .map(|r| (Some(*r), None))
                 .chain(self.snap_swap.iter().map(|r| (None, Some(*r))))
                 .collect())
@@ -749,8 +739,7 @@ mod tests {
         // manifest level (single fetch, not double).
         let meta = PinSetMockMeta {
             enabled: vec![mref_a],
-            live: vec![mref_a, mref_b],
-            snap_disk: vec![mref_b],
+            snap_disk: vec![mref_a, mref_b],
             snap_mem: vec![mref_c],
             ..Default::default()
         };
@@ -866,7 +855,7 @@ mod tests {
         let (store, _dir) = fresh_store();
         let a = seed_manifest(&store, &[b"a", b"b"], ManifestKind::Disk).await;
         let meta = PinSetMockMeta {
-            live: vec![a],
+            snap_disk: vec![a],
             ..Default::default()
         };
         let got = PinSet::collect_converging(&meta, &store, 4, 3)
@@ -887,7 +876,7 @@ mod tests {
         let a = seed_manifest(&store, &[b"a"], ManifestKind::Disk).await;
         let late = seed_manifest(&store, &[b"late"], ManifestKind::Disk).await;
         let meta = PinSetMockMeta {
-            live: vec![a],
+            snap_disk: vec![a],
             staged: vec![late],
             ..Default::default()
         };
@@ -916,7 +905,7 @@ mod tests {
             staged.push(seed_manifest(&store, &[&[b'x', i]], ManifestKind::Disk).await);
         }
         let meta = PinSetMockMeta {
-            live: vec![a],
+            snap_disk: vec![a],
             staged,
             ..Default::default()
         };

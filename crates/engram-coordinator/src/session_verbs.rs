@@ -1876,11 +1876,8 @@ mod tests {
         );
     }
 
-    /// The `ManifestRef` version the reap fixtures publish + assert on.
-    const REAP_MANIFEST_VERSION: u64 = 7;
-
     /// Build an Evicting, quarantined session bound to a fresh sandbox on a
-    /// fresh host with a published disk manifest, plus a claimed Evict op —
+    /// fresh host, plus a claimed Evict op —
     /// the shape the exhaustion arm reads. When `route_destroy` is true a
     /// fresh in-proc backend is registered under the session's host so a
     /// `destroy(sandbox_id)` WOULD succeed — which lets the park test assert
@@ -1896,26 +1893,19 @@ mod tests {
         std::sync::Arc<crate::state::tests::MiniMeta>,
         engram_core::types::session_op::SessionOp,
         engram_core::SandboxId,
-        engram_core::types::manifest::ManifestRef,
         (tempfile::TempDir, Option<tempfile::TempDir>),
     ) {
-        use engram_core::types::manifest::ManifestRef;
         use engram_core::{HostId, SandboxId};
         use std::sync::Arc;
 
         let id = SessionId::new();
         let sandbox_id = SandboxId::new();
         let host_id = HostId::new();
-        let manifest = ManifestRef {
-            manifest_id: uuid::Uuid::new_v4(),
-            version: REAP_MANIFEST_VERSION,
-        };
 
         let mut session = idle_session(id);
         session.status = SessionState::Evicting;
         session.host_id = Some(host_id);
         session.sandbox_id = Some(sandbox_id);
-        session.live_disk_manifest = Some(manifest);
         let (state, mini, local) = crate::state::tests::build_state_for_session(session);
 
         let backend_dir = if route_destroy {
@@ -1957,7 +1947,7 @@ mod tests {
             EnqueueOutcome::Claimed(op) => op,
             other => panic!("lane busy: {other:?}"),
         };
-        (state, mini, op, sandbox_id, manifest, (local, backend_dir))
+        (state, mini, op, sandbox_id, (local, backend_dir))
     }
 
     /// 2026-08-02 durability-rollback RCA regression: a quarantined
@@ -1969,7 +1959,7 @@ mod tests {
     /// acked writes, and the host's rehydrate retry can still recover it).
     #[tokio::test]
     async fn quarantine_exhaustion_parks_the_op_and_records_no_rollback() {
-        let (state, mini, op, _sandbox_id, _manifest, _keep) = reap_fixture(true).await;
+        let (state, mini, op, _sandbox_id, _keep) = reap_fixture(true).await;
         let ctx = crate::session_ops::OpCtx {
             state: &state,
             op: &op,
@@ -2024,7 +2014,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

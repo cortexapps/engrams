@@ -944,11 +944,7 @@ pub(crate) async fn run_evict_pipeline(
     // `recoverable = false` row recorded just above is precisely what lets
     // that sweep emit the signal.
     let manifests_present = metadata.disk_manifest.is_some() || metadata.memory_manifest.is_some();
-    if target_state == SessionState::Idle
-        && manifests_present
-        && !record.recoverable
-        && session.live_disk_manifest.is_none()
-    {
+    if target_state == SessionState::Idle && manifests_present && !record.recoverable {
         ::metrics::counter!(crate::metrics::EVICTION_UNRECOVERABLE_CAPTURE_GUARD_TOTAL)
             .increment(1);
         tracing::warn!(
@@ -956,14 +952,14 @@ pub(crate) async fn run_evict_pipeline(
             sandbox_id = %sandbox_id,
             snapshot_id = %record.id,
             "idle eviction: capture recorded recoverable=false (manifests present but a \
-             BlobStorage HEAD failed) with no live disk manifest — refusing to land Idle on \
-             an un-resumable capture; aborting and retrying verification via the op budget",
+             BlobStorage HEAD failed); refusing to land Idle on an un-resumable capture; \
+             aborting and retrying verification via the op budget",
         );
         abort_inflight_snapshot(ctx, session_id, sandbox_id, "recoverable-guard").await;
         return Err(EvictError::Meta(format!(
-            "capture {} recorded recoverable=false (transient BlobStorage HEAD failure) with \
-             no live disk manifest; refusing to land Idle on an un-resumable capture — \
-             retrying verification within the evict op budget",
+            "capture {} recorded recoverable=false (transient BlobStorage HEAD failure); \
+             refusing to land Idle on an un-resumable capture; retrying verification \
+             within the evict op budget",
             record.id,
         )));
     }
@@ -1937,7 +1933,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -1993,7 +1988,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2155,7 +2149,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2284,7 +2277,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2489,7 +2481,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2715,7 +2706,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2937,7 +2927,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3056,7 +3045,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3263,7 +3251,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3383,7 +3370,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3412,7 +3398,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -4388,7 +4373,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

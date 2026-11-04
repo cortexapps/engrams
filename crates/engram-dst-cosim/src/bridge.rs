@@ -235,8 +235,8 @@ impl HostClient for CosimHostClient {
 /// It holds the replica's [`SharedState`] directly — the "transport" is a
 /// direct function call into the real handler logic, which is exactly the
 /// fidelity rung 1 buys (the toy `SimCoordClient` is a BTreeMap; this is the
-/// real `update_live_disk_manifest` / `get_session` + terminal-predicate /
-/// `session_owning_sandbox` code path).
+/// real `get_session` + terminal-predicate / `session_owning_sandbox` code
+/// path).
 pub struct CosimCoordControlPlane {
     /// `SharedState` is already `Arc<AppState>` — cheap to clone.
     state: SharedState,

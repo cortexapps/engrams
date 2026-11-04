@@ -6338,16 +6338,6 @@ impl SandboxBackend for PooledBackend {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
 
-        // ADR 0016 Phase B commit 4: the host-side
-        // LiveManifestPublisher's SessionResolver reads
-        // `session_bindings` to map sandbox_id → session_id at
-        // publish time. Phase A's design tied population to the
-        // egress-proxy branch, which means hosts without a wired
-        // proxy (the integration-up.sh dev stack, prod hosts with
-        // egress disabled) silently never populate the map — every
-        // FlushScheduler publish then skips with "sandbox not
-        // bound to a session" even though the session IS bound.
-        //
         // Insert FIRST, unconditionally. The egress-proxy registration
         // below is still gated on `self.egress`; only the sandbox→
         // session bookkeeping is universal.
@@ -6359,13 +6349,10 @@ impl SandboxBackend for PooledBackend {
                     "guest services and tunnels require a host egress proxy".into(),
                 ));
             }
-            // No proxy attached — egress is unfiltered. The
-            // coordinator may still send policy frames (the
-            // coordinator-side codepath doesn't know whether a host
-            // happens to have a proxy); skip the egress-proxy
-            // registration but the sandbox→session map insert above
-            // still ran, so Phase B's publisher resolver sees the
-            // binding.
+            // No proxy attached: egress is unfiltered. The coordinator
+            // still sends policy frames (it does not know whether a host
+            // has a proxy); the sandbox→session binding above is what
+            // this frame must record.
             tracing::debug!(
                 %sandbox_id,
                 %session_id,

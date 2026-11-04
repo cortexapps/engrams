@@ -2559,7 +2559,6 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id, image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at, nbd_slot_need
@@ -2762,7 +2761,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at, last_event_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at, suggested_title
             FROM sessions WHERE id = $1
             "#,
@@ -2936,7 +2934,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at, last_event_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at,
                    suggested_title
             FROM sessions
@@ -2949,135 +2946,6 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
         rows.iter().map(row::session_from_row).collect()
-    }
-
-    /// ADR 0016 Phase B commit 7 — single-query rehydration source.
-    /// LEFT JOIN against snapshots to compute the effective disk
-    /// manifest server-side (newer of live + latest recoverable
-    /// snapshot). Avoids the N+1 query the trait default would
-    /// produce.
-    async fn list_resident_sandboxes_on_host_with_disk_manifest(
-        &self,
-        host_id: HostId,
-    ) -> Result<
-        Vec<(
-            SessionId,
-            SandboxId,
-            Option<engram_core::types::manifest::ManifestRef>,
-        )>,
-        MetaError,
-    > {
-        // Root only: phase 2b adds swap when swap manifests are materialized.
-        // CTE picks the LATEST recoverable snapshot per session
-        // (one row per session_id, ordered by created_at DESC).
-        // The outer SELECT joins it with the VM-resident sessions
-        // on this host and picks max(live, snapshot) version when
-        // both share the same manifest_id; if they differ, snapshot
-        // wins (mirrors `effective_resume_disk_manifest`'s
-        // defensive branch).
-        //
-        // The status list IS `SessionState::host_memory_reserving_states()`
-        // (interpolated from the const): every state whose VM is
-        // resident on the host, not just 'active'. A rung-parked
-        // 'evicting' session's paused VM survives a host-agent pod
-        // roll like any other survivor; filtering it out here left
-        // its NBD device unclaimed after the roll — the successor's
-        // stale-binding sweep shot the live rootfs and the un-pause
-        // resumed the guest onto a dead data plane (session
-        // 731df805, 2026-07-17). The same omission recurred when ADR
-        // 0101 C introduced 'parked' and this list (then hand-rolled)
-        // missed it: the parked survivor fell to the local fallback
-        // pass, whose manifest-kind bug quarantined the device and
-        // the quarantine ladder destroyed the healthy paused VM
-        // (session 61a03b7e, 2026-07-21 — 93 events rewound).
-        let sql = format!(
-            r#"
-            WITH latest_snap AS (
-                SELECT DISTINCT ON (session_id)
-                       session_id,
-                       disk_manifest_id      AS snap_id,
-                       disk_manifest_version AS snap_version
-                FROM snapshots
-                WHERE session_id IS NOT NULL
-                  AND recoverable = TRUE
-                  AND disk_manifest_id IS NOT NULL
-                ORDER BY session_id, created_at DESC
-            )
-            SELECT s.id              AS session_id,
-                   s.sandbox_id      AS sandbox_id,
-                   s.live_disk_manifest_id      AS live_id,
-                   s.live_disk_manifest_version AS live_version,
-                   ls.snap_id        AS snap_id,
-                   ls.snap_version   AS snap_version
-            FROM sessions s
-            LEFT JOIN latest_snap ls ON ls.session_id = s.id
-            WHERE s.host_id    = $1
-              AND s.status IN ({reserving})
-              AND s.sandbox_id IS NOT NULL
-            "#,
-            reserving = reserving_states_sql(),
-        );
-        let rows = sqlx::query(&sql)
-            .bind(host_id.as_uuid())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let session: Uuid = r
-                .try_get("session_id")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: session_id: {e}")))?;
-            let sandbox: Uuid = r
-                .try_get("sandbox_id")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: sandbox_id: {e}")))?;
-            let live_id: Option<Uuid> = r
-                .try_get("live_id")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: live_id: {e}")))?;
-            let live_version: Option<i64> = r
-                .try_get("live_version")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: live_version: {e}")))?;
-            let snap_id: Option<Uuid> = r
-                .try_get("snap_id")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: snap_id: {e}")))?;
-            let snap_version: Option<i64> = r
-                .try_get("snap_version")
-                .map_err(|e| MetaError::Serialization(format!("rehydrate: snap_version: {e}")))?;
-            let live = match (live_id, live_version) {
-                (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
-                    manifest_id: id,
-                    version: v as u64,
-                }),
-                _ => None,
-            };
-            let snap = match (snap_id, snap_version) {
-                (Some(id), Some(v)) => Some(engram_core::types::manifest::ManifestRef {
-                    manifest_id: id,
-                    version: v as u64,
-                }),
-                _ => None,
-            };
-            // Mirror `effective_resume_disk_manifest` exactly.
-            // Same-id → max(version). Different id → snapshot wins
-            // (defensive). Both None → None (sandbox without
-            // chunked-disk lineage, host skips rehydration).
-            let effective = match (live, snap) {
-                (None, snap) => snap,
-                (Some(l), None) => Some(l),
-                (Some(l), Some(s)) => {
-                    if l.manifest_id == s.manifest_id && l.version > s.version {
-                        Some(l)
-                    } else {
-                        Some(s)
-                    }
-                }
-            };
-            out.push((
-                SessionId::from(session),
-                SandboxId::from(sandbox),
-                effective,
-            ));
-        }
-        Ok(out)
     }
 
     async fn list_resident_sandbox_assignments_on_host(
@@ -3299,8 +3167,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
-                   created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version
+                   created_at, last_active_at
             FROM sessions
             WHERE status = 'host_lost'
             "#,
@@ -3324,7 +3191,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at,
                    evict_attempts
             FROM sessions
@@ -3353,7 +3219,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at,
                    evict_attempts
             FROM sessions
@@ -4114,8 +3979,6 @@ impl MetadataStore for PostgresStore {
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
     ) -> Result<Option<u64>, MetaError> {
-        // Clear the live manifest and bump chunk_generation on unbind in
-        // the same transaction, so resume cannot use a post-snapshot publish.
         let states: Vec<String> = allowed_states
             .iter()
             .map(|s| s.as_str().to_string())
@@ -4164,30 +4027,18 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
             Some(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
         } else {
-            let n = sqlx::query(
+            sqlx::query(
                 "UPDATE sessions
-                    SET sandbox_id                 = NULL,
-                        missing_strikes            = 0,
-                        live_disk_manifest_id      = NULL,
-                        live_disk_manifest_version = NULL,
-                        live_disk_manifest_at      = NULL,
-                        updated_at                 = $2
+                    SET sandbox_id      = NULL,
+                        missing_strikes = 0,
+                        updated_at      = $2
                   WHERE id = $1",
             )
             .bind(id.as_uuid())
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(db_err)?
-            .rows_affected();
-            if n > 0 {
-                sqlx::query(
-                    "UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE",
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
+            .map_err(db_err)?;
             None
         };
         tx.commit().await.map_err(db_err)?;
@@ -5378,53 +5229,6 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         row.map(|r| row::snapshot_from_row(&r)).transpose()
-    }
-
-    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        // Root only: phase 2b adds swap when swap manifests are materialized.
-        // The `idx_snapshots_disk_manifest` partial index (migration
-        // 0018) makes this a fast scan over rows that actually have
-        // a chunked manifest. Legacy rows (NULL disk_manifest_id)
-        // are filtered out by the index predicate.
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT disk_manifest_id
-            FROM snapshots
-            WHERE disk_manifest_id IS NOT NULL
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter()
-            .map(|r| {
-                r.try_get::<uuid::Uuid, _>("disk_manifest_id")
-                    .map_err(db_err)
-            })
-            .collect()
-    }
-
-    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        // Mirror of `list_live_disk_manifest_ids`. The partial
-        // `idx_snapshots_memory_manifest` (migration 0019) keeps
-        // the scan proportional to FC snapshot rows — VZ rows skip
-        // memory manifests so they're invisible here.
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT memory_manifest_id
-            FROM snapshots
-            WHERE memory_manifest_id IS NOT NULL
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter()
-            .map(|r| {
-                r.try_get::<uuid::Uuid, _>("memory_manifest_id")
-                    .map_err(db_err)
-            })
-            .collect()
     }
 
     async fn session_exec_event_at(
@@ -8778,20 +8582,11 @@ impl MetadataStore for PostgresStore {
         host_id: Option<HostId>,
     ) -> Result<Option<u64>, MetaError> {
         let res = sqlx::query(
-            "WITH binding AS (
-              UPDATE sessions
+            "UPDATE sessions
                 SET sandbox_id = $2, host_id = $3, last_active_at = $5, updated_at = $5,
                     missing_strikes = 0,
-                    live_disk_manifest_id = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_id END,
-                    live_disk_manifest_version = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_version END,
-                    live_disk_manifest_at = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_at END,
                     binding_epoch = binding_epoch + CASE WHEN $2::uuid IS NULL THEN 0 ELSE 1 END
-              WHERE id = $1 AND current_epoch = $4 RETURNING binding_epoch
-             ), generation AS (
-              UPDATE chunk_generation SET generation = generation + 1
-              WHERE id = TRUE AND $2::uuid IS NULL AND EXISTS (SELECT 1 FROM binding)
-             )
-             SELECT binding_epoch FROM binding",
+              WHERE id = $1 AND current_epoch = $4 RETURNING binding_epoch",
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.map(|s| s.as_uuid()))
@@ -8806,57 +8601,6 @@ impl MetadataStore for PostgresStore {
         Ok(sandbox_id.map(|_| epoch))
     }
 
-    /// ADR 0016 Phase B: publish the host's freshly-flushed disk
-    /// manifest. Single TX:
-    ///
-    /// 1. `UPDATE sessions SET live_disk_manifest_* WHERE id = $1
-    ///    AND sandbox_id = $2`. The sandbox_id guard is the core
-    ///    correctness invariant — a stale publish from a destroyed
-    ///    or rebound sandbox can't clobber a fresh binding.
-    /// 2. If `rows_affected == 0`: return `DroppedStale` and let
-    ///    the transaction roll back. No `chunk_generation` bump
-    ///    because nothing was pinned.
-    /// 3. Else: bump `chunk_generation` so Phase C's mid-sweep
-    ///    barrier observes the new pin set atomically with the
-    ///    `sessions` row write. Return `Applied`.
-    async fn update_live_disk_manifest(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        manifest_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let rows_affected = sqlx::query(
-            "UPDATE sessions
-                SET live_disk_manifest_id      = $3,
-                    live_disk_manifest_version = $4,
-                    live_disk_manifest_at      = $5
-              WHERE id         = $1
-                AND sandbox_id = $2",
-        )
-        .bind(session_id.as_uuid())
-        .bind(sandbox_id.as_uuid())
-        .bind(manifest_ref.manifest_id)
-        .bind(manifest_ref.version as i64)
-        .bind(self.clock.now_utc())
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if rows_affected == 0 {
-            // Rollback the TX explicitly — nothing was written, but
-            // letting it implicit-drop is fine; this is documentation.
-            tx.rollback().await.map_err(db_err)?;
-            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
-        }
-        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(engram_core::traits::UpdateOutcome::Applied)
-    }
-
     /// ADR 0016 Phase C: read the one-row `chunk_generation` counter.
     /// Sweep before-and-after read; mid-sweep restart on bump.
     async fn chunk_generation(&self) -> Result<u64, MetaError> {
@@ -8868,13 +8612,8 @@ impl MetadataStore for PostgresStore {
         Ok(row as u64)
     }
 
-    /// ADR 0016 Phase C: explicit barrier bump for non-flush manifest-
-    /// lineage writes (`enable_image`, `record_snapshot`). Phase B's
-    /// `update_live_disk_manifest` already bumps inline in its own
-    /// TX; this method lets callers that don't share that TX (or
-    /// don't want to refactor their existing TX boundary) tick the
-    /// generation in a one-shot statement after their own write
-    /// commits.
+    /// Barrier bump for manifest-lineage writes (`enable_image`,
+    /// `record_snapshot`) whose own transaction has already committed.
     async fn bump_chunk_generation(&self) -> Result<(), MetaError> {
         sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
             .execute(&self.pool)
@@ -9030,32 +8769,6 @@ impl MetadataStore for PostgresStore {
                FROM enabled_images
               WHERE base_snapshot_disk_manifest_id IS NOT NULL
                 AND base_snapshot_disk_manifest_version IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
-                manifest_id: id,
-                version: version as u64,
-            })
-            .collect())
-    }
-
-    /// ADR 0016 Phase C: pin-set source #2 — every session that has
-    /// published a live disk manifest. The partial index
-    /// `idx_sessions_live_disk_manifest` (migration 0034) covers the
-    /// predicate so the scan is bounded by live-manifest count, not
-    /// total session count.
-    async fn list_live_session_disk_manifest_ids(
-        &self,
-    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
-        let rows = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT DISTINCT live_disk_manifest_id, live_disk_manifest_version
-               FROM sessions
-              WHERE live_disk_manifest_id IS NOT NULL
-                AND live_disk_manifest_version IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await

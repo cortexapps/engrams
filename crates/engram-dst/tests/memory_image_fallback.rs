@@ -79,16 +79,12 @@ fn refused_memory_image_resumes_by_disk_only_cold_boot() {
                 .expect("blob put");
         }
 
-        // Rest to Idle the surgical way, with the continuously flushed
-        // disk one version ahead of the snapshot's disk.
-        let mut live = snapshot_disk;
-        live.version += 1;
+        // Rest to Idle the surgical way.
         sim.world.meta.with_db_mut(|db| {
             let row = db.sessions.get_mut(&sid).expect("session row");
             row.session.status = SessionState::Idle;
             row.session.sandbox_id = None;
             row.session.host_id = None;
-            row.session.live_disk_manifest = Some(live);
         });
 
         // Every host refuses the memory image, as a real fleet does.
@@ -122,8 +118,8 @@ fn refused_memory_image_resumes_by_disk_only_cold_boot() {
             .collect();
         assert_eq!(
             created,
-            vec![Some(live)],
-            "exactly one cold boot, on the live disk (newer than the snapshot's)",
+            vec![Some(snapshot_disk)],
+            "exactly one cold boot, on the snapshot's disk",
         );
         // The cold boot came from the refusal, not from the resume skipping
         // the snapshot (that path boots the same disk).

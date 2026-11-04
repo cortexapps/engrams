@@ -782,59 +782,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(DeleteHostOutcome::Deleted)
     }
 
-    /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
-    /// Returns one record per session with a VM resident on
-    /// `host_id` (any [`SessionState::reserves_host_memory`] state
-    /// with `sandbox_id` bound — NOT just `Active`: a rung-parked
-    /// `Evicting` session's paused VM survives a host-agent pod roll
-    /// exactly like an active one, and session 731df805 (2026-07-17)
-    /// showed what excluding it does — the successor pod's rehydrate
-    /// pass never re-claims the parked survivor's NBD device, the
-    /// stale-binding sweep then disconnects the live rootfs, and the
-    /// un-pause resumes the guest onto a dead data plane), including
-    /// the effective disk manifest the host should rebuild
-    /// `ChunkedDiskBackend` from: the newer of
-    /// `sessions.live_disk_manifest_*` (last FlushScheduler publish)
-    /// and the latest recoverable snapshot's `disk_manifest`.
-    /// Same resolver semantic as `effective_resume_disk_manifest`
-    /// (commit 6); kept server-side so the host issues one query
-    /// per restart instead of N+1 round-trips.
-    ///
-    /// Default impl: scans `list_active_sessions()` + walks
-    /// `list_session_snapshots(...)` per row. Postgres overrides
-    /// with a single LEFT JOIN. The default exists so test mocks
-    /// without a snapshot index still satisfy the trait.
-    ///
-    /// `Option<ManifestRef>` is `None` when:
-    /// - The session never published a live manifest AND has no
-    ///   recoverable snapshot — legacy session or sandbox without
-    ///   chunked-disk tracking. Host skips rehydration (no
-    ///   `attach_chunked_disk` to call).
-    /// - The session's status changed mid-query (defensive).
-    async fn list_resident_sandboxes_on_host_with_disk_manifest(
-        &self,
-        host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
-        let all = self.list_active_sessions().await?;
-        let mut out = Vec::new();
-        for s in all {
-            if !s.status.reserves_host_memory() {
-                continue;
-            }
-            let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
-                continue;
-            };
-            if h != host_id {
-                continue;
-            }
-            // Pick newer of live vs. latest snapshot. The default
-            // impl can't cheaply query "latest snapshot"; default
-            // to live_disk_manifest only and let PgMeta's override
-            // do the JOIN.
-            out.push((s.id, sb, s.live_disk_manifest));
-        }
-        Ok(out)
-    }
     /// ADR 0015 M2: the single validated entry point for `UPDATE
     /// sessions SET status = ...`. Reads the current state, runs
     /// [`SessionState::try_transition_to`] against `target`, and
@@ -2084,35 +2031,9 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// Enumerate every disk `manifest_id` referenced by a live
-    /// snapshot row. Today's sole caller is `reap_materialize_dir`,
-    /// which uses the result as the "do not delete" filter when
-    /// pruning assembled `<manifest_id>-vN.ext4` files on hosts.
-    /// (The chunk-store GC that previously consumed this set was
-    /// removed 2026-05-23 — see ADR 0015 M5.)
-    ///
-    /// Returns DISTINCT ids; versions aren't surfaced. Default
-    /// `Ok(vec![])` keeps in-memory test impls quiet — the real
-    /// query lives in `engram-postgres`.
-    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// Symmetric memory-side companion to
-    /// `list_live_disk_manifest_ids`. Currently unused by any
-    /// in-tree caller after the chunk-store GC was removed, but
-    /// kept on the trait so a future reintroduction has a
-    /// pre-shaped seam.
-    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// ADR 0016 Phase C: pin-set source #3 — every recoverable
-    /// snapshot's root and swap `ManifestRef` pair (id + version). Unlike
-    /// `list_live_disk_manifest_ids` (which returns Uuid-only for
-    /// the `reap_materialize_dir` reaper), the pin-set query needs
-    /// the version so `chunk_store.get_manifest` reads the exact
-    /// manifest that snapshot row depends on.
+    /// Pin-set source: every recoverable snapshot's root and swap
+    /// `ManifestRef` pair (id + version), so `chunk_store.get_manifest`
+    /// reads the exact manifest that snapshot row depends on.
     ///
     /// Filtered to `recoverable=true` per the ADR's pin-set
     /// definition: non-recoverable snapshot rows are informational
@@ -3306,32 +3227,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0016 Phase B: write the host's freshly-flushed disk
-    /// manifest into `sessions.live_disk_manifest_*`, gated by a
-    /// `sandbox_id` match so a stale publish from a destroyed
-    /// sandbox can't clobber a fresh binding. Bumps
-    /// `chunk_generation` in the same transaction on `Applied` so
-    /// Phase C's GC barrier sees an atomic step from "old pin set
-    /// → write → new pin set" (no mid-sweep window where the new
-    /// manifest exists but the generation hasn't ticked).
-    ///
-    /// `DroppedStale` means the UPDATE matched zero rows — either
-    /// the session was destroyed between flush and publish, or the
-    /// sandbox was rebound. Coord-side handler logs a `warn!` with
-    /// the mismatch and returns 200 to the host (the host shouldn't
-    /// retry; the staleness is structural).
-    ///
-    /// Default returns `Applied` and does nothing, so test mocks
-    /// don't need to plumb the columns until they exercise Phase B.
-    async fn update_live_disk_manifest(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: SandboxId,
-        _manifest_ref: ManifestRef,
-    ) -> Result<UpdateOutcome, MetaError> {
-        Ok(UpdateOutcome::Applied)
-    }
-
     /// ADR 0016 Phase C support: read the one-row `chunk_generation`
     /// counter. Phase C's GC sweep reads this before listing the
     /// pin set and again at the end; if it ticked, the sweep
@@ -3394,21 +3289,6 @@ pub trait MetadataStore: Send + Sync {
     async fn list_enabled_image_base_snapshot_disk_manifests(
         &self,
     ) -> Result<Vec<ManifestRef>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
-    /// live_disk_manifest_version)` pair currently advertised by a
-    /// session row. Pin-set source #2 (the other two are
-    /// `list_enabled_image_disk_manifest_ids` and
-    /// `list_live_disk_manifest_ids` / `list_live_memory_manifest_ids`
-    /// over snapshots).
-    ///
-    /// Returns DISTINCT (id, version) tuples wrapped as `ManifestRef`.
-    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
-    /// runs an indexed `WHERE live_disk_manifest_id IS NOT NULL`
-    /// query against the partial index added by migration 0034.
-    async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
         Ok(Vec::new())
     }
 
@@ -3870,17 +3750,4 @@ pub struct GcCandidateRow {
     pub content_hash: [u8; 32],
     pub first_seen_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Outcome of [`MetadataStore::update_live_disk_manifest`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UpdateOutcome {
-    /// The session row was updated and `chunk_generation` ticked.
-    /// Coord handler logs `info!`; host's coalescing mpsc moves on.
-    Applied,
-    /// The UPDATE matched zero rows — `sessions.sandbox_id !=
-    /// publish.sandbox_id` (destroyed/rebound) or the session is
-    /// gone. Coord handler logs `warn!` with the mismatch fields;
-    /// host shouldn't retry.
-    DroppedStale,
 }

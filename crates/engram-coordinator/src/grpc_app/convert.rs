@@ -22,8 +22,7 @@ use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
-/// (off-contract per ADR 0051 §2.1: attribution leaves the contract) and
-/// `live_disk_manifest` (internal coord state, not on the wire shape).
+/// (off-contract per ADR 0051 §2.1: attribution leaves the contract).
 ///
 /// The exhaustive destructure below is the totality guard — if a field is
 /// added to `engram_core::types::Session` without updating this converter,
@@ -39,9 +38,8 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         last_event_at,
-        live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
-        park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
-        parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        park_rung: _, // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        parked_at: _, // Internal parking-ladder state (ADR 0074); not on the wire shape.
         suggested_title,
     } = s;
     app::Session {
@@ -938,7 +936,6 @@ mod tests {
             // crossed the two clocks fails this fixture instead of passing on
             // two identical `Utc::now()` values.
             last_event_at: Some(chrono::Utc::now() + chrono::Duration::seconds(61)),
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

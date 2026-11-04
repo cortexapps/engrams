@@ -617,18 +617,6 @@ pub struct Session {
     /// than by the last state transition.
     #[serde(default)]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// ADR 0016 Phase B: the host's last-published live disk
-    /// manifest from the FlushScheduler. Updated by
-    /// `MetadataStore::update_live_disk_manifest`; cleared by
-    /// `fenced_assign_sandbox(None)`. Coord's
-    /// `effective_resume_disk_manifest` picks the newer of this
-    /// and `snapshots.disk_manifest` so the first resume after
-    /// continuous flush is enabled doesn't silently roll back to
-    /// the snapshot's stale disk lineage. `None` for sessions
-    /// that haven't gotten a publish (non-NBD hosts /
-    /// pre-Phase-B sessions).
-    #[serde(default)]
-    pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,
     /// ADR 0074 parking ladder: which rung this session's sandbox is
     /// currently parked at. `0` = not parked (normal). `1` = nominated
     /// for eviction (still Active, cancellable). `2` = parked-paused
@@ -1101,7 +1089,6 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: Some(Utc::now()),
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

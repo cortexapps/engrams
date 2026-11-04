@@ -63,12 +63,10 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
-    /// ADR 0028 Fix B: chunked-manifest override for the root disk.
-    /// When set, the host serves the rootfs from THIS manifest's
-    /// chunks (NBD-attached, continuous-flush continues the same
-    /// lineage) instead of resolving it from `image_uri` — the
-    /// disk-only cold-boot recovery shape: a fresh kernel boot
-    /// mounting a session's evolved `live_disk_manifest`. Wire note:
+    /// Chunked-manifest override for the root disk. When set, the host
+    /// continues this manifest's lineage instead of forking the image's
+    /// base — the disk-only cold-boot recovery shape: a fresh kernel
+    /// boot on a session's evolved disk. Wire note:
     /// `SandboxSpec` is bincode-framed coord→host, so a mixed-version
     /// fleet mid-deploy can't decode creates — acceptable per the
     /// clean-break norm (coord + host MIG roll together on push).

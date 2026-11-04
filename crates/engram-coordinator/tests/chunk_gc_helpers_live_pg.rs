@@ -1,7 +1,6 @@
-//! Live-Postgres tests for the ADR 0016 Phase C `MetadataStore`
-//! helpers shipped in commit 1: `chunk_gc_candidates` upsert/list/
-//! delete cycle, `bump_chunk_generation`, and
-//! `list_live_session_disk_manifest_ids`.
+//! Live-Postgres tests for the chunk-GC `MetadataStore` helpers:
+//! the `chunk_gc_candidates` upsert/list/delete cycle and
+//! `bump_chunk_generation`.
 //!
 //! `#[ignore]`'d by default; requires Postgres reachable at
 //! `ENGRAM_TEST_DATABASE_URL`. Run:
@@ -16,7 +15,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
@@ -24,7 +22,7 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::registry::EnabledImage;
 use engram_core::types::session::SessionMode;
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::{SandboxId, SessionSpec, SnapshotId};
+use engram_core::types::{SessionSpec, SnapshotId};
 use uuid::Uuid;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
@@ -146,90 +144,6 @@ async fn bump_chunk_generation_increments_monotonically() {
         after_three >= after_one + 2,
         "three bumps from {after_one} must reach >= {} (got {after_three})",
         after_one + 2,
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
-    let Some(meta) = connect().await else {
-        return;
-    };
-
-    // Need a session row to attach a sandbox + live manifest to.
-    let session_id = meta
-        .create_session(SessionSpec {
-            image: "phase-c-helpers-test:warm-1".into(),
-            mode: SessionMode::Agent,
-        })
-        .await
-        .expect("create session");
-    let sandbox_id = SandboxId::new();
-    // 0108: the production fused Pending→Created bind.
-    meta.transition_session_created(session_id, sandbox_id)
-        .await
-        .expect("assign sandbox");
-
-    let mref = ManifestRef {
-        manifest_id: Uuid::new_v4(),
-        version: 42,
-    };
-
-    // Pre-write: live set must NOT contain our (fresh) manifest_id.
-    let before = meta
-        .list_live_session_disk_manifest_ids()
-        .await
-        .expect("list before");
-    assert!(
-        !before.iter().any(|r| r.manifest_id == mref.manifest_id),
-        "fresh manifest id appeared before being written — UUID collision or stale fixture",
-    );
-
-    let outcome = meta
-        .update_live_disk_manifest(session_id, sandbox_id, mref)
-        .await
-        .expect("publish live manifest");
-    assert!(
-        matches!(outcome, engram_core::traits::UpdateOutcome::Applied),
-        "publish must apply against a live (sandbox_id-matching) session",
-    );
-
-    // Post-write: live set MUST contain it.
-    let after = meta
-        .list_live_session_disk_manifest_ids()
-        .await
-        .expect("list after");
-    let hit = after
-        .iter()
-        .find(|r| r.manifest_id == mref.manifest_id)
-        .expect("live manifest not surfaced after publish");
-    assert_eq!(
-        hit.version, mref.version,
-        "version must round-trip via the live-set query",
-    );
-
-    // Clear the live manifest via fenced_assign_sandbox(None) —
-    // the trait method already cascades the cleanup per its docs.
-    meta.fenced_assign_sandbox(
-        session_id,
-        0,
-        None,
-        meta.get_session(session_id).await.unwrap().host_id,
-    )
-    .await
-    .expect("unbind sandbox");
-
-    // Allow PG a tick to fully commit the cascade then re-poll.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let after_clear = meta
-        .list_live_session_disk_manifest_ids()
-        .await
-        .expect("list after clear");
-    assert!(
-        !after_clear
-            .iter()
-            .any(|r| r.manifest_id == mref.manifest_id),
-        "live manifest must drop out of the live set after the sandbox is unbound",
     );
 }
 

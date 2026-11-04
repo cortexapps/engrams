@@ -88,10 +88,6 @@ pub fn router(state: SharedState) -> Router {
             "/hosts/{id}/sandboxes/{sandbox_id}/owner",
             get(host_http::sandbox_owner),
         )
-        .route(
-            "/hosts/{id}/live-manifest",
-            post(host_http::live_manifest_publish),
-        )
         // WS4: the egress proxy re-mints a near-expiry inject credential.
         .route(
             "/hosts/{id}/sessions/{session_id}/inject/refresh",

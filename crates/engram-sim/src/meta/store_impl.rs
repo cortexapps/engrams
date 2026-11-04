@@ -730,7 +730,6 @@ impl MetadataStore for SimMetadataStore {
                     created_at: now,
                     last_active_at: now,
                     last_event_at: None,
-                    live_disk_manifest: None,
                     park_rung: 0,
                     parked_at: None,
                     suggested_title: None,
@@ -860,7 +859,6 @@ impl MetadataStore for SimMetadataStore {
                     created_at: now,
                     last_active_at: now,
                     last_event_at: None,
-                    live_disk_manifest: None,
                     park_rung: 0,
                     parked_at: None,
                     suggested_title: None,
@@ -2649,10 +2647,6 @@ impl MetadataStore for SimMetadataStore {
             r.binding_epoch += 1;
             r.binding_epoch as u64
         });
-        if sandbox_id.is_none() {
-            r.session.live_disk_manifest = None;
-            db.chunk_generation += 1;
-        }
         Ok(binding_epoch)
     }
 
@@ -2693,10 +2687,6 @@ impl MetadataStore for SimMetadataStore {
             r.binding_epoch += 1;
             r.binding_epoch as u64
         });
-        if sandbox_id.is_none() {
-            r.session.live_disk_manifest = None;
-            db.chunk_generation += 1;
-        }
         Ok(epoch)
     }
 
@@ -3964,37 +3954,6 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
-    /// Fenced-by-sandbox manifest publish; stale binding -> DroppedStale.
-    async fn update_live_disk_manifest(
-        &self,
-        session_id: SessionId,
-        sandbox_id: engram_core::SandboxId,
-        manifest_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
-        self.gate()?;
-        let mut db = self.db.lock();
-        let Some(r) = db.sessions.get_mut(&session_id) else {
-            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
-        };
-        if r.session.sandbox_id != Some(sandbox_id) {
-            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
-        }
-        r.session.live_disk_manifest = Some(manifest_ref);
-        db.chunk_generation += 1;
-        Ok(engram_core::traits::UpdateOutcome::Applied)
-    }
-
-    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        self.gate()?;
-        let db = self.db.lock();
-        Ok(db
-            .sessions
-            .values()
-            .filter_map(|r| r.session.live_disk_manifest.as_ref())
-            .map(|m| m.manifest_id)
-            .collect())
-    }
-
     /// Queued totals: count + Σ budgets.
     async fn queued_demand(&self) -> Result<engram_core::types::session::QueuedDemand, MetaError> {
         self.gate()?;
@@ -4741,58 +4700,6 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
-    async fn list_resident_sandboxes_on_host_with_disk_manifest(
-        &self,
-        host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
-        // PG twin: sessions in any `reserves_host_memory` state with a
-        // sandbox bound on this host (a rung-parked `Evicting` VM is
-        // as resident as an `Active` one — session 731df805), each
-        // resolved to the effective disk manifest: newer of the live
-        // manifest and the latest recoverable snapshot's, same-id →
-        // max(version), different id → snapshot wins.
-        self.gate()?;
-        let db = self.db.lock();
-        let mut out = Vec::new();
-        for row in db.sessions.values() {
-            let s = &row.session;
-            if !s.status.reserves_host_memory() {
-                continue;
-            }
-            let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
-                continue;
-            };
-            if h != host_id {
-                continue;
-            }
-            // Latest recoverable snapshot with a disk manifest
-            // (PG: DISTINCT ON (session_id) … ORDER BY created_at DESC).
-            let snap = db
-                .snapshots
-                .values()
-                .filter(|snap| {
-                    snap.session_id == Some(s.id)
-                        && snap.recoverable
-                        && snap.disk_manifest.is_some()
-                })
-                .max_by_key(|snap| snap.created_at)
-                .and_then(|snap| snap.disk_manifest);
-            let effective = match (s.live_disk_manifest, snap) {
-                (None, snap) => snap,
-                (Some(l), None) => Some(l),
-                (Some(l), Some(sn)) => {
-                    if l.manifest_id == sn.manifest_id && l.version > sn.version {
-                        Some(l)
-                    } else {
-                        Some(sn)
-                    }
-                }
-            };
-            out.push((s.id, sb, effective));
-        }
-        Ok(out)
-    }
-
     async fn list_enable_jobs(&self, _limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         panic!("SimMeta: list_enable_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
@@ -4823,14 +4730,6 @@ impl MetadataStore for SimMetadataStore {
 
     async fn list_harnesses(&self) -> Result<Vec<engram_core::types::CatalogHarness>, MetaError> {
         panic!("SimMeta: list_harnesses not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        panic!("SimMeta: list_live_memory_manifest_ids not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
-        panic!("SimMeta: list_live_session_disk_manifest_ids not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
     async fn list_org_secrets(

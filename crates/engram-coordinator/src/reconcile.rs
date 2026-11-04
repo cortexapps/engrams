@@ -404,26 +404,14 @@ async fn flip_missing(
     // HostLost -> {Idle, Dead} via the ONE shared predicate
     // `dead_host::recovery_target`. A session is recoverable iff its
     // latest snapshot's `recoverable` flag is true (the BlobStorage HEAD
-    // result at snapshot-take time — false means even an Idle-ready
-    // snapshot wouldn't survive a /resume) OR it has a live disk manifest
-    // (disk-only cold-boot resume). Before #777 this site ignored the
-    // manifest (a disk-recoverable session could be lied into Dead) and
-    // the two dead-host sites keyed on mere snapshot presence (an
-    // un-recoverable snapshot could be lied into Idle) — the shared
-    // predicate closes both directions.
+    // result at snapshot-take time; false means even an Idle-ready
+    // snapshot would not survive a /resume).
     // ADR 0116 A4: the shared settle. NOTE the error-posture change
     // from the pre-A4 copy this replaces: a snapshot-read error now
     // leaves the row at HostLost for the straggler sweep (the old copy
     // treated it as not-recoverable — a PG blip could terminally Dead a
     // recoverable session, a latent honest-Dead violation).
-    crate::dead_host::settle_host_lost(
-        meta,
-        events,
-        session_id,
-        Some(session.live_disk_manifest.is_some()),
-        now,
-    )
-    .await;
+    crate::dead_host::settle_host_lost(meta, events, session_id, now).await;
     // The Active -> HostLost transition above landed regardless of
     // whether stage 2 (HostLost -> {Idle,Dead}) also succeeded — the
     // session left Active, which is what `to_flip` promises callers.

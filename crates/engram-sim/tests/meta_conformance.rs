@@ -2864,190 +2864,6 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
-/// Register-time rehydrate list (`list_resident_sandboxes_on_host_
-/// with_disk_manifest`): every VM-resident state with a bound sandbox
-/// is returned — a rung-parked `Evicting` session included (session
-/// 731df805, 2026-07-17: filtering on `status = 'active'` orphaned the
-/// parked survivor's NBD device across a host-agent pod roll) — with
-/// the effective disk manifest resolved as newer-of(live, latest
-/// recoverable snapshot): same manifest_id → max(version), different
-/// id → snapshot wins, non-recoverable snapshots invisible.
-async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
-    use engram_core::types::manifest::ManifestRef;
-
-    let meta = &ctx.meta;
-    let now = ctx.clock.now_utc();
-    let host = HostId::new();
-    let other_host = HostId::new();
-    meta.upsert_host(host_record(host, "conf-rehydrate-h1", now))
-        .await
-        .unwrap();
-    meta.upsert_host(host_record(other_host, "conf-rehydrate-h2", now))
-        .await
-        .unwrap();
-
-    let mref = |manifest_id: uuid::Uuid, version: u64| ManifestRef {
-        manifest_id,
-        version,
-    };
-    let snap_with = |sid, at, recoverable, manifest: Option<ManifestRef>| {
-        let mut s = snapshot(SnapshotId::new(), sid, at, recoverable);
-        s.disk_manifest = manifest;
-        s
-    };
-    let bind = |sid, h| async move {
-        meta.assign_session_host(sid, Some(h)).await.unwrap();
-        let sb = engram_core::SandboxId::new();
-        // 0108: the production fused Pending→Created bind.
-        meta.transition_session_created(sid, sb).await.unwrap();
-        sb
-    };
-
-    let m_a = uuid::Uuid::from_u128(0xA);
-    let m_b = uuid::Uuid::from_u128(0xB);
-    let m_c = uuid::Uuid::from_u128(0xC);
-    let m_d = uuid::Uuid::from_u128(0xD);
-    let m_e = uuid::Uuid::from_u128(0xE);
-    let m_f = uuid::Uuid::from_u128(0xF);
-    let m_g = uuid::Uuid::from_u128(0x10);
-
-    // Active + sandbox: live A@5 vs recoverable snap A@3 → same id,
-    // live is newer → A@5.
-    let s_active = meta
-        .create_session(spec("conf:rehydrate-active"))
-        .await
-        .unwrap();
-    let sb_active = bind(s_active, host).await;
-    meta.transition_session(s_active, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_active, sb_active, mref(m_a, 5))
-        .await
-        .unwrap();
-    assert!(meta
-        .record_snapshot(snap_with(s_active, now, true, Some(mref(m_a, 3))))
-        .await
-        .unwrap());
-
-    // THE regression case — rung-parked survivor: Evicting + sandbox
-    // still bound. Live B@2; two recoverable snapshots, the NEWEST
-    // (D@1) must win over both the older snap (C@9) and the live ref
-    // (different manifest_id → snapshot wins).
-    let s_parked = meta
-        .create_session(spec("conf:rehydrate-parked"))
-        .await
-        .unwrap();
-    let sb_parked = bind(s_parked, host).await;
-    meta.transition_session(s_parked, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_parked, sb_parked, mref(m_b, 2))
-        .await
-        .unwrap();
-    assert!(meta
-        .record_snapshot(snap_with(s_parked, now, true, Some(mref(m_c, 9))))
-        .await
-        .unwrap());
-    ctx.clock.advance(Duration::from_secs(10));
-    let later = ctx.clock.now_utc();
-    assert!(meta
-        .record_snapshot(snap_with(s_parked, later, true, Some(mref(m_d, 1))))
-        .await
-        .unwrap());
-    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
-        .await
-        .unwrap();
-
-    // ADR 0101 C — a session at the `parked` STATUS (paused in place,
-    // sandbox bound). THE 2026-07-21 regression (session 61a03b7e): the
-    // hand-rolled SQL status list missed 'parked', the parked survivor
-    // vanished from the register-time rehydrate list after a host-agent
-    // roll, and the quarantine ladder destroyed its healthy paused VM
-    // (93 events rewound). Live G@3, no snapshots → G@3.
-    let s_c_parked = meta
-        .create_session(spec("conf:rehydrate-parked-status"))
-        .await
-        .unwrap();
-    let sb_c_parked = bind(s_c_parked, host).await;
-    meta.transition_session(s_c_parked, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.update_live_disk_manifest(s_c_parked, sb_c_parked, mref(m_g, 3))
-        .await
-        .unwrap();
-    meta.transition_session(
-        s_c_parked,
-        SessionState::Evicting,
-        BindingDisposition::Retain,
-    )
-    .await
-    .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Parked, BindingDisposition::Retain)
-        .await
-        .unwrap();
-
-    // Created + sandbox (VM resident, agent not yet started): no live
-    // manifest; one recoverable snap E@1; a NEWER but non-recoverable
-    // F@7 must be invisible → E@1.
-    let s_created = meta
-        .create_session(spec("conf:rehydrate-created"))
-        .await
-        .unwrap();
-    let sb_created = bind(s_created, host).await;
-    assert!(meta
-        .record_snapshot(snap_with(s_created, now, true, Some(mref(m_e, 1))))
-        .await
-        .unwrap());
-    assert!(meta
-        .record_snapshot(snap_with(s_created, later, false, Some(mref(m_f, 7))))
-        .await
-        .unwrap());
-
-    // Idle (evicted; sandbox unbound) → excluded.
-    let s_idle = meta
-        .create_session(spec("conf:rehydrate-idle"))
-        .await
-        .unwrap();
-    bind(s_idle, host).await;
-    meta.transition_session(s_idle, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .unwrap();
-    meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
-        .await
-        .unwrap();
-    meta.fenced_assign_sandbox(s_idle, 0, None, Some(host))
-        .await
-        .unwrap();
-
-    // Active on ANOTHER host → excluded from this host's list.
-    let s_elsewhere = meta
-        .create_session(spec("conf:rehydrate-elsewhere"))
-        .await
-        .unwrap();
-    bind(s_elsewhere, other_host).await;
-    meta.transition_session(
-        s_elsewhere,
-        SessionState::Active,
-        BindingDisposition::Retain,
-    )
-    .await
-    .unwrap();
-
-    let mut rows = meta
-        .list_resident_sandboxes_on_host_with_disk_manifest(host)
-        .await
-        .unwrap();
-    rows.sort_by_key(|(sid, _, _)| *sid);
-    let mut expected = vec![
-        (s_active, sb_active, Some(mref(m_a, 5))),
-        (s_parked, sb_parked, Some(mref(m_d, 1))),
-        (s_c_parked, sb_c_parked, Some(mref(m_g, 3))),
-        (s_created, sb_created, Some(mref(m_e, 1))),
-    ];
-    expected.sort_by_key(|(sid, _, _)| *sid);
-    assert_eq!(rows, expected);
-}
-
 /// ADR 0023 broker tokens (R2): first-writer-wins insert, get, delete.
 async fn broker_token_flow(ctx: &Ctx) {
     let meta = &ctx.meta;
@@ -3128,7 +2944,7 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         "a parked session is in the non-terminal (active) set"
     );
     assert!(
-        meta.list_resident_sandboxes_on_host_with_disk_manifest(host)
+        meta.list_resident_sandbox_assignments_on_host(host)
             .await
             .unwrap()
             .iter()
@@ -4130,10 +3946,6 @@ conformance!(
 conformance!(t_chunk_gc_sweep_lease, super::chunk_gc_sweep_lease);
 conformance!(t_host_lifecycle, super::host_lifecycle);
 conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);
-conformance!(
-    t_resident_sandboxes_rehydrate_list,
-    super::resident_sandboxes_rehydrate_list
-);
 
 /// Issue #722 (R3): the reservation predicate is UNCONDITIONAL — a
 /// `pending` pinned to a host holds its budget (visible through
@@ -6091,27 +5903,17 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         .unwrap();
     let first = engram_core::SandboxId::new();
     meta.transition_session_created(sid, first).await.unwrap();
-    let manifest = engram_core::types::manifest::ManifestRef::new();
-    meta.update_live_disk_manifest(sid, first, manifest)
-        .await
-        .unwrap();
-    let generation = meta.chunk_generation().await.unwrap();
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
         .await
         .unwrap()
         .is_empty());
 
-    // A rejected clear must retain both the live pin and the strike streak.
+    // A rejected clear must retain the strike streak.
     assert!(matches!(
         meta.fenced_assign_sandbox(sid, 1, None, None).await,
         Err(MetaError::Conflict(_))
     ));
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().live_disk_manifest,
-        Some(manifest)
-    );
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
     assert_eq!(
         meta.apply_missing_sandbox_strikes(&[], &[sid], 2)
             .await
@@ -6119,7 +5921,7 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         vec![sid]
     );
 
-    // A bind resets strikes, retains the manifest, and mints one epoch.
+    // A bind resets strikes and mints one epoch.
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
         .await
@@ -6137,13 +5939,8 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         .await
         .unwrap()
         .is_empty());
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().live_disk_manifest,
-        Some(manifest)
-    );
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
 
-    // A clear resets strikes and removes the live pin without minting an epoch.
+    // A clear resets strikes without minting an epoch.
     assert_eq!(
         meta.fenced_assign_sandbox(sid, 0, None, None)
             .await
@@ -6152,8 +5949,6 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
     );
     let session = meta.get_session(sid).await.unwrap();
     assert_eq!(session.sandbox_id, None);
-    assert_eq!(session.live_disk_manifest, None);
-    assert_eq!(meta.chunk_generation().await.unwrap(), generation + 1);
     assert_eq!(meta.session_binding_generations(sid).await.unwrap().0, 2);
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)
