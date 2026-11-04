@@ -4,13 +4,14 @@
 //! volume named `img-<manifest>-v<N>` exists only once its stage
 //! finished, because a stage writes under `tmp-img-...` and renames.
 
+use std::collections::HashSet;
 use std::io;
 
-use engram_chunk_store::ChunkStore;
+use engram_chunk_store::{ChunkStore, Manifest};
 use engram_core::types::manifest::ManifestRef;
 use uuid::Uuid;
 
-use crate::disk::{SessionDisk, VolumeName};
+use crate::disk::{SessionDisk, Volume, VolumeName};
 use crate::disk_flows::stage;
 
 const IMAGE_PREFIX: &str = "img-";
@@ -57,8 +58,10 @@ pub struct Report {
     pub failed: Vec<(VolumeName, io::Error)>,
 }
 
-/// One pass: delete unfinished stages, delete image volumes that are
-/// no longer desired, stage desired images that have no volume. A
+/// One pass: delete unfinished stages, stage desired images that have
+/// no volume, then delete image volumes that are no longer desired. A
+/// new image stages as a snapshot of the present volume it shares the
+/// most chunks with, which is why the undesired volumes go last. A
 /// failure on one volume is recorded and the pass continues. `Err`
 /// only when the disk cannot be listed.
 pub async fn reconcile_once(
@@ -79,6 +82,21 @@ pub async fn reconcile_once(
         }
     }
 
+    // Lower versions first, so a version staged in this pass can be the
+    // origin of the next.
+    let mut to_stage: Vec<ManifestRef> = desired
+        .iter()
+        .copied()
+        .filter(|image| !present.contains(image))
+        .collect();
+    to_stage.sort_by_key(|image| (image.manifest_id, image.version));
+    for image in to_stage {
+        match stage_one(disk, store, image, &present).await {
+            Ok(()) => present.push(image),
+            Err(e) => report.failed.push((volume_name(image), e)),
+        }
+    }
+
     for image in present.clone() {
         if desired.contains(&image) {
             continue;
@@ -90,26 +108,6 @@ pub async fn reconcile_once(
                 report.deleted.push(name);
             }
             Err(e) => report.failed.push((name, e)),
-        }
-    }
-
-    // Lower versions first, so a version staged in this pass can be the
-    // origin of the next.
-    let mut to_stage: Vec<ManifestRef> = desired
-        .iter()
-        .copied()
-        .filter(|image| !present.contains(image))
-        .collect();
-    to_stage.sort_by_key(|image| (image.manifest_id, image.version));
-    for image in to_stage {
-        let predecessor = present
-            .iter()
-            .copied()
-            .filter(|p| p.manifest_id == image.manifest_id && p.version < image.version)
-            .max_by_key(|p| p.version);
-        match stage_one(disk, store, image, predecessor).await {
-            Ok(()) => present.push(image),
-            Err(e) => report.failed.push((volume_name(image), e)),
         }
     }
 
@@ -125,19 +123,10 @@ async fn stage_one(
     disk: &dyn SessionDisk,
     store: &ChunkStore,
     image: ManifestRef,
-    predecessor: Option<ManifestRef>,
+    present: &[ManifestRef],
 ) -> io::Result<()> {
     let manifest = store.get_manifest(image).await.map_err(io::Error::other)?;
-    let base = match predecessor {
-        Some(p) => match (
-            disk.open(&volume_name(p)).await,
-            store.get_manifest(p).await,
-        ) {
-            (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
-            _ => None,
-        },
-        None => None,
-    };
+    let base = closest(disk, store, &manifest, present).await;
     let staging = staging_name(image);
     let staged = stage(
         disk,
@@ -156,12 +145,50 @@ async fn stage_one(
     disk.rename(&staging, &volume_name(image)).await
 }
 
+/// The present volume whose manifest holds the most of `wanted`'s
+/// chunks at the same offsets, when one holds any. A volume whose
+/// manifest the store no longer has, or whose shape differs, is not a
+/// candidate.
+async fn closest(
+    disk: &dyn SessionDisk,
+    store: &ChunkStore,
+    wanted: &Manifest,
+    present: &[ManifestRef],
+) -> Option<(Volume, Manifest)> {
+    let wanted_chunks: HashSet<(u64, _)> =
+        wanted.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+    let mut best: Option<(usize, Volume, Manifest)> = None;
+    for candidate in present {
+        let Ok(manifest) = store.get_manifest(*candidate).await else {
+            continue;
+        };
+        if manifest.chunk_size != wanted.chunk_size || manifest.total_bytes != wanted.total_bytes {
+            continue;
+        }
+        let shared = manifest
+            .chunks
+            .iter()
+            .filter(|c| wanted_chunks.contains(&(c.offset, c.hash)))
+            .count();
+        if shared == 0 || best.as_ref().is_some_and(|(most, _, _)| *most >= shared) {
+            continue;
+        }
+        let Ok(volume) = disk.open(&volume_name(*candidate)).await else {
+            continue;
+        };
+        best = Some((shared, volume, manifest));
+    }
+    best.map(|(_, volume, manifest)| (volume, manifest))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use engram_chunk_store::Manifest;
     use engram_storage_local::LocalBlobStorage;
+
+    use crate::test_support::CountingBlob;
 
     use super::*;
     use crate::disk::{ChunkIndex, FileDisk, Volume};
@@ -173,13 +200,18 @@ mod tests {
         _dir: tempfile::TempDir,
         disk: FileDisk,
         store: ChunkStore,
+        blob: Arc<CountingBlob>,
     }
 
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
+        let blob = Arc::new(CountingBlob::new(LocalBlobStorage::new(
+            dir.path().join("blobs"),
+        )));
         Rig {
             disk: FileDisk::new(dir.path().join("volumes"), CHUNK).unwrap(),
-            store: ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs")))),
+            store: ChunkStore::new(blob.clone()),
+            blob,
             _dir: dir,
         }
     }
@@ -272,6 +304,32 @@ mod tests {
         let two = r.disk.open(&volume_name(v2)).await.unwrap();
         assert_eq!(bytes_of(&one).await, vec![1, 2, 3]);
         assert_eq!(bytes_of(&two).await, vec![1, 0, 9]);
+    }
+
+    /// A re-bake of an image is a new lineage; it stages as a snapshot
+    /// of the volume it shares the most chunks with and fetches only
+    /// the difference, and the old volume goes only after that.
+    #[tokio::test]
+    async fn a_new_lineage_stages_from_the_present_volume_it_shares_most_with() {
+        let r = rig();
+        let old = ManifestRef::new();
+        let other = ManifestRef::new();
+        let rebaked = ManifestRef::new();
+        publish(&r, old, &[1, 2, 3, 4]).await;
+        publish(&r, other, &[1, 0, 0, 0]).await;
+        publish(&r, rebaked, &[1, 2, 3, 9]).await;
+        reconcile_once(&r.disk, &r.store, &[old, other])
+            .await
+            .unwrap();
+
+        let gets = r.blob.gets();
+        let report = reconcile_once(&r.disk, &r.store, &[other, rebaked])
+            .await
+            .unwrap();
+        assert_eq!(r.blob.gets(), gets + 1, "only the changed chunk is fetched");
+        assert_eq!(report.deleted, vec![volume_name(old)]);
+        let v = r.disk.open(&volume_name(rebaked)).await.unwrap();
+        assert_eq!(bytes_of(&v).await, vec![1, 2, 3, 9]);
     }
 
     #[tokio::test]

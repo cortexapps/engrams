@@ -35,6 +35,8 @@ pub mod fs;
 pub mod image_volumes;
 pub mod session_volumes;
 pub mod shutdown;
+#[cfg(test)]
+mod test_support;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{CoordControlPlane, CoordError};

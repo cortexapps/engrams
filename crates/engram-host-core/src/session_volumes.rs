@@ -697,7 +697,7 @@ mod tests {
     use super::*;
     use crate::disk::FileDisk;
     use crate::disk_flows::checkpoint;
-    use engram_core::error::BlobError;
+    use crate::test_support::CountingBlob;
 
     const CHUNK: u64 = 4096;
 
@@ -726,10 +726,9 @@ mod tests {
     }
 
     fn rig_on(dir: tempfile::TempDir, disk: Arc<dyn SessionDisk>) -> Rig {
-        let blob = Arc::new(CountingBlob {
-            inner: LocalBlobStorage::new(dir.path().join("blobs")),
-            gets: std::sync::atomic::AtomicU64::new(0),
-        });
+        let blob = Arc::new(CountingBlob::new(LocalBlobStorage::new(
+            dir.path().join("blobs"),
+        )));
         let store = ChunkStore::new(blob.clone());
         Rig {
             volumes: SessionVolumes::new(disk.clone(), store.clone()),
@@ -737,50 +736,6 @@ mod tests {
             store,
             blob,
             _dir: dir,
-        }
-    }
-
-    /// Counts the chunk GETs a stage makes; manifest reads do not count.
-    struct CountingBlob {
-        inner: LocalBlobStorage,
-        gets: std::sync::atomic::AtomicU64,
-    }
-
-    impl CountingBlob {
-        fn gets(&self) -> u64 {
-            self.gets.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl engram_core::traits::BlobStorage for CountingBlob {
-        async fn put_streaming(
-            &self,
-            key: &str,
-            body: engram_core::traits::storage::ByteStream,
-        ) -> Result<u64, BlobError> {
-            self.inner.put_streaming(key, body).await
-        }
-        async fn get_streaming(
-            &self,
-            key: &str,
-        ) -> Result<engram_core::traits::storage::ByteStream, BlobError> {
-            if key.starts_with("chunks/") {
-                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.inner.get_streaming(key).await
-        }
-        async fn head(
-            &self,
-            key: &str,
-        ) -> Result<engram_core::traits::storage::BlobObjectMeta, BlobError> {
-            self.inner.head(key).await
-        }
-        async fn delete(&self, key: &str) -> Result<(), BlobError> {
-            self.inner.delete(key).await
-        }
-        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
-            self.inner.list_prefix(prefix).await
         }
     }
 
