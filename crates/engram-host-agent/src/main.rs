@@ -64,6 +64,11 @@ struct Cli {
     )]
     dirty_root: PathBuf,
 
+    /// Name of the node's dm-thin pool for session disks. When set, the
+    /// host-agent opens the pool at startup and logs its capacity.
+    #[arg(long, env = "ENGRAM_THIN_POOL")]
+    thin_pool: Option<String>,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -550,6 +555,33 @@ async fn main() -> Result<(), HostAgentError> {
             }
         }
     };
+    if let Some(pool) = cli.thin_pool.as_deref() {
+        #[cfg(target_os = "linux")]
+        {
+            let disk = engram_disk_thin::ThinPoolDisk::open(
+                pool,
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+                std::path::Path::new("/dev/engram"),
+            )
+            .await
+            .map_err(|e| HostAgentError::Config(format!("thin pool {pool}: {e}")))?;
+            let capacity = engram_host_core::SessionDisk::capacity(&disk)
+                .await
+                .map_err(|e| HostAgentError::Config(format!("thin pool {pool} capacity: {e}")))?;
+            tracing::info!(
+                pool,
+                data_free_bytes = capacity.data_free_bytes,
+                data_total_bytes = capacity.data_total_bytes,
+                metadata_free_bytes = capacity.metadata_free_bytes,
+                metadata_total_bytes = capacity.metadata_total_bytes,
+                "thin pool open"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostAgentError::Config(format!(
+            "--thin-pool {pool} needs Linux device-mapper"
+        )));
+    }
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
     // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute

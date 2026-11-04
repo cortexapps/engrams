@@ -277,6 +277,10 @@ spec:
             # in the configmap, and matches the emptyDir layout).
             - name: ENGRAM_FIRECRACKER_BIN
               value: /opt/engram/firecracker
+            {{- if and .Values.nodePrep.enabled .Values.thinPool.enabled }}
+            - name: ENGRAM_THIN_POOL
+              value: {{ .Values.thinPool.name | quote }}
+            {{- end }}
             {{- if .Values.coordinator.tokenSecretName }}
             - name: ENGRAM_COORDINATOR_TOKEN
               valueFrom:

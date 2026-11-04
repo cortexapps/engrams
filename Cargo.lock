@@ -2352,6 +2352,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-disk-thin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "engram-chunk-store",
+ "engram-host-core",
+ "engram-storage-local",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-dst"
 version = "0.1.0"
 dependencies = [
@@ -2655,6 +2670,7 @@ dependencies = [
  "engram-cloud-sql",
  "engram-cloud-static",
  "engram-core",
+ "engram-disk-thin",
  "engram-egress-proto",
  "engram-egress-proxy",
  "engram-egress-proxyd",

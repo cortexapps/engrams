@@ -178,15 +178,15 @@ pub fn is_zero_chunk(bytes: &[u8]) -> bool {
 }
 
 /// Release `length` bytes at `offset` so they read as zeros: `BLKDISCARD`
-/// on a block device (dm-thin does not accept `fallocate`'s write-zeroes
-/// mapping; verify when the thin-pool implementation lands), `fallocate`
-/// punch-hole on a file.
+/// on a block device (a dm-thin volume unmaps the range and reads back
+/// zeros), `fallocate` punch-hole on a file.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
     if file.metadata()?.file_type().is_block_device() {
         // _IO(0x12, 119); argument is [start, length] in bytes.
-        const BLKDISCARD: libc::c_ulong = 0x1277;
+        const BLKDISCARD: libc::Ioctl = 0x1277;
         let range: [u64; 2] = [offset, length];
         // SAFETY: the kernel copies the two-element range in and writes
         // nothing back. The fd is owned by `file` for the whole call.

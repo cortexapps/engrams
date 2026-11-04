@@ -1,0 +1,30 @@
+[package]
+name = "engram-disk-thin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SessionDisk on a dm-thin pool: thin volumes, O(1) snapshots and thin_delta dirty-chunk diffs"
+
+# The workspace `forbid` cannot be relaxed per function; `deny` can.
+# Only the ioctl and mknod calls in `dm` carry an allow.
+[lints.rust]
+unsafe_code = "deny"
+
+# Copied from the root Cargo.toml: `workspace = true` cannot coexist
+# with a crate-local lint.
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+async-trait.workspace = true
+engram-host-core.workspace = true
+libc = "0.2"
+tokio.workspace = true
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+engram-chunk-store.workspace = true
+engram-storage-local.workspace = true
+tempfile = "3"

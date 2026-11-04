@@ -34,6 +34,7 @@ path = "src/main.rs"
 engram-tls.workspace = true
 engram-core.workspace = true
 engram-host-core.workspace = true
+engram-disk-thin.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
 engram-substrate-proto.workspace = true
