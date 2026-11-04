@@ -533,12 +533,14 @@ that adds code without retiring the row it replaces is incomplete.
   checkpoint reproduced through `stage`, capacity falling by the blocks
   written, orphan reaping and id-counter skipping, `list` and `rename`
   keeping an open handle valid.
-- **Firecracker integration (KVM runners, `ci.yml`):** create → write →
-  checkpoint → verify the manifest's chunks equal the guest's bytes;
-  checkpoint under a guest writing at full rate, assert the pause is
-  bounded; host-agent restart with a running guest, assert zero disk
-  calls and zero lost writes; resume on a second pool from the
-  manifest, assert equality. Each sized to its property.
+- **Firecracker integration (KVM runners, `ci.yml`, over the pool
+  `ENGRAM_TEST_THIN_POOL` names):** create → write → checkpoint →
+  resume on another disk from the manifest, assert the bytes are equal;
+  the disk half of a checkpoint under a guest writing at full rate,
+  assert it is bounded; host-agent restart with a running guest, assert
+  zero disk calls and zero lost writes; a two-host move under a guest
+  writing at a steady rate, assert the seal holds only the residual.
+  Each sized to its property.
 - **Simulation (engram-sim):** the heartbeat no longer carries a
   quarantine field; the cosim oracle from the stalled ADR 0110
   retirement PR, "a host-agent roll produces zero evictions and zero
@@ -650,16 +652,20 @@ names the test that guards each one. As landed, the guards are:
 
 - A session's disk is a thin volume the kernel owns; no userspace
   process is in the data path; a volume outlives every handle to it.
-  (`a_volume_survives_a_dropped_handle_and_opens_by_name`)
+  (`a_volume_survives_a_dropped_handle_and_opens_by_name`,
+  `a_host_agent_restart_keeps_the_guest_and_every_write`)
 - An acknowledged guest write is in the host page cache or the pool,
   never in host-agent memory. (By construction: the host agent is not
-  in the data path. No CI guard.)
+  in the data path. The restart test above guards the consequence.)
 - A checkpoint pauses the guest only for the page-cache sync and the
   volume snapshot; the upload runs after the resume and carries only
   what changed. (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`,
   `checkpoints_upload_only_what_changed_and_rotate_the_volume`,
-  `thin_delta_reports_exactly_what_the_full_compare_reports`.) The
-  pause itself is measured in Tradeoffs, not guarded in CI.
+  `thin_delta_reports_exactly_what_the_full_compare_reports`,
+  `the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate`.)
+- A live move's pause carries only what the guest wrote during the
+  precopy. (`two_host_teleport_seals_only_the_residual_under_steady_writes`,
+  `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`)
 - The base image is staged on a node before the image is ready there.
   (`only_images_with_a_volume_on_disk_stay_ready`)
 - Placement never chooses a node whose pool is below the floor.
@@ -667,7 +673,8 @@ names the test that guards each one. As landed, the guards are:
 - The chunk store manifest is the only cross-host representation of a
   disk; any host stages any manifest.
   (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
-  `a_checkpoint_over_the_pool_reproduces_through_stage`)
+  `a_checkpoint_over_the_pool_reproduces_through_stage`,
+  `a_checkpoint_reproduces_the_guest_disk_on_another_disk`)
 - The heartbeat carries observed facts only; no field asks the
   coordinator to take an action.
 

@@ -210,14 +210,25 @@ the test named beside it.
 - No userspace process is in the data path. The host agent holds a volume only while it
   stages or checkpoints it; a volume outlives every handle to it and reopens by name
   (`a_volume_survives_a_dropped_handle_and_opens_by_name`). An acknowledged guest write
-  is in the host page cache or the pool, never in host-agent memory.
+  is in the host page cache or the pool, never in host-agent memory. A host-agent restart
+  reattaches a running guest with no disk call and loses none of its writes
+  (`a_host_agent_restart_keeps_the_guest_and_every_write`).
 - A checkpoint pauses the guest only for the page-cache sync and the volume snapshot; the
   upload runs after the guest resumes
   (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`) and carries only the
   blocks that changed since the previous checkpoint
   (`checkpoints_upload_only_what_changed_and_rotate_the_volume`,
-  `thin_delta_reports_exactly_what_the_full_compare_reports`). The pause is tens of
-  milliseconds however much the session wrote (measured in ADR 0125; no CI guard).
+  `thin_delta_reports_exactly_what_the_full_compare_reports`). Under a guest writing at
+  full rate the sync and snapshot stay under two seconds however much it wrote
+  (`the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate`).
+- A live move carries the disk in 64 KiB blocks in three tiers: the checkpoint the source
+  advertises, the blocks a snapshot taken while the guest runs changed since it, and the
+  blocks the snapshot under the pause changed since that one. The pause carries only what
+  the guest wrote during the precopy
+  (`two_host_teleport_seals_only_the_residual_under_steady_writes`,
+  `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`), and the destination's
+  disk holds every byte once the source is destroyed
+  (`two_host_teleport_rootfs_survives_source_destroy`).
 - A base image is staged into a volume on a node before the image is ready there
   (`only_images_with_a_volume_on_disk_stay_ready`). A session volume is a snapshot of
   that image volume (`a_fork_of_a_published_manifest_starts_its_own_lineage`), so a create
@@ -240,7 +251,8 @@ the test named beside it.
   instead of failing it, so a session stalls rather than corrupts.
 - The chunk-store manifest is the only cross-host representation of a disk; any host
   stages any manifest (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
-  `a_checkpoint_over_the_pool_reproduces_through_stage`).
+  `a_checkpoint_over_the_pool_reproduces_through_stage`,
+  `a_checkpoint_reproduces_the_guest_disk_on_another_disk`).
 - The heartbeat carries observed facts only; no field asks the coordinator to act.
 - The session's disk lineage is the latest recoverable snapshot. A session with no
   recoverable snapshot whose host is lost is dead.
