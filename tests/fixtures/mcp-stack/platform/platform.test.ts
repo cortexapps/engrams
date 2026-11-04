@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import {
   chmod,
   link,
@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { request } from "node:http";
 import { connect } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   ContextSchema,
   type Context,
@@ -1264,4 +1264,134 @@ test("FC whole-module inventory rejects invalid counts and uses kernel device nu
     ENGRAM_NBD_MAX_SLOTS: "1",
     ENGRAM_NBD_WARM_SLOTS: "1",
   });
+});
+
+test("guest enable accepts an unobserved queued digest and verifies the ready image", async () => {
+  const { create } =
+    await import("../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js");
+  const { EnableImageResponseSchema, GetEnableJobResponseSchema, ListEnabledImagesResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/image_pb.ts");
+  const { GetHostResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/fleet_pb.ts");
+  const { WhoAmIResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts");
+  const transport = await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
+  const { enableGuest } = await import("./main.ts");
+  const directory = await mkdtemp(join(root, "enable-identity-"));
+  const inputs = input();
+  const opensslPath = await realpath(
+    process.env.MCP_PLATFORM_TEST_OPENSSL ?? Bun.which("openssl") ?? "openssl",
+  );
+  inputs.binaries.openssl = { path: opensslPath, sha256: hash(await readFile(opensslPath)) };
+  const identity = await generateIdentity(inputs, directory);
+  const expectedDigest = `sha256:${"d".repeat(64)}`;
+  const wrongDigest = `sha256:${"e".repeat(64)}`;
+  const uri = "registry.fixture.example/guest:fixture";
+  for (const scenario of [
+    {
+      name: "unobserved",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: expectedDigest,
+      error: undefined,
+    },
+    {
+      name: "wrong-ready",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: wrongDigest,
+      error: "enable_actual_host",
+    },
+    {
+      name: "missing-id",
+      id: "",
+      queuedDigest: undefined,
+      readyDigest: expectedDigest,
+      error: "enable_manifest",
+    },
+    {
+      name: "wrong-queued",
+      id: "job-1",
+      queuedDigest: wrongDigest,
+      readyDigest: expectedDigest,
+      error: "enable_manifest",
+    },
+  ]) {
+    const ctx = await context();
+    ctx.runRoot = dirname(ctx.endpoints.app.ca.path);
+    const admin = await transport.publicClient(ctx, { kind: "cookie", value: "fixture=cookie" });
+    const responses = [
+      create(GetEnableJobResponseSchema, { job: { id: "job-1", state: "materializing" } }),
+      create(GetEnableJobResponseSchema, {
+        job: {
+          id: "job-1",
+          state: "ready",
+          manifestDigest: scenario.readyDigest,
+          materializeHostId: ctx.hostId,
+        },
+      }),
+    ];
+    const spies = [
+      spyOn(transport, "jsonRequest").mockResolvedValue({
+        status: 200,
+        headers: { "set-cookie": ["fixture=cookie; HttpOnly"] },
+        body: {},
+      }),
+      spyOn(transport, "publicClient").mockResolvedValue(admin),
+      spyOn(admin.identity, "whoAmI").mockResolvedValue(
+        create(WhoAmIResponseSchema, {
+          email: "bootstrap@fixture.example",
+          role: "admin",
+          userId: "actor-1",
+        }),
+      ),
+      spyOn(admin.fleet, "getHost").mockResolvedValue(
+        create(GetHostResponseSchema, {
+          host: {
+            id: ctx.hostId,
+            status: "ready",
+            capacityTotalMib: 512n,
+            readyImageDigests: [expectedDigest],
+          },
+        }),
+      ),
+      spyOn(admin.images, "enableImage").mockResolvedValue(
+        create(EnableImageResponseSchema, {
+          job: { id: scenario.id, state: "pending", manifestDigest: scenario.queuedDigest },
+        }),
+      ),
+      spyOn(admin.images, "getEnableJob").mockImplementation(async () => {
+        const response = responses.shift();
+        if (!response) throw new Error("unexpected enable poll");
+        return response;
+      }),
+      spyOn(admin.images, "listEnabledImages").mockResolvedValue(
+        create(ListEnabledImagesResponseSchema, {
+          images: [{ id: "enabled-1", imageUri: uri, manifestDigest: expectedDigest }],
+        }),
+      ),
+    ];
+    try {
+      const enabling = enableGuest(ctx, identity, uri, expectedDigest);
+      if (scenario.error) {
+        await expect(enabling, scenario.name).rejects.toThrow(scenario.error);
+        await expect(readFile(join(ctx.runRoot, "enable-observation.json"))).rejects.toThrow();
+      } else {
+        await enabling;
+        expect(
+          JSON.parse(await readFile(join(ctx.runRoot, "enable-observation.json"), "utf8")),
+        ).toMatchObject({
+          jobId: "job-1",
+          imageId: "enabled-1",
+          imageDigest: expectedDigest,
+          hostId: ctx.hostId,
+          state: "ready",
+        });
+        expect(ctx.imageId).toBe("enabled-1");
+        expect(ctx.imageDigest).toBe(expectedDigest);
+      }
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  }
 });

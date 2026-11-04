@@ -43,7 +43,7 @@ export const matrixArguments = (contextPath: string) => [
   "all",
 ];
 
-async function enableGuest(
+export async function enableGuest(
   ctx: Context,
   identity: Identity,
   uri: string,
@@ -106,7 +106,8 @@ async function enableGuest(
     },
   });
   check(
-    job.job?.id && job.job.manifestDigest === expectedDigest,
+    job.job?.id &&
+      (job.job.manifestDigest === undefined || job.job.manifestDigest === expectedDigest),
     "enable_manifest",
   );
   const result = await waitFor(
