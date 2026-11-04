@@ -1,4 +1,4 @@
-import { RunnerFailure } from "./context.ts";
+import { RunnerFailure } from "./failure.ts";
 
 export const HARNESS = ["claude", "codex"] as const;
 export type Harness = (typeof HARNESS)[number];

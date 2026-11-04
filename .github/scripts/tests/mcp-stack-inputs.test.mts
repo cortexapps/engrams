@@ -5,6 +5,7 @@ import {
   access,
   chmod,
   chown,
+  cp,
   link,
   lstat,
   mkdir,
@@ -301,5 +302,52 @@ test("CLI accepts exact flags, rejects unknown backend and extra arguments, and 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, "");
     parseInputs(JSON.parse(await readFile(output, "utf8")), "vz");
+  });
+});
+
+test("CLI writes Inputs from a source snapshot before dependencies are installed", async () => {
+  await fixture("vz", async ({ root, template, source, output }) => {
+    const snapshot = join(root, "source");
+    for (const path of [
+      ".github/scripts/mcp-stack-inputs.mts",
+      "tests/fixtures/mcp-stack/platform",
+      "orchestrator/scripts/mcp-stack",
+    ]) {
+      const target = join(snapshot, path);
+      await mkdir(dirname(target), { recursive: true });
+      await cp(join(REPO, path), target, { recursive: true });
+    }
+    await absent(join(snapshot, "node_modules"));
+    await absent(join(snapshot, "orchestrator/node_modules"));
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--experimental-transform-types",
+        join(snapshot, ".github/scripts/mcp-stack-inputs.mts"),
+        "--backend",
+        "vz",
+        "--template",
+        source,
+        "--output",
+        output,
+      ],
+      {
+        cwd: snapshot,
+        env: { PATH: dirname(process.execPath), TMPDIR: root },
+        encoding: "utf8",
+        timeout: 10000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "");
+    const inputs = parseInputs(JSON.parse(await readFile(output, "utf8")), "vz");
+    assert.equal((await lstat(output)).mode & 0o777, 0o600);
+    assert.equal(inputs.sourceCommit, template.sourceCommit);
+    assert.equal(
+      inputs.binaries.node.sha256,
+      createHash("sha256").update(await readFile(template.binaries.node.path)).digest("hex"),
+    );
+    assert.equal(inputs.images.guest.id, template.images.guest!.id);
+    assert.equal(inputs.images.guest.manifestDigest, template.images.guest!.manifestDigest);
   });
 });

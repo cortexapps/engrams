@@ -3,19 +3,9 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
+import { RunnerFailure } from "./failure.ts";
 
-export class RunnerFailure extends Error {
-  constructor(
-    readonly code:
-      | "INVALID_CONTEXT"
-      | "ASSERTION_FAILED"
-      | "NEEDS_CONTEXT"
-      | "TRANSPORT_FAILED",
-    readonly seam: string,
-  ) {
-    super(`${code}:${seam}`);
-  }
-}
+export { RunnerFailure } from "./failure.ts";
 export function requireThat(
   condition: unknown,
   seam: string,

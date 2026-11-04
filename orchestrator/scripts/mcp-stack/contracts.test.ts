@@ -185,6 +185,8 @@ test("manifest has exactly twelve cases for each real harness", () => {
       12,
     );
   expect(() => selectMatrix("claude")).toThrow("matrix_selection");
+  expect(() => selectMatrix("claude")).toThrow(RunnerFailure);
+  expect(() => verifyResults([])).toThrow(RunnerFailure);
 });
 test("preflight rejects incomplete fixed controls before publication or signup", () => {
   const ctx = ContextSchema.parse(validContext());
