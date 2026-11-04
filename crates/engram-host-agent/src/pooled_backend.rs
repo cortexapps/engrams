@@ -3850,8 +3850,7 @@ impl SnapshotFinisher {
         }
         let Some(memory_ref) = metadata.memory_manifest else {
             // No chunked memory (no chunk store / non-FC backend):
-            // nothing to chain, and a record without a memory
-            // manifest adds nothing over the live disk manifest.
+            // nothing to chain.
             return;
         };
 
@@ -6338,9 +6337,8 @@ impl SandboxBackend for PooledBackend {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
 
-        // Insert FIRST, unconditionally. The egress-proxy registration
-        // below is still gated on `self.egress`; only the sandbox→
-        // session bookkeeping is universal.
+        // The sandbox→session binding is recorded whether or not an
+        // egress proxy is attached.
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {

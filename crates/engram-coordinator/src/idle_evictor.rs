@@ -439,12 +439,8 @@ pub(crate) async fn run_evict_pipeline(
                     }
                 },
                 Err(engram_core::SandboxError::InvalidSpec(_)) => {
-                    // Backend can't pause (VZ/Process) — fall through to
-                    // the full eviction below. ADR 0116 C4 deliberately
-                    // lands here too: the host refuses a park with
-                    // `InvalidSpec` when the sandbox's data plane is
-                    // flush-escalated (a park would freeze nothing
-                    // durable), so the session takes the full eviction.
+                    // Backend can't pause (VZ/Process): fall through to
+                    // the full eviction below.
                 }
                 // ADR 0091: TRANSIENT refusal — the host declined the park
                 // because a capture (usually the periodic checkpoint, 600s
@@ -604,9 +600,8 @@ pub(crate) async fn run_evict_pipeline(
     // only at `/resume`, which then fails (→ `Dead` via the #782 honest
     // predicate) after the user already tried to come back. Gate the
     // terminal transition on the SAME honest predicate the dead-host
-    // stage-2 ladder uses (#782 `dead_host::recovery_target`): a capture
-    // with no recoverable snapshot AND no live disk manifest is not a safe
-    // basis for `Idle`.
+    // stage-2 ladder uses (`dead_host::recovery_target`): a capture with
+    // no recoverable snapshot is not a safe basis for `Idle`.
     //
     // Scope is exactly the transient-blip class — `manifests_present &&
     // !recoverable` means "the capture DID produce manifests but a HEAD
@@ -1171,13 +1166,11 @@ async fn scanner_advance_one(
     //
     // The suppression is TIME-BOUNDED, not absolute: past the grace the
     // scanner re-mints — but as a CAPTURE RETRY (`allow_park: false`).
-    // The stale-Done case means the settle never landed (a wedged or
-    // quarantined finalize); re-parking there would defeat the eviction
-    // the prior op already committed to (and against a lock-free
-    // quarantined survivor, `host.pause` can succeed — stranding a
-    // "parked" session whose durability upload failed). The capture
-    // retry preserves the wedged-upload → bounded-attempts → HostLost
-    // floor; a DEAD host is the dead-host detector's job either way.
+    // The stale-Done case means the settle never landed (a wedged
+    // finalize); re-parking there would defeat the eviction the prior op
+    // already committed to. The capture retry preserves the wedged-upload
+    // → bounded-attempts → HostLost floor; a DEAD host is the dead-host
+    // detector's job either way.
     let mut allow_park = true;
     if let Some(prior) = state
         .services
@@ -3917,15 +3910,12 @@ mod tests {
         );
     }
 
-    /// The 2026-07-17 resume-stall incident (session 03e6535e): a verb
-    /// `await` that never returns (there, `host.start_agent` on a resume
-    /// `finish` step, on a dead rootfs device) keeps the op heartbeating
-    /// forever, so the stale-op reclaim can never fire and the op is pinned
-    /// until a deploy rolls the pod. `drive_one`'s wall-clock deadline
-    /// (`op_deadline`) is the backstop: a hung dispatch is cancelled and the
-    /// op REQUEUES with backoff — "executor alive but wedged" converges
-    /// without waiting on a pod roll. This drives the parked-paused (rung-2)
-    /// ascent, whose only host call is `resume`, and hangs it.
+    /// A verb `await` that never returns keeps the op heartbeating forever,
+    /// so the stale-op reclaim can never fire. `drive_one`'s wall-clock
+    /// deadline (`op_deadline`) is the backstop: a hung dispatch is
+    /// cancelled and the op REQUEUES with backoff. This drives the
+    /// parked-paused (rung-2) ascent, whose only host call is `resume`,
+    /// and hangs it.
     #[tokio::test]
     async fn resume_op_whose_host_call_wedges_is_requeued_by_the_op_deadline() {
         // Process-local (nextest = process-per-test): a tiny global op
@@ -4300,8 +4290,7 @@ mod tests {
                 .await
                 .unwrap()
                 .contains(&sandbox_id),
-            "a plain skip must never destroy — only the quarantine flavor \
-             carries the reap authority",
+            "a skip must never destroy the VM",
         );
         assert_eq!(
             state

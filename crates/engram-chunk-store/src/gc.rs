@@ -30,16 +30,16 @@
 //! enabled template still has live sharers.
 //!
 //! The root and swap snapshot refs share one query. We dedup at the
-//! `ManifestRef` level (a manifest referenced by both a session and
-//! a snapshot is fetched once), fetch the manifest JSON from the
+//! `ManifestRef` level (a manifest referenced by two sources is
+//! fetched once), fetch the manifest JSON from the
 //! chunk store (bounded by a 16-permit semaphore), and fold
 //! `manifest.chunks[].hash` into a single `HashSet<ChunkHash>`.
 //!
 //! Failure surface: a `MetaError` from any list query, or a
 //! `ChunkStoreError` from any manifest fetch, fails the whole
 //! collection. A partial pin set is dangerous — the sweep would
-//! mark currently-live chunks as candidates. The caller (commit 4's
-//! sweep orchestrator) retries on the next interval tick.
+//! mark currently-live chunks as candidates. The sweep retries on the
+//! next interval tick.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -101,7 +101,7 @@ pub struct PinSetCollection {
 /// Errors from [`PinSet::collect`].
 #[derive(Debug)]
 pub enum GcError {
-    /// One of the four PG list queries failed. Partial pin set is
+    /// One of the pin-source list queries failed. Partial pin set is
     /// not safe to expose — caller retries.
     Meta(MetaError),
     /// A manifest fetch from the chunk store failed. Partial pin
@@ -161,7 +161,7 @@ impl PinSet {
         self.chunks.is_empty()
     }
 
-    /// Union over the four pin-set sources. See module docs.
+    /// Union over every pin-set source. See module docs.
     pub async fn collect(
         meta: &dyn MetadataStore,
         chunk_store: &ChunkStore,
@@ -173,7 +173,7 @@ impl PinSet {
     /// instant, by CONVERGING ON THE REF SET rather than on
     /// `chunk_generation`.
     ///
-    /// `collect` is not atomic: it runs seven un-transacted list queries
+    /// `collect` is not atomic: it runs six un-transacted list queries
     /// and then fans out manifest fetches over a wall-clock window, so a
     /// manifest published mid-collect can be missed. The previous guard
     /// bracketed the collect between two `chunk_generation` reads and
@@ -189,7 +189,7 @@ impl PinSet {
     /// A `ManifestRef` is `(manifest_id, version)`, so a new manifest
     /// VERSION is a new ref. Re-reading the ref set therefore detects
     /// exactly the publishes that can affect the pin set, and nothing
-    /// else — and it costs seven cheap SQL queries instead of gigabytes
+    /// else — and it costs six cheap SQL queries instead of gigabytes
     /// of blob reads. Each round fetches only refs not already fetched,
     /// so convergence is cheap even when it takes several passes.
     ///
@@ -364,7 +364,7 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     for r in meta.list_recoverable_snapshot_memory_manifests().await? {
         refs.insert(r);
     }
-    // ADR 0022 Option A: sources #5 + #6 — the per-template base memfile
+    // ADR 0022 Option A: sources #4 + #5 — the per-template base memfile
     // (memory) and its rootfs (disk) companion, pinned for the enabled
     // lifetime independent of the base snapshot row's `recoverable` flag.
     for r in meta
@@ -379,7 +379,7 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     {
         refs.insert(r);
     }
-    // ADR 0084 §B6: source #7 — cold bases have no root of their own
+    // ADR 0084 §B6: source #6 — cold bases have no root of their own
     // besides this (no `snapshots` row); never a second GC.
     for r in meta.cold_base_manifest_refs().await? {
         refs.insert(r);
@@ -407,8 +407,8 @@ mod tests {
     use super::*;
     use crate::manifest::ManifestKind;
 
-    /// Minimal MetadataStore mock that overrides only the four
-    /// pin-set source methods. Other methods fall through to the
+    /// Minimal MetadataStore mock that overrides only the pin-set
+    /// source methods. Other methods fall through to the
     /// trait defaults (Ok(...) / NotFound).
     #[derive(Default)]
     struct PinSetMockMeta {
@@ -416,7 +416,7 @@ mod tests {
         snap_disk: Vec<ManifestRef>,
         snap_swap: Vec<ManifestRef>,
         snap_mem: Vec<ManifestRef>,
-        // ADR 0022 sources #5 + #6.
+        // ADR 0022 sources #4 + #5.
         enabled_base_mem: Vec<ManifestRef>,
         enabled_base_disk: Vec<ManifestRef>,
         /// Snapshot disk refs revealed on LATER reads, modelling snapshots
@@ -629,7 +629,7 @@ mod tests {
             Ok(())
         }
 
-        // The four methods PinSet::collect actually drives.
+        // The methods PinSet::collect actually drives.
         async fn list_enabled_image_disk_manifest_ids(
             &self,
         ) -> Result<Vec<ManifestRef>, MetaError> {
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_sources_union_with_dedup() {
+    async fn sources_union_with_dedup() {
         let (store, _dir) = fresh_store();
 
         // Three manifests, three distinct chunk sets.
@@ -760,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_snapshot_memfile_pinned_via_enabled_image_only() {
-        // ADR 0022 sources #5/#6: a base snapshot's memfile (memory) +
+        // ADR 0022 sources #4/#5: a base snapshot's memfile (memory) +
         // rootfs (disk) manifests must stay pinned via the enabled_images
         // row even when NO recoverable snapshot references them (i.e. the
         // base snapshot row's `recoverable` flag was cleared while the

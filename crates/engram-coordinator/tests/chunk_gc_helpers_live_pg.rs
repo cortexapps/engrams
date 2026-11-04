@@ -1,6 +1,6 @@
-//! Live-Postgres tests for the chunk-GC `MetadataStore` helpers:
-//! the `chunk_gc_candidates` upsert/list/delete cycle and
-//! `bump_chunk_generation`.
+//! Live-Postgres tests for the chunk-GC `MetadataStore` helpers: the
+//! `chunk_gc_candidates` upsert/list/delete cycle, the
+//! `chunk_generation` bumps, and the enabled-image pin-set listing.
 //!
 //! `#[ignore]`'d by default; requires Postgres reachable at
 //! `ENGRAM_TEST_DATABASE_URL`. Run:
@@ -147,8 +147,6 @@ async fn bump_chunk_generation_increments_monotonically() {
     );
 }
 
-// ---- Commit 2: barrier-coverage extension to enable_image + record_snapshot ----
-
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn record_snapshot_bumps_chunk_generation() {
@@ -292,8 +290,6 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
     // Cleanup so re-runs against the same DB stay independent.
     meta.delete_enabled_image(&image_uri).await.expect("delete");
 }
-
-// ---- Commit 3a: enabled_images.disk_manifest_* round-trip + pin-set ----
 
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]

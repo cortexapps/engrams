@@ -7,13 +7,10 @@
 //! consecutive heartbeats (default 3, ~15 s at the 5 s cadence)
 //! transition per the missing-sandbox policy:
 //!
-//! - latest `snapshots` row has `recoverable = true`, OR the session
-//!   carries a live disk manifest → `Idle` (next user prompt rehydrates
-//!   via the existing resume / disk-only cold-boot path).
-//! - else → `Dead` (terminal). Issue #777 honest-Dead: an un-recoverable
-//!   snapshot row is NOT enough — the shared `dead_host::recovery_target`
-//!   predicate keys on the `recoverable` flag, never mere row presence,
-//!   so we never land an `Idle` that lies about resumability.
+//! - latest `snapshots` row has `recoverable = true` → `Idle` (the next
+//!   user prompt resumes it).
+//! - else → `Dead` (terminal). The shared `dead_host::recovery_target`
+//!   predicate keys on the `recoverable` flag, never mere row presence.
 //!
 //! This closes case **B** from the failure-mode taxonomy (Active
 //! sessions stuck pointing at sandbox_ids that no longer exist
@@ -406,11 +403,7 @@ async fn flip_missing(
     // latest snapshot's `recoverable` flag is true (the BlobStorage HEAD
     // result at snapshot-take time; false means even an Idle-ready
     // snapshot would not survive a /resume).
-    // ADR 0116 A4: the shared settle. NOTE the error-posture change
-    // from the pre-A4 copy this replaces: a snapshot-read error now
-    // leaves the row at HostLost for the straggler sweep (the old copy
-    // treated it as not-recoverable — a PG blip could terminally Dead a
-    // recoverable session, a latent honest-Dead violation).
+    // ADR 0116 A4: the shared settle.
     crate::dead_host::settle_host_lost(meta, events, session_id, now).await;
     // The Active -> HostLost transition above landed regardless of
     // whether stage 2 (HostLost -> {Idle,Dead}) also succeeded — the

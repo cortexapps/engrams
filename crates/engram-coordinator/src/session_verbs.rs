@@ -495,17 +495,14 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
             .await
             {
                 Ok(crate::api::snapshot::FinishResumeOutcome::Active) => OpOutcome::Done,
-                // 2026-07-21 livelock incident (prod 8174b7aa): a failed
-                // harness start parked the session at Created and this arm
-                // read `Ok(_) => Done` — the op "succeeded" while the
-                // session sat wedged with nothing owning it. ADR 0116
-                // B-D3: a DETERMINISTIC failure (B3's typed kind — the
-                // binary is missing/unreadable) recurs on an identical
-                // re-dispatch, so retrying the same finish burns the
-                // budget for nothing: RE-PLAN now (rebuild the binding;
-                // the next attempt re-materializes from scratch). A
-                // transient failure stays in the finish retries, bounded
-                // by SHORTCUT_MAX_ATTEMPTS.
+                // A failed harness start parks the session at Created;
+                // `Done` here would leave it wedged with nothing owning
+                // it. A DETERMINISTIC failure (the binary is missing or
+                // unreadable) recurs on an identical re-dispatch, so the
+                // op re-plans now (rebuild the binding; the next attempt
+                // re-materializes from scratch). A transient failure
+                // stays in the finish retries, bounded by
+                // SHORTCUT_MAX_ATTEMPTS.
                 Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed {
                     message,
                     deterministic,
@@ -675,25 +672,6 @@ const DELIVER_ROW_MAX_ATTEMPTS: i32 = 20;
 /// loop by construction.
 const EVICT_MAX_ATTEMPTS: i32 = 20;
 
-/// #810 finding 2 (the Evicting-convergence hole): on evict-budget
-/// exhaustion, which flavors MUST settle the session into `HostLost`?
-///
-/// `HostLost` is the only non-terminal lane the dead-host straggler sweep
-/// re-drives (`list_host_lost_sessions` → destroy/settle → Idle-recoverable),
-/// so a settled-but-failed eviction that does not land there strands with no
-/// re-driver.
-///
-/// - `nominated`: the eviction was the coordinator's own densification pick;
-///   it cannot stay Active (it would just re-nominate forever) and there is no
-///   durable snapshot to call it Idle — HostLost is the honest limbo.
-///
-/// Any other flavor (a plain idle-evict that keeps failing) leaves the op
-/// terminally Failed and the session where it was — an operator-visible
-/// coord-side fault, not a settle that fabricates a lost host.
-const fn exhaustion_settles_host_lost(nominated: bool) -> bool {
-    nominated
-}
-
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
@@ -751,28 +729,19 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
             OpOutcome::Failed("fenced mid-pipeline (successor re-claimed)".into())
         }
         Err(e) => {
-            // Retry budget: the attempt count lives on the op row (bumped
-            // at every claim). Exhaustion falls back to HostLost for
-            // nominated evictions — NOT Active (would re-nominate
-            // forever), NOT Idle (lies: no durable snapshot), NOT Dead
-            // (destroys a healthy runtime over a coord-side failure) —
-            // exactly the retired scanner's classification (ADR 0034).
-            // The one lane the dead-host straggler sweep re-drives is
-            // HostLost, so a settled-but-failed nominated eviction MUST
-            // land there or it strands with no re-driver.
+            // The attempt count lives on the op row (bumped at every
+            // claim). On exhaustion a NOMINATED eviction settles to
+            // HostLost without a destroy: it cannot stay Active (it would
+            // re-nominate forever), Idle would lie (no durable snapshot),
+            // and HostLost is the one lane the dead-host straggler sweep
+            // re-drives. A plain idle-evict that keeps failing leaves the
+            // op terminally Failed and the session where it was: an
+            // operator-visible coord-side fault, not a fabricated lost
+            // host. A fenced-out flip is safe: the successor that
+            // re-claimed the lane owns the session's convergence.
             if ctx.op.attempts >= EVICT_MAX_ATTEMPTS {
                 ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
-                // #810 finding 2 (the Evicting-convergence hole): a
-                // settled-but-failed NOMINATED eviction must land in
-                // HostLost — the one lane the dead-host straggler sweep
-                // re-drives (`list_host_lost_sessions`) — or it strands in
-                // `Evicting` with no re-driver (prod aac4efab, 15+ min).
-                // The flip fires WITHOUT a destroy (the runtime may be
-                // healthy — the straggler sweep's ask-the-host reconcile
-                // settles it). A fenced-out failure here (a successor
-                // re-claimed the lane) is safe: the successor now owns the
-                // session's convergence. (See `exhaustion_settles_host_lost`.)
-                if exhaustion_settles_host_lost(nominated) {
+                if nominated {
                     match crate::session_ops::transition_with_fence(
                         ctx.state,
                         ctx.op.session_id,
@@ -1729,21 +1698,6 @@ mod tests {
                 "{pick_err:?} must map to OpOutcome::Retry, the transient contract",
             );
         }
-    }
-
-    /// #810 finding 2: only NOMINATED evictions settle `HostLost` on
-    /// budget exhaustion.
-    #[test]
-    fn budget_exhaustion_settles_host_lost_for_nominated_only() {
-        assert!(
-            exhaustion_settles_host_lost(true),
-            "a nominated eviction settles to HostLost (cannot stay Active)"
-        );
-        assert!(
-            !exhaustion_settles_host_lost(false),
-            "a plain idle-evict that keeps failing is an operator-visible coord fault, \
-             not a settle that fabricates a lost host"
-        );
     }
 
     /// Moved with `failure_backoff` from the retired `outbox_delivery`

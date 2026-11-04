@@ -703,16 +703,12 @@ pub trait MetadataStore: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
-    /// ADR 0009 reconcile pass: enumerate the `(session_id, sandbox_id,
-    /// status)` triples for every RESIDENT session (any
-    /// `reserves_host_memory` state — a paused `parked` VM is exactly as
-    /// resident as an `active` one) assigned to `host_id` whose
-    /// `sandbox_id` is populated. The reconcile pass intersects this
-    /// against the host's heartbeat-reported `running_sandboxes` (which
-    /// is the backend's whole live set, not just Active). Was
-    /// `status='active'`-only until 2026-07-21 (status-set audit
-    /// finding 3): a vanished parked VM accrued no strikes and never
-    /// flipped HostLost.
+    /// The `(session_id, sandbox_id, status)` triples for every RESIDENT
+    /// session (any `reserves_host_memory` state; a paused `parked` VM is
+    /// as resident as an `active` one) bound to `host_id`. The reconcile
+    /// pass intersects this against the host's reported
+    /// `running_sandboxes`; the register handler hands it to a restarted
+    /// host as its rehydrate list.
     ///
     /// The listing is the full resident set; each caller filters to the
     /// statuses its own semantics need — reconcile strikes only
@@ -1266,11 +1262,9 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// A set returns the new binding epoch; a clear returns None.
-    /// A stale fence returns Conflict. Both writes reset missing-sandbox strikes;
-    /// a clear also removes the live manifest and bumps chunk_generation.
-    /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
-    /// bespoke expected-state list with the one epoch predicate.
+    /// Fenced sandbox (re)bind. A set returns the new binding epoch; a
+    /// clear returns None; a stale fence returns Conflict. Both reset the
+    /// missing-sandbox strikes.
     async fn fenced_assign_sandbox(
         &self,
         session_id: SessionId,
@@ -3227,21 +3221,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0016 Phase C support: read the one-row `chunk_generation`
-    /// counter. Phase C's GC sweep reads this before listing the
-    /// pin set and again at the end; if it ticked, the sweep
-    /// restarts with a fresh pin set. Default `0` so non-PG
-    /// backends don't have to track it.
+    /// Read the one-row `chunk_generation` counter: the GC promote pass
+    /// re-checks its candidates when it ticks. Default `0` for stores
+    /// that do not track it.
     async fn chunk_generation(&self) -> Result<u64, MetaError> {
         Ok(0)
     }
 
-    /// ADR 0016 Phase C: bump `chunk_generation` independent of a
-    /// flush. Used by `enable_image` and `record_snapshot` writes
-    /// (commit 2 of the Phase C chain) to keep the barrier complete
-    /// across all manifest-lineage-producing paths, not just live
-    /// disk flushes. Default is a no-op so non-PG backends opt out
-    /// cleanly. PG override increments the single row.
+    /// Barrier bump for manifest-lineage writes (`enable_image`,
+    /// `record_snapshot`). Default no-op for stores that do not track it.
     async fn bump_chunk_generation(&self) -> Result<(), MetaError> {
         Ok(())
     }

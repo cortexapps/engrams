@@ -1284,16 +1284,6 @@ async fn transition_to_dead_if_no_snapshot(
     Ok(())
 }
 
-/// Same-host resume path: the snapshot's chunked manifests are
-/// durable in `BlobStorage`, and the host that captured the snapshot
-/// still holds the dir under
-/// `<cfg.local_path>/snapshots/<session>/<snapshot_id>`. The scheduler
-/// routes restore back to that host via snapshot-affinity.
-///
-/// Cross-host materialization (where the picked host doesn't have a
-/// local copy and reconstructs from chunks) is a follow-up task —
-/// the chunked manifests are the portable form, but FC's restore
-/// API still wants a directory on local disk today.
 /// ADR 0019 / telemetry restoration (#526): classify a resume's
 /// placement against the snapshot record's capturing host — the
 /// `engram_session_resume_total{placement=...}` label. Pure so it's
@@ -2102,9 +2092,7 @@ async fn bind_resumed_session(
 /// session→sandbox mapping on the target host-agent.
 ///
 /// `host.bind_session(id, sandbox_id)` is what the in-VM adapter's
-/// vsock-accept path uses to route reconnects, and what the
-/// FlushScheduler's live-manifest publisher uses to attach session_id
-/// to the publish RPC. The coordinator-side binding is NOT updated
+/// vsock-accept path uses to route reconnects. The coordinator-side binding is NOT updated
 /// here — it lives only in `sessions.sandbox_id` (Postgres), written by
 /// the caller through a guarded binding write BEFORE this call, so every
 /// replica's `/exec` / `/shell` / `/prompt` resolves the new sandbox by

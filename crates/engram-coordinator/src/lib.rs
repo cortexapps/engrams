@@ -309,10 +309,8 @@ pub async fn run_with_registry_and_local(
         None
     };
 
-    // ADR 0016 Phase C: chunk-store GC, redesigned. Pin-set unions
-    // enabled_images + recoverable snapshots (disk + memory);
-    // `chunk_generation` barrier catches mid-sweep races; 24h grace period in
-    // `chunk_gc_candidates` absorbs straggling races. Gated by
+    // Chunk-store GC: the pin set is `engram_chunk_store::gc`'s; the 24h
+    // grace period in `chunk_gc_candidates` absorbs straggling races. Gated by
     // `ENGRAM_CHUNK_GC_ENABLED` (default ON; the grace window is
     // the real safety net in active-development posture).
     let _gc_sweeps = {

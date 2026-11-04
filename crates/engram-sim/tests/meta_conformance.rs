@@ -2864,6 +2864,109 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
+/// The register-time rehydrate list and the reconcile assignment list are
+/// one listing: every VM-resident state with a bound sandbox on the host.
+/// A rung-parked `Evicting` survivor and a `Created` survivor are as
+/// resident as an `Active` one; an `Idle` row and a row on another host
+/// are not.
+async fn resident_sandbox_assignments_state_matrix(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    let other_host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-resident-h1", now))
+        .await
+        .unwrap();
+    meta.upsert_host(host_record(other_host, "conf-resident-h2", now))
+        .await
+        .unwrap();
+    let bind = |sid, h| async move {
+        meta.assign_session_host(sid, Some(h)).await.unwrap();
+        let sb = engram_core::SandboxId::new();
+        meta.transition_session_created(sid, sb).await.unwrap();
+        sb
+    };
+    let activate = |sid| async move {
+        meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
+            .await
+            .unwrap();
+    };
+
+    let s_active = meta
+        .create_session(spec("conf:resident-active"))
+        .await
+        .unwrap();
+    let sb_active = bind(s_active, host).await;
+    activate(s_active).await;
+
+    let s_evicting = meta
+        .create_session(spec("conf:resident-evicting"))
+        .await
+        .unwrap();
+    let sb_evicting = bind(s_evicting, host).await;
+    activate(s_evicting).await;
+    meta.transition_session(
+        s_evicting,
+        SessionState::Evicting,
+        BindingDisposition::Retain,
+    )
+    .await
+    .unwrap();
+
+    let s_parked = meta
+        .create_session(spec("conf:resident-parked"))
+        .await
+        .unwrap();
+    let sb_parked = bind(s_parked, host).await;
+    activate(s_parked).await;
+    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    meta.transition_session(s_parked, SessionState::Parked, BindingDisposition::Retain)
+        .await
+        .unwrap();
+
+    let s_created = meta
+        .create_session(spec("conf:resident-created"))
+        .await
+        .unwrap();
+    let sb_created = bind(s_created, host).await;
+
+    let s_idle = meta
+        .create_session(spec("conf:resident-idle"))
+        .await
+        .unwrap();
+    bind(s_idle, host).await;
+    activate(s_idle).await;
+    meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    meta.fenced_assign_sandbox(s_idle, 0, None, Some(host))
+        .await
+        .unwrap();
+
+    let s_elsewhere = meta
+        .create_session(spec("conf:resident-elsewhere"))
+        .await
+        .unwrap();
+    bind(s_elsewhere, other_host).await;
+    activate(s_elsewhere).await;
+
+    let mut rows = meta
+        .list_resident_sandbox_assignments_on_host(host)
+        .await
+        .unwrap();
+    rows.sort_by_key(|(sid, _, _)| *sid);
+    let mut expected = vec![
+        (s_active, sb_active, SessionState::Active),
+        (s_evicting, sb_evicting, SessionState::Evicting),
+        (s_parked, sb_parked, SessionState::Parked),
+        (s_created, sb_created, SessionState::Created),
+    ];
+    expected.sort_by_key(|(sid, _, _)| *sid);
+    assert_eq!(rows, expected);
+}
+
 /// ADR 0023 broker tokens (R2): first-writer-wins insert, get, delete.
 async fn broker_token_flow(ctx: &Ctx) {
     let meta = &ctx.meta;
@@ -2942,14 +3045,6 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
             .iter()
             .any(|s| s.id == sid),
         "a parked session is in the non-terminal (active) set"
-    );
-    assert!(
-        meta.list_resident_sandbox_assignments_on_host(host)
-            .await
-            .unwrap()
-            .iter()
-            .any(|(s, sb2, _)| *s == sid && *sb2 == sb),
-        "a parked survivor is in the register-time rehydrate list"
     );
     assert!(
         meta.per_host_reserved().await.unwrap().contains_key(&host),
@@ -3880,6 +3975,10 @@ conformance!(
 conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle
+);
+conformance!(
+    t_resident_sandbox_assignments_state_matrix,
+    super::resident_sandbox_assignments_state_matrix
 );
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(
@@ -5940,7 +6039,9 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
         .unwrap()
         .is_empty());
 
-    // A clear resets strikes without minting an epoch.
+    // A clear resets strikes without minting an epoch and without touching
+    // the chunk-GC barrier: a binding is not a pin-set source.
+    let generation = meta.chunk_generation().await.unwrap();
     assert_eq!(
         meta.fenced_assign_sandbox(sid, 0, None, None)
             .await
@@ -5949,6 +6050,7 @@ async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
     );
     let session = meta.get_session(sid).await.unwrap();
     assert_eq!(session.sandbox_id, None);
+    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
     assert_eq!(meta.session_binding_generations(sid).await.unwrap().0, 2);
     assert!(meta
         .apply_missing_sandbox_strikes(&[], &[sid], 2)

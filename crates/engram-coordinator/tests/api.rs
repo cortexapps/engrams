@@ -481,18 +481,6 @@ async fn healthz_returns_ok_status_and_version() {
     assert!(v["version"].is_string());
 }
 
-// ADR 0021 P1.3 deleted `create_session_unknown_harness_name_is_400`:
-// the session no longer selects which harness to attach (that's an
-// image-manifest property baked at image-bake time). The equivalent
-// post-0021 failure mode is "the image has no [harness] block, so
-// even with mode=Agent the session runs as a dev VM" — which is *not*
-// an error condition, it's the harness-less template case. There's no
-// per-session "unknown harness" path anymore.
-
-// ---------------------------------------------------------------------
-// /sessions/:id/events bus
-// ---------------------------------------------------------------------
-
 // ---------------------------------------------------------------------
 // End-to-end exec wiring (POST /sessions → registry → sandbox.exec)
 //
@@ -511,30 +499,6 @@ async fn unknown_route_returns_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
-
-// ---------------------------------------------------------------------
-// Image manifest + secret resolution + rootfs materialization
-// ---------------------------------------------------------------------
-
-// Phase 2 removed the "no image / empty workdir" fallback path. The
-// `session_with_no_image_falls_through_to_empty_workdir` test that
-// exercised it lived here; it was deleted alongside the fallback
-// because every session now declares an explicit image (verified by
-// `create_session_with_unknown_image_returns_400`).
-
-// ---------------------------------------------------------------------
-// Session-id injection
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// Persistent event log + late-join via ?since=N / Last-Event-ID
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// ADR 0005 retired the checkpoint / fork / diff / log?kind=workspace
-// endpoints along with the platform's git surface. The deleted routes
-// now return 404 because they're no longer registered.
-// ---------------------------------------------------------------------
 
 /// Issue #231 regression: the heartbeat handler must NOT swallow a
 /// `touch_host_heartbeat` persist failure into a 200. If it does, the

@@ -448,7 +448,7 @@ describe("buildMessages — message/part shaping", () => {
     });
   });
 
-  // ADR 0090: the durability-rollback warning marker carries the manifest the
+  // The durability-rollback warning marker carries the manifest the
   // resume rewound to (flattened to `<id>@v<n>`) plus the reason.
   test("durability_rollback becomes a durability_rollback marker with the restored manifest", () => {
     const { messages } = buildMessages(
@@ -457,7 +457,7 @@ describe("buildMessages — message/part shaping", () => {
           type: "durability_rollback",
           sandbox_id: "sb-9",
           rewind_disk_manifest: { manifest_id: "abc", version: 4 },
-          reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+          reason: "evict budget exhausted; VM destroyed",
           at: AT,
         },
       ]),
@@ -466,7 +466,7 @@ describe("buildMessages — message/part shaping", () => {
     expect(customMarker(real(messages)[0]!)).toMatchObject({
       kind: "durability_rollback",
       manifest: "abc@v4",
-      reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+      reason: "evict budget exhausted; VM destroyed",
     });
   });
 

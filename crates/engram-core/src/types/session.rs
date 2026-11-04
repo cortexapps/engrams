@@ -77,12 +77,9 @@ pub enum SessionState {
     /// (`resume_from_idle`) is the sole consumer of that residue.
     Idle,
     /// Heartbeat-loss against the bound host. Non-terminal: the
-    /// dead-host detector's second stage moves it onward —
-    /// `HostLost → Idle` when the session is recoverable (a snapshot
-    /// OR a live disk manifest exists; the user/exec `/resume`s on
-    /// next access, ADR 0045 Phase A), or `HostLost → Dead` when
-    /// there is nothing to recover. The detector no longer routes
-    /// into `Evacuating` (the reactive auto-evac is retired).
+    /// dead-host detector's second stage moves it to `Idle` when a
+    /// recoverable snapshot exists (the next `/resume` recovers it) or
+    /// to `Dead` when nothing is recoverable.
     HostLost,
     /// ADR 0123: a durable teleport owns this relocation. The source binding
     /// stays in place until commit atomically installs the destination binding.

@@ -619,8 +619,8 @@ mod steps {
         Ok(Some(OpOutcome::Done))
     }
     /// Where a session rests when its move fails: the dead-host predicate
-    /// (`recovery_target`: Idle with a recoverable memory snapshot or a live
-    /// disk manifest, Dead otherwise), except that a session parked at
+    /// (`recovery_target`: Idle with a recoverable snapshot, Dead
+    /// otherwise), except that a session parked at
     /// Created by a deterministic spawn failure has no Dead edge and rests
     /// at Failed. `allow_snapshot = false` discards the snapshot evidence
     /// (the move itself produced it and it is not trusted).
@@ -1155,8 +1155,7 @@ mod steps {
     /// The source is gone during a rollback (dead or retired host, or a
     /// destroyed sandbox): entomb it and settle the session the way a lost
     /// host settles it (`dead_host::recovery_target`): Idle with a
-    /// recoverable memory snapshot or a live disk manifest (the disk-only
-    /// cold boot), Dead with nothing recoverable.
+    /// recoverable snapshot, Dead with nothing recoverable.
     async fn settle_lost_source(
         ctx: &OpCtx<'_>,
         row: &TeleportRow,

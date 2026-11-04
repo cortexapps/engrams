@@ -817,8 +817,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         // the bare delay. DST finding (ADR 0108 swarm, seed 33043259):
         // an attempt whose dispatch burns LONGER than its requeue delay
         // — a hung host RPC resolved only by `op_deadline` (Deliver
-        // 120s) or by an in-verb bound (evict's capture timeout) —
-        // re-arms every SIBLING op on the session whose ≤60s-capped
+        // 120s) — re-arms every SIBLING op on the session whose ≤60s-capped
         // backoff it just outlasted. Two such ops mutually re-arm:
         // each one's burn makes the other due again, `drive_session`'s
         // claim loop never runs dry, and the lane churns hung RPCs

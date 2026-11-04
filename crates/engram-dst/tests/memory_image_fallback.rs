@@ -4,8 +4,7 @@
 //! The production case: a memory snapshot captured before the swap
 //! drive was a chunked disk carries no swap manifest, and every host
 //! refuses to restore it. The disk is intact, so the resume verb must
-//! fall back to a disk-only cold boot on the newest disk lineage (the
-//! live manifest when it is ahead of the snapshot's disk). In-RAM
+//! fall back to a disk-only cold boot on the snapshot's disk. In-RAM
 //! context is lost; the session is not.
 
 use engram_core::traits::BlobStorage as _;

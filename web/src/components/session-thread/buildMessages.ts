@@ -1166,8 +1166,8 @@ export function buildMessages(
         harnessIdle = true;
         break;
 
-      // ADR 0090: the durability-rollback warning boundary. The next resume
-      // rewound the disk to `manifest`, dropping acked-but-unuploaded writes.
+      // The durability-rollback warning boundary (historical rows only): the
+      // next resume rewound the disk to `manifest`, dropping acked writes.
       case "durability_rollback":
         pushSystem(`dr:${idx}`, "guest disk was rolled back", {
           kind: "durability_rollback",

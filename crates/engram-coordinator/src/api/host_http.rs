@@ -104,20 +104,10 @@ pub struct RegisterResponse {
     /// to just `prefetch_time`.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
-    /// ADR 0016 Phase B commit 7: rehydration source. One record
-    /// per Active session PG already has bound to this host with
-    /// a chunked-disk manifest. Host iterates this on startup,
-    /// rebuilds `ChunkedDiskBackend` from the effective manifest,
-    /// spawns the NBD daemon + FlushScheduler. Closes the
-    /// host-agent-restart-loses-COW-tracking gap the ADR's
-    /// commit-0 design called out.
-    ///
-    /// Empty when:
-    /// - The host's first registration (no Active sessions yet).
-    /// - The host's restart but no Active sessions in PG were
-    ///   bound (eviction sweep ran while the host was down).
-    /// - The coord lookup failed (we log + emit empty so the host
-    ///   continues; sandboxes recover via the M4 evac path).
+    /// Every VM-resident binding PG still holds for this host, which a
+    /// restarted host re-registers. Empty on a first registration, when
+    /// nothing survived, or when the lookup failed (logged; the host
+    /// runs blind for the survivors).
     #[serde(default)]
     pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
 }

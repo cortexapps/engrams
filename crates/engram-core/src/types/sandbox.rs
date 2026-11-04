@@ -65,11 +65,8 @@ pub struct SandboxSpec {
     pub image_uri: Option<String>,
     /// Chunked-manifest override for the root disk. When set, the host
     /// continues this manifest's lineage instead of forking the image's
-    /// base — the disk-only cold-boot recovery shape: a fresh kernel
-    /// boot on a session's evolved disk. Wire note:
-    /// `SandboxSpec` is bincode-framed coord→host, so a mixed-version
-    /// fleet mid-deploy can't decode creates — acceptable per the
-    /// clean-break norm (coord + host MIG roll together on push).
+    /// base: the disk-only cold boot, a fresh kernel on a session's
+    /// evolved disk.
     #[serde(default)]
     pub rootfs_manifest: Option<super::manifest::ManifestRef>,
     // ADR 0021 P1.5b retired `harness_pack_uri` + `harness_substrate`.

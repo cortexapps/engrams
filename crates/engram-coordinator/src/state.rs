@@ -405,8 +405,7 @@ pub enum SessionEvent {
         /// The disk manifest the next resume rewinds to; `None` when the
         /// resume falls back to the snapshot's disk lineage.
         rewind_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
-        /// Human-readable cause (e.g. "quarantined-survivor evict budget
-        /// exhausted; VM destroyed").
+        /// Human-readable cause recorded with the row.
         reason: String,
         at: DateTime<Utc>,
     },
@@ -2277,8 +2276,6 @@ pub(crate) mod tests {
         /// when true, the next `record_snapshot` call returns an error.
         /// Reset to false on use.
         pub(crate) fail_next_record_snapshot: PlMutex<bool>,
-        /// In-memory mirror of the `chunk_generation` counter.
-        pub(crate) chunk_generation: PlMutex<u64>,
         /// ADR 0034: in-memory mirror of the eviction retry count.
         pub(crate) evict_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
         /// Issue #531/PR #564 (ADR 0068 persist-before-reconcile
@@ -2368,7 +2365,6 @@ pub(crate) mod tests {
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
-                chunk_generation: PlMutex::new(0),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 fail_next_heartbeat_persist: PlMutex::new(false),
                 fail_next_append_event: PlMutex::new(false),
@@ -3428,10 +3424,6 @@ pub(crate) mod tests {
                 *epoch += 1;
                 *epoch
             }))
-        }
-
-        async fn chunk_generation(&self) -> Result<u64, MetaError> {
-            Ok(*self.chunk_generation.lock())
         }
 
         // ADR 0018 commit 12b: scanner support. MiniMeta carries one

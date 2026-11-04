@@ -336,10 +336,8 @@ pub async fn host_lost_straggler_sweep(
 /// long to bind).
 pub const UNBOUND_ENTOMB_GRACE_SECS: u64 = 30;
 
-/// engrams#1378: `running` is the host's PRESENCE set — running VMs ∪ the
-/// attributed NBD-residue sandboxes from the heartbeat — so a tombstone is
-/// acked by absence only when the VM AND its kernel binding are gone, and
-/// the A5 entomb arm mints the destroy order for residue no session binds.
+/// `running` is the host's resident set; `running_known` gates the ack-by-
+/// absence and entomb arms.
 pub async fn process_sandbox_tombstones(
     meta: &Arc<dyn MetadataStore>,
     host_id: HostId,
@@ -460,23 +458,12 @@ async fn host_responds(client: &Arc<dyn engram_core::traits::HostClient>) -> boo
     client.ping().await.is_ok()
 }
 
-/// THE HostLost stage-2 routing predicate (ADR 0045 Phase A; unified in
-/// issue #777, ADR 0098 Phase 3 "honest-Dead"). A session is recoverable
-/// — routed to `Idle` for lazy `/resume` on next access — iff it has a
-/// **recoverable** memory snapshot OR a live disk manifest (the latter
-/// still resumes via the cold-boot path). With nothing recoverable it
-/// goes to `Dead` — never an `Idle` that lies about resumability.
-///
-/// `has_recoverable_snapshot` is the honest predicate: it is the latest
-/// snapshot's `recoverable` flag (the BlobStorage HEAD result at
-/// snapshot-take time), NOT the mere presence of a snapshot row. Before
-/// #777 the two dead-host sites keyed on `snapshot.is_some()`, disagreeing
-/// with `reconcile::flip_missing`, which already keyed on `recoverable`;
-/// the filtered predicate is now the one true stage-2 decision, shared by
-/// every site.
-///
-/// The detector no longer routes into `Evacuating`; proactive relocation
-/// is operator drain only (ADR 0044 K3).
+/// THE HostLost stage-2 routing predicate, shared by every settle site.
+/// A session rests at `Idle` for a lazy `/resume` iff its latest snapshot
+/// is `recoverable` (the BlobStorage HEAD result at capture time, not the
+/// mere presence of a row); otherwise `Dead`, never an `Idle` that lies
+/// about resumability. Proactive relocation is operator drain only, so
+/// nothing routes here into `Evacuating`.
 pub(crate) fn recovery_target(has_recoverable_snapshot: bool) -> SessionState {
     if has_recoverable_snapshot {
         SessionState::Idle
@@ -501,9 +488,8 @@ pub(crate) fn note_unrecoverable_if_dead(
         ::metrics::counter!(crate::metrics::HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL).increment(1);
         tracing::warn!(
             session_id = %session_id,
-            "HostLost stage 2: snapshot row(s) exist but none is recoverable and no live disk \
-             manifest — routing to Dead (bad-capture signal, issue #777). Check snapshot \
-             durability (BlobStorage HEAD at capture time)",
+            "HostLost stage 2: snapshot row(s) exist but none is recoverable; routing to \
+             Dead. Check snapshot durability (BlobStorage HEAD at capture time)",
         );
     }
 }

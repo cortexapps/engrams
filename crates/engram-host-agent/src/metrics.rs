@@ -403,12 +403,7 @@ pub const HEARTBEAT_DELIVERY_FAILURES_TOTAL: &str = "engram_host_heartbeat_deliv
 /// Counter (ADR 0091). External pause (the rung-2 park's host leg)
 /// refused or failed, labeled by bounded `reason`:
 /// `capture_in_flight` (typed retryable refusal — the park retries next
-/// nomination) / `vmm_pause` (the VMM itself failed the PATCH) /
-/// `data_plane_failed` (ADR 0116 C4: the sandbox's flush loop escalated
-/// a persistent device-class failure — the park is refused
-/// non-retryably, because it would freeze nothing durable, and the
-/// caller falls through to the quarantine-bounded full eviction).
-/// Sustained `vmm_pause` means parking is genuinely broken, not merely
+/// nomination) / `vmm_pause` (the VMM itself failed the PATCH). Sustained `vmm_pause` means parking is genuinely broken, not merely
 /// contended.
 pub const RUNG2_PARK_FAILED_TOTAL: &str = "engram_rung2_park_failed_total";
 

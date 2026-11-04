@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Coverage:
-//! - `pin_set_covers_all_three_sources_and_dry_run_is_pure` —
+//! - `pin_set_covers_every_source_and_dry_run_is_pure` —
 //!   enabled image (rootfs + base-snapshot disk/memory, ADR 0022
 //!   sources #5/#6) + live session manifest + recoverable snapshot
 //!   all pin their chunks; a planted orphan ends up in the
@@ -155,7 +155,7 @@ async fn plant_orphan(blob: &dyn BlobStorage) -> ChunkHash {
 
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
+async fn pin_set_covers_every_source_and_dry_run_is_pure() {
     let Some(rig) = rig().await else { return };
 
     // ---- enabled image with chunked-disk manifest ----

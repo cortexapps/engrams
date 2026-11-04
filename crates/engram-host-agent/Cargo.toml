@@ -120,8 +120,7 @@ engram-uffd-handler.workspace = true
 engram-egress-proxyd.workspace = true
 # ADR 0035 amendment (2026-08-10): startup-publish retry test injects a first-PUT blob fault.
 engram-testkit.workspace = true
-# 2026-08-02 durability-rollback RCA: paused-clock (`start_paused`)
-# regression tests for the SIGTERM flush join's deadline-overrun arm.
+# Paused-clock tests for the SIGTERM flush join.
 tokio = { workspace = true, features = ["test-util"] }
 # base_shm_gc tests backdate mtimes
 filetime = "0.2"

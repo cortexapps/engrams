@@ -379,11 +379,8 @@ async fn retirement_status(
 /// [`SessionState::host_memory_reserving_states`], instead of a
 /// hand-spelled literal per query.
 ///
-/// Literal drift here is an incident class, not a hypothetical: ADR 0101
-/// Phase C added `parked` to the typed set, and the five hand-rolled SQL
-/// twins in this file all missed it, so a parked survivor was absent from
-/// the register-time rehydrate list and a healthy paused VM was destroyed
-/// after a host-agent roll. No query spells this list by hand any more.
+/// Every query reads this list: ADR 0101 C added `parked` to the typed
+/// set and hand-written copies missed it.
 fn reserving_states_sql() -> String {
     engram_core::types::session::SessionState::host_memory_reserving_states()
         .iter()

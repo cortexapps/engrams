@@ -496,16 +496,15 @@ pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhaus
 /// user-visible transcript rewind — the "resumed from an earlier
 /// checkpoint" boundary. Small, rare `host_failure_recovery` blips are
 /// the designed blast radius of real host death; `checkpoint_lag` (the
-/// checkpoint lagged live activity with NO host failure — 2026-07-21
-/// 61a03b7e: 93 events on a healthy host) and any large burst deserve an
-/// alert.
+/// checkpoint lagged live activity with NO host failure) and any large
+/// burst deserve an alert.
 pub const SESSION_REWOUND_EVENTS_TOTAL: &str = "engram_session_rewound_events_total";
 
 /// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
 /// guard fired: an idle-evict capture produced manifests but
 /// `verify_snapshot_recoverable`'s BlobStorage HEAD failed
-/// (`recoverable = false`) with no live disk manifest, so the pipeline
-/// refused to land `Idle` and returned a retryable error. A transient
+/// (`recoverable = false`), so the pipeline refused to land `Idle` and
+/// returned a retryable error. A transient
 /// blip clears on the op redrive; a persistently-high value means the
 /// snapshot pipeline (or the BlobStorage HEAD path) is genuinely failing
 /// and sessions are riding the budget out to the HostLost/Dead honest
@@ -682,8 +681,8 @@ pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_straggler
 
 /// Counter (issue #777, ADR 0098 Phase 3 honest-Dead). A HostLost
 /// stage-2 transition routed a session to `Dead` while a snapshot row
-/// DID exist — the snapshot was un-recoverable (its BlobStorage HEAD
-/// failed at take-time) and there was no live disk manifest either.
+/// DID exist: the snapshot was un-recoverable (its BlobStorage HEAD
+/// failed at take-time).
 /// Distinct from "no snapshot at all" so a bad-capture pipeline stays
 /// visible instead of hiding behind a generic Dead. Fired from every
 /// stage-2 site (`reconcile::flip_missing`, `dead_host::evict_host`,
