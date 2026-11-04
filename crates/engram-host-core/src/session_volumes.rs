@@ -246,6 +246,9 @@ impl SessionVolumes {
         root: Source,
         swap: Option<Source>,
     ) -> io::Result<Provisioned> {
+        // A sandbox resumed on this host is live again: its kept
+        // checkpoint is no longer the reap's to purge.
+        self.kept.lock().unwrap().retain(|s| *s != sandbox);
         let provisioned = async {
             let (root, root_manifest) = self.provision_role(sandbox, DiskRole::Root, root).await?;
             let (swap, swap_manifest) = match swap {
@@ -1722,6 +1725,40 @@ mod tests {
         assert!(checkpoints_of(&r, b, DiskRole::Root).await.is_empty());
         let none_left = r.volumes.reap(POOL_TOTAL).await.unwrap();
         assert!(none_left.deleted.is_empty() && none_left.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resume_takes_the_sandbox_out_of_the_reap_queue() {
+        let r = pressured_rig();
+        let image = staged_image(&r, &[1]).await;
+        let sandbox = SandboxId::new();
+        r.volumes
+            .provision(sandbox, fork(image), None)
+            .await
+            .unwrap();
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+        r.volumes.release(sandbox).await.unwrap();
+        r.volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: published,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let report = r.volumes.reap(POOL_TOTAL).await.unwrap();
+        assert!(
+            report.deleted.is_empty() && report.failed.is_empty(),
+            "a live sandbox is never reaped: {report:?}"
+        );
+        assert_eq!(
+            checkpoints_of(&r, sandbox, DiskRole::Root).await,
+            vec![published]
+        );
     }
 
     #[tokio::test]
