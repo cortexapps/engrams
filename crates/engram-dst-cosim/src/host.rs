@@ -53,7 +53,7 @@ use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_host_agent::eviction_finalize::{
     reconcile_volumes, run_eviction_finalize_attempt, EvictionFinalizeRecord, EvictionFinalizer,
-    EvictionSandbox, FinalizeAttempt,
+    EvictionSandbox, FinalizeAttempt, PendingDisk,
 };
 use engram_host_agent::teardown_reconcile::ReconcileBackend;
 use engram_host_core::session_volumes::{Report, Source};
@@ -873,10 +873,16 @@ impl CosimHost {
 
         // The checkpoint taken under the pause: the transient volume the
         // finalize publishes by name.
-        self.volumes
+        let root = self
+            .volumes
             .take(sandbox_id, DiskRole::Root)
             .await
             .map_err(|e| format!("snapshot_begin take root checkpoint: {e}"))?;
+        let disk_pending = vec![PendingDisk {
+            role: DiskRole::Root,
+            previous: root.previous(),
+        }];
+        drop(root);
 
         let now = self.clock.now_utc();
         let record = EvictionFinalizeRecord {
@@ -889,7 +895,7 @@ impl CosimHost {
             captured_at: now,
             dest,
             chain_prev_ref: None,
-            disk_pending: vec![DiskRole::Root],
+            disk_pending,
             // ADR 0035 amendment: the capture pins what the sandbox actually
             // has attached, so the REAL finalize's bundle-publish leg
             // (`run_upload_blobs` → `BundleStore::publish`) runs (the leg a
@@ -955,13 +961,14 @@ impl CosimHost {
     }
 
     /// Test hook (the capture-lock release pin): delete the in-flight
-    /// finalize's staging dir AND the sandbox's volumes, so every redrive
-    /// attempt fails (the disk leg finds neither a pending checkpoint nor a
-    /// published one) and the REAL `run_eviction_finalize_attempt`
-    /// QUARANTINES after the redrive budget — proving the quarantine arm
-    /// releases the capture lock (`pending_finalizes` entry cleared), so
-    /// #783's teardown-reconcile capture-in-flight exemption can never become
-    /// a permanent reap-shield.
+    /// finalize's staging dir and release the sandbox's volumes. The
+    /// release keeps the checkpoint the pending one was taken over, so the
+    /// disk leg finds its pending checkpoint gone and never published, and
+    /// every redrive fails. The REAL `run_eviction_finalize_attempt` then
+    /// QUARANTINES after the redrive budget, which proves the quarantine
+    /// arm releases the capture lock (`pending_finalizes` entry cleared), so
+    /// #783's teardown-reconcile capture-in-flight exemption can never
+    /// become a permanent reap-shield.
     pub async fn sabotage_finalize_inputs(&self, sandbox_id: SandboxId) {
         if let Some(record) = self.in_flight.get(&sandbox_id) {
             let _ = tokio::fs::remove_dir_all(&record.dest).await;

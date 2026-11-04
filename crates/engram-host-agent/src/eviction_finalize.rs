@@ -67,10 +67,10 @@ pub struct EvictionFinalizeRecord {
     /// `checkpoint_chains` map) — durable, re-drive-safe. `None` ⇒ Full
     /// capture.
     pub chain_prev_ref: Option<ManifestRef>,
-    /// The roles whose pending checkpoint the capture took; each is
-    /// published from the session disk by name.
+    /// The pending checkpoints the capture took; each is published from
+    /// the session disk by name.
     #[serde(default)]
-    pub disk_pending: Vec<DiskRole>,
+    pub disk_pending: Vec<PendingDisk>,
     pub aux_bundles: Vec<AuxBundleRef>,
     pub stage: FinalizeStage,
     pub attempts: u32,
@@ -80,6 +80,15 @@ pub struct EvictionFinalizeRecord {
     pub swap_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
+}
+
+/// A pending checkpoint of one disk and the checkpoint it was taken
+/// over. A pending checkpoint that is gone counts as published only when
+/// the disk holds a newer checkpoint of that lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDisk {
+    pub role: DiskRole,
+    pub previous: ManifestRef,
 }
 
 impl EvictionFinalizeRecord {
@@ -226,9 +235,10 @@ pub async fn reconcile_volumes(
 }
 
 /// The disk leg: publish each pending checkpoint from the session disk.
-/// A role whose pending checkpoint is gone was published by an earlier
-/// attempt that died before the stage bump; its checkpoint ref is the
-/// answer then.
+/// A pending checkpoint that is gone was published by an earlier attempt
+/// that died before the stage bump only if the disk's checkpoint is newer
+/// than the one it was taken over; otherwise it was lost, and the leg
+/// fails instead of answering with the older checkpoint.
 async fn disk_leg_work(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
@@ -242,19 +252,30 @@ async fn disk_leg_work(
                 "finalize has pending disk checkpoints but this host has no session disk".into(),
             )
         })?;
-        for role in &record.disk_pending {
-            let published = match volumes.pending(record.sandbox_id, *role).await {
+        for &PendingDisk { role, previous } in &record.disk_pending {
+            let published = match volumes.pending(record.sandbox_id, role).await {
                 Ok(pending) => volumes.publish(pending).await.map_err(|e| {
                     SandboxError::Snapshot(format!("eviction finalize: publish {role} disk: {e}"))
                 })?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => volumes
-                    .checkpoint_of(record.sandbox_id, *role)
-                    .await
-                    .map_err(|e| {
-                        SandboxError::Snapshot(format!(
-                            "eviction finalize: {role} disk has no pending checkpoint and no checkpoint: {e}"
-                        ))
-                    })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let current = volumes
+                        .checkpoint_of(record.sandbox_id, role)
+                        .await
+                        .map_err(|e| {
+                            SandboxError::Snapshot(format!(
+                                "eviction finalize: {role} disk has no pending checkpoint and no checkpoint: {e}"
+                            ))
+                        })?;
+                    if current.manifest_id != previous.manifest_id
+                        || current.version <= previous.version
+                    {
+                        return Err(SandboxError::Snapshot(format!(
+                            "eviction finalize: the pending {role} disk checkpoint is gone and was \
+                             never published (the disk holds {current}, taken over {previous})"
+                        )));
+                    }
+                    current
+                }
                 Err(e) => {
                     return Err(SandboxError::Snapshot(format!(
                         "eviction finalize: open pending {role} disk checkpoint: {e}"
@@ -674,7 +695,16 @@ mod tests {
             captured_at: chrono::DateTime::UNIX_EPOCH,
             dest: tmp.path().join("capture"),
             chain_prev_ref: None,
-            disk_pending: vec![DiskRole::Root, DiskRole::Swap],
+            disk_pending: vec![
+                PendingDisk {
+                    role: DiskRole::Root,
+                    previous: ManifestRef::new(),
+                },
+                PendingDisk {
+                    role: DiskRole::Swap,
+                    previous: ManifestRef::new(),
+                },
+            ],
             aux_bundles: Vec::new(),
             stage: FinalizeStage::default(),
             attempts: 0,
@@ -697,6 +727,118 @@ mod tests {
         std::fs::write(tmp.path().join("torn.partial"), b"{").unwrap();
         let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].disk_pending, vec![DiskRole::Root, DiskRole::Swap]);
+        assert_eq!(loaded[0].disk_pending, record.disk_pending);
+    }
+
+    struct NoDestroy;
+
+    #[async_trait]
+    impl EvictionSandbox for NoDestroy {
+        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    /// A finalizer over file-backed session volumes holding one sandbox
+    /// with an empty root volume.
+    async fn finalizer_with_a_root(
+        tmp: &Path,
+        sandbox: SandboxId,
+    ) -> (EvictionFinalizer, Arc<engram_host_core::SessionVolumes>) {
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.join("blob")),
+        );
+        let store = ChunkStore::new(blob);
+        let disk: Arc<dyn engram_host_core::SessionDisk> =
+            Arc::new(engram_host_core::FileDisk::new(tmp.join("volumes"), 64 * 1024).unwrap());
+        let volumes = Arc::new(engram_host_core::SessionVolumes::new(disk, store.clone()));
+        volumes
+            .provision(
+                sandbox,
+                engram_host_core::session_volumes::Source::Empty {
+                    size_bytes: 128 * 1024,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let finalizer = EvictionFinalizer::new(
+            Some(volumes.clone()),
+            Some(store),
+            None,
+            tmp.join("bundles"),
+            "bundle",
+            tmp.join("checkpoints"),
+            Arc::new(DashMap::new()),
+            Arc::new(NoDestroy),
+            Arc::new(engram_host_core::TokioFs),
+            3,
+        );
+        (finalizer, volumes)
+    }
+
+    fn record_for(sandbox: SandboxId, disk_pending: Vec<PendingDisk>) -> EvictionFinalizeRecord {
+        EvictionFinalizeRecord {
+            snapshot_id: SnapshotId::new(),
+            session_id: SessionId::new(),
+            sandbox_id: sandbox,
+            image_version: "v".into(),
+            size_bytes: 0,
+            paused_at: chrono::DateTime::UNIX_EPOCH,
+            captured_at: chrono::DateTime::UNIX_EPOCH,
+            dest: PathBuf::from("/nonexistent"),
+            chain_prev_ref: None,
+            disk_pending,
+            aux_bundles: Vec::new(),
+            stage: FinalizeStage::default(),
+            attempts: 0,
+            disk_manifest: None,
+            swap_manifest: None,
+            memory_manifest: None,
+        }
+    }
+
+    /// An attempt that published and died before the stage bump leaves
+    /// no pending checkpoint; the redrive answers with the published one.
+    #[tokio::test]
+    async fn a_redrive_after_the_publish_answers_with_the_published_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let pending = volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        let entry = PendingDisk {
+            role: DiskRole::Root,
+            previous: pending.previous(),
+        };
+        let published = volumes.publish(pending).await.unwrap();
+
+        let (root, swap) = disk_leg_work(&finalizer, &record_for(sandbox, vec![entry]))
+            .await
+            .unwrap();
+        assert_eq!(root, Some(published));
+        assert_eq!(swap, None);
+    }
+
+    /// A pending checkpoint lost without a publish leaves only the
+    /// checkpoint it was taken over. The leg fails rather than answer
+    /// with it, which would drop every write since that checkpoint.
+    #[tokio::test]
+    async fn a_lost_pending_checkpoint_fails_the_disk_leg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let pending = volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        let entry = PendingDisk {
+            role: DiskRole::Root,
+            previous: pending.previous(),
+        };
+        volumes.discard(pending).await.unwrap();
+
+        let Err(SandboxError::Snapshot(message)) =
+            disk_leg_work(&finalizer, &record_for(sandbox, vec![entry])).await
+        else {
+            panic!("a lost pending checkpoint must fail the disk leg");
+        };
+        assert!(message.contains("never published"), "{message}");
     }
 }

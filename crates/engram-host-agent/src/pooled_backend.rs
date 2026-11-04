@@ -4735,7 +4735,14 @@ impl SandboxBackend for PooledBackend {
         // their transient names; the finalize job finds them by name and
         // publishes them. From here the record and the job own the
         // capture's recovery state.
-        let disk_pending: Vec<DiskRole> = unwind.pending.drain(..).map(|p| p.role()).collect();
+        let disk_pending = unwind
+            .pending
+            .drain(..)
+            .map(|p| crate::eviction_finalize::PendingDisk {
+                role: p.role(),
+                previous: p.previous(),
+            })
+            .collect();
         unwind.defuse();
         drop(unwind);
         let record = crate::eviction_finalize::EvictionFinalizeRecord {

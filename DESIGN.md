@@ -241,6 +241,16 @@ the test named beside it.
   (`a_resume_of_a_newer_manifest_stages_the_delta_onto_the_kept_checkpoint`). The host
   purges kept checkpoints, oldest release first, when the pool's free space falls under
   twice the placement floor (`reap_purges_kept_sandboxes_oldest_first_until_the_floor_holds`).
+  A resume takes the sandbox out of that queue
+  (`a_resume_takes_the_sandbox_out_of_the_reap_queue`).
+- An eviction finalize records, for each pending checkpoint, the checkpoint it was taken
+  over. A redrive whose pending checkpoint is gone answers with the disk's checkpoint only
+  when that one is newer
+  (`a_redrive_after_the_publish_answers_with_the_published_checkpoint`); a pending
+  checkpoint lost without a publish fails the finalize, which quarantines, rather than
+  answer with the older checkpoint and drop the writes since it
+  (`a_lost_pending_checkpoint_fails_the_disk_leg`,
+  `quarantined_finalize_releases_the_capture_lock`).
 - A stage reads the node's chunk cache before blob storage
   (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
   prefetch pulled are not fetched a second time.
