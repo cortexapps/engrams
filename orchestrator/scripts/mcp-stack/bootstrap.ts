@@ -350,7 +350,18 @@ export async function createCatalog(
       published.catalog.tools.length === 2,
     "published_catalog",
   );
-  return { connection: authorizedConnection, catalog: published.catalog };
+  const enabled = await admin.integration.setConnectionEnabled({
+    id: created.connection.id,
+    expectedRevision: authorizedConnection.configRevision,
+    enabled: true,
+  });
+  requireThat(
+    enabled.connection?.id === created.connection.id &&
+      enabled.connection.configRevision === authorizedConnection.configRevision &&
+      enabled.connection.enabled,
+    "enabled_connection",
+  );
+  return { connection: enabled.connection, catalog: published.catalog };
 }
 
 /** Stable compiled name from actual public connection identity; verify against public binding before prompt. */

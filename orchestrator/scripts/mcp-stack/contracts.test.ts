@@ -17,7 +17,8 @@ import {
   type CaseResult,
 } from "./manifest.ts";
 import { credentialHeaders, publicClient } from "./transport.ts";
-import { expectRejected, modelToolName } from "./bootstrap.ts";
+import { createCatalog, expectRejected, modelToolName } from "./bootstrap.ts";
+import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { ExecOutputSchema } from "../../src/gen/engram/app/v1/session_pb.ts";
 import { StatusSchema } from "./supervisor.ts";
@@ -29,6 +30,9 @@ import { isProofFilename, readGuestFile } from "./guest.ts";
 import { parseArgs } from "./cli.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  IntegrationService,
+  IntegrationConnectionSchema,
+  McpCatalogSchema,
   PutMcpCredentialRequestSchema,
   PublishMcpRequestSchema,
 } from "../../src/gen/engram/app/v1/integration_pb.ts";
@@ -949,6 +953,180 @@ test("public RPC diagnostics retain descriptor methods and keep error data priva
     for await (const message of client.sessions.exec({ sessionId: "session" }))
       complete.push(message);
     expect(complete).toEqual([first]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("catalog bootstrap enables the published connection with the authorized revision and checks the response", async () => {
+  const keyPath = join(root, "catalog.key");
+  const certPath = join(root, "catalog.pem");
+  const certificate = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "subjectAltName=DNS:localhost",
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  expect(await certificate.exited).toBe(0);
+  await chmod(certPath, 0o600);
+  const cert = await readFile(certPath);
+  const ctx = ContextSchema.parse(validContext());
+  ctx.runRoot = root;
+  ctx.protocolFixtures.modern.resourceKeyFile = join(root, "catalog-resource.key");
+  await writeFile(ctx.protocolFixtures.modern.resourceKeyFile, "fixture-neutral-resource-key", {
+    mode: 0o600,
+  });
+  const created = create(IntegrationConnectionSchema, {
+    id: "connection-1",
+    alias: "fixture-catalog",
+    provider: "mcp",
+    enabled: false,
+    configRevision: 3,
+    authGeneration: 5,
+    catalogRevision: 0,
+    mcp: {
+      endpoint: ctx.protocolFixtures.modern.resourceOrigin + "/mcp",
+      zone: "fixture",
+      authKind: "api_key",
+    },
+  });
+  const authorized = create(IntegrationConnectionSchema, {
+    ...created,
+    configRevision: 7,
+    authGeneration: 6,
+    credentialIdentity: "credential-1",
+  });
+  const draft = create(McpCatalogSchema, {
+    id: "draft-1",
+    connectionId: "connection-1",
+    kind: "draft",
+    revision: 11,
+    configRevision: 7,
+    authGeneration: 6,
+    tools: ["read_counter", "write_counter"].map((upstreamName) => ({
+      upstreamName,
+      inputSchemaJson: '{"type":"object"}',
+    })),
+  });
+  const published = create(McpCatalogSchema, {
+    ...draft,
+    id: "published-1",
+    kind: "published",
+    revision: 12,
+  });
+  const enabled = create(IntegrationConnectionSchema, {
+    ...authorized,
+    enabled: true,
+    catalogRevision: 12,
+    testedAt: "2026-01-01T00:00:00Z",
+  });
+  let mode = "success";
+  const calls: string[] = [];
+  const handler = connectNodeAdapter({
+    requestPathPrefix: "/rpc",
+    routes(router) {
+      router.service(IntegrationService, {
+        createConnection(req, rpc) {
+          calls.push("create");
+          expect(rpc.requestHeader.get("cookie")).toBe("fixture_session=admin");
+          expect(rpc.requestHeader.has("x-api-key")).toBe(false);
+          expect(req.alias).toBe("fixture-catalog");
+          return { connection: created };
+        },
+        putMcpCredential(req) {
+          calls.push("authorize");
+          expect(req.connectionId).toBe("connection-1");
+          expect(req.expectedRevision).toBe(3);
+          expect(req.expectedGeneration).toBe(5);
+          return { connection: authorized };
+        },
+        discoverMcp(req) {
+          calls.push("discover");
+          expect(req.connectionId).toBe("connection-1");
+          expect(req.expectedRevision).toBe(7);
+          return { catalog: draft };
+        },
+        getMcpCatalogs(req) {
+          calls.push("review");
+          expect(req.connectionId).toBe("connection-1");
+          return { draft, configRevision: 7, catalogRevision: 11 };
+        },
+        publishMcp(req) {
+          calls.push("publish");
+          expect(req.connectionId).toBe("connection-1");
+          expect(req.draftId).toBe("draft-1");
+          expect(req.expectedRevision).toBe(11);
+          expect(
+            req.tools.map((tool) => [tool.upstreamName, tool.classification, tool.enabled]),
+          ).toEqual([
+            ["read_counter", "read", true],
+            ["write_counter", "write", true],
+          ]);
+          return { catalog: published };
+        },
+        setConnectionEnabled(req, rpc) {
+          calls.push("enable");
+          expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+          expect(rpc.requestHeader.get("cookie")).toBe("fixture_session=admin");
+          expect(rpc.requestHeader.has("x-api-key")).toBe(false);
+          expect(req.id).toBe("connection-1");
+          expect(req.expectedRevision).toBe(7);
+          expect(req.enabled).toBe(true);
+          if (mode === "rpc-failure")
+            throw new ConnectError("enable refused", Code.FailedPrecondition);
+          if (mode === "missing") return {};
+          return {
+            connection: create(IntegrationConnectionSchema, {
+              ...enabled,
+              ...(mode === "wrong-id" ? { id: "connection-2" } : {}),
+              ...(mode === "wrong-revision" ? { configRevision: 8 } : {}),
+              ...(mode === "disabled" ? { enabled: false } : {}),
+            }),
+          };
+        },
+      });
+    },
+  });
+  const server = createServer({ key: await readFile(keyPath), cert }, handler);
+  await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server_address");
+    ctx.endpoints.app = {
+      origin: `https://localhost:${address.port}`,
+      ca: { path: certPath, sha256: sha256(cert) },
+      serverFingerprint: new X509Certificate(cert).fingerprint256,
+    };
+    const client = await publicClient(ctx, { kind: "cookie", value: "fixture_session=admin" });
+    const result = await createCatalog(ctx, client, "catalog");
+    expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+    expect(result.connection).toEqual(enabled);
+    expect(result.catalog).toEqual(published);
+    for (mode of ["rpc-failure", "wrong-id", "wrong-revision", "disabled", "missing"]) {
+      calls.length = 0;
+      await expect(createCatalog(ctx, client, "catalog")).rejects.toThrow(
+        mode === "rpc-failure" ? "enable refused" : "enabled_connection",
+      );
+      expect(calls).toEqual(["create", "authorize", "discover", "review", "publish", "enable"]);
+    }
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
