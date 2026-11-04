@@ -202,20 +202,32 @@ describe("/me connector credentials (ADR 0115)", () => {
     });
   });
 
-  test("PUT 400s a token the provider does not confirm", async () => {
+  function probeFailure(slug: string) {
     const { oauth } = fakeOauth();
     oauth.putCredential = async () => {
-      const metadata = new Headers({ "engram-error-slug": "probe_failed" });
-      throw new ConnectError("metadata probe returned HTTP 401", Code.Unavailable, metadata);
+      const metadata = new Headers({ "engram-error-slug": slug });
+      throw new ConnectError("metadata probe failed", Code.Unavailable, metadata);
     };
-    const response = await appWith(oauth).request("/api/v1/me/connector-credentials/github", {
+    return appWith(oauth).request("/api/v1/me/connector-credentials/github", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ value: "ghp-bad" }),
+      body: JSON.stringify({ value: "ghp-1" }),
     });
+  }
+
+  test("PUT 400s a token the provider refuses", async () => {
+    const response = await probeFailure("probe_rejected");
     expect(response.status).toBe(400);
     expect(await response.text()).toBe(
       "Could not confirm this token with GitHub. Check the token and try again.",
+    );
+  });
+
+  test("PUT 503s when the provider cannot confirm the token for another reason", async () => {
+    const response = await probeFailure("probe_failed");
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe(
+      "Could not reach GitHub to confirm this token. Try again later.",
     );
   });
 

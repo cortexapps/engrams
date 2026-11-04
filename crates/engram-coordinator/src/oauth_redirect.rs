@@ -763,8 +763,15 @@ impl OAuthManager {
             .map_err(|e| driver_err("probe_failed", format!("metadata probe failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
+            // 401/403 is the provider refusing the token; any other failure
+            // says nothing about the token, so the caller can retry.
+            let code = if matches!(status.as_u16(), 401 | 403) {
+                "probe_rejected"
+            } else {
+                "probe_failed"
+            };
             return Err(driver_err(
-                "probe_failed",
+                code,
                 format!("metadata probe returned HTTP {status}"),
             ));
         }

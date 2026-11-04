@@ -424,16 +424,20 @@ export function makeMeRoute(deps?: MeDeps): Hono {
         ...(entry.identity ? { identity: entry.identity } : {}),
       });
     } catch (error) {
-      // The connector asks the provider who owns the token before the seal;
-      // a refusal or an unreachable provider leaves the token unconfirmed.
-      if (
-        error instanceof ConnectError &&
-        error.code === Code.Unavailable &&
-        error.metadata.get("engram-error-slug") === "probe_failed"
-      ) {
-        throw new HTTPException(400, {
-          message: `Could not confirm this token with ${entry.name}. Check the token and try again.`,
-        });
+      // The connector asks the provider who owns the token before the seal.
+      // A refusal is the token's fault; any other probe failure is not.
+      if (error instanceof ConnectError && error.code === Code.Unavailable) {
+        const slug = error.metadata.get("engram-error-slug");
+        if (slug === "probe_rejected") {
+          throw new HTTPException(400, {
+            message: `Could not confirm this token with ${entry.name}. Check the token and try again.`,
+          });
+        }
+        if (slug === "probe_failed") {
+          throw new HTTPException(503, {
+            message: `Could not reach ${entry.name} to confirm this token. Try again later.`,
+          });
+        }
       }
       throw error;
     }
