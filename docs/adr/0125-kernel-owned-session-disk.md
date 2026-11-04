@@ -533,14 +533,15 @@ that adds code without retiring the row it replaces is incomplete.
   checkpoint reproduced through `stage`, capacity falling by the blocks
   written, orphan reaping and id-counter skipping, `list` and `rename`
   keeping an open handle valid.
-- **Firecracker integration (KVM runners, `ci.yml`, over the pool
-  `ENGRAM_TEST_THIN_POOL` names):** create → write → checkpoint →
-  resume on another disk from the manifest, assert the bytes are equal;
-  the disk half of a checkpoint under a guest writing at full rate,
-  assert it is bounded; host-agent restart with a running guest, assert
-  zero disk calls and zero lost writes; a two-host move under a guest
-  writing at a steady rate, assert the seal holds only the residual.
-  Each sized to its property.
+- **Firecracker integration (KVM runners, `ci.yml`):** over the pool
+  `ENGRAM_TEST_THIN_POOL` names: create → write → checkpoint → resume
+  on another disk from the manifest, assert the bytes are equal; the
+  disk half of a checkpoint under a guest writing at full rate, assert
+  it is bounded; host-agent restart with a running guest, assert no
+  disk mutation and zero lost writes. Over `FileDisk`, whose block diff
+  is the full compare `thin_delta` is tested equal to: a two-host move
+  under a guest writing at a steady rate, assert the seal holds only
+  the residual. Each sized to its property.
 - **Simulation (engram-sim):** the heartbeat no longer carries a
   quarantine field; the cosim oracle from the stalled ADR 0110
   retirement PR, "a host-agent roll produces zero evictions and zero

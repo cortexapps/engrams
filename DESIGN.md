@@ -211,7 +211,7 @@ the test named beside it.
   stages or checkpoints it; a volume outlives every handle to it and reopens by name
   (`a_volume_survives_a_dropped_handle_and_opens_by_name`). An acknowledged guest write
   is in the host page cache or the pool, never in host-agent memory. A host-agent restart
-  reattaches a running guest with no disk call and loses none of its writes
+  reattaches a running guest with no change to the disk and loses none of its writes
   (`a_host_agent_restart_keeps_the_guest_and_every_write`).
 - A checkpoint pauses the guest only for the page-cache sync and the volume snapshot; the
   upload runs after the guest resumes
