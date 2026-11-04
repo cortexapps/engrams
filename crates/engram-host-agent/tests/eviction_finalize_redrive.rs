@@ -59,14 +59,21 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
-/// A `BlobStorage` whose FIRST `put_streaming` blocks until released —
-/// freezes generation A's finalize job mid-leg (after the disk leg,
-/// inside the memory leg's chunk upload) so generation B's redrive has
-/// real, unfinished work to pick up.
+/// A `BlobStorage` whose first `put_streaming` after [`Self::arm`] blocks
+/// until released. Armed just before the eviction capture, it freezes
+/// generation A's finalize job mid-upload so generation B's redrive has
+/// real, unfinished work to pick up. The create before it writes a
+/// manifest of its own, so the gate starts disarmed.
 struct GateFirstPut {
     inner: engram_storage_local::LocalBlobStorage,
     gate: Arc<tokio::sync::Notify>,
-    armed: AtomicBool,
+    spent: AtomicBool,
+}
+
+impl GateFirstPut {
+    fn arm(&self) {
+        self.spent.store(false, Ordering::SeqCst);
+    }
 }
 #[async_trait::async_trait]
 impl engram_core::traits::BlobStorage for GateFirstPut {
@@ -75,7 +82,7 @@ impl engram_core::traits::BlobStorage for GateFirstPut {
         key: &str,
         body: engram_core::traits::ByteStream,
     ) -> Result<u64, engram_core::error::BlobError> {
-        if !self.armed.swap(true, Ordering::SeqCst) {
+        if !self.spent.swap(true, Ordering::SeqCst) {
             self.gate.notified().await;
         }
         self.inner.put_streaming(key, body).await
@@ -167,12 +174,12 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
 
     // ---- 2. Generation A: PooledBackend wrapping a GATED chunk store ----
     let gate = Arc::new(tokio::sync::Notify::new());
-    let gated_blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(GateFirstPut {
+    let gated = Arc::new(GateFirstPut {
         inner: local_blob,
         gate: gate.clone(),
-        armed: AtomicBool::new(false),
+        spent: AtomicBool::new(true),
     });
-    let gated_chunk_store = engram_chunk_store::ChunkStore::new(gated_blob);
+    let gated_chunk_store = engram_chunk_store::ChunkStore::new(gated.clone());
 
     let mut cfg = FirecrackerConfig::with_kernel(kernel.clone());
     cfg.net_pool = None;
@@ -221,9 +228,10 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     let marker_sum = plant_marker(&pooled_a, sandbox).await;
 
     // ---- 3. snapshot_begin: durably persists, THEN the background job
-    // freezes in the memory leg (the gated blob's first PUT) — standing
-    // in for generation A dying between the durable persist and the
-    // upload completing. ----
+    // freezes at its first upload (the gated blob's first PUT after the
+    // arm) — standing in for generation A dying between the durable
+    // persist and the upload completing. ----
+    gated.arm();
     let t = Instant::now();
     let snapshot_id = pooled_a
         .snapshot_begin(sandbox)
