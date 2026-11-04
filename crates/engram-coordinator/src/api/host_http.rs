@@ -404,29 +404,10 @@ pub struct HeartbeatRequest {
     /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot the host quarantined after a
-    /// failed rehydrate — the coordinator enqueues `evict_local` for
-    /// each still-owned one (the op layer dedups re-adverts).
-    #[serde(default)]
-    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: control-plane-dead guests (host's 3/3-probe verdict) —
     /// the handler flips each owning session Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
-    /// engrams#1378: sandboxes whose kernel NBD binding survives on the host
-    /// as attributed residue of an interrupted teardown. Counted as PRESENT
-    /// for tombstone ack-by-absence and the ADR 0116 A5 unbound-entomb arm —
-    /// a tombstone is only settled when the host affirms the VM AND its
-    /// kernel binding are gone. `#[serde(default)]` → empty from a pre-#1378
-    /// host-agent mid-roll.
-    #[serde(default)]
-    pub device_residue_sandboxes: Vec<SandboxId>,
-    /// engrams#1378: `false` while the host's startup classification barrier
-    /// has not yet run (residue unknown — the issue-#215 asymmetry). The
-    /// default is `true` so a pre-#1378 host-agent mid-roll keeps today's
-    /// ack behavior.
-    #[serde(default = "default_running_sandboxes_known")]
-    pub device_residue_known: bool,
 }
 
 #[derive(Serialize)]
@@ -944,31 +925,6 @@ pub async fn heartbeat(
         );
     }
 
-    // ADR 0090: drive the documented remediation for quarantined
-    // survivors (NBD rehydrate failed after a roll — VM possibly live,
-    // disk unserved). Enqueue `evict_local` (full capture, no park) for
-    // each survivor the session still owns. Dedup keys ONLY on the
-    // idempotency key (ADR 0079 finding #4 — active-state-scoped), so the
-    // re-adverts every 5s heartbeat carries MUST pass one; a key-less
-    // enqueue inserts a fresh queued row per heartbeat (ADR 0093: 423
-    // rows piled up behind one wedged evict in the 2026-07-13 incident).
-    // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
-    // reconciler's orphan path SIGKILLed the VM.
-    //
-    // 2026-07-21 livelock incident: the active-state-scoped key is only
-    // safe because the enqueued op is guaranteed to CONVERGE. An op that
-    // settles Done as a fast no-op frees the key before the next
-    // heartbeat and turns this enqueue into a 5s-cadence infinite loop
-    // (session 8174b7aa: an ADR 0077 harness-failed park at `Created`
-    // skipped the evict guard in ~10ms, for 2.5 days / ~43k ops). The
-    // evict pipeline's quarantine arm (`quarantine_reap_unevictable`)
-    // now destroys the survivor — clearing the host's quarantine entry,
-    // i.e. this very advertise — whenever the session can't be evicted
-    // from its current state, so every enqueue here ends the loop it
-    // rides on. Keep that pairing in mind before adding states the
-    // pipeline may skip.
-    quarantined_survivor_advertise_core(&state, host_id, &hb.quarantined_survivors).await;
-
     // ADR 0091: flip sessions whose guest control plane is dead. The
     // host re-advertises until a successful capture or destroy clears
     // the entry, so this is idempotent (already-Unreachable sessions
@@ -1120,21 +1076,15 @@ pub async fn heartbeat(
         }
     };
 
-    // ADR 0116 A-D5: ack tombstones the host's PRESENCE set no longer
-    // contains, then advertise what is still outstanding. engrams#1378:
-    // presence = running VMs ∪ attributed NBD residue — a sandbox whose
-    // kernel binding survives an interrupted teardown keeps its tombstone
-    // alive (and advertised, so the host's destroy completes the
-    // disconnect) instead of being acked by a VM-only absence check, the
-    // exact mis-ack of the 2026-08-25 firing. Both `known` flags gate the
-    // ack/entomb arms (the issue-#215 "no information ≠ empty" asymmetry).
-    let mut present_sandboxes = hb.running_sandboxes.clone();
-    present_sandboxes.extend(hb.device_residue_sandboxes.iter().copied());
+    // ADR 0116 A-D5: ack tombstones the host's running set no longer
+    // contains, then advertise what is still outstanding. The `known`
+    // flag gates the ack/entomb arms (the issue-#215 "no information ≠
+    // empty" asymmetry).
     let tombstoned_sandboxes = crate::dead_host::process_sandbox_tombstones(
         &state.services.meta,
         host_id,
-        &present_sandboxes,
-        hb.running_sandboxes_known && hb.device_residue_known,
+        &hb.running_sandboxes,
+        hb.running_sandboxes_known,
     )
     .await;
 
@@ -1701,79 +1651,6 @@ pub async fn register_rehydrate_list_core(
         .collect())
 }
 
-/// The ADR 0090 quarantined-survivor advertise arm of the heartbeat,
-/// extracted per the run_once pattern so the boundary co-simulator
-/// (`engram-dst-cosim`) drives the REAL reaction to a host's quarantine
-/// advertise — the seam the 2026-07-21 8174b7aa livelock lived in (the
-/// cosim previously wrote host liveness straight to the store, so the
-/// advertise → enqueue → skip loop was structurally invisible to it).
-/// For each survivor the session still owns, enqueue the keyed
-/// quarantine `evict_local`; the pipeline's convergence guarantee (see
-/// the heartbeat handler's comment) is what keeps this 5s-cadence
-/// enqueue loop-free.
-pub async fn quarantined_survivor_advertise_core(
-    state: &SharedState,
-    host_id: HostId,
-    survivors: &[engram_protocol::heartbeat::QuarantinedSurvivor],
-) {
-    for q in survivors {
-        match state.services.meta.get_session(q.session_id).await {
-            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
-                match crate::session_ops::enqueue(
-                    state,
-                    q.session_id,
-                    engram_core::types::session_op::OpKind::Evict,
-                    serde_json::json!({
-                        "target": "idle",
-                        "allow_park": false,
-                        "nominated": false,
-                        // Quarantine flavor: the survivor's disk is unserved, so
-                        // the evict verb bounds each capture attempt and, past
-                        // the fast-retry budget, parks the op on a slow retry
-                        // cadence until the host's rehydrate retry re-serves
-                        // the disk (2026-08-02 durability-rollback RCA — the
-                        // old exhaustion arm destroyed the VM and rewound past
-                        // acked writes).
-                        "quarantine": true,
-                        // Pin the op to the advertised sandbox: the slow lane
-                        // can outlive a relocation, and a stale wake-up must
-                        // no-op instead of evicting the session's NEW, healthy
-                        // sandbox.
-                        "sandbox_id": q.sandbox_id,
-                    }),
-                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
-                )
-                .await
-                {
-                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
-                    Ok(_) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            sandbox_id = %q.sandbox_id,
-                            reason = ?q.reason,
-                            "quarantined survivor advertised — enqueued evict_local \
-                             (capture + relocate; ADR 0090)",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            error = %e,
-                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
-                        );
-                    }
-                }
-            }
-            // Session moved on (relocated / terminal) or unknown — the
-            // host's quarantine entry clears when the sandbox is
-            // destroyed; nothing to drive here.
-            _ => {}
-        }
-    }
-}
-
 /// ADR 0034: fast control-plane nomination. The pre-0034 handler ran
 /// the full snapshot pipeline inline here; a fat session's eviction
 /// (60-90s+) outlived the host's POST timeout, the connection drop
@@ -1919,35 +1796,6 @@ mod tests {
         assert_eq!(m.resident_sandboxes, 0);
     }
 
-    /// engrams#1378 mixed-fleet pin: a heartbeat from a pre-#1378 host-agent
-    /// (no residue fields) must decode as known-empty residue — today's ack
-    /// behavior — while an unclassified new host's explicit `false` withholds
-    /// the ack (the issue-#215 asymmetry, applied to residue).
-    #[test]
-    fn heartbeat_residue_fields_default_for_pre_1378_hosts() {
-        let legacy = r#"{
-            "capacity": {
-                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
-            }
-        }"#;
-        let hb: HeartbeatRequest = serde_json::from_str(legacy).expect("decode legacy heartbeat");
-        assert!(hb.device_residue_sandboxes.is_empty());
-        assert!(hb.device_residue_known);
-        let sb = engram_core::SandboxId::new();
-        let unclassified = format!(
-            r#"{{
-            "capacity": {{
-                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
-            }},
-            "device_residue_sandboxes": ["{sb}"],
-            "device_residue_known": false
-        }}"#
-        );
-        let hb: HeartbeatRequest =
-            serde_json::from_str(&unclassified).expect("decode residue heartbeat");
-        assert_eq!(hb.device_residue_sandboxes, vec![sb]);
-        assert!(!hb.device_residue_known);
-    }
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
     use engram_core::types::SessionState;
@@ -2170,104 +2018,6 @@ mod tests {
             assert_eq!(*meta.reconcile_probe_calls.lock(), 0);
             assert_eq!(meta.hosts.lock()[0].status, status);
         }
-    }
-
-    /// 2026-07-13 incident regression: the ADR 0090 quarantined-survivor
-    /// arm fires on EVERY 5s heartbeat, and `session_ops` dedup keys
-    /// ONLY on the idempotency key — a key-less enqueue inserts a fresh
-    /// queued row per heartbeat (423 piled up behind one wedged evict in
-    /// prod). Pin that re-adverts collapse to ONE keyed row. The seeded
-    /// running evict keeps the lane busy so the first advert's row stays
-    /// `queued` (never claimed/driven) and the second advert must dedup
-    /// against it.
-    #[tokio::test]
-    async fn quarantined_survivor_readverts_dedup_to_one_op() {
-        let host_id = HostId::new();
-        let sandbox_id = SandboxId::new();
-        let session_id = engram_core::SessionId::new();
-        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
-        session.host_id = Some(host_id);
-        let (state, meta, _local) = build_state_for_session(session);
-        meta.ops
-            .seed_running(session_id, engram_core::types::session_op::OpKind::Evict);
-
-        let hb_json = serde_json::json!({
-            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
-            "running_sandboxes": [sandbox_id],
-            "quarantined_survivors": [
-                { "sandbox_id": sandbox_id, "session_id": session_id },
-            ],
-        });
-        for tick in 0..2 {
-            let hb: HeartbeatRequest =
-                serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
-            let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
-            assert!(result.is_ok(), "heartbeat tick {tick}: {:?}", result.err());
-        }
-
-        let keyed: Vec<_> = meta
-            .ops
-            .all()
-            .into_iter()
-            .filter(|o| {
-                o.idempotency_key.as_deref()
-                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
-            })
-            .collect();
-        assert_eq!(
-            keyed.len(),
-            1,
-            "re-advertised quarantined survivor must dedup to one keyed evict op, got {keyed:#?}",
-        );
-    }
-
-    /// ADR 0116 C4: a survivor advertised with the additive
-    /// `reason: "data_plane_failed"` still produces the same keyed
-    /// quarantine evict — the reason changes the WARN log, never the
-    /// enqueue behavior (the keyed op is already convergence-safe).
-    /// The old-host shape (no `reason` key) is pinned by
-    /// `quarantined_survivor_readverts_dedup_to_one_op` above, whose
-    /// fixture omits the field.
-    #[tokio::test]
-    async fn quarantined_survivor_with_data_plane_reason_enqueues_keyed_evict() {
-        let host_id = HostId::new();
-        let sandbox_id = SandboxId::new();
-        let session_id = engram_core::SessionId::new();
-        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
-        session.host_id = Some(host_id);
-        let (state, meta, _local) = build_state_for_session(session);
-
-        let hb_json = serde_json::json!({
-            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
-            "running_sandboxes": [sandbox_id],
-            "quarantined_survivors": [
-                {
-                    "sandbox_id": sandbox_id,
-                    "session_id": session_id,
-                    "reason": "data_plane_failed",
-                },
-            ],
-        });
-        let hb: HeartbeatRequest =
-            serde_json::from_value(hb_json).expect("deserialize heartbeat with reason");
-        let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
-        assert!(result.is_ok(), "heartbeat failed: {:?}", result.err());
-
-        let keyed: Vec<_> = meta
-            .ops
-            .all()
-            .into_iter()
-            .filter(|o| {
-                o.idempotency_key.as_deref()
-                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
-            })
-            .collect();
-        assert_eq!(
-            keyed.len(),
-            1,
-            "a data-plane-failed survivor must drive the keyed quarantine evict, \
-             got {keyed:#?}",
-        );
     }
 
     /// ADR 0084 §A: the terminal-report ack rule. The two failure modes

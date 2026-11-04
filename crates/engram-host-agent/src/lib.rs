@@ -1371,12 +1371,9 @@ impl HostAgent {
                         stages_images: stages_images_for_heartbeat,
                         capabilities,
                         capture_job_reports,
-                        quarantined_survivors: Vec::new(),
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
-                        device_residue_sandboxes: Vec::new(),
-                        device_residue_known: true,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

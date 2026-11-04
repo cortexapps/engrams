@@ -381,11 +381,9 @@ async fn retirement_status(
 ///
 /// Literal drift here is an incident class, not a hypothetical: ADR 0101
 /// Phase C added `parked` to the typed set, and the five hand-rolled SQL
-/// twins in this file all missed it — so a parked survivor was absent
-/// from the register-time rehydrate list, its NBD device was never
-/// re-served after a host-agent roll, and the quarantine ladder destroyed
-/// a healthy paused VM (session 61a03b7e, 2026-07-21: 93 events rewound).
-/// No query spells this list by hand any more.
+/// twins in this file all missed it, so a parked survivor was absent from
+/// the register-time rehydrate list and a healthy paused VM was destroyed
+/// after a host-agent roll. No query spells this list by hand any more.
 fn reserving_states_sql() -> String {
     engram_core::types::session::SessionState::host_memory_reserving_states()
         .iter()

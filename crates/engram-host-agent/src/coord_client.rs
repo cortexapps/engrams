@@ -554,10 +554,6 @@ pub struct HeartbeatRequest {
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined —
-    /// re-advertised until destroyed; the coord drives evict_local.
-    #[serde(default)]
-    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: guests whose control plane stopped answering (the
     /// checkpoint driver's 3/3-probe verdict) — `(sandbox_id,
     /// session_id)` pairs, re-advertised until a successful capture or
@@ -565,21 +561,6 @@ pub struct HeartbeatRequest {
     /// Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
-    /// engrams#1378: sandboxes whose kernel NBD binding survives on this
-    /// host as attributed residue of an interrupted teardown (a destroy that
-    /// died between the FC kill and the NBD disconnect, attributed via the
-    /// durable owner records). The coordinator counts these as PRESENT for
-    /// tombstone ack-by-absence and the ADR 0116 A5 unbound-entomb arm, so
-    /// the tombstone stays advertised until the binding is actually gone.
-    #[serde(default)]
-    pub device_residue_sandboxes: Vec<SandboxId>,
-    /// engrams#1378: `false` until this generation's startup classification
-    /// barrier has run (or the host has no NBD data plane). The issue-#215
-    /// asymmetry, applied to residue: an unclassified generation's empty
-    /// residue list is "no information", and the coordinator must withhold
-    /// tombstone ack-by-absence against it — exactly the window the
-    /// 2026-08-25 incident's tombstone was wrongly acked in.
-    pub device_residue_known: bool,
 }
 
 #[derive(Deserialize)]
@@ -767,10 +748,7 @@ mod tests {
             capabilities: Default::default(),
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
-            quarantined_survivors: Vec::new(),
             unreachable_guests: Vec::new(),
-            device_residue_sandboxes: Vec::new(),
-            device_residue_known: true,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

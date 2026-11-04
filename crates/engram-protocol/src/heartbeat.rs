@@ -87,16 +87,6 @@ pub struct Heartbeat {
     /// must still decode).
     #[serde(default)]
     pub capture_job_reports: Vec<CaptureJobReport>,
-    /// ADR 0090: survivor sandboxes whose NBD rehydrate failed after a
-    /// roll — the slot is quarantined, the (possibly live) VM's disk is
-    /// unserved, and the documented remediation is `evict_local →
-    /// resume`. Re-advertised every heartbeat until the sandbox is
-    /// destroyed; the coordinator reacts by enqueueing the evict (the
-    /// op layer dedups), instead of the VM waiting for the teardown
-    /// reconciler's orphan path. `#[serde(default)]` for mixed-version
-    /// interop during the roll.
-    #[serde(default)]
-    pub quarantined_survivors: Vec<QuarantinedSurvivor>,
 }
 
 /// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
@@ -147,39 +137,6 @@ pub struct HostCapacityReport {
     pub used_mib: u64,
     /// Resident count: running plus tearing-down sandboxes.
     pub running_sandboxes: u32,
-}
-
-/// ADR 0116 C4: why a survivor is quarantined. `Rehydrate` is the
-/// ADR 0090 original — the NBD rehydrate `RECONFIGURE` failed after a
-/// roll. `DataPlaneFailed` is the flush-escalation flavor — the device
-/// is still served, but consecutive device-class flush failures mean
-/// nothing durable can land. The coordinator's reaction (the keyed
-/// quarantine evict) is the same for both; the reason feeds the WARN
-/// log and the host-side park refusal. `#[serde(default)]` on the
-/// carrying field keeps the JSON heartbeat additive-safe with no
-/// WIRE_VERSION bump (the `tombstoned_sandboxes`/`CheckpointKind`
-/// precedent; the bincode twin's only cross-peer consumers are
-/// same-build dev paths).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuarantineReason {
-    #[default]
-    Rehydrate,
-    DataPlaneFailed,
-}
-
-/// ADR 0090: one quarantined survivor — a sandbox whose NBD slot was
-/// parked after a failed rehydrate `RECONFIGURE` (or, ADR 0116 C4,
-/// whose flush loop escalated a failed data plane), still owned by
-/// `session_id` per the generation's register reply.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct QuarantinedSurvivor {
-    pub sandbox_id: SandboxId,
-    pub session_id: SessionId,
-    /// ADR 0116 C4 — additive: a survivor from a pre-reason host
-    /// decodes as [`QuarantineReason::Rehydrate`].
-    #[serde(default)]
-    pub reason: QuarantineReason,
 }
 
 /// NOTE (ADR 0116 A-D5): `tombstoned_sandboxes` rides ONLY the JSON
@@ -337,7 +294,6 @@ mod tests {
             checkpoints: Vec::new(),
             utilization: Default::default(),
             capture_job_reports: Vec::new(),
-            quarantined_survivors: Vec::new(),
         }
     }
 
@@ -637,35 +593,6 @@ mod tests {
         // authoritative "cancel everything you're running".
         assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
-    }
-
-    /// ADR 0116 C4 rollout interop: a survivor from a pre-reason
-    /// host carries no `reason` key — it must decode to `Rehydrate`,
-    /// not fail the heartbeat.
-    #[test]
-    fn quarantined_survivor_without_reason_decodes_to_rehydrate() {
-        let v = serde_json::json!({
-            "sandbox_id": SandboxId::new(),
-            "session_id": SessionId::new(),
-        });
-        let q: QuarantinedSurvivor = serde_json::from_value(v).expect("decode without reason");
-        assert_eq!(q.reason, QuarantineReason::Rehydrate);
-    }
-
-    /// ADR 0116 C4: the data-plane-failed flavor round-trips, and its
-    /// wire token is the snake_case string the coordinator's fixtures
-    /// use.
-    #[test]
-    fn quarantined_survivor_reason_round_trips_through_json() {
-        let original = QuarantinedSurvivor {
-            sandbox_id: SandboxId::new(),
-            session_id: SessionId::new(),
-            reason: QuarantineReason::DataPlaneFailed,
-        };
-        let v = serde_json::to_value(&original).unwrap();
-        assert_eq!(v["reason"], serde_json::json!("data_plane_failed"));
-        let back: QuarantinedSurvivor = serde_json::from_value(v).unwrap();
-        assert_eq!(back, original);
     }
 
     #[test]

@@ -44,7 +44,6 @@ pub fn build_heartbeat(
         // (dormant P1a) — always empty until a later commit wires the
         // durable-record source.
         capture_job_reports: Vec::new(),
-        quarantined_survivors: Vec::new(),
     }
 }
 

@@ -151,10 +151,9 @@ export type SystemMarker =
       cause: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
     }
-  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
-  // eviction exhausted its budget; the coordinator destroyed the crippled VM
-  // and the next resume rewinds to the last published disk manifest, dropping
-  // guest writes acked-but-never-uploaded past it. A prominent warning marker.
+  // A recorded durability rollback (historical rows only): the coordinator
+  // destroyed a VM whose acked guest writes were never uploaded, so the next
+  // resume rewinds past them. A prominent warning marker.
   | {
       kind: "durability_rollback";
       manifest: string | null;
