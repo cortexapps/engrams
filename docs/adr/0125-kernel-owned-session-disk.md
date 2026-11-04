@@ -305,66 +305,63 @@ store. Restore still clones a host-local snapshot file instead of
 staging a manifest; the code marks that as a retirement that never
 landed. This ADR lands it.
 
-The seam is one trait in `engram-host-core`, beside the seams it
-replaces (`device::DeviceSync` and `nbd::NbdKernel`, both of which
-exist only for the daemon and retire with it). Host-core depends only on
-`engram-core`, so the trait speaks in volumes and 16 MiB chunk indices;
-the shared code above it does the manifest work.
+The seam lives in `engram-host-core` beside the seams it replaces
+(`device::DeviceSync` and `nbd::NbdKernel`, which retire with the
+daemon). Landed in step 1 of the rollout; the shape below is the code, and it
+differs from the first draft of this section in three ways recorded
+after the listing.
 
 ```rust
-/// A session disk the kernel owns. One implementation per platform.
+// engram-host-core/src/disk.rs
+pub struct Volume { pub name: VolumeName, pub path: PathBuf,
+                    pub size_bytes: u64, pub chunk_size: u64, /* open fd */ }
+impl Volume {
+    async fn read_chunk(&self, ChunkIndex) -> io::Result<Vec<u8>>;
+    async fn write_chunk(&self, ChunkIndex, Vec<u8>) -> io::Result<()>;
+    async fn zero_chunk(&self, ChunkIndex) -> io::Result<()>;   // hole / discard
+    async fn sync(&self) -> io::Result<()>;
+}
+
 #[async_trait]
 pub trait SessionDisk: Send + Sync {
-    type Volume: Volume;
-
-    /// An empty volume of `bytes` (an image version, or swap).
-    async fn create(&self, name: &VolumeName, bytes: u64) -> Result<Self::Volume>;
-    /// An O(1) point-in-time copy. The origin may be live when the
-    /// caller has paused the guest and called `Volume::sync`.
-    async fn snapshot(&self, origin: &Self::Volume, name: &VolumeName)
-        -> Result<Self::Volume>;
-    /// A volume recorded in `sandbox.json`. Err when it does not exist.
-    async fn open(&self, name: &VolumeName) -> Result<Self::Volume>;
-    async fn delete(&self, name: &VolumeName) -> Result<()>;
-    /// Free data and metadata space, reported in the heartbeat.
-    async fn capacity(&self) -> Result<Capacity>;
-    /// Chunk indices whose bytes differ between two snapshots of one
-    /// origin. The default reads and hashes every chunk of both: correct
-    /// on every platform, slow, and the oracle the fast path is tested
-    /// against.
-    async fn dirty_chunks(&self, a: &Self::Volume, b: &Self::Volume)
-        -> Result<Vec<ChunkIndex>> { /* default: full compare */ }
+    async fn create(&self, &VolumeName, size_bytes: u64) -> io::Result<Volume>;
+    async fn snapshot(&self, origin: &Volume, &VolumeName) -> io::Result<Volume>;
+    async fn open(&self, &VolumeName) -> io::Result<Volume>;
+    async fn delete(&self, &VolumeName) -> io::Result<()>;
+    async fn capacity(&self) -> io::Result<Capacity>;
+    async fn dirty_chunks(&self, a: &Volume, b: &Volume) -> io::Result<Vec<ChunkIndex>>
+        { /* default: read both in full; the oracle for overrides */ }
 }
 
-#[async_trait]
-pub trait Volume: Send + Sync {
-    /// What the hypervisor opens: a device on Linux, a file on macOS.
-    fn path(&self) -> &Path;
-    /// Staging sink: write one 16 MiB chunk at its offset.
-    async fn write_chunk(&self, index: ChunkIndex, bytes: &[u8]) -> Result<()>;
-    /// Hashing source for upload.
-    async fn read_chunk(&self, index: ChunkIndex) -> Result<Bytes>;
-    /// Host page cache to the volume. Called inside the checkpoint pause.
-    async fn sync(&self) -> Result<()>;
-}
+// engram-host-core/src/disk_flows.rs
+pub async fn stage(disk, store, name, manifest, base: Option<(&Volume, &Manifest)>)
+    -> io::Result<Volume>;
+pub async fn checkpoint(disk, store, live, name, previous: Option<(&Volume, &Manifest)>)
+    -> io::Result<(Volume, Manifest)>;
+pub mod checkpoint_split { pub async fn take(..); pub async fn upload(..); }
 ```
 
-Two shared functions in host-core use it and nothing else:
-`stage(disk, manifest, fetch) -> Volume` writes a manifest's chunks into a
-new volume (or into a snapshot of the predecessor version, skipping
-chunks whose hash is unchanged at that offset), and
-`checkpoint(disk, live, previous) -> Manifest` syncs, snapshots, asks for
-the dirty chunks, reads and hashes them, and builds the manifest. The
-capture driver, the checkpoint record, the publish path and resume call
-those two functions. Three implementations:
+- **`Volume` is a struct, not a trait.** Once a volume exists every
+  platform reads, writes, punches and syncs it the same way through a
+  file descriptor; only creation, snapshot, diff and capacity vary.
+- **The flows live in host-core, not the chunk store.** The chunk store
+  cannot depend on `Volume` (host-core depends on it for `Manifest`),
+  so the chunk store contributes only the pure list arithmetic
+  `Manifest::delta_from` / `apply`, and host-core moves the bytes. The
+  path-based `chunk_file` and `materialize_to_file` helpers retire with
+  their last callers.
+- **Checkpoint is two halves.** `take` (sync, snapshot) runs inside the
+  guest pause; `upload` runs after the guest resumes. The one-call form
+  composes them.
 
-- `ThinPoolDisk` (Linux, `engram-host-agent`): `dmsetup` and
-  `thin_delta`. `dirty_chunks` overrides the default and is tested
-  against it.
-- `ApfsFileDisk` (macOS, `engram-sandbox-vz`): `clonefile`, keeps the
-  default `dirty_chunks`.
-- `SimDisk` (`engram-dst-host`): in-memory, so the simulator drives the
-  same staging and checkpoint code with fault injection (ADR 0098).
+Implementations: `ThinPoolDisk` (Linux, phase 3, overrides
+`dirty_chunks` with `thin_delta`), `FileDisk` (host-core: sparse files
+in a directory, `fs::copy` for snapshot, which APFS makes a clone; the
+macOS implementation and the Linux one without a pool), and `CrashDisk`
+(`engram-dst-host`: `FileDisk` with every call traced and cut at an
+armed op index, the pattern `CrashFs` set). Phase 1 tests prove the
+round trip (what `checkpoint` produces, `stage` reproduces) and that a
+cut at any op leaves the live volume intact.
 
 | Operation | Linux (thin pool) | macOS (APFS file) |
 |---|---|---|
@@ -375,8 +372,8 @@ those two functions. Three implementations:
 | Dirty set for upload | `thin_delta` | hash every 16 MiB window of the clone; the store dedups by hash |
 | Delete | `dmsetup message delete` | unlink |
 
-The macOS dirty set is the default `dirty_chunks`: a full hash of the
-clone on every checkpoint. That is slower by tens of
+The macOS dirty set is the default `dirty_chunks`: a full read of both
+snapshots on every checkpoint. That is slower by tens of
 seconds for a development-sized image and uploads only new chunks,
 because the chunk store dedups by hash. It is `chunk_file`, which
 exists and is what VZ calls today, so macOS needs no extent or delta
@@ -480,30 +477,40 @@ that adds code without retiring the row it replaces is incomplete.
 
 ## Rollout
 
-Each phase is one PR on a worktree, each retires the code it replaces,
+Each step is one PR, each retires the code it replaces where it can,
 and each updates the DESIGN.md fact page. The chunk-store manifest is
-the interchange format, so hosts on either side of any phase
+the interchange format, so hosts on either side of any step
 interoperate: a session evicted from an NBD-era host resumes on a
 thin-pool host and the reverse.
 
-1. **Node substrate.** Data disk in the fleet module; node-prep builds
-   and checks the pool; the host-agent heartbeat reports pool free
-   space; the scheduler gates on it. No session uses the pool yet. Dev
-   VM and CI get the loop-device pool.
-2. **Image staging into volumes.** The prefetch supervisor stages into
-   a thin volume beside the chunk cache; readiness requires both.
-   `thin_delta`-based diff and the chunk hasher land here with their
-   fixtures, exercised against staged volumes.
-3. **Sessions on the pool.** New sessions and resumes create thin
-   snapshots and start Firecracker on the device path; checkpoint,
-   evict and teleport use the snapshot primitive. Existing NBD sessions
-   finish their lives on the daemon. The small-synchronous-write
+1. **The seam.** `SessionDisk`, `Volume`, `FileDisk`, `CrashDisk`,
+   `Manifest::delta_from`, `stage` and `checkpoint`, with the round-trip
+   and crash-at-every-op tests. Pure Rust, no node change. Retires the
+   daemon's duplicated hole-punch helpers.
+2. **Node substrate.** Data disk in the fleet module; node-prep builds
+   and checks the pool; the heartbeat reports pool capacity; the
+   scheduler gates on it. No session uses the pool yet. Dev VM and CI
+   get a loop-device pool.
+3. **The real implementations.** `ThinPoolDisk` with its `dmsetup`
+   builder and `thin_delta` parser, tested against the default
+   `dirty_chunks` on the KVM runners; VZ switches to `FileDisk` and the
+   shared flows, retiring its `rootfs_source` restore input and its
+   host-local snapshot-file clone.
+4. **Image staging into volumes.** The prefetch supervisor stages each
+   enabled version into a thin volume beside the chunk cache; readiness
+   requires the volume.
+5. **Sessions on the pool.** Create, resume, checkpoint, evict and
+   teleport go through `stage` and `checkpoint`. One deploy cycle where
+   a host-agent runs both paths: new sessions on the pool, the last NBD
+   sessions on the daemon until they evict. The small-synchronous-write
    measurement from Tradeoffs runs here on a real image.
-4. **Retire the daemon.** Once no NBD-backed session exists, delete
-   every row of "What this deletes", the chunk cache, the heartbeat
-   field, the coordinator consumer and the quarantine evictor flavour.
-   Flip ADR 0110, ADR 0090 Decision 3 and ADR 0049 to superseded, write
-   the fact page, flip this ADR to Accepted with the commit chain.
+6. **Delete.** Once no NBD-backed session exists, every row of "What
+   this deletes", the chunk cache, the heartbeat field, the coordinator
+   consumer, the quarantine evictor flavour, `DeviceSync`, `NbdKernel`
+   and the path-based chunk-store helpers. Collapse ADR 0110, ADR 0090
+   Decision 3 and ADR 0049 to stubs, write the fact page, reword the
+   AGENTS.md "source of truth" sentence, flip this ADR to Accepted with
+   the commit chain.
 
 ## Facts this ADR establishes
 
