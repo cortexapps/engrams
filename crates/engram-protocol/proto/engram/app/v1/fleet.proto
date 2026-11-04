@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package engram.app.v1;
 
-import "engram/app/v1/session.proto";
-
 // Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
 // The caller is a single trusted service (bearer-authed); there is no
 // per-user anything here. Attribution and authz live in the orchestrator.
