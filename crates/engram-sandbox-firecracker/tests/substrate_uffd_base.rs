@@ -273,7 +273,11 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     // already-populated base (SEEK_HOLE fast path + shared CONTINUE).
     let sibling_id = SandboxId::new();
     match backend
-        .restore(sibling_id, restore_metadata, common::disks(&local_rootfs))
+        .restore(
+            sibling_id,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
         .await
     {
         Ok(()) => {}
@@ -298,6 +302,51 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     let mut expect = vec![restored_id, sibling_id];
     expect.sort();
     assert_eq!(listed, expect, "both substrate-backed VMs alive");
+
+    // An image base whose layout does not match the session (the image was
+    // re-captured after the session's snapshot): the handler falls back to a
+    // restore without a shared base and never creates the image base file.
+    // The load must not name that file, or Firecracker fails with ENOENT.
+    let short_memory = work.path().join("short-memory.bin");
+    std::fs::write(&short_memory, vec![0u8; 4 * 1024 * 1024]).expect("write short memory");
+    let short_chunked = cs
+        .chunk_file(&short_memory, ManifestKind::Memory, None)
+        .await
+        .expect("chunk short memory");
+    let mismatched_base = ManifestRef::new();
+    cs.put_manifest(mismatched_base, &short_chunked)
+        .await
+        .expect("put mismatched base manifest");
+    let mut mismatched_metadata = restore_metadata;
+    mismatched_metadata.base_memory_manifest = Some(mismatched_base);
+    let fallback_id = SandboxId::new();
+    match backend
+        .restore(
+            fallback_id,
+            mismatched_metadata,
+            common::disks(&local_rootfs),
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(e) => dump_logs_and_panic(
+            "restore #3 (mismatched base)",
+            format!("{e:?}"),
+            work.path(),
+        ),
+    };
+    let mismatched_base_path = base_dir.join(format!(
+        "{}-v{}.base",
+        mismatched_base.manifest_id, mismatched_base.version
+    ));
+    assert!(
+        !mismatched_base_path.exists(),
+        "the fallback restore must not create the mismatched image base"
+    );
+    backend
+        .destroy(fallback_id)
+        .await
+        .expect("destroy fallback");
 
     backend.destroy(sibling_id).await.expect("destroy sibling");
     backend

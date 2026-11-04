@@ -7,7 +7,7 @@
  */
 
 import { create } from "@bufbuild/protobuf";
-import type { Connector, OauthMetadataField } from "./registry.ts";
+import type { Connector, OauthMetadataField, OauthMetadataProbe } from "./registry.ts";
 import {
   ClientCredentialsSpecSchema,
   RedirectMetadataProbeSchema,
@@ -15,6 +15,7 @@ import {
   RedirectOauthSpecSchema,
   ServiceAccountSpecSchema,
   type ClientCredentialsSpec,
+  type RedirectMetadataProbe,
   type RedirectMetadataSpec,
   type RedirectOauthSpec,
   type ServiceAccountSpec,
@@ -37,6 +38,23 @@ function wireMap(
   return out;
 }
 
+function wireProbe(connector: Connector, probe: OauthMetadataProbe): RedirectMetadataProbe {
+  return create(RedirectMetadataProbeSchema, {
+    method: probe.method ?? "GET",
+    host: probe.host ?? connector.hosts[0] ?? "",
+    path: probe.path,
+    body: probe.body ?? "",
+    map: wireMap(probe.map),
+  });
+}
+
+/** The wire probe that names the account behind a pasted personal token,
+ * when the connector declares one. */
+export function userTokenIdentityProbe(connector: Connector): RedirectMetadataProbe | undefined {
+  const identity = connector.userCredential?.token?.identity;
+  return identity ? wireProbe(connector, identity) : undefined;
+}
+
 /** Build the wire spec for a connector's oauth facet. `extraParams` lets a
  * caller append flow extras (e.g. `prompt: "consent"` on a reconnect); facet
  * params win on collision so a connector's declared behavior is stable. */
@@ -45,15 +63,7 @@ function wireMetadata(connector: Connector): RedirectMetadataSpec | undefined {
   if (!oauth?.metadata) return undefined;
   return create(RedirectMetadataSpecSchema, {
     fromTokenResponse: wireMap(oauth.metadata.fromTokenResponse),
-    probe: oauth.metadata.probe
-      ? create(RedirectMetadataProbeSchema, {
-          method: oauth.metadata.probe.method ?? "GET",
-          host: oauth.metadata.probe.host ?? connector.hosts[0] ?? "",
-          path: oauth.metadata.probe.path,
-          body: oauth.metadata.probe.body ?? "",
-          map: wireMap(oauth.metadata.probe.map),
-        })
-      : undefined,
+    probe: oauth.metadata.probe ? wireProbe(connector, oauth.metadata.probe) : undefined,
   });
 }
 

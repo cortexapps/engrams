@@ -768,6 +768,10 @@ describe("on-disk registry", () => {
     expect(userScopes).toContain("chat:write");
     expect(reg.get("sentry")!.userCredential?.token?.hint).toContain("User Auth Tokens");
     expect(reg.get("github")!.userCredential?.oauth).toBeUndefined();
+    expect(reg.get("github")!.userCredential?.token?.identity).toEqual({
+      path: "/user",
+      map: { displayName: "login" },
+    });
     expect(reg.get("github")!.userCredential?.inject).toEqual({
       header: "Authorization",
       template: "Bearer {}",
@@ -1429,6 +1433,35 @@ describe("user-scoped credentials (ADR 0115)", () => {
     test("accepts token mode with an inject spec on a mint connector", () => {
       const c = parseConnector(acmeMintRaw, "acmemint");
       expect(c.userCredential?.inject).toEqual({ header: "Authorization", template: "Bearer {}" });
+    });
+
+    test("accepts a token identity probe against one of the connector's hosts", () => {
+      const withIdentity = {
+        ...acmeRaw,
+        userCredential: {
+          token: { hint: "x", identity: { path: "/me", map: { displayName: "login" } } },
+        },
+      };
+      expect(parseConnector(withIdentity, "acme").userCredential?.token).toEqual({
+        hint: "x",
+        identity: { path: "/me", map: { displayName: "login" } },
+      });
+    });
+
+    test("rejects a token identity probe that maps accountId or leaves the hosts", () => {
+      const token = (identity: unknown) => ({
+        ...acmeRaw,
+        userCredential: { token: { hint: "x", identity } },
+      });
+      expect(() =>
+        parseConnector(token({ path: "/me", map: { accountId: "id" } }), "t"),
+      ).toThrow(/must not map "accountId"/);
+      expect(() =>
+        parseConnector(token({ host: "evil.test", path: "/me", map: { displayName: "login" } }), "t"),
+      ).toThrow(/token.identity.host/);
+      expect(() => parseConnector(token({ path: "/me", map: {} }), "t")).toThrow(
+        /token.identity.map/,
+      );
     });
 
     test("rejects an empty facet (no mode)", () => {

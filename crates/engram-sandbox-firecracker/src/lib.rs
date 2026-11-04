@@ -72,6 +72,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -418,6 +419,37 @@ pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
 /// (duplicated, not shared, by design — the two binaries don't depend
 /// on each other; the filename is the contract).
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
+
+/// Per-jail file where the uffd-handler records the base shm file it
+/// opened (empty: none). The Firecracker load names exactly that file.
+const UFFD_BASE_SHM_ACK_FILE: &str = "uffd-base-shm.ack";
+
+/// Read the handler's base shm ack. The handler writes it before it binds
+/// the FC-facing socket, so it exists once that socket does. Empty means
+/// the handler fell back to running without a shared base, and the load
+/// must not name one: a base file the handler did not open is either
+/// missing on this host or sized for another layout.
+async fn read_base_shm_ack(
+    jail_dir: &Path,
+    expected: &Path,
+) -> Result<Option<PathBuf>, SandboxError> {
+    let ack = jail_dir.join(UFFD_BASE_SHM_ACK_FILE);
+    let body = tokio::fs::read(&ack)
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("read {}: {e}", ack.display())))?;
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let opened = PathBuf::from(std::ffi::OsString::from_vec(body));
+    if opened != expected {
+        return Err(SandboxError::Snapshot(format!(
+            "uffd handler opened base {} but the load expected {}",
+            opened.display(),
+            expected.display()
+        )));
+    }
+    Ok(Some(opened))
+}
 
 /// ADR 0045 C2: the peer-mode handler's one-way control socket
 /// (Sealed/DrainProgress/DrainDone/PeerLost), bound in the jail dir.
@@ -2051,9 +2083,9 @@ impl FirecrackerBackend {
     /// VM's lifetime.
     #[allow(clippy::too_many_arguments)]
     /// ADR 0045 substrate (v2b): the per-template base shm path for a
-    /// canonical manifest, or `None` when the substrate is off. Both the
-    /// handler spawn (creates + populates it) and the FC load (maps it
-    /// `MAP_PRIVATE`) derive the path through here so they can't diverge.
+    /// canonical manifest, or `None` when the substrate is off. The
+    /// handler spawn passes it as `--base-shm`; the FC load maps only what
+    /// the handler's ack confirms it opened (see [`read_base_shm_ack`]).
     fn uffd_base_path(
         &self,
         canonical_ref: &engram_core::types::manifest::ManifestRef,
@@ -2136,7 +2168,12 @@ impl FirecrackerBackend {
                     .await
                     .map_err(|e| vm_err(format!("create uffd base dir {}: {e}", dir.display())))?;
             }
-            cmd.arg("--base-shm").arg(&base);
+            let ack = jail_dir.join(UFFD_BASE_SHM_ACK_FILE);
+            let _ = tokio::fs::remove_file(&ack).await;
+            cmd.arg("--base-shm")
+                .arg(&base)
+                .arg("--base-shm-ack")
+                .arg(ack);
         }
         // The destination poller atomically stages the capture-time rider in
         // the snapshot directory. Hint reads run independently: neither the drain
@@ -3330,7 +3367,10 @@ impl FirecrackerBackend {
         } else {
             None
         };
-        let load_result: Result<(), SandboxError> = async {
+        // Ok carries the base shm file the uffd load mapped (None in File
+        // mode or when the handler runs without a shared base).
+        let load_result: Result<Option<PathBuf>, SandboxError> = async {
+            let mut uffd_base = None;
             match &mut uffd_leg {
                 None => {
                     let paths = SnapshotPaths {
@@ -3390,11 +3430,17 @@ impl FirecrackerBackend {
                             "post-copy load gate open (sealed + state.bin staged)",
                         );
                     }
-                    // The same canonical ref as the handler spawn, so the
-                    // derived base path matches the handler's.
-                    let base = base_memory_manifest
+                    // Map the base the handler acked, not the one derived
+                    // here: after a canonical/session mismatch the handler
+                    // runs without a base, and the derived file is missing
+                    // (ENOENT) or sized for another layout.
+                    let base = match base_memory_manifest
                         .or(manifest.memory_manifest)
-                        .and_then(|r| self.uffd_base_path(&r));
+                        .and_then(|r| self.uffd_base_path(&r))
+                    {
+                        Some(expected) => read_base_shm_ack(jail_dir, &expected).await?,
+                        None => None,
+                    };
                     let t_load = std::time::Instant::now();
                     tracing::Instrument::instrument(
                         async {
@@ -3418,6 +3464,7 @@ impl FirecrackerBackend {
                         resumed_in_load = aux_swap_plan.is_empty(),
                         "fc snapshot load complete (uffd)",
                     );
+                    uffd_base = base;
                 }
             }
             if !aux_swap_plan.is_empty() {
@@ -3438,15 +3485,15 @@ impl FirecrackerBackend {
                 )
                 .await?;
             }
-            Ok(())
+            Ok(uffd_base)
         }
         .await;
         // FC holds the fds; the shared paths are free for the next restore.
         drop(_src_canon_guard);
         drop(swap_restore);
 
-        let uffd_handler: Option<Child> = match load_result {
-            Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
+        let (uffd_handler, uffd_base): (Option<Child>, Option<PathBuf>) = match load_result {
+            Ok(base) => (uffd_leg.map(|(handler, _uds)| handler), base),
             // The armed guards reap FC, the handler, and the netns.
             Err(e) => return Err(e),
         };
@@ -3473,13 +3520,12 @@ impl FirecrackerBackend {
                 .clone()
                 .unwrap_or_else(|| paths::rootfs_canonical(&self.work_dir, sandbox_id)),
             swap_canonical: manifest.source_swap_canonical.clone(),
-            // What guest RAM is a private mapping of, in the absolute,
+            // What guest RAM is a private mapping of (Uffd: the base the
+            // load named, None for anonymous RAM), in the absolute,
             // symlink-resolved form `/proc/<pid>/maps` prints.
             memory_backing: match restore_mode {
                 RestoreMode::File => Some(mem_path.clone()),
-                RestoreMode::Uffd => base_memory_manifest
-                    .or(manifest.memory_manifest)
-                    .and_then(|r| self.uffd_base_path(&r)),
+                RestoreMode::Uffd => uffd_base,
             }
             .map(canonical_backing_path),
         };
@@ -8977,6 +9023,36 @@ mod tests {
                 "a UFFD resume serves memory lazily",
             );
         }
+    }
+
+    /// The load maps only the base the handler acked. An empty ack (the
+    /// canonical/session mismatch fallback) maps none; this is the case
+    /// that failed every resume with ENOENT when the load derived the path.
+    #[tokio::test]
+    async fn load_maps_only_the_base_the_handler_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("img-v2.base");
+        let ack = dir.path().join(UFFD_BASE_SHM_ACK_FILE);
+
+        assert!(
+            read_base_shm_ack(dir.path(), &expected).await.is_err(),
+            "a missing ack fails the restore instead of guessing",
+        );
+
+        std::fs::write(&ack, b"").unwrap();
+        assert_eq!(
+            read_base_shm_ack(dir.path(), &expected).await.unwrap(),
+            None
+        );
+
+        std::fs::write(&ack, expected.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            read_base_shm_ack(dir.path(), &expected).await.unwrap(),
+            Some(expected.clone()),
+        );
+
+        std::fs::write(&ack, b"/var/lib/engram/shm/other-v1.base").unwrap();
+        assert!(read_base_shm_ack(dir.path(), &expected).await.is_err());
     }
 
     /// ADR 0045 C2 (2026-10-07 addendum): a post-copy source is any VM
