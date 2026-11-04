@@ -762,6 +762,33 @@ async fn invalid_grant_breaks_the_credential_and_reconnect_repairs_it() {
 }
 
 #[tokio::test]
+async fn github_bad_refresh_token_breaks_the_credential() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // GitHub's shape: HTTP 200, its own error code.
+    *fx.provider.token_response.lock() = json!({
+        "error": "bad_refresh_token",
+        "error_description": "The refresh token passed is incorrect or expired.",
+    });
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.broke, 1, "{sweep:?}");
+    let row = fx
+        .meta
+        .get_oauth_credential(&linear_key())
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.broken_reason.as_deref(), Some("invalid_grant"));
+}
+
+#[tokio::test]
 async fn non_refreshable_expiring_token_breaks_at_expiry_not_before() {
     let fx = fixture().await;
     // A provider shape neither shipped connector produces but a custom

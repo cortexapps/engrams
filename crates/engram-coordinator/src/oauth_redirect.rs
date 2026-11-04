@@ -692,7 +692,9 @@ impl OAuthManager {
                         format!("no access token under {grant_path:?}")
                     }
                 });
-            let code = if err == "invalid_grant" {
+            // GitHub answers a dead refresh token with HTTP 200 and its own
+            // `bad_refresh_token` code, not the RFC's `invalid_grant`.
+            let code = if err == "invalid_grant" || err == "bad_refresh_token" {
                 "invalid_grant"
             } else {
                 "exchange_failed"
