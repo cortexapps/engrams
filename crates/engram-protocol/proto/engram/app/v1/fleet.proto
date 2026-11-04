@@ -142,8 +142,13 @@ message HostView {
   // ADR 0123 A2: retirement status. Unset when no retirement was
   // requested; `retired_at` set means the grant landed.
   HostRetirement retirement = 34;
-  uint32 nbd_slots_total = 35;
-  uint32 nbd_slots_in_use = 36;
+  reserved 35, 36;
+  // The session-disk pool, as the host's last heartbeat reported it.
+  // A zero total means the host has no pool.
+  uint64 pool_data_free_mib = 37;
+  uint64 pool_data_total_mib = 38;
+  uint64 pool_metadata_free_mib = 39;
+  uint64 pool_metadata_total_mib = 40;
 }
 
 message GetHostRequest {

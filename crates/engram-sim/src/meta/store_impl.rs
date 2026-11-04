@@ -96,60 +96,6 @@ fn reserved_budgets(db: &SimDb) -> std::collections::BTreeMap<HostId, (i64, i64)
     out
 }
 
-/// Mirror of the SQL slot ledger. A reported attachment is already in
-/// nbd_slots_in_use, so only an unreported binding reserves more slots.
-fn reserved_nbd(db: &SimDb) -> std::collections::BTreeMap<HostId, i64> {
-    let mut out = std::collections::BTreeMap::new();
-    let mut add = |host: Option<HostId>, sandbox: Option<SandboxId>, need: u32| {
-        if let Some(host) = host {
-            let reported = sandbox
-                .and_then(|id| {
-                    db.hosts
-                        .get(&host)
-                        .and_then(|h| h.utilization.nbd_sandboxes.get(&id).copied())
-                })
-                .unwrap_or(0);
-            *out.entry(host).or_insert(0) += i64::from(need.saturating_sub(reported));
-        }
-    };
-    for r in db.sessions.values().filter(|r| reserves(r.session.status)) {
-        add(r.session.host_id, r.session.sandbox_id, r.nbd_slot_need);
-    }
-    for r in db.capture_jobs.values().filter(|r| !r.stage.is_terminal()) {
-        add(
-            r.host_id,
-            r.stage_progress.as_ref().and_then(|p| p.sandbox_id),
-            1 + u32::from(r.image_config.resolved_swap_mib() > 0),
-        );
-    }
-    for r in db.teleports.values() {
-        let need = db
-            .sessions
-            .get(&r.session_id)
-            .map(|s| s.nbd_slot_need)
-            .unwrap_or(2);
-        if engram_core::types::teleport::TeleportPhase::dest_reserving_phases()
-            .contains(&r.phase.as_str())
-        {
-            add(Some(r.dest_host_id), r.dest_sandbox_id, need);
-        }
-        if engram_core::types::teleport::TeleportPhase::source_reserving_phases()
-            .contains(&r.phase.as_str())
-        {
-            add(Some(r.source_host_id), Some(r.source_sandbox_id), need);
-        }
-    }
-    out
-}
-
-fn slots_fit(h: &HostRecord, reserved: i64, need: u32) -> bool {
-    h.utilization.nbd_slots_total == 0
-        || i64::from(h.utilization.nbd_slots_total)
-            - i64::from(h.utilization.nbd_slots_in_use)
-            - reserved
-            >= i64::from(need)
-}
-
 fn append_teleport_finished(
     db: &mut SimDb,
     id: TeleportId,
@@ -276,18 +222,10 @@ impl SimMetadataStore {
         &self,
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
-        nbd_slot_need: u32,
     ) -> Option<HostId> {
         let db = self.db.lock();
         let candidates: Vec<HostId> = db.hosts.keys().copied().collect();
-        Self::pick_host_2d(
-            &db,
-            &candidates,
-            0,
-            mem_budget_mib,
-            cpu_budget_vcpus,
-            nbd_slot_need,
-        )
+        Self::pick_host_2d(&db, &candidates, 0, mem_budget_mib, cpu_budget_vcpus)
     }
 
     /// Mirror of `pick_host_2d` + `choose_placement_host`: candidates
@@ -304,14 +242,11 @@ impl SimMetadataStore {
         affinity_len: usize,
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
-        need_slots: u32,
     ) -> Option<HostId> {
-        let slots = reserved_nbd(db);
         let eligible: Vec<&HostRecord> = candidates
             .iter()
             .filter_map(|id| db.hosts.get(id))
             .filter(|h| matches!(h.status, HostStatus::Ready | HostStatus::Draining) && !h.cordoned)
-            .filter(|h| slots_fit(h, slots.get(&h.id).copied().unwrap_or(0), need_slots))
             .collect();
         if eligible.is_empty() {
             return None;
@@ -413,7 +348,6 @@ impl MetadataStore for SimMetadataStore {
             0,
             req.mem_budget_mib,
             req.cpu_budget_vcpus,
-            s.nbd_slot_need,
         ) else {
             return Ok(TeleportAdmitOutcome::NoFit);
         };
@@ -719,7 +653,6 @@ impl MetadataStore for SimMetadataStore {
         db.sessions.insert(
             id,
             SessRow {
-                nbd_slot_need: 2,
                 session: Session {
                     id,
                     status: SessionState::Pending,
@@ -834,7 +767,6 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             ws.mem_budget_mib,
             i64::from(ws.cpu_budget_vcpus),
-            ws.nbd_slot_need,
         );
         let (status, host_id, queue_origin, queued_at) = match picked {
             Some(h) => (SessionState::Pending, Some(h), None, None),
@@ -848,7 +780,6 @@ impl MetadataStore for SimMetadataStore {
         db.sessions.insert(
             ws.session_id,
             SessRow {
-                nbd_slot_need: ws.nbd_slot_need,
                 session: Session {
                     id: ws.session_id,
                     status,
@@ -1049,7 +980,6 @@ impl MetadataStore for SimMetadataStore {
         Ok(rows
             .into_iter()
             .map(|r| QueuedSession {
-                nbd_slot_need: r.nbd_slot_need,
                 session: r.session.clone(),
                 origin: r.queue_origin.unwrap_or(QueueOrigin::Create),
                 mem_budget_mib: r.mem_budget_mib,
@@ -1084,10 +1014,6 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             mem_budget_mib,
             i64::from(cpu_budget_vcpus),
-            db.sessions
-                .get(&id)
-                .ok_or(MetaError::NotFound)?
-                .nbd_slot_need,
         ) else {
             return Ok(None);
         };
@@ -1113,19 +1039,9 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<std::collections::HashMap<HostId, ReservedBudget>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        let slots = reserved_nbd(&db);
         Ok(reserved_budgets(&db)
             .into_iter()
-            .map(|(h, (mem_mib, vcpus))| {
-                (
-                    h,
-                    ReservedBudget {
-                        mem_mib,
-                        vcpus,
-                        nbd_slots: slots.get(&h).copied().unwrap_or(0),
-                    },
-                )
-            })
+            .map(|(h, (mem_mib, vcpus))| (h, ReservedBudget { mem_mib, vcpus }))
             .collect())
     }
 
@@ -4840,7 +4756,6 @@ impl MetadataStore for SimMetadataStore {
             0,
             current.mem_budget_mib,
             i64::from(current.cpu_budget_vcpus),
-            1 + u32::from(current.image_config.resolved_swap_mib() > 0),
         );
         let row = db.capture_jobs.get_mut(&id).expect("checked above");
         row.host_id = picked;
@@ -4864,7 +4779,6 @@ impl MetadataStore for SimMetadataStore {
         candidates: &[HostId],
         mem_budget_mib: i64,
         cpu_budget_vcpus: i32,
-        need_slots: u32,
     ) -> Result<Vec<PlacementNoFit>, MetaError> {
         self.gate()?;
         if candidates.is_empty() {
@@ -4872,7 +4786,6 @@ impl MetadataStore for SimMetadataStore {
         }
         let db = self.db.lock();
         let reserved = reserved_budgets(&db);
-        let slots = reserved_nbd(&db);
         Ok(candidates
             .iter()
             .map(|id| {
@@ -4896,9 +4809,7 @@ impl MetadataStore for SimMetadataStore {
                     i64::MAX
                 };
                 let free_mib = alloc - res_mib;
-                let reason = if !slots_fit(h, slots.get(id).copied().unwrap_or(0), need_slots) {
-                    "nbd_slots"
-                } else if alloc <= 0 {
+                let reason = if alloc <= 0 {
                     "unmeasured"
                 } else if free_mib < mem_budget_mib {
                     "ram_full"
@@ -4938,7 +4849,6 @@ impl MetadataStore for SimMetadataStore {
             0,
             current.mem_budget_mib,
             i64::from(current.cpu_budget_vcpus),
-            1 + u32::from(current.image_config.resolved_swap_mib() > 0),
         );
         let row = db.capture_jobs.get_mut(&id).expect("checked above");
         row.host_id = picked;
@@ -5100,7 +5010,6 @@ impl MetadataStore for SimMetadataStore {
             0,
             current.mem_budget_mib,
             i64::from(current.cpu_budget_vcpus),
-            1 + u32::from(current.image_config.resolved_swap_mib() > 0),
         );
         let row = db.capture_jobs.get_mut(&id).expect("checked above");
         row.host_id = picked;

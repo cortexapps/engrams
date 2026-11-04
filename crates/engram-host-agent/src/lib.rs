@@ -1313,7 +1313,22 @@ impl HostAgent {
                             kind: r.kind,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    if let Some(disk) = &session_disk_for_heartbeat {
+                        match disk.capacity().await {
+                            Ok(cap) => {
+                                const MIB: u64 = 1024 * 1024;
+                                utilization.pool_data_free_mib = cap.data_free_bytes / MIB;
+                                utilization.pool_data_total_mib = cap.data_total_bytes / MIB;
+                                utilization.pool_metadata_free_mib = cap.metadata_free_bytes / MIB;
+                                utilization.pool_metadata_total_mib =
+                                    cap.metadata_total_bytes / MIB;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "session disk capacity probe failed");
+                            }
+                        }
+                    }
                     // ADR 0068: re-run every probe this tick. Cheap
                     // (statfs/stat/one TCP connect/a memfd-backed uffd
                     // self-test; the FC binary version is cached after

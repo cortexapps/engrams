@@ -25,7 +25,7 @@
 //! ## Per-fit-class FIFO (queue-fairness follow-up to ADR 0048)
 //!
 //! [`FitClass`] partitions the FIFO-ordered queue purely by the 2D
-//! `(mem_budget_mib, cpu_budget_vcpus, nbd_slot_need)` tuple ([`partition_queue`]) and each
+//! `(mem_budget_mib, cpu_budget_vcpus)` tuple ([`partition_queue`]) and each
 //! class sweeps strict FIFO independently. Classes are attempted
 //! oldest-head-first (the most-starved class gets first claim on freed
 //! capacity this tick); a create that hits `NoCapacity` stops only its
@@ -149,7 +149,6 @@ fn env_secs(name: &str, default: u64) -> u64 {
 /// blocking. See the module doc.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct FitClass {
-    nbd_slot_need: u32,
     mem_budget_mib: i64,
     cpu_budget_vcpus: i32,
 }
@@ -159,7 +158,6 @@ impl FitClass {
         Self {
             mem_budget_mib: q.mem_budget_mib,
             cpu_budget_vcpus: q.cpu_budget_vcpus,
-            nbd_slot_need: q.nbd_slot_need,
         }
     }
 }
@@ -484,7 +482,6 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         .map(|e| e.base_snapshot_memory_manifest.is_some())
         .unwrap_or(false);
     let ctx = crate::placement::ScheduleContext {
-        nbd_slot_need: q.nbd_slot_need,
         repo,
         image_version: tag,
         snapshot_host: None,
@@ -601,7 +598,6 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCa
         .ok()
         .flatten();
     let ctx = crate::placement::ScheduleContext {
-        nbd_slot_need: q.nbd_slot_need,
         repo,
         image_version: tag,
         snapshot_host: None,
@@ -840,12 +836,7 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
                 if let Ok(details) = state
                     .services
                     .meta
-                    .placement_no_fit_details(
-                        &ids,
-                        q.mem_budget_mib,
-                        q.cpu_budget_vcpus,
-                        q.nbd_slot_need,
-                    )
+                    .placement_no_fit_details(&ids, q.mem_budget_mib, q.cpu_budget_vcpus)
                     .await
                 {
                     payload["hosts"] = details
@@ -937,18 +928,9 @@ mod tests {
     use super::*;
     use engram_core::types::session::{Session, SessionMode};
 
-    #[test]
-    fn slot_need_separates_queue_fit_classes() {
-        let root = queued(1, 1024, 1, 10);
-        let mut swap = root.clone();
-        swap.nbd_slot_need = 2;
-        assert_eq!(partition_queue(vec![swap, root]).len(), 2);
-    }
-
     fn queued(id_seed: u8, mem: i64, cpu: i32, secs_ago: i64) -> QueuedSession {
         let id = SessionId::new();
         QueuedSession {
-            nbd_slot_need: 1,
             session: Session {
                 id,
                 status: SessionState::Queued,

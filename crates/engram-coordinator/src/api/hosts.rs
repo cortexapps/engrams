@@ -17,8 +17,10 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct HostView {
-    pub nbd_slots_total: u32,
-    pub nbd_slots_in_use: u32,
+    pub pool_data_free_mib: u64,
+    pub pool_data_total_mib: u64,
+    pub pool_metadata_free_mib: u64,
+    pub pool_metadata_total_mib: u64,
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
@@ -130,8 +132,10 @@ impl HostView {
             util_base_shm_mib: row.utilization.base_shm_mib,
             util_parked_pss_mib: row.utilization.parked_pss_mib,
             util_running_pss_mib: row.utilization.running_pss_mib,
-            nbd_slots_total: row.utilization.nbd_slots_total,
-            nbd_slots_in_use: row.utilization.nbd_slots_in_use,
+            pool_data_free_mib: row.utilization.pool_data_free_mib,
+            pool_data_total_mib: row.utilization.pool_data_total_mib,
+            pool_metadata_free_mib: row.utilization.pool_metadata_free_mib,
+            pool_metadata_total_mib: row.utilization.pool_metadata_total_mib,
             allocatable_mib,
             reserved_mib,
             free_mib: allocatable_mib.saturating_sub(reserved_mib),

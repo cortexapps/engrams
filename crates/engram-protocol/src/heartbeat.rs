@@ -317,9 +317,10 @@ mod tests {
     fn utilization_round_trips_through_json() {
         let mut original = sample();
         original.utilization = engram_core::types::host::HostUtilization {
-            nbd_slots_total: 128,
-            nbd_slots_in_use: 37,
-            nbd_sandboxes: Default::default(),
+            pool_data_free_mib: 128,
+            pool_data_total_mib: 512,
+            pool_metadata_free_mib: 0,
+            pool_metadata_total_mib: 0,
             disk_total_mib: 102_400,
             disk_used_mib: 81_920,
             mem_total_mib: 32_768,
@@ -334,8 +335,8 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Heartbeat = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.utilization.nbd_slots_total, 128);
-        assert_eq!(back.utilization.nbd_slots_in_use, 37);
+        assert_eq!(back.utilization.pool_data_free_mib, 128);
+        assert_eq!(back.utilization.pool_data_total_mib, 512);
         assert_eq!(back.utilization.disk_total_mib, 102_400);
         assert_eq!(back.utilization.disk_used_mib, 81_920);
         assert_eq!(back.utilization.mem_total_mib, 32_768);

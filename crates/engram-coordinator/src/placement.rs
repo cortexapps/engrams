@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore, SessionFence};
-use engram_core::types::host::{CapStatus, HostRecord, HostStatus, ReservedBudget};
+use engram_core::types::host::{
+    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_DATA_FLOOR_BYTES,
+    HOST_POOL_METADATA_FLOOR_BYTES,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId};
 use engram_protocol::heartbeat::ManifestDigest;
@@ -34,7 +37,6 @@ use crate::host_registry::HostRegistry;
 /// the backing store moved from the in-memory mirror to the hosts rows.)
 #[derive(Clone, Debug)]
 pub struct ScheduleContext<'a> {
-    pub nbd_slot_need: u32,
     pub repo: &'a str,
     pub image_version: &'a str,
     /// ADR 0078 (GCS-free resume) tier-0 authoritative affinity: the host
@@ -91,7 +93,7 @@ pub struct ScheduleContext<'a> {
 pub struct CapabilityRequirements {
     /// This placement restores/creates against a memory manifest, so
     /// it needs the FC UFFD substrate: `base_shm_tmpfs` +
-    /// `uffd_minor_shmem` + `nbd` must all be `Ok` on the candidate
+    /// `uffd_minor_shmem` + `session_disk` must all be `Ok` on the candidate
     /// host. Derived per call site — e.g. `snapshot.memory_manifest.is_some()`
     /// on resume, the enabled image's `base_snapshot_memory_manifest`
     /// presence on create.
@@ -99,7 +101,7 @@ pub struct CapabilityRequirements {
     /// ADR 0123: this placement is the DESTINATION of a live post-copy
     /// move. The migration restore forces the UFFD backend against the
     /// substrate, so `NotApplicable` is not enough: `base_shm_tmpfs`,
-    /// `uffd_minor_shmem` and `nbd` must be `Ok` and the backend must be
+    /// `uffd_minor_shmem` and `session_disk` must be `Ok` and the backend must be
     /// Firecracker. A host that cannot run that restore is not a
     /// candidate (the answer is `NoFit`, never a failure after the
     /// source blackout).
@@ -128,7 +130,7 @@ pub struct CapabilityRequirements {
 ///   listener is up, or has no bundle generation staged, can't safely
 ///   take any session). Each capability `req` actually asks for
 ///   (`needs_uffd_substrate` → `base_shm_tmpfs` + `uffd_minor_shmem` +
-///   `nbd`) must be `Ok` **or** `NotApplicable` — `NotApplicable` is
+///   `session_disk`) must be `Ok` **or** `NotApplicable` — `NotApplicable` is
 ///   the honest report of an ADR 0022 File-backend host (the substrate
 ///   was never configured, so there's nothing to probe): it must not
 ///   be treated the same as `Failed`/`Unknown`, or a File-mode fleet
@@ -166,8 +168,8 @@ pub fn host_meets_capabilities(
         if !substrate_ok(&caps.uffd_minor_shmem) {
             return Err("uffd_minor_shmem");
         }
-        if !substrate_ok(&caps.nbd) {
-            return Err("nbd");
+        if !substrate_ok(&caps.session_disk) {
+            return Err("session_disk");
         }
     }
     if req.needs_live_substrate {
@@ -180,8 +182,8 @@ pub fn host_meets_capabilities(
         if !caps.uffd_minor_shmem.is_ok() {
             return Err("live:uffd_minor_shmem");
         }
-        if !caps.nbd.is_ok() {
-            return Err("live:nbd");
+        if !caps.session_disk.is_ok() {
+            return Err("live:session_disk");
         }
     }
     if let (Some(want), Some(have)) = (&req.fc_snapshot_version, &caps.fc_snapshot_version) {
@@ -405,6 +407,9 @@ fn host_passes_filters(
     if host_meets_capabilities(h, &ctx.caps).is_err() {
         return false;
     }
+    if !host_pool_floor_ok(h) {
+        return false;
+    }
     match ctx.required_image_digest.as_ref() {
         Some(d) => h.ready_images.iter().any(|r| r == d.as_str()),
         None => true,
@@ -544,16 +549,7 @@ pub fn pick_from(
     pick_from_2d(hosts, reserved, ctx, now, ttl, false)
 }
 
-fn nbd_slots_fit(h: &HostRecord, reserved: &HashMap<HostId, ReservedBudget>, need: u32) -> bool {
-    h.utilization.nbd_slots_total == 0
-        || i64::from(h.utilization.nbd_slots_total)
-            - i64::from(h.utilization.nbd_slots_in_use)
-            - reserved.get(&h.id).map(|r| r.nbd_slots).unwrap_or(0)
-            >= i64::from(need)
-}
-
 /// The ranked RAM/CPU pick, with an explicit `require_fit` knob.
-/// NBD slot capacity is a hard gate in every mode.
 ///
 /// `require_fit=false` (the historical `pick_from` behavior) keeps the
 /// ADR 0046 capacity-SOFT last-resort fallback: when nothing fits both
@@ -583,17 +579,6 @@ pub fn pick_from_2d(
             Some(d) => Err(PickError::ImageNotReady(d.clone())),
             None => Err(PickError::NoCapacity),
         };
-    }
-    // Slots are a hard gate, including affinity and unmeasured-RAM hosts.
-    let slot_hosts: Vec<_> = hosts
-        .iter()
-        .filter(|h| nbd_slots_fit(h, reserved, ctx.nbd_slot_need))
-        .cloned()
-        .collect();
-    let hosts = slot_hosts.as_slice();
-    let ranked = rank_hosts(hosts, ctx, now, ttl);
-    if ranked.hosts.is_empty() {
-        return Err(PickError::NoCapacity);
     }
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
     let need_vcpus = ctx.cpu_budget_vcpus.unwrap_or(0) as i64;
@@ -824,9 +809,6 @@ pub async fn placement_preview(
             return false;
         };
         let alloc = h.utilization.allocatable_mib as i64;
-        if !nbd_slots_fit(h, &reserved, ctx.nbd_slot_need) {
-            return false;
-        }
         if alloc <= 0 {
             return true; // unmeasured → soft fallback fits
         }
@@ -931,12 +913,7 @@ pub async fn log_reserve_no_fit(
 ) -> Vec<(HostId, String)> {
     let mut summary: Vec<(HostId, String)> = Vec::new();
     match meta
-        .placement_no_fit_details(
-            candidates,
-            mem_budget_mib,
-            cpu_budget_vcpus,
-            ctx.nbd_slot_need,
-        )
+        .placement_no_fit_details(candidates, mem_budget_mib, cpu_budget_vcpus)
         .await
     {
         Ok(details) => {
@@ -1049,7 +1026,6 @@ pub async fn pick_specific_host(
     registry: &HostRegistry,
     host_id: HostId,
     exclude_host: Option<HostId>,
-    nbd_slot_need: u32,
     now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     if Some(host_id) == exclude_host {
@@ -1071,7 +1047,7 @@ pub async fn pick_specific_host(
     if host_meets_capabilities(h, &CapabilityRequirements::default()).is_err() {
         return Err(PickError::NoCapacity);
     }
-    if !nbd_slots_fit(h, &reserved, nbd_slot_need) {
+    if !host_pool_floor_ok(h) {
         return Err(PickError::NoCapacity);
     }
     let alloc = h.utilization.allocatable_mib as i64;
@@ -1228,6 +1204,29 @@ fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> b
     host_is_schedulable(h, now, ttl)
         && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
         && host_disk_floor_ok(h)
+        && host_pool_floor_ok(h)
+}
+
+/// The session-disk pool floor: a host whose pool has less data or
+/// metadata space free than the floors takes no new session. A hard gate
+/// in every tier, including an operator pin, because a full data pool
+/// stalls every guest on the node. A zero data total (no pool reported)
+/// is soft, the same posture as unmeasured RAM.
+fn host_pool_floor_ok(h: &HostRecord) -> bool {
+    let u = &h.utilization;
+    u.pool_data_total_mib == 0
+        || (u.pool_data_free_mib >= host_pool_data_floor_mib()
+            && u.pool_metadata_free_mib >= HOST_POOL_METADATA_FLOOR_BYTES / (1024 * 1024))
+}
+
+/// `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` overrides the pool data floor for
+/// small dev rigs; it is a separate knob from the work_dir disk floor.
+fn host_pool_data_floor_mib() -> u64 {
+    std::env::var("ENGRAM_PLACEMENT_POOL_FLOOR_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(HOST_POOL_DATA_FLOOR_BYTES)
+        / (1024 * 1024)
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
@@ -1407,7 +1406,7 @@ mod tests {
             bundle: CapStatus,
             base_shm: CapStatus,
             uffd_minor: CapStatus,
-            nbd: CapStatus,
+            session_disk: CapStatus,
             fc_snapshot_version: Option<&str>,
         ) -> engram_core::types::host::HostCapabilities {
             engram_core::types::host::HostCapabilities {
@@ -1416,7 +1415,7 @@ mod tests {
                 grpc_self_connect: grpc,
                 base_shm_tmpfs: base_shm,
                 uffd_minor_shmem: uffd_minor,
-                nbd,
+                session_disk,
                 page_idle: CapStatus::Unknown,
                 bundle_stamp: bundle,
                 fc_snapshot_version: fc_snapshot_version.map(str::to_string),
@@ -1776,43 +1775,42 @@ mod tests {
     }
 
     #[test]
-    fn nbd_slots_are_hard_even_for_affinity_and_soft_fallback() {
+    fn scheduler_rejects_hosts_below_pool_low_water() {
+        let floor_mib = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
         let mut h = host(1);
-        h.utilization.nbd_slots_total = 2;
-        h.utilization.nbd_slots_in_use = 1;
+        h.utilization.pool_data_total_mib = 4 * floor_mib;
+        h.utilization.pool_data_free_mib = floor_mib - 1;
+        h.utilization.pool_metadata_free_mib = 1024;
         let mut c = ctx();
-        c.nbd_slot_need = 2;
         c.snapshot_host = Some(h.id);
         c.prefer_host = Some(h.id);
-        let mut reserved = HashMap::new();
+        let reserved = HashMap::new();
         for require_fit in [false, true] {
             assert!(
-                pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, require_fit).is_err()
+                pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, require_fit).is_err(),
+                "a pool below the data floor is rejected in every tier"
             );
         }
-        c.nbd_slot_need = 1;
+        h.utilization.pool_data_free_mib = floor_mib;
         assert_eq!(
             pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
             h.id
         );
-        reserved.insert(
+        h.utilization.pool_metadata_free_mib = 0;
+        assert!(
+            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).is_err(),
+            "exhausted metadata is rejected too"
+        );
+        h.utilization.pool_data_total_mib = 0;
+        assert_eq!(
+            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
             h.id,
-            ReservedBudget {
-                nbd_slots: 1,
-                ..Default::default()
-            },
-        );
-        assert!(pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).is_err());
-        h.utilization.nbd_slots_total = 0;
-        assert_eq!(
-            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
-            h.id
+            "no pool reported is soft"
         );
     }
 
     fn ctx<'a>() -> ScheduleContext<'a> {
         ScheduleContext {
-            nbd_slot_need: 1,
             repo: "r",
             image_version: "v",
             snapshot_host: None,
@@ -1831,16 +1829,7 @@ mod tests {
     fn mem_reserved(entries: &[(HostId, i64)]) -> HashMap<HostId, ReservedBudget> {
         entries
             .iter()
-            .map(|&(id, mem_mib)| {
-                (
-                    id,
-                    ReservedBudget {
-                        mem_mib,
-                        vcpus: 0,
-                        nbd_slots: 0,
-                    },
-                )
-            })
+            .map(|&(id, mem_mib)| (id, ReservedBudget { mem_mib, vcpus: 0 }))
             .collect()
     }
 
@@ -2069,7 +2058,6 @@ mod tests {
             (
                 hid(1),
                 ReservedBudget {
-                    nbd_slots: 0,
                     mem_mib: 0,
                     vcpus: 32,
                 },
@@ -2077,7 +2065,6 @@ mod tests {
             (
                 hid(2),
                 ReservedBudget {
-                    nbd_slots: 0,
                     mem_mib: 0,
                     vcpus: 0,
                 },
@@ -2362,7 +2349,7 @@ mod tests {
                 grpc_self_connect: engram_core::types::host::CapStatus::Ok(None),
                 base_shm_tmpfs: engram_core::types::host::CapStatus::Ok(None),
                 uffd_minor_shmem: engram_core::types::host::CapStatus::Ok(None),
-                nbd: engram_core::types::host::CapStatus::Ok(None),
+                session_disk: engram_core::types::host::CapStatus::Ok(None),
                 page_idle: engram_core::types::host::CapStatus::Unknown,
                 bundle_stamp: engram_core::types::host::CapStatus::Ok(None),
                 fc_snapshot_version: Some("v9.0.0".into()),

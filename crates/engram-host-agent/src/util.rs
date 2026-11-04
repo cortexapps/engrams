@@ -109,9 +109,10 @@ impl UtilizationProbe {
         let (disk_total_mib, disk_used_mib) = self.sample_disk(work_dir);
         let cpu_pct = self.cpu_pct();
         HostUtilization {
-            nbd_slots_total: 0,
-            nbd_slots_in_use: 0,
-            nbd_sandboxes: Default::default(),
+            pool_data_free_mib: 0,
+            pool_data_total_mib: 0,
+            pool_metadata_free_mib: 0,
+            pool_metadata_total_mib: 0,
             disk_total_mib,
             disk_used_mib,
             mem_total_mib: ledger.mem_total_mib,

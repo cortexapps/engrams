@@ -676,7 +676,6 @@ mod steps {
         };
         let candidates_for = |caps: crate::placement::CapabilityRequirements| {
             let context = crate::placement::ScheduleContext {
-                nbd_slot_need: 1,
                 repo: &session.image,
                 image_version: "",
                 snapshot_host: None,

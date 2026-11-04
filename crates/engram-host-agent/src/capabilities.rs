@@ -241,10 +241,9 @@ pub fn probe_uffd_minor_shmem(_substrate_configured: bool) -> CapStatus {
     CapStatus::NotApplicable
 }
 
-/// Session disks are owned by the host (`SessionVolumes` wired).
-/// `NotApplicable` off the FC backend. Reported under the `nbd` name the
-/// coordinator's placement gate reads.
-pub fn probe_nbd(is_fc_backend: bool, has_session_disk: bool) -> CapStatus {
+/// The host owns a session-disk pool (`SessionVolumes` wired).
+/// `NotApplicable` off the FC backend.
+pub fn probe_session_disk(is_fc_backend: bool, has_session_disk: bool) -> CapStatus {
     if !is_fc_backend {
         return CapStatus::NotApplicable;
     }
@@ -360,7 +359,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         CapStatus::NotApplicable
     };
     let uffd_minor_shmem = probe_uffd_minor_shmem(substrate_configured);
-    let nbd = probe_nbd(is_fc, inputs.has_session_disk);
+    let session_disk = probe_session_disk(is_fc, inputs.has_session_disk);
     let bundle_stamp = probe_bundle_stamp(&inputs.bundle_dir).await;
     let fc_snapshot_version =
         fc_snapshot_version(inputs.fc.as_ref().map(|fc| fc.firecracker_bin.as_path())).await;
@@ -371,7 +370,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         grpc_self_connect,
         base_shm_tmpfs,
         uffd_minor_shmem,
-        nbd,
+        session_disk,
         page_idle: probe_page_idle(is_fc),
         bundle_stamp,
         fc_snapshot_version,
@@ -491,9 +490,12 @@ mod tests {
 
     #[test]
     fn session_disk_is_not_applicable_off_the_fc_backend_and_required_on_it() {
-        assert_eq!(probe_nbd(false, false), CapStatus::NotApplicable);
-        assert!(matches!(probe_nbd(true, false), CapStatus::Failed(_)));
-        assert!(matches!(probe_nbd(true, true), CapStatus::Ok(_)));
+        assert_eq!(probe_session_disk(false, false), CapStatus::NotApplicable);
+        assert!(matches!(
+            probe_session_disk(true, false),
+            CapStatus::Failed(_)
+        ));
+        assert!(matches!(probe_session_disk(true, true), CapStatus::Ok(_)));
     }
 
     #[tokio::test]
