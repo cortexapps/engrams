@@ -329,9 +329,10 @@ message PostCopyCaptureResponse {
   uint64 pause_ms = 8;
   uint64 disk_drain_ms = 9;
   uint64 vmstate_ms = 10;
-  // Disk post-copy: how many disk chunks were sealed (dirty +
-  // pending tiers) for P2P demand-fetch.
-  uint64 sealed_disk_chunks = 11;
+  // Disk blocks sealed under the pause, and the blocks the presetup's
+  // snapshot carried while the guest ran.
+  uint64 sealed_disk_blocks = 11;
+  uint64 precopy_disk_blocks = 12;
 }
 
 message DrainOutcomeResponse {
@@ -361,19 +362,22 @@ enum DiskRole {
 
 message MigrationItem {
   enum Kind {
-    reserved 2, 3;
-    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST";
+    reserved 2, 3, 5;
+    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST", "DISK_CHUNK_AT";
     KIND_UNSPECIFIED = 0;
     STATE_BIN = 1;
     DISK_SEAL_INFO = 4;
-    DISK_CHUNK_AT = 5;
     HOT_HINT = 6;
+    // One 64 KiB disk block by index.
+    DISK_BLOCK_AT = 7;
+    // The blocks the presetup's snapshot carries, before the pause.
+    DISK_PRECOPY_INFO = 8;
   }
-  reserved 2;
-  reserved "hash";
+  reserved 2, 3;
+  reserved "hash", "chunk_idx";
   Kind kind = 1;
-  uint64 chunk_idx = 3;
   DiskRole role = 4;
+  uint64 index = 5;
 }
 
 message MigrationFrame {

@@ -3,9 +3,9 @@
 //! checkpoint chain, and the optional egress proxy. The inner backend
 //! (VZ or FC) only attaches the devices this layer provisions.
 use engram_core::types::sandbox::SessionDisks;
-use engram_core::types::snapshot::DiskRole;
+use engram_core::types::snapshot::{DiskRole, MIGRATION_DISK_BLOCK_BYTES};
 use engram_host_core::session_volumes::{PendingCheckpoint, Source};
-use engram_host_core::{ChunkIndex, SessionVolumes, Volume};
+use engram_host_core::{SessionVolumes, Volume};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -113,6 +113,10 @@ struct PendingPresetup {
     /// pending checkpoints must be changes on exactly these.
     disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
     swap_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
+    /// A snapshot of each disk, taken while the guest runs, and the
+    /// blocks it changed since the advertised checkpoint. The dest pulls
+    /// them before the pause; the capture seals only what changed since.
+    precopy: std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>,
     sidecar_json: Vec<u8>,
     idle_marked: bool,
     hot_chunks: Vec<[u8; 32]>,
@@ -220,12 +224,31 @@ impl Drop for CaptureUnwind {
     }
 }
 
-/// A post-copy source's sealed disk: the checkpoint taken under the
-/// pause and the chunks that changed since the one the presetup
-/// advertised. `migration_fetch` serves those chunks from the snapshot.
+/// A snapshot of one disk a live move serves blocks from: the
+/// presetup's, taken while the guest runs, or the capture's, taken
+/// under the pause. `sealed` lists the blocks of
+/// [`MIGRATION_DISK_BLOCK_BYTES`] that changed since the snapshot
+/// before it: the advertised checkpoint for a precopy, the precopy for
+/// a seal.
 pub struct DiskSeal {
     pub(crate) pending: PendingCheckpoint,
-    pub(crate) sealed: std::collections::HashSet<u64>,
+    pub(crate) sealed: std::collections::BTreeSet<u64>,
+}
+
+impl DiskSeal {
+    fn info(&self) -> engram_core::types::snapshot::DiskSealInfo {
+        engram_core::types::snapshot::DiskSealInfo {
+            block_indices: self.sealed.iter().copied().collect(),
+        }
+    }
+
+    /// Block `index` of the snapshot; short when it is the last one.
+    async fn read_block(&self, index: u64) -> std::io::Result<Vec<u8>> {
+        let volume = self.pending.snapshot();
+        let offset = index * MIGRATION_DISK_BLOCK_BYTES;
+        let len = MIGRATION_DISK_BLOCK_BYTES.min(volume.size_bytes.saturating_sub(offset));
+        volume.read_range(offset, len).await
+    }
 }
 
 async fn discard_pending(volumes: &SessionVolumes, pending: PendingCheckpoint) {
@@ -628,16 +651,19 @@ fn stage_hot_trace(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
 }
 
 impl PooledBackend {
-    /// Compose the pre-pause export from the current disk checkpoints.
+    /// Compose the pre-pause export. The dest stages each disk from the
+    /// checkpoint the precopy is a change on.
     async fn prepare_migration_export(
         &self,
         id: SandboxId,
         chain_ref: engram_core::types::manifest::ManifestRef,
         chain_manifest: &engram_chunk_store::Manifest,
         peer_port: u16,
-        disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
-        swap_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
+        precopy: std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let advertised = |role| precopy.get(&role).map(|seal| seal.pending.previous());
+        let (disk_manifest_ref, swap_manifest_ref) =
+            (advertised(DiskRole::Root), advertised(DiskRole::Swap));
         let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
         let memory_manifest_json = serde_json::to_vec(&chain_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
@@ -649,6 +675,7 @@ impl PooledBackend {
             chain_ref,
             disk_manifest_ref,
             swap_manifest_ref,
+            precopy,
             sidecar_json: sidecar_json.clone(),
             idle_marked: false,
             hot_chunks: self.read_hot_chunks(id),
@@ -682,7 +709,7 @@ impl PooledBackend {
         let export_id = export.export_id.clone();
         tokio::spawn(async move {
             if let Some(volumes) = volumes.as_ref() {
-                for (_, seal) in export.disk_seal {
+                for (_, seal) in export.disk_seal.into_iter().chain(export.precopy) {
                     discard_seal(volumes, seal).await;
                 }
             }
@@ -1491,6 +1518,49 @@ impl PooledBackend {
         self.volumes
             .as_ref()
             .ok_or_else(|| SandboxError::InvalidSpec("this host has no session disk".into()))
+    }
+
+    /// A snapshot of each of the sandbox's disks while the guest runs,
+    /// with the blocks it changed since the checkpoint. Nothing is left
+    /// behind when one role fails.
+    async fn take_precopy(
+        &self,
+        volumes: &SessionVolumes,
+        id: SandboxId,
+    ) -> Result<std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>, SandboxError> {
+        let mut precopy = std::collections::BTreeMap::new();
+        let taken = async {
+            for role in volumes.roles(id).await.map_err(disk_err)? {
+                let pending = volumes
+                    .take_precopy(id, role)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
+                let changed = volumes
+                    .changed_blocks(&pending, MIGRATION_DISK_BLOCK_BYTES)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("{role} disk precopy diff: {e}"))
+                    })?;
+                precopy.insert(
+                    role,
+                    Arc::new(DiskSeal {
+                        pending,
+                        sealed: changed.into_iter().collect(),
+                    }),
+                );
+            }
+            Ok::<_, SandboxError>(())
+        }
+        .await;
+        match taken {
+            Ok(()) => Ok(precopy),
+            Err(error) => {
+                for (_, seal) in precopy {
+                    discard_seal(volumes, seal).await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// The live volumes of a sandbox, by role.
@@ -2328,19 +2398,21 @@ impl PooledBackend {
         Ok(())
     }
 
-    /// The destination's fetch poller. Once the source's capture lands
-    /// (the export answers), pull each disk's seal descriptor, write the
-    /// sealed chunks into the live volumes, then write `state.bin` last:
-    /// its appearance is the FC load gate, so the guest never runs on a
-    /// disk that could be stale. Every error arm returns without landing
-    /// `state.bin`; the load gate times out and the coordinator aborts
-    /// to the source with zero loss.
+    /// The destination's fetch poller. While the source guest still
+    /// runs, pull the presetup's precopy tier into the live volumes.
+    /// Once the capture lands (the seal answers), pull `state.bin` and
+    /// the seal tier, then write `state.bin` last: its appearance is the
+    /// FC load gate, so the guest never runs on a disk that could be
+    /// stale. Every error arm returns without landing `state.bin`; the
+    /// load gate times out and the coordinator aborts to the source
+    /// with zero loss.
     fn spawn_postcopy_fetch_poller(
         &self,
         pending: PostCopyDestPending,
         dest_dir: std::path::PathBuf,
         live: Vec<(DiskRole, Volume)>,
     ) -> tokio::task::JoinHandle<()> {
+        use engram_core::types::snapshot::MigrationItem;
         tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(240);
             let started = crate::time_source::metrics_now();
@@ -2350,14 +2422,22 @@ impl PooledBackend {
             // Dial once and poll tight over the live channel; a failed
             // attempt is a sub-ms NotFound on the pod network.
             let mut source: Option<engram_protocol::grpc_client::GrpcHostClient> = None;
-            let mut roles: Vec<DiskRole> = live.iter().map(|(role, _)| *role).collect();
-            if roles.is_empty() {
-                roles.push(DiskRole::Root);
+            // The tiers in order; each one is polled until the source
+            // serves it.
+            #[derive(Clone, Copy, Debug)]
+            enum Stage {
+                Precopy,
+                StateBin,
+                Seal,
             }
-            let (state_tmp, fetch_ms) = loop {
+            let mut stage = Stage::Precopy;
+            let mut stage_started = crate::time_source::metrics_now();
+            let (mut precopy_ms, mut precopy_blocks, mut sealed_blocks) = (0, 0, 0);
+            loop {
                 if started.elapsed() > budget {
                     tracing::error!(
                         export_id = %pending.export_id,
+                        ?stage,
                         "post-copy fetch poller timed out; the FC load gate will tear the restore down",
                     );
                     return;
@@ -2373,95 +2453,74 @@ impl PooledBackend {
                         }
                     },
                 };
-                let t_fetch = crate::time_source::metrics_now();
-                match Self::fetch_postcopy_artifacts(
-                    client,
-                    &pending.export_id,
-                    &tmp,
-                    &roles
-                        .iter()
-                        .copied()
-                        .map(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
-                        .chain(std::iter::once(
-                            engram_core::types::snapshot::MigrationItem::StateBin,
-                        ))
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                {
-                    Ok(()) => break (tmp.join("state.bin"), t_fetch.elapsed().as_millis() as u64),
+                let next = match stage {
+                    Stage::Precopy => Self::pull_disk_tier(
+                        client,
+                        &pending.export_id,
+                        &live,
+                        MigrationItem::DiskPrecopyInfo,
+                    )
+                    .await
+                    .map(|blocks| {
+                        precopy_blocks = blocks;
+                        precopy_ms = stage_started.elapsed().as_millis() as u64;
+                        Some(Stage::StateBin)
+                    }),
+                    Stage::StateBin => Self::fetch_postcopy_artifacts(
+                        client,
+                        &pending.export_id,
+                        &tmp,
+                        &[MigrationItem::StateBin],
+                    )
+                    .await
+                    .map(|()| Some(Stage::Seal)),
+                    Stage::Seal => Self::pull_disk_tier(
+                        client,
+                        &pending.export_id,
+                        &live,
+                        MigrationItem::DiskSealInfo,
+                    )
+                    .await
+                    .map(|blocks| {
+                        sealed_blocks = blocks;
+                        None
+                    }),
+                };
+                match next {
+                    Ok(None) => break,
+                    Ok(Some(reached)) => {
+                        stage = reached;
+                        stage_started = crate::time_source::metrics_now();
+                    }
+                    // Not served yet: the export is not open or the
+                    // capture has not run.
+                    Err(SandboxError::NotFound) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    }
+                    // A transport failure poisons the cached channel.
                     Err(e) => {
-                        // A transport failure poisons the cached channel;
-                        // NotFound (export not open yet) does not.
-                        if !matches!(e, SandboxError::NotFound) {
-                            tracing::debug!(error = %e, "post-copy fetch not ready; retrying");
-                            source = None;
-                        }
+                        tracing::debug!(error = %e, ?stage, "post-copy fetch not ready; retrying");
+                        source = None;
                         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                     }
                 }
-            };
+            }
+            let seal_ms = stage_started.elapsed().as_millis() as u64;
             let Some(client) = source.as_ref() else {
                 return;
             };
 
-            #[derive(serde::Deserialize)]
-            struct SealInfo {
-                sealed_chunk_indices: Vec<u64>,
-            }
-            let t_disk = crate::time_source::metrics_now();
-            let mut sealed_chunks = 0usize;
-            for role in roles {
-                let info: SealInfo = match fs::read(tmp.join(role.seal_file_name())).await {
-                    Ok(bytes) => match serde_json::from_slice(&bytes) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            tracing::error!(error = %e, "post-copy disk seal parse failed; NOT landing state.bin");
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!(error = %e, "post-copy disk seal read failed; NOT landing state.bin");
-                        return;
-                    }
-                };
-                if info.sealed_chunk_indices.is_empty() {
-                    continue;
-                }
-                let Some((_, volume)) = live.iter().find(|(r, _)| *r == role) else {
-                    tracing::error!(
-                        %role,
-                        sealed = info.sealed_chunk_indices.len(),
-                        "post-copy disk seal present but this sandbox has no such volume; NOT landing state.bin",
-                    );
-                    return;
-                };
-                if let Err(error) = Self::fetch_sealed_disk_chunks(
-                    client,
-                    &pending.export_id,
-                    role,
-                    &info.sealed_chunk_indices,
-                    volume,
-                )
-                .await
-                {
-                    tracing::error!(%role, %error, "post-copy disk fetch failed; NOT landing state.bin");
-                    return;
-                }
-                sealed_chunks += info.sealed_chunk_indices.len();
-            }
-            let disk_ms = t_disk.elapsed().as_millis() as u64;
-
-            if let Err(e) = fs::rename(&state_tmp, dest_dir.join("state.bin")).await {
+            if let Err(e) = fs::rename(tmp.join("state.bin"), dest_dir.join("state.bin")).await {
                 tracing::error!(error = %e, "post-copy state.bin land failed");
                 return;
             }
             tracing::info!(
                 export_id = %pending.export_id,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                fetch_ms,
-                disk_ms,
-                sealed_chunks,
+                precopy_ms,
+                precopy_blocks,
+                seal_ms,
+                sealed_blocks,
                 "post-copy restore inputs staged (state.bin landed)",
             );
             // Demand faults can run now. The hint task polls for the
@@ -2503,46 +2562,108 @@ impl PooledBackend {
         })
     }
 
-    /// Write the source's sealed chunks of one disk into the live volume.
-    async fn fetch_sealed_disk_chunks(
+    /// Pull one tier of disk blocks into the live volumes: the
+    /// descriptor `tier` names for each role, then its blocks. Returns
+    /// the block count; `NotFound` while the source does not serve the
+    /// tier yet.
+    async fn pull_disk_tier(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        live: &[(DiskRole, Volume)],
+        tier: fn(DiskRole) -> engram_core::types::snapshot::MigrationItem,
+    ) -> Result<u64, SandboxError> {
+        let mut blocks = 0;
+        for (role, volume) in live {
+            let info = Self::fetch_disk_info(source, export_id, tier(*role)).await?;
+            Self::fetch_disk_blocks(source, export_id, *role, &info.block_indices, volume).await?;
+            blocks += info.block_indices.len() as u64;
+        }
+        Ok(blocks)
+    }
+
+    /// One descriptor item, read whole.
+    async fn fetch_disk_info(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        item: engram_core::types::snapshot::MigrationItem,
+    ) -> Result<engram_core::types::snapshot::DiskSealInfo, SandboxError> {
+        use futures::StreamExt;
+        let mut stream = source.migration_fetch(export_id, vec![item]).await?;
+        let mut bytes = Vec::new();
+        while let Some(frame) = stream.next().await {
+            bytes.extend_from_slice(&frame?.data);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))
+    }
+
+    /// Write the source's blocks of one disk into the live volume, a few
+    /// batches in flight at once, and sync it.
+    async fn fetch_disk_blocks(
         source: &engram_protocol::grpc_client::GrpcHostClient,
         export_id: &str,
         role: DiskRole,
-        sealed: &[u64],
+        blocks: &[u64],
         volume: &Volume,
     ) -> Result<(), SandboxError> {
-        use engram_core::types::snapshot::MigrationItem;
+        use futures::stream::FuturesUnordered;
         use futures::StreamExt;
         const BATCH: usize = 64;
-        for batch in sealed.chunks(BATCH) {
-            let items: Vec<MigrationItem> = batch
-                .iter()
-                .map(|idx| MigrationItem::DiskChunkAt(role, *idx))
-                .collect();
-            let mut stream = source.migration_fetch(export_id, items).await?;
-            let mut current: Vec<u8> = Vec::new();
-            while let Some(frame) = stream.next().await {
-                let frame = frame?;
-                current.extend_from_slice(&frame.data);
-                if frame.last {
-                    let Some(idx) = batch.get(frame.item_idx as usize) else {
-                        return Err(SandboxError::Snapshot(
-                            "migration fetch: unexpected item index".into(),
-                        ));
-                    };
-                    volume
-                        .write_chunk(ChunkIndex(*idx), std::mem::take(&mut current))
-                        .await
-                        .map_err(|e| {
-                            SandboxError::Snapshot(format!("write sealed disk chunk {idx}: {e}"))
-                        })?;
-                }
+        const IN_FLIGHT: usize = 4;
+        let mut in_flight = FuturesUnordered::new();
+        for batch in blocks.chunks(BATCH) {
+            if in_flight.len() >= IN_FLIGHT {
+                in_flight.next().await.transpose()?;
             }
+            in_flight.push(Self::fetch_block_batch(
+                source, export_id, role, batch, volume,
+            ));
+        }
+        while let Some(done) = in_flight.next().await {
+            done?;
         }
         volume
             .sync()
             .await
             .map_err(|e| SandboxError::Snapshot(format!("sync {role} volume: {e}")))
+    }
+
+    async fn fetch_block_batch(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        role: DiskRole,
+        batch: &[u64],
+        volume: &Volume,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let items = batch
+            .iter()
+            .map(|index| MigrationItem::DiskBlockAt(role, *index))
+            .collect();
+        let mut stream = source.migration_fetch(export_id, items).await?;
+        let mut current: Vec<u8> = Vec::new();
+        while let Some(frame) = stream.next().await {
+            let frame = frame?;
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let Some(index) = batch.get(frame.item_idx as usize) else {
+                    return Err(SandboxError::Snapshot(
+                        "migration fetch: unexpected item index".into(),
+                    ));
+                };
+                volume
+                    .write_range(
+                        index * MIGRATION_DISK_BLOCK_BYTES,
+                        std::mem::take(&mut current),
+                    )
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("write sealed disk block {index}: {e}"))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Dial a migration source's gRPC endpoint.
@@ -2592,7 +2713,6 @@ impl PooledBackend {
                 let name = match item_specs.get(idx) {
                     Some(MigrationItem::StateBin) => "state.bin",
                     Some(MigrationItem::HotHint) => "hot-hint.json",
-                    Some(MigrationItem::DiskSealInfo(role)) => role.seal_file_name(),
                     _ => {
                         return Err(SandboxError::Snapshot(
                             "fetch_postcopy_artifacts: unexpected item".into(),
@@ -4707,12 +4827,17 @@ impl SandboxBackend for PooledBackend {
         // one — the session lease serializes movers). Last-write-wins:
         // refusing here would brick every future move for this sandbox
         // until a host-agent restart.
-        if let Some(stale) = self.pending_presetups.get(&id) {
+        if let Some((_, stale)) = self.pending_presetups.remove(&id) {
             tracing::warn!(
                 sandbox_id = %id,
                 stale_export = %stale.export_id,
                 "presetup superseding an abandoned pending presetup",
             );
+            if let Some(volumes) = self.volumes.as_ref() {
+                for (_, seal) in stale.precopy {
+                    discard_seal(volumes, seal).await;
+                }
+            }
         }
         // The guest RAM must be a private mapping of a file (the
         // per-image memfile or the substrate base shm): the pagemap
@@ -4741,34 +4866,35 @@ impl SandboxBackend for PooledBackend {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = &view;
-        // The disk moves by checkpoint: the destination continues the
-        // lineages advertised here and the capture seals the changes
-        // since. A sandbox without a session disk cannot post-copy.
+        // The disk moves in three tiers: the destination continues the
+        // checkpoint lineages advertised here, pulls the precopy taken
+        // now while the guest runs, and after the pause pulls only what
+        // changed since. A sandbox without a session disk cannot post-copy.
         let volumes = self.volumes()?;
-        let mut disk_manifest_ref = None;
-        let mut swap_manifest_ref = None;
-        for role in volumes.roles(id).await.map_err(disk_err)? {
-            let checkpoint = volumes.checkpoint_of(id, role).await.map_err(disk_err)?;
-            match role {
-                DiskRole::Root => disk_manifest_ref = Some(checkpoint),
-                DiskRole::Swap => swap_manifest_ref = Some(checkpoint),
+        let precopy = self.take_precopy(volumes, id).await?;
+        if !precopy.contains_key(&DiskRole::Root) {
+            for (_, seal) in precopy {
+                discard_seal(volumes, seal).await;
             }
-        }
-        let Some(disk_manifest_ref) = disk_manifest_ref else {
             return Err(SandboxError::InvalidSpec(
                 "the sandbox has no root volume — use snapshot-rehome".into(),
             ));
+        }
+        let precopy_blocks: u64 = precopy.values().map(|s| s.sealed.len() as u64).sum();
+        let out = match self
+            .prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), precopy.clone())
+            .await
+        {
+            Ok(out) => out,
+            Err(error) => {
+                for (_, seal) in precopy {
+                    discard_seal(volumes, seal).await;
+                }
+                return Err(error);
+            }
         };
-        let out = self
-            .prepare_migration_export(
-                id,
-                chain_ref,
-                &chain_manifest,
-                peer.port(),
-                Some(disk_manifest_ref),
-                swap_manifest_ref,
-            )
-            .await?;
+        tracing::info!(sandbox_id = %id, export_id = %out.export_id, precopy_blocks,
+            "post-copy presetup took the disk precopy");
         #[cfg(target_os = "linux")]
         {
             let pending_presetups = self.pending_presetups.clone();
@@ -4927,12 +5053,11 @@ impl SandboxBackend for PooledBackend {
                 }
             }
 
-            // The disk seal: a checkpoint of each disk under the pause and
-            // the chunks that changed since the one the presetup advertised.
-            // The guard owns the seals until the export is registered.
+            // The disk seal: a snapshot of each disk under the pause and
+            // the blocks that changed since the presetup's snapshot. The
+            // guard owns the seals until the export is registered.
             let t_seal = crate::time_source::metrics_now();
             let mut disk_seal = std::collections::BTreeMap::new();
-            let mut descriptors = std::collections::BTreeMap::new();
             let volumes = self.volumes()?;
             for role in volumes.roles(id).await.map_err(disk_err)? {
                 let checkpoint = volumes
@@ -4950,36 +5075,32 @@ impl SandboxBackend for PooledBackend {
                         "{role} disk checkpoint advanced between presetup and capture — retry the move"
                     )));
                 }
-                let changed: Vec<u64> = volumes
-                    .changed(checkpoint)
+                let Some(precopy) = pending.precopy.get(&role) else {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "{role} disk gained a volume between presetup and capture — retry the move"
+                    )));
+                };
+                let changed = volumes
+                    .changed_since(&precopy.pending, checkpoint, MIGRATION_DISK_BLOCK_BYTES)
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk seal diff: {e}")))?
-                    .into_iter()
-                    .map(|c| c.0)
-                    .collect();
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk seal diff: {e}")))?;
                 let checkpoint = unwind.pending.pop().expect("just pushed");
                 let seal = Arc::new(DiskSeal {
-                    sealed: changed.iter().copied().collect(),
+                    sealed: changed.into_iter().collect(),
                     pending: checkpoint,
                 });
                 unwind.disk_seal.push(seal.clone());
-                descriptors.insert(role, serde_json::json!({ "sealed_chunk_indices": changed }));
                 disk_seal.insert(role, seal);
             }
-            descriptors.entry(DiskRole::Root).or_insert_with(
-                || serde_json::json!({ "sealed_chunk_indices": Vec::<u64>::new() }),
-            );
-            let sealed_disk_chunks = disk_seal
+            let sealed_disk_blocks = disk_seal
                 .values()
                 .map(|seal| seal.sealed.len() as u64)
                 .sum::<u64>();
-            for (role, info) in &descriptors {
-                let bytes = serde_json::to_vec(info)
-                    .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))?;
-                tokio::fs::write(export_dir.join(role.seal_file_name()), bytes)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("write disk seal info: {e}")))?;
-            }
+            let precopy_disk_blocks = pending
+                .precopy
+                .values()
+                .map(|seal| seal.sealed.len() as u64)
+                .sum::<u64>();
             let disk_drain_ms = t_seal.elapsed().as_millis() as u64;
 
             // Register BOTH exports under the same identity, then the
@@ -4997,6 +5118,7 @@ impl SandboxBackend for PooledBackend {
                 sandbox_id: id,
                 snapshot_dir: export_dir.clone(),
                 disk_seal,
+                precopy: pending.precopy.clone(),
                 clock: self.clock.clone(),
                 state_served,
                 last_activity,
@@ -5076,7 +5198,8 @@ impl SandboxBackend for PooledBackend {
                 export_id,
                 sealed_chunks,
                 total_chunks,
-                sealed_disk_chunks,
+                sealed_disk_blocks,
+                precopy_disk_blocks,
                 pause_ms,
                 disk_drain_ms,
                 vmstate_ms,
@@ -5090,7 +5213,8 @@ impl SandboxBackend for PooledBackend {
                 disk_drain_ms,
                 vmstate_ms,
                 scan_ms,
-                sealed_disk_chunks,
+                sealed_disk_blocks,
+                precopy_disk_blocks,
                 paused_at_unix_ms: paused_at.timestamp_millis(),
             })
         }
@@ -5203,38 +5327,65 @@ impl SandboxBackend for PooledBackend {
     > {
         use engram_core::types::snapshot::{MigrationFrame, MigrationItem};
         // Resolve + validate under the registry ref, then drop it (the
-        // stream must not hold a dashmap guard).
-        let (snapshot_dir, disk_seal) = {
-            let Some(export) = self.migrations.find_by_export_id(export_id) else {
-                return Err(SandboxError::NotFound);
-            };
-            // Advisory hints never extend the export lease, even when absent.
-            // Required artifacts and disk chunks still count as activity.
-            if items
-                .iter()
-                .any(|item| !matches!(item, MigrationItem::HotHint))
-            {
-                export.touch();
+        // stream must not hold a dashmap guard). Before the capture the
+        // presetup serves its precopy; everything else is not yet there.
+        let (snapshot_dir, disk_seal, precopy) = match self.migrations.find_by_export_id(export_id)
+        {
+            Some(export) => {
+                // Advisory hints never extend the export lease, even when absent.
+                // Required artifacts and disk blocks still count as activity.
+                if items
+                    .iter()
+                    .any(|item| !matches!(item, MigrationItem::HotHint))
+                {
+                    export.touch();
+                }
+                // Once state.bin is served, the TTL sweep must not resume us.
+                if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
+                    export
+                        .state_served
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                (
+                    Some(export.snapshot_dir.clone()),
+                    export.disk_seal.clone(),
+                    export.precopy.clone(),
+                )
             }
-            // Once state.bin is served, the TTL sweep must not resume us.
-            if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
-                export
-                    .state_served
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            None => {
+                let Some(presetup) = self
+                    .pending_presetups
+                    .iter()
+                    .find(|p| crate::migration::constant_time_str_eq(&p.export_id, export_id))
+                else {
+                    return Err(SandboxError::NotFound);
+                };
+                (None, Default::default(), presetup.precopy.clone())
             }
-            (export.snapshot_dir.clone(), export.disk_seal.clone())
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<MigrationFrame, SandboxError>>(16);
         tokio::spawn(async move {
             const FRAME: usize = 1024 * 1024;
             for (idx, item) in items.into_iter().enumerate() {
                 let idx = idx as u32;
-                let bytes: Result<bytes::Bytes, SandboxError> = match item {
-                    MigrationItem::StateBin => fs::read(snapshot_dir.join("state.bin"))
+                let info = |seal: &Arc<DiskSeal>| {
+                    serde_json::to_vec(&seal.info())
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))
+                };
+                let bytes: Result<bytes::Bytes, SandboxError> = match (item, &snapshot_dir) {
+                    // Not captured yet: the dest keeps polling.
+                    (
+                        MigrationItem::StateBin
+                        | MigrationItem::HotHint
+                        | MigrationItem::DiskSealInfo(_),
+                        None,
+                    ) => Err(SandboxError::NotFound),
+                    (MigrationItem::StateBin, Some(dir)) => fs::read(dir.join("state.bin"))
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
-                    MigrationItem::HotHint => fs::read(snapshot_dir.join("hot-hint.json"))
+                    (MigrationItem::HotHint, Some(dir)) => fs::read(dir.join("hot-hint.json"))
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| {
@@ -5244,33 +5395,40 @@ impl SandboxBackend for PooledBackend {
                                 SandboxError::Snapshot(format!("read hot hint: {e}"))
                             }
                         }),
-                    MigrationItem::DiskSealInfo(role) => {
-                        fs::read(snapshot_dir.join(role.seal_file_name()))
-                            .await
-                            .map(bytes::Bytes::from)
-                            .map_err(|e| {
-                                SandboxError::Snapshot(format!("read disk seal info: {e}"))
-                            })
-                    }
-                    MigrationItem::DiskChunkAt(role, idx) => match disk_seal.get(&role) {
-                        // The seal is the allowlist: only changed chunks
-                        // are servable, from the snapshot under the pause.
-                        Some(seal) if seal.sealed.contains(&idx) => seal
-                            .pending
-                            .snapshot()
-                            .read_chunk(ChunkIndex(idx))
-                            .await
-                            .map(bytes::Bytes::from)
-                            .map_err(|e| {
-                                SandboxError::Snapshot(format!("read sealed disk chunk {idx}: {e}"))
-                            }),
-                        Some(_) => Err(SandboxError::InvalidSpec(format!(
-                            "disk chunk {idx} is not sealed on this export"
+                    (MigrationItem::DiskSealInfo(role), Some(_)) => match disk_seal.get(&role) {
+                        Some(seal) => info(seal),
+                        None => Err(SandboxError::InvalidSpec(format!(
+                            "this export has no {role} disk seal"
                         ))),
-                        None => Err(SandboxError::InvalidSpec(
-                            "this export has no disk seal".into(),
-                        )),
                     },
+                    (MigrationItem::DiskPrecopyInfo(role), _) => match precopy.get(&role) {
+                        Some(seal) => info(seal),
+                        None => Err(SandboxError::InvalidSpec(format!(
+                            "this export has no {role} disk precopy"
+                        ))),
+                    },
+                    // The seals are the allowlist; the newer snapshot
+                    // wins for a block both list.
+                    (MigrationItem::DiskBlockAt(role, index), _) => {
+                        let tier = [disk_seal.get(&role), precopy.get(&role)]
+                            .into_iter()
+                            .flatten()
+                            .find(|seal| seal.sealed.contains(&index));
+                        match tier {
+                            Some(seal) => seal
+                                .read_block(index)
+                                .await
+                                .map(bytes::Bytes::from)
+                                .map_err(|e| {
+                                    SandboxError::Snapshot(format!(
+                                        "read sealed disk block {index}: {e}"
+                                    ))
+                                }),
+                            None => Err(SandboxError::InvalidSpec(format!(
+                                "{role} disk block {index} is not sealed on this export"
+                            ))),
+                        }
+                    }
                 };
                 match bytes {
                     Ok(bytes) => {
@@ -6440,6 +6598,7 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::*;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
+    use engram_host_core::ChunkIndex;
     use engram_sandbox_process::ProcessBackend;
 
     /// 2026-08-03 `chain_poisoned` alert regression: once the SIGTERM
@@ -8139,7 +8298,7 @@ mod tests {
     /// Export identity gates the framed VM-state and disk-seal artifacts.
     #[tokio::test]
     async fn migration_fetch_checks_export_id_and_frames_artifacts() {
-        use engram_core::types::snapshot::MigrationItem;
+        use engram_core::types::snapshot::{DiskSealInfo, MigrationItem};
         use futures::StreamExt;
         let tmp = tempfile::tempdir().unwrap();
         let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
@@ -8149,15 +8308,16 @@ mod tests {
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
         std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
-        std::fs::write(export_dir.join("disk-seal.json"), b"{}").unwrap();
         let sandbox_id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), sandbox_id).await;
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
         let guard_src = Arc::new(tokio::sync::Mutex::new(()));
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: export_id.clone(),
             sandbox_id,
             snapshot_dir: export_dir,
-            disk_seal: Default::default(),
+            disk_seal: [(DiskRole::Root, seal_root(&volumes, sandbox_id).await)].into(),
+            precopy: Default::default(),
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -8175,31 +8335,48 @@ mod tests {
         };
         assert!(matches!(err, SandboxError::NotFound));
 
-        // Valid pull: state.bin and the disk seal descriptor, framed in order.
+        // Valid pull: state.bin, the disk seal descriptor and a sealed
+        // block, framed in order.
         let stream = pooled
             .migration_fetch(
                 &export_id,
                 vec![
                     MigrationItem::StateBin,
                     MigrationItem::DiskSealInfo(DiskRole::Root),
+                    MigrationItem::DiskBlockAt(DiskRole::Root, 0),
                 ],
             )
             .await
             .expect("valid fetch");
         let frames: Vec<_> = stream.map(|f| f.expect("frame")).collect().await;
-        let item0: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 0)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(item0, b"vmstate-bytes");
-        let item1: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 1)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(item1, b"{}");
-        assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
+        let item = |idx: u32| -> Vec<u8> {
+            frames
+                .iter()
+                .filter(|f| f.item_idx == idx)
+                .flat_map(|f| f.data.to_vec())
+                .collect()
+        };
+        assert_eq!(item(0), b"vmstate-bytes");
+        assert_eq!(
+            serde_json::from_slice::<DiskSealInfo>(&item(1)).unwrap(),
+            DiskSealInfo {
+                block_indices: vec![0]
+            }
+        );
+        assert_eq!(item(2), root_block());
+        assert!(frames.iter().any(|f| f.item_idx == 2 && f.last));
+
+        // A block the seal does not list is refused.
+        let frames: Vec<_> = pooled
+            .migration_fetch(
+                &export_id,
+                vec![MigrationItem::DiskBlockAt(DiskRole::Root, 1)],
+            )
+            .await
+            .expect("fetch opens")
+            .collect()
+            .await;
+        assert!(matches!(&frames[0], Err(SandboxError::InvalidSpec(_))));
     }
 
     /// The first descriptor permits resume; a later update carries the final
@@ -8336,20 +8513,16 @@ mod tests {
         let dest = tmp.path().join("dest");
         std::fs::create_dir_all(&export_dir).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
-        let descriptor = serde_json::json!({"sealed_chunk_indices": [0], "manifest": null, "disk_ref_bincode": null});
-        std::fs::write(
-            export_dir.join("disk-seal.json"),
-            serde_json::to_vec(&descriptor).unwrap(),
-        )
-        .unwrap();
         std::fs::write(export_dir.join("state.bin"), b"state").unwrap();
         let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
         let guard = pooled.capture_lock(id).lock_owned().await;
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: "hot-export".into(),
             sandbox_id: id,
             snapshot_dir: export_dir.clone(),
-            disk_seal: Default::default(),
+            disk_seal: [(DiskRole::Root, seal_root(&volumes, id).await)].into(),
+            precopy: Default::default(),
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(pooled.clock.now_mono())),
@@ -8360,35 +8533,35 @@ mod tests {
             &trace_path,
         ));
         assert!(futures::poll!(&mut loader).is_pending());
-        let descriptor_bytes = std::fs::read(export_dir.join("disk-seal.json")).unwrap();
+        let initial = || async {
+            pooled
+                .migration_fetch(
+                    "hot-export",
+                    vec![
+                        MigrationItem::DiskSealInfo(DiskRole::Root),
+                        MigrationItem::StateBin,
+                    ],
+                )
+                .await
+                .unwrap()
+                .map(|f| f.unwrap().data)
+                .collect::<Vec<_>>()
+                .await
+        };
+        let before = initial().await;
         // Even a large, already published hint cannot enlarge the initial fetch.
         let hot = vec![[255; 32]; 4096];
         publish_hot_hint(&export_dir, &hot).unwrap();
-        assert_eq!(
-            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
-            descriptor_bytes
-        );
-        assert_eq!(
-            std::fs::metadata(export_dir.join("disk-seal.json"))
-                .unwrap()
-                .len(),
-            descriptor_bytes.len() as u64
-        );
-        let frames: Vec<_> = pooled
-            .migration_fetch(
-                "hot-export",
-                vec![
-                    MigrationItem::DiskSealInfo(DiskRole::Root),
-                    MigrationItem::StateBin,
-                ],
-            )
-            .await
-            .unwrap()
-            .collect()
-            .await;
+        let frames = initial().await;
+        assert_eq!(frames, before);
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].as_ref().unwrap().data.as_ref(), descriptor_bytes);
-        assert_eq!(frames[1].as_ref().unwrap().data.as_ref(), b"state");
+        assert_eq!(
+            serde_json::from_slice::<engram_core::types::snapshot::DiskSealInfo>(&frames[0])
+                .unwrap()
+                .block_indices,
+            vec![0]
+        );
+        assert_eq!(frames[1].as_ref(), b"state");
         // Both missing and published hints must leave the lease untouched.
         let last_activity = pooled
             .migrations
@@ -8431,10 +8604,6 @@ mod tests {
                 .map(|h| *h.as_bytes())
                 .collect::<Vec<_>>(),
             vec![[2; 32], [1; 32]]
-        );
-        assert_eq!(
-            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
-            descriptor_bytes
         );
     }
 
@@ -8623,18 +8792,43 @@ mod tests {
         use engram_storage_local::LocalBlobStorage;
         let blob: Arc<dyn engram_core::traits::BlobStorage> =
             Arc::new(LocalBlobStorage::new(tmp.join("blob")));
-        let disk: Arc<dyn engram_host_core::SessionDisk> =
-            Arc::new(engram_host_core::FileDisk::new(tmp.join("volumes"), 4096).unwrap());
+        let disk: Arc<dyn engram_host_core::SessionDisk> = Arc::new(
+            engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
+                .unwrap(),
+        );
         let volumes = Arc::new(SessionVolumes::new(disk, ChunkStore::new(blob)));
         volumes
-            .provision(id, Source::Empty { size_bytes: 8192 }, None)
+            .provision(
+                id,
+                Source::Empty {
+                    size_bytes: 2 * MIGRATION_DISK_BLOCK_BYTES,
+                },
+                None,
+            )
             .await
             .unwrap();
         let live = volumes.live(id, DiskRole::Root).await.unwrap();
-        live.write_chunk(ChunkIndex(0), vec![0x42; 4096])
+        live.write_chunk(ChunkIndex(0), root_block()).await.unwrap();
+        volumes
+    }
+
+    /// The bytes `volumes_with_a_root` writes into block 0.
+    fn root_block() -> Vec<u8> {
+        vec![0x42; MIGRATION_DISK_BLOCK_BYTES as usize]
+    }
+
+    /// A seal of the root volume's pending snapshot, listing block 0.
+    async fn seal_root(volumes: &SessionVolumes, id: SandboxId) -> Arc<DiskSeal> {
+        let pending = volumes.take(id, DiskRole::Root).await.unwrap();
+        let sealed = volumes
+            .changed_blocks(&pending, MIGRATION_DISK_BLOCK_BYTES)
             .await
             .unwrap();
-        volumes
+        assert_eq!(sealed, vec![0]);
+        Arc::new(DiskSeal {
+            pending,
+            sealed: sealed.into_iter().collect(),
+        })
     }
 
     async fn settle(resumes: &parking_lot::Mutex<Vec<SandboxId>>) {
@@ -8676,10 +8870,7 @@ mod tests {
         assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(volumes.roles(id).await.unwrap(), vec![DiskRole::Root]);
         let live = volumes.live(id, DiskRole::Root).await.unwrap();
-        assert_eq!(
-            live.read_chunk(ChunkIndex(0)).await.unwrap(),
-            vec![0x42; 4096]
-        );
+        assert_eq!(live.read_chunk(ChunkIndex(0)).await.unwrap(), root_block());
     }
 
     /// A defused guard is inert: no resume, and the checkpoint it handed
@@ -8729,16 +8920,9 @@ mod tests {
         let dir = tmp.path().join("export");
         let export_id = open_export(&pooled, id, dir.clone()).await;
         let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
-        let pending = volumes.take(id, DiskRole::Root).await.unwrap();
-        let sealed = volumes.changed(&pending).await.unwrap();
-        assert_eq!(sealed, vec![ChunkIndex(0)]);
-        export.disk_seal.insert(
-            DiskRole::Root,
-            Arc::new(DiskSeal {
-                pending,
-                sealed: sealed.into_iter().map(|c| c.0).collect(),
-            }),
-        );
+        export
+            .disk_seal
+            .insert(DiskRole::Root, seal_root(&volumes, id).await);
         pooled.abort_migration_export(export).await.unwrap();
         settle(&resumes).await;
         assert_eq!(*resumes.lock(), vec![id]);
@@ -10921,6 +11105,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: dir,
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),

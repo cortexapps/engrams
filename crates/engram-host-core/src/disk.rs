@@ -172,6 +172,41 @@ impl Volume {
             .map_err(|e| io::Error::other(format!("zero_chunk task: {e}")))?
     }
 
+    /// Read `len` bytes at `offset`; the range must lie inside the volume.
+    pub async fn read_range(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        self.check_range(offset, len)?;
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact_at(&mut buf, offset)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("read_range task: {e}")))?
+    }
+
+    /// Write `bytes` at `offset`; the range must lie inside the volume.
+    pub async fn write_range(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
+        self.check_range(offset, bytes.len() as u64)?;
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
+            .await
+            .map_err(|e| io::Error::other(format!("write_range task: {e}")))?
+    }
+
+    fn check_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.size_bytes => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "range {offset}+{len} is past the end of volume {} ({} bytes)",
+                    self.name, self.size_bytes
+                ),
+            )),
+        }
+    }
+
     /// Flush the host page cache for this volume to the store.
     pub async fn sync(&self) -> io::Result<()> {
         let file = Arc::clone(&self.file);
@@ -179,6 +214,39 @@ impl Volume {
             .await
             .map_err(|e| io::Error::other(format!("sync task: {e}")))?
     }
+}
+
+/// Two volumes are snapshots of one origin when their shapes match.
+pub fn same_origin(before: &Volume, after: &Volume) -> io::Result<()> {
+    if before.size_bytes != after.size_bytes || before.chunk_size != after.chunk_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} ({} bytes) and {} ({} bytes) must be snapshots of one origin",
+                before.name, before.size_bytes, after.name, after.size_bytes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// How many `block_bytes` blocks make a chunk of `volume`.
+pub fn blocks_per_chunk(volume: &Volume, block_bytes: u64) -> io::Result<u64> {
+    if block_bytes == 0 || !volume.chunk_size.is_multiple_of(block_bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "block size {block_bytes} does not divide chunk size {}",
+                volume.chunk_size
+            ),
+        ));
+    }
+    Ok(volume.chunk_size / block_bytes)
+}
+
+/// Number of `block_bytes` blocks in `volume`, including a short final one.
+pub fn block_count(volume: &Volume, block_bytes: u64) -> u64 {
+    volume.size_bytes.div_ceil(block_bytes)
 }
 
 /// A chunk of zeros is a hole and is left out of manifests.
@@ -271,33 +339,47 @@ pub trait SessionDisk: Send + Sync {
 
     async fn capacity(&self) -> io::Result<Capacity>;
 
-    /// Ascending indices of the chunks that differ between two snapshots
-    /// of one origin. The default reads both in full and is the oracle a
+    /// Ascending indices of the `block_bytes`-sized blocks that differ
+    /// between two snapshots of one origin; `block_bytes` divides the
+    /// chunk size. The default reads both in full and is the oracle a
     /// metadata-based override is tested against.
-    async fn dirty_chunks(&self, before: &Volume, after: &Volume) -> io::Result<Vec<ChunkIndex>> {
-        let chunk_count = before.chunk_count();
-        if chunk_count != after.chunk_count() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "dirty_chunks: {} has {chunk_count} chunks but {} has {}; \
-                     both must be snapshots of one origin",
-                    before.name,
-                    after.name,
-                    after.chunk_count()
-                ),
-            ));
-        }
-
+    async fn dirty_blocks(
+        &self,
+        before: &Volume,
+        after: &Volume,
+        block_bytes: u64,
+    ) -> io::Result<Vec<u64>> {
+        same_origin(before, after)?;
+        let blocks_per_chunk = blocks_per_chunk(before, block_bytes)?;
         let mut dirty = Vec::new();
-        for index in (0..chunk_count).map(ChunkIndex) {
+        for index in (0..before.chunk_count()).map(ChunkIndex) {
             let (before_chunk, after_chunk) =
                 tokio::try_join!(before.read_chunk(index), after.read_chunk(index))?;
-            if before_chunk != after_chunk {
-                dirty.push(index);
+            let first = index.0 * blocks_per_chunk;
+            let blocks = before_chunk
+                .chunks(block_bytes as usize)
+                .zip(after_chunk.chunks(block_bytes as usize));
+            for (i, (b, a)) in blocks.enumerate() {
+                if b != a {
+                    dirty.push(first + i as u64);
+                }
             }
         }
         Ok(dirty)
+    }
+
+    /// Ascending indices of the chunks that differ between two snapshots
+    /// of one origin.
+    async fn dirty_chunks(&self, before: &Volume, after: &Volume) -> io::Result<Vec<ChunkIndex>> {
+        let chunk_size = before.chunk_size;
+        let mut chunks: Vec<ChunkIndex> = self
+            .dirty_blocks(before, after, chunk_size)
+            .await?
+            .into_iter()
+            .map(ChunkIndex)
+            .collect();
+        chunks.dedup();
+        Ok(chunks)
     }
 }
 

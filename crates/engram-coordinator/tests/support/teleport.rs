@@ -274,7 +274,8 @@ impl HostClient for ScriptedHost {
             disk_drain_ms: 0,
             vmstate_ms: 0,
             scan_ms: 0,
-            sealed_disk_chunks: 1,
+            sealed_disk_blocks: 1,
+            precopy_disk_blocks: 0,
             paused_at_unix_ms: 0,
         })
     }

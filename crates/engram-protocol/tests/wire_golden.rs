@@ -439,18 +439,20 @@ fn migration_item_indices_stay_fixed() {
     for (item, index) in [
         (MigrationItem::StateBin, 0),
         (MigrationItem::DiskSealInfo(DiskRole::Root), 1),
-        (MigrationItem::DiskChunkAt(DiskRole::Root, 9), 2),
+        (MigrationItem::DiskBlockAt(DiskRole::Root, 9), 2),
         (MigrationItem::HotHint, 3),
+        (MigrationItem::DiskPrecopyInfo(DiskRole::Root), 4),
     ] {
         // Exhaustive guard: every new kind needs an explicit wire pin.
         let kind = match item {
             MigrationItem::StateBin => Kind::StateBin,
             MigrationItem::DiskSealInfo(_) => Kind::DiskSealInfo,
-            MigrationItem::DiskChunkAt(_, _) => Kind::DiskChunkAt,
+            MigrationItem::DiskBlockAt(_, _) => Kind::DiskBlockAt,
             MigrationItem::HotHint => Kind::HotHint,
+            MigrationItem::DiskPrecopyInfo(_) => Kind::DiskPrecopyInfo,
         };
         assert_variant_index(&item, index, "MigrationItem");
-        assert_eq!(kind as i32, [1, 4, 5, 6][index as usize]);
+        assert_eq!(kind as i32, [1, 4, 7, 6, 8][index as usize]);
         let bytes = bincode::serialize(&item).unwrap();
         assert_eq!(bincode::deserialize::<MigrationItem>(&bytes).unwrap(), item);
     }
@@ -697,8 +699,11 @@ fn wire_version_pinned() {
     // MigrationItem appends HotHint (bincode 3, protobuf 6). Existing item
     // indices stay fixed; the optional hint is separate from immutable disk seals.
     // Existing goldens embed neither payload and keep their bytes.
+    // 37 -> 38: MigrationItem::DiskBlockAt replaces DiskChunkAt at bincode
+    // index 2 (protobuf 7) and DiskPrecopyInfo is appended (bincode 4,
+    // protobuf 8); the capture reports block counts. No golden embeds either.
     assert_eq!(
-        WIRE_VERSION, 37,
+        WIRE_VERSION, 38,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

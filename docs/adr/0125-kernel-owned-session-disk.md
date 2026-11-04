@@ -313,10 +313,18 @@ artifacts, now the checkpoint snapshot instead of a frozen dirty file.
 starts; nothing is faulted lazily from the chunk store on the disk path.
 The memory path keeps its lazy base (ADR 0092).
 
-**Teleport (ADR 0123).** The source takes a checkpoint and publishes a
-manifest; the target resumes from it. The chunk-level protocol is
-unchanged, so a source on an NBD-era host and a target on a thin-pool
-host interoperate during rollout.
+**Teleport (ADR 0123).** A live move carries the disk in three tiers.
+The target stages the checkpoint the source advertises at presetup. The
+presetup also takes a snapshot of each live volume while the guest runs
+and lists the 64 KiB blocks it changed since that checkpoint; the target
+pulls those while the guest still runs. The capture takes a second
+snapshot under the pause and seals only the blocks that changed since
+the presetup's snapshot; the target pulls those, then loads the VM
+state. The pause therefore carries what the guest wrote during the
+precopy, not since its last checkpoint. The block list and the block
+bytes travel over `MigrationFetch`; a block both tiers list is served
+from the newer snapshot. The move block is 64 KiB, the pool's block
+size, so the pool's block size must divide it.
 
 **Destroy.** Delete the volumes. A volume that is still open by a
 Firecracker process cannot be deleted; the host-agent kills the process
@@ -623,6 +631,13 @@ thin-pool host and the reverse.
 - **A released session keeps its newest checkpoint volume.** The
   volume stays until the pool needs the space, so the same-host resume
   that placement prefers is a snapshot, not a stage.
+- **A live move carries the disk in three tiers, in 64 KiB blocks.**
+  The plan moved the disk by checkpoint, with every change since the
+  last one sealed under the pause and pulled at the 16 MiB chunk size.
+  That made the pause a function of how long the session had run since
+  its checkpoint. The presetup now snapshots the live volume while the
+  guest runs and the target pulls that delta first; the capture seals
+  only what changed since, at the pool's block size.
 - **The DST oracle no longer models disk capacity.** The simulator's
   pick mirrors the Postgres in-transaction pick, which gates on RAM and
   CPU; the pool floor is a coordinator-side candidate filter, like the

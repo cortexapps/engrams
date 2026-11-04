@@ -425,12 +425,12 @@ impl HostService for HostServiceImpl {
                     Ok(Kind::DiskSealInfo) => Ok(
                         engram_core::types::snapshot::MigrationItem::DiskSealInfo(role),
                     ),
-                    Ok(Kind::DiskChunkAt) => {
-                        Ok(engram_core::types::snapshot::MigrationItem::DiskChunkAt(
-                            role,
-                            item.chunk_idx,
-                        ))
+                    Ok(Kind::DiskPrecopyInfo) => {
+                        Ok(engram_core::types::snapshot::MigrationItem::DiskPrecopyInfo(role))
                     }
+                    Ok(Kind::DiskBlockAt) => Ok(
+                        engram_core::types::snapshot::MigrationItem::DiskBlockAt(role, item.index),
+                    ),
                     Ok(Kind::Unspecified) | Err(_) => {
                         Err(Status::invalid_argument("unknown migration item kind"))
                     }
@@ -593,7 +593,8 @@ impl HostService for HostServiceImpl {
             pause_ms: out.pause_ms,
             disk_drain_ms: out.disk_drain_ms,
             vmstate_ms: out.vmstate_ms,
-            sealed_disk_chunks: out.sealed_disk_chunks,
+            sealed_disk_blocks: out.sealed_disk_blocks,
+            precopy_disk_blocks: out.precopy_disk_blocks,
             paused_at_unix_ms: out.paused_at_unix_ms,
         }))
     }
@@ -1840,7 +1841,7 @@ mod wire_version_tests {
             items: vec![engram_protocol::grpc::MigrationItem {
                 role: 0,
                 kind: engram_protocol::grpc::migration_item::Kind::StateBin as i32,
-                chunk_idx: 0,
+                index: 0,
             }],
         });
         req.metadata_mut().insert(
@@ -1863,13 +1864,13 @@ mod wire_version_tests {
         let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
         let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
         let service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
-        for kind in [0, 2, 3] {
+        for kind in [0, 2, 3, 5] {
             let mut req = Request::new(MigrationFetchRequest {
                 export_id: "absent-export".into(),
                 items: vec![engram_protocol::grpc::MigrationItem {
                     role: 0,
                     kind,
-                    chunk_idx: 0,
+                    index: 0,
                 }],
             });
             req.metadata_mut().insert(

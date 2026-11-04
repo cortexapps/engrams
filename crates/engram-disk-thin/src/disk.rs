@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::dm;
 use crate::parse::{self, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
-use engram_host_core::disk::{Capacity, ChunkIndex, SessionDisk, Volume, VolumeName};
+use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
 
 const SECTOR_BYTES: u64 = 512;
 /// dm-thin device ids are 24 bits wide.
@@ -319,32 +319,39 @@ impl SessionDisk for ThinPoolDisk {
         })
     }
 
-    /// Reads the pool's mapping tree instead of the volumes. A chunk is
-    /// dirty when any pool block inside it differs.
-    async fn dirty_chunks(&self, before: &Volume, after: &Volume) -> io::Result<Vec<ChunkIndex>> {
-        let ((left, left_sectors), (right, right_sectors)) = (
-            self.thin_of(&before.name).await?,
-            self.thin_of(&after.name).await?,
-        );
-        if left_sectors != right_sectors {
+    /// Reads the pool's mapping tree instead of the volumes. A block is
+    /// dirty when any pool block inside it differs; `block_bytes` is a
+    /// multiple of the pool's block size.
+    async fn dirty_blocks(
+        &self,
+        before: &Volume,
+        after: &Volume,
+        block_bytes: u64,
+    ) -> io::Result<Vec<u64>> {
+        engram_host_core::disk::same_origin(before, after)?;
+        engram_host_core::disk::blocks_per_chunk(before, block_bytes)?;
+        if !block_bytes.is_multiple_of(self.block_bytes) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "dirty_chunks: {} and {} differ in size; both must be snapshots of one origin",
-                    before.name, after.name
+                    "block size {block_bytes} is not a multiple of the pool's {} bytes",
+                    self.block_bytes
                 ),
             ));
         }
-        let blocks = self
+        let (left, _) = self.thin_of(&before.name).await?;
+        let (right, _) = self.thin_of(&after.name).await?;
+        let pool_blocks = self
             .with_metadata_snap(dm::thin_delta(&self.metadata_path, left.id, right.id))
             .await?;
-        let blocks_per_chunk = self.chunk_size / self.block_bytes;
-        let mut chunks: Vec<ChunkIndex> = blocks
+        let per_block = block_bytes / self.block_bytes;
+        let count = engram_host_core::disk::block_count(before, block_bytes);
+        let mut blocks: Vec<u64> = pool_blocks
             .into_iter()
-            .map(|block| ChunkIndex(block / blocks_per_chunk))
-            .filter(|chunk| chunk.0 < before.chunk_count())
+            .map(|block| block / per_block)
+            .filter(|block| *block < count)
             .collect();
-        chunks.dedup();
-        Ok(chunks)
+        blocks.dedup();
+        Ok(blocks)
     }
 }

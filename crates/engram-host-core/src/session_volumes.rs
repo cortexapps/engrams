@@ -30,13 +30,14 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
-use crate::disk::{Capacity, ChunkIndex, SessionDisk, Volume, VolumeName};
+use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
 use crate::disk_flows::{checkpoint_split, stage};
 use crate::image_volumes;
 
 const LIVE_PREFIX: &str = "sb-";
 const TRANSIENT_PREFIX: &str = "tmp-sb-";
 const CHECKPOINT_INFIX: &str = "-ckpt-";
+const PRECOPY_SUFFIX: &str = "-pre";
 
 /// What a volume name says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,17 @@ fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     .expect("a transient volume name is 44 bytes of [a-z0-9-]")
 }
 
+/// The snapshot a live move takes while the guest runs; it lives
+/// beside the transient one the capture takes under the pause.
+fn precopy_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
+    VolumeName::new(format!(
+        "{TRANSIENT_PREFIX}{}-{}{PRECOPY_SUFFIX}",
+        sandbox.as_uuid().simple(),
+        role
+    ))
+    .expect("a precopy volume name is 48 bytes of [a-z0-9-]")
+}
+
 /// What `name` says; `None` for a volume that is not a session's.
 pub fn parse(name: &VolumeName) -> Option<Parsed> {
     let (rest, transient) = match name.as_str().strip_prefix(TRANSIENT_PREFIX) {
@@ -104,6 +116,10 @@ pub fn parse(name: &VolumeName) -> Option<Parsed> {
     let (role, rest) = match rest.split_once(CHECKPOINT_INFIX) {
         Some((role, manifest)) => (role, Some(manifest)),
         None => (rest, None),
+    };
+    let role = match (transient, role.strip_suffix(PRECOPY_SUFFIX)) {
+        (true, Some(role)) => role,
+        _ => role,
     };
     let role: DiskRole = role.parse().ok()?;
     let kind = match (transient, rest) {
@@ -455,9 +471,36 @@ impl SessionVolumes {
         })
     }
 
-    /// Ascending indices of the chunks the pending snapshot changed
-    /// since the sandbox's checkpoint: what a live move has to carry.
-    pub async fn changed(&self, pending: &PendingCheckpoint) -> io::Result<Vec<ChunkIndex>> {
+    /// A snapshot of the live volume while the guest runs, for a live
+    /// move to carry before the pause. It is independent of the
+    /// transient snapshot [`Self::take`] makes, so the capture can take
+    /// its own beside it. A precopy left by an earlier move is replaced.
+    pub async fn take_precopy(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<PendingCheckpoint> {
+        let previous = self.checkpoint_of(sandbox, role).await?;
+        let name = precopy_name(sandbox, role);
+        self.delete_if_present(&name).await?;
+        let live = self.live(sandbox, role).await?;
+        let snapshot = checkpoint_split::take(self.disk.as_ref(), &live, &name).await?;
+        Ok(PendingCheckpoint {
+            sandbox,
+            role,
+            snapshot,
+            previous,
+        })
+    }
+
+    /// Ascending indices of the `block_bytes` blocks the pending
+    /// snapshot changed since the sandbox's checkpoint: what a live
+    /// move carries before the pause.
+    pub async fn changed_blocks(
+        &self,
+        pending: &PendingCheckpoint,
+        block_bytes: u64,
+    ) -> io::Result<Vec<u64>> {
         let previous = self
             .disk
             .open(&checkpoint_name(
@@ -466,7 +509,23 @@ impl SessionVolumes {
                 pending.previous,
             ))
             .await?;
-        self.disk.dirty_chunks(&previous, &pending.snapshot).await
+        self.disk
+            .dirty_blocks(&previous, &pending.snapshot, block_bytes)
+            .await
+    }
+
+    /// Ascending indices of the `block_bytes` blocks that differ between
+    /// two pending snapshots of one volume: what a live move carries
+    /// under the pause, after the earlier snapshot went ahead.
+    pub async fn changed_since(
+        &self,
+        earlier: &PendingCheckpoint,
+        later: &PendingCheckpoint,
+        block_bytes: u64,
+    ) -> io::Result<Vec<u64>> {
+        self.disk
+            .dirty_blocks(&earlier.snapshot, &later.snapshot, block_bytes)
+            .await
     }
 
     /// Outside the pause: upload what changed since the last checkpoint,
@@ -695,7 +754,7 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
 
     use super::*;
-    use crate::disk::FileDisk;
+    use crate::disk::{ChunkIndex, FileDisk};
     use crate::disk_flows::checkpoint;
     use crate::test_support::CountingBlob;
 
@@ -830,6 +889,18 @@ mod tests {
             .unwrap();
     }
 
+    /// Fill half `half` (0 or 1) of `chunk` with `byte`.
+    async fn write_half(path: &std::path::Path, chunk: u64, half: u64, byte: u8) {
+        let size = std::fs::metadata(path).unwrap().len();
+        let v = Volume::open(VolumeName::new("probe").unwrap(), path, size, CHUNK).unwrap();
+        v.write_range(
+            chunk * CHUNK + half * CHUNK / 2,
+            vec![byte; (CHUNK / 2) as usize],
+        )
+        .await
+        .unwrap();
+    }
+
     async fn names(r: &Rig) -> Vec<String> {
         let mut names: Vec<String> = r
             .disk
@@ -880,14 +951,19 @@ mod tests {
                 kind: Kind::Checkpoint(manifest)
             })
         );
-        assert_eq!(
-            parse(&transient_name(sandbox, DiskRole::Root)),
-            Some(Parsed {
-                sandbox,
-                role: DiskRole::Root,
-                kind: Kind::Transient
-            })
-        );
+        for name in [
+            transient_name(sandbox, DiskRole::Root),
+            precopy_name(sandbox, DiskRole::Root),
+        ] {
+            assert_eq!(
+                parse(&name),
+                Some(Parsed {
+                    sandbox,
+                    role: DiskRole::Root,
+                    kind: Kind::Transient
+                })
+            );
+        }
         assert_eq!(parse(&image_volumes::volume_name(manifest)), None);
         assert_eq!(parse(&VolumeName::new("sb-nothex-root").unwrap()), None);
         assert_eq!(
@@ -1236,6 +1312,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_precopy_snapshot_lives_beside_the_one_the_capture_takes() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 3, 4]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let half = CHUNK / 2;
+
+        // The move starts: the guest has changed the second half of chunk 1.
+        write_half(&p.root, 1, 1, 9).await;
+        let precopy = r
+            .volumes
+            .take_precopy(sandbox, DiskRole::Root)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.volumes.changed_blocks(&precopy, half).await.unwrap(),
+            vec![3]
+        );
+
+        // The guest runs on and changes chunk 3; the capture's snapshot
+        // sees only that, and both snapshots stay readable.
+        write_half(&p.root, 3, 0, 7).await;
+        let sealed = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        assert_eq!(
+            r.volumes
+                .changed_since(&precopy, &sealed, half)
+                .await
+                .unwrap(),
+            vec![6]
+        );
+        assert_eq!(
+            precopy.snapshot().read_range(3 * CHUNK, 1).await.unwrap(),
+            vec![4]
+        );
+        assert_eq!(
+            sealed.snapshot().read_range(3 * CHUNK, 1).await.unwrap(),
+            vec![7]
+        );
+
+        // A second move replaces the precopy; the capture's snapshot is untouched.
+        let again = r
+            .volumes
+            .take_precopy(sandbox, DiskRole::Root)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.snapshot().read_range(3 * CHUNK, 1).await.unwrap(),
+            vec![7]
+        );
+        r.volumes.pending(sandbox, DiskRole::Root).await.unwrap();
+        r.volumes.discard(again).await.unwrap();
+        r.volumes.discard(sealed).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_pending_checkpoint_is_found_by_name_and_says_what_changed() {
         let r = rig();
         let image = staged_image(&r, &[1, 2, 3]).await;
@@ -1264,8 +1406,8 @@ mod tests {
         write_byte(&p.root, 2, 9).await;
         let taken = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
         assert_eq!(
-            r.volumes.changed(&taken).await.unwrap(),
-            vec![ChunkIndex(2)]
+            r.volumes.changed_blocks(&taken, CHUNK).await.unwrap(),
+            vec![2]
         );
         assert_eq!(
             taken.snapshot().read_chunk(ChunkIndex(2)).await.unwrap()[0],

@@ -24,7 +24,7 @@ use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::DiskRole;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_host_core::disk::{Capacity, ChunkIndex, SessionDisk, Volume, VolumeName};
+use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
 use engram_host_core::SessionVolumes;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
@@ -268,12 +268,13 @@ impl SessionDisk for CountingDisk {
     async fn capacity(&self) -> std::io::Result<Capacity> {
         self.inner.capacity().await
     }
-    async fn dirty_chunks(
+    async fn dirty_blocks(
         &self,
         before: &Volume,
         after: &Volume,
-    ) -> std::io::Result<Vec<ChunkIndex>> {
-        self.inner.dirty_chunks(before, after).await
+        block_bytes: u64,
+    ) -> std::io::Result<Vec<u64>> {
+        self.inner.dirty_blocks(before, after, block_bytes).await
     }
 }
 

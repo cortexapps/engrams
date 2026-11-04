@@ -171,7 +171,11 @@ use serde::{Deserialize, Serialize};
 // the Dead budget instead of recovering from disk.
 // v36 gates page-channel v6 fault windows for a lockstep host roll.
 // v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
-pub const WIRE_VERSION: u32 = 37;
+// v38 moves disk changes in 64 KiB blocks and carries the presetup's
+// snapshot before the pause: MigrationItem::DiskBlockAt replaces
+// DiskChunkAt at the same index, DiskPrecopyInfo is appended, and the
+// capture reports sealed and precopy block counts.
+pub const WIRE_VERSION: u32 = 38;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

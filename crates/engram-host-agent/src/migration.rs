@@ -60,10 +60,18 @@ pub struct MigrationExport {
     pub sandbox_id: SandboxId,
     /// Holds state.bin + the (patched) sidecar manifest.json.
     pub snapshot_dir: PathBuf,
-    /// The disk checkpoints sealed under the pause, served by index over
-    /// `MigrationFetch::DiskChunkAt`; discarded on abort, released with
+    /// The disk snapshots under the pause and the blocks they changed
+    /// since the presetup's snapshots, served over
+    /// `MigrationFetch::DiskBlockAt`; discarded on abort, released with
     /// the sandbox on commit.
     pub disk_seal: std::collections::BTreeMap<
+        engram_core::types::snapshot::DiskRole,
+        Arc<crate::pooled_backend::DiskSeal>,
+    >,
+    /// The presetup's disk snapshots, taken while the guest ran, and the
+    /// blocks they changed since the advertised checkpoints. The dest
+    /// pulls these before the pause.
+    pub precopy: std::collections::BTreeMap<
         engram_core::types::snapshot::DiskRole,
         Arc<crate::pooled_backend::DiskSeal>,
     >,
@@ -334,7 +342,7 @@ pub fn reattach_source_verdict(
 }
 
 /// Constant-time string compare (export_id nonces).
-fn constant_time_str_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -414,6 +422,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: clock.clone(),
             state_served: Arc::new(AtomicBool::new(false)),
             last_activity: last_activity.clone(),
@@ -485,6 +494,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -505,6 +515,7 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -531,6 +542,7 @@ mod tests {
             sandbox_id,
             snapshot_dir: "/tmp".into(),
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
