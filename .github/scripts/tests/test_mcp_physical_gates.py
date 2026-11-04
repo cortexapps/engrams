@@ -24,6 +24,49 @@ SPEC.loader.exec_module(assets)
 
 
 class PhysicalGates(unittest.TestCase):
+    def test_guard_apt_retries_are_bounded_and_failed_update_blocks_install(self):
+        source = (ROOT / 'tests/fixtures/mcp-stack/platform/guard.Dockerfile').read_text()
+        commands = source.split('> /etc/apt/sources.list; \\\n', 1)[1].split(
+            '    rm -rf /var/lib/apt/lists/', 1)[0].replace('\\\n', '')
+        shell = 'set -eu;\n' + commands
+        subprocess.run(['/bin/sh', '-n'], input=shell, text=True, check=True)
+        cases = [(0, 0, 0, 1, 1), (2, 1, 0, 3, 2), (3, 3, 0, 4, 4),
+                 (4, 0, 1, 4, 0), (0, 4, 1, 1, 4)]
+        for update_failures, install_failures, failed, updates, installs in cases:
+            with self.subTest(update_failures=update_failures, install_failures=install_failures):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    log = root / 'calls.json'
+                    stub = root / 'apt-get'
+                    stub.write_text(f'#!{sys.executable} -I\n' +
+                                    'import json, os, sys\n'
+                                    'from pathlib import Path\n'
+                                    'log = Path(os.environ["APT_STUB_LOG"])\n'
+                                    'calls = json.loads(log.read_text()) if log.exists() else []\n'
+                                    'args = sys.argv[1:]\n'
+                                    'operation = "update" if "update" in args else "install"\n'
+                                    'calls.append({"operation": operation, "args": args})\n'
+                                    'log.write_text(json.dumps(calls))\n'
+                                    'attempt = sum(c["operation"] == operation for c in calls)\n'
+                                    'sys.exit(100 if attempt <= int(os.environ[operation.upper() + "_FAILURES"]) else 0)\n')
+                    stub.chmod(0o700)
+                    result = subprocess.run(['/bin/sh', '-c', shell], capture_output=True,
+                                            text=True, timeout=5, env={
+                                                'PATH': directory, 'APT_STUB_LOG': str(log),
+                                                'UPDATE_FAILURES': str(update_failures),
+                                                'INSTALL_FAILURES': str(install_failures),
+                                            })
+                    self.assertEqual(result.returncode != 0, bool(failed), result.stderr)
+                    calls = json.loads(log.read_text())
+                    self.assertEqual([call['operation'] for call in calls],
+                                     ['update'] * updates + ['install'] * installs)
+                    for call in calls:
+                        args = call['args']
+                        self.assertEqual(args[:4], ['-o', 'Acquire::Retries=0',
+                                                   '-o', 'Acquire::http::Timeout=30'])
+                        if call['operation'] == 'update':
+                            self.assertEqual(args[4:], ['--error-on=any', 'update'])
+
     def test_source_context_rejects_secrets(self):
         assets.source_paths(['docker/host-agent.Dockerfile', '.env.example', 'orchestrator/src/index.ts'])
         for path in ['.env', 'orchestrator/.env.local', 'var/key', '.git/config', '.superpowers/private',

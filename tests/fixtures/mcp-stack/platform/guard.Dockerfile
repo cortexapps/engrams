@@ -1,6 +1,8 @@
 FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 ARG SOURCE_COMMIT
 LABEL org.opencontainers.image.revision=${SOURCE_COMMIT}
+# Retry whole commands to avoid the APT retry-queue memory bug.
+# https://bugs.debian.org/1152704
 RUN set -eu; \
     test "${#SOURCE_COMMIT}" = 40; \
     case "$SOURCE_COMMIT" in *[!a-f0-9]*) exit 2 ;; esac; \
@@ -9,8 +11,14 @@ RUN set -eu; \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20261102T000000Z trixie main' \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20261102T000000Z trixie-security main' \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 --error-on=any update; \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+    apt_retry() { \
+        for attempt in 1 2 3 4; do \
+            if apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 "$@"; then return 0; fi; \
+        done; \
+        return 1; \
+    }; \
+    apt_retry --error-on=any update; \
+    apt_retry install -y --no-install-recommends \
       bash coreutils findutils ca-certificates nftables bind9-dnsutils \
       netcat-openbsd curl skopeo squashfs-tools iproute2 openssl; \
     rm -rf /var/lib/apt/lists/*; \
