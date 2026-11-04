@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { chmod, mkdtemp, writeFile, symlink, rm } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, symlink, rm, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { createServer } from "node:https";
+import { X509Certificate } from "node:crypto";
 import {
   ContextSchema,
   privateFile,
@@ -14,14 +16,14 @@ import {
   verifyResults,
   type CaseResult,
 } from "./manifest.ts";
-import { credentialHeaders } from "./transport.ts";
+import { credentialHeaders, publicClient } from "./transport.ts";
 import { modelToolName } from "./bootstrap.ts";
 import { StatusSchema } from "./supervisor.ts";
 import { Evidence } from "./evidence.ts";
 import { requirePrerequisites } from "./preflight.ts";
 import { safeFailure, validateDrivers } from "./runner.ts";
 import { drivers } from "./run.ts";
-import { isProofFilename } from "./guest.ts";
+import { isProofFilename, readGuestFile } from "./guest.ts";
 import { parseArgs } from "./cli.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -665,4 +667,158 @@ test("only an exact ordered present-to-absent pair can reuse a native call ID", 
     [present, absent, { ...absent, marker: "third" }],
   ])
     expect(() => encodeCallPlan({ steps })).toThrow();
+});
+
+test("guest proof reads use authenticated downloads with bounded verified bytes", async () => {
+  const keyPath = join(root, "download.key");
+  const certPath = join(root, "download.pem");
+  const certificate = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "subjectAltName=DNS:localhost",
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  expect(await certificate.exited).toBe(0);
+  await chmod(certPath, 0o600);
+  const cert = await readFile(certPath);
+  const bytes = Buffer.from('{"callId":"proof"}\n');
+  const requests: { url: string; cookie?: string; apiKey?: string; origin?: string }[] = [];
+  let status = 200;
+  let body = bytes;
+  let size = String(body.length);
+  let hash = sha256(body);
+  let stall = false;
+  let chunked = false;
+  const server = createServer({ key: await readFile(keyPath), cert }, (req, res) => {
+    requests.push({
+      url: req.url ?? "",
+      cookie: req.headers.cookie,
+      apiKey: req.headers["x-api-key"]?.toString(),
+      origin: req.headers.origin,
+    });
+    if (stall) return;
+    res.writeHead(status, {
+      "content-type": "application/octet-stream",
+      ...(chunked ? {} : { "content-length": size }),
+      "x-content-sha256": hash,
+      ...(status === 302 ? { location: "/redirect-target" } : {}),
+    });
+    res.end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server_address");
+    const ctx = ContextSchema.parse(validContext());
+    ctx.runRoot = root;
+    ctx.endpoints.app = {
+      origin: `https://localhost:${address.port}`,
+      ca: { path: certPath, sha256: sha256(cert) },
+      serverFingerprint: new X509Certificate(cert).fingerprint256,
+    };
+    ctx.deadlines.requestMs = 2000;
+    const path = ctx.guest.stateDirectory + "/proof.json";
+    for (const credential of [
+      { kind: "cookie" as const, value: "fixture_session=owner" },
+      { kind: "api-key" as const, value: "engk_owner" },
+    ]) {
+      const client = await publicClient(ctx, credential);
+      expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(bytes);
+      expect(requests.at(-1)).toEqual({
+        url: "/api/v1/sessions/owned-session/files?path=%2Ftmp%2Fmcp-stack-fixture%2Fproof.json",
+        cookie: credential.kind === "cookie" ? credential.value : undefined,
+        apiKey: credential.kind === "api-key" ? credential.value : undefined,
+        origin: ctx.endpoints.app.origin,
+      });
+    }
+    const client = await publicClient(ctx, { kind: "cookie", value: "fixture_session=owner" });
+    for (const invalid of [
+      "../proof",
+      path + "/child",
+      ctx.guest.stateDirectory + "/..",
+      path + "?x=1",
+      path + ";id",
+      path + "\n",
+    ]) {
+      const before = requests.length;
+      await expect(readGuestFile(ctx, client, "owned-session", invalid)).rejects.toThrow(
+        "guest_proof_path",
+      );
+      expect(requests.length).toBe(before);
+    }
+    for (const denied of [401, 403, 404, 302]) {
+      status = denied;
+      const before = requests.length;
+      await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+        "guest_file_status",
+      );
+      expect(requests.length).toBe(before + 1);
+    }
+    status = 200;
+    const pin = ctx.endpoints.app.serverFingerprint;
+    ctx.endpoints.app.serverFingerprint = Array(32).fill("00").join(":");
+    const beforeBadPin = requests.length;
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_download",
+    );
+    expect(requests.length).toBe(beforeBadPin);
+    ctx.endpoints.app.serverFingerprint = pin;
+    size = String(bytes.length + 1);
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_download",
+    );
+    size = String(bytes.length);
+    hash = "invalid";
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_metadata",
+    );
+    hash = "0".repeat(64);
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_integrity",
+    );
+    hash = sha256(bytes);
+    size = String(1024 * 1024 + 1);
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_metadata",
+    );
+    chunked = true;
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_metadata",
+    );
+    chunked = false;
+    body = Buffer.alloc(1024 * 1024, 65);
+    hash = sha256(body);
+    size = String(body.length);
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(body);
+    body = Buffer.alloc(0);
+    hash = sha256(body);
+    size = "0";
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(body);
+    ctx.deadlines.requestMs = 50;
+    stall = true;
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
+      "guest_file_download",
+    );
+    expect(requests.every((request) => request.url.startsWith("/api/v1/sessions/"))).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });

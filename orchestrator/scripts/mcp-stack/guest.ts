@@ -28,44 +28,16 @@ export async function readGuestFile(
   sessionId: string,
   path: string,
 ) {
+  const name = path.slice(ctx.guest.stateDirectory.length + 1);
   requireThat(
     path.startsWith(ctx.guest.stateDirectory + "/") &&
-      /^[A-Za-z0-9_.-]+$/.test(path.slice(ctx.guest.stateDirectory.length + 1)),
+      name.length > 0 &&
+      !/[^A-Za-z0-9_.-]/.test(name) &&
+      name !== "." &&
+      name !== "..",
     "guest_proof_path",
   );
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  let expected: { size: bigint; hash: string } | undefined;
-  for await (const response of client.sessions.readFile(
-    { sessionId, path },
-    { timeoutMs: ctx.deadlines.requestMs },
-  )) {
-    if (response.frame.case === "metadata") {
-      requireThat(
-        !expected &&
-          response.frame.value.path === path &&
-          response.frame.value.sizeBytes <= 1024n * 1024n,
-        "guest_file_metadata",
-      );
-      expected = {
-        size: response.frame.value.sizeBytes,
-        hash: response.frame.value.sha256,
-      };
-    } else if (response.frame.case === "chunk") {
-      requireThat(expected, "guest_metadata_first");
-      bytes += response.frame.value.length;
-      requireThat(bytes <= 1024 * 1024, "guest_proof_size");
-      chunks.push(response.frame.value);
-    } else throw new RunnerFailure("ASSERTION_FAILED", "guest_file_frame");
-  }
-  const value = Buffer.concat(chunks);
-  requireThat(
-    expected &&
-      BigInt(value.length) === expected.size &&
-      sha256(value) === expected.hash,
-    "guest_file_integrity",
-  );
-  return value;
+  return await client.downloadGuestProofFile(sessionId, path);
 }
 
 export const NativeProofSchema = z

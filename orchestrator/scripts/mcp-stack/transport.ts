@@ -21,6 +21,8 @@ import { ImageService } from "../../src/gen/engram/app/v1/image_pb.ts";
 import { OperatorPublicationService } from "../../src/gen/engram/mcp/v1/operator_pb.ts";
 import {
   privateFile,
+  requireThat,
+  sha256,
   RunnerFailure,
   type Context,
   type Endpoint,
@@ -84,6 +86,8 @@ export async function publicClient(ctx: Context, credential: Credential) {
     useBinaryFormat: true,
   });
   return {
+    downloadGuestProofFile: (sessionId: string, path: string) =>
+      downloadGuestProofFile(ctx, headers, sessionId, path),
     identity: createClient(ApiKeyService, transport),
     automations: createClient(AutomationService, transport),
     automationRuns: createClient(AutomationRunService, transport),
@@ -116,6 +120,71 @@ export async function operatorClient(ctx: Context) {
       idleConnectionTimeoutMs: 1000,
     }),
   );
+}
+
+/** Read the owner-gated file route with the same credentials and TLS pin as RPC. */
+async function downloadGuestProofFile(
+  ctx: Context,
+  headers: Record<string, string>,
+  sessionId: string,
+  path: string,
+): Promise<Buffer> {
+  const tls = await tlsOptions(ctx, ctx.endpoints.app);
+  const route = `/api/v1/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(path)}`;
+  return await new Promise<Buffer>((resolve, reject) => {
+    const fail = (detail = "guest_file_download") => {
+      clearTimeout(timer);
+      reject(new RunnerFailure("TRANSPORT_FAILED", detail));
+      req.destroy();
+    };
+    const req = httpsRequest(
+      new URL(route, ctx.endpoints.app.origin),
+      {
+        ...tls,
+        method: "GET",
+        agent: false,
+        headers: { ...headers, origin: ctx.endpoints.app.origin },
+      },
+      (res) => {
+        if (res.statusCode !== 200) return fail("guest_file_status");
+        const size = res.headers["content-length"];
+        const hash = res.headers["x-content-sha256"];
+        if (
+          typeof size !== "string" ||
+          !/^[0-9]+$/.test(size) ||
+          BigInt(size) > 1024n * 1024n ||
+          typeof hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(hash)
+        )
+          return fail("guest_file_metadata");
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        res.on("data", (chunk: Buffer) => {
+          bytes += chunk.length;
+          if (bytes > 1024 * 1024) fail("guest_proof_size");
+          else chunks.push(chunk);
+        });
+        res.on("error", () => fail());
+        res.on("aborted", () => fail());
+        res.on("end", () => {
+          clearTimeout(timer);
+          const value = Buffer.concat(chunks);
+          try {
+            requireThat(
+              BigInt(value.length) === BigInt(size) && sha256(value) === hash,
+              "guest_file_integrity",
+            );
+            resolve(value);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    const timer = setTimeout(() => fail(), ctx.deadlines.requestMs);
+    req.on("error", () => fail());
+    req.end();
+  });
 }
 
 /** One bounded HTTPS request. Never follows a redirect or logs response bodies. */
