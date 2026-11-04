@@ -298,9 +298,13 @@ tens of milliseconds in all.
 durable `CheckpointRecord` are unchanged; only the disk capture
 primitive changes.
 
-**Evict.** A final checkpoint, then the VM is destroyed and every
-session volume is deleted (`dmsetup message delete`, which returns
-the volume's exclusive blocks to the pool's free space). The eviction finalize
+**Evict.** A final checkpoint, then the VM is destroyed and the
+session's live volume is deleted (`dmsetup message delete`, which
+returns the volume's exclusive blocks to the pool's free space). The
+newest checkpoint volume stays, so a resume on the same host (placement's
+tier-0 affinity) is a snapshot of it with no chunk fetched; the host
+purges kept checkpoints, oldest release first, when the pool's free
+space falls under twice the placement floor. The eviction finalize
 (`eviction_finalize.rs`) keeps its shape: a host-owned job over durable
 artifacts, now the checkpoint snapshot instead of a frozen dirty file.
 

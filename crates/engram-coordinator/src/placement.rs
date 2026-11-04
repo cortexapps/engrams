@@ -23,8 +23,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore, SessionFence};
 use engram_core::types::host::{
-    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_DATA_FLOOR_MIB,
-    HOST_POOL_METADATA_FLOOR_MIB,
+    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_METADATA_FLOOR_MIB,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId};
@@ -1118,30 +1117,8 @@ fn host_pool_floor_ok(h: &HostRecord) -> bool {
             && u.pool_metadata_free_mib >= HOST_POOL_METADATA_FLOOR_MIB)
 }
 
-/// `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` overrides the pool data floor for
-/// small dev rigs; it is a separate knob from the work_dir disk floor.
 fn host_pool_data_floor_mib() -> u64 {
-    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *FLOOR.get_or_init(|| {
-        floor_mib_from_env(
-            "ENGRAM_PLACEMENT_POOL_FLOOR_BYTES",
-            HOST_POOL_DATA_FLOOR_MIB,
-        )
-    })
-}
-
-/// A floor from `var` in bytes, as MiB, or `default_mib` when unset. A
-/// value that does not parse is a configuration error, not a default.
-fn floor_mib_from_env(var: &str, default_mib: u64) -> u64 {
-    match std::env::var(var) {
-        Ok(s) => {
-            let bytes: u64 = s
-                .parse()
-                .unwrap_or_else(|e| panic!("{var}={s:?} is not a byte count: {e}"));
-            bytes / (1024 * 1024)
-        }
-        Err(_) => default_mib,
-    }
+    engram_core::types::host::pool_data_floor_bytes() / (1024 * 1024)
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
@@ -1171,10 +1148,10 @@ fn host_disk_floor_ok(h: &HostRecord) -> bool {
 fn host_disk_cache_floor_mib() -> u64 {
     static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| {
-        floor_mib_from_env(
+        engram_core::types::host::floor_bytes_from_env(
             "ENGRAM_PLACEMENT_DISK_FLOOR_BYTES",
-            engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB,
-        )
+            engram_core::types::host::HOST_DISK_CACHE_FLOOR_BYTES,
+        ) / (1024 * 1024)
     })
 }
 
@@ -1272,7 +1249,9 @@ pub async fn fleet_snapshot(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use engram_core::types::host::{HostCapacity, HostMetadata, HostUtilization};
+    use engram_core::types::host::{
+        HostCapacity, HostMetadata, HostUtilization, HOST_POOL_DATA_FLOOR_MIB,
+    };
 
     fn host(id: u128) -> HostRecord {
         HostRecord {

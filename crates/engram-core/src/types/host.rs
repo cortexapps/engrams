@@ -121,6 +121,30 @@ pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 *
 pub const HOST_POOL_DATA_FLOOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const HOST_POOL_DATA_FLOOR_MIB: u64 = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
 
+/// The pool data floor in effect: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`,
+/// else [`HOST_POOL_DATA_FLOOR_BYTES`]. The coordinator places against
+/// it and a host reaps kept checkpoint volumes to stay above twice it.
+pub fn pool_data_floor_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        floor_bytes_from_env(
+            "ENGRAM_PLACEMENT_POOL_FLOOR_BYTES",
+            HOST_POOL_DATA_FLOOR_BYTES,
+        )
+    })
+}
+
+/// A byte count from `var`, or `default` when unset. A value that does
+/// not parse is a configuration error, not a default.
+pub fn floor_bytes_from_env(var: &str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|e| panic!("{var}={s:?} is not a byte count: {e}")),
+        Err(_) => default,
+    }
+}
+
 /// Placement stops choosing a host whose pool metadata has less space
 /// free than this. Metadata is sized so this never trips; the heartbeat
 /// reports it so an alert fires first.

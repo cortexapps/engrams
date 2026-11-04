@@ -222,6 +222,17 @@ the test named beside it.
   (`only_images_with_a_volume_on_disk_stay_ready`). A session volume is a snapshot of
   that image volume (`a_fork_of_a_published_manifest_starts_its_own_lineage`), so a create
   writes nothing.
+- A released sandbox keeps its newest checkpoint volume per role
+  (`release_keeps_the_newest_checkpoint_volume_of_each_role`). A resume on the same host
+  is a snapshot of it and fetches no chunk
+  (`a_resume_on_the_same_host_snapshots_the_kept_checkpoint`); a resume of a newer
+  manifest fetches only the delta
+  (`a_resume_of_a_newer_manifest_stages_the_delta_onto_the_kept_checkpoint`). The host
+  purges kept checkpoints, oldest release first, when the pool's free space falls under
+  twice the placement floor (`reap_purges_kept_sandboxes_oldest_first_until_the_floor_holds`).
+- A stage reads the node's chunk cache before blob storage
+  (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
+  prefetch pulled are not fetched a second time.
 - The host reports the pool's data and metadata free space every heartbeat
   (`capacity_falls_by_the_blocks_written`, `pool_capacity_round_trips_through_heartbeat`).
   Placement never chooses a node whose pool is below the floor

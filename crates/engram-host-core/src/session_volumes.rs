@@ -13,10 +13,16 @@
 //! name that lies. The manifest id in the name is the session's lineage
 //! and the next checkpoint publishes under it, so no caller tracks a
 //! manifest ref between calls.
+//!
+//! A released sandbox keeps its newest checkpoint volume per role, so a
+//! resume on this host is a snapshot of it instead of a stage from blob
+//! storage. [`SessionVolumes::reap`] deletes kept checkpoints, oldest
+//! release first, when the pool needs the space.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
@@ -185,17 +191,27 @@ impl PendingCheckpoint {
 pub struct Report {
     pub deleted: Vec<VolumeName>,
     pub failed: Vec<(VolumeName, io::Error)>,
+    /// Sandboxes that still have a checkpoint volume.
+    pub kept: Vec<SandboxId>,
 }
 
 /// The owner of every `sb-` volume on a host.
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
     store: ChunkStore,
+    /// Released sandboxes whose checkpoint volumes stay, oldest release
+    /// first. A sandbox `reconcile` finds with no live volume joins at
+    /// the front: its age is unknown, so it goes first.
+    kept: Mutex<VecDeque<SandboxId>>,
 }
 
 impl SessionVolumes {
     pub fn new(disk: Arc<dyn SessionDisk>, store: ChunkStore) -> Self {
-        Self { disk, store }
+        Self {
+            disk,
+            store,
+            kept: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub fn disk(&self) -> &dyn SessionDisk {
@@ -233,13 +249,16 @@ impl SessionVolumes {
         }
         .await;
         if provisioned.is_err() {
-            let _ = self.release(sandbox).await;
+            let _ = self.purge(sandbox).await;
         }
         provisioned
     }
 
     /// The checkpoint volume first, under the transient name until its
     /// manifest is in the store; then the live volume as its snapshot.
+    /// A `Continue` of the checkpoint this host kept skips the stage;
+    /// one of a newer manifest stages only the delta onto the kept
+    /// checkpoint.
     async fn provision_role(
         &self,
         sandbox: SandboxId,
@@ -248,7 +267,7 @@ impl SessionVolumes {
     ) -> io::Result<(PathBuf, ManifestRef)> {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
-        let lineage = match source {
+        let (checkpoint, lineage) = match source {
             Source::Fork { manifest, base } => {
                 let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
                 match self.staged(manifest).await {
@@ -260,13 +279,30 @@ impl SessionVolumes {
                     .put_manifest(lineage, &wanted)
                     .await
                     .map_err(store_err)?;
-                lineage
+                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
             }
-            Source::Continue { manifest, base } => {
-                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
-                self.stage_into(&tmp, &wanted, base).await?;
-                manifest
-            }
+            Source::Continue { manifest, base } => match self.kept(sandbox, role).await? {
+                Some((volume, _, held)) if held == manifest => (volume, manifest),
+                kept => {
+                    let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                    match kept {
+                        Some((volume, held_manifest, _))
+                            if volume.size_bytes == wanted.total_bytes =>
+                        {
+                            stage(
+                                self.disk.as_ref(),
+                                &self.store,
+                                &tmp,
+                                &wanted,
+                                Some((&volume, &held_manifest)),
+                            )
+                            .await?
+                        }
+                        _ => self.stage_into(&tmp, &wanted, base).await?,
+                    };
+                    (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
+                }
+            },
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
                 let lineage = ManifestRef::new();
@@ -278,17 +314,59 @@ impl SessionVolumes {
                     .put_manifest(lineage, &manifest)
                     .await
                     .map_err(store_err)?;
-                lineage
+                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
             }
         };
-        let checkpoint = checkpoint_name(sandbox, role, lineage);
-        self.disk.rename(&tmp, &checkpoint).await?;
-        let checkpoint = self.disk.open(&checkpoint).await?;
         let live = self
             .disk
             .snapshot(&checkpoint, &live_name(sandbox, role))
             .await?;
         Ok((live.path, lineage))
+    }
+
+    /// Give the staged transient volume its checkpoint name and delete
+    /// the role's other checkpoints.
+    async fn commit(
+        &self,
+        tmp: &VolumeName,
+        sandbox: SandboxId,
+        role: DiskRole,
+        lineage: ManifestRef,
+    ) -> io::Result<Volume> {
+        let name = checkpoint_name(sandbox, role, lineage);
+        self.disk.rename(tmp, &name).await?;
+        for other in self.disk.list().await? {
+            if other != name
+                && parse(&other).is_some_and(|p| {
+                    p.sandbox == sandbox && p.role == role && matches!(p.kind, Kind::Checkpoint(_))
+                })
+            {
+                self.disk.delete(&other).await?;
+            }
+        }
+        self.disk.open(&name).await
+    }
+
+    /// The newest checkpoint volume of the role, its manifest and that
+    /// manifest's ref, when this host holds all three.
+    async fn kept(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<Option<(Volume, Manifest, ManifestRef)>> {
+        let held = match self.checkpoint_of(sandbox, role).await {
+            Ok(held) => held,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let volume = self
+            .disk
+            .open(&checkpoint_name(sandbox, role, held))
+            .await?;
+        Ok(match self.store.get_manifest(held).await {
+            Ok(manifest) => Some((volume, manifest, held)),
+            Err(_) => None,
+        })
     }
 
     /// Write `wanted` into a new volume `name`, from the staged volume of
@@ -452,26 +530,84 @@ impl SessionVolumes {
         self.disk.delete(&name).await
     }
 
-    /// Delete every volume of the sandbox. Fails while a process holds
-    /// one open.
+    /// Delete the sandbox's live and transient volumes and every
+    /// checkpoint volume but the newest of each role. The kept
+    /// checkpoint makes a resume on this host a snapshot instead of a
+    /// stage; [`Self::reap`] deletes it when the pool needs the space.
+    /// Fails while a process holds a volume open.
     pub async fn release(&self, sandbox: SandboxId) -> io::Result<()> {
-        let mut first_error = None;
+        let report = self.sweep(|s| s == sandbox, &[]).await?;
+        if let Some((_, e)) = report.failed.into_iter().next() {
+            return Err(e);
+        }
+        if report.kept.contains(&sandbox) {
+            self.remember_kept(sandbox, false);
+        }
+        Ok(())
+    }
+
+    /// Delete every volume of the sandbox. A volume a process holds
+    /// open stays and is reported as failed.
+    pub async fn purge(&self, sandbox: SandboxId) -> io::Result<Report> {
+        let mut report = Report::default();
         for name in self.disk.list().await? {
             if parse(&name).is_some_and(|p| p.sandbox == sandbox) {
-                if let Err(e) = self.disk.delete(&name).await {
-                    first_error.get_or_insert(e);
+                match self.disk.delete(&name).await {
+                    Ok(()) => report.deleted.push(name),
+                    Err(e) => report.failed.push((name, e)),
                 }
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if report.failed.is_empty() {
+            self.kept.lock().unwrap().retain(|s| *s != sandbox);
+        }
+        Ok(report)
     }
 
-    /// Delete what no live sandbox needs: every volume of a sandbox not
-    /// in `live` and every checkpoint volume but the newest of its role.
-    /// A live sandbox keeps its transient volume: it may be a checkpoint
-    /// whose publish is being redriven. Run once after the live set is
-    /// known, before any sandbox is provisioned.
+    /// Delete what no sandbox needs: the live and transient volumes of
+    /// every sandbox not in `live` and every checkpoint volume but the
+    /// newest of its role. A live sandbox keeps its transient volume:
+    /// it may be a checkpoint whose publish is being redriven. Run once
+    /// after the live set is known, before any sandbox is provisioned.
     pub async fn reconcile(&self, live: &[SandboxId]) -> io::Result<Report> {
+        let report = self.sweep(|_| true, live).await?;
+        for sandbox in &report.kept {
+            if !live.contains(sandbox) {
+                self.remember_kept(*sandbox, true);
+            }
+        }
+        Ok(report)
+    }
+
+    /// Purge kept sandboxes, oldest release first, until the pool's
+    /// free data space is at least `floor_bytes` or none is left. A
+    /// sandbox whose purge fails moves to the back and the pass ends.
+    /// A disk without a pool reports no capacity and never reaps.
+    pub async fn reap(&self, floor_bytes: u64) -> io::Result<Report> {
+        let mut report = Report::default();
+        while self.capacity().await?.data_below(floor_bytes) {
+            let next = self.kept.lock().unwrap().front().copied();
+            let Some(sandbox) = next else { break };
+            let purged = self.purge(sandbox).await?;
+            let stuck = !purged.failed.is_empty();
+            report.deleted.extend(purged.deleted);
+            report.failed.extend(purged.failed);
+            if stuck {
+                self.kept.lock().unwrap().rotate_left(1);
+                break;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Among the volumes of the sandboxes `within` selects, delete the
+    /// live and transient volumes of sandboxes outside `live` and every
+    /// checkpoint volume but the newest of its role.
+    async fn sweep(
+        &self,
+        within: impl Fn(SandboxId) -> bool,
+        live: &[SandboxId],
+    ) -> io::Result<Report> {
         let mut report = Report::default();
         let mut newest: std::collections::HashMap<(SandboxId, DiskRole), u64> = Default::default();
         let parsed: Vec<(VolumeName, Parsed)> = self
@@ -480,6 +616,7 @@ impl SessionVolumes {
             .await?
             .into_iter()
             .filter_map(|name| parse(&name).map(|p| (name, p)))
+            .filter(|(_, p)| within(p.sandbox))
             .collect();
         for (_, p) in &parsed {
             if let Kind::Checkpoint(m) = p.kind {
@@ -488,12 +625,14 @@ impl SessionVolumes {
             }
         }
         for (name, p) in parsed {
-            let unwanted = !live.contains(&p.sandbox)
-                || match p.kind {
-                    Kind::Live | Kind::Transient => false,
-                    Kind::Checkpoint(m) => m.version < newest[&(p.sandbox, p.role)],
-                };
+            let unwanted = match p.kind {
+                Kind::Live | Kind::Transient => !live.contains(&p.sandbox),
+                Kind::Checkpoint(m) => m.version < newest[&(p.sandbox, p.role)],
+            };
             if !unwanted {
+                if matches!(p.kind, Kind::Checkpoint(_)) && !report.kept.contains(&p.sandbox) {
+                    report.kept.push(p.sandbox);
+                }
                 continue;
             }
             match self.disk.delete(&name).await {
@@ -502,6 +641,17 @@ impl SessionVolumes {
             }
         }
         Ok(report)
+    }
+
+    fn remember_kept(&self, sandbox: SandboxId, age_unknown: bool) {
+        let mut kept = self.kept.lock().unwrap();
+        if kept.contains(&sandbox) {
+            return;
+        }
+        match age_unknown {
+            true => kept.push_front(sandbox),
+            false => kept.push_back(sandbox),
+        }
     }
 
     /// The manifest of the sandbox's checkpoint volume: what the last
@@ -547,25 +697,133 @@ mod tests {
     use super::*;
     use crate::disk::FileDisk;
     use crate::disk_flows::checkpoint;
+    use engram_core::error::BlobError;
 
     const CHUNK: u64 = 4096;
 
     struct Rig {
         _dir: tempfile::TempDir,
-        disk: Arc<FileDisk>,
+        disk: Arc<dyn SessionDisk>,
         store: ChunkStore,
         volumes: SessionVolumes,
+        blob: Arc<CountingBlob>,
     }
 
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let disk = Arc::new(FileDisk::new(dir.path().join("volumes"), CHUNK).unwrap());
-        let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs"))));
+        rig_on(dir, disk)
+    }
+
+    /// A rig whose pool reports `POOL_TOTAL` bytes with `VOLUME_COST`
+    /// used per volume, so reaping frees space.
+    fn pressured_rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(PressuredDisk(
+            FileDisk::new(dir.path().join("volumes"), CHUNK).unwrap(),
+        ));
+        rig_on(dir, disk)
+    }
+
+    fn rig_on(dir: tempfile::TempDir, disk: Arc<dyn SessionDisk>) -> Rig {
+        let blob = Arc::new(CountingBlob {
+            inner: LocalBlobStorage::new(dir.path().join("blobs")),
+            gets: std::sync::atomic::AtomicU64::new(0),
+        });
+        let store = ChunkStore::new(blob.clone());
         Rig {
             volumes: SessionVolumes::new(disk.clone(), store.clone()),
             disk,
             store,
+            blob,
             _dir: dir,
+        }
+    }
+
+    /// Counts the chunk GETs a stage makes; manifest reads do not count.
+    struct CountingBlob {
+        inner: LocalBlobStorage,
+        gets: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingBlob {
+        fn gets(&self) -> u64 {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::BlobStorage for CountingBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::storage::ByteStream,
+        ) -> Result<u64, BlobError> {
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::storage::ByteStream, BlobError> {
+            if key.starts_with("chunks/") {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::storage::BlobObjectMeta, BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    const POOL_TOTAL: u64 = 100;
+    const VOLUME_COST: u64 = 10;
+
+    struct PressuredDisk(FileDisk);
+
+    #[async_trait::async_trait]
+    impl SessionDisk for PressuredDisk {
+        async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
+            self.0.create(name, size_bytes).await
+        }
+        async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
+            self.0.snapshot(origin, name).await
+        }
+        async fn open(&self, name: &VolumeName) -> io::Result<Volume> {
+            self.0.open(name).await
+        }
+        async fn delete(&self, name: &VolumeName) -> io::Result<()> {
+            self.0.delete(name).await
+        }
+        async fn list(&self) -> io::Result<Vec<VolumeName>> {
+            self.0.list().await
+        }
+        async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
+            self.0.rename(from, to).await
+        }
+        async fn capacity(&self) -> io::Result<Capacity> {
+            let used = VOLUME_COST * self.0.list().await?.len() as u64;
+            Ok(Capacity {
+                data_free_bytes: POOL_TOTAL - used,
+                data_total_bytes: POOL_TOTAL,
+                metadata_free_bytes: POOL_TOTAL,
+                metadata_total_bytes: POOL_TOTAL,
+            })
+        }
+    }
+
+    fn fork(image: ManifestRef) -> Source {
+        Source::Fork {
+            manifest: image,
+            base: None,
         }
     }
 
@@ -1121,7 +1379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_keeps_live_sandboxes_and_the_newest_checkpoint_only() {
+    async fn reconcile_deletes_dead_live_volumes_and_older_checkpoints() {
         let r = rig();
         let image = staged_image(&r, &[1]).await;
         let live = SandboxId::new();
@@ -1180,9 +1438,6 @@ mod tests {
         deleted.sort();
         let mut expected = vec![
             live_name(dead, DiskRole::Root).as_str().to_string(),
-            checkpoint_name(dead, DiskRole::Root, dead_lineage)
-                .as_str()
-                .to_string(),
             checkpoint_name(live, DiskRole::Root, lineage)
                 .as_str()
                 .to_string(),
@@ -1194,6 +1449,12 @@ mod tests {
             checkpoints_of(&r, live, DiskRole::Root).await,
             vec![lineage.next_version()]
         );
+        assert_eq!(
+            checkpoints_of(&r, dead, DiskRole::Root).await,
+            vec![dead_lineage],
+            "a dead sandbox keeps its newest checkpoint for a resume here"
+        );
+        assert!(report.kept.contains(&dead) && report.kept.contains(&live));
         assert!(r.disk.open(&live_name(live, DiskRole::Swap)).await.is_ok());
         assert!(r
             .disk
@@ -1211,33 +1472,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_deletes_one_sandbox_and_leaves_the_rest() {
+    async fn release_keeps_the_newest_checkpoint_volume_of_each_role() {
         let r = rig();
         let image = staged_image(&r, &[1]).await;
         let a = SandboxId::new();
         let b = SandboxId::new();
         for s in [a, b] {
             r.volumes
-                .provision(
-                    s,
-                    Source::Fork {
-                        manifest: image,
-                        base: None,
-                    },
-                    Some(Source::Empty { size_bytes: CHUNK }),
-                )
+                .provision(s, fork(image), Some(Source::Empty { size_bytes: CHUNK }))
                 .await
                 .unwrap();
         }
+        let root = r.volumes.checkpoint(a, DiskRole::Root).await.unwrap();
+        let swap = checkpoints_of(&r, a, DiskRole::Swap).await[0];
+
         r.volumes.release(a).await.unwrap();
-        let left = names(&r).await;
-        assert_eq!(left.len(), 5);
-        assert!(left
-            .iter()
-            .all(|n| !n.contains(&a.as_uuid().simple().to_string())));
+
+        let mut expected = vec![
+            image_volumes::volume_name(image).as_str().to_string(),
+            checkpoint_name(a, DiskRole::Root, root)
+                .as_str()
+                .to_string(),
+            checkpoint_name(a, DiskRole::Swap, swap)
+                .as_str()
+                .to_string(),
+        ];
+        for role in DiskRole::ALL {
+            expected.push(live_name(b, role).as_str().to_string());
+            let lineage = checkpoints_of(&r, b, role).await[0];
+            expected.push(checkpoint_name(b, role, lineage).as_str().to_string());
+        }
+        expected.sort();
+        assert_eq!(names(&r).await, expected);
         assert_eq!(
             r.volumes.path(a, DiskRole::Root).await.unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn a_resume_on_the_same_host_snapshots_the_kept_checkpoint() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, fork(image), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+        r.volumes.release(sandbox).await.unwrap();
+
+        let gets = r.blob.gets();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: published,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.blob.gets(), gets, "no chunk is fetched");
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+        assert_eq!(p.root_manifest, published);
+        assert_eq!(
+            checkpoints_of(&r, sandbox, DiskRole::Root).await,
+            vec![published]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_of_a_newer_manifest_stages_the_delta_onto_the_kept_checkpoint() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        r.volumes
+            .provision(sandbox, fork(image), None)
+            .await
+            .unwrap();
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+        r.volumes.release(sandbox).await.unwrap();
+
+        // Another host published the next version with chunk 0 changed.
+        let mut newer = r.store.get_manifest(published).await.unwrap();
+        newer.chunks[0].hash = r.store.put_chunk(&vec![7u8; CHUNK as usize]).await.unwrap();
+        let next = published.next_version();
+        r.store.put_manifest(next, &newer).await.unwrap();
+
+        let gets = r.blob.gets();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: next,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.blob.gets(), gets + 1, "only the changed chunk is fetched");
+        assert_eq!(bytes_at(&p.root).await, vec![7, 2]);
+        assert_eq!(
+            checkpoints_of(&r, sandbox, DiskRole::Root).await,
+            vec![next]
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_purges_kept_sandboxes_oldest_first_until_the_floor_holds() {
+        let r = pressured_rig();
+        let image = staged_image(&r, &[1]).await;
+        let a = SandboxId::new();
+        let b = SandboxId::new();
+        for s in [a, b] {
+            r.volumes.provision(s, fork(image), None).await.unwrap();
+        }
+        r.volumes.release(a).await.unwrap();
+        r.volumes.release(b).await.unwrap();
+        // Three volumes: the image and one kept checkpoint each.
+        assert_eq!(names(&r).await.len(), 3);
+        let a_checkpoint = checkpoint_name(
+            a,
+            DiskRole::Root,
+            checkpoints_of(&r, a, DiskRole::Root).await[0],
+        );
+
+        let report = r.volumes.reap(POOL_TOTAL - 2 * VOLUME_COST).await.unwrap();
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            report.deleted,
+            vec![a_checkpoint],
+            "the oldest release goes first"
+        );
+        assert!(checkpoints_of(&r, a, DiskRole::Root).await.is_empty());
+        assert_eq!(checkpoints_of(&r, b, DiskRole::Root).await.len(), 1);
+
+        let again = r.volumes.reap(POOL_TOTAL - 2 * VOLUME_COST).await.unwrap();
+        assert!(
+            again.deleted.is_empty(),
+            "the floor holds; nothing more goes"
+        );
+
+        let all = r.volumes.reap(POOL_TOTAL).await.unwrap();
+        assert_eq!(all.deleted.len(), 1);
+        assert!(checkpoints_of(&r, b, DiskRole::Root).await.is_empty());
+        let none_left = r.volumes.reap(POOL_TOTAL).await.unwrap();
+        assert!(none_left.deleted.is_empty() && none_left.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_queues_dead_sandboxes_for_the_reap() {
+        let r = pressured_rig();
+        let image = staged_image(&r, &[1]).await;
+        let dead = SandboxId::new();
+        r.volumes.provision(dead, fork(image), None).await.unwrap();
+
+        let restarted = SessionVolumes::new(r.disk.clone(), r.store.clone());
+        let report = restarted.reconcile(&[]).await.unwrap();
+        assert_eq!(report.kept, vec![dead]);
+        assert_eq!(checkpoints_of(&r, dead, DiskRole::Root).await.len(), 1);
+
+        let reaped = restarted.reap(POOL_TOTAL).await.unwrap();
+        assert_eq!(reaped.deleted.len(), 1);
+        assert!(checkpoints_of(&r, dead, DiskRole::Root).await.is_empty());
     }
 }

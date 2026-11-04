@@ -24,7 +24,7 @@ where, for anyone reading a manifest or running a component outside the charts.
 | `ENGRAM_SECRETS_BACKEND` | `gcp`, `aws`, or `env` for development. |
 | `ENGRAM_GCP_PROJECT_ID` | With `gcp`: the Secret Manager project. |
 | `ENGRAM_CHUNK_GC_INTERVAL_SECS`, `ENGRAM_CHUNK_GC_RETAIN_SECS` | How often chunk garbage collection runs, and how long an unreferenced chunk is kept before deletion. |
-| `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` | Free space a node's session-disk pool must keep for the scheduler to place a new session on it; default 16 GiB. |
+| `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` | Free space a node's session-disk pool must keep for the scheduler to place a new session on it; default 16 GiB. A node deletes the checkpoint volumes of evicted sessions it kept for a fast resume when its free space falls under twice this value, so set it on the host agents too. |
 
 Cloud credentials are ambient: Workload Identity on GKE, IRSA on EKS, bound to the
 coordinator's ServiceAccount. There are no key files.

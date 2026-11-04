@@ -38,6 +38,29 @@ async fn probe_pool(
     }
 }
 
+/// Purge released sandboxes' kept checkpoint volumes until the pool
+/// holds twice the placement floor free, so the host stays placeable
+/// before the coordinator stops choosing it.
+async fn reap_kept_checkpoints(volumes: &engram_host_core::SessionVolumes) {
+    match volumes
+        .reap(2 * engram_core::types::host::pool_data_floor_bytes())
+        .await
+    {
+        Ok(report) => {
+            if !report.deleted.is_empty() {
+                tracing::info!(
+                    deleted = report.deleted.len(),
+                    "reaped kept checkpoint volumes for pool space"
+                );
+            }
+            for (name, error) in &report.failed {
+                tracing::warn!(volume = %name, %error, "kept checkpoint reap: purge failed");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "kept checkpoint reap failed"),
+    }
+}
+
 pub mod base_shm_gc;
 pub mod bindings;
 pub mod bundles;
@@ -1335,6 +1358,9 @@ impl HostAgent {
                         .collect();
                     let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
                     let mut probe_inputs = probe_inputs_for_heartbeat.clone();
+                    if let Some(volumes) = session_volumes_for_heartbeat.as_deref() {
+                        reap_kept_checkpoints(volumes).await;
+                    }
                     let (pool_state, pool) =
                         probe_pool(session_volumes_for_heartbeat.as_deref().map(|v| v.disk()))
                             .await;

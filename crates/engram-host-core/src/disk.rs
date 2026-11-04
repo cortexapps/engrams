@@ -64,6 +64,14 @@ pub struct Capacity {
     pub metadata_total_bytes: u64,
 }
 
+impl Capacity {
+    /// Free data space is under `floor_bytes`. A disk with no pool
+    /// reports no total and is never below a floor.
+    pub fn data_below(&self, floor_bytes: u64) -> bool {
+        self.data_total_bytes > 0 && self.data_free_bytes < floor_bytes
+    }
+}
+
 /// An open volume. Clones share the file handle.
 #[derive(Clone, Debug)]
 pub struct Volume {
