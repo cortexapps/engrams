@@ -119,9 +119,10 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     cfg.track_dirty_pages = true;
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
+    let rootfs = outcome.rootfs_path;
     let spec = SandboxSpec {
         image: "engram-diff-snapshot-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: Some(rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -203,7 +204,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     let t = Instant::now();
     let vm2 = SandboxId::new();
     backend
-        .restore(vm2, meta2)
+        .restore(vm2, meta2, common::disks(&rootfs))
         .await
         .expect("restore from rebased diff1");
     eprintln!("SPIKE: restore(full+diff1) {} ms", t.elapsed().as_millis());
@@ -262,7 +263,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     );
     let vm3 = SandboxId::new();
     backend
-        .restore(vm3, meta3)
+        .restore(vm3, meta3, common::disks(&rootfs))
         .await
         .expect("restore from chained diff2");
     let out = exec(

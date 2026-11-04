@@ -92,7 +92,7 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    SessionFileMetadata, SessionFileSpec, SessionFileStream,
+    SessionDisks, SessionFileMetadata, SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1088,6 +1088,26 @@ pub struct FirecrackerBackend {
     bundle_stamp: tokio::sync::OnceCell<std::collections::HashMap<String, String>>,
 }
 
+/// Restore-time inputs that the capture-time sidecar cannot carry.
+struct RestoreInputs {
+    /// The disks this residence attaches; the sidecar's paths name the
+    /// source residence's.
+    disks: SessionDisks,
+    /// Fresh-create flavor: swap pinned aux bundles to this host's current
+    /// generation, load-paused (ADR 0035 §3).
+    swap_aux_to_current: bool,
+    /// Per-session skills assigned to reserved slots, patched in
+    /// load-paused. Empty on resume.
+    selected_mounts: Vec<AuxRoDrive>,
+    /// The memory backend for THIS restore: base-create may be File while
+    /// resume follows the host's configured mode.
+    restore_mode: RestoreMode,
+    /// The image's base memory manifest. `Some` ⇒ substrate restores
+    /// continue base-identical pages against the shared per-image base
+    /// shm; `None` ⇒ canonical == session.
+    base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+}
+
 impl FirecrackerBackend {
     pub fn new(work_dir: impl Into<PathBuf>, config: FirecrackerConfig) -> Self {
         // Per-process test-isolation slot (0 in production). Partitions
@@ -1306,9 +1326,13 @@ impl FirecrackerBackend {
         &self,
         sandbox_id: SandboxId,
         metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
         swap_aux_to_current: bool,
         selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<(), SandboxError> {
+        let disks = disks.ok_or_else(|| {
+            SandboxError::Snapshot("restore requires the session's disk paths".into())
+        })?;
         let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
             .await
@@ -1327,31 +1351,24 @@ impl FirecrackerBackend {
         }
 
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
-        // ADR 0022: base-create (swap_aux_to_current) may use File; resume
-        // follows restore_mode.
-        //
-        // ADR 0045 C1: a migration restore is UFFD-shaped by
-        // construction — its memory is the staged local session
-        // manifest + cache-resident chunks, and there is deliberately
-        // NO memory.bin to File-load. Override whatever the host's
-        // configured mode says.
+        // A migration restore has no memory.bin: its memory is the staged
+        // session manifest plus cached chunks, so it is UFFD whatever the
+        // host's configured mode says.
         let restore_mode = if src.join("migration-session-manifest.json").exists() {
             RestoreMode::Uffd
         } else {
             self.effective_restore_mode(swap_aux_to_current)
         };
 
+        let inputs = RestoreInputs {
+            disks,
+            swap_aux_to_current,
+            selected_mounts,
+            restore_mode,
+            base_memory_manifest: metadata.base_memory_manifest,
+        };
         match self
-            .restore_in_jail(
-                sandbox_id,
-                &jail_dir,
-                &src,
-                &manifest,
-                swap_aux_to_current,
-                selected_mounts,
-                restore_mode,
-                metadata.base_memory_manifest,
-            )
+            .restore_in_jail(sandbox_id, &jail_dir, &src, &manifest, inputs)
             .await
         {
             Ok(()) => Ok(()),
@@ -2957,32 +2974,13 @@ impl FirecrackerBackend {
     /// `state.bin`/`memory.bin` into it. Symmetric with `create_in_jail`
     /// — same outer cleanup contract on error.
     #[tracing::instrument(name = "fc.restore_in_jail", skip_all, fields(sandbox_id = %sandbox_id))]
-    // 8 args: the D4 canonical ref is a restore-time input that can't ride
-    // the capture-time sidecar; bundling into a params struct is the cleanup
-    // when the next one arrives.
-    #[allow(clippy::too_many_arguments)]
     async fn restore_in_jail(
         &self,
         sandbox_id: SandboxId,
         jail_dir: &Path,
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
-        swap_aux_to_current: bool,
-        // ADR 0055: per-session skills the coordinator assigned to reserved
-        // slots (dyn_i + content sha), patch_drived in load-paused. Empty on
-        // resume / reattach.
-        selected_mounts: Vec<AuxRoDrive>,
-        // ADR 0022: the effective memory backend for THIS restore
-        // (base-create may be File while resume is UFFD). Computed by the
-        // caller via `effective_restore_mode` rather than read from
-        // `self.config.restore_mode`, which is now resume-only.
-        restore_mode: RestoreMode,
-        // ADR 0045 D4: the IMAGE's base manifest from the coordinator's
-        // restore metadata (a restore-time input — the capture-time
-        // sidecar can't know it). `Some` ⇒ substrate restores CONTINUE
-        // base-identical pages against the shared per-image base shm;
-        // `None` ⇒ canonical == session (old coordinators, reattach).
-        base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+        inputs: RestoreInputs,
     ) -> Result<(), SandboxError> {
         let post_copy = snapshot_dir.join(MIGRATION_PEER_FILE).exists();
         let mut load_started = false;
@@ -2992,10 +2990,7 @@ impl FirecrackerBackend {
                 jail_dir,
                 snapshot_dir,
                 manifest,
-                swap_aux_to_current,
-                selected_mounts,
-                restore_mode,
-                base_memory_manifest,
+                inputs,
                 &mut load_started,
             )
             .await;
@@ -3016,63 +3011,37 @@ impl FirecrackerBackend {
     /// The body of [`Self::restore_in_jail`]. `load_started` flips to true the
     /// instant a snapshot-load request is sent to FC; the wrapper uses it to
     /// classify a post-copy failure as never-loaded (abortable to the source).
-    #[allow(clippy::too_many_arguments)]
     async fn restore_in_jail_inner(
         &self,
         sandbox_id: SandboxId,
         jail_dir: &Path,
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
-        swap_aux_to_current: bool,
-        // ADR 0055: per-session skills the coordinator assigned to reserved
-        // slots (dyn_i + content sha), patch_drived in load-paused. Empty on
-        // resume / reattach.
-        selected_mounts: Vec<AuxRoDrive>,
-        // ADR 0022: the effective memory backend for THIS restore
-        // (base-create may be File while resume is UFFD). Computed by the
-        // caller via `effective_restore_mode` rather than read from
-        // `self.config.restore_mode`, which is now resume-only.
-        restore_mode: RestoreMode,
-        // ADR 0045 D4: the IMAGE's base manifest from the coordinator's
-        // restore metadata (a restore-time input — the capture-time
-        // sidecar can't know it). `Some` ⇒ substrate restores CONTINUE
-        // base-identical pages against the shared per-image base shm;
-        // `None` ⇒ canonical == session (old coordinators, reattach).
-        base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+        inputs: RestoreInputs,
         load_started: &mut bool,
     ) -> Result<(), SandboxError> {
+        let RestoreInputs {
+            disks,
+            swap_aux_to_current,
+            selected_mounts,
+            restore_mode,
+            base_memory_manifest,
+        } = inputs;
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
 
-        // ADR 0048 (surfaced by the fleet load test): same-base concurrent
-        // restores share the FC-embedded `source_rootfs_canonical` rootfs path
-        // and collide on it. The fix — install that symlink + hold a
-        // per-source-path lock ONLY across `load_snapshot` (when FC opens the
-        // rootfs fd) — lives right before the load below, NOT here: holding it
-        // across all of `restore_in_jail` (netns + spawn + the cold chunk
-        // fetch) serialized a burst so hard the coordinator's restore RPC timed
-        // out. The load itself is ~5 ms in UFFD mode, so the tight window is
-        // nearly free.
-
-        // ADR 0035 §3/§4: aux RO bundles.
-        //
-        // The PINNED generation must be present regardless of flavor —
-        // `load_snapshot` opens the `state.bin`-embedded path before any
-        // `patch_drive` is possible. `PooledBackend::restore` materializes
-        // missing generations from BlobStorage before calling here; this
-        // assert is the backstop that turns a miss into a clear error
-        // instead of an opaque FC virtio "No such file".
-        //
-        // On the fresh-create flavor (`swap_aux_to_current`) we also plan a
-        // post-load, pre-resume `patch_drive` to this host's CURRENT
-        // generation for any drive whose pin is stale — that's how a skill
-        // edit reaches new sessions without re-enabling images (Invariant 2).
-        // Resumes never swap: live guest processes may hold fds into the
-        // pinned bundle, and an in-flight session keeps the world it was
-        // working in. Missing stamp / missing current file degrade to the
-        // pinned generation with a warning — staler skills beat a failed
-        // create.
+        // Aux RO bundles. The pinned generation must be staged whatever the
+        // flavor: `load_snapshot` opens the state.bin-embedded path before
+        // any `patch_drive` is possible. A fresh create also plans a
+        // load-paused `patch_drive` to the host's current generation for
+        // each stale pin; a resume never swaps, because live guest
+        // processes may hold fds into the pinned bundle. A missing stamp or
+        // current file keeps the pin with a warning.
         let mut live_spec = manifest.spec.clone();
+        // The sidecar's disk paths describe the SOURCE residence; this
+        // residence attaches the disks the caller provisioned.
+        live_spec.rootfs_source = Some(disks.root.clone());
+        live_spec.swap_source = disks.swap.clone();
         let mut aux_swap_plan: Vec<(String, PathBuf)> = Vec::new();
         if !live_spec.aux_ro_drives.is_empty() {
             for aux in &live_spec.aux_ro_drives {
@@ -3117,9 +3086,7 @@ impl FirecrackerBackend {
                                 continue;
                             }
                             aux_swap_plan.push((aux.drive_id.clone(), current_path));
-                            // The live VM's device now points at the current
-                            // generation — record that on the live spec so a
-                            // later `snapshot()` pins what's actually attached.
+                            // A later `snapshot()` pins what is attached.
                             aux.sha256 = Some(current_sha.clone());
                         }
                     }
@@ -3133,33 +3100,20 @@ impl FirecrackerBackend {
                 }
             }
         }
-        // ADR 0080: does this restore actually change the agentd slot's
-        // content? Computed against the snapshot's pinned generation
-        // BEFORE the loop below overwrites it on the live spec.
-        // `refresh_agent` skips the in-guest RPC when this stays false
-        // (the steady state), keeping the create path's added latency at
-        // zero except on the first creates after an agentd roll.
+        // Whether this restore changes the agentd slot's content:
+        // `refresh_agent` skips its in-guest RPC otherwise.
         let agentd_drive_id =
             AuxRoDrive::slot_drive_id(engram_core::types::sandbox::AuxRoDrive::AGENTD_SLOT_INDEX);
         let mut agentd_slot_swapped = false;
-        // ADR 0055: per-session skill selection. The coordinator assigned each
-        // selected skill to a reserved slot (dyn_i) + content sha; plan a
-        // `patch_drive` over that slot's sentinel and record it on the live spec
-        // so a later eviction snapshot pins the skill (resume re-attaches it).
-        // Only the fresh-create flavor carries selections; resume passes none.
+        // Per-session skills: each selection names a reserved slot and a
+        // content sha. Plan a `patch_drive` over the slot's sentinel and
+        // record it on the live spec so an eviction snapshot pins it.
         for sel in &selected_mounts {
-            // ADR 0062: resolve via the backend's `bundle_dir` (config) — the
-            // single source of truth — NOT a hardcoded SHARED_DIR. The sentinel
-            // swap just above already uses `config.bundle_dir`; this used to read
-            // `AuxRoDrive::staged_path()` (hardcoded SHARED_DIR), which only
-            // matched while the FC config silently defaulted there too. On a
-            // dev/e2e host (ENGRAM_BUNDLE_DIR) it checked the wrong dir and every
-            // selected skill/harness 404'd "not staged".
             let staged = self.staged_bundle_path(sel)?;
             if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
                 return Err(SandboxError::Snapshot(format!(
-                    "ADR 0055 selected skill {} for slot {} is not staged on this \
-                 host (catalog materialize gap?) — restore can't proceed",
+                    "selected skill {} for slot {} is not staged on this host — \
+                 restore can't proceed",
                     sel.sha256.as_deref().unwrap_or("?"),
                     sel.drive_id,
                 )));
@@ -3173,18 +3127,14 @@ impl FirecrackerBackend {
                 .iter_mut()
                 .find(|d| d.drive_id == sel.drive_id)
             {
-                // ADR 0080: an agentd-slot selection that differs from the
-                // snapshot's pin is the (rare) "agentd rolled since capture"
-                // case `refresh_agent` acts on.
                 if sel.drive_id == agentd_drive_id && slot.sha256 != sel.sha256 {
                     agentd_slot_swapped = true;
                 }
                 slot.sha256 = sel.sha256.clone();
             }
         }
-        // ADR 0045 C2: a post-copy destination starts restoring BEFORE
-        // the source pauses — state.bin appears later via the fetch
-        // poller, and the pre-load gate below waits for it.
+        // A post-copy destination starts restoring before the source
+        // pauses; state.bin lands later and the pre-load gate waits for it.
         let post_copy = snapshot_dir.join(MIGRATION_PEER_FILE).exists();
         if !post_copy && !state_path.exists() {
             return Err(SandboxError::Snapshot(format!(
@@ -3192,18 +3142,8 @@ impl FirecrackerBackend {
                 state_path.display()
             )));
         }
-        // ADR 0020 Route B: UFFD mode faults memory pages from chunks
-        // on demand via the handler we spawn below; memory.bin is not
-        // read by `PUT /snapshot/load` in this mode and won't exist on
-        // disk after a cross-host receive (PooledBackend::restore
-        // skips `materialize_memory_if_missing` when
-        // `restore_memory_is_lazy_for(fresh)` returns true). Requiring it here
-        // unconditionally was the prod blocker on 2026-05-29: after a
-        // host-agent pod restart the new hosts had every base-snapshot restore fail
-        // with "snapshot memory.bin missing" before the mode-specific
-        // load branch could run. Same-host UFFD restore passed only
-        // because `PooledBackend::snapshot` had already written
-        // memory.bin during capture on the same host.
+        // UFFD mode faults pages from chunks through the handler and never
+        // reads memory.bin, which a cross-host receive does not stage.
         if matches!(restore_mode, RestoreMode::File) && !mem_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot memory.bin missing at {}",
@@ -3211,14 +3151,7 @@ impl FirecrackerBackend {
             )));
         }
 
-        // ADR 0020 P3 fix: create jail_dir up front, before the parallel legs.
-        // Both spawn_firecracker (its chroot/jail setup) AND spawn_uffd_handler
-        // (its log + UDS at jail_dir/{uffd-handler.log,uffd.sock}) write here. In
-        // the old serial form FC-spawn's own create_dir_all ran first; once the
-        // two legs run concurrently the UFFD leg races it and File::create on the
-        // log fails with ENOENT (prod regression 501e30e, reverted a91f83b).
-        // Creating it here is idempotent with FC-spawn's create_dir_all and makes
-        // the dir present for whichever leg touches it first.
+        // Both legs below write under jail_dir; create it before they race.
         tokio::fs::create_dir_all(jail_dir).await.map_err(|e| {
             vm_err(format!(
                 "create restore jail dir {}: {e}",
@@ -3226,45 +3159,18 @@ impl FirecrackerBackend {
             ))
         })?;
 
-        // ADR 0014 M1.16: warm-restore networking provisions a
-        // per-VM netns BEFORE spawning FC. The netns has the bake's
-        // TAP recreated inside it (collision-free vs other warm VMs
-        // on the same host) plus SNAT remapping the VM's bake-time
-        // source IP to a unique-per-VM pool slot. FC enters the netns
-        // via `spawn_firecracker`'s direct exec + `pre_exec` `setns(2)`
-        // closure (no `ip netns exec` wrapper fork) so `load_snapshot`'s
-        // TAP open resolves inside it.
-        //
-        // Legacy/test snapshots with `manifest.net = None` keep the
-        // historical host-root flow: TAP lives directly on host
-        // root, FC stays in host root, no netns at all.
-        // ADR 0020 P3: the restore-setup legs are independent up to the
-        // `load_snapshot` gate. {reserve netns → spawn FC into it} is a real
-        // chain, but spawning the UFFD handler (a separate process on its own
-        // UDS) need not wait for it. Run the two concurrently. We use `join!`,
-        // NOT `try_join!`: try_join cancels the slower leg on the first error,
-        // which can strand a half-created netns / FC child / handler; `join!`
-        // lets both finish, then we tear down whatever succeeded if either
-        // failed. Measured (trace 309633f4): collapses the ~250 ms serial setup
-        // to ~max-leg — the ~102 ms UFFD spawn hides under the ~110 ms
-        // netns→spawn chain. Each leg self-cleans its own partial state, so its
-        // Err carries no live resource; reconciliation below only undoes the
-        // OTHER leg.
-
-        // Leg 1 — netns → FC spawn → rootfs symlinks (a chain; the symlinks are
-        // ~0.5 ms so they ride here rather than as a third leg). Spans inline.
+        // Two independent setup legs run concurrently up to the load:
+        // {netns → FC spawn → symlinks} and the UFFD handler spawn. `join!`,
+        // not `try_join!`: a cancelled leg could strand a half-created
+        // resource, so both finish and every resource rides a drop guard.
+        // A snapshot with `manifest.net = None` restores in host root with
+        // no netns.
         let leg_setup = async {
             let netns_setup = tracing::Instrument::instrument(
                 self.reserve_restored_netns(sandbox_id, manifest.net.as_ref()),
                 tracing::info_span!("fc.reserve_netns"),
             )
             .await?;
-            // Issue #197: arm the drop-based netns teardown the instant the
-            // netns is provisioned, so ANY subsequent cancel/early-return
-            // (FC spawn failing, the symlink step, a cancellation of the
-            // whole restore future inside the join below) reclaims the
-            // netns + veth + SNAT slot. Replaces the per-`Err`-arm
-            // `teardown_netns` calls this leg used to carry.
             let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
             let netns_guard = NetnsGuard::new(netns_setup, Arc::clone(&self.net_allocator));
             let (socket, child, fc_guard) = tracing::Instrument::instrument(
@@ -3272,64 +3178,37 @@ impl FirecrackerBackend {
                 tracing::info_span!("fc.spawn_process"),
             )
             .await?;
-            // ADR 0014: `state.bin` embeds the canonical rootfs path keyed by
-            // the SOURCE sandbox_id; recreate the source-id-keyed symlink
-            // pointing at the host-local backing before `load_snapshot` opens
-            // it. On failure `fc_guard` (SIGKILL FC) and `netns_guard` (tear
-            // the netns down) fire on drop — no manual cleanup needed.
             tracing::Instrument::instrument(
-                restore_canonical_symlinks(&self.work_dir, sandbox_id, manifest),
+                restore_canonical_symlinks(&self.work_dir, sandbox_id, &disks.root),
                 tracing::info_span!("fc.restore_symlinks"),
             )
             .await?;
             Ok::<_, SandboxError>((netns_guard, socket, child, fc_guard))
         };
 
-        // Leg 2 — spawn the UFFD page-fault handler (Uffd mode) so it's
-        // listening before `load_snapshot` connects; File mode has none.
-        // Issue #197: `spawn_uffd_handler` arms a `SpawnKillGuard` internally
-        // (no kill_on_drop — ADR 0044 K2), so a cancellation while it parks
-        // on the peer control sock SIGKILLs the handler on drop. Returns
-        // (handler, the UDS the gate dials, the guard).
+        // The UFFD page-fault handler listens before `load_snapshot`
+        // connects; File mode has none.
         let leg_uffd = async {
             match restore_mode {
                 RestoreMode::File => Ok::<_, SandboxError>(None),
                 RestoreMode::Uffd => {
-                    // ADR 0007: the handler reads its memory manifest from the
-                    // chunk store; without one, refuse loud rather than
-                    // silently lose chunked restore.
                     let session_ref = manifest.memory_manifest.ok_or_else(|| {
                         SandboxError::Snapshot(
-                            "RestoreMode::Uffd requires manifest.memory_manifest \
-                         (snapshot wasn't taken via PooledBackend with a \
-                         chunk_store attached; either wrap the FC backend \
-                         with PooledBackend.with_chunk_store(...) before \
-                         snapshotting, or switch to RestoreMode::File)"
-                                .into(),
+                            "RestoreMode::Uffd requires manifest.memory_manifest".into(),
                         )
                     })?;
-                    // ADR 0045 D4: the canonical ref is the IMAGE's base
-                    // manifest when the coordinator supplies it — resumed
-                    // sessions then CONTINUE base-identical pages against
-                    // the SHARED per-image base shm (density across fresh +
-                    // resumed sessions, and resumes stop minting
-                    // session-keyed base files). Fallback (old coordinator
-                    // or fresh create, where the snapshot IS the base):
-                    // canonical == session, the ADR 0015 M5 behavior.
+                    // Base-identical pages continue against the shared
+                    // per-image base shm when the coordinator names it.
                     let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
                     let uffd_uds = jail_dir.join("uffd.sock");
                     let _ = tokio::fs::remove_file(&uffd_uds).await;
-                    // ADR 0045 C1: a migration destination pre-stages the
-                    // not-yet-durable session manifest as a local file in
-                    // the snapshot dir (the catch-up upload publishes it
-                    // later); when present, the handler resolves the
-                    // session manifest from disk instead of the store.
+                    // A migration destination stages the not-yet-durable
+                    // session manifest as a local file.
                     let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
                     let migration_manifest =
                         migration_manifest.exists().then_some(migration_manifest);
-                    // ADR 0045 C2: a post-copy destination additionally
-                    // stages the peer spec — the handler dials the
-                    // source's page server and parks for the SEAL.
+                    // A post-copy destination also stages the peer spec: the
+                    // handler dials the source's page server.
                     let peer_spec: Option<MigrationPeerSpec> = {
                         let p = snapshot_dir.join(MIGRATION_PEER_FILE);
                         match tokio::fs::read(&p).await {
@@ -3339,15 +3218,10 @@ impl FirecrackerBackend {
                             Err(_) => None,
                         }
                     };
-                    // ADR 0007 Phase 5: prefault host from the sidecar (capture
-                    // host); publish under THIS host so later restores here use
-                    // the local trace.
+                    // Prefault from the capture host's trace; publish this
+                    // host's own.
                     let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
                     let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
-                    // Tier 2 (resume-prefault fix): the session-stable trace
-                    // key from the sidecar. Present on resume/evac restores
-                    // (stamped by the host-agent at snapshot-finish); `None`
-                    // on base snapshots keeps the per-host manifest keying.
                     let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
                     let (handler, uffd_guard) = self
                         .spawn_uffd_handler(
@@ -3369,93 +3243,48 @@ impl FirecrackerBackend {
 
         let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
 
-        // Reconcile. Issue #197: every per-leg resource now rides a Drop
-        // guard (FC + uffd on `SpawnKillGuard`, the netns on `NetnsGuard`),
-        // so on ANY failure we just `return Err` — dropping the OTHER leg's
-        // success tuple fires its guards and self-cleans. No manual
-        // kill/teardown reconciliation (and no window where one leg's
-        // resources are live but unguarded).
+        // On a failure the other leg's success tuple drops here and its
+        // guards reap its resources.
         let (netns_guard, socket, child, mut fc_guard, uffd_leg) = match (setup_res, uffd_res) {
             (Ok((netns_guard, socket, child, fc_guard)), Ok(uffd)) => {
                 (netns_guard, socket, child, fc_guard, uffd)
             }
-            // On either-or-both failure, the surviving Ok tuple drops here,
-            // running its guards. Surface the setup error first when present.
             (Err(e), _) => return Err(e),
             (Ok(_), Err(e)) => return Err(e),
         };
 
-        // The guards armed inside the legs stay live from here through
-        // `load_snapshot` and the listener spawns — every `?` below reaps FC,
-        // the uffd handler, and the netns. They're disarmed just before the
-        // `sandboxes.insert` once the VM is resumed and committed (ADR 0044
-        // K2: a committed VM is decoupled from this host-agent's lifecycle).
+        // The guards stay armed through the load and the listener spawns;
+        // they disarm once the manifest is durable and the VM is committed.
         let (mut uffd_leg, mut uffd_guard) = match uffd_leg {
             Some((handler, uds, guard)) => (Some((handler, uds)), Some(guard)),
             None => (None, None),
         };
 
-        // Legacy/test path: no netns means we still might need the
-        // old host-root TAP setup (when `manifest.net.is_some` but
-        // the host is configured without a netns-style pool — e.g.
-        // a fixture that wants a direct TAP). For now we only take
-        // the netns path; legacy snapshots without `manifest.net`
-        // get `None` here and keep restoring netless.
+        // A restore never builds a host-root TAP: it is netns or netless.
         let net_setup: Option<net::NetSetup> = None;
 
-        // `PUT /snapshot/load` in File mode reads the entire memory.bin
-        // synchronously before resuming — the symmetric cost to
-        // `create_snapshot` (which already uses 60s here for the same
-        // reason). The default 10s client timeout fits a tiny VM but
-        // trips on a multi-GiB one (a 4 GiB base snapshot false-failed
-        // with "PUT /snapshot/load timed out after 10s" on a cold
-        // chunk-materialized memory.bin). Give the load the same 60s.
-        // (UFFD mode returns immediately — pages fault lazily — so this
-        // ceiling only bites File mode; tune up for huge VMs.)
+        // A File-mode load reads all of memory.bin before it returns; a
+        // multi-GiB VM needs more than the default client timeout.
         let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
 
-        // Re-key the vsock UDS to THIS sandbox's id via the fork's
-        // `vsock_override` load param. Without the override FC binds the
-        // ancestor path embedded in state.bin (`source_vsock_canonical`),
-        // which is shared by EVERY VM descended from the same base
-        // capture — two same-image VMs on one host then fight over one
-        // absolute path, and exec/harness traffic silently follows the
-        // last binder (the 2026-06-11 cross-session misroute: a teleport
-        // dest, an idle-resume, and a warm-pool refill of one image took
-        // turns stealing each other's channels). Per-sandbox keying makes
-        // the path unique by construction; the unlink below only ever
-        // touches OUR OWN id-keyed path, never a live sibling's.
+        // The load's `vsock_override` re-keys the vsock UDS to this sandbox's
+        // id. The state.bin-embedded path is shared by every VM descended
+        // from one base, so binding it would cross-route siblings' traffic.
         let vsock_uds_path = paths::vsock_uds_path(&self.work_dir, sandbox_id);
         let _ = tokio::fs::remove_file(&vsock_uds_path).await;
 
-        // The UFFD handler was already spawned concurrently in leg 2
-        // (`uffd_leg`); the gate just dials it. File mode loads memory.bin
-        // synchronously; Uffd returns immediately and pages fault lazily.
-        // Either way the VM is running once `load_snapshot*` returns.
-        // ADR 0035 §3: with a pending aux-bundle swap, load PAUSED, patch
-        // each stale drive to the host's current generation (FC reopens the
-        // backing file on PATCH /drives), then resume — the same load-paused
-        // → patch → resume sequence ADR 0014's warm-lease harness swap used
-        // (pinned by `tests/patch_drive_swap.rs`). agentd umount/remounts the
-        // bundle mounts at session bind so the guest's squashfs superblock
-        // re-parses the swapped device. With no swap pending, keep the
-        // single-call load-and-resume.
-        // ADR 0048 (load-test finding): install the SHARED, FC-embedded
-        // `source_rootfs_canonical` rootfs symlink pointing at OUR device, and
-        // hold a per-source-path lock ACROSS the load below so a concurrent
-        // same-base restore can't repoint it between our install and FC opening
-        // the rootfs fd (that repoint → FC opens the WRONG device; the racing
-        // install → "/dev/nbdN: File exists" 503). The per-NEW-sandbox
-        // `canonical` was already installed in leg 1 (unique, uncontended).
-        // Scoped to the load only: UFFD load returns in ~ms, so this serializes
-        // just the FD-open instant — the netns/spawn/cold chunk-fetch above all
-        // ran concurrently. Distinct bases use distinct paths and never contend.
+        // With an aux swap pending the load leaves the VM paused, each stale
+        // drive is patched (FC reopens the backing file), then the VM
+        // resumes; otherwise one call loads and resumes.
+        //
+        // The state.bin-embedded `source_rootfs_canonical` path is shared by
+        // every VM descended from one base. Point it at OUR device under a
+        // per-path lock held across the load, the instant FC opens the fd;
+        // a concurrent same-base restore would otherwise repoint it first.
         let uniq_canonical = paths::rootfs_canonical(&self.work_dir, sandbox_id);
-        let _src_canon_guard = match (
-            manifest.source_rootfs_canonical.as_ref(),
-            manifest.spec.rootfs_source.as_ref(),
-        ) {
-            (Some(src), Some(target)) if src.as_path() != uniq_canonical.as_path() => {
+        let _src_canon_guard = match manifest.source_rootfs_canonical.as_ref() {
+            Some(src) if src.as_path() != uniq_canonical.as_path() => {
+                let target = &disks.root;
                 let guard = source_canonical_lock(src).lock_owned().await;
                 if let Some(parent) = src.parent() {
                     tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -3510,9 +3339,6 @@ impl FirecrackerBackend {
                     };
                     tracing::Instrument::instrument(
                         async {
-                            // ADR 0028: restored VMs re-arm dirty
-                            // tracking here (no machine-config PUT on
-                            // the restore path).
                             *load_started = true;
                             api.load_snapshot_opts(
                                 &paths,
@@ -3527,13 +3353,9 @@ impl FirecrackerBackend {
                     .await?;
                 }
                 Some((handler, uffd_uds)) => {
-                    // ADR 0045 C2 load gates: in post-copy mode the
-                    // handler binds its UDS only once SEALED, and
-                    // state.bin lands only once the fetch poller pulls
-                    // it from the captured source. Wait for both (the
-                    // blackout-side budget: capture + fetch; generous —
-                    // a timeout tears the restore down via the normal
-                    // failure path and the coordinator aborts the move).
+                    // Post-copy: the handler binds its UDS once sealed and
+                    // state.bin lands once fetched from the source. Wait for
+                    // both.
                     if post_copy {
                         let budget = Duration::from_secs(240);
                         let started = std::time::Instant::now();
@@ -3549,13 +3371,9 @@ impl FirecrackerBackend {
                                 break;
                             }
                             if started.elapsed() > budget {
-                                // The "postcopy-never-loaded" marker is
-                                // LOAD-BEARING: the coordinator's abort-
-                                // to-source arm keys on it (the timeout
-                                // PRECEDES the FC load, so the dest
-                                // provably never ran this state and an
-                                // un-pause of the source is zero-loss
-                                // sound).
+                                // Before the load: the wrapper classifies
+                                // this as never-loaded, so the coordinator
+                                // can resume the source without loss.
                                 return Err(SandboxError::Snapshot(format!(
                                     "load gate timed out after {budget:?} \
                                  (uds: {}, state.bin: {})",
@@ -3563,10 +3381,7 @@ impl FirecrackerBackend {
                                     state_path.exists(),
                                 )));
                             }
-                            // 2 ms: a file-existence check is ~µs and
-                            // this wait sits inside the guest-observed
-                            // blackout — the old 25 ms grain was pure
-                            // tax.
+                            // This wait is inside the guest-observed blackout.
                             tokio::time::sleep(Duration::from_millis(2)).await;
                         }
                         tracing::info!(
@@ -3575,10 +3390,8 @@ impl FirecrackerBackend {
                             "post-copy load gate open (sealed + state.bin staged)",
                         );
                     }
-                    // ADR 0045 substrate: same canonical ref as the handler
-                    // spawn (D4: the image base manifest when supplied, else
-                    // the session manifest), so the derived base path always
-                    // matches the handler's.
+                    // The same canonical ref as the handler spawn, so the
+                    // derived base path matches the handler's.
                     let base = base_memory_manifest
                         .or(manifest.memory_manifest)
                         .and_then(|r| self.uffd_base_path(&r));
@@ -3599,10 +3412,6 @@ impl FirecrackerBackend {
                         tracing::info_span!("fc.load_snapshot", mode = "uffd"),
                     )
                     .await?;
-                    // Restore-tail attribution (blackout-critical on a
-                    // post-copy dest: the load demand-faults early
-                    // guest pages through the handler → P2P, and the
-                    // resume rides this call when no aux swap runs).
                     tracing::info!(
                         sandbox_id = %sandbox_id,
                         load_ms = t_load.elapsed().as_millis() as u64,
@@ -3632,99 +3441,40 @@ impl FirecrackerBackend {
             Ok(())
         }
         .await;
-        // FC has opened the rootfs fd (load returned); the shared path is free
-        // for the next same-base restore. Release before the post-load work.
+        // FC holds the fds; the shared paths are free for the next restore.
         drop(_src_canon_guard);
         drop(swap_restore);
 
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
-            Err(e) => {
-                // Snapshot load failed. Issue #197: the still-armed
-                // `fc_guard` / `uffd_guard` SIGKILL FC + the handler, and
-                // `netns_guard` tears down the per-VM netns + frees the SNAT
-                // slot — all on this early-return drop (ADR 0044 K2). No
-                // manual cleanup needed.
-                return Err(e);
-            }
+            // The armed guards reap FC, the handler, and the netns.
+            Err(e) => return Err(e),
         };
 
-        // ADR 0018 §12p: re-anchor the harness drive onto THIS restored
-        // sandbox's id. FC's `load_snapshot` just reopened the harness
-        // virtio-blk drive at the path `state.bin` embedded — the
-        // snapshot's ANCESTOR id, never this fresh restored id, and
-        // nothing re-points it. Left alone, the next `snapshot()`
-        // recomputes `source_harness_canonical` from the new live id
-        // (see the stamp below in `snapshot`) and diverges from the
-        // embedded path, so the FOLLOWING restore can't find the harness
-        // backing file ("No such file or directory
-        // harness/<ancestor>.ext4") — the harness-drive analog of the
-        // 12o rootfs/vsock bug, prod-found via session 3e692ab6 driven
-        // through two idle-evict→resume hops. Re-pointing here makes the
-        // embedded path track the live id (so the recompute stays
-        // ADR 0021 P1.5: no harness drive to repoint — the harness
-        // travels in the rootfs now. The repoint_harness_drive PATCH
-        // path can also retire once nothing else gates on it.
-
-        // Carry the manifest's spec forward so SandboxState reflects
-        // what the snapshot was taken from. rootfs_path mirrors what
-        // the original VM had attached — Firecracker reopens that
-        // path on load, so it must still be valid on disk.
-        let rootfs_path = manifest.spec.rootfs_source.clone().unwrap_or_default();
-        // `vsock_uds_path` was re-keyed to THIS sandbox's id before the
-        // load (the fork's `vsock_override` rewrote the device state, so
-        // FC bound it — NOT the `source_vsock_canonical` ancestor path
-        // that PUT /vsock's post-load 400 used to force us to inherit).
-        // The manifest's `source_vsock_canonical` is lineage metadata
-        // only from here on.
+        // The host-side accept loops that served the source VM died with
+        // it; the guest's post-resume reconnects need new ones.
         let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
-        // Re-spawn the harness accept loop for the restored VM at the
-        // re-keyed base. The host-side accept loop that originally bound
-        // `<uds>_1026` died with the pre-snapshot sandbox (or never
-        // existed on this host). Without this, the in-VM adapter's
-        // post-resume reconnect dial finds no listener.
         self.spawn_harness_listener(sandbox_id, &vsock_uds_path)
             .await?;
-        // ADR 0023: forge bridge accept loop, alongside the harness one.
         self.spawn_forge_listener(sandbox_id, &vsock_uds_path)
             .await?;
-        // ADR 0026: artifact-upload bridge accept loop.
         self.spawn_upload_listener(sandbox_id, &vsock_uds_path)
             .await?;
         let state = SandboxState {
-            // ADR 0035: `live_spec` reflects any aux-bundle swap above, so a
-            // later `snapshot()` of this sandbox pins the generation that's
-            // actually attached.
             spec: live_spec,
             firecracker_socket: socket,
-            rootfs_path,
+            rootfs_path: disks.root,
             vsock_cid,
             vsock_uds_path,
-            // Restore inherits state.bin's embedded root-drive path —
-            // `load_snapshot` reopens the drive at whatever the
-            // snapshotting VM had, and we never re-point it. That path
-            // is `manifest.source_rootfs_canonical` (which
-            // `restore_canonical_symlinks` recreated → live backing).
-            // Carry it forward so a re-snapshot of THIS sandbox stamps
-            // the path FC actually has open, not one recomputed from
-            // the fresh live id. Fallback to the own-id canonical for
-            // legacy snapshots that predate the field.
+            // FC reopened the root and swap drives at the state.bin-embedded
+            // paths; a re-snapshot of this sandbox stamps what FC has open.
             rootfs_canonical: manifest
                 .source_rootfs_canonical
                 .clone()
                 .unwrap_or_else(|| paths::rootfs_canonical(&self.work_dir, sandbox_id)),
-            // ADR 0112: same inherit-the-embedded-path contract for the
-            // swap drive; the symlink at that path was re-pointed at
-            // OUR fresh backing file before the load.
             swap_canonical: manifest.source_swap_canonical.clone(),
-            // ADR 0045 C2: what the guest RAM is a private mapping of.
-            // File mode maps the snapshot's memfile; Uffd mode maps the
-            // substrate base derived exactly as the load did (D4: the
-            // image base when the coordinator supplied it, else the
-            // session manifest).
-            // Recorded in the form `/proc/<pid>/maps` prints (absolute,
-            // symlinks resolved): a relative or symlinked work dir would
-            // otherwise never match the mapping.
+            // What guest RAM is a private mapping of, in the absolute,
+            // symlink-resolved form `/proc/<pid>/maps` prints.
             memory_backing: match restore_mode {
                 RestoreMode::File => Some(mem_path.clone()),
                 RestoreMode::Uffd => base_memory_manifest
@@ -3733,16 +3483,10 @@ impl FirecrackerBackend {
             }
             .map(canonical_backing_path),
         };
-        // ADR 0009 §4: supervisor watches restored FC + (optional)
-        // UFFD handler. The UFFD handler is critical — if it dies
-        // mid-restore the FC process page-faults forever; we want
-        // the entry pruned so reconcile transitions the session.
         let fc_pid = child.id();
         let uffd_pid = uffd_handler.as_ref().and_then(|c| c.id());
-        // Restore path: agentd was captured already-running in the
-        // snapshot. It won't dial the ready port on resume (no
-        // startup happens). Pre-set the watch to true so start_agent
-        // proceeds immediately to SpawnHarness.
+        // agentd was captured running: it never dials the ready port, so
+        // the watch starts true.
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
         // Persist the role while all restore guards remain armed. A failed
         // write must kill the processes and release the network namespace.
@@ -3766,9 +3510,8 @@ impl FirecrackerBackend {
                     }),
                 post_copy.then_some(sandbox_manifest::ROLE_POST_COPY_DEST),
             )?;
-            // ADR 0044 K2: move FC AND the uffd handler (Uffd mode) into the
-            // node cgroup — both must survive a host-agent pod restart, or a
-            // killed handler leaves the restored guest page-faulting forever.
+            // Both must survive a host-agent restart: a killed handler
+            // leaves the guest page-faulting forever.
             let mut pids = vec![fc_pid_u];
             pids.extend(uffd_pid);
             place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
@@ -4006,7 +3749,7 @@ fn source_canonical_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 async fn restore_canonical_symlinks(
     work_dir: &Path,
     new_sandbox_id: SandboxId,
-    manifest: &FcSnapshotManifest,
+    rootfs_target: &Path,
 ) -> Result<(), SandboxError> {
     for parent in paths::canonical_parent_dirs(work_dir) {
         tokio::fs::create_dir_all(&parent).await.map_err(|e| {
@@ -4016,50 +3759,27 @@ async fn restore_canonical_symlinks(
             ))
         })?;
     }
-    if let Some(rootfs_target) = manifest.spec.rootfs_source.as_ref() {
-        // The host's own canonical-path symlink, keyed by the NEW
-        // live sandbox_id. This is what `snapshot(new_sandbox_id)`'s
-        // `assert_rootfs_canonical` checks, so a restored sandbox can
-        // be re-snapshotted (operator-evac / drain) just like a
-        // cold-created one.
-        let canonical = paths::rootfs_canonical(work_dir, new_sandbox_id);
-        paths::install_symlink(&canonical, rootfs_target)
-            .await
-            .map_err(|e| {
-                vm_err(format!(
-                    "restore rootfs canonical symlink {} -> {}: {e}",
-                    canonical.display(),
-                    rootfs_target.display()
-                ))
-            })?;
-        // ADR 0014 M1.11: cross-host restore. FC's state.bin embeds
-        // whatever path the bake's PUT /drives used as `path_on_host`
-        // — that's the bake's `tempfile::tempdir()/rootfs/<src>.dev`,
-        // which doesn't exist on the receiver. If the bake recorded
-        // its canonical path on the manifest, recreate the file there
-        // too (mkdir parent + symlink) so FC `load_snapshot` finds
-        // the drive at the absolute path it expects.
-        // NOTE: the SHARED `source_rootfs_canonical` symlink (the state.bin-
-        // embedded path, identical across every VM descended from one base) is
-        // installed by `restore_in_jail` under a per-source-path lock held only
-        // across `load_snapshot` — NOT here. Doing it here, off the lock, let
-        // same-base concurrent restores race it (TOCTOU `EEXIST` 503 + cross-VM
-        // repoint). This function only installs the per-NEW-sandbox `canonical`
-        // above, which is unique and never contended.
-    }
-    // Vsock: nothing to recreate. The load passes `vsock_override`
-    // keyed to the NEW live sandbox id, so FC never binds the
-    // state.bin-embedded ancestor path. The old arm here unlinked
-    // `source_vsock_canonical` pre-load — on a host where a same-image
-    // sibling VM was LIVE on that shared path, that unlink stole its
-    // socket (the 2026-06-11 cross-session misroute). Deliberately
-    // gone; the per-sandbox path's stale-file unlink happens at the
-    // load site in `restore_in_jail`.
-    // ADR 0021 P1.5: no harness canonical symlink to restore — the
-    // harness binary lives in the rootfs at the manifest-declared
-    // `[harness] exec` path, so there's nothing for the host to
-    // re-point.
-
+    // The host's own canonical-path symlink, keyed by the NEW
+    // live sandbox_id. This is what `snapshot(new_sandbox_id)`'s
+    // `assert_rootfs_canonical` checks, so a restored sandbox can
+    // be re-snapshotted (operator-evac / drain) just like a
+    // cold-created one.
+    let canonical = paths::rootfs_canonical(work_dir, new_sandbox_id);
+    paths::install_symlink(&canonical, rootfs_target)
+        .await
+        .map_err(|e| {
+            vm_err(format!(
+                "restore rootfs canonical symlink {} -> {}: {e}",
+                canonical.display(),
+                rootfs_target.display()
+            ))
+        })?;
+    // The SHARED `source_rootfs_canonical` symlink (the state.bin-embedded
+    // path, identical across every VM descended from one base) is installed
+    // by `restore_in_jail` under a per-source-path lock held across
+    // `load_snapshot`, never here: off the lock, same-base concurrent
+    // restores race it. Vsock needs no symlink: the load passes
+    // `vsock_override` keyed to the new sandbox id.
     Ok(())
 }
 
@@ -5561,10 +5281,16 @@ impl SandboxBackend for FirecrackerBackend {
         FirecrackerClient::new(&socket).resume().await
     }
 
-    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
+    ) -> Result<(), SandboxError> {
         self.restore_with(
             id,
             metadata,
+            disks,
             /*swap_aux_to_current=*/ false,
             Vec::new(),
         )
@@ -5575,6 +5301,7 @@ impl SandboxBackend for FirecrackerBackend {
         &self,
         id: SandboxId,
         metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
         selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
@@ -5583,6 +5310,7 @@ impl SandboxBackend for FirecrackerBackend {
         self.restore_with(
             id,
             metadata,
+            disks,
             /*swap_aux_to_current=*/ true,
             selected_mounts,
         )
@@ -7346,6 +7074,7 @@ impl FirecrackerBackend {
             // dev/test paths don't need a chunk-store wiring.
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             // ADR 0014: portable-snapshot fields are populated by
             // `PooledBackend::snapshot` after the inner backend
@@ -7622,6 +7351,13 @@ mod tests {
     /// paths point at non-existent files so `create()` fails early at
     /// spec validation rather than trying to spawn anything. The
     /// integration test in `tests/lifecycle.rs` exercises the real path.
+    fn test_disks() -> Option<SessionDisks> {
+        Some(SessionDisks {
+            root: PathBuf::from("/dev/null"),
+            swap: None,
+        })
+    }
+
     fn backend() -> (FirecrackerBackend, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = FirecrackerConfig {
@@ -7888,6 +7624,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -7897,7 +7634,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        match b.restore(SandboxId::new(), metadata).await {
+        match b.restore(SandboxId::new(), metadata, test_disks()).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("manifest"),
@@ -7962,10 +7699,13 @@ mod tests {
                     &work.path().join("jail"),
                     work.path(),
                     &manifest,
-                    false,
-                    Vec::new(),
-                    RestoreMode::File,
-                    None,
+                    RestoreInputs {
+                        disks: test_disks().unwrap(),
+                        swap_aux_to_current: false,
+                        selected_mounts: Vec::new(),
+                        restore_mode: RestoreMode::File,
+                        base_memory_manifest: None,
+                    },
                 )
                 .await
                 .unwrap_err();
@@ -8050,6 +7790,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -8059,7 +7800,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        match b.restore(SandboxId::new(), metadata).await {
+        match b.restore(SandboxId::new(), metadata, test_disks()).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("not 'fc'") && msg.contains("cross-VMM"),

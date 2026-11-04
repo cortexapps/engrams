@@ -10,11 +10,8 @@ pub struct SnapshotMetadata {
     pub created_at: DateTime<Utc>,
     /// Image version the source sandbox was launched from.
     pub image_version: String,
-    /// ADR 0007: content-addressed manifest pointing at the disk's
-    /// chunks in `BlobStorage`, captured at snapshot time. `None`
-    /// for backends that haven't wired chunk-store snapshot yet
-    /// (FC; lights up with Phase 4's NBD work). `Some` for VZ on
-    /// macOS once a `ChunkStore` is attached to its config.
+    /// The root disk's chunk-store manifest, captured at snapshot
+    /// time. `None` only for a backend with no chunk store.
     #[serde(default)]
     pub disk_manifest: Option<super::manifest::ManifestRef>,
     /// ADR 0007: content-addressed manifest pointing at the
@@ -120,6 +117,12 @@ pub struct SnapshotMetadata {
     /// Chunked swap device captured with this snapshot.
     #[serde(default)]
     pub swap_manifest: Option<super::manifest::ManifestRef>,
+    /// The disk manifest of the image this session started from. A
+    /// host that has the image staged writes only the difference
+    /// between it and `disk_manifest` when it restores. `None` stages
+    /// the whole disk.
+    #[serde(default)]
+    pub base_disk_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Persisted row in the `snapshots` table.

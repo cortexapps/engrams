@@ -197,7 +197,10 @@ async fn post_copy_restore_persists_role_before_list() {
     // File restore isolates the manifest transaction from peer transport.
     let backend = FirecrackerBackend::new(work.path(), cfg);
     let source = SandboxId::new();
-    backend.create(source, test_spec(rootfs)).await.unwrap();
+    backend
+        .create(source, test_spec(rootfs.clone()))
+        .await
+        .unwrap();
     let snapshot = backend.snapshot(source).await.unwrap();
     backend.destroy(source).await.unwrap();
     std::fs::write(
@@ -208,7 +211,7 @@ async fn post_copy_restore_persists_role_before_list() {
     )
     .unwrap();
     let id = SandboxId::new();
-    let restore = backend.restore(id, snapshot);
+    let restore = backend.restore(id, snapshot, common::disks(&rootfs));
     tokio::pin!(restore);
     loop {
         tokio::select! {

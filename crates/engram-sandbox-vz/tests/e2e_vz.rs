@@ -1,46 +1,30 @@
-//! Live end-to-end lifecycle test for the VZ (Virtualization.framework)
-//! backend. Exercises the real prod-shape path through `VzBackend` on an
-//! actual booting microVM and locks in the parity fixes from ADR 0032 +
-//! ADR 0096:
-//!
-//!   - agentd exec over the real vsock transport (ADR 0066 Phase 2),
-//!   - the ADR 0080 boot contract — agentd is NOT baked into the rootfs;
-//!     the stage-1 init shim execs it out of its reserved bundle slot,
-//!     resolved from the staged `current.json` exactly like real sessions,
-//!   - durable snapshots — a guest write with NO explicit `sync` survives a
-//!     snapshot → cold-boot restore (the `flush_guest_fs` / agentd `Sync` RPC),
-//!   - cold-boot restore from a clone-snapshot,
-//!   - the SHELL tab — `start_shell` forwards to agentd's `StartShell` so ttyd
-//!     (from the guest-tools bundle slot) is actually spawned,
-//!   - the vsock port relay reaching guest loopback without head-of-line
-//!     blocking (ADR 0066).
+//! Live end-to-end tests for the VZ backend on a real booting microVM:
+//! agentd exec over vsock, the boot contract (agentd comes from its
+//! reserved bundle slot, resolved from the staged `current.json`),
+//! snapshot and warm or cold restore of caller-provided disks, the SHELL
+//! tab, the port relay, egress steering, crash detection, pause and
+//! resume, the forge credential broker, and the browser bundle.
 //!
 //! # Gating
 //!
-//! macOS-only (`cfg`) and `#[ignore]` by default. **`just vz-e2e` stages
-//! everything from HEAD and runs this in one command** (ADR 0096) — kernel,
-//! bundles, a fresh Docker-free rootfs (Alpine minirootfs + the real init
-//! shim, packed by mkext4/ADR 0093), codesigned binaries. The env contract:
+//! macOS-only and `#[ignore]` by default. `just vz-e2e` stages everything
+//! and runs the suite. The env contract:
 //!
 //!   - `ENGRAM_VZ_KERNEL_PATH` (or `~/.cache/engram-vz-test/vmlinux-arm64`,
 //!     populated by `just pull-kernel`),
-//!   - `ENGRAM_VZ_ROOTFS` — a bootable arm64 ext4 whose init is the ADR 0080
-//!     stage-1 shim (`make-test-rootfs.sh`, or any materialized session
-//!     image); agentd itself must NOT be baked in,
-//!   - `ENGRAM_VZ_BUNDLE_DIR` — a staged bundle dir (`<sha>.squashfs` files +
-//!     `current.json` carrying at least the `agentd` and `guest-tools`
+//!   - `ENGRAM_VZ_ROOTFS`: a bootable arm64 ext4 whose init is the stage-1
+//!     shim (`make-test-rootfs.sh`, or any materialized session image);
+//!     agentd itself must NOT be baked in,
+//!   - `ENGRAM_VZ_BUNDLE_DIR`: a staged bundle dir (`<sha>.squashfs` files
+//!     and a `current.json` with at least the `agentd` and `guest-tools`
 //!     keys; `just vz-test-bundles` produces the minimal set),
-//!   - `ENGRAM_VZ_REQUIRE=1` (optional) — turn every preflight SKIP into a
-//!     hard failure. CI sets this so the lane can never silently regress
-//!     back to skip-and-green (ADR 0096).
+//!   - `ENGRAM_VZ_REQUIRE=1` (optional): every preflight SKIP becomes a
+//!     hard failure. CI sets it so the lane cannot pass vacuously.
 //!
-//! Missing kernel/rootfs/bundles otherwise skip cleanly (prints `SKIP:` and
-//! returns), mirroring `fc_preflight`.
-//!
-//! The skill/browser variants additionally need `ENGRAM_VZ_SKILL_SQUASHFS`
-//! (a Docker-built bundle staged into the SAME dir as
-//! `ENGRAM_VZ_BUNDLE_DIR`) and a glibc rootfs for the browser stack — they
-//! stay soft-skips even under `ENGRAM_VZ_REQUIRE`.
+//! The skill and browser variants also need `ENGRAM_VZ_SKILL_SQUASHFS` (a
+//! Docker-built bundle staged into the same dir as `ENGRAM_VZ_BUNDLE_DIR`)
+//! and a glibc rootfs for the browser stack; they stay soft skips even
+//! under `ENGRAM_VZ_REQUIRE`.
 
 #![cfg(target_os = "macos")]
 
@@ -51,8 +35,9 @@ use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{
-    AuxRoDrive, CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
+    AuxRoDrive, CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec, SessionDisks,
 };
+use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxId;
 use engram_harness_proto::{
     read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, RelayAck, RelayConnect,
@@ -68,9 +53,8 @@ struct VzEnv {
     bundle_dir: PathBuf,
 }
 
-/// ADR 0096: a failed preflight is a clean SKIP locally, a hard failure
-/// under `ENGRAM_VZ_REQUIRE=1` (CI) — the exact mechanism that let the
-/// live suite pass vacuously for weeks is gone.
+/// A failed preflight is a clean SKIP locally and a hard failure under
+/// `ENGRAM_VZ_REQUIRE=1`.
 fn skip(msg: &str) {
     if std::env::var("ENGRAM_VZ_REQUIRE").as_deref() == Ok("1") {
         panic!("ENGRAM_VZ_REQUIRE=1: {msg}");
@@ -130,27 +114,51 @@ fn vz_preflight() -> Option<VzEnv> {
     })
 }
 
-fn backend(env: &VzEnv, work: &Path, with_chunks: bool) -> VzBackend {
-    let b = VzBackend::new(
+fn backend(env: &VzEnv, work: &Path) -> VzBackend {
+    VzBackend::new(
         work.join("sb"),
         VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(env.bundle_dir.clone()),
     )
-    .expect("VzBackend::new");
-    if with_chunks {
-        let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
-            work.join("blob"),
-        ));
-        b.with_chunk_store(engram_chunk_store::ChunkStore::new(blob))
-    } else {
-        b
-    }
+    .expect("VzBackend::new")
 }
 
-/// ADR 0080/0096: every live spec carries the symbolic agentd +
-/// guest-tools reserved slots — `resolve_agentd_slot` resolves them
-/// against the staged `current.json`, the same path real sessions take.
-/// There is no other way to boot: the init shim panics the kernel when
-/// no agentd bundle is mounted.
+/// The disk owner's job, emulated: each sandbox boots its own writable
+/// copy of the staged rootfs (an APFS clone, through `fs::copy`).
+fn session_rootfs(env: &VzEnv, work: &Path, id: SandboxId) -> PathBuf {
+    let path = work.join(format!("{id}.ext4"));
+    std::fs::copy(&env.rootfs, &path).expect("copy rootfs");
+    path
+}
+
+fn disks(root: &Path) -> Option<SessionDisks> {
+    Some(SessionDisks {
+        root: root.to_path_buf(),
+        swap: None,
+    })
+}
+
+/// The disk owner's capture protocol, emulated: flush the guest fs,
+/// pause, copy the disk, save the machine state, resume. Returns the
+/// metadata and the disk copy a restore attaches.
+async fn snapshot_with_disk(
+    b: &VzBackend,
+    id: SandboxId,
+    rootfs: &Path,
+    work: &Path,
+) -> (SnapshotMetadata, PathBuf) {
+    let (_, code) = exec(b, id, "sync").await;
+    assert_eq!(code, Some(0), "guest sync");
+    b.pause(id).await.expect("pause");
+    let copy = work.join(format!("snap-{id}.ext4"));
+    std::fs::copy(rootfs, &copy).expect("copy disk");
+    let meta = b.snapshot(id).await.expect("snapshot");
+    b.resume(id).await.expect("resume");
+    (meta, copy)
+}
+
+/// Every live spec carries the symbolic agentd and guest-tools reserved
+/// slots, resolved against the staged `current.json` as real sessions
+/// are. The init shim panics the kernel when no agentd bundle is mounted.
 fn spec(rootfs: &Path) -> SandboxSpec {
     SandboxSpec {
         image: "engram-e2e-vz".into(),
@@ -174,11 +182,9 @@ fn spec(rootfs: &Path) -> SandboxSpec {
     }
 }
 
-/// ADR 0061/0096: resolve a staged skill bundle (`ENGRAM_VZ_SKILL_SQUASHFS`,
-/// pointing at a `<bundle_dir>/<sha>.squashfs` produced by
-/// `just bundles-squashfs`) into its sha. Always a soft skip when
-/// unset/missing — the skill/browser bundles are Docker-built, which the
-/// CI runner can't produce.
+/// Resolve `ENGRAM_VZ_SKILL_SQUASHFS` (a `<bundle_dir>/<sha>.squashfs`)
+/// into its sha. A soft skip when unset or missing: the skill and browser
+/// bundles are Docker-built, which the CI runner cannot produce.
 fn skill_bundle_preflight(env: &VzEnv) -> Option<String> {
     let path = match std::env::var("ENGRAM_VZ_SKILL_SQUASHFS") {
         Ok(p) => PathBuf::from(p),
@@ -268,10 +274,9 @@ async fn await_agent(backend: &VzBackend, id: SandboxId) {
     }
 }
 
-/// ADR 0112 VZ parity: a spec with `swap_mib` boots with exactly one
-/// writable non-vda virtio disk of that size, agentd arms it at boot
-/// (mkswap + swapon + vm.swappiness), and destroy removes the backing
-/// file. Checks the VZ swap attach path.
+/// A spec with `swap_mib` and a swap disk boots with exactly one writable
+/// non-vda virtio disk of that size, and agentd arms it at boot (mkswap +
+/// swapon + vm.swappiness).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_swap_drive_arms() {
@@ -280,11 +285,16 @@ async fn e2e_vz_swap_drive_arms() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), false);
+    let backend = backend(&env, work.path());
 
-    let mut s = spec(&env.rootfs);
-    s.swap_mib = Some(64);
     let id = SandboxId::new();
+    let mut s = spec(&session_rootfs(&env, work.path(), id));
+    s.swap_mib = Some(64);
+    let swap = work.path().join("swap.img");
+    std::fs::File::create(&swap)
+        .and_then(|f| f.set_len(64 * 1024 * 1024))
+        .expect("sparse swap");
+    s.swap_source = Some(swap);
     backend.create(id, s).await.expect("create with swap");
     await_agent(&backend, id).await;
 
@@ -325,24 +335,7 @@ async fn e2e_vz_swap_drive_arms() {
     }
     let (swappiness, _) = exec(&backend, id, "cat /proc/sys/vm/swappiness").await;
     assert_eq!(swappiness.trim(), "100", "vm.swappiness applied");
-
-    // Destroy removes the per-sandbox backing file (the backend's
-    // work_dir is `<work>/sb` — see `backend()` above). Unlike FC's
-    // unlinked-after-attach backing this file keeps its name for the
-    // VM's lifetime, so its mode must be 0600 regardless of umask —
-    // it holds guest memory in plaintext.
-    let swap_backing = work.path().join("sb").join(format!("{id}.swap.img"));
-    assert!(swap_backing.exists(), "backing exists while running");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&swap_backing)
-            .expect("backing metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "swap backing must be private");
-    }
     backend.destroy(id).await.expect("destroy");
-    assert!(!swap_backing.exists(), "backing removed at destroy");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -353,51 +346,42 @@ async fn e2e_vz_lifecycle() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), true);
+    let backend = backend(&env, work.path());
 
-    // 1. Boot + exec over the real vsock transport (ADR 0066 Phase 2; ADR
-    //    0032 #3: exec must answer promptly, not 90s later — the ready-port
-    //    drain listener keeps the guest handshake from stalling). The boot
-    //    itself proves the ADR 0080 contract: agentd came out of its
-    //    bundle slot, resolved from current.json.
+    // 1. Boot and exec over vsock.
     let id = SandboxId::new();
-    backend.create(id, spec(&env.rootfs)).await.expect("create");
+    let rootfs = session_rootfs(&env, work.path(), id);
+    backend.create(id, spec(&rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo hello-vz && uname -m").await;
     assert_eq!(code, Some(0), "exec exit; out={out}");
     assert!(out.contains("hello-vz"), "exec stdout: {out}");
 
-    // 2. SHELL tab (ADR 0032 #5): start_shell must spawn ttyd (from the
-    //    guest-tools bundle slot — the rootfs bakes no ttyd) and return
-    //    its port, not the trait-default-7681-without-a-listener.
+    // 2. SHELL tab: start_shell spawns ttyd from the guest-tools slot (the
+    //    rootfs bakes no ttyd) and returns its port.
     let port = backend
         .start_shell(id)
         .await
         .expect("start_shell spawns ttyd");
     assert_eq!(port, 7681, "ttyd default port");
 
-    // 3. Durable snapshot (ADR 0032 #4): write with NO sync, snapshot, restore,
-    //    read it back. Without the pre-clone guest flush this is lost.
+    // 3. Durable snapshot: write, snapshot, restore, read it back.
     let (_, code) = exec(&backend, id, "echo durable-payload > /root/z.txt").await;
     assert_eq!(code, Some(0));
-    let meta = backend.snapshot(id).await.expect("snapshot");
-    assert!(
-        meta.disk_manifest.is_some(),
-        "VZ snapshot must chunk a disk manifest"
-    );
+    let (meta, disk) = snapshot_with_disk(&backend, id, &rootfs, work.path()).await;
     backend.destroy(id).await.expect("destroy");
 
     let id2 = SandboxId::new();
     backend
-        .restore(id2, meta)
+        .restore(id2, meta, disks(&disk))
         .await
-        .expect("restore (cold-boot)");
+        .expect("restore");
     await_agent(&backend, id2).await;
     let (out, code) = exec(&backend, id2, "cat /root/z.txt").await;
     assert_eq!(code, Some(0), "post-restore read; out={out}");
     assert!(
         out.contains("durable-payload"),
-        "un-synced write must survive snapshot→restore (flush_guest_fs); got: {out:?}",
+        "write must survive snapshot→restore; got: {out:?}",
     );
     backend.destroy(id2).await.expect("destroy 2");
 }
@@ -414,17 +398,20 @@ async fn e2e_vz_skill_bundle_attaches() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), true);
+    let backend = backend(&env, work.path());
 
     let id = SandboxId::new();
     backend
-        .create(id, spec_with_skill(&env.rootfs, &sha))
+        .create(
+            id,
+            spec_with_skill(&session_rootfs(&env, work.path(), id), &sha),
+        )
         .await
         .expect("create");
     await_agent(&backend, id).await;
 
-    // Attach order is slot-ascending (ADR 0062), so the skill (slot 0)
-    // is the FIRST aux drive: /dev/vdb (after the /dev/vda rootfs).
+    // Attach order is slot-ascending, so the skill (slot 0) is the first
+    // aux drive: /dev/vdb (after the /dev/vda rootfs).
     // RO-mount it and read the bundle's mount.json to prove the attach +
     // the kernel's squashfs driver work end to end (a second RO mount of
     // an already-init-shim-mounted device shares the superblock — fine).
@@ -443,11 +430,9 @@ async fn e2e_vz_skill_bundle_attaches() {
     backend.destroy(id).await.expect("destroy");
 }
 
-/// ADR 0066 Phase 2: the port relay reaches a dev server bound to the
-/// guest's `127.0.0.1` (which a direct dial_ip/eth0 dial can't), and a
-/// persistent forwarded connection does NOT head-of-line block a fresh
-/// one — the property real virtio-vsock gives us that the retired
-/// single-stream-per-port console bridge couldn't.
+/// The port relay reaches a server bound to the guest's `127.0.0.1`, and
+/// a persistent forwarded connection does not head-of-line block a fresh
+/// one.
 ///
 /// Uses the cross-built `vz-e2e-echo` helper `make-test-rootfs.sh` bakes
 /// at /usr/bin (std-only echo + hold-open sink on guest loopback),
@@ -460,10 +445,13 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), false);
+    let backend = backend(&env, work.path());
 
     let id = SandboxId::new();
-    backend.create(id, spec(&env.rootfs)).await.expect("create");
+    backend
+        .create(id, spec(&session_rootfs(&env, work.path(), id)))
+        .await
+        .expect("create");
     await_agent(&backend, id).await;
 
     // Bring loopback up (the relay dials 127.0.0.1; a minimal guest may leave
@@ -492,8 +480,8 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
         "vz-e2e-echo not in the rootfs — stage it via make-test-rootfs.sh; out={out}"
     );
 
-    // 1. Loopback reach (the ADR 0066 regression): round-trip bytes through
-    //    the relay to the 127.0.0.1 echo server.
+    // 1. Loopback reach: round-trip bytes through the relay to the
+    //    127.0.0.1 echo server.
     let mut echo = relay_connect(&backend, id, ECHO).await;
     echo.write_all(b"ping-vz").await.expect("relay write");
     let mut got = [0u8; 7];
@@ -521,12 +509,10 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     backend.destroy(id).await.expect("destroy");
 }
 
-/// ADR 0096 D7: WARM restore — a snapshot→restore round-trip preserves
-/// guest MEMORY, not just disk. The tmpfs marker (/dev/shm — never
-/// touches the virtio-blk disk) is the memory proof: a cold boot loses
-/// it, only a machine-state resume carries it. Also pins the StepClock
-/// path: the resumed guest's frozen CLOCK_REALTIME is host-pushed back
-/// within the threshold.
+/// WARM restore: a snapshot and restore round-trip preserves guest
+/// memory, not just disk. The tmpfs marker is the memory proof: a cold
+/// boot loses it. Also pins StepClock: the resumed guest's frozen clock
+/// is host-pushed back within the threshold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
@@ -535,10 +521,11 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let b = backend(&env, work.path(), true);
+    let b = backend(&env, work.path());
 
     let id = SandboxId::new();
-    b.create(id, spec(&env.rootfs)).await.expect("create");
+    let rootfs = session_rootfs(&env, work.path(), id);
+    b.create(id, spec(&rootfs)).await.expect("create");
     await_agent(&b, id).await;
     let (_, code) = exec(
         &b,
@@ -548,7 +535,7 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
     .await;
     assert_eq!(code, Some(0), "write markers");
 
-    let meta = b.snapshot(id).await.expect("snapshot");
+    let (meta, disk) = snapshot_with_disk(&b, id, &rootfs, work.path()).await;
     let machine_state = work
         .path()
         .join("sb/snapshots")
@@ -573,7 +560,7 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     let id2 = SandboxId::new();
-    b.restore(id2, meta).await.expect("restore");
+    b.restore(id2, meta, disks(&disk)).await.expect("restore");
     await_agent(&b, id2).await;
     let (out, code) = exec(&b, id2, "cat /root/warm.txt /dev/shm/warm.txt").await;
     assert_eq!(code, Some(0), "post-restore read; out={out}");
@@ -602,10 +589,9 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
     b.destroy(id2).await.expect("destroy 2");
 }
 
-/// ADR 0096 D7: the cold-boot FALLBACK. Deleting machine.vzs fails the
-/// warm gate; the restore must cold-boot exactly like pre-D7 — the
-/// un-synced disk write survives (the pre-clone flush property), the
-/// tmpfs marker is gone (fresh memory), and the session is functional.
+/// The cold-boot FALLBACK. Deleting machine.vzs fails the warm gate;
+/// the restore must cold-boot the same disk: the disk write survives,
+/// the tmpfs marker is gone (fresh memory), and the session is functional.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_warm_restore_falls_back_to_cold() {
@@ -614,14 +600,12 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let b = backend(&env, work.path(), true);
+    let b = backend(&env, work.path());
 
     let id = SandboxId::new();
-    b.create(id, spec(&env.rootfs)).await.expect("create");
+    let rootfs = session_rootfs(&env, work.path(), id);
+    b.create(id, spec(&rootfs)).await.expect("create");
     await_agent(&b, id).await;
-    // NO explicit sync — the disk marker's survival across the COLD
-    // path is the flush_guest_fs property this test now carries
-    // (lifecycle's restore leg went warm).
     let (_, code) = exec(
         &b,
         id,
@@ -629,7 +613,7 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
     )
     .await;
     assert_eq!(code, Some(0), "write markers");
-    let meta = b.snapshot(id).await.expect("snapshot");
+    let (meta, disk) = snapshot_with_disk(&b, id, &rootfs, work.path()).await;
     b.destroy(id).await.expect("destroy");
 
     // Fail the warm gate: remove the machine state.
@@ -641,7 +625,9 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
     let _ = std::fs::remove_file(&machine_state);
 
     let id2 = SandboxId::new();
-    b.restore(id2, meta).await.expect("restore (cold fallback)");
+    b.restore(id2, meta, disks(&disk))
+        .await
+        .expect("restore (cold fallback)");
     await_agent(&b, id2).await;
     let (out, code) = exec(
         &b,
@@ -652,7 +638,7 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
     assert_eq!(code, Some(0), "post-fallback read; out={out}");
     assert!(
         out.contains("disk-marker"),
-        "un-synced disk write must survive the cold fallback (flush property): {out}",
+        "disk write must survive the cold fallback: {out}",
     );
     assert!(
         out.contains("TMPFS-GONE"),
@@ -662,14 +648,11 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
     b.destroy(id2).await.expect("destroy 2");
 }
 
-/// ADR 0096 D6: soft egress steering. The backend passes
-/// `ENGRAM_EGRESS=<proxy>:<dns>:<metadata>` on the kernel cmdline; the init shim
-/// derives the NAT gateway from the guest's default route and installs
-/// DNAT rules for tcp/443, {udp,tcp}/53, and the metadata address.
-/// This pins the cmdline → shim → netfilter chain (the test rootfs
-/// carries Alpine's iptables; images without it warn + stay open). The
-/// full traffic path (proxy SNI dial, CA, allow_hosts) is exercised by
-/// `just dev` — the backend-level harness runs no proxy.
+/// Soft egress steering. The backend passes
+/// `ENGRAM_EGRESS=<proxy>:<dns>:<metadata>` on the kernel cmdline; the
+/// init shim installs DNAT rules for tcp/443, {udp,tcp}/53, and the
+/// metadata address. The full traffic path through a proxy is exercised
+/// by `just dev`; this harness runs no proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_egress_steering_installs_guest_redirect() {
@@ -687,7 +670,9 @@ async fn e2e_vz_egress_steering_installs_guest_redirect() {
     .expect("VzBackend::new");
 
     let id = SandboxId::new();
-    b.create(id, spec(&env.rootfs)).await.expect("create");
+    b.create(id, spec(&session_rootfs(&env, work.path(), id)))
+        .await
+        .expect("create");
     await_agent(&b, id).await;
 
     let (out, code) = exec(&b, id, "iptables -t nat -S OUTPUT").await;
@@ -708,14 +693,9 @@ async fn e2e_vz_egress_steering_installs_guest_redirect() {
     b.destroy(id).await.expect("destroy");
 }
 
-/// ADR 0096 (ADR 0009 §4, VZ edition): crash detection. A guest that
-/// stops its VM out from under the host-agent must be noticed eagerly:
-/// the `VZVirtualMachineDelegate` shim flips the dead flag,
-/// `probe_sandbox` reports `process_alive=false` from the flag + a live
-/// `state()` read, and `list()` drops the sandbox so the heartbeat's
-/// `running_sandboxes` reflects ground truth (the coordinator's 3-strike
-/// divergence flip then fires unmodified). Cleanup stays coordinator-
-/// driven — the map entry survives until `destroy`.
+/// Crash detection: a guest that stops its own VM is noticed.
+/// `probe_sandbox` reports `process_alive=false` and `list()` drops the
+/// sandbox; the map entry survives until `destroy`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_crash_detection_marks_dead() {
@@ -724,10 +704,13 @@ async fn e2e_vz_crash_detection_marks_dead() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), false);
+    let backend = backend(&env, work.path());
 
     let id = SandboxId::new();
-    backend.create(id, spec(&env.rootfs)).await.expect("create");
+    backend
+        .create(id, spec(&session_rootfs(&env, work.path(), id)))
+        .await
+        .expect("create");
     await_agent(&backend, id).await;
     let probe = backend.probe_sandbox(id).await.expect("probe");
     assert!(
@@ -763,15 +746,10 @@ async fn e2e_vz_crash_detection_marks_dead() {
         .expect("destroy tolerates an already-stopped VM");
 }
 
-/// ADR 0096: external pause/resume — the coordinator's rung-2 park.
-/// Until ADR 0096 `VzBackend` inherited the trait-default no-ops, so a
-/// park "succeeded" while the guest kept running. Pins:
-///   - pause actually freezes the guest (an exec makes no progress),
-///   - snapshot of a PARKED VM works (the rung-2→3 descent: idempotent
-///     pause + flush skipped) and does NOT un-park as a side effect,
-///   - resume revives the guest and the vsock control channel still
-///     answers (the ADR 0074 lesson from FC: never assume
-///     vsock-survives-resume — pin it).
+/// External pause and resume. Pins:
+///   - pause freezes the guest (an exec makes no progress),
+///   - a snapshot of a paused VM works and does not resume it,
+///   - resume revives the guest and the vsock control channel answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_pause_freezes_and_resume_revives() {
@@ -780,10 +758,13 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), true);
+    let backend = backend(&env, work.path());
 
     let id = SandboxId::new();
-    backend.create(id, spec(&env.rootfs)).await.expect("create");
+    backend
+        .create(id, spec(&session_rootfs(&env, work.path(), id)))
+        .await
+        .expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo pre-pause").await;
     assert_eq!(code, Some(0), "pre-pause exec; out={out}");
@@ -806,8 +787,7 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
 
     // Snapshot of the parked VM (rung-2→3 descent): idempotent pause,
     // flush skipped, and the VM stays parked afterwards.
-    let meta = backend.snapshot(id).await.expect("snapshot of parked VM");
-    assert!(meta.disk_manifest.is_some(), "parked snapshot still chunks");
+    let _meta = backend.snapshot(id).await.expect("snapshot of parked VM");
     let still_frozen = tokio::time::timeout(
         Duration::from_secs(3),
         exec(&backend, id, "echo should-still-not-run"),
@@ -828,21 +808,16 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     backend.destroy(id).await.expect("destroy");
 }
 
-/// ADR 0023/0096: the in-guest forge credential broker over vsock 1028 —
-/// the VZ mirror of FC's `forge_loopback.rs`. Registers a `ForgeSink`
-/// that echoes the broker token back inside the minted password, runs
-/// `engram-agentd forge-credential` inside the guest (the exact helper
-/// git invokes in real sessions), and asserts the round-trip:
+/// The in-guest forge credential broker over vsock 1028. Registers a
+/// `ForgeSink` that echoes the broker token back inside the minted
+/// password, runs `engram-agentd forge-credential` inside the guest (the
+/// helper git invokes in real sessions), and asserts the round-trip:
 ///
 ///   guest `engram-agentd forge-credential`
 ///     → dials AF_VSOCK host:1028
 ///     → VZ vsock bridge listener → our ForgeSink
 ///     → sink reads the `ForgeRequest`, writes a `ForgeResponse`
 ///     → agentd prints the credential password to stdout
-///
-/// Until ADR 0096 the bridge had no 1028 listener and `set_forge_sink`
-/// was the trait-default no-op — this dial died on connection-refused,
-/// silently breaking git-credential brokering on every VZ session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_forge_credential_round_trips() {
@@ -851,7 +826,7 @@ async fn e2e_vz_forge_credential_round_trips() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), false);
+    let backend = backend(&env, work.path());
 
     // Echo the broker token back inside the password so the assertion
     // proves the in-guest env → ForgeRequest plumbing is intact
@@ -882,7 +857,10 @@ async fn e2e_vz_forge_credential_round_trips() {
     backend.set_forge_sink(sink);
 
     let id = SandboxId::new();
-    backend.create(id, spec(&env.rootfs)).await.expect("create");
+    backend
+        .create(id, spec(&session_rootfs(&env, work.path(), id)))
+        .await
+        .expect("create");
     await_agent(&backend, id).await;
 
     // The exec'd helper needs the session env the harness normally
@@ -956,14 +934,9 @@ async fn relay_connect(
     stream
 }
 
-/// ADR 0065 (P4.2): VZ parity for the in-guest browser. Boots a VZ guest with
-/// the **`browser`** bundle attached (`Xvfb` + `openbox` + `chromium` +
-/// `x11vnc` + the `engram-browser` launcher), then calls
-/// [`SandboxBackend::start_browser`] and asserts the bound VNC port — the same
-/// lazy-spawn path the host's `proxy_vnc` drives before dialing the guest's
-/// raw-TCP `:5900`. This mirrors [`e2e_vz_skill_bundle_attaches`] (the ADR 0061
-/// bundle harness) but with the browser bundle and the `start_browser` lazy
-/// spawn instead of a manual mount-and-read.
+/// The in-guest browser. Boots a guest with the `browser` bundle attached
+/// (Xvfb, openbox, chromium, x11vnc, the launcher), calls
+/// [`SandboxBackend::start_browser`], and asserts the bound VNC port.
 ///
 /// Point `ENGRAM_VZ_SKILL_SQUASHFS` at the **browser** bundle's
 /// `<bundle_dir>/<sha>.squashfs` (built by `just bundles-squashfs`). NB: the browser
@@ -991,11 +964,14 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = backend(&env, work.path(), true);
+    let backend = backend(&env, work.path());
 
     let id = SandboxId::new();
     backend
-        .create(id, spec_with_skill(&env.rootfs, &sha))
+        .create(
+            id,
+            spec_with_skill(&session_rootfs(&env, work.path(), id), &sha),
+        )
         .await
         .expect("create");
     await_agent(&backend, id).await;

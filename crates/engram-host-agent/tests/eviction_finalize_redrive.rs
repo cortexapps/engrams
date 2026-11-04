@@ -337,6 +337,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         disk_manifest: checkpoint.disk_manifest,
         memory_manifest: Some(memory_manifest),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -349,7 +350,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     };
     let restored = SandboxId::new();
     pooled_b
-        .restore(restored, metadata)
+        .restore(restored, metadata, None)
         .await
         .expect("restore from the redriven eviction-final checkpoint");
     let out = exec(

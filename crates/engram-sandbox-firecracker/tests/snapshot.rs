@@ -124,7 +124,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // Step 6: restore from the snapshot — gets a *new* sandbox id
     let restored_id = SandboxId::new();
     backend
-        .restore(restored_id, metadata.clone())
+        .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
         .await
         .expect("restore");
     assert_ne!(

@@ -878,6 +878,7 @@ impl SandboxBackend for ProcessBackend {
             // guest RAM to capture.
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             // ADR 0014: ProcessBackend is dev/test only; no portable
             // BlobStorage upload.
@@ -909,7 +910,12 @@ impl SandboxBackend for ProcessBackend {
     ///   - `rootfs_source` is irrelevant after restore — the cwd is
     ///     materialized from the snapshot's tarball, not from a source
     ///     image directory.
-    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = match tokio::fs::read(src.join("manifest.json")).await {
@@ -2676,7 +2682,7 @@ mod tests {
         b.destroy(id).await.unwrap();
 
         let restored = SandboxId::new();
-        b.restore(restored, meta).await.unwrap();
+        b.restore(restored, meta, None).await.unwrap();
         let h_top = b.exec(restored, exec(&["cat", "greeting"])).await.unwrap();
         assert_eq!(String::from_utf8(h_top.stdout).unwrap(), "hello\n");
         let h_nested = b.exec(restored, exec(&["cat", "sub/file"])).await.unwrap();
@@ -2712,6 +2718,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -2721,7 +2728,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        let res = b.restore(SandboxId::new(), meta).await;
+        let res = b.restore(SandboxId::new(), meta, None).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));
     }
 

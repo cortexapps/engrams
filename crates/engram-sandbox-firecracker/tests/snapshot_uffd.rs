@@ -79,7 +79,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
 
     let spec = SandboxSpec {
         image: "fc-uffd-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -180,6 +180,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: metadata.source_sandbox_id,
         state_blob_key: metadata.state_blob_key.clone(),
@@ -191,7 +192,10 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         peer_hints: Vec::new(),
     };
     let restored_id = SandboxId::new();
-    match backend.restore(restored_id, restore_metadata).await {
+    match backend
+        .restore(restored_id, restore_metadata, common::disks(&local_rootfs))
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             // The preserved jail dir lives under work_dir; dump every
@@ -315,7 +319,7 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
 
     let spec = SandboxSpec {
         image: "fc-uffd-cross-host-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -412,6 +416,7 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: metadata.source_sandbox_id,
         state_blob_key: metadata.state_blob_key.clone(),
@@ -423,7 +428,10 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         peer_hints: Vec::new(),
     };
     let restored_id = SandboxId::new();
-    match backend.restore(restored_id, restore_metadata).await {
+    match backend
+        .restore(restored_id, restore_metadata, common::disks(&local_rootfs))
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             // The prod bug surfaced as exactly this error. Dump logs

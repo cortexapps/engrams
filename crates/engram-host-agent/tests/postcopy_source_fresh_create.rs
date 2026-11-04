@@ -71,7 +71,7 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
     // chain is seeded at create from the base manifest.
     let vm = SandboxId::new();
     pooled
-        .restore_fresh(vm, result.snapshot, Vec::new())
+        .restore_fresh(vm, result.snapshot, None, Vec::new())
         .await
         .expect("fresh create from the base snapshot");
     let view = pooled

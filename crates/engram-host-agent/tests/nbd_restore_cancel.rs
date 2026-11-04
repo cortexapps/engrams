@@ -144,7 +144,12 @@ impl SandboxBackend for BarrierInner {
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
         true
     }
-    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        _: SandboxId,
+        _meta: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // The NBD daemon is already serving /dev/nbdN and the sidecar is
         // patched to it by now — exactly the window the bug lives in.
         self.entered.notify_one();
@@ -249,6 +254,7 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -267,7 +273,7 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
     let entered_wait = entered.notified();
     let handle = {
         let pooled = pooled.clone();
-        tokio::spawn(async move { pooled.restore(restored_id, metadata).await })
+        tokio::spawn(async move { pooled.restore(restored_id, metadata, None).await })
     };
     // Wait until the (fix: detached) inner.restore is in-flight past the NBD
     // attach. Bound it so a hang fails the test rather than wedging CI.

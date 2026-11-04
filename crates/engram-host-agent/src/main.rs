@@ -531,18 +531,9 @@ async fn main() -> Result<(), HostAgentError> {
                         cli.guest_gateway_port,
                     );
                 fc_for_reattach = None;
-                // ADR 0007: attach the chunk store so `snapshot()` chunks
-                // the rootfs clone and reports the manifest ref. Without
-                // this the base-snapshot capture produces a disk_manifest
-                // of None, and the coordinator's HEAD-verify rejects the
-                // enable ("chunked manifests failed HEAD-verify"). Shares
-                // the same `blob` Arc as the PooledBackend wrapper below.
-                let cs = engram_chunk_store::ChunkStore::new(blob.clone())
-                    .with_upload_budget(upload_budget.clone());
                 Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
-                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?
-                        .with_chunk_store(cs),
+                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?,
                 )
             }
             #[cfg(not(target_os = "macos"))]

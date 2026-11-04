@@ -262,7 +262,7 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
     pooled_b.destroy(sandbox).await.expect("destroy survivor");
     let restored = SandboxId::new();
     pooled_b
-        .restore(restored, ckpt2.clone())
+        .restore(restored, ckpt2.clone(), None)
         .await
         .expect("restore from the roll-spanning diff checkpoint");
     let out = exec(

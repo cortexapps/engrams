@@ -2194,10 +2194,10 @@ impl PooledBackend {
             let join = tokio::spawn(async move {
                 if fresh {
                     inner
-                        .restore_fresh(new_id, metadata, selected_mounts)
+                        .restore_fresh(new_id, metadata, None, selected_mounts)
                         .await?
                 } else {
-                    inner.restore(new_id, metadata).await?
+                    inner.restore(new_id, metadata, None).await?
                 };
                 // Subscribe as soon as the backend exposes the restored VM.
                 // Replay covers a drain that finished during restore.
@@ -2309,10 +2309,10 @@ impl PooledBackend {
         tokio::spawn(async move {
             if fresh {
                 inner
-                    .restore_fresh(new_id, metadata, selected_mounts)
+                    .restore_fresh(new_id, metadata, None, selected_mounts)
                     .await?
             } else {
-                inner.restore(new_id, metadata).await?
+                inner.restore(new_id, metadata, None).await?
             };
             if let Some(poller) = hint_poller {
                 hint_pollers.insert(
@@ -8997,7 +8997,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.swap_device(id)
     }
 
-    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // ADR 0038 B2: capture the source's memory manifest before
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
@@ -9060,6 +9065,7 @@ impl SandboxBackend for PooledBackend {
         &self,
         id: SandboxId,
         metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         // ADR 0045 seed-at-create: guest RAM right after a fresh restore
@@ -11564,7 +11570,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!("dead guest has no snapshot")
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 unreachable!("cold boot")
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11663,6 +11674,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -11677,7 +11689,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11771,7 +11788,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11871,7 +11893,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12003,7 +12030,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12139,6 +12171,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12153,7 +12186,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12278,6 +12316,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12292,7 +12331,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12459,6 +12503,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12473,7 +12518,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 self.restore_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -12509,6 +12559,7 @@ mod tests {
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
+                base_disk_manifest: None,
                 migration_source: None,
                 source_sandbox_id: None,
                 state_blob_key: None,
@@ -13416,7 +13467,12 @@ mod tests {
         fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
             PathBuf::new()
         }
-        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14069,6 +14125,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14083,7 +14140,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14211,6 +14273,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14225,7 +14288,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14353,6 +14421,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14371,6 +14440,7 @@ mod tests {
                 &self,
                 _: SandboxId,
                 meta: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
             ) -> Result<(), SandboxError> {
                 // Capture what was on disk at the moment inner.restore ran.
                 let dest = self.dir_for(meta.id);
@@ -14430,7 +14500,10 @@ mod tests {
 
         // Restore — wrap must re-download state.bin + sidecar
         // before delegating to inner.
-        pooled.restore(SandboxId::new(), metadata).await.unwrap();
+        pooled
+            .restore(SandboxId::new(), metadata, None)
+            .await
+            .unwrap();
 
         let seen_state = inner.saw_state.lock().clone().expect("inner.restore ran");
         assert_eq!(&seen_state[..], b"upload-me-state");
@@ -14517,6 +14590,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14531,7 +14605,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 self.restored.store(true, Ordering::SeqCst);
                 Err(SandboxError::InvalidSpec(
                     "inner.restore must not be reached".into(),
@@ -14572,7 +14651,7 @@ mod tests {
         assert!(md.disk_manifest.is_none(), "fixture precondition");
 
         let err = pooled
-            .restore(SandboxId::new(), md)
+            .restore(SandboxId::new(), md, None)
             .await
             .expect_err("restore must refuse");
         assert!(
@@ -14630,7 +14709,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 std::env::temp_dir().join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14761,7 +14845,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging_root.join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, m: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                m: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(m);
                 Ok(())
             }
@@ -14833,6 +14922,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -14844,7 +14934,7 @@ mod tests {
             peer_hints: Vec::new(),
         };
         pooled
-            .restore(SandboxId::new(), metadata.clone())
+            .restore(SandboxId::new(), metadata.clone(), None)
             .await
             .unwrap();
 
@@ -14942,7 +15032,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 self.snap_dir.clone()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 // Inner restore is irrelevant for this test — we
                 // only assert the materialize branch was a no-op.
                 Ok(())
@@ -14968,6 +15063,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -14978,7 +15074,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        let _ = pooled.restore(SandboxId::new(), metadata).await;
+        let _ = pooled.restore(SandboxId::new(), metadata, None).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
         assert_eq!(after, original, "memory.bin must not be overwritten");
     }
@@ -15166,7 +15262,12 @@ mod tests {
                     .join("engram-test-snaps")
                     .join(id.to_string())
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -15316,7 +15417,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15555,7 +15661,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15784,7 +15895,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15957,6 +16073,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -15971,7 +16088,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -16244,7 +16366,12 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.root.join(id.to_string())
         }
-        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             self.park("restore").await;
             Ok(())
         }
@@ -16509,6 +16636,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -16641,6 +16769,7 @@ mod tests {
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
+                base_disk_manifest: None,
                 migration_source: None,
                 source_sandbox_id: None,
                 state_blob_key: None,
@@ -16655,7 +16784,12 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.dir_for(id)
         }
-        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -17207,7 +17341,12 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -17370,7 +17509,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 unreachable!()
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -17536,8 +17680,13 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, id: SandboxId, meta: SnapshotMetadata) -> Result<(), SandboxError> {
-            self.inner.restore(id, meta).await
+        async fn restore(
+            &self,
+            id: SandboxId,
+            meta: SnapshotMetadata,
+            disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
+            self.inner.restore(id, meta, disks).await
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.inner.destroy(id).await

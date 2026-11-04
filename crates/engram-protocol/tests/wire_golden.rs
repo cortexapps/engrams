@@ -204,6 +204,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
         disk_manifest: Some(fixed_manifest_ref(0x21, 1)),
         memory_manifest: Some(fixed_manifest_ref(0x22, 1)),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: Some(SandboxId::from(fixed_uuid(0x23))),
         state_blob_key: Some("snapshots/x/state.bin".into()),

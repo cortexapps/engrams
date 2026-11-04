@@ -1623,31 +1623,42 @@ fn portable_blob_keys(
     }
 }
 
-/// ADR 0045 D4: the IMAGE's base-snapshot memory manifest for a session's
-/// image — the CANONICAL ref for substrate resumes (base-identical pages
-/// CONTINUE against the shared per-image base shm). Best-effort: any miss
-/// (image disabled, no base snapshot, no memory manifest) returns `None`
-/// and the restore falls back to canonical == session (pre-D4 behavior).
-pub(crate) async fn base_memory_manifest_for_image(
+/// The manifests of the image's base snapshot: what a fresh session
+/// of the image starts from, so a resumed session shares them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ImageBaseManifests {
+    pub memory: Option<engram_core::types::manifest::ManifestRef>,
+    pub disk: Option<engram_core::types::manifest::ManifestRef>,
+}
+
+pub(crate) async fn base_manifests_for_image(
     state: &SharedState,
     image_uri: &str,
-) -> Option<engram_core::types::manifest::ManifestRef> {
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image_any(image_uri)
-        .await
-        .ok()
-        .flatten()?;
-    let base_id = enabled.base_snapshot_id?;
-    state
-        .services
-        .meta
-        .get_snapshot(base_id)
-        .await
-        .ok()
-        .flatten()?
-        .memory_manifest
+) -> ImageBaseManifests {
+    let base = async {
+        let enabled = state
+            .services
+            .meta
+            .get_enabled_image_any(image_uri)
+            .await
+            .ok()
+            .flatten()?;
+        state
+            .services
+            .meta
+            .get_snapshot(enabled.base_snapshot_id?)
+            .await
+            .ok()
+            .flatten()
+    }
+    .await;
+    match base {
+        Some(snapshot) => ImageBaseManifests {
+            memory: snapshot.memory_manifest,
+            disk: snapshot.disk_manifest,
+        },
+        None => ImageBaseManifests::default(),
+    }
 }
 
 async fn resume_from_fc_snapshot(
@@ -1878,7 +1889,7 @@ async fn resume_from_fc_snapshot(
     // the engine type the backend expects.
     // ADR 0045 D4: hand the host the image's base manifest so resumed
     // sessions share the per-image base shm with fresh creates.
-    let base_memory_manifest = base_memory_manifest_for_image(state, &session.image).await;
+    let base = base_manifests_for_image(state, &session.image).await;
     // ADR 0095: peer-fill hint — if the snapshot host is alive and
     // wire-compatible, tell the destination where the chunks are
     // resident. Stamped unconditionally BEFORE placement (the pick
@@ -1911,7 +1922,8 @@ async fn resume_from_fc_snapshot(
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version.clone(),
-        base_memory_manifest,
+        base_memory_manifest: base.memory,
+        base_disk_manifest: base.disk,
         migration_source: None,
         swap_manifest: record.swap_manifest,
         disk_manifest: effective_disk_manifest,

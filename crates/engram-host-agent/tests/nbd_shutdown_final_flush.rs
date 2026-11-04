@@ -161,7 +161,12 @@ impl SandboxBackend for ImmediateInner {
             .then(|| self.rootfs_dev.clone())
             .flatten()
     }
-    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        _: SandboxId,
+        _meta: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -309,6 +314,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -322,7 +328,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
 
     // Resume: installs the NBD data plane in `nbd_sandboxes`.
     pooled
-        .restore(restored_id, metadata)
+        .restore(restored_id, metadata, None)
         .await
         .expect("restore");
     assert!(
@@ -526,6 +532,7 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -537,7 +544,7 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         peer_hints: Vec::new(),
     };
     pooled
-        .restore(restored_id, metadata)
+        .restore(restored_id, metadata, None)
         .await
         .expect("restore");
 
@@ -799,6 +806,7 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -810,7 +818,7 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
         peer_hints: Vec::new(),
     };
     pooled
-        .restore(restored_id, metadata)
+        .restore(restored_id, metadata, None)
         .await
         .expect("restore");
 

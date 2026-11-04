@@ -226,7 +226,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     let t = Instant::now();
     let restored = SandboxId::new();
     pooled
-        .restore(restored, ckpt2.clone())
+        .restore(restored, ckpt2.clone(), None)
         .await
         .expect("restore from diff checkpoint");
     eprintln!("CHAIN: restore(ckpt2) {} ms", t.elapsed().as_millis());
@@ -279,7 +279,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     pooled.destroy(restored).await.expect("destroy restored");
     let restored2 = SandboxId::new();
     pooled
-        .restore(restored2, ckpt3.clone())
+        .restore(restored2, ckpt3.clone(), None)
         .await
         .expect("restore from sparse diff checkpoint");
     let out = exec(
@@ -309,7 +309,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // have minted yet another id at v1).
     let fresh_a = SandboxId::new();
     pooled
-        .restore_fresh(fresh_a, ckpt3.clone(), Vec::new())
+        .restore_fresh(fresh_a, ckpt3.clone(), None, Vec::new())
         .await
         .expect("fresh restore A");
     // Marker planted BEFORE B exists: File-mode siblings restored from
@@ -322,7 +322,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     let sum4 = plant_marker(&pooled, fresh_a, 4).await;
     let fresh_b = SandboxId::new();
     pooled
-        .restore_fresh(fresh_b, ckpt3.clone(), Vec::new())
+        .restore_fresh(fresh_b, ckpt3.clone(), None, Vec::new())
         .await
         .expect("fresh restore B");
     let t = Instant::now();
@@ -367,7 +367,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     pooled.destroy(fresh_b).await.expect("destroy fresh_b");
     let restored3 = SandboxId::new();
     pooled
-        .restore(restored3, ckpt_a)
+        .restore(restored3, ckpt_a, None)
         .await
         .expect("restore from seed-at-create forked checkpoint");
     let out = exec(

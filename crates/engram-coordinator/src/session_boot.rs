@@ -248,6 +248,7 @@ pub(crate) async fn boot_on_reserved_host(
     // shape.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         id: base_snapshot_id,
         size_bytes: record.size_bytes,

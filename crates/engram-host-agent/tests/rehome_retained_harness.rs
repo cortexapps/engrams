@@ -238,7 +238,7 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
 
     let restored = SandboxId::new();
     pooled
-        .restore(restored, snapshot)
+        .restore(restored, snapshot, None)
         .await
         .expect("restore memory snapshot");
     hub.bind_session(session, restored, 2)

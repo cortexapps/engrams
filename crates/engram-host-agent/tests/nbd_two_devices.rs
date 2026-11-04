@@ -61,6 +61,7 @@ impl SandboxBackend for Inner {
             swap_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -78,7 +79,12 @@ impl SandboxBackend for Inner {
     fn rootfs_device(&self, _: SandboxId) -> Option<PathBuf> {
         Some(self.root.clone())
     }
-    async fn restore(&self, _: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        _: SandboxId,
+        metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         let bytes =
             std::fs::read(self.snapshot_path_for(metadata.id).join("manifest.json")).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -89,9 +95,10 @@ impl SandboxBackend for Inner {
         &self,
         id: SandboxId,
         metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
         _: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<(), SandboxError> {
-        self.restore(id, metadata).await
+        self.restore(id, metadata, None).await
     }
     fn swap_device(&self, _: SandboxId) -> Option<PathBuf> {
         self.spec.lock().unwrap().as_ref()?.swap_source.clone()
@@ -415,7 +422,10 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     drop(file);
     pooled.destroy(id).await.unwrap();
     common::postcopy::wait_devices_free(&devices);
-    pooled.restore(inner.id, captured.clone()).await.unwrap();
+    pooled
+        .restore(inner.id, captured.clone(), None)
+        .await
+        .unwrap();
     let swap = inner
         .spec
         .lock()
@@ -434,7 +444,10 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     common::postcopy::wait_devices_free(&devices);
     let mut base = captured;
     base.swap_manifest = None;
-    pooled.restore_fresh(inner.id, base, vec![]).await.unwrap();
+    pooled
+        .restore_fresh(inner.id, base, None, vec![])
+        .await
+        .unwrap();
     let swap = inner
         .spec
         .lock()

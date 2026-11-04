@@ -119,9 +119,17 @@ pub struct SandboxSpec {
     /// Host block device that serves the swap disk.
     #[serde(default)]
     pub swap_source: Option<PathBuf>,
-    /// Private swap lineage used to recover the host disk server.
+    /// Start the swap from this lineage instead of blank.
     #[serde(default)]
     pub swap_manifest: Option<super::manifest::ManifestRef>,
+}
+
+/// The device paths of a session's disks, provisioned by the layer
+/// that owns them and handed to the backend that attaches them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDisks {
+    pub root: PathBuf,
+    pub swap: Option<PathBuf>,
 }
 
 /// A read-only mount the host attaches to the guest as an additional

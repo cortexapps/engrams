@@ -717,7 +717,7 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
 
     let restored = SandboxId::new();
     pooled
-        .restore_fresh(restored, result.snapshot, Vec::new())
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("UFFD restore from the warm base snapshot");
 

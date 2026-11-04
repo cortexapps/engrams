@@ -112,7 +112,12 @@ impl SandboxBackend for SurvivorInner {
             .then(|| self.rootfs_dev.clone())
             .flatten()
     }
-    async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        _: SandboxId,
+        _: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -263,6 +268,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -274,7 +280,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         working_set_blob_key: None,
     };
     pooled_a
-        .restore(sandbox_id, metadata)
+        .restore(sandbox_id, metadata, None)
         .await
         .expect("gen A restore");
     let marker = vec![0xABu8; 4096];

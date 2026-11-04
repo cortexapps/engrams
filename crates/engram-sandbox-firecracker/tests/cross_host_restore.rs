@@ -153,7 +153,7 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
 
     let restored_id = SandboxId::new();
     receiver
-        .restore(restored_id, metadata.clone())
+        .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
         .await
         .expect("cross-host restore should succeed");
 

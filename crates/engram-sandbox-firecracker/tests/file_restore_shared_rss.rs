@@ -200,7 +200,10 @@ async fn file_backend_siblings_share_clean_pages() {
     for i in 0..SIBLINGS {
         let t = Instant::now();
         let id = SandboxId::new();
-        match backend.restore(id, metadata.clone()).await {
+        match backend
+            .restore(id, metadata.clone(), common::disks(&baked.rootfs))
+            .await
+        {
             Ok(()) => {}
             Err(e) => {
                 dump_fc_logs(work.path());
@@ -387,7 +390,12 @@ async fn file_backend_base_create_shares_residency_memfile() {
         let t = Instant::now();
         let id = SandboxId::new();
         match backend
-            .restore_fresh(id, metadata.clone(), Vec::new())
+            .restore_fresh(
+                id,
+                metadata.clone(),
+                common::disks(&baked.rootfs),
+                Vec::new(),
+            )
             .await
         {
             Ok(()) => {}
@@ -585,6 +593,7 @@ async fn substrate_base_create_density_and_latency_parity() {
         label: &str,
         backend: &FirecrackerBackend,
         metadata: &engram_core::types::snapshot::SnapshotMetadata,
+        rootfs: &Path,
         work_path: &Path,
     ) -> (u64, u128) {
         let mut vms = Vec::new();
@@ -593,7 +602,7 @@ async fn substrate_base_create_density_and_latency_parity() {
             let t = Instant::now();
             let id = SandboxId::new();
             match backend
-                .restore_fresh(id, metadata.clone(), Vec::new())
+                .restore_fresh(id, metadata.clone(), common::disks(rootfs), Vec::new())
                 .await
             {
                 Ok(()) => {}
@@ -717,8 +726,14 @@ async fn substrate_base_create_density_and_latency_parity() {
     cfg_file.firecracker_bin = fork_bin.clone();
     cfg_file.restore_mode = RestoreMode::Uffd;
     let backend_file = FirecrackerBackend::new(work.path(), cfg_file);
-    let (pct_file, median_file) =
-        measure_arm("file-mode", &backend_file, &metadata, work.path()).await;
+    let (pct_file, median_file) = measure_arm(
+        "file-mode",
+        &backend_file,
+        &metadata,
+        &baked.rootfs,
+        work.path(),
+    )
+    .await;
 
     // ---- Arm B: the substrate (Uffd + base shm on the fork) ----
     let base_dir = PathBuf::from(format!(
@@ -736,8 +751,14 @@ async fn substrate_base_create_density_and_latency_parity() {
     let backend_sub = FirecrackerBackend::new(work.path(), cfg_sub);
     let mut metadata_sub = metadata.clone();
     metadata_sub.memory_manifest = Some(manifest_ref);
-    let (pct_sub, median_sub) =
-        measure_arm("substrate", &backend_sub, &metadata_sub, work.path()).await;
+    let (pct_sub, median_sub) = measure_arm(
+        "substrate",
+        &backend_sub,
+        &metadata_sub,
+        &baked.rootfs,
+        work.path(),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&base_dir);
 
     eprintln!(

@@ -387,6 +387,7 @@ fn spawn_capture_job_simulator(
                     disk_manifest: Some(capture_host.snapshot_disk_ref),
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,

@@ -15,7 +15,7 @@ use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    SessionFileMetadata, SessionFileSpec, SessionFileStream,
+    SessionDisks, SessionFileMetadata, SessionFileSpec, SessionFileStream,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -524,17 +524,24 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
-    /// Restore a sandbox from a previously-taken snapshot. ADR 0007
-    /// Phase 6: takes the metadata directly (carrying the manifest
-    /// refs + snapshot id) rather than a host-local path — the
-    /// backend looks up its own staging dir for `metadata.id` and
-    /// rehydrates from chunks if local files are missing.
+    /// Restore a sandbox from a snapshot. The backend looks up its own
+    /// staging dir for `metadata.id` and rehydrates from chunks when
+    /// local files are missing.
     ///
-    /// ADR 0035: this is the *resume* flavor — aux RO bundles stay on
-    /// the generation the snapshot pinned (live guest processes may
-    /// hold fds into them). Fresh session creates go through
+    /// `disks` are the session's disks, provisioned and named by the
+    /// caller. `None` asks the layer that owns the disks to provision
+    /// them; a backend that attaches disks and owns none refuses it.
+    ///
+    /// This is the *resume* flavor: aux RO bundles stay on the
+    /// generation the snapshot pinned (live guest processes may hold
+    /// fds into them). Fresh session creates go through
     /// [`Self::restore_fresh`].
-    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError>;
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
+    ) -> Result<(), SandboxError>;
 
     /// ADR 0035/0055: restore for a *fresh* session (the base-snapshot path) —
     /// identical to [`Self::restore`] except, while the VM is load-paused,
@@ -547,9 +554,10 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         id: SandboxId,
         metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
     ) -> Result<(), SandboxError> {
-        self.restore(id, metadata).await
+        self.restore(id, metadata, disks).await
     }
 
     /// ADR 0020 P1: block until the guest's agentd has dialled its
@@ -796,12 +804,8 @@ pub trait SandboxBackend: Send + Sync {
         Ok(AgentRefresh::UpToDate)
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a session and
-    /// ADR 0020 P1: restore the image's shared base snapshot for a
-    /// new session and inject the per-session env. ADR 0021 P1.5
-    /// retired the option-D substrate-swap stage that used to ride
-    /// here — the harness lives in the rootfs now and arrives with
-    /// the snapshot itself. Implemented on `PooledBackend`.
+    /// Restore the image's shared base snapshot for a new session and
+    /// inject the per-session env. Implemented on `PooledBackend`.
     async fn restore_base_for_session(
         &self,
         _id: SandboxId,

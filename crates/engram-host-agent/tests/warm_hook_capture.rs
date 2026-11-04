@@ -106,7 +106,7 @@ async fn warm_hook_process_survives_base_snapshot() {
     // the warmed process came back live (the snapshot froze it running).
     let restored = SandboxId::new();
     pooled
-        .restore_fresh(restored, result.snapshot, Vec::new())
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("restore from warm base snapshot");
 
@@ -192,7 +192,7 @@ async fn warm_hook_sees_manifest_env() {
     // default), surviving into a restored session.
     let restored = SandboxId::new();
     pooled
-        .restore_fresh(restored, result.snapshot, Vec::new())
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("restore");
     let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;

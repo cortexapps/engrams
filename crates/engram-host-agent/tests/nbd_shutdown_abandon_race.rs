@@ -170,7 +170,12 @@ impl SandboxBackend for BarrierInner {
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
         true
     }
-    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
+    async fn restore(
+        &self,
+        _: SandboxId,
+        _meta: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // The NBD daemon is already serving /dev/nbdN and the sidecar is
         // patched to it by now — exactly the window the bug lives in.
         self.entered.notify_one();
@@ -274,6 +279,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -290,7 +296,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
     let entered_wait = entered.notified();
     let handle = {
         let pooled = pooled.clone();
-        tokio::spawn(async move { pooled.restore(restored_id, metadata).await })
+        tokio::spawn(async move { pooled.restore(restored_id, metadata, None).await })
     };
     tokio::time::timeout(Duration::from_secs(30), entered_wait)
         .await

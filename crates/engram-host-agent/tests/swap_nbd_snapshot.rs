@@ -169,7 +169,7 @@ async fn moves_swapped_guest(live: bool) {
     timed(
         "fresh restore",
         90,
-        source.restore_fresh(vm, base.clone(), vec![]),
+        source.restore_fresh(vm, base.clone(), None, vec![]),
     )
     .await
     .unwrap();
@@ -268,7 +268,7 @@ async fn moves_swapped_guest(live: bool) {
         timed(
             "restore on second host",
             120,
-            dest.restore(restored, snapshot),
+            dest.restore(restored, snapshot, None),
         )
         .await
         .unwrap();

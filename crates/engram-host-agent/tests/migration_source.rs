@@ -206,7 +206,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     pooled.destroy(vm).await.expect("destroy vm1");
     let restored = SandboxId::new();
     pooled
-        .restore(restored, ckpt2)
+        .restore(restored, ckpt2, None)
         .await
         .expect("restore post-abort checkpoint");
     let restored_sum = exec(
@@ -257,7 +257,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let metadata = common::postcopy::metadata(ckpt_v2, &out2, addr);
     let dest = pooled.clone();
     let moved = SandboxId::new();
-    let restore = tokio::spawn(async move { dest.restore(moved, metadata).await });
+    let restore = tokio::spawn(async move { dest.restore(moved, metadata, None).await });
     tokio::task::yield_now().await;
     pooled
         .migration_capture_postcopy(vm2, &out2.export_id)

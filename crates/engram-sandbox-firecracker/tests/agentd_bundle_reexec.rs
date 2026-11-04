@@ -139,9 +139,10 @@ async fn agentd_rolls_via_bundle_without_recapture() {
     let backend = FirecrackerBackend::new(work.path(), cfg);
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
+    let rootfs = outcome.rootfs_path;
     let spec = SandboxSpec {
         image: "agentd-reexec-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: Some(rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -193,6 +194,7 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         .restore_fresh(
             restored,
             metadata,
+            common::disks(&rootfs),
             vec![AuxRoDrive {
                 drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::AGENTD_SLOT_INDEX),
                 guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::AGENTD_SLOT_INDEX),

@@ -148,7 +148,7 @@ async fn chained_restore_snapshot_lineage_holds() {
     for hop in 1..=HOPS {
         let restored = SandboxId::new();
         backend
-            .restore(restored, metadata.clone())
+            .restore(restored, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("hop {hop}: restore failed: {e}"));
         assert!(

@@ -114,7 +114,7 @@ async fn serial_restore_from_one_canonical_n_times() {
     for i in 0..N {
         let id = SandboxId::new();
         backend
-            .restore(id, metadata.clone())
+            .restore(id, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("restore iter {i}: {e}"));
         assert!(
@@ -203,7 +203,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
     for i in 0..N {
         let id = SandboxId::new();
         backend
-            .restore(id, metadata.clone())
+            .restore(id, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("concurrent restore {i}: {e}"));
         ids.push(id);
@@ -315,9 +315,14 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     for i in 0..OVERLAP_N {
         let b = backend.clone();
         let md = metadata.clone();
+        let disks = common::disks(&local_rootfs);
         let id = SandboxId::new();
         handles.push(tokio::spawn(async move {
-            (i, id, SandboxBackend::restore(b.as_ref(), id, md).await)
+            (
+                i,
+                id,
+                SandboxBackend::restore(b.as_ref(), id, md, disks).await,
+            )
         }));
     }
     let mut ids = Vec::new();

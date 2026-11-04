@@ -110,7 +110,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
 
     let spec = SandboxSpec {
         image: "fc-substrate-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -183,6 +183,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: metadata.source_sandbox_id,
         state_blob_key: metadata.state_blob_key.clone(),
@@ -211,7 +212,14 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     };
 
     let restored_id = SandboxId::new();
-    match backend.restore(restored_id, restore_metadata.clone()).await {
+    match backend
+        .restore(
+            restored_id,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
+        .await
+    {
         Ok(()) => {}
         Err(e) => dump_logs_and_panic("restore #1", format!("{e:?}"), work.path()),
     };
@@ -264,7 +272,10 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     // Sibling restore from the same snapshot: exercises the
     // already-populated base (SEEK_HOLE fast path + shared CONTINUE).
     let sibling_id = SandboxId::new();
-    match backend.restore(sibling_id, restore_metadata).await {
+    match backend
+        .restore(sibling_id, restore_metadata, common::disks(&local_rootfs))
+        .await
+    {
         Ok(()) => {}
         Err(e) => dump_logs_and_panic("restore #2 (sibling)", format!("{e:?}"), work.path()),
     };
@@ -362,7 +373,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     let spec = SandboxSpec {
         image: "fc-substrate-capture-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -428,7 +439,11 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     // Restore #1 onto the substrate; let the guest run + COW-dirty pages.
     let substrate_vm = SandboxId::new();
     backend
-        .restore(substrate_vm, restore_metadata.clone())
+        .restore(
+            substrate_vm,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
         .await
         .expect("restore #1 onto the substrate");
     // Irreducible open-loop churn window (NOT a readiness wait): let the guest
@@ -508,7 +523,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     let revived = SandboxId::new();
     backend
-        .restore(revived, meta2)
+        .restore(revived, meta2, common::disks(&local_rootfs))
         .await
         .expect("restore FROM the capture-of-substrate snapshot");
     // Poll list() until both VMs appear rather than sleeping a fixed window; the

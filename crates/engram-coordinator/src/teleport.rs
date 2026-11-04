@@ -413,6 +413,7 @@ mod steps {
                 .trim_start_matches("https://");
             let hostname = hostpart.rsplit_once(':').map_or(hostpart, |(h, _)| h);
             let peer_addr = format!("{hostname}:{}", presetup.peer_port);
+            let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
             let metadata = SnapshotMetadata {
                 id: engram_core::SnapshotId::from(state.services.entropy.uuid()),
                 size_bytes: durable.as_ref().map_or(0, |s| s.size_bytes),
@@ -423,11 +424,8 @@ mod steps {
                 swap_manifest: presetup.swap_manifest_ref,
                 disk_manifest: presetup.disk_manifest_ref,
                 memory_manifest: Some(presetup.memory_manifest_ref),
-                base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                    state,
-                    &session.image,
-                )
-                .await,
+                base_memory_manifest: base.memory,
+                base_disk_manifest: base.disk,
                 migration_source: Some(engram_core::types::snapshot::MigrationSourceInfo {
                     export_id: presetup.export_id.clone(),
                     source_addr,
@@ -871,6 +869,7 @@ mod steps {
             })
             .into_iter()
             .collect();
+        let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
         let metadata = SnapshotMetadata {
             id: snapshot.id,
             size_bytes: snapshot.size_bytes,
@@ -879,11 +878,8 @@ mod steps {
             swap_manifest: snapshot.swap_manifest,
             disk_manifest: snapshot.disk_manifest,
             memory_manifest: snapshot.memory_manifest,
-            base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                state,
-                &session.image,
-            )
-            .await,
+            base_memory_manifest: base.memory,
+            base_disk_manifest: base.disk,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(

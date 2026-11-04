@@ -835,7 +835,10 @@ async fn e2e_harness_warm_via_pooled_backend() {
     pooled.destroy(cold_id).await.expect("destroy cold");
 
     let warm_id = SandboxId::new();
-    pooled.restore(warm_id, metadata).await.expect("restore");
+    pooled
+        .restore(warm_id, metadata, None)
+        .await
+        .expect("restore");
     let warm_endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —

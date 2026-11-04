@@ -1135,7 +1135,7 @@ mod tests {
 
         let scratch = tempfile::tempdir().expect("scratch");
         let rootfs_copy = scratch.path().join("rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+        tokio::fs::copy(&rootfs, &rootfs_copy)
             .await
             .expect("clone rootfs");
         let state = scratch.path().join("machine.vzs");
@@ -1268,7 +1268,7 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch");
         let rootfs_a = scratch.path().join("a.rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs, &rootfs_a)
+        tokio::fs::copy(&rootfs, &rootfs_a)
             .await
             .expect("clone rootfs");
         let state = scratch.path().join("machine.vzs");
@@ -1301,7 +1301,7 @@ mod tests {
 
         // (a) restore with the rootfs at a DIFFERENT path.
         let rootfs_b = scratch.path().join("b.rootfs.ext4");
-        crate::disk::clone_or_copy(&rootfs_a, &rootfs_b)
+        tokio::fs::copy(&rootfs_a, &rootfs_b)
             .await
             .expect("clone to different path");
         let vm2 = VzVm::new(spike_cfg(&kernel, &rootfs_b, mid.clone(), MAC, 1024))
@@ -1385,7 +1385,7 @@ mod tests {
         match phase.as_str() {
             "save" => {
                 std::fs::create_dir_all(&dir).expect("spike dir");
-                crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+                tokio::fs::copy(&rootfs, &rootfs_copy)
                     .await
                     .expect("clone rootfs");
                 let mid = fresh_machine_identifier();

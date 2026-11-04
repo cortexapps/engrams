@@ -133,6 +133,7 @@ impl HostClient for ScriptedHost {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,

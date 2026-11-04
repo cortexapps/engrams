@@ -69,7 +69,7 @@ async fn round_trip(
 
     let spec = SandboxSpec {
         image: label.into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -121,7 +121,10 @@ async fn round_trip(
     // (the R2 risk) would surface here as a deserialize/magic/version error.
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let restored_id = SandboxId::new();
-    match restorer.restore(restored_id, metadata).await {
+    match restorer
+        .restore(restored_id, metadata, common::disks(&local_rootfs))
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             // Dump firecracker.log (carries the guest console) for any preserved jail.

@@ -379,7 +379,10 @@ async fn e2e_shell_warm_via_pooled_backend() {
     //      tunnel dial happens from host root, which has no route
     //      to the netns'd 10.200.0.x. ----
     let warm_id = SandboxId::new();
-    pooled.restore(warm_id, metadata).await.expect("restore");
+    pooled
+        .restore(warm_id, metadata, None)
+        .await
+        .expect("restore");
     let endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // ttyd's TCP listen socket should survive the snapshot/restore
     // (FC restores the kernel state including sockets). But give a

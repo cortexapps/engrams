@@ -292,6 +292,7 @@ async fn hit_with_a_verified_present_candidate() {
         disk_manifest: Some(disk_manifest_ref),
         memory_manifest: Some(mem_manifest_ref),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,

@@ -711,7 +711,12 @@ mod tests {
         fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
             PathBuf::new()
         }
-        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -785,6 +790,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,

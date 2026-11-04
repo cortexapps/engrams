@@ -241,7 +241,7 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     //    under the same name
     let restored_id = SandboxId::new();
     backend
-        .restore(restored_id, metadata.clone())
+        .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
         .await
         .expect("restore");
     assert_ne!(

@@ -259,7 +259,7 @@ impl HostClient for LocalHostClient {
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         let id = SandboxId::new();
-        self.sandbox.restore(id, metadata).await?;
+        self.sandbox.restore(id, metadata, None).await?;
         Ok(id)
     }
 

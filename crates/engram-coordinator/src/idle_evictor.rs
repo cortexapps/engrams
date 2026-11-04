@@ -2091,8 +2091,9 @@ mod tests {
             &self,
             id: SandboxId,
             metadata: engram_core::types::snapshot::SnapshotMetadata,
+            disks: Option<engram_core::types::sandbox::SessionDisks>,
         ) -> Result<(), SandboxError> {
-            self.inner.restore(id, metadata).await
+            self.inner.restore(id, metadata, disks).await
         }
         fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
             self.inner.snapshot_path_for(id)
@@ -4806,8 +4807,9 @@ mod tests {
             &self,
             id: SandboxId,
             metadata: engram_core::types::snapshot::SnapshotMetadata,
+            disks: Option<engram_core::types::sandbox::SessionDisks>,
         ) -> Result<(), SandboxError> {
-            self.inner.restore(id, metadata).await
+            self.inner.restore(id, metadata, disks).await
         }
         fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
             self.inner.snapshot_path_for(id)
