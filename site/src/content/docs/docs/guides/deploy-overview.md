@@ -21,8 +21,8 @@ the deployment.
 
 **The `engram-host-fleet` release is the Firecracker hosts.** It runs the host agent as a
 privileged DaemonSet on a dedicated node pool with nested virtualization, in a namespace that
-enforces the privileged pod security level. A node-prep DaemonSet loads the NBD module, sets
-the sysctls, and mounts the memory substrate; an init container stages Firecracker, the guest
+enforces the privileged pod security level. A node-prep DaemonSet builds the session-disk
+pool, sets the sysctls, and mounts the memory substrate; an init container stages Firecracker, the guest
 kernel, and the session bundles on each node. The same release runs the fleet operator,
 which rolls hosts one at a time after draining them and scales the node pool from the
 coordinator's queue.

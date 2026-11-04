@@ -1,9 +1,19 @@
 # ADR 0125: The kernel owns the session disk — dm-thin volumes replace the NBD disk daemon
 
-- Status: Proposed (2026-11-03). When accepted, this ADR supersedes
-  ADR 0110 (honest writes) and Decision 3 of ADR 0090 (the quarantined
-  survivor channel), and retires ADR 0049 (the NBD slot allocator).
+- Status: Accepted (2026-11-04). This ADR supersedes ADR 0110 (honest
+  writes) and Decision 3 of ADR 0090 (the quarantined survivor channel),
+  and retires ADR 0049 (the NBD slot allocator).
 - Date: 2026-11-03
+- Commit chain (branch `disk/session-disk-seam`, one PR): step 1
+  `ed6186b7c`..`08403960d` (the seam, `FileDisk`, `CrashDisk`, the two
+  flows); step 2 `09e9f61f7` (node-prep builds the pool); step 3
+  `b692edba1`, `de81e8b31` (`ThinPoolDisk`); step 4 `35c984694` (image
+  staging into volumes); step 5 `f734690fa`..`ca919d4c9` (session
+  volumes own every sandbox disk, VZ on `FileDisk`); step 6
+  `f2e732a0c`..`f586012dc` (the deletions: node prep, the flush trigger
+  and copy-on-write view, the live disk manifest, the quarantined
+  survivor arm, the slot placement, with the review pass `eed3039c5`),
+  then this fact page and the ADR flip.
 - Related: ADR 0007 (chunk store — unchanged, it stays the durable and
   portable format), ADR 0036 (per-chunk image artifacts and fleet
   prestage — the staging target changes), ADR 0028 / 0039 / 0077
@@ -574,27 +584,60 @@ thin-pool host and the reverse.
    AGENTS.md "source of truth" sentence, flip this ADR to Accepted with
    the commit chain.
 
+### Divergences from the plan, as landed
+
+- **Steps 5 and 6 landed in one PR, not across a deploy cycle.** There
+  is no host-agent build that runs both disk paths. The branch is a
+  clean break: a host on the new build serves only pool volumes, and
+  the chunk-store manifest carries any session across. Three
+  migrations carry the metadata: 0126 drops the live disk manifest and
+  settles a session whose only recoverable state was that manifest to
+  `dead`; 0127 cancels queued evict ops the quarantine flavour minted;
+  0128 replaces the slot columns with the pool capacity columns and
+  drops the per-session slot need.
+- **The placement gate is a host floor, not a per-session
+  reservation.** Decision 7 said "pool free space exceeds the session's
+  disk reservation". A thin volume reserves nothing at create, and a
+  reservation sized to the disk would refuse the oversubscription the
+  pool exists for. The scheduler instead refuses any host whose pool
+  data free space is below `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` (16 GiB
+  by default) or whose metadata free space is below 64 MiB, in every
+  tier including an operator pin. The floor is a hard gate because a
+  full data pool stalls every guest on the node; a host that reports no
+  pool is soft, like unmeasured RAM.
+- **The chunk cache stays.** Memory chunks still page in through it,
+  and image staging reads image chunks through it. Only the disk path
+  left it.
+- **The DST oracle no longer models disk capacity.** The simulator's
+  pick mirrors the Postgres in-transaction pick, which gates on RAM and
+  CPU; the pool floor is a coordinator-side candidate filter, like the
+  work-dir disk floor, and is covered by the placement unit test.
+
 ## Facts this ADR establishes
 
-These sentences become the DESIGN.md fact page at phase 4. Each is
-guarded by a test or a metric named beside it when it lands.
+These sentences are the DESIGN.md "Session disk" fact page, which
+names the test that guards each one. As landed, the guards are:
 
 - A session's disk is a thin volume the kernel owns; no userspace
-  process is in the data path.
-- A host-agent restart does not open, reconfigure or verify any
-  session disk. (`host_agent_restart_makes_no_disk_calls`)
+  process is in the data path; a volume outlives every handle to it.
+  (`a_volume_survives_a_dropped_handle_and_opens_by_name`)
 - An acknowledged guest write is in the host page cache or the pool,
-  never in host-agent memory. (`acked_writes_survive_host_agent_death`)
-- A checkpoint pauses the guest for the page-cache sync plus about
-  20 ms, independent of how much the session has written.
-  (`checkpoint_pause_is_bounded_under_full_rate_writes`)
-- The base image is fully staged on a node before the image is ready
-  there. (`image_is_ready_only_when_its_volume_is_complete`)
-- Placement never chooses a node whose pool cannot hold the session's
-  disk reservation. (`scheduler_rejects_hosts_below_pool_low_water`)
+  never in host-agent memory. (By construction: the host agent is not
+  in the data path. No CI guard.)
+- A checkpoint pauses the guest only for the page-cache sync and the
+  volume snapshot; the upload runs after the resume and carries only
+  what changed. (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`,
+  `checkpoints_upload_only_what_changed_and_rotate_the_volume`,
+  `thin_delta_reports_exactly_what_the_full_compare_reports`.) The
+  pause itself is measured in Tradeoffs, not guarded in CI.
+- The base image is staged on a node before the image is ready there.
+  (`only_images_with_a_volume_on_disk_stay_ready`)
+- Placement never chooses a node whose pool is below the floor.
+  (`scheduler_rejects_hosts_below_pool_low_water`)
 - The chunk store manifest is the only cross-host representation of a
-  disk; any host resumes any manifest.
-  (`manifest_from_thin_host_resumes_on_any_host`)
+  disk; any host stages any manifest.
+  (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
+  `a_checkpoint_over_the_pool_reproduces_through_stage`)
 - The heartbeat carries observed facts only; no field asks the
   coordinator to take an action.
 

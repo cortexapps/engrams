@@ -1,6 +1,6 @@
 # ADR 0049: NBD slot allocator — large pool + warm front
 
-**Status:** Proposed (2026-06-13). The ADR 0048 fleet load test wedged on a
+**Status:** Superseded by [ADR 0125](./0125-kernel-owned-session-disk.md) (accepted 2026-11-04): there are no NBD slots. Originally Proposed (2026-06-13). The ADR 0048 fleet load test wedged on a
 host-local resource that was neither GCS, CPU, nor RAM: the **NBD `/dev/nbdN`
 slot pool**. Prod ran a 16-slot pool scanned on the restore hot path; a
 same-image burst (24+ concurrent restores on two nodes) exhausted it,

@@ -13,7 +13,8 @@ and snapshots/evicts/resumes the VM for density. Production isolation is
 against the same code paths.
 
 The deep architecture lives in `README.md` and `DESIGN.md`; design decisions live in
-`docs/adr/` (the source of truth — see [ADRs](#adrs)). This file is the operational
+`docs/adr/` (the record of each decision and its history; `DESIGN.md` states the current
+facts — see [ADRs](#adrs)). This file is the operational
 layer: how to build, test, and the conventions we hold.
 
 ## Daily commands (justfile)
@@ -80,7 +81,7 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
   if the states aren't externally constructible, the format is the problem.
   Scripted `engram_testkit::storage::FaultyBlobStorage` covers the blob tier.
 - **Firecracker integration** (`crates/engram-sandbox-firecracker/tests/`): `#[ignore]`'d,
-  Linux+KVM only; run in CI on KVM runners. New FC/NBD regression tests **must** be wired
+  Linux+KVM only; run in CI on KVM runners. New FC regression tests **must** be wired
   into `ci.yml`'s `--test` list (not gated as local-only) or they never run. **Size a test
   to the property it asserts, not to realism — minimize CI time.** Prove a
   correctness/isolation/head-of-line-freedom property with the least data, iterations, and
@@ -344,5 +345,7 @@ and the site's CLI reference describe the user side.
 - **0051** the TypeScript orchestration tier · **0003** the VZ backend · **0006** the egress proxy
 - **0066** the vsock port relay · **0118** session apps (named ports, reserved hostnames,
   and the orchestrator-enforced login wall that replaces IAP on preview hosts)
+- **0125** the kernel-owned session disk (dm-thin volumes, `SessionDisk`, the pool
+  capacity gate)
 
 When in doubt about *why* something is shaped the way it is, grep `docs/adr/` before assuming.

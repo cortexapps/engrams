@@ -106,7 +106,7 @@ Production is a Kubernetes cluster with two Helm releases: the control plane (co
 
 The **orchestrator** is the product surface. It owns users and API keys, tasks and profiles, the Slack and GitHub integrations, and the Connect RPC API the dashboard and CLI call. The **coordinator** is a stateless service in front of Postgres that schedules sessions onto hosts, evicts idle ones, and fans out session events. Hosts never need an inbound port: each **host agent** dials the coordinator, registers its capacity, and runs the VMs. Inside every VM a small **in-guest daemon** starts the harness, runs commands, and moves files.
 
-Storage is the part that makes the rest cheap. Disk and memory state live as hash-keyed immutable chunks in a blob store, with versioned manifests pointing at them. A base image is materialized into chunks once when you enable it. Sessions read those chunks on demand through an NBD device and page memory in lazily with `userfaultfd`, and a snapshot writes only the chunks that changed. Restoring on a different host is a matter of fetching the delta.
+Storage is the part that makes the rest cheap. Disk and memory state live as hash-keyed immutable chunks in a blob store, with versioned manifests pointing at them. A base image is materialized into chunks once when you enable it. Each host stages the image into a kernel-owned thin volume once, every session's disk is a snapshot of it, memory pages in lazily with `userfaultfd`, and a checkpoint writes only the chunks that changed. Restoring on a different host is a matter of fetching the delta.
 
 [`DESIGN.md`](DESIGN.md) has the full design and the [architecture page](site/src/content/docs/docs/concepts/architecture.md) the component and wire detail.
 
