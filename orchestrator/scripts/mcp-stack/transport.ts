@@ -173,7 +173,18 @@ async function downloadGuestProofFile(
         headers: { ...headers, origin: ctx.endpoints.app.origin },
       },
       (res) => {
-        if (res.statusCode !== 200) return fail("guest_file_status");
+        if (res.statusCode !== 200) {
+          const status = res.statusCode;
+          if (!status || !Number.isInteger(status) || status < 100 || status > 599)
+            return fail("guest_file_status");
+          const rpcCode = res.headers["x-engram-rpc-code"];
+          return fail(
+            `guest_file_status_http_${status}` +
+              (typeof rpcCode === "string" && /^(?:[1-9]|1[0-6])$/.test(rpcCode)
+                ? `_rpc_code_${Number(rpcCode)}`
+                : ""),
+          );
+        }
         const size = res.headers["content-length"];
         const hash = res.headers["x-content-sha256"];
         if (

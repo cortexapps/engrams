@@ -5,6 +5,7 @@ import { createServer } from "node:https";
 import { X509Certificate } from "node:crypto";
 import {
   ContextSchema,
+  RunnerFailure,
   privateFile,
   realOwnedPath,
   sha256,
@@ -705,6 +706,8 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
   const bytes = Buffer.from('{"callId":"proof"}\n');
   const requests: { url: string; cookie?: string; apiKey?: string; origin?: string }[] = [];
   let status = 200;
+  let rpcCode: string | string[] | undefined;
+  const secret = "private-file-response-token";
   let body = bytes;
   let size = String(body.length);
   let hash = sha256(body);
@@ -722,6 +725,8 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
       "content-type": "application/octet-stream",
       ...(chunked ? {} : { "content-length": size }),
       "x-content-sha256": hash,
+      "x-private": secret,
+      ...(rpcCode === undefined ? {} : { "x-engram-rpc-code": rpcCode }),
       ...(status === 302 ? { location: "/redirect-target" } : {}),
     });
     res.end(body);
@@ -770,12 +775,60 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
     for (const denied of [401, 403, 404, 302]) {
       status = denied;
       const before = requests.length;
-      await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toThrow(
-        "guest_file_status",
-      );
+      await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toMatchObject({
+        code: "TRANSPORT_FAILED",
+        seam: `guest_file_status_http_${denied}`,
+      });
       expect(requests.length).toBe(before + 1);
     }
+    body = Buffer.from(JSON.stringify({ error: secret }));
+    size = String(body.length);
+    status = 400;
+    const fileErrors: Array<[string | string[] | undefined, string]> = [
+      ["1", "guest_file_status_http_400_rpc_code_1"],
+      ["9", "guest_file_status_http_400_rpc_code_9"],
+      ["16", "guest_file_status_http_400_rpc_code_16"],
+      [undefined, "guest_file_status_http_400"],
+      ["", "guest_file_status_http_400"],
+      ["0", "guest_file_status_http_400"],
+      ["17", "guest_file_status_http_400"],
+      ["09", "guest_file_status_http_400"],
+      ["+9", "guest_file_status_http_400"],
+      ["9junk", "guest_file_status_http_400"],
+      ["9 9", "guest_file_status_http_400"],
+      ["9, 9", "guest_file_status_http_400"],
+      [["9", "9"], "guest_file_status_http_400"],
+      [secret, "guest_file_status_http_400"],
+    ];
+    for (const [header, seam] of fileErrors) {
+      rpcCode = header;
+      let failure: unknown;
+      try {
+        await readGuestFile(ctx, client, "owned-session", path);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(RunnerFailure);
+      if (!(failure instanceof RunnerFailure)) throw new Error("expected_runner_failure");
+      expect(failure.code).toBe("TRANSPORT_FAILED");
+      expect(failure.seam).toBe(seam);
+      expect(failure.message).toBe(`TRANSPORT_FAILED:${seam}`);
+      expect(Object.keys(failure).sort()).toEqual(["code", "seam"]);
+      expect(JSON.stringify(safeFailure(failure))).not.toContain(secret);
+      expect(failure.stack).not.toContain(secret);
+    }
+    status = 600;
+    rpcCode = "9";
+    await expect(readGuestFile(ctx, client, "owned-session", path)).rejects.toMatchObject({
+      code: "TRANSPORT_FAILED",
+      seam: "guest_file_status",
+    });
     status = 200;
+    body = bytes;
+    size = String(bytes.length);
+    // Success uses file metadata and bytes, regardless of an error diagnostic header.
+    expect(await readGuestFile(ctx, client, "owned-session", path)).toEqual(bytes);
+    rpcCode = undefined;
     const pin = ctx.endpoints.app.serverFingerprint;
     ctx.endpoints.app.serverFingerprint = Array(32).fill("00").join(":");
     const beforeBadPin = requests.length;
