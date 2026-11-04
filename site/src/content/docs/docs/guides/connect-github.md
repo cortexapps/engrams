@@ -12,7 +12,7 @@ pull request review.
 
 ## Create the App
 
-Settings → Integrations → GitHub walks through four steps.
+Settings → Integrations → GitHub walks through four steps, and an optional fifth.
 
 1. **Register the App.** Either open GitHub's new-app page and fill it in, or copy the
    manifest from the panel and use GitHub's "register from a manifest" flow. The manifest
@@ -30,7 +30,13 @@ Settings → Integrations → GitHub walks through four steps.
    owns the repositories, generate a private key, and paste the numeric App ID and the
    downloaded key into the connect sheet.
 
-The App ID and the key are stored as org secrets; the key is sealed and never returned.
+5. **Let people connect their own account (optional).** Set the App's callback URL to
+   `<origin>/api/v1/integrations/github/oauth/callback`; the manifest already sets it. Generate
+   a client secret, and paste the App's client ID and the client secret into the optional
+   fields of the connect sheet.
+
+The App ID and the key are stored as org secrets; the key is sealed and never returned. The
+client secret is sealed in the same way.
 
 ## What sessions get
 
@@ -58,10 +64,18 @@ To enroll a repository, open Settings → Automations → PR review → Inputs a
 
 The handle defaults to the App's own login. The other inputs are the reviewer profile, the
 review categories, and free-text instructions the reviewers read. The Reviews page lists
-every reviewed pull request with its findings and what was posted.
+every reviewed pull request with its findings and what was posted. Select **Mine** to see
+only the pull requests you opened. It matches the GitHub login of your personal GitHub
+credential.
 
 ## Personal GitHub credentials
 
-A person can add a fine-grained personal access token under Settings → Credentials. A
-profile set to act as the launching person uses it instead of the App token, so commits and
-pull requests carry that person's identity.
+A person connects their own GitHub account under Settings → Credentials. A profile set to act
+as the launching person uses it instead of the App token, so commits and pull requests carry
+that person's identity. There are two ways to connect:
+
+- **Connect** authorizes the App to act as you. It is available when an admin completed step
+  5. The token has the App's permissions, limited to what you can access, and engrams renews
+  it.
+- **Add token** saves a fine-grained personal access token. engrams asks GitHub for the
+  token's login when you save it, and does not save a token that GitHub refuses.

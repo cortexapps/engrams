@@ -640,7 +640,11 @@ impl OAuthManager {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| driver_err("http_client", e.to_string()))?;
-        let request = http.post(token_url);
+        // RFC 6749 answers in JSON, but some providers (GitHub) answer the
+        // token request in form encoding unless the client asks for JSON.
+        let request = http
+            .post(token_url)
+            .header(reqwest::header::ACCEPT, "application/json");
         let request = match body {
             TokenRequestBody::Form => request.form(form),
             TokenRequestBody::Json => {
@@ -688,7 +692,9 @@ impl OAuthManager {
                         format!("no access token under {grant_path:?}")
                     }
                 });
-            let code = if err == "invalid_grant" {
+            // GitHub answers a dead refresh token with HTTP 200 and its own
+            // `bad_refresh_token` code, not the RFC's `invalid_grant`.
+            let code = if err == "invalid_grant" || err == "bad_refresh_token" {
                 "invalid_grant"
             } else {
                 "exchange_failed"

@@ -654,6 +654,39 @@ describe("integration oauth route", () => {
     });
   });
 
+  test("a mint connector's own personal flow: GitHub authorize and callback", async () => {
+    const { client, calls } = fakeRedirectClient({
+      flowSubject: { kind: OauthSubjectKind.USER_CONNECTOR, id: "u2" },
+    });
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    const begun = await app.request("/api/v1/me/connector-credentials/github/oauth/authorize");
+    expect(begun.status).toBe(302);
+    const spec = calls.begin[0]!.spec!;
+    expect(calls.begin[0]!.subject).toMatchObject({ kind: OauthSubjectKind.USER_CONNECTOR, id: "u2" });
+    expect(spec.authorizeUrl).toBe("https://github.com/login/oauth/authorize");
+    expect(spec.tokenUrl).toBe("https://github.com/login/oauth/access_token");
+    expect(spec.scopes).toEqual([]);
+    expect(spec.clientIdRef).toBe("github_app.client_id");
+    expect(spec.metadata?.probe).toMatchObject({
+      host: "api.github.com",
+      path: "/user",
+      map: { account_id: "id", display_name: "login" },
+    });
+
+    const done = await app.request(
+      "/api/v1/integrations/github/oauth/callback?code=abc&state=10600000-0000-4000-8000-0000000000aa",
+    );
+    expect(done.status).toBe(302);
+    expect(done.headers.get("location")).toBe("/settings/credentials?connected=github");
+    // The completion uses the same spec the flow began with.
+    expect(calls.complete[0]!.spec?.tokenUrl).toBe("https://github.com/login/oauth/access_token");
+  });
+
   test("callback: a user-subject flow is fenced to its owner", async () => {
     const { client, calls } = fakeRedirectClient({
       flowSubject: { kind: OauthSubjectKind.USER_CONNECTOR, id: "someone-else" },
