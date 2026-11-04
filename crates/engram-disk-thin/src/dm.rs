@@ -342,11 +342,14 @@ impl Dm {
                 io::ErrorKind::ResourceBusy,
             )
             .await;
-        if let Err(e) = loaded {
+        let ready = match loaded {
+            Ok(_) => self.resume(name).await,
+            Err(e) => Err(e),
+        };
+        if ready.is_err() {
             let _ = self.remove(name).await;
-            return Err(e);
         }
-        self.resume(name).await
+        ready
     }
 
     pub async fn remove(&self, name: &str) -> io::Result<()> {
