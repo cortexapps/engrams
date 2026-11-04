@@ -2,9 +2,8 @@
 //! that read pool metadata the kernel exposes no interface for.
 //!
 //! The wire format is `struct dm_ioctl` from `linux/dm-ioctl.h`: a
-//! 312-byte header followed by a command-specific payload. The layout
-//! has been ABI-stable at interface version 4 since 2.6; the constants
-//! below were read from the header and checked with a compiled probe.
+//! 312-byte header followed by a command-specific payload, ABI-stable
+//! at interface version 4.
 
 use std::fs::File;
 use std::io;
@@ -18,6 +17,7 @@ const HEADER_LEN: usize = 0x138;
 const DM_IOCTL: u32 = 0xfd;
 const DM_DEV_CREATE_CMD: u32 = 3;
 const DM_DEV_REMOVE_CMD: u32 = 4;
+const DM_DEV_RENAME_CMD: u32 = 5;
 const DM_DEV_SUSPEND_CMD: u32 = 6;
 const DM_DEV_STATUS_CMD: u32 = 7;
 const DM_TABLE_LOAD_CMD: u32 = 9;
@@ -99,6 +99,12 @@ impl Request {
     /// Append a `dm_target_msg` for sector 0.
     fn push_message(&mut self, text: &str) {
         self.buf.extend_from_slice(&0u64.to_ne_bytes());
+        self.buf.extend_from_slice(text.as_bytes());
+        self.buf.push(0);
+    }
+
+    /// Append a bare string payload, as `DM_DEV_RENAME` takes.
+    fn push_str(&mut self, text: &str) {
         self.buf.extend_from_slice(text.as_bytes());
         self.buf.push(0);
     }
@@ -213,11 +219,22 @@ impl Dm {
         })
     }
 
-    async fn call(&self, op: &str, name: &str, req: Request, cmd: u32) -> io::Result<Request> {
+    /// `busy` is the kind `EBUSY` maps to: the kernel uses it both for
+    /// "the name is taken" (create, rename) and "the device is open"
+    /// (remove). The returned error carries no raw errno.
+    async fn call(
+        &self,
+        op: &str,
+        name: &str,
+        req: Request,
+        cmd: u32,
+        busy: io::ErrorKind,
+    ) -> io::Result<Request> {
         req.ioctl(self.control.clone(), cmd).await.map_err(|e| {
             let kind = match e.raw_os_error() {
                 Some(libc::ENXIO) => io::ErrorKind::NotFound,
                 Some(libc::EEXIST) => io::ErrorKind::AlreadyExists,
+                Some(libc::EBUSY) => busy,
                 _ => e.kind(),
             };
             io::Error::new(kind, format!("dm {op} {name}: {e}"))
@@ -232,18 +249,25 @@ impl Dm {
         kind: &str,
         params: &str,
     ) -> io::Result<()> {
-        self.call("create", name, Request::new(name, 0)?, DM_DEV_CREATE_CMD)
-            .await
-            .map_err(|e| {
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    io::Error::new(io::ErrorKind::AlreadyExists, e)
-                } else {
-                    e
-                }
-            })?;
+        self.call(
+            "create",
+            name,
+            Request::new(name, 0)?,
+            DM_DEV_CREATE_CMD,
+            io::ErrorKind::AlreadyExists,
+        )
+        .await?;
         let mut load = Request::new(name, 0)?;
         load.push_target(length_sectors, kind, params);
-        let loaded = self.call("load", name, load, DM_TABLE_LOAD_CMD).await;
+        let loaded = self
+            .call(
+                "load",
+                name,
+                load,
+                DM_TABLE_LOAD_CMD,
+                io::ErrorKind::ResourceBusy,
+            )
+            .await;
         if let Err(e) = loaded {
             let _ = self.remove(name).await;
             return Err(e);
@@ -252,9 +276,36 @@ impl Dm {
     }
 
     pub async fn remove(&self, name: &str) -> io::Result<()> {
-        self.call("remove", name, Request::new(name, 0)?, DM_DEV_REMOVE_CMD)
-            .await
-            .map(drop)
+        self.call(
+            "remove",
+            name,
+            Request::new(name, 0)?,
+            DM_DEV_REMOVE_CMD,
+            io::ErrorKind::ResourceBusy,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Rename a device; the kernel refuses with `EBUSY` when `to` exists.
+    pub async fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        if to.len() >= NAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("device name {to:?} is too long for device-mapper"),
+            ));
+        }
+        let mut req = Request::new(from, 0)?;
+        req.push_str(to);
+        self.call(
+            "rename",
+            from,
+            req,
+            DM_DEV_RENAME_CMD,
+            io::ErrorKind::AlreadyExists,
+        )
+        .await
+        .map(drop)
     }
 
     /// Flush in-flight I/O and hold new I/O until `resume`.
@@ -264,28 +315,47 @@ impl Dm {
             name,
             Request::new(name, DM_SUSPEND_FLAG)?,
             DM_DEV_SUSPEND_CMD,
+            io::ErrorKind::ResourceBusy,
         )
         .await
         .map(drop)
     }
 
     pub async fn resume(&self, name: &str) -> io::Result<()> {
-        self.call("resume", name, Request::new(name, 0)?, DM_DEV_SUSPEND_CMD)
-            .await
-            .map(drop)
+        self.call(
+            "resume",
+            name,
+            Request::new(name, 0)?,
+            DM_DEV_SUSPEND_CMD,
+            io::ErrorKind::ResourceBusy,
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn message(&self, name: &str, text: &str) -> io::Result<()> {
         let mut req = Request::new(name, 0)?;
         req.push_message(text);
-        self.call("message", name, req, DM_TARGET_MSG_CMD)
-            .await
-            .map(drop)
+        self.call(
+            "message",
+            name,
+            req,
+            DM_TARGET_MSG_CMD,
+            io::ErrorKind::ResourceBusy,
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn devno(&self, name: &str) -> io::Result<DevNo> {
         let reply = self
-            .call("status", name, Request::new(name, 0)?, DM_DEV_STATUS_CMD)
+            .call(
+                "status",
+                name,
+                Request::new(name, 0)?,
+                DM_DEV_STATUS_CMD,
+                io::ErrorKind::ResourceBusy,
+            )
             .await?;
         Ok(reply.dev())
     }
@@ -305,7 +375,15 @@ impl Dm {
         loop {
             let mut req = Request::new(name, flags)?;
             req.reserve(room);
-            let reply = self.call("table", name, req, DM_TABLE_STATUS_CMD).await?;
+            let reply = self
+                .call(
+                    "table",
+                    name,
+                    req,
+                    DM_TABLE_STATUS_CMD,
+                    io::ErrorKind::ResourceBusy,
+                )
+                .await?;
             if reply.flags() & DM_BUFFER_FULL_FLAG == 0 {
                 return reply.targets();
             }
