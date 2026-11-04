@@ -1,11 +1,5 @@
-//! Moving chunks between a [`Volume`] and the chunk store.
-//!
-//! [`stage`] turns a manifest into a volume; [`checkpoint`] turns a
-//! volume into a manifest. Both speak only in whole chunks, skip
-//! all-zero chunks (a manifest gap, a hole in the volume), and fan the
-//! per-chunk store calls out with bounded concurrency. The platform
-//! lifecycle (create, snapshot, delete) stays behind [`SessionDisk`];
-//! the hypervisor's pause around a checkpoint is the caller's.
+//! Chunks between a [`Volume`] and the chunk store: [`stage`] turns a
+//! manifest into a volume, [`checkpoint`] turns a volume into a manifest.
 
 use std::io;
 
@@ -14,8 +8,7 @@ use futures::stream::{self, TryStreamExt};
 
 use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
 
-/// Chunk store calls in flight at once. Peak buffered memory is this
-/// many chunks (1 GiB at 16 MiB).
+/// Store calls in flight; peak buffered memory is this many chunks.
 const CONCURRENCY: usize = 64;
 
 fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
@@ -41,8 +34,6 @@ fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `delta` into `volume`: fetch and write each chunk in
-/// `delta.write`, punch a hole at each offset in `delta.zero`.
 async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta) -> io::Result<()> {
     let chunk_size = volume.chunk_size;
     stream::iter(delta.write.iter().map(Ok))
@@ -59,13 +50,9 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
     Ok(())
 }
 
-/// A new volume holding the bytes `manifest` describes.
-///
-/// With `base`, the volume is a snapshot of `base.0` (which holds
-/// `base.1`) and only the chunks that differ are written: this is how
-/// image version N+1 is staged beside version N, and how a session is
-/// resumed onto its base image. Without it, the volume is fresh and
-/// every listed chunk is written; gaps stay holes.
+/// A new volume holding `manifest`. With `base` (a volume and the
+/// manifest it holds) the result is a snapshot of it with only the delta
+/// written; without, a fresh volume with every listed chunk written.
 pub async fn stage(
     disk: &dyn SessionDisk,
     store: &ChunkStore,
@@ -95,17 +82,10 @@ pub async fn stage(
     Ok(volume)
 }
 
-/// A point-in-time snapshot of `live` and the manifest describing it.
-///
-/// The caller pauses the guest before this call and resumes it after
-/// `snapshot` returns; this function syncs the volume, snapshots it,
-/// and then does the slow part (reading and uploading) from the
-/// snapshot, so the pause covers only the sync and the O(1) snapshot.
-/// Use [`checkpoint_split`] to resume the guest between the two.
-///
-/// With `previous`, only the chunks that differ from the previous
-/// snapshot are read and uploaded, and the manifest is the previous
-/// one with those replaced. Without it, every non-zero chunk is.
+/// A snapshot of `live` and the manifest describing it. With `previous`
+/// (the last snapshot and its manifest) only the chunks that differ are
+/// uploaded. The guest must be paused across [`checkpoint_split::take`];
+/// use the split form to resume it before the upload.
 pub async fn checkpoint(
     disk: &dyn SessionDisk,
     store: &ChunkStore,
@@ -118,12 +98,11 @@ pub async fn checkpoint(
     Ok((snapshot, manifest))
 }
 
-/// [`checkpoint`] in two halves, so a caller can resume the guest in
-/// between.
+/// [`checkpoint`] in two halves.
 pub mod checkpoint_split {
     use super::*;
 
-    /// The part inside the guest pause: sync, then snapshot.
+    /// Inside the guest pause: sync, then snapshot.
     pub async fn take(
         disk: &dyn SessionDisk,
         live: &Volume,
@@ -133,8 +112,7 @@ pub mod checkpoint_split {
         disk.snapshot(live, name).await
     }
 
-    /// The part outside the pause: find what changed, upload it, build
-    /// the manifest. Reads only from `snapshot`.
+    /// Outside the pause: upload what changed and build the manifest.
     pub async fn upload(
         disk: &dyn SessionDisk,
         store: &ChunkStore,

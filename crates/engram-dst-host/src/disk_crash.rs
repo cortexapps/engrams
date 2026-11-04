@@ -1,18 +1,7 @@
-//! The op-boundary crash injector for the session-disk seam.
-//!
-//! [`CrashDisk`] wraps a real [`FileDisk`] and gates every
-//! [`SessionDisk`] call the way [`CrashFs`](crate::CrashFs) gates
-//! `HostFs`: each call appends its [`DiskOp`] to a trace, and when a
-//! crash index is armed, the op at (and after) that index returns an
-//! error without performing. Ops before the cut run for real, so the
-//! volumes left in the directory are exactly what a process death at
-//! that point leaves. A flow's crash-point list is derived by running
-//! it once in recording mode and reading the trace.
-//!
-//! Chunk reads and writes on a [`Volume`] are not gated: they go to
-//! the kernel directly in production too, and a death between two of
-//! them is a torn volume, which is the checkpoint snapshot's job to
-//! exclude, not this injector's.
+//! [`CrashDisk`]: a real [`FileDisk`] with every [`SessionDisk`] call
+//! traced and, when armed, cut at an op index, like [`CrashFs`](crate::CrashFs).
+//! Chunk reads and writes are not gated: they go to the kernel in
+//! production too.
 
 use std::io;
 use std::path::Path;
@@ -22,9 +11,7 @@ use async_trait::async_trait;
 use engram_host_core::{Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName};
 use parking_lot::Mutex;
 
-/// One [`SessionDisk`] operation kind. Wildcard-free at its use sites:
-/// a new trait method must add a variant here or the impl below fails
-/// to compile.
+/// One [`SessionDisk`] operation kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskOp {
     Create,
@@ -40,22 +27,17 @@ struct CrashDiskState {
     crash_at: Option<usize>,
 }
 
-/// A [`SessionDisk`] over real files that records every op and, when
-/// armed, refuses the op at index `crash_at` and everything after it.
 pub struct CrashDisk {
     inner: FileDisk,
     state: Mutex<CrashDiskState>,
 }
 
 impl CrashDisk {
-    /// Recording-only: no crash armed.
     pub fn recording(root: &Path, chunk_size: u64) -> io::Result<Arc<Self>> {
         Self::with_crash_at(root, chunk_size, None)
     }
 
-    /// Arm a cut at op index `k` (0-based over this instance's whole
-    /// lifetime): op `k` and every later op fail without performing.
-    /// `None` never cuts.
+    /// Op `k` and every later op fail without performing.
     pub fn with_crash_at(root: &Path, chunk_size: u64, k: Option<usize>) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: FileDisk::new(root, chunk_size)?,
@@ -66,12 +48,11 @@ impl CrashDisk {
         }))
     }
 
-    /// Every op issued so far, in order, including the refused ones.
+    /// Every op issued so far, including refused ones.
     pub fn trace(&self) -> Vec<DiskOp> {
         self.state.lock().trace.clone()
     }
 
-    /// The real disk underneath, for a test to inspect what survived.
     pub fn inner(&self) -> &FileDisk {
         &self.inner
     }
@@ -132,9 +113,6 @@ mod tests {
         VolumeName::new(s).expect("valid name")
     }
 
-    /// A small flow: create, snapshot, delete the origin. Run it once to
-    /// derive its op trace, then cut at every index and check the files
-    /// left behind match a death at that op.
     async fn flow(disk: &dyn SessionDisk) -> io::Result<()> {
         let origin = disk.create(&name("origin"), CHUNK).await?;
         disk.snapshot(&origin, &name("snap")).await?;

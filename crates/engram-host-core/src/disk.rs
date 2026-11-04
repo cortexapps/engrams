@@ -1,21 +1,11 @@
-//! The session-disk seam: volumes the kernel owns.
+//! Session disks the kernel owns (ADR 0125).
 //!
-//! A [`Volume`] is a block device or a file that a hypervisor opens
-//! directly. Nothing in the host-agent sits in its data path. Once a
-//! volume exists, every platform treats it the same way: positional
-//! reads and writes of whole chunks, hole punching, and `fsync`. So
-//! `Volume` is one concrete type.
-//!
-//! What varies by platform is how a volume comes to exist, how it is
-//! copied in O(1), how two copies are compared, and how much room is
-//! left. That is [`SessionDisk`]: a thin pool on Linux, APFS clones on
-//! macOS, memory in the simulator.
-//!
-//! Chunks are the unit of everything here. A chunk is `chunk_size`
-//! bytes at `index * chunk_size`, the same unit the chunk store uploads.
-//! A chunk that reads as all zeros is a *hole*: it is never listed in a
-//! manifest and it holds no space in the volume. See ADR 0125 for the
-//! reasoning.
+//! A [`Volume`] is a block device or a file the hypervisor opens
+//! directly; it is one concrete type because every platform reads,
+//! writes, punches and syncs it the same way. [`SessionDisk`] is the
+//! per-platform lifecycle around it. Everything is addressed in chunks
+//! of `chunk_size` bytes; an all-zero chunk is a hole and is never
+//! listed in a manifest.
 
 use std::fs::File;
 use std::io;
@@ -26,14 +16,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-/// The name a volume is created and reopened by. Recorded in the
-/// sandbox's `sandbox.json`; the platform maps it to a device or a file.
+/// The name a volume is created and reopened by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VolumeName(String);
 
 impl VolumeName {
-    /// Names are a short, device-safe alphabet: `[a-z0-9-]`, 1..=64
-    /// bytes. Device-mapper and file systems both accept them verbatim.
+    /// `[a-z0-9-]`, 1..=64 bytes: accepted verbatim by device-mapper
+    /// and file systems.
     pub fn new(name: impl Into<String>) -> Result<Self, String> {
         let name = name.into();
         let ok_len = (1..=64).contains(&name.len());
@@ -64,10 +53,8 @@ impl std::fmt::Display for VolumeName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkIndex(pub u64);
 
-/// Room left on the platform's store, reported in the heartbeat so
-/// placement can refuse a host that cannot hold another session.
-/// Metadata is a separate pool on Linux; a platform with no separate
-/// metadata reports it equal to data.
+/// Room left on the platform's store. A platform with no separate
+/// metadata pool reports metadata equal to data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub data_free_bytes: u64,
@@ -76,7 +63,7 @@ pub struct Capacity {
     pub metadata_total_bytes: u64,
 }
 
-/// An open volume. Cheap to clone: the file handle is shared.
+/// An open volume. Clones share the file handle.
 #[derive(Clone, Debug)]
 pub struct Volume {
     pub name: VolumeName,
@@ -88,8 +75,7 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// Open the device or file at `path` read-write. Platform
-    /// implementations call this after creating or finding a volume.
+    /// Open the device or file at `path` read-write.
     pub fn open(
         name: VolumeName,
         path: &Path,
@@ -107,13 +93,12 @@ impl Volume {
         })
     }
 
-    /// Number of chunks, counting a short final chunk.
+    /// Number of chunks, including a short final one.
     pub fn chunk_count(&self) -> u64 {
         self.size_bytes.div_ceil(self.chunk_size)
     }
 
-    /// Byte length of chunk `index`: `chunk_size`, or shorter for the
-    /// final chunk of a volume whose size is not a multiple.
+    /// Byte length of chunk `index`; only the final chunk can be short.
     pub fn chunk_len(&self, index: ChunkIndex) -> io::Result<usize> {
         let offset = self.offset_of(index)?;
         Ok((self.size_bytes - offset).min(self.chunk_size) as usize)
@@ -133,7 +118,7 @@ impl Volume {
         Ok(offset)
     }
 
-    /// Read chunk `index` in full. Runs on the blocking pool.
+    /// Read chunk `index` in full.
     pub async fn read_chunk(&self, index: ChunkIndex) -> io::Result<Vec<u8>> {
         let offset = self.offset_of(index)?;
         let len = self.chunk_len(index)?;
@@ -147,8 +132,7 @@ impl Volume {
         .map_err(|e| io::Error::other(format!("read_chunk task: {e}")))?
     }
 
-    /// Write chunk `index` in full. `bytes` must be exactly the chunk's
-    /// length; a partial chunk write is a caller bug, not a short write.
+    /// Write chunk `index` in full; `bytes` must be exactly its length.
     pub async fn write_chunk(&self, index: ChunkIndex, bytes: Vec<u8>) -> io::Result<()> {
         let offset = self.offset_of(index)?;
         let len = self.chunk_len(index)?;
@@ -169,8 +153,7 @@ impl Volume {
             .map_err(|e| io::Error::other(format!("write_chunk task: {e}")))?
     }
 
-    /// Make chunk `index` read as zeros and hold no space. On a thin
-    /// volume this unmaps the blocks; on a file it punches a hole.
+    /// Make chunk `index` read as zeros and hold no space.
     pub async fn zero_chunk(&self, index: ChunkIndex) -> io::Result<()> {
         let offset = self.offset_of(index)?;
         let len = self.chunk_len(index)? as u64;
@@ -180,8 +163,7 @@ impl Volume {
             .map_err(|e| io::Error::other(format!("zero_chunk task: {e}")))?
     }
 
-    /// Push the host page cache for this volume down to the platform
-    /// store. Called inside a checkpoint pause, before the snapshot.
+    /// Flush the host page cache for this volume to the store.
     pub async fn sync(&self) -> io::Result<()> {
         let file = Arc::clone(&self.file);
         tokio::task::spawn_blocking(move || file.sync_all())
@@ -190,26 +172,20 @@ impl Volume {
     }
 }
 
-/// True when every byte is zero: the chunk is a hole and is left out
-/// of manifests.
+/// A chunk of zeros is a hole and is left out of manifests.
 pub fn is_zero_chunk(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == 0)
 }
 
-/// Release `length` bytes at `offset` so they read as zeros.
-///
-/// A block device (a thin volume) takes `BLKDISCARD`, which unmaps the
-/// range so the pool reclaims it and reads return zeros. A regular
-/// file takes `fallocate` with punch-hole. The kernel maps `fallocate`
-/// on a block device to a write-zeroes request that dm-thin is not
-/// expected to accept; the device branch exists so this never depends
-/// on that mapping. Confirm on a thin volume when the Linux
-/// implementation lands.
+/// Release `length` bytes at `offset` so they read as zeros: `BLKDISCARD`
+/// on a block device (dm-thin does not accept `fallocate`'s write-zeroes
+/// mapping; verify when the thin-pool implementation lands), `fallocate`
+/// punch-hole on a file.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     if file.metadata()?.file_type().is_block_device() {
-        // `_IO(0x12, 119)`: the discard ioctl, start and length in bytes.
+        // _IO(0x12, 119); argument is [start, length] in bytes.
         const BLKDISCARD: libc::c_ulong = 0x1277;
         let range: [u64; 2] = [offset, length];
         // SAFETY: the kernel copies the two-element range in and writes
@@ -239,8 +215,8 @@ pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     }
 }
 
-/// Release `length` bytes at `offset` so they read as zeros. APFS
-/// requires the range to be block-aligned; whole chunks always are.
+/// Release `length` bytes at `offset` so they read as zeros. The range
+/// must be block-aligned.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
@@ -261,31 +237,27 @@ pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     }
 }
 
-/// The platform's volume store. One implementation per platform; the
-/// lifecycle code above it is shared.
+/// The platform's volume store.
 #[async_trait]
 pub trait SessionDisk: Send + Sync {
     /// A new volume of `size_bytes` that reads as zeros.
     async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume>;
 
-    /// An O(1) point-in-time copy of `origin`. The origin may be in use
-    /// by a running guest when the caller has paused the guest and
-    /// called [`Volume::sync`] first.
+    /// An O(1) point-in-time copy of `origin`. A live origin must be
+    /// paused and synced first.
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume>;
 
     /// A volume that already exists. `NotFound` when it does not.
     async fn open(&self, name: &VolumeName) -> io::Result<Volume>;
 
-    /// Remove a volume and return its exclusive space to the store.
-    /// Fails while a process holds the volume open.
+    /// Remove a volume. Fails while a process holds it open.
     async fn delete(&self, name: &VolumeName) -> io::Result<()>;
 
     async fn capacity(&self) -> io::Result<Capacity>;
 
-    /// Indices of the chunks whose bytes differ between `before` and `after`,
-    /// ascending. Both are snapshots of one origin. A platform with a
-    /// metadata diff overrides this; the default reads both volumes in
-    /// full and is the oracle the override is tested against.
+    /// Ascending indices of the chunks that differ between two snapshots
+    /// of one origin. The default reads both in full and is the oracle a
+    /// metadata-based override is tested against.
     async fn dirty_chunks(&self, before: &Volume, after: &Volume) -> io::Result<Vec<ChunkIndex>> {
         let chunk_count = before.chunk_count();
         if chunk_count != after.chunk_count() {
@@ -313,10 +285,8 @@ pub trait SessionDisk: Send + Sync {
     }
 }
 
-/// Volumes as sparse files in one directory. This is the macOS
-/// implementation (APFS makes `fs::copy` a clone) and the development
-/// implementation on a Linux box with no thin pool. The simulator wraps
-/// it. It keeps the default `dirty_chunks`.
+/// Volumes as sparse files in one directory: the macOS implementation
+/// (`fs::copy` is a clone on APFS) and the Linux one without a thin pool.
 #[derive(Clone, Debug)]
 pub struct FileDisk {
     root: PathBuf,
@@ -324,7 +294,6 @@ pub struct FileDisk {
 }
 
 impl FileDisk {
-    /// Create the directory when it does not exist.
     pub fn new(root: impl Into<PathBuf>, chunk_size: u64) -> io::Result<Self> {
         assert!(chunk_size > 0, "chunk_size must be non-zero");
         let root = root.into();
@@ -400,8 +369,7 @@ fn filesystem_space(path: &Path) -> io::Result<(u64, u64)> {
     }
     // SAFETY: a zero return means the kernel initialised every field.
     let stat = unsafe { stat.assume_init() };
-    // Block counts are 32-bit on macOS and 64-bit on Linux; widen through
-    // a generic so neither platform's clippy sees a useless conversion.
+    // Block counts are 32-bit on macOS and 64-bit on Linux.
     fn widen(n: impl Into<u64>) -> u64 {
         n.into()
     }

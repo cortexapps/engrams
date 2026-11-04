@@ -206,11 +206,9 @@ pub struct ChunkRef {
 /// What separates two versions of one disk: see [`Manifest::delta_from`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManifestDelta {
-    /// Chunks present in the target with a hash the base lacks at that
-    /// offset: write these.
+    /// Chunks whose hash differs from the base at that offset.
     pub write: Vec<ChunkRef>,
-    /// Offsets the base lists and the target does not: make these read
-    /// as zeros.
+    /// Offsets the base lists and the target does not.
     pub zero: Vec<u64>,
 }
 
@@ -380,11 +378,8 @@ impl Manifest {
         Ok(())
     }
 
-    /// The chunks that must be written, and the offsets that must be
-    /// zeroed, to turn a disk holding `base` into one holding `self`.
-    /// Pure list arithmetic over hashes; no chunk data is read. Both
-    /// manifests must have the same chunk size and total size, which is
-    /// what "the same disk at two versions" means.
+    /// What must be written and zeroed to turn a disk holding `base`
+    /// into one holding `self`. Both must have the same shape.
     pub fn delta_from(&self, base: &Manifest) -> Result<ManifestDelta> {
         if self.chunk_size != base.chunk_size || self.total_bytes != base.total_bytes {
             return Err(ChunkStoreError::MalformedManifest(format!(
@@ -413,10 +408,8 @@ impl Manifest {
         Ok(ManifestDelta { write, zero })
     }
 
-    /// `self` with `write` entries inserted or replaced by offset and
-    /// `zero` offsets removed. Keeps the chunk list sorted by offset.
     /// The inverse of [`Self::delta_from`]: `base.apply(&next.delta_from(&base))`
-    /// equals `next` in its chunk list.
+    /// has `next`'s chunk list.
     pub fn apply(&self, delta: &ManifestDelta) -> Manifest {
         let mut by_offset: BTreeMap<u64, ChunkHash> =
             self.chunks.iter().map(|c| (c.offset, c.hash)).collect();
