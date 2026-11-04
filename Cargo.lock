@@ -2713,7 +2713,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "engram-chunk-store",
  "engram-core",
+ "engram-storage-local",
+ "futures",
  "libc",
  "serde",
  "serde_json",

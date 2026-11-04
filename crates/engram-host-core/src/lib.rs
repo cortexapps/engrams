@@ -1,11 +1,12 @@
 //! Portable host-agent core (ADR 0098 Phase 2, the P-series).
 //!
 //! This crate holds the host-agent's side-effect seams and the
-//! prod-portable impls of them. It depends only on `engram-core` (plus the
-//! ambient async/serde/time crates) — deliberately NOT on
-//! `engram-host-agent`, reqwest, or anything Linux-gated — which is what
-//! makes the extracted lifecycle logic **runnable on macOS** and drivable
-//! by the host-internal simulator (`engram-dst-host`).
+//! prod-portable impls of them. It depends on `engram-core` and
+//! `engram-chunk-store` (plus the ambient async/serde/time crates) —
+//! deliberately NOT on `engram-host-agent`, reqwest, or anything
+//! Linux-gated — which is what makes the extracted lifecycle logic
+//! **runnable on macOS** and drivable by the host-internal simulator
+//! (`engram-dst-host`).
 //!
 //! # Why a bundle struct, not a mega-trait
 //!
@@ -27,6 +28,10 @@
 //!   (abandon-in-place stays a `NbdSandboxState` method; see `device`).
 //! - [`nbd::NbdKernel`] — the connect/reconfigure/disconnect/
 //!   backend-identifier kernel ops.
+//! - [`disk::SessionDisk`] — volumes the kernel owns (create, O(1)
+//!   snapshot, delete, dirty-chunk diff); [`disk_flows`] moves chunks
+//!   between a volume and the chunk store. Replaces the two seams above
+//!   once the disk daemon is gone (ADR 0125).
 //!
 //! The data plane (the NBD serve loop, `read_chunk`/`write_chunk`, the
 //! migrate_peer page server, the flush lock ladder) is deliberately NOT
@@ -37,6 +42,7 @@ pub mod checkpoint;
 pub mod coord;
 pub mod device;
 pub mod disk;
+pub mod disk_flows;
 pub mod effects;
 pub mod finalize;
 pub mod fs;
@@ -53,6 +59,7 @@ pub use coord::{
 };
 pub use device::DeviceSync;
 pub use disk::{is_zero_chunk, Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName};
+pub use disk_flows::{checkpoint, checkpoint_split, stage};
 pub use effects::HostEffects;
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
