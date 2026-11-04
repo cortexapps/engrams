@@ -464,13 +464,12 @@ if sandbox_backend == 'process':
         coord_env['ENGRAM_PROCESS_IMAGE_CATALOG'] = process_image_catalog
 
 if fc_colima_profile:
-    # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
-    # production 20 GiB disk-cache floor. Lower BOTH coordinator-side
-    # floors — placement (or the VM is never disk-eligible for a
-    # session) and the idle detector's — in lockstep with the VM-side
-    # host-agent idle-evict override below. The two are separate env
-    # vars on purpose: prod must be able to tune idle eviction without
-    # silently loosening placement's disk gate.
+    # The fc-dev VM has a ~19 GiB rootfs and a 20 GiB session-disk
+    # pool, both under the production floors (20 GiB disk cache, 16 GiB
+    # pool). Lower the placement floors (or the VM never takes a
+    # session) and the idle detector's disk floor, in lockstep with the
+    # VM-side host-agent idle-evict override below. Separate env vars on
+    # purpose: prod tunes idle eviction without loosening placement.
     coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'

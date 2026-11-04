@@ -359,18 +359,69 @@ pub fn host_wire_version_ok(h: &HostRecord) -> bool {
 /// coordinator-cordoned, heartbeat-fresh within `ttl`, and on a
 /// compatible wire version (issue #229).
 pub fn host_is_schedulable(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
-    h.status == HostStatus::Ready
-        && !h.cordoned
-        && host_wire_version_ok(h)
-        && now
-            .signed_duration_since(h.last_heartbeat_at)
-            .to_std()
-            .map_or(
-                // last_heartbeat_at in the future (clock skew between the
-                // writer pod and us) is trivially fresh.
-                true,
-                |age| age <= ttl,
-            )
+    fleet_veto(h, now, ttl).is_none()
+}
+
+/// Why a host is out of the fleet for every kind of work, or `None`.
+fn fleet_veto(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> Option<Exclusion> {
+    if h.status != HostStatus::Ready {
+        return Some(Exclusion::NotReady);
+    }
+    if h.cordoned {
+        return Some(Exclusion::Cordoned);
+    }
+    if !host_wire_version_ok(h) {
+        return Some(Exclusion::WireSkew);
+    }
+    // A heartbeat in the future (clock skew between pods) is fresh.
+    let stale = now
+        .signed_duration_since(h.last_heartbeat_at)
+        .to_std()
+        .is_ok_and(|age| age > ttl);
+    stale.then_some(Exclusion::Stale)
+}
+
+/// Why a host takes no new session of any kind, or `None`: the fleet
+/// veto plus the session-disk pool floor. The capture picker, the
+/// autoscaler and the queue diagnostics read this; a pick for a
+/// specific session adds its own requirements in [`exclusion_reason`].
+pub fn new_session_veto(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> Option<Exclusion> {
+    fleet_veto(h, now, ttl).or_else(|| (!host_pool_floor_ok(h)).then_some(Exclusion::PoolFull))
+}
+
+/// Why a host is excluded from a pick. `label` is the bounded
+/// vocabulary of `engram_placement_excluded_total{reason}` and the
+/// `queue_timeout` payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Exclusion {
+    /// The pick's explicit `exclude_host`.
+    Excluded,
+    NotReady,
+    Cordoned,
+    WireSkew,
+    /// Heartbeat older than the placement TTL.
+    Stale,
+    /// The session-disk pool is below the floor.
+    PoolFull,
+    /// A required capability failed; carries its name.
+    Cap(String),
+    /// The image is not staged on the host.
+    DigestNotReady,
+}
+
+impl Exclusion {
+    pub fn label(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Exclusion::Excluded => "excluded".into(),
+            Exclusion::NotReady => "not_ready".into(),
+            Exclusion::Cordoned => "cordoned".into(),
+            Exclusion::WireSkew => "wire_skew".into(),
+            Exclusion::Stale => "stale".into(),
+            Exclusion::PoolFull => "pool_full".into(),
+            Exclusion::Cap(name) => format!("cap:{name}").into(),
+            Exclusion::DigestNotReady => "digest_not_ready".into(),
+        }
+    }
 }
 
 /// ADR 0095: a host that may SERVE chunks to a fleet peer — alive
@@ -392,62 +443,31 @@ pub fn host_can_serve_chunks(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) 
     }
 }
 
-/// Why `h` cannot take a session under `ctx`, or `None` when it can.
-/// The one definition of schedulability every pick path reads: the
-/// ranked candidate set, the tier-0 snapshot-affinity veto and the
-/// exclusion diagnostics. First-match order: `excluded` (an explicit
-/// `exclude_host`) → `not_ready` → `cordoned` → `wire_skew` → `stale`
-/// (heartbeat older than `ttl`) → `cap:<name>` (a required capability
-/// failed) → `pool_full` (the session-disk pool is below the floor) →
-/// `digest_not_ready` (image not staged).
+/// Why `h` cannot take the session `ctx` describes, or `None` when it
+/// can. The one definition every pick path reads: the ranked candidate
+/// set, the tier-0 snapshot-affinity veto and the exclusion
+/// diagnostics. First match wins: `Excluded`, then
+/// [`new_session_veto`], then `Cap`, then `DigestNotReady`.
 fn exclusion_reason(
     h: &HostRecord,
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
     ttl: Duration,
-) -> Option<std::borrow::Cow<'static, str>> {
+) -> Option<Exclusion> {
     if Some(h.id) == ctx.exclude_host {
-        return Some("excluded".into());
+        return Some(Exclusion::Excluded);
     }
-    if h.status != HostStatus::Ready {
-        return Some("not_ready".into());
-    }
-    if h.cordoned {
-        return Some("cordoned".into());
-    }
-    if !host_wire_version_ok(h) {
-        return Some("wire_skew".into());
-    }
-    if now
-        .signed_duration_since(h.last_heartbeat_at)
-        .to_std()
-        .is_ok_and(|age| age > ttl)
-    {
-        return Some("stale".into());
+    if let Some(veto) = new_session_veto(h, now, ttl) {
+        return Some(veto);
     }
     if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
-        return Some(format!("cap:{cap}").into());
+        return Some(Exclusion::Cap(cap.to_string()));
     }
-    if !host_pool_floor_ok(h) {
-        return Some("pool_full".into());
-    }
-    if ctx
+    let staged = ctx
         .required_image_digest
         .as_ref()
-        .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
-    {
-        return Some("digest_not_ready".into());
-    }
-    None
-}
-
-fn host_passes_filters(
-    h: &HostRecord,
-    ctx: &ScheduleContext<'_>,
-    now: DateTime<Utc>,
-    ttl: Duration,
-) -> bool {
-    exclusion_reason(h, ctx, now, ttl).is_none()
+        .is_none_or(|d| h.ready_images.iter().any(|r| r == d.as_str()));
+    (!staged).then_some(Exclusion::DigestNotReady)
 }
 
 /// The first [`exclusion_reason`] of each host in `hosts`, in row order,
@@ -464,8 +484,7 @@ pub fn exclusion_summary(
         .iter()
         .map(|h| {
             let reason = exclusion_reason(h, ctx, now, ttl)
-                .map(|r| r.into_owned())
-                .unwrap_or_else(|| "no_fit".to_string());
+                .map_or_else(|| "no_fit".to_string(), |r| r.label().into_owned());
             (h.id, reason)
         })
         .collect()
@@ -492,7 +511,7 @@ pub fn rank_hosts(
     // alternative exists but is never stranded when none does.
     let mut uncovered: Vec<HostId> = Vec::new();
     for h in hosts {
-        if host_passes_filters(h, ctx, now, ttl) {
+        if exclusion_reason(h, ctx, now, ttl).is_none() {
             if host_covers_bundles(h, ctx.prefer_bundles) {
                 ranked.push(h.id);
             } else {
@@ -523,7 +542,7 @@ pub fn host_covers_bundles(
 /// Pure pick for the resume/evac path. Ranking tiers:
 ///
 /// 1. snapshot-affinity (capacity-CHECKED: the tier-0 veto mirrors every
-///    `host_passes_filters` gate plus disk/RAM/CPU — an affinity host that
+///    `exclusion_reason` gate plus disk/RAM/CPU — an affinity host that
 ///    can't take the resume falls through to the soft tiers, counted in
 ///    `engram_resume_affinity_fallback_total`),
 /// 2. `prefer_host` if it passes the same disk + RAM/CPU fit gate as
@@ -658,8 +677,8 @@ fn snapshot_host_veto(
     match exclusion_reason(h, ctx, now, ttl) {
         // Not Ready and stale are both "dead" to the metric: the host
         // that held the chunks is not there to serve them.
-        Some(r) if r == "not_ready" || r == "stale" => return Some("dead".into()),
-        Some(r) => return Some(r),
+        Some(Exclusion::NotReady | Exclusion::Stale) => return Some("dead".into()),
+        Some(r) => return Some(r.label()),
         None => {}
     }
     // Disk + capacity: the shared named-host fit gate (also applied by
@@ -989,7 +1008,7 @@ pub fn capture_candidate_hosts_from(
         if host_meets_capabilities(h, &caps).is_err() {
             continue;
         }
-        if !host_disk_floor_ok(h) || !host_pool_floor_ok(h) {
+        if !host_disk_floor_ok(h) {
             continue;
         }
         if live_capture_hosts.contains(&h.id) {
@@ -1077,13 +1096,12 @@ pub async fn pick_materialize_host(
 }
 
 /// Shared eligibility for the enable pipeline's host-side stages:
-/// schedulable, base-capable, and above the disk and pool floors (same
+/// takes a new session, base-capable, and above the disk floor (same
 /// unmeasured-is-soft posture as `named_host_fit_veto`).
 fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
-    host_is_schedulable(h, now, ttl)
+    new_session_veto(h, now, ttl).is_none()
         && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
         && host_disk_floor_ok(h)
-        && host_pool_floor_ok(h)
 }
 
 /// The session-disk pool floor: a host whose pool has less data or
@@ -1093,7 +1111,7 @@ fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> b
 /// that has not reported yet) is soft, the same posture as unmeasured
 /// RAM; a pool whose probe fails withdraws the `session_disk`
 /// capability instead, which is a hard exclusion.
-pub(crate) fn host_pool_floor_ok(h: &HostRecord) -> bool {
+fn host_pool_floor_ok(h: &HostRecord) -> bool {
     let u = &h.utilization;
     u.pool_data_total_mib == 0
         || (u.pool_data_free_mib >= host_pool_data_floor_mib()
@@ -1103,11 +1121,27 @@ pub(crate) fn host_pool_floor_ok(h: &HostRecord) -> bool {
 /// `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` overrides the pool data floor for
 /// small dev rigs; it is a separate knob from the work_dir disk floor.
 fn host_pool_data_floor_mib() -> u64 {
-    std::env::var("ENGRAM_PLACEMENT_POOL_FLOOR_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|bytes| bytes / (1024 * 1024))
-        .unwrap_or(HOST_POOL_DATA_FLOOR_MIB)
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        floor_mib_from_env(
+            "ENGRAM_PLACEMENT_POOL_FLOOR_BYTES",
+            HOST_POOL_DATA_FLOOR_MIB,
+        )
+    })
+}
+
+/// A floor from `var` in bytes, as MiB, or `default_mib` when unset. A
+/// value that does not parse is a configuration error, not a default.
+fn floor_mib_from_env(var: &str, default_mib: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(s) => {
+            let bytes: u64 = s
+                .parse()
+                .unwrap_or_else(|e| panic!("{var}={s:?} is not a byte count: {e}"));
+            bytes / (1024 * 1024)
+        }
+        Err(_) => default_mib,
+    }
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
@@ -1135,11 +1169,13 @@ fn host_disk_floor_ok(h: &HostRecord) -> bool {
 /// packing → disk-full hosts). Small-disk dev rigs (the fc-colima VM)
 /// set both.
 fn host_disk_cache_floor_mib() -> u64 {
-    std::env::var("ENGRAM_PLACEMENT_DISK_FLOOR_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(engram_core::types::host::HOST_DISK_CACHE_FLOOR_BYTES)
-        / (1024 * 1024)
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        floor_mib_from_env(
+            "ENGRAM_PLACEMENT_DISK_FLOOR_BYTES",
+            engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB,
+        )
+    })
 }
 
 /// Pick a host for `ctx`, then `restore` from `metadata` on it. (The
@@ -1179,13 +1215,12 @@ fn fleet_capability_req() -> CapabilityRequirements {
 }
 
 /// The autoscaler's per-host capacity predicate: a host counts only if
-/// PLACEMENT would rank it — schedulable, capable under the fleet
-/// posture, and above the pool floor. Pure so the gate is unit-testable
-/// without a store.
+/// PLACEMENT would rank it — takes a new session and is capable under
+/// the fleet posture. Pure so the gate is unit-testable without a
+/// store.
 pub fn host_counts_as_capacity(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
-    host_is_schedulable(h, now, ttl)
+    new_session_veto(h, now, ttl).is_none()
         && host_meets_capabilities(h, &fleet_capability_req()).is_ok()
-        && host_pool_floor_ok(h)
 }
 
 /// Fleet-wide autoscaling counts (ADR 0044 K4 + ADR 0048 CPU dims),
@@ -1577,9 +1612,8 @@ mod tests {
             .is_ok());
         }
 
-        /// `host_passes_filters` wires the gate in: a schedulable host
-        /// that fails a required capability is excluded from
-        /// `rank_hosts`.
+        /// A schedulable host that fails a required capability is
+        /// excluded from `rank_hosts`.
         #[test]
         fn rank_hosts_excludes_a_host_failing_required_capabilities() {
             let mut ready = host(1);

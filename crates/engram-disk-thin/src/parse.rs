@@ -91,9 +91,11 @@ pub const METADATA_BLOCK_BYTES: u64 = 4096;
 pub fn pool_status(status: &str) -> io::Result<PoolStatus> {
     let fields: Vec<&str> = status.split_whitespace().collect();
     match fields.as_slice() {
-        [_, _, _, _, mode, ..] if *mode != "rw" => {
-            Err(invalid(format!("thin-pool is {mode}: {status:?}")))
-        }
+        ["Fail" | "Error"] => Err(invalid(format!("thin-pool is {}", fields[0]))),
+        // The mode is the only part of the message: it stays the same
+        // from one sample to the next, so a faulted host's capability
+        // detail does not change every tick.
+        [_, _, _, _, mode, ..] if *mode != "rw" => Err(invalid(format!("thin-pool is {mode}"))),
         [_, metadata, data, _, "rw", ..] => {
             let (metadata_used_blocks, metadata_total_blocks) = fraction(metadata)?;
             let (data_used_blocks, data_total_blocks) = fraction(data)?;
@@ -234,7 +236,9 @@ mod tests {
             "0 4115/65536 5/65536 - ro discard_passdown queue_if_no_space - 1024",
             "Fail",
         ] {
-            assert!(pool_status(status).is_err(), "{status}");
+            let err = pool_status(status).unwrap_err().to_string();
+            assert!(err.starts_with("thin-pool is "), "{status}: {err}");
+            assert!(!err.contains('/'), "the message carries no block counts: {err}");
         }
     }
 

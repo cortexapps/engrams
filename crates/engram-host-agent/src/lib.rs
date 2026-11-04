@@ -21,6 +21,23 @@ use engram_host_core::CoordControlPlane;
 
 use crate::image_cache::ImageCache;
 
+/// The session-disk pool's state for the capability vector, and its
+/// capacity when it answered.
+async fn probe_pool(
+    disk: Option<&dyn engram_host_core::SessionDisk>,
+) -> (
+    capabilities::SessionDiskState,
+    Option<engram_host_core::Capacity>,
+) {
+    let Some(disk) = disk else {
+        return (capabilities::SessionDiskState::Absent, None);
+    };
+    match disk.capacity().await {
+        Ok(cap) => (capabilities::SessionDiskState::Ready, Some(cap)),
+        Err(e) => (capabilities::SessionDiskState::Faulted(e.to_string()), None),
+    }
+}
+
 pub mod base_shm_gc;
 pub mod bindings;
 pub mod bundles;
@@ -818,6 +835,7 @@ impl HostAgent {
             // POST carries an honest `bundle_stamp` from the first
             // attempt, not `Unknown` until the first heartbeat.
             let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
+            let session_volumes = pooled.session_volumes().cloned();
             let probe_inputs = capabilities::ProbeInputs {
                 backend: self.cfg.backend_name.clone(),
                 grpc_probe_addr: self.cfg.grpc_listen_addr,
@@ -829,10 +847,9 @@ impl HostAgent {
                         uffd_base_dir: cfg.uffd_base_dir.clone(),
                     }
                 }),
-                session_disk: match pooled.session_volumes() {
-                    Some(_) => capabilities::SessionDiskState::Ready,
-                    None => capabilities::SessionDiskState::Absent,
-                },
+                session_disk: probe_pool(session_volumes.as_deref().map(|v| v.disk()))
+                    .await
+                    .0,
             };
 
             // ADR 0013: per-process HttpCoordClient for HTTP traffic
@@ -1154,10 +1171,11 @@ impl HostAgent {
             let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
-            let session_disk_for_heartbeat = self.session_disk.clone();
+            let session_volumes_for_heartbeat = session_volumes.clone();
             let enabled_for_heartbeat = enabled_images_tx.as_ref().map(|tx| tx.subscribe());
             let util_work_dir = self.cfg.work_dir.clone();
             let probe_inputs_for_heartbeat = probe_inputs.clone();
+            let mut last_pool_state = probe_inputs.session_disk.clone();
             let ram_ledger_for_heartbeat = ram_ledger.clone();
             let ram_ledger_tx_for_heartbeat = ram_ledger_tx;
             let stages_images_for_heartbeat = stages_images;
@@ -1317,23 +1335,26 @@ impl HostAgent {
                         .collect();
                     let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
                     let mut probe_inputs = probe_inputs_for_heartbeat.clone();
-                    if let Some(disk) = &session_disk_for_heartbeat {
-                        probe_inputs.session_disk = match disk.capacity().await {
-                            Ok(cap) => {
-                                const MIB: u64 = 1024 * 1024;
-                                utilization.pool_data_free_mib = cap.data_free_bytes / MIB;
-                                utilization.pool_data_total_mib = cap.data_total_bytes / MIB;
-                                utilization.pool_metadata_free_mib = cap.metadata_free_bytes / MIB;
-                                utilization.pool_metadata_total_mib =
-                                    cap.metadata_total_bytes / MIB;
-                                capabilities::SessionDiskState::Ready
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "session disk capacity probe failed");
-                                capabilities::SessionDiskState::Faulted(e.to_string())
-                            }
-                        };
+                    let (pool_state, pool) =
+                        probe_pool(session_volumes_for_heartbeat.as_deref().map(|v| v.disk()))
+                            .await;
+                    if let Some(cap) = pool {
+                        const MIB: u64 = 1024 * 1024;
+                        utilization.pool_data_free_mib = cap.data_free_bytes / MIB;
+                        utilization.pool_data_total_mib = cap.data_total_bytes / MIB;
+                        utilization.pool_metadata_free_mib = cap.metadata_free_bytes / MIB;
+                        utilization.pool_metadata_total_mib = cap.metadata_total_bytes / MIB;
                     }
+                    if pool_state != last_pool_state {
+                        match &pool_state {
+                            capabilities::SessionDiskState::Faulted(e) => {
+                                tracing::warn!(error = %e, "session-disk pool probe failed")
+                            }
+                            _ => tracing::info!(?pool_state, "session-disk pool state changed"),
+                        }
+                        last_pool_state = pool_state.clone();
+                    }
+                    probe_inputs.session_disk = pool_state;
                     // Every probe re-runs each tick, so a withdrawn
                     // capability returns by itself.
                     let capabilities = capabilities::probe_all(&probe_inputs).await;
@@ -1352,11 +1373,12 @@ impl HostAgent {
                         running_sandboxes_known,
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
-                        ready_images: match (&session_disk_for_heartbeat, &enabled_for_heartbeat) {
-                            (Some(disk), Some(enabled)) => {
+                        ready_images: match (&session_volumes_for_heartbeat, &enabled_for_heartbeat)
+                        {
+                            (Some(volumes), Some(enabled)) => {
                                 let enabled = enabled.borrow().clone();
                                 image_volumes::ready_on_disk(
-                                    disk.as_ref(),
+                                    volumes.disk(),
                                     &enabled,
                                     readiness_for_heartbeat.snapshot(),
                                 )

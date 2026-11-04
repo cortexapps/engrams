@@ -7069,6 +7069,13 @@ async fn capture_job_epoch_fences_reassignment_and_redrive(ctx: &Ctx) {
         })
         .await
         .unwrap());
+    assert!(
+        m.redrive_failed_capture_job(job.id, placed.epoch, &[h], 10)
+            .await
+            .unwrap()
+            .is_none(),
+        "a redrive that names the fenced epoch is a no-op"
+    );
     let retry = m
         .redrive_failed_capture_job(job.id, reassigned.epoch, &[h], 10)
         .await
@@ -7076,11 +7083,19 @@ async fn capture_job_epoch_fences_reassignment_and_redrive(ctx: &Ctx) {
         .unwrap();
     assert_eq!(retry.host_id, Some(h));
     assert_eq!(retry.epoch, reassigned.epoch + 1);
-    assert!(m
-        .redrive_failed_capture_job(job.id, reassigned.epoch, &[h], 10)
+    assert!(
+        !m.record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: reassigned.epoch,
+            stage: CaptureJobStage::Booting,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: None,
+        })
         .await
-        .unwrap()
-        .is_none());
+        .unwrap(),
+        "a report from the epoch the redrive replaced is dropped"
+    );
 }
 conformance!(
     t_capture_job_epoch_fences_reassignment_and_redrive,

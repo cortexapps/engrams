@@ -4246,8 +4246,8 @@ impl MetadataStore for PostgresStore {
             // `draining` is the agent's own preStop flag and a host that
             // finished/aborted its drain legitimately reports ready again.
             r#"WITH previous AS MATERIALIZED (
-                    SELECT status, allocatable_mib, pool_data_total_mib, ready_images,
-                           total_vcpus, wire_version, capabilities
+                    SELECT status, allocatable_mib, ready_images, total_vcpus,
+                           wire_version, capabilities
                       FROM hosts
                      WHERE id = $1
                      FOR UPDATE
@@ -4302,7 +4302,6 @@ impl MetadataStore for PostgresStore {
                     previous.status IS DISTINCT FROM
                         CASE WHEN previous.status IN ('dead','retired') THEN previous.status ELSE $2 END
                     OR (COALESCE(previous.allocatable_mib, 0) = 0 AND $11::bigint > 0)
-                    OR (previous.pool_data_total_mib = 0 AND $25::bigint > 0)
                     OR previous.ready_images IS DISTINCT FROM $12::jsonb
                     OR previous.total_vcpus IS DISTINCT FROM $14::int
                     OR previous.wire_version IS DISTINCT FROM $15::int

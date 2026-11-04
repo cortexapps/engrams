@@ -832,34 +832,36 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
                 });
             }
             if let Ok(hosts) = state.services.meta.list_active_hosts().await {
-                // A host below the pool floor never reaches the fit
-                // arithmetic, so it is labelled here, not `fits_now`.
-                let (pool_full, ids): (Vec<_>, Vec<_>) = hosts
-                    .iter()
-                    .map(|h| (h.id, crate::placement::host_pool_floor_ok(h)))
-                    .partition(|(_, ok)| !ok);
-                let ids: Vec<_> = ids.into_iter().map(|(id, _)| id).collect();
+                // A vetoed host never reaches the fit arithmetic, so it
+                // is labelled here instead of `fits_now`.
+                let now = state.services.clock.now_utc();
+                let ttl = crate::placement::placement_ttl();
+                let mut entries = Vec::new();
+                let mut candidates = Vec::new();
+                for h in &hosts {
+                    match crate::placement::new_session_veto(h, now, ttl) {
+                        Some(veto) => entries.push(
+                            serde_json::json!({ "id": h.id.to_string(), "reason": veto.label() }),
+                        ),
+                        None => candidates.push(h.id),
+                    }
+                }
                 if let Ok(details) = state
                     .services
                     .meta
-                    .placement_no_fit_details(&ids, q.mem_budget_mib, q.cpu_budget_vcpus)
+                    .placement_no_fit_details(&candidates, q.mem_budget_mib, q.cpu_budget_vcpus)
                     .await
                 {
-                    payload["hosts"] = pool_full
-                        .iter()
-                        .map(|(id, _)| {
-                            serde_json::json!({ "id": id.to_string(), "reason": "pool_full" })
+                    entries.extend(details.iter().map(|d| {
+                        serde_json::json!({
+                            "id": d.host_id.to_string(),
+                            "reason": d.reason,
+                            "free_mib": d.free_mib,
                         })
-                        .chain(details.iter().map(|d| {
-                            serde_json::json!({
-                                "id": d.host_id.to_string(),
-                                "reason": d.reason,
-                                "free_mib": d.free_mib,
-                            })
-                        }))
-                        .take(16)
-                        .collect();
+                    }));
                 }
+                entries.truncate(16);
+                payload["hosts"] = entries.into();
             }
             if let Err(e) = state
                 .services

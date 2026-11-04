@@ -642,8 +642,8 @@ pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_ho
 /// Labels:
 /// - `reason` = the bounded `placement::exclusion_summary` vocabulary
 ///   (`excluded` / `not_ready` / `cordoned` / `wire_skew` / `stale` /
-///   `cap:<name>` — one of the ~6 named capabilities, so still bounded
-///   / `digest_not_ready` / `no_fit`) PLUS the reserve-path fit
+///   `pool_full` / `cap:<name>` — one of the ~6 named capabilities, so
+///   still bounded / `digest_not_ready` / `no_fit`) PLUS the reserve-path fit
 ///   vocabulary from `PlacementNoFit` (`ram_full` / `cpu_full` /
 ///   `unmeasured` / `not_lockable` / `fits_now`).
 /// - `origin` = which call site: `create` (fresh session,
