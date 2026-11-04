@@ -67,6 +67,8 @@ export function makeCredentialBroker(deps: {
         intent.lease.expiresAt > now + 300000
       )
         throw new Error("stale credential dispatch context");
+      if (intent.requestDigest.length !== 71 || !/^sha256:[0-9a-f]{64}$/.test(intent.requestDigest))
+        throw new Error("MCP request digest invalid");
       parseWorkerRequest({
         protocol: 1,
         intent: { ...intent, operationDigest: "0".repeat(64) },
@@ -83,7 +85,7 @@ export function makeCredentialBroker(deps: {
         reference,
         worker: identity,
         intentId: intent.id,
-        requestDigest: intent.requestDigest,
+        requestDigest: intent.requestDigest.slice("sha256:".length),
         operation: operation.kind,
         expiresAt: BigInt(deliveryExpiry),
         operationExpiresAt: BigInt(intent.expiresAt),

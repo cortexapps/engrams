@@ -1,13 +1,18 @@
 import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
-import { createClient, createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import {
   CredentialControlService,
   CredentialKind,
   CredentialStatusSchema,
 } from "../gen/engram/mcp/v1/control_pb.ts";
-import { makeCredentialBroker } from "../mcp/credential-broker.ts";
+import {
+  makeCredentialBroker,
+  type AdmittedCredentialOperation,
+} from "../mcp/credential-broker.ts";
+import type { WorkerRequest } from "../../../mcp-worker/src/contracts.ts";
+import { canonicalDigest } from "../mcp/hash.ts";
 const now = 100000;
 const identity = {
   protocol: 1 as const,
@@ -36,11 +41,13 @@ const status = create(CredentialStatusSchema, {
   status: "connected",
   version: 1n,
 });
-function fixture(expire = false, finalFenceMs = 0) {
+function fixture(expire = false, finalFenceMs = 0, responseDigest?: string) {
   let time = now,
     deliveries = 0,
     leases = 0;
   const seen: unknown[] = [];
+  const admitted: AdmittedCredentialOperation[] = [];
+  const requests: WorkerRequest[] = [];
   const control = unwrapCredentialControlClient(
     createClient(
       CredentialControlService,
@@ -49,6 +56,9 @@ function fixture(expire = false, finalFenceMs = 0) {
           async lease(req) {
             leases++;
             seen.push(req);
+            // Match McpAuthority::lease: exactly 64 ASCII hexadecimal characters.
+            if (req.requestDigest.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(req.requestDigest))
+              throw new ConnectError("invalid request digest", Code.PermissionDenied);
             if (expire) time = now + 10000;
             return {
               protocol: 1,
@@ -70,8 +80,8 @@ function fixture(expire = false, finalFenceMs = 0) {
       time += finalFenceMs;
     },
     admission: {
-      async assertAdmitted() {
-        return;
+      async assertAdmitted(operation) {
+        admitted.push(structuredClone(operation));
       },
     },
     worker: {
@@ -80,12 +90,13 @@ function fixture(expire = false, finalFenceMs = 0) {
       },
       async dispatch(request) {
         deliveries++;
+        requests.push(structuredClone(request));
         return {
           ok: true,
           identity,
           intent: request.intent,
           intentId: request.intent.id,
-          requestDigest: request.intent.requestDigest,
+          requestDigest: responseDigest ?? request.intent.requestDigest,
           operationDigest: request.intent.operationDigest,
           leaseId: request.intent.lease.id,
           result: { outcome: "succeeded" },
@@ -93,7 +104,7 @@ function fixture(expire = false, finalFenceMs = 0) {
       },
     },
   });
-  const input = {
+  const input: AdmittedCredentialOperation = {
     status,
     identity,
     intent: {
@@ -113,7 +124,7 @@ function fixture(expire = false, finalFenceMs = 0) {
       },
       operation: "execute" as const,
       destination: "https://tools.example.test/mcp",
-      requestDigest: "b".repeat(64),
+      requestDigest: `sha256:${"b".repeat(64)}`,
       expiresAt: now + 60000,
       lease: { id: "admission", deploymentId: "deployment", expiresAt: now + 60000 },
     },
@@ -127,8 +138,92 @@ function fixture(expire = false, finalFenceMs = 0) {
       classification: "read" as const,
     },
   };
-  return { broker, input, seen, counters: () => ({ deliveries, leases }) };
+  return { broker, input, seen, admitted, requests, counters: () => ({ deliveries, leases }) };
 }
+for (const [operation, rawDigest] of [
+  ["discover", "1d8346198aa04c4188491657f648995a8657213ae8bde54920a7588ca74f778e"],
+  ["execute", "4307c51da41ceb7da86053004e56d21d4b7b6fe78811d8ce64a2e1468b936a77"],
+] as const)
+  test(`${operation} leases raw hex while admission and worker retain the canonical intent`, async () => {
+    const f = fixture();
+    f.input.intent.requestDigest = canonicalDigest({ kind: operation });
+    if (operation === "discover") {
+      f.input.intent.operation = operation;
+      f.input.intent.scope = { kind: "administration", requestId: "discovery", actorId: "admin" };
+      f.input.operation = { kind: operation, endpoint: "https://tools.example.test/mcp" };
+    }
+    const original = structuredClone(f.input);
+    const response = await f.broker.dispatch(f.input);
+    expect(f.counters()).toEqual({ deliveries: 1, leases: 1 });
+    expect(f.seen[0]).toMatchObject({
+      protocol: 1,
+      context: original.status.context,
+      reference: original.status.reference,
+      worker: original.identity,
+      intentId: "intent",
+      requestDigest: rawDigest,
+      operation,
+      expiresAt: 110000n,
+      operationExpiresAt: 160000n,
+      admission: { id: "admission", deploymentId: "deployment", expiresAt: 160000n },
+      scope:
+        operation === "discover"
+          ? { case: "administration", value: { requestId: "discovery", actorId: "admin" } }
+          : {
+              case: "execution",
+              value: {
+                sessionId: "s",
+                runId: "r",
+                toolCallId: "call",
+                bindingHash: "b".repeat(64),
+              },
+            },
+    });
+    expect(f.admitted).toEqual([original, original]);
+    expect(response.ok).toBe(true);
+    if (!response.ok) throw Error("unexpected worker failure");
+    expect(f.requests).toEqual([
+      {
+        protocol: 1,
+        intent: { ...original.intent, operationDigest: response.operationDigest },
+        operation: {
+          ...original.operation,
+          credential: { header: "x-api-key", value: "transient-value" },
+        },
+      },
+    ]);
+    expect(response.requestDigest).toBe(`sha256:${rawDigest}`);
+    expect(response.intent).toEqual(f.requests[0]!.intent);
+    expect(f.input).toEqual(original);
+  });
+
+test("malformed canonical request digests fail before credential leasing", async () => {
+  const raw = "b".repeat(64);
+  for (const requestDigest of [
+    "",
+    raw,
+    `sha256:sha256:${raw}`,
+    `SHA256:${raw}`,
+    `sha256:${raw.toUpperCase()}`,
+    `sha256:${raw} `,
+    `sha256:${raw}\n`,
+    `sha256:${raw.slice(1)}`,
+    `sha256:${raw}0`,
+    `sha256:${"g".repeat(64)}`,
+  ]) {
+    const f = fixture();
+    f.input.intent.requestDigest = requestDigest;
+    await expect(f.broker.dispatch(f.input)).rejects.toThrow("MCP request digest invalid");
+    expect(f.counters()).toEqual({ deliveries: 0, leases: 0 });
+  }
+});
+
+test("raw control digest cannot replace the tagged worker response binding", async () => {
+  const f = fixture(false, 0, "b".repeat(64));
+  await expect(f.broker.dispatch(f.input)).rejects.toThrow("MCP worker response mismatch");
+  expect(f.counters()).toEqual({ deliveries: 1, leases: 1 });
+});
+
 test("broker preserves 60 second intent while credential delivery expires in 10 seconds", async () => {
   const f = fixture();
   await f.broker.dispatch(f.input);
