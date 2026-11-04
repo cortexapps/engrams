@@ -4105,7 +4105,7 @@ impl SnapshotFinisher {
             sandbox_id = %id,
             src = %src_ref,
             fork = %fork_ref,
-            "ADR 0045 seed-at-create: chain seeded on a forked lineage; first checkpoint will diff",
+            "chain seeded on a forked lineage; the first checkpoint diffs against it",
         );
     }
 
@@ -5226,7 +5226,7 @@ impl SandboxBackend for PooledBackend {
                 disk_drain_ms,
                 vmstate_ms,
                 scan_ms,
-                "post-copy capture sealed; guest frozen as page server (ADR 0045 C2)",
+                "post-copy capture sealed; guest frozen as page server",
             );
             Ok(PostCopyCaptureOut {
                 sealed_chunks,
@@ -5509,7 +5509,7 @@ impl SandboxBackend for PooledBackend {
         let destroyed = self.destroy(id).await;
         let _ = fs::remove_dir_all(&snapshot_dir).await;
         destroyed?;
-        tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045)");
+        tracing::info!(sandbox_id = %id, "migration committed; source destroyed");
         Ok(())
     }
 
