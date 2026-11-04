@@ -38,6 +38,7 @@ use engram_core::types::sandbox::{
     AuxRoDrive, CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec, SessionDisks,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
+use engram_core::SandboxError;
 use engram_core::SandboxId;
 use engram_harness_proto::{
     read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, RelayAck, RelayConnect,
@@ -114,7 +115,14 @@ fn vz_preflight() -> Option<VzEnv> {
     })
 }
 
+/// Host-side tracing lands in the captured stderr, next to the guest
+/// console, so a failed run shows both sides.
 fn backend(env: &VzEnv, work: &Path) -> VzBackend {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .with_test_writer()
+        .try_init();
     VzBackend::new(
         work.join("sb"),
         VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(env.bundle_dir.clone()),
@@ -234,6 +242,16 @@ fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
 
 /// Run one command to completion, returning (stdout, exit_code).
 async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i32>) {
+    try_exec(backend, id, sh).await.expect("exec_stream")
+}
+
+/// `exec` for a guest that may refuse the dial: a paused VM fails fast
+/// or hangs, and both are the outcome under test.
+async fn try_exec(
+    backend: &VzBackend,
+    id: SandboxId,
+    sh: &str,
+) -> Result<(String, Option<i32>), SandboxError> {
     let req = ExecRequest {
         command: vec!["/bin/sh".into(), "-c".into(), sh.into()],
         stdin: None,
@@ -245,7 +263,7 @@ async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i
         stderr_offset: None,
         wake: None,
     };
-    let mut stream = backend.exec_stream(id, req).await.expect("exec_stream");
+    let mut stream = backend.exec_stream(id, req).await?;
     let mut out = String::new();
     let mut code = None;
     while let Some(ev) = stream.events.next().await {
@@ -259,7 +277,7 @@ async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i
             ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
-    (out, code)
+    Ok((out, code))
 }
 
 /// Poll `guest_endpoints` until the in-VM agentd answers (proves boot + agentd up).
@@ -769,19 +787,19 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     let (out, code) = exec(&backend, id, "echo pre-pause").await;
     assert_eq!(code, Some(0), "pre-pause exec; out={out}");
 
-    // Park. A frozen guest can't serve a fresh exec: either the vsock
-    // dial hangs (timeout) or it fails fast and the stream ends with NO
+    // Park. A frozen guest can't serve a fresh exec: the vsock dial
+    // hangs (timeout), fails fast (`Err`), or the stream ends with no
     // Exit event (`code=None`). Only a completed `Some(0)` exec proves
     // the guest is still running.
     backend.pause(id).await.expect("pause");
     backend.pause(id).await.expect("pause is idempotent");
     let frozen = tokio::time::timeout(
         Duration::from_secs(3),
-        exec(&backend, id, "echo should-not-run"),
+        try_exec(&backend, id, "echo should-not-run"),
     )
     .await;
     assert!(
-        !matches!(&frozen, Ok((_, Some(0)))),
+        !matches!(&frozen, Ok(Ok((_, Some(0))))),
         "exec completed against a paused VM — pause didn't freeze the guest: {frozen:?}",
     );
 
@@ -790,11 +808,11 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     let _meta = backend.snapshot(id).await.expect("snapshot of parked VM");
     let still_frozen = tokio::time::timeout(
         Duration::from_secs(3),
-        exec(&backend, id, "echo should-still-not-run"),
+        try_exec(&backend, id, "echo should-still-not-run"),
     )
     .await;
     assert!(
-        !matches!(&still_frozen, Ok((_, Some(0)))),
+        !matches!(&still_frozen, Ok(Ok((_, Some(0))))),
         "snapshot un-parked the VM as a side effect: {still_frozen:?}",
     );
 
