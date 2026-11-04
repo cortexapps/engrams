@@ -287,7 +287,34 @@ async fn identity_probe_rejects_a_token_the_provider_refuses() {
         .put_static_credential(&key, "pat-bad", Some(&identity_probe(&fx.host)))
         .await
         .expect_err("a refused token must not be saved");
-    assert!(matches!(err, OAuthServiceError::Driver(_)), "{err:?}");
+    assert!(
+        matches!(&err, OAuthServiceError::Driver(d) if d.code == "probe_rejected"),
+        "{err:?}"
+    );
+    assert!(fx
+        .meta
+        .get_oauth_credential(&key)
+        .await
+        .expect("get")
+        .is_none());
+}
+
+#[tokio::test]
+async fn identity_probe_failure_that_is_not_a_refusal_is_retryable() {
+    let fx = fixture().await;
+    let key = user_key("github");
+    // The provider answers 404: nothing is known about the token.
+    let mut probe = identity_probe(&fx.host);
+    probe.path = "/missing".into();
+    let err = fx
+        .manager
+        .put_static_credential(&key, "pat-good", Some(&probe))
+        .await
+        .expect_err("an unconfirmed token must not be saved");
+    assert!(
+        matches!(&err, OAuthServiceError::Driver(d) if d.code == "probe_failed"),
+        "{err:?}"
+    );
     assert!(fx
         .meta
         .get_oauth_credential(&key)
