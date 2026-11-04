@@ -47,8 +47,15 @@ pub struct Parsed {
     pub kind: Kind,
 }
 
+/// A manifest the store does not hold is `NotFound`, like a volume the
+/// disk does not hold.
 fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
-    io::Error::other(e)
+    use engram_chunk_store::ChunkStoreError;
+    use engram_core::error::BlobError;
+    match e {
+        ChunkStoreError::Blob(BlobError::NotFound) => io::Error::new(io::ErrorKind::NotFound, e),
+        e => io::Error::other(e),
+    }
 }
 
 pub fn live_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
@@ -112,28 +119,35 @@ pub fn parse(name: &VolumeName) -> Option<Parsed> {
     })
 }
 
-/// Where a live volume's contents come from.
+/// Where a live volume's contents come from. A manifest is written in
+/// full before the sandbox starts; when `base` names an image staged on
+/// this host, that volume is the origin and only the difference is
+/// written. A manifest that is itself a staged image is snapshotted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// The staged volume of this image version. `NotFound` when the
-    /// image is not staged on this host.
-    Image(ManifestRef),
-    /// A manifest the store holds, written in full before the sandbox
-    /// starts. With `base` the staged volume of that image, when it is
-    /// present, is the origin and only the difference is written.
-    Manifest {
+    /// A manifest many sandboxes share: the volume starts a new lineage
+    /// that holds a copy of it.
+    Fork {
         manifest: ManifestRef,
         base: Option<ManifestRef>,
     },
-    /// Zeros.
+    /// The sandbox's own manifest: the volume continues its lineage.
+    Continue {
+        manifest: ManifestRef,
+        base: Option<ManifestRef>,
+    },
+    /// Zeros, in a new lineage.
     Empty { size_bytes: u64 },
 }
 
-/// The device paths a backend opens.
+/// What `provision` made: the device paths a backend opens and the
+/// lineage each volume checkpoints under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provisioned {
     pub root: PathBuf,
+    pub root_manifest: ManifestRef,
     pub swap: Option<PathBuf>,
+    pub swap_manifest: Option<ManifestRef>,
 }
 
 /// A snapshot taken under the guest pause, not yet published. Dropping
@@ -154,6 +168,11 @@ impl PendingCheckpoint {
 
     pub fn role(&self) -> DiskRole {
         self.role
+    }
+
+    /// The checkpoint the snapshot is a change on.
+    pub fn previous(&self) -> ManifestRef {
+        self.previous
     }
 
     /// The paused state, readable while the guest runs on.
@@ -196,12 +215,21 @@ impl SessionVolumes {
         swap: Option<Source>,
     ) -> io::Result<Provisioned> {
         let provisioned = async {
-            let root = self.provision_role(sandbox, DiskRole::Root, root).await?;
-            let swap = match swap {
-                Some(source) => Some(self.provision_role(sandbox, DiskRole::Swap, source).await?),
-                None => None,
+            let (root, root_manifest) = self.provision_role(sandbox, DiskRole::Root, root).await?;
+            let (swap, swap_manifest) = match swap {
+                Some(source) => {
+                    let (path, manifest) =
+                        self.provision_role(sandbox, DiskRole::Swap, source).await?;
+                    (Some(path), Some(manifest))
+                }
+                None => (None, None),
             };
-            Ok(Provisioned { root, swap })
+            Ok(Provisioned {
+                root,
+                root_manifest,
+                swap,
+                swap_manifest,
+            })
         }
         .await;
         if provisioned.is_err() {
@@ -217,41 +245,26 @@ impl SessionVolumes {
         sandbox: SandboxId,
         role: DiskRole,
         source: Source,
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<(PathBuf, ManifestRef)> {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
         let lineage = match source {
-            Source::Image(image) => {
-                let origin = self.disk.open(&image_volumes::volume_name(image)).await?;
-                let manifest = self.store.get_manifest(image).await.map_err(store_err)?;
+            Source::Fork { manifest, base } => {
+                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                match self.staged(manifest).await {
+                    Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
+                    None => self.stage_into(&tmp, &wanted, base).await?,
+                };
                 let lineage = ManifestRef::new();
                 self.store
-                    .put_manifest(lineage, &manifest)
+                    .put_manifest(lineage, &wanted)
                     .await
                     .map_err(store_err)?;
-                self.disk.snapshot(&origin, &tmp).await?;
                 lineage
             }
-            Source::Manifest { manifest, base } => {
+            Source::Continue { manifest, base } => {
                 let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
-                let base = match base {
-                    Some(image) => match (
-                        self.disk.open(&image_volumes::volume_name(image)).await,
-                        self.store.get_manifest(image).await,
-                    ) {
-                        (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
-                        _ => None,
-                    },
-                    None => None,
-                };
-                stage(
-                    self.disk.as_ref(),
-                    &self.store,
-                    &tmp,
-                    &wanted,
-                    base.as_ref().map(|(v, m)| (v, m)),
-                )
-                .await?;
+                self.stage_into(&tmp, &wanted, base).await?;
                 manifest
             }
             Source::Empty { size_bytes } => {
@@ -275,7 +288,50 @@ impl SessionVolumes {
             .disk
             .snapshot(&checkpoint, &live_name(sandbox, role))
             .await?;
-        Ok(live.path)
+        Ok((live.path, lineage))
+    }
+
+    /// Write `wanted` into a new volume `name`, from the staged volume of
+    /// `base` when this host has it.
+    async fn stage_into(
+        &self,
+        name: &VolumeName,
+        wanted: &Manifest,
+        base: Option<ManifestRef>,
+    ) -> io::Result<Volume> {
+        let base = match base {
+            Some(image) => self.staged(image).await,
+            None => None,
+        };
+        stage(
+            self.disk.as_ref(),
+            &self.store,
+            name,
+            wanted,
+            base.as_ref().map(|(v, m)| (v, m)),
+        )
+        .await
+    }
+
+    /// The staged volume of an image and its manifest, when this host
+    /// has both.
+    async fn staged(&self, image: ManifestRef) -> Option<(Volume, Manifest)> {
+        match (
+            self.disk.open(&image_volumes::volume_name(image)).await,
+            self.store.get_manifest(image).await,
+        ) {
+            (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
+            _ => None,
+        }
+    }
+
+    /// The roles the sandbox has a live volume for.
+    pub async fn roles(&self, sandbox: SandboxId) -> io::Result<Vec<DiskRole>> {
+        let names = self.disk.list().await?;
+        Ok(DiskRole::ALL
+            .into_iter()
+            .filter(|role| names.contains(&live_name(sandbox, *role)))
+            .collect())
     }
 
     /// A live volume, the one the hypervisor opens.
@@ -389,6 +445,13 @@ impl SessionVolumes {
         self.publish(pending).await
     }
 
+    /// Delete a pending checkpoint's snapshot without publishing it.
+    pub async fn discard(&self, pending: PendingCheckpoint) -> io::Result<()> {
+        let name = pending.snapshot.name.clone();
+        drop(pending);
+        self.disk.delete(&name).await
+    }
+
     /// Delete every volume of the sandbox. Fails while a process holds
     /// one open.
     pub async fn release(&self, sandbox: SandboxId) -> io::Result<()> {
@@ -441,7 +504,13 @@ impl SessionVolumes {
         Ok(report)
     }
 
-    async fn checkpoint_of(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<ManifestRef> {
+    /// The manifest of the sandbox's checkpoint volume: what the last
+    /// publish made durable.
+    pub async fn checkpoint_of(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<ManifestRef> {
         let mut found: Option<ManifestRef> = None;
         for name in self.disk.list().await? {
             if let Some(Parsed {
@@ -626,7 +695,14 @@ mod tests {
 
         let p = r
             .volumes
-            .provision(sandbox, Source::Image(image), None)
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 0, 3]);
@@ -637,9 +713,13 @@ mod tests {
         );
 
         let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await;
-        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage, vec![p.root_manifest]);
         assert_ne!(lineage[0].manifest_id, image.manifest_id);
         assert_eq!(lineage[0].version, 1);
+        assert_eq!(
+            r.volumes.roles(sandbox).await.unwrap(),
+            vec![DiskRole::Root]
+        );
         let v1 = r.store.get_manifest(lineage[0]).await.unwrap();
         assert_eq!(v1, r.store.get_manifest(image).await.unwrap());
         assert_eq!(
@@ -661,7 +741,14 @@ mod tests {
         let first = SandboxId::new();
         let p = r
             .volumes
-            .provision(first, Source::Image(image), None)
+            .provision(
+                first,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         write_byte(&p.root, 1, 9).await;
@@ -673,7 +760,7 @@ mod tests {
             .volumes
             .provision(
                 second,
-                Source::Manifest {
+                Source::Continue {
                     manifest: published,
                     base: Some(image),
                 },
@@ -693,7 +780,7 @@ mod tests {
             .volumes
             .provision(
                 third,
-                Source::Manifest {
+                Source::Continue {
                     manifest: published,
                     base: None,
                 },
@@ -702,6 +789,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+        assert_eq!(p.root_manifest, published);
+    }
+
+    #[tokio::test]
+    async fn a_fork_of_a_published_manifest_starts_its_own_lineage() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let first = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                first,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let published = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+
+        let mut forks = Vec::new();
+        for _ in 0..2 {
+            let sandbox = SandboxId::new();
+            let p = r
+                .volumes
+                .provision(
+                    sandbox,
+                    Source::Fork {
+                        manifest: published,
+                        base: Some(image),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+            assert_ne!(p.root_manifest.manifest_id, published.manifest_id);
+            assert_eq!(p.root_manifest.version, 1);
+            forks.push(p.root_manifest);
+        }
+        assert_ne!(forks[0].manifest_id, forks[1].manifest_id);
+        // The shared manifest is still at the version the first sandbox published.
+        assert_eq!(
+            r.volumes
+                .checkpoint_of(first, DiskRole::Root)
+                .await
+                .unwrap(),
+            published
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discarded_checkpoint_leaves_the_live_volume_and_the_last_checkpoint() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        write_byte(&p.root, 0, 7).await;
+        let pending = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        assert_eq!(pending.previous(), p.root_manifest);
+        r.volumes.discard(pending).await.unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![7, 2]);
+        assert_eq!(
+            checkpoints_of(&r, sandbox, DiskRole::Root).await,
+            vec![p.root_manifest]
+        );
+        assert!(r.volumes.pending(sandbox, DiskRole::Root).await.is_err());
     }
 
     #[tokio::test]
@@ -713,7 +881,10 @@ mod tests {
             .volumes
             .provision(
                 sandbox,
-                Source::Image(image),
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
                 Some(Source::Empty {
                     size_bytes: CHUNK * 2,
                 }),
@@ -745,8 +916,14 @@ mod tests {
             .volumes
             .provision(
                 sandbox,
-                Source::Image(image),
-                Some(Source::Image(ManifestRef::new())),
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                Some(Source::Continue {
+                    manifest: ManifestRef::new(),
+                    base: None,
+                }),
             )
             .await
             .unwrap_err();
@@ -764,7 +941,14 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(sandbox, Source::Image(image), None)
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
@@ -798,7 +982,7 @@ mod tests {
             .volumes
             .provision(
                 resumed,
-                Source::Manifest {
+                Source::Continue {
                     manifest: v3,
                     base: Some(image),
                 },
@@ -816,7 +1000,14 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(sandbox, Source::Image(image), None)
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         write_byte(&p.root, 0, 5).await;
@@ -838,7 +1029,14 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(sandbox, Source::Image(image), None)
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -886,7 +1084,14 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(sandbox, Source::Image(image), None)
+            .provision(
+                sandbox,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
@@ -924,13 +1129,23 @@ mod tests {
         r.volumes
             .provision(
                 live,
-                Source::Image(image),
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
                 Some(Source::Empty { size_bytes: CHUNK }),
             )
             .await
             .unwrap();
         r.volumes
-            .provision(dead, Source::Image(image), None)
+            .provision(
+                dead,
+                Source::Fork {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, live, DiskRole::Root).await[0];
@@ -1005,7 +1220,10 @@ mod tests {
             r.volumes
                 .provision(
                     s,
-                    Source::Image(image),
+                    Source::Fork {
+                        manifest: image,
+                        base: None,
+                    },
                     Some(Source::Empty { size_bytes: CHUNK }),
                 )
                 .await
