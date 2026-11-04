@@ -20,6 +20,8 @@ pub enum DiskOp {
     Delete,
     Capacity,
     DirtyChunks,
+    List,
+    Rename,
 }
 
 struct CrashDiskState {
@@ -92,6 +94,16 @@ impl SessionDisk for CrashDisk {
         self.inner.delete(name).await
     }
 
+    async fn list(&self) -> io::Result<Vec<VolumeName>> {
+        self.gate(DiskOp::List)?;
+        self.inner.list().await
+    }
+
+    async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
+        self.gate(DiskOp::Rename)?;
+        self.inner.rename(from, to).await
+    }
+
     async fn capacity(&self) -> io::Result<Capacity> {
         self.gate(DiskOp::Capacity)?;
         self.inner.capacity().await
@@ -108,6 +120,8 @@ mod tests {
     use std::sync::Arc;
 
     use engram_chunk_store::{ChunkStore, Manifest};
+    use engram_core::types::manifest::ManifestRef;
+    use engram_host_core::image_volumes::{reconcile_once, volume_name};
     use engram_host_core::{checkpoint, stage};
     use engram_storage_local::LocalBlobStorage;
 
@@ -266,6 +280,147 @@ mod tests {
             assert_eq!(exists("snap"), k >= 2, "k={k}");
             // The refused op is still in the trace, nothing after it.
             assert_eq!(disk.trace().len(), k + 1, "k={k}");
+        }
+    }
+
+    /// Publish an image whose chunk `i` holds byte `pattern[i]`.
+    async fn publish(
+        disk: &dyn SessionDisk,
+        store: &ChunkStore,
+        image: ManifestRef,
+        pattern: &[u8],
+    ) {
+        let v = disk
+            .create(&name("scratch"), CHUNK * pattern.len() as u64)
+            .await
+            .unwrap();
+        for (i, byte) in pattern.iter().enumerate() {
+            if *byte != 0 {
+                v.write_chunk(ChunkIndex(i as u64), fill(*byte))
+                    .await
+                    .unwrap();
+            }
+        }
+        let (_, manifest) = checkpoint(disk, store, &v, &name("scratch-snap"), None)
+            .await
+            .unwrap();
+        store.put_manifest(image, &manifest).await.unwrap();
+        disk.delete(&name("scratch")).await.unwrap();
+        disk.delete(&name("scratch-snap")).await.unwrap();
+    }
+
+    async fn first_bytes(disk: &dyn SessionDisk, image: ManifestRef) -> Vec<u8> {
+        let v = disk.open(&volume_name(image)).await.unwrap();
+        let mut out = Vec::new();
+        for i in 0..v.chunk_count() {
+            out.push(v.read_chunk(ChunkIndex(i)).await.unwrap()[0]);
+        }
+        out
+    }
+
+    /// Two versions of one image: the second pass snapshots the first
+    /// volume instead of creating a fresh one.
+    #[tokio::test]
+    async fn a_later_version_is_a_snapshot_of_the_earlier_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let v1 = ManifestRef::new();
+        let v2 = v1.next_version();
+        let disk = CrashDisk::recording(&dir.path().join("volumes"), CHUNK).unwrap();
+        publish(disk.inner(), &store, v1, &[1, 2, 3]).await;
+        publish(disk.inner(), &store, v2, &[1, 0, 9]).await;
+        reconcile_once(disk.as_ref(), &store, &[v1]).await.unwrap();
+        assert_eq!(
+            disk.trace(),
+            vec![DiskOp::List, DiskOp::Create, DiskOp::Rename]
+        );
+
+        let disk = CrashDisk::recording(&dir.path().join("volumes"), CHUNK).unwrap();
+        reconcile_once(disk.as_ref(), &store, &[v1, v2])
+            .await
+            .unwrap();
+        assert_eq!(
+            disk.trace(),
+            vec![DiskOp::List, DiskOp::Open, DiskOp::Snapshot, DiskOp::Rename]
+        );
+        assert_eq!(first_bytes(disk.as_ref(), v2).await, vec![1, 0, 9]);
+    }
+
+    /// A pass cut at any op leaves a state the next uncut pass converges
+    /// from: the desired volumes exist with the right bytes and nothing
+    /// else does.
+    #[tokio::test]
+    async fn a_pass_cut_at_any_op_converges_on_the_next_pass() {
+        let v1 = ManifestRef::new();
+        let v2 = v1.next_version();
+        let gone = ManifestRef::new();
+        let desired = [v1, v2];
+
+        let full = tempfile::tempdir().unwrap();
+        let recording = CrashDisk::recording(&full.path().join("volumes"), CHUNK).unwrap();
+        let store_full = store(full.path());
+        publish(recording.inner(), &store_full, v1, &[1, 2, 3]).await;
+        publish(recording.inner(), &store_full, v2, &[1, 0, 9]).await;
+        publish(recording.inner(), &store_full, gone, &[7]).await;
+        reconcile_once(recording.as_ref(), &store_full, &[gone])
+            .await
+            .unwrap();
+        let setup_ops = recording.trace().len();
+        reconcile_once(recording.as_ref(), &store_full, &desired)
+            .await
+            .unwrap();
+        let ops = recording.trace().len() - setup_ops;
+        assert!(ops >= 6, "the pass under test issues {ops} ops");
+
+        for k in 0..ops {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let setup = CrashDisk::recording(&dir.path().join("volumes"), CHUNK).unwrap();
+            publish(setup.inner(), &store, v1, &[1, 2, 3]).await;
+            publish(setup.inner(), &store, v2, &[1, 0, 9]).await;
+            publish(setup.inner(), &store, gone, &[7]).await;
+            reconcile_once(setup.as_ref(), &store, &[gone])
+                .await
+                .unwrap();
+
+            let cut =
+                CrashDisk::with_crash_at(&dir.path().join("volumes"), CHUNK, Some(k)).unwrap();
+            let _ = reconcile_once(cut.as_ref(), &store, &desired).await;
+
+            let next = CrashDisk::recording(&dir.path().join("volumes"), CHUNK).unwrap();
+            let report = reconcile_once(next.as_ref(), &store, &desired)
+                .await
+                .unwrap();
+            assert_eq!(report.staged, desired, "cut at op {k}");
+            assert!(
+                report.failed.is_empty(),
+                "cut at op {k}: {:?}",
+                report.failed
+            );
+            let mut names: Vec<String> = next
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().to_string())
+                .collect();
+            names.sort();
+            let mut expected = vec![
+                volume_name(v1).as_str().to_string(),
+                volume_name(v2).as_str().to_string(),
+            ];
+            expected.sort();
+            assert_eq!(names, expected, "cut at op {k}");
+            assert_eq!(
+                first_bytes(next.as_ref(), v1).await,
+                vec![1, 2, 3],
+                "cut at op {k}"
+            );
+            assert_eq!(
+                first_bytes(next.as_ref(), v2).await,
+                vec![1, 0, 9],
+                "cut at op {k}"
+            );
         }
     }
 }

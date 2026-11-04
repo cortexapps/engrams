@@ -202,6 +202,19 @@ impl SessionDisk for ThinPoolDisk {
             .await
     }
 
+    async fn list(&self) -> io::Result<Vec<VolumeName>> {
+        Ok(dm::devices_on(self.pool_dev)
+            .await?
+            .into_iter()
+            .filter_map(|name| VolumeName::new(name).ok())
+            .collect())
+    }
+
+    async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
+        self.dm.rename(from.as_str(), to.as_str()).await?;
+        tokio::fs::rename(self.node_of(from), self.node_of(to)).await
+    }
+
     async fn capacity(&self) -> io::Result<Capacity> {
         let status = parse::pool_status(&single_target(
             &self.dm.status(&self.pool).await?,

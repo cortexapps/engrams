@@ -71,6 +71,39 @@ impl SessionDisk for Oracle<'_> {
     async fn capacity(&self) -> std::io::Result<Capacity> {
         self.0.capacity().await
     }
+    async fn list(&self) -> std::io::Result<Vec<VolumeName>> {
+        self.0.list().await
+    }
+    async fn rename(&self, from: &VolumeName, to: &VolumeName) -> std::io::Result<()> {
+        self.0.rename(from, to).await
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn list_sees_a_volume_and_rename_keeps_the_open_handle_valid() {
+    let disk = pool_or_skip!();
+    let (a, b) = (name("rename", "a"), name("rename", "b"));
+    let v = disk.create(&a, CHUNK * CHUNKS).await.unwrap();
+    v.write_chunk(ChunkIndex(3), fill(3)).await.unwrap();
+    assert!(disk.list().await.unwrap().contains(&a));
+
+    let other = disk.create(&b, CHUNK).await.unwrap();
+    assert_eq!(
+        disk.rename(&a, &b).await.unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    drop(other);
+    disk.delete(&b).await.unwrap();
+
+    disk.rename(&a, &b).await.unwrap();
+    let names = disk.list().await.unwrap();
+    assert!(names.contains(&b) && !names.contains(&a));
+    assert_eq!(v.read_chunk(ChunkIndex(3)).await.unwrap(), fill(3));
+    let reopened = disk.open(&b).await.unwrap();
+    assert_eq!(reopened.read_chunk(ChunkIndex(3)).await.unwrap(), fill(3));
+    drop((v, reopened));
+    disk.delete(&b).await.unwrap();
 }
 
 #[tokio::test]
@@ -101,7 +134,10 @@ async fn delete_fails_while_a_handle_is_open() {
     let disk = pool_or_skip!();
     let live = name("busy", "live");
     let v = disk.create(&live, CHUNK * CHUNKS).await.unwrap();
-    assert!(disk.delete(&live).await.is_err());
+    assert_eq!(
+        disk.delete(&live).await.unwrap_err().kind(),
+        std::io::ErrorKind::ResourceBusy
+    );
     drop(v);
     disk.delete(&live).await.unwrap();
 }

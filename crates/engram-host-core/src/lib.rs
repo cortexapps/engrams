@@ -46,6 +46,7 @@ pub mod disk_flows;
 pub mod effects;
 pub mod finalize;
 pub mod fs;
+pub mod image_volumes;
 pub mod nbd;
 pub mod reattach;
 pub mod shutdown;

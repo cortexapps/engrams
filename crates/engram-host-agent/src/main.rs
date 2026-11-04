@@ -64,8 +64,9 @@ struct Cli {
     )]
     dirty_root: PathBuf,
 
-    /// Name of the node's dm-thin pool for session disks. When set, the
-    /// host-agent opens the pool at startup and logs its capacity.
+    /// Name of the node's dm-thin pool. When set, enabled images are
+    /// staged as volumes in it and an image is reported ready only
+    /// once its volume exists.
     #[arg(long, env = "ENGRAM_THIN_POOL")]
     thin_pool: Option<String>,
 
@@ -555,9 +556,12 @@ async fn main() -> Result<(), HostAgentError> {
             }
         }
     };
-    if let Some(pool) = cli.thin_pool.as_deref() {
+    let session_disk: Option<Arc<dyn engram_host_core::SessionDisk>> = match cli
+        .thin_pool
+        .as_deref()
+    {
         #[cfg(target_os = "linux")]
-        {
+        Some(pool) => {
             let disk = engram_disk_thin::ThinPoolDisk::open(
                 pool,
                 engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
@@ -576,12 +580,16 @@ async fn main() -> Result<(), HostAgentError> {
                 metadata_total_bytes = capacity.metadata_total_bytes,
                 "thin pool open"
             );
+            Some(Arc::new(disk))
         }
         #[cfg(not(target_os = "linux"))]
-        return Err(HostAgentError::Config(format!(
-            "--thin-pool {pool} needs Linux device-mapper"
-        )));
-    }
+        Some(pool) => {
+            return Err(HostAgentError::Config(format!(
+                "--thin-pool {pool} needs Linux device-mapper"
+            )));
+        }
+        None => None,
+    };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
     // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute
@@ -691,6 +699,9 @@ async fn main() -> Result<(), HostAgentError> {
         .with_base_shm_protected(base_shm_protected);
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
+    }
+    if let Some(disk) = session_disk {
+        agent = agent.with_session_disk(disk);
     }
     // ADR 0007 Phase 4 / ADR 0049: NBD daemon with a warm-pool slot
     // allocator. The pool sizes itself from the kernel's `nbds_max`

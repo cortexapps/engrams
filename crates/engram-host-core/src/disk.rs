@@ -253,6 +253,13 @@ pub trait SessionDisk: Send + Sync {
     /// Remove a volume. Fails while a process holds it open.
     async fn delete(&self, name: &VolumeName) -> io::Result<()>;
 
+    /// Every volume that exists, in no particular order.
+    async fn list(&self) -> io::Result<Vec<VolumeName>>;
+
+    /// Give a volume a new name atomically. `AlreadyExists` when `to`
+    /// is taken. Open handles keep working under the new name.
+    async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()>;
+
     async fn capacity(&self) -> io::Result<Capacity>;
 
     /// Ascending indices of the chunks that differ between two snapshots
@@ -341,6 +348,28 @@ impl SessionDisk for FileDisk {
 
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
         std::fs::remove_file(self.path_of(name))
+    }
+
+    async fn list(&self) -> io::Result<Vec<VolumeName>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if let Ok(name) = VolumeName::new(entry.file_name().to_string_lossy()) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
+        let target = self.path_of(to);
+        if target.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("volume {to} already exists"),
+            ));
+        }
+        std::fs::rename(self.path_of(from), target)
     }
 
     async fn capacity(&self) -> io::Result<Capacity> {
@@ -487,6 +516,41 @@ mod tests {
         assert_eq!(
             disk.snapshot(&origin, &name("s")).await.unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn list_names_every_volume_and_rename_moves_one_atomically() {
+        let (_dir, disk) = disk();
+        disk.create(&name("a"), CHUNK).await.unwrap();
+        let b = disk.create(&name("b"), CHUNK).await.unwrap();
+        b.write_chunk(ChunkIndex(0), vec![7; CHUNK as usize])
+            .await
+            .unwrap();
+        let mut names = disk.list().await.unwrap();
+        names.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(names, vec![name("a"), name("b")]);
+
+        assert_eq!(
+            disk.rename(&name("b"), &name("a"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        disk.rename(&name("b"), &name("c")).await.unwrap();
+        assert_eq!(
+            disk.open(&name("b")).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let c = disk.open(&name("c")).await.unwrap();
+        assert_eq!(
+            c.read_chunk(ChunkIndex(0)).await.unwrap(),
+            vec![7; CHUNK as usize]
+        );
+        assert_eq!(
+            b.read_chunk(ChunkIndex(0)).await.unwrap(),
+            vec![7; CHUNK as usize]
         );
     }
 

@@ -236,33 +236,48 @@ thin-provisioning tools it calls at run time (`thin_dump`,
 ```text
 /dev/mapper/engram-pool                  the pool (loop-backed metadata + data files)
 /dev/engram/img-<manifest_id>-v<N>       one volume per staged image version
+/dev/engram/tmp-img-<manifest_id>-v<N>   an image version whose stage has not finished
 /dev/engram/sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
 /dev/engram/sb-<sandbox_id>-swap         session swap (fresh volume, no origin)
 /dev/engram/sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
 <work_dir>/<sandbox_id>/sandbox.json     records the volume names
 ```
 
-Thin ids are allocated by the host-agent from a counter persisted under
-the work dir, the same way NBD slots were recorded, and are written into
-`sandbox.json` before the volume is created. A volume whose id is not
-recorded anywhere is garbage and the image GC deletes it.
+The pool's metadata is the only record of which thins exist and the
+device-mapper table the only record of which name maps to which thin
+(Decision 6). The device nodes under `/dev/engram` are made by the
+host-agent with `mknod`, so nothing waits on udev.
 
 ### Lifecycles
 
-**Node bring-up.** Node-prep: `modprobe dm_thin_pool`; find the data
-disk by its device symlink; partition it on first use; `thin_check` the
-metadata; `dmsetup create engram-pool`. A failed check marks the node
-not ready and surfaces in the heartbeat. The host-agent activates image
-and session volumes it finds recorded; it never activates a volume it
-has no record of.
+**Node bring-up.** Node-prep runs `thin-pool.sh`: `modprobe
+dm_thin_pool`, preallocate the metadata and data files under the
+stateful directory on first use, attach them as loop devices,
+`thin_check` the metadata, `dmsetup create engram-pool`. A failed check
+leaves no pool and the host-agent refuses to start with `--thin-pool`
+set. At open the host-agent reads the pool table, seeds the id counter
+from `thin_dump`, and deletes any thin that has no device.
 
-**Stage an image.** Triggered by the heartbeat-ack `enabled_images`
-set, as today. Create the volume (snapshot of the predecessor version if
-present, else a fresh volume), stream the chunks whose hash is new at
-their offsets, `fdatasync`, record the version as staged, mark ready.
-The chunk download path and the GCS client are unchanged; only the sink
-changes from the chunk cache to a device offset. The chunk cache that
-backed the daemon is deleted; it has no other reader.
+**Stage an image.** Desired state is the enabled set the coordinator
+sends in every heartbeat ack; actual state is the pool's volume list.
+One stateless pass (`image_volumes::reconcile_once`) runs on each
+change of the enabled set and nothing else drives it: delete every
+`tmp-img-*` volume, delete every `img-*` volume that is not desired,
+then stage each desired version that has no volume, lower versions
+first, so a version staged in the pass can be the origin of the next.
+A stage snapshots the highest lower version of the same image when one
+exists, else creates a fresh volume; writes the chunks the origin does
+not already hold; syncs; then renames `tmp-img-...` to `img-...`. The
+rename is the commit: a volume named `img-...` is complete by
+construction, so a crash anywhere in a pass leaves a state the next
+pass converges from and nothing records progress. One image's failure
+is logged and the pass continues to the rest. The heartbeat reports an
+image ready when its chunks are cached AND `list()` shows its volume at
+heartbeat time (Decision 7); nothing stores readiness. The memory half
+(base memfile, base-shm pins) keeps the prefetch supervisor and its
+`ImageReadiness` map until a follow-up moves it onto the same
+desired-versus-actual shape; the disk half no longer depends on it
+except through that intersection.
 
 **Create a session.** Snapshot the image volume, create the swap
 volume, write both names into `sandbox.json`, start Firecracker with
@@ -305,11 +320,10 @@ corrupts; the idle evictor's existing eviction ordering drains the
 node. Metadata exhaustion is prevented by sizing, and the heartbeat
 reports it separately so an alert can fire long before it happens.
 
-**Image GC.** Desired: the versions referenced by any session on this
-node plus the enabled set. Observed: the image volumes that exist.
-Delete the difference. Deleting an image volume whose blocks are shared
-with session snapshots keeps those blocks allocated; the pool reclaims
-them when the last sharer goes.
+**Image GC.** The same pass: an image volume outside the enabled set
+is deleted. A session snapshot does not depend on its origin, so the
+origin can go while sessions run; blocks shared with those snapshots
+stay allocated until the last sharer goes.
 
 ### The macOS backend
 
@@ -483,6 +497,19 @@ that adds code without retiring the row it replaces is incomplete.
   parsers for target params, pool status, `thin_dump` and `thin_delta`
   output, against recorded fixtures. The id counter has no on-disk
   state to crash-test.
+- **Image staging (`engram-host-core`, `engram-dst-host`):** a pass
+  over `FileDisk` stages a published image and reads back its bytes, a
+  later version is a snapshot of the earlier volume, undesired and
+  unfinished volumes go while session volumes stay, one image without a
+  manifest fails alone; and over `CrashDisk`, a pass cut at every
+  operation converges on the next uncut pass to exactly the desired
+  volumes with the right bytes.
+- **dm-thin root lane (KVM runners, `ci.yml`):** `ThinPoolDisk` against
+  a pool built by `thin-pool.sh`: reopen after a dropped handle, delete
+  refused while open, `thin_delta` equal to the full compare, a
+  checkpoint reproduced through `stage`, capacity falling by the blocks
+  written, orphan reaping and id-counter skipping, `list` and `rename`
+  keeping an open handle valid.
 - **Firecracker integration (KVM runners, `ci.yml`):** create → write →
   checkpoint → verify the manifest's chunks equal the guest's bytes;
   checkpoint under a guest writing at full rate, assert the pause is
@@ -524,9 +551,12 @@ thin-pool host and the reverse.
    change as moving Firecracker's disk ownership into `PooledBackend`,
    and doing it once retires the VZ clone, chunk and restore code in
    one move.
-4. **Image staging into volumes.** The prefetch supervisor stages each
-   enabled version into a thin volume beside the chunk cache; readiness
-   requires the volume.
+4. **Image staging into volumes.** `SessionDisk` gains `list` and
+   `rename`. The stateless pass above lives in `engram-host-core` and
+   the host-agent runs it from a second receiver on the enabled-set
+   watch channel; the heartbeat intersects chunk-cache readiness with
+   the volume list. No new state, no timer. The memory half stays on
+   the prefetch supervisor for now (see "Stage an image").
 5. **Sessions on the pool.** `PooledBackend` owns the disk for both
    backends: create, resume, checkpoint, evict and teleport go through
    `stage` and `checkpoint`, and each backend only attaches the path it

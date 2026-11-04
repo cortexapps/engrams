@@ -54,6 +54,7 @@ pub mod heartbeat;
 pub mod idle_evictor;
 pub mod image_cache;
 pub mod image_prefetch;
+pub mod image_volumes;
 pub mod live_attach;
 pub mod materialize;
 pub mod metrics;
@@ -76,50 +77,35 @@ pub struct HostAgent {
     pub cfg: HostAgentConfig,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
-    /// ADR 0006: local egress proxy. The production host-agent binary
-    /// ALWAYS attaches one (issue #240 made it mandatory — a host that
-    /// can't stand up the proxy refuses to start). `None` is reachable
-    /// only from in-process test harnesses and the non-FC dev backends
-    /// (VZ/Process), which carry no internet-facing guest network.
+    /// Local egress proxy. The production binary refuses to start
+    /// without one; `None` is for in-process tests and the VZ/Process
+    /// backends, whose guests have no internet-facing network.
     pub egress: Option<Arc<egress::HostEgress>>,
-    /// ADR 0007: chunk store + per-host materialization root. `None`
-    /// keeps the legacy OCI-pulled `rootfs.ext4` path active (chunked
-    /// images skip the chunk-store resolve and use the cached file
-    /// directly).
+    /// Chunk store and the per-host materialization root. `None` keeps
+    /// the OCI-pulled `rootfs.ext4` path.
     pub chunk_store: Option<(ChunkStore, PathBuf)>,
-    /// Per-host OCI image cache. `None` means the host-agent can't
-    /// pull images by URI — sessions must arrive with
-    /// `spec.rootfs_source` set already (the dev-only path).
-    /// Production multi-host topologies must set this.
+    /// Per-host OCI image cache. `None` means sessions must arrive with
+    /// `spec.rootfs_source` set (the dev-only path).
     pub image_cache: Option<ImageCache>,
-    /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
-    /// production to amortise chunk reads across manifests.
+    /// NVMe-backed chunk cache shared across manifests.
     pub chunk_cache: Option<ChunkCache>,
     /// Root for per-sandbox sparse dirty files.
     pub dirty_root: Option<PathBuf>,
-    /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
-    /// daemon allocates from when serving chunked rootfs disks.
-    /// `None` keeps the legacy materialize-to-file path active.
+    /// `/dev/nbdN` slots the disk daemon serves chunked rootfs disks
+    /// from. `None` materializes each disk to a file instead.
     pub nbd_pool: Option<Arc<disk_daemon::NbdSlotAllocator>>,
-    /// ADR 0009 §6: typed handle on the FC backend (when this host
-    /// uses Firecracker) so the live-attach pass at startup can
-    /// invoke `reattach_sandbox`. The `Arc<dyn SandboxBackend>` in
-    /// `sandbox` can't be downcast to a concrete type (the trait
-    /// doesn't extend `Any`), so callers that want live-attach
-    /// must wire this separately. `None` skips reattach entirely
-    /// (clean-slate startup; matches today's behaviour).
+    /// The concrete Firecracker backend, for the startup reattach pass.
+    /// `sandbox` cannot be downcast (the trait does not extend `Any`).
+    /// `None` starts clean-slate.
     pub fc_for_reattach: Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>>,
-    /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
-    /// snapshots' `trace_host_hint` (so cross-host restore knows
-    /// which trace to prefault) AND passed to the UFFD handler
-    /// as `--publish-trace-host`. `None` generates a fresh id at
-    /// run time (the pre-Phase-5 default).
+    /// Where image and session volumes live. `None` keeps readiness on
+    /// the chunk cache alone.
+    pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
+    /// This host's stable id, stamped on snapshot trace hints and passed
+    /// to the UFFD handler. `None` generates one at run time.
     pub host_id: Option<engram_core::HostId>,
-    /// ADR 0045 addendum (2026-07-10): the base-shm sweeper's
-    /// enabled-image keep-set, shared with `base_shm_gc::spawn`
-    /// (main.rs owns the sweeper; the image-prefetch supervisor
-    /// spawned in `run` publishes into it). Always present; inert
-    /// unless a sweeper holds the same handle.
+    /// The base-shm sweeper's keep-set. The image-prefetch supervisor
+    /// publishes into it; inert unless a sweeper holds the same handle.
     pub base_shm_protected: Arc<base_shm_gc::ProtectedPaths>,
 }
 
@@ -139,27 +125,43 @@ impl HostAgent {
             chunk_cache: None,
             dirty_root: None,
             nbd_pool: None,
-            host_id: None,
             fc_for_reattach: None,
+            session_disk: None,
+            host_id: None,
             base_shm_protected: base_shm_gc::ProtectedPaths::new(),
         }
     }
 
-    /// ADR 0045 addendum (2026-07-10): share the base-shm sweeper's
-    /// enabled-image keep-set so the image-prefetch supervisor
-    /// (spawned in `run`) publishes into the SAME registry the
-    /// sweeper consults.
-    pub fn with_base_shm_protected(mut self, protected: Arc<base_shm_gc::ProtectedPaths>) -> Self {
-        self.base_shm_protected = protected;
+    pub fn with_egress(mut self, egress: Arc<egress::HostEgress>) -> Self {
+        self.egress = Some(egress);
         self
     }
 
-    /// ADR 0009 §6: register the concrete FC backend for the
-    /// startup reattach pass. Optional — only meaningful when
-    /// `--sandbox-backend=firecracker` (reattach is unconditional
-    /// for the FC backend).
-    /// When unset, the host-agent starts clean-slate (reconcile
-    /// then flips orphaned sessions per §3).
+    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
+        self.chunk_store = Some((chunk_store, materialize_dir));
+        self
+    }
+
+    pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
+        self.image_cache = Some(cache);
+        self
+    }
+
+    pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
+        self.chunk_cache = Some(cache);
+        self
+    }
+
+    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
+        self.dirty_root = Some(root);
+        self
+    }
+
+    pub fn with_nbd_pool(mut self, pool: Arc<disk_daemon::NbdSlotAllocator>) -> Self {
+        self.nbd_pool = Some(pool);
+        self
+    }
+
     pub fn with_fc_reattach(
         mut self,
         fc: Arc<engram_sandbox_firecracker::FirecrackerBackend>,
@@ -168,117 +170,60 @@ impl HostAgent {
         self
     }
 
-    /// Set this host's stable `HostId`. Pair with the same id
-    /// stamped on `FirecrackerConfig.host_id` at backend
-    /// construction — both sides need to agree so the trace
-    /// `traces/<manifest_id>/<host_id>.json` keying is consistent.
+    pub fn with_session_disk(mut self, disk: Arc<dyn engram_host_core::SessionDisk>) -> Self {
+        self.session_disk = Some(disk);
+        self
+    }
+
+    /// Must match the id on `FirecrackerConfig.host_id`: both key the
+    /// trace file `traces/<manifest_id>/<host_id>.json`.
     pub fn with_host_id(mut self, id: engram_core::HostId) -> Self {
         self.host_id = Some(id);
         self
     }
 
-    /// Attach a `ChunkCache`. Optional; layers on top of
-    /// `with_chunk_store` to amortise chunk reads across manifests
-    /// (canonical-base images, forks).
-    pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
-        self.chunk_cache = Some(cache);
+    pub fn with_base_shm_protected(mut self, protected: Arc<base_shm_gc::ProtectedPaths>) -> Self {
+        self.base_shm_protected = protected;
         self
     }
 
-    /// Set the root for per-sandbox sparse dirty files.
-    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
-        self.dirty_root = Some(root);
-        self
-    }
-
-    /// Attach a `/dev/nbdN` slot allocator. When set + a chunk
-    /// store + chunk cache are also wired, `create()` spawns the
-    /// NBD daemon to serve chunked rootfs disks instead of
-    /// materializing them to single files. Linux-only at runtime.
-    pub fn with_nbd_pool(mut self, pool: Arc<disk_daemon::NbdSlotAllocator>) -> Self {
-        self.nbd_pool = Some(pool);
-        self
-    }
-
-    /// Attach a local egress proxy. The host-agent will route every
-    /// inbound `notify_session_policy` to this proxy's registry,
-    /// unregister sandboxes on `destroy`, and expose the CA cert
-    /// PEM to substrate-building code paths.
-    pub fn with_egress(mut self, egress: Arc<egress::HostEgress>) -> Self {
-        self.egress = Some(egress);
-        self
-    }
-
-    /// Attach a chunk store + per-host materialization directory.
-    /// The PooledBackend uses these to resolve chunked image
-    /// manifests to per-host materialized rootfs files.
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
-        self.chunk_store = Some((chunk_store, materialize_dir));
-        self
-    }
-
-    /// Attach a per-host OCI image cache. Sessions with `image_uri`
-    /// set route through this cache (pull on miss, hit on subsequent
-    /// references). Required for multi-host production where the
-    /// coordinator hands out images by URI.
-    pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
-        self.image_cache = Some(cache);
-        self
-    }
-
-    /// Run the host agent's background loops until shutdown.
-    ///
-    /// Phase 3a: if `coordinator_endpoint` is set, runs the WS dialer
-    /// against that coordinator until ctrl-c (reconnecting on drops).
-    /// Otherwise stays idle until ctrl-c — useful for `engram-host-agent`
-    /// in standalone dev where the binary just hosts a local backend
-    /// without phoning home.
+    /// Run until ctrl-c: the reattach pass, the background drivers, and
+    /// the coordinator dialer when `coordinator_endpoint` is set.
     pub async fn run(self) -> Result<(), HostAgentError> {
         tracing::info!(?self.cfg.work_dir, "host-agent starting");
         let _ = self.cloud.host_metadata().await;
 
-        // ADR 0009 §6 / ADR 0044 K2: live-VM reattach pass. Runs once at
-        // startup, before connecting to coord, so reattached sandboxes
-        // show up in the very first heartbeat's `running_sandboxes` field
-        // — coord sees them as continuously-present and doesn't strike-out
-        // / flip the owning sessions.
-        //
-        // This is now UNCONDITIONAL for the FC backend, not opt-in: K2
-        // detaches the node's VMs on a host-agent restart (no kill, no
-        // checkpoint), so the successor generation MUST re-adopt them or
-        // they leak. Non-FC backends register no `fc_for_reattach` and
-        // clean-slate (VZ/process don't survive a host-agent restart).
-        let mut reattached_roles: Vec<(SandboxId, migration::MigrationRole)> = Vec::new();
-        let mut reattach_ran = false;
-        if let Some(fc) = self.fc_for_reattach.as_ref() {
-            match live_attach::reattach_pass(&self.cfg.work_dir, fc).await {
-                Ok(report) => {
-                    tracing::info!("{}", report.summary());
-                    reattach_ran = true;
-                    // ADR 0045 C2: sandboxes that were mid-post-copy when
-                    // the previous generation died; the fences re-arm
-                    // once the pooled backend exists below.
-                    reattached_roles = live_attach::scan_migration_roles(&self.cfg.work_dir);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "live-attach pass failed; continuing with clean-slate startup"
-                    );
-                }
-            }
-        } else {
-            // Non-FC backends clean-slate on restart — no VM survives,
-            // so every uuid entry in the work_dir is residue.
-            reattach_ran = true;
-        }
-        // Residue sweep: jail dirs, vsock sockets, and canonical entries
-        // whose sandbox did not survive. Runs after the reattach pass
-        // fixes the live set and before coordinator registration can
-        // create or resume anything (the ADR 0110 sweep ordering).
-        // Skipped when the reattach pass itself FAILED — an incomplete
-        // live set must never widen the sweep.
-        if reattach_ran {
+        // Reattach before the first heartbeat, so the coordinator sees
+        // surviving VMs as continuously present. A host-agent restart
+        // detaches Firecracker VMs rather than killing them; the new
+        // generation must adopt them or they leak.
+        // `live_set_known` is false only when the pass failed: an
+        // incomplete live set must never widen the residue sweep below.
+        let (live_set_known, reattached_roles): (bool, Vec<(SandboxId, migration::MigrationRole)>) =
+            match self.fc_for_reattach.as_ref() {
+                Some(fc) => match live_attach::reattach_pass(&self.cfg.work_dir, fc).await {
+                    Ok(report) => {
+                        tracing::info!("{}", report.summary());
+                        // Sandboxes mid-post-copy when the previous generation
+                        // died; their fences re-arm once the pooled backend exists.
+                        (true, live_attach::scan_migration_roles(&self.cfg.work_dir))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "live-attach pass failed; continuing with clean-slate startup"
+                        );
+                        (false, Vec::new())
+                    }
+                },
+                // No VM survives a restart of the other backends: every
+                // uuid entry in the work dir is residue.
+                None => (true, Vec::new()),
+            };
+        // Sweep jail dirs, vsock sockets, and canonical entries whose
+        // sandbox did not survive, before the coordinator can create or
+        // resume anything.
+        if live_set_known {
             let live: std::collections::HashSet<SandboxId> = self
                 .sandbox
                 .list()
@@ -1330,13 +1275,16 @@ impl HostAgent {
                         Some(resolver)
                     };
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
-                        chunk_store,
+                        chunk_store.clone(),
                         chunk_cache,
                         readiness.clone(),
                         base_memfile_dir,
                         ram_ledger.clone(),
                         self.base_shm_protected.clone(),
                     );
+                    if let Some(disk) = self.session_disk.clone() {
+                        image_volumes::spawn(disk, chunk_store, tx.subscribe());
+                    }
                     Some(tx)
                 }
                 _ => {
@@ -1427,6 +1375,8 @@ impl HostAgent {
             let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
+            let session_disk_for_heartbeat = self.session_disk.clone();
+            let enabled_for_heartbeat = enabled_images_tx.as_ref().map(|tx| tx.subscribe());
             let util_work_dir = self.cfg.work_dir.clone();
             let probe_inputs_for_heartbeat = probe_inputs.clone();
             let ram_ledger_for_heartbeat = ram_ledger.clone();
@@ -1635,7 +1585,18 @@ impl HostAgent {
                         running_sandboxes_known,
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
-                        ready_images: readiness_for_heartbeat.snapshot(),
+                        ready_images: match (&session_disk_for_heartbeat, &enabled_for_heartbeat) {
+                            (Some(disk), Some(enabled)) => {
+                                let enabled = enabled.borrow().clone();
+                                image_volumes::ready_on_disk(
+                                    disk.as_ref(),
+                                    &enabled,
+                                    readiness_for_heartbeat.snapshot(),
+                                )
+                                .await
+                            }
+                            _ => readiness_for_heartbeat.snapshot(),
+                        },
                         current_bundles: current_bundles.clone(),
                         sandbox_bundles,
                         checkpoints,
