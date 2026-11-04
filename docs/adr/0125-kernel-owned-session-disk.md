@@ -181,9 +181,10 @@ thin-provisioning tools it calls at run time (`thin_dump`,
 3. **A session disk is a thin snapshot.** A fresh session's root disk
    is a snapshot of its image volume. A resumed session's root disk is
    a snapshot of its base image volume with the session's dirty chunks
-   written in. Guest swap (ADR 0112) is a fresh thin volume with no
-   origin; it is never captured. Every volume a session owns is
-   recorded in its `sandbox.json`.
+   written in. Guest swap (ADR 0112) starts as a fresh thin volume
+   with no origin and is checkpointed with the root disk from then on
+   (see the divergences). Every volume a session owns is recorded in
+   its `sandbox.json`.
 4. **Firecracker opens the device path.** The guest's virtio-blk drive
    is a device node the host-agent makes itself under `/dev/engram/`
    (`mknod` from the kernel's major:minor, so no udev rule is in the
@@ -248,7 +249,7 @@ thin-provisioning tools it calls at run time (`thin_dump`,
 /dev/engram/img-<manifest_id>-v<N>       one volume per staged image version
 /dev/engram/tmp-img-<manifest_id>-v<N>   an image version whose stage has not finished
 /dev/engram/sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
-/dev/engram/sb-<sandbox_id>-swap         session swap (fresh volume, no origin)
+/dev/engram/sb-<sandbox_id>-swap         session swap (a fresh volume at first; checkpointed like root)
 /dev/engram/sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
 <work_dir>/<sandbox_id>/sandbox.json     records the volume names
 ```
@@ -612,6 +613,16 @@ thin-pool host and the reverse.
 - **The chunk cache stays.** Memory chunks still page in through it,
   and image staging reads image chunks through it. Only the disk path
   left it.
+- **Swap is checkpointed, not discarded.** ADR 0112 planned a guest
+  `swapoff` before every memory capture so swap content could be
+  dropped; that `swapoff` was never built (the guest runs it only for
+  the kill switch). A memory image can therefore reference swap slots,
+  so the swap volume is a checkpoint role like root: snapshotted under
+  the same pause, published after it, and continued on resume. The
+  swap snapshot adds one `create_snap` to the pause.
+- **A released session keeps its newest checkpoint volume.** The
+  volume stays until the pool needs the space, so the same-host resume
+  that placement prefers is a snapshot, not a stage.
 - **The DST oracle no longer models disk capacity.** The simulator's
   pick mirrors the Postgres in-transaction pick, which gates on RAM and
   CPU; the pool floor is a coordinator-side candidate filter, like the

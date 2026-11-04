@@ -305,11 +305,11 @@ impl ImageConfig {
                     .into(),
             );
         }
-        // ADR 0112: a swap device larger than the guest's memory is
-        // always a misconfiguration — the capture-time `swapoff` must
-        // page everything back into RAM, so swap > memory can never
-        // fully disarm. Reject at the user-facing boundary instead of
-        // silently capping.
+        // A swap device larger than the guest's memory is always a
+        // misconfiguration: the guest cannot park more than it holds,
+        // and the swap volume is checkpointed with the root disk, so
+        // the cap bounds what every checkpoint can carry. Reject at the
+        // user-facing boundary instead of silently capping.
         if self.resolved_swap_mib() > self.resolved_memory_mib() {
             return Err(format!(
                 "config `[resources] suggested_swap_mib` ({}) exceeds the guest's memory \
@@ -457,24 +457,23 @@ pub struct ResourceHints {
     /// changes the disk manifest, so a bump takes effect on the next
     /// refresh/enable (re-capture), not on live sessions.
     pub suggested_disk_gib: Option<u32>,
-    /// ADR 0112: size of the guest's ephemeral swap device in MiB.
-    /// Absent or 0 ⇒ no swap device — nothing changes for the image.
-    /// Opting in attaches a host-file-backed RW drive whose contents
-    /// are discarded at every capture (`swapoff` runs before the
-    /// pause), so the value also bounds the worst-case capture-time
-    /// page-back-in. [`recommended_swap_mib`] gives the default sizing
-    /// formula; enable-time validation rejects a value larger than the
-    /// guest's memory (a `swapoff` that can never complete). Like
-    /// memory, the device geometry is frozen into the base snapshot's
-    /// `state.bin`, so a change takes effect on re-capture.
+    /// ADR 0112: size of the guest's swap device in MiB. Absent or 0
+    /// ⇒ no swap device — nothing changes for the image. Opting in
+    /// attaches a session volume the host checkpoints with the root
+    /// disk, so the value bounds what a checkpoint can carry.
+    /// [`recommended_swap_mib`] gives the default sizing formula;
+    /// enable-time validation rejects a value larger than the guest's
+    /// memory. Like memory, the device geometry is frozen into the
+    /// base snapshot's `state.bin`, so a change takes effect on
+    /// re-capture.
     pub suggested_swap_mib: Option<u32>,
 }
 
 /// ADR 0112: the recommended swap size for a guest with `memory_mib`
 /// of RAM — `clamp(memory/4, 1 GiB, 8 GiB)`. RAM/4 bounds three things
-/// at once: the worst-case `swapoff` page-back-in at capture, the
-/// worst-case host disk footprint, and the degree of overcommit worth
-/// papering over before a bigger guest is the honest fix. Tooling that
+/// at once: the worst-case swap a checkpoint carries, the worst-case
+/// host disk footprint, and the degree of overcommit worth papering
+/// over before a bigger guest is the honest fix. Tooling that
 /// suggests a value uses this; [`ResourceHints::suggested_swap_mib`]
 /// always wins when set.
 pub fn recommended_swap_mib(memory_mib: u32) -> u32 {
