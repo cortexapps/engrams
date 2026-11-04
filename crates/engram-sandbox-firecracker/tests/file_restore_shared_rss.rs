@@ -355,13 +355,13 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let store_root = tempfile::tempdir().expect("store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(LocalBlobStorage::new(store_root.path().join("blob")));
-    let chunk_store = ChunkStore::new(blob);
     let cache = ChunkCache::new(ChunkCacheConfig {
         root: store_root.path().join("cache"),
         budget_bytes: 4 * 1024 * 1024 * 1024,
         sweep_debounce_ms: 0,
         eviction_enabled: true,
     });
+    let chunk_store = ChunkStore::new(blob).with_chunk_cache(cache);
     let memory_manifest = chunk_store
         .chunk_file(&mem_path, ManifestKind::Memory, None)
         .await
@@ -370,7 +370,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
     std::fs::remove_file(&mem_path).expect("delete captured memory.bin");
     let mat = Instant::now();
     chunk_store
-        .materialize_to_file_cached(&memory_manifest, &mem_path, &cache)
+        .materialize_to_file(&memory_manifest, &mem_path)
         .await
         .expect("re-materialize memory.bin from manifest");
     eprintln!(

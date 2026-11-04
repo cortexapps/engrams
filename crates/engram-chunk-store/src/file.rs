@@ -598,51 +598,6 @@ impl ChunkStore {
         fs::rename(&temp, dest).await?;
         Ok(())
     }
-
-    /// Like [`materialize_to_file`] but reads chunks from the
-    /// supplied [`crate::cache::ChunkCache`] instead of going
-    /// straight to the underlying store. Use this when the caller
-    /// has a hot path with locality (multiple sessions reusing
-    /// base-image chunks).
-    pub async fn materialize_to_file_cached(
-        &self,
-        manifest: &Manifest,
-        dest: &Path,
-        cache: &crate::cache::ChunkCache,
-    ) -> Result<()> {
-        manifest.validate()?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        // Same atomicity invariant as `materialize_to_file`: write
-        // to a `.partial` sibling, rename only on full success.
-        // Without this, a mid-write failure would leave a file at
-        // `dest` with `total_bytes` zero-filler — and any caller
-        // probing size as "is this materialized?" (e.g.
-        // PooledBackend's fast-path) would treat it as a success
-        // and feed a junk rootfs to FC / VZ.
-        let temp = temp_for(dest);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp)
-            .await?;
-        file.set_len(manifest.total_bytes).await?;
-        for entry in &manifest.chunks {
-            // Cache miss → fetch through `self` (whatever resolver
-            // `self` carries — including the per-session tiered
-            // resolver from ADR 0008 Phase 5). The cache is
-            // backend-agnostic; each call site chooses.
-            let bytes: Bytes = cache.get(entry.hash, || self.get_chunk(entry.hash)).await?;
-            file.seek(SeekFrom::Start(entry.offset)).await?;
-            file.write_all(&bytes).await?;
-        }
-        file.flush().await?;
-        drop(file);
-        fs::rename(&temp, dest).await?;
-        Ok(())
-    }
 }
 
 /// Sibling temp path used by `materialize_to_file*` for the
@@ -1163,8 +1118,6 @@ mod tests {
     #[tokio::test]
     async fn materialize_via_cache_uses_cache_path() {
         let (s, _d) = store().await;
-        let blob = tempfile::tempdir().unwrap();
-        let _ = blob; // already held by store via _d
         let cache_dir = tempfile::tempdir().unwrap();
         // Pin the floor to 0 so the test is deterministic regardless of
         // the host disk's fill level (the default free-space floor would
@@ -1178,6 +1131,7 @@ mod tests {
             },
             0.0,
         );
+        let s = s.with_chunk_cache(cache.clone());
         let work = tempfile::tempdir().unwrap();
         let data = (0..40u8).cycle().take(5 * 1024 * 1024).collect::<Vec<_>>();
         let src = work.path().join("src.bin");
@@ -1187,9 +1141,7 @@ mod tests {
             .await
             .unwrap();
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file_cached(&m, &dest, &cache)
-            .await
-            .unwrap();
+        s.materialize_to_file(&m, &dest).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
         // Cache should hold every chunk now.
         for entry in &m.chunks {
@@ -1240,46 +1192,6 @@ mod tests {
         // success); verify the canonical name is clean. Production
         // callers probe `dest` for the fast-path; that probe must
         // miss after an error.
-    }
-
-    /// Same invariant for the cached path. Different code path —
-    /// must also be temp-and-rename clean.
-    #[tokio::test]
-    async fn errored_materialize_cached_leaves_no_dest_file() {
-        let (s, _d) = store().await;
-        let cache_dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(ChunkCacheConfig {
-            root: cache_dir.path().to_path_buf(),
-            budget_bytes: 1024 * 1024,
-            sweep_debounce_ms: 0,
-            eviction_enabled: true,
-        });
-        let work = tempfile::tempdir().unwrap();
-
-        let phantom = crate::manifest::ChunkHash::of(b"never-stored-cached");
-        let bad_manifest = Manifest {
-            schema_version: 1,
-            kind: ManifestKind::Disk,
-            total_bytes: 4096,
-            chunk_size: crate::manifest::ChunkSize::bytes(4096),
-            chunks: vec![crate::manifest::ChunkRef {
-                offset: 0,
-                hash: phantom,
-            }],
-            parent: None,
-            working_set_trace: None,
-            annotations: serde_json::Value::Null,
-        };
-
-        let dest = work.path().join("rootfs.ext4");
-        assert!(s
-            .materialize_to_file_cached(&bad_manifest, &dest, &cache)
-            .await
-            .is_err());
-        assert!(
-            !dest.exists(),
-            "errored cached materialize must NOT leave the canonical file behind"
-        );
     }
 
     // ---- ADR 0038: sparse re-chunk (no rolling memfile) ----

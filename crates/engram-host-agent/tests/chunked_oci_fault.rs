@@ -374,16 +374,11 @@ async fn tiered_resolver_fails_loudly_when_chunk_missing_from_all_tiers() {
     );
 }
 
-/// End-to-end: `materialize_to_file_cached` with a global
-/// `ChunkCache` (constructed without any backend reference) routes
-/// chunk misses through the **tiered store** passed at call time.
-/// No rebind dance, no stale-backend bug — the cache stays
-/// backend-agnostic.
-///
-/// This is the contract that prevents the original cross-namespace
-/// failure mode from re-emerging through the cache layer.
+/// End-to-end: a materialize through a store that carries the local
+/// cache serves a miss from the store's own tiered resolver, so the
+/// cache never holds a backend reference of its own.
 #[tokio::test]
-async fn materialize_to_file_cached_uses_caller_supplied_store() {
+async fn materialize_through_the_cache_uses_the_store_resolver() {
     use engram_chunk_store::{
         cache::ChunkCacheConfig, ChunkCache, ChunkRef as CsChunkRef, ChunkSize, Manifest,
         ManifestKind, ManifestRef,
@@ -451,10 +446,6 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
         vec![cache_resolver, oci_resolver],
         Some(blob.clone()),
     ));
-    let tiered_store = base_store.with_resolver(tiered);
-
-    // A plain global ChunkCache — backend-agnostic now. No store
-    // reference held; cannot drift.
     let cache_dir = tempfile::tempdir().unwrap();
     let cache = ChunkCache::new(ChunkCacheConfig {
         root: cache_dir.path().to_path_buf(),
@@ -462,14 +453,14 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
         sweep_debounce_ms: 0,
         eviction_enabled: true,
     });
+    let tiered_store = base_store
+        .with_resolver(tiered)
+        .with_chunk_cache(cache.clone());
 
-    // materialize_to_file_cached on the tiered store: cache misses
-    // route through `tiered_store.get_chunk` (the closure the new
-    // materialize_to_file_cached passes), which falls through
-    // BlobStorage → OCI → tee-fill.
+    // A cache miss falls through BlobStorage → OCI → tee-fill.
     let dest = tempfile::NamedTempFile::new().unwrap();
     tiered_store
-        .materialize_to_file_cached(&manifest, dest.path(), &cache)
+        .materialize_to_file(&manifest, dest.path())
         .await
         .expect("materialize through cache + tiered store");
 

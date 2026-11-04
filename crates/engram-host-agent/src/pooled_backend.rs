@@ -1232,12 +1232,11 @@ impl PooledBackend {
                     "chunked restore memory chunk prefetch failed; falling back to serial fault path",
                 );
             }
-        } else if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
-        {
+        } else if let Some(cs) = self.chunk_store.clone() {
             let md = metadata.clone();
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &cache, &md).await {
+                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
                         tracing::warn!(
                             error = %e,
                             snapshot_id = %md.id,
@@ -2998,7 +2997,7 @@ impl PooledBackend {
     /// ADR 0014 M1.13: parallel prefetch the memory manifest's
     /// chunks into the local NVMe chunk cache. Idempotent (no-op
     /// when the cache is already warm) and best-effort (errors
-    /// degrade to the serial fault path inside materialize_to_file_cached).
+    /// degrade to the serial fault path inside materialize_to_file).
     ///
     /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
     /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
@@ -3013,16 +3012,14 @@ impl PooledBackend {
         &self,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
-        match (self.chunk_store.as_ref(), self.chunk_cache.as_ref()) {
-            (Some(cs), Some(cache)) => {
-                Self::prefetch_memory_chunks_inner(cs, cache, metadata).await
-            }
-            _ => Ok(0),
+        match self.chunk_store.as_ref() {
+            Some(cs) => Self::prefetch_memory_chunks_inner(cs, metadata).await,
+            None => Ok(0),
         }
     }
 
     /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
-    /// already-resolved store + cache (by ref) so it can run either inline
+    /// already-resolved store (by ref) so it can run either inline
     /// (`await`, on a NON-LAZY File restore where the serial
     /// `materialize_memory_if_missing` reads the warmed cache) or inside a
     /// spawned background task (ADR 0043 P1, any lazy UFFD restore — the warmed
@@ -3030,7 +3027,6 @@ impl PooledBackend {
     /// need not block restore).
     async fn prefetch_memory_chunks_inner(
         chunk_store: &ChunkStore,
-        cache: &ChunkCache,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
@@ -3083,18 +3079,10 @@ impl PooledBackend {
             }
         };
         let chunk_count = hashes_to_prefetch.len();
-        let store_for_fetch = chunk_store.clone();
-        cache
-            .prefetch_chunks_parallel(
-                hashes_to_prefetch,
-                MEMORY_PREFETCH_CONCURRENCY,
-                move |hash| {
-                    let s = store_for_fetch.clone();
-                    async move { s.get_chunk(hash).await }
-                },
-            )
+        chunk_store
+            .prefetch_chunks(hashes_to_prefetch, MEMORY_PREFETCH_CONCURRENCY)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks_parallel: {e}")))?;
+            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks: {e}")))?;
         tracing::debug!(
             manifest = %mref,
             chunk_count,
@@ -3170,18 +3158,10 @@ impl PooledBackend {
             .get_manifest(mref)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("get_manifest {mref}: {e}")))?;
-        match self.chunk_cache.as_ref() {
-            Some(cache) => chunk_store
-                .materialize_to_file_cached(&manifest, &mem_path, cache)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("materialize memory.bin (cached): {e}"))
-                })?,
-            None => chunk_store
-                .materialize_to_file(&manifest, &mem_path)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?,
-        }
+        chunk_store
+            .materialize_to_file(&manifest, &mem_path)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?;
         tracing::info!(
             manifest = %mref,
             path = %mem_path.display(),
