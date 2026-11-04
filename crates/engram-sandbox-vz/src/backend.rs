@@ -35,6 +35,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::vm::{VmConfig, VzVm};
 use crate::vsock_bridge::{port_uds_path, VsockBridge, VsockConnector};
 
+/// The bound on a best-effort guest RPC: a wedged guest must not stall
+/// a snapshot or a restore.
+const GUEST_RPC_BOUND: Duration = Duration::from_secs(5);
+
 /// Vsock port engram-agentd binds inside the rootfs. Same number FC
 /// uses; the in-VM binary doesn't know which VMM is hosting it.
 const ENGRAM_AGENTD_PORT: u32 = 1024;
@@ -167,10 +171,10 @@ impl VzBackend {
         })
     }
 
-    fn vsock_uds_path_for(&self, id: SandboxId) -> PathBuf {
+    fn vsock_uds_path_for(&self, id: SandboxId) -> Result<PathBuf, SandboxError> {
         let dir = engram_core::socket::short_socket_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{id}.vsock"))
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(format!("{id}.vsock")))
     }
 
     /// Resolve the symbolic stamped slots against this host's
@@ -292,73 +296,70 @@ impl VzBackend {
         .kernel_cmdline
     }
 
-    /// Ask the in-guest agentd to `sync(2)`. Best effort, bounded to 5 s
-    /// so a wedged guest cannot stall the snapshot; on failure the disk
-    /// holds the last ext4 commit.
-    async fn flush_guest_fs(&self, id: SandboxId, vsock_uds_path: &Path) {
+    /// One request to the in-guest agentd, bounded by `within`. `None`:
+    /// the dial, the write, the read, or the bound failed.
+    async fn agentd_request(
+        vsock_uds_path: &Path,
+        req: WireRequest,
+        within: Duration,
+    ) -> Option<WireResponse> {
         let agent_uds = port_uds_path(vsock_uds_path, ENGRAM_AGENTD_PORT);
         let fut = async {
             let conn = UnixStream::connect(&agent_uds).await.ok()?;
             let (mut reader, mut writer) = tokio::io::split(conn);
-            write_msg(&mut writer, &WireRequest::Sync).await.ok()?;
-            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
-            Some(resp)
+            write_msg(&mut writer, &req).await.ok()?;
+            read_msg::<_, WireResponse>(&mut reader).await.ok()
         };
-        match tokio::time::timeout(Duration::from_secs(5), fut).await {
-            Ok(Some(WireResponse::Synced)) => {
+        tokio::time::timeout(within, fut).await.ok().flatten()
+    }
+
+    /// Ask the in-guest agentd to `sync(2)` before a snapshot. Best
+    /// effort: on any failure the disk holds the last ext4 commit.
+    async fn flush_guest_fs(&self, id: SandboxId, vsock_uds_path: &Path) {
+        match Self::agentd_request(vsock_uds_path, WireRequest::Sync, GUEST_RPC_BOUND).await {
+            Some(WireResponse::Synced) => {
                 tracing::debug!(sandbox_id = %id, "vz: guest fs flushed before snapshot");
             }
-            Ok(Some(other)) => {
-                tracing::warn!(sandbox_id = %id, ?other, "vz: unexpected reply to Sync; snapshot will use last ext4 commit");
-            }
-            Ok(None) => {
-                tracing::warn!(sandbox_id = %id, "vz: guest fs flush dial failed; snapshot will use last ext4 commit");
-            }
-            Err(_) => {
-                tracing::warn!(sandbox_id = %id, "vz: guest fs flush timed out after 5s; snapshot will use last ext4 commit");
+            other => {
+                tracing::warn!(sandbox_id = %id, ?other, "vz: guest fs flush failed; snapshot will use last ext4 commit");
             }
         }
     }
 
     /// Push the host's wall clock into a warm-restored guest. VZ exposes
     /// no PTP device, so the guest wakes with `CLOCK_REALTIME` frozen at
-    /// save time. Best effort, bounded like `flush_guest_fs`.
+    /// save time and nothing else corrects it. The guest's vsock comes
+    /// back a beat after `resume`, so a refused dial is retried until
+    /// the bound; the pushed time is re-read per attempt.
     async fn step_guest_clock(&self, id: SandboxId, vsock_uds_path: &Path) {
-        let agent_uds = port_uds_path(vsock_uds_path, ENGRAM_AGENTD_PORT);
-        let unix_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_nanos() as i64,
-            Err(_) => return,
-        };
-        let fut = async {
-            let conn = UnixStream::connect(&agent_uds).await.ok()?;
-            let (mut reader, mut writer) = tokio::io::split(conn);
-            write_msg(&mut writer, &WireRequest::StepClock { unix_nanos })
-                .await
-                .ok()?;
-            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
-            Some(resp)
-        };
-        match tokio::time::timeout(Duration::from_secs(5), fut).await {
-            Ok(Some(WireResponse::ClockStepped {
-                applied_offset_nanos,
-            })) => {
-                tracing::info!(
-                    sandbox_id = %id,
-                    applied_offset_secs = applied_offset_nanos.map(|n| n / 1_000_000_000),
-                    "vz: warm-restored guest clock stepped (None = under threshold)"
-                );
-            }
-            Ok(Some(other)) => {
-                tracing::warn!(sandbox_id = %id, ?other, "vz: unexpected reply to StepClock");
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    "vz: StepClock dial failed (old agentd generation?) — guest clock stays stale"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(sandbox_id = %id, "vz: StepClock timed out after 5s");
+        let deadline = tokio::time::Instant::now() + GUEST_RPC_BOUND;
+        loop {
+            let unix_nanos =
+                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_nanos() as i64,
+                    Err(_) => return,
+                };
+            let req = WireRequest::StepClock { unix_nanos };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match Self::agentd_request(vsock_uds_path, req, left).await {
+                Some(WireResponse::ClockStepped {
+                    applied_offset_nanos,
+                }) => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        applied_offset_secs = applied_offset_nanos.map(|n| n / 1_000_000_000),
+                        "vz: warm-restored guest clock stepped (None = under threshold)"
+                    );
+                    return;
+                }
+                other if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(sandbox_id = %id, ?other, "vz: StepClock not answered yet; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => {
+                    tracing::warn!(sandbox_id = %id, ?other, "vz: StepClock failed; guest clock stays stale");
+                    return;
+                }
             }
         }
     }
@@ -463,7 +464,7 @@ impl VzBackend {
         let vm = Arc::new(VzVm::new(vm_cfg)?);
         vm.restore(&src.join(crate::snapshot::MACHINE_STATE_FILENAME))
             .await?;
-        let vsock_uds_path = self.vsock_uds_path_for(new_id);
+        let vsock_uds_path = self.vsock_uds_path_for(new_id)?;
         let (bridge, connector) = self.attach_bridge(&vm, &vsock_uds_path).await?;
         vm.resume().await?;
         self.step_guest_clock(new_id, &vsock_uds_path).await;
@@ -550,7 +551,7 @@ impl VzBackend {
             .with_mac_address(mac_address.clone());
         let vm = Arc::new(VzVm::new(vm_cfg)?);
         vm.start().await?;
-        let vsock_uds_path = self.vsock_uds_path_for(new_id);
+        let vsock_uds_path = self.vsock_uds_path_for(new_id)?;
         let (bridge, connector) = self.attach_bridge(&vm, &vsock_uds_path).await?;
 
         self.sandboxes.insert(
@@ -804,7 +805,7 @@ impl SandboxBackend for VzBackend {
         // sandbox.
         let vm = Arc::new(VzVm::new(vm_cfg)?);
         vm.start().await?;
-        let vsock_uds_path = self.vsock_uds_path_for(id);
+        let vsock_uds_path = self.vsock_uds_path_for(id)?;
         let (bridge, connector) = self.attach_bridge(&vm, &vsock_uds_path).await?;
 
         self.sandboxes.insert(
@@ -1418,26 +1419,18 @@ impl SandboxBackend for VzBackend {
             let live = self.sandboxes.get(&id)?;
             live.vsock_uds_path.clone()
         };
-        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
         // A hang guard, not a latency bound: the read waits for the guest's
         // agentd, which a cold boot reaches in a few seconds. A bound that
         // races the boot leaves the coordinator with no guest address and
         // the egress proxy with no policy for this VM.
         const GUEST_IP_HANG_GUARD: Duration = Duration::from_secs(30);
-        let fut = async {
-            let conn = UnixStream::connect(&agent_uds).await.ok()?;
-            let (mut reader, mut writer) = tokio::io::split(conn);
-            write_msg(&mut writer, &WireRequest::GuestIp).await.ok()?;
-            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
-            match resp {
-                WireResponse::GuestIp(ip) => ip,
+        let ip_str =
+            match Self::agentd_request(&vsock_uds_path, WireRequest::GuestIp, GUEST_IP_HANG_GUARD)
+                .await
+            {
+                Some(WireResponse::GuestIp(ip)) => ip,
                 _ => None,
-            }
-        };
-        let ip_str: Option<String> = tokio::time::timeout(GUEST_IP_HANG_GUARD, fut)
-            .await
-            .ok()
-            .flatten();
+            };
         let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
         let ep = GuestEndpoints {
             egress_identity: ip,
@@ -1611,7 +1604,7 @@ mod tests {
             Err(e) => panic!("backend construction failed: {e}"),
         };
         let sid = SandboxId::new();
-        let path = backend.vsock_uds_path_for(sid);
+        let path = backend.vsock_uds_path_for(sid).unwrap();
         // Rooted in the short SUN_LEN-safe dir (engram_core::socket), NOT under
         // the deep work_dir.
         assert_eq!(
