@@ -46,6 +46,7 @@ class PhysicalGates(unittest.TestCase):
                    '.github/scripts/mcp-stack-inputs.mts', '.github/scripts/mcp-stack-fc.sh',
                    '.github/scripts/mcp-stack-vz.sh', 'tests/fixtures/mcp-stack/platform/main.ts',
                    'tests/fixtures/mcp-stack/platform/fixture.Dockerfile',
+                   'tests/fixtures/mcp-stack/platform/guest.Dockerfile',
                    'tests/fixtures/mcp-stack/platform/guard.Dockerfile',
                    'tests/fixtures/mcp-stack/platform/host-agent.Dockerfile']
         for name in [*recipes, 'tracked.txt', *extra]:
@@ -316,6 +317,43 @@ else:
                 self.assertNotIn('-t', call)
                 self.assertNotIn('--iidfile', call)
             self.assertEqual(p.names, [])
+
+    def test_guest_archive_creates_private_state_before_start_and_keeps_existing_proof(self):
+        with self.archive_fixture() as (p, _):
+            demo = 'deploy/demo/Dockerfile'
+            selected = assets.SOURCE_IMAGES['guest']
+            for name in {demo, selected}:
+                target = p.source / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / name).read_bytes())
+            p.archive('guest', selected)
+            calls = [json.loads(line) for line in (p.root / 'calls').read_text().splitlines()]
+            build = next(call for call in calls if call[0] == 'docker' and call[5:7] == ['buildx', 'build'])
+            recipe = Path(build[build.index('--file') + 1]).read_bytes()
+            self.assertTrue(recipe.startswith((ROOT / demo).read_bytes()))
+            self.assertEqual(recipe, (ROOT / demo).read_bytes() + b'\n' + (ROOT / selected).read_bytes())
+            self.assertEqual(build[-1], str(p.source))
+            self.assertIn('SOURCE_COMMIT=' + p.head, build)
+            self.assertIn('org.opencontainers.image.revision=' + p.head, build)
+            self.assertIn(assets.LABEL + '=' + p.run, build)
+            instruction = recipe.decode().strip().splitlines()[-1]
+            self.assertTrue(instruction.startswith('RUN '))
+            state = p.root / 'state'
+            command = instruction.removeprefix('RUN ').replace('/tmp/mcp-stack-fixture', str(state))
+            command = command.replace('/workspace/.engrams', str(p.root / 'workspace'))
+            def setup():
+                subprocess.run(['/bin/sh', '-c', 'umask 022; ' + command], check=True)
+            setup()
+            self.assertTrue(state.is_dir())
+            self.assertFalse(state.is_symlink())
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(state.stat().st_uid, os.getuid())
+            proof = state / 'proof.jsonl'
+            proof.write_bytes(b'existing proof\n')
+            setup()
+            self.assertEqual(proof.read_bytes(), b'existing proof\n')
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(state.stat().st_uid, os.getuid())
 
     def test_archive_rejects_missing_or_invalid_config_metadata_before_inspect(self):
         for metadata in [None, b'not-json', b'[]', b'{}',

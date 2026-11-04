@@ -29,7 +29,7 @@ SOURCE_IMAGES = {
     'worker': 'docker/mcp-worker.Dockerfile',
     'fixture': 'tests/fixtures/mcp-stack/platform/fixture.Dockerfile',
     'guard': 'tests/fixtures/mcp-stack/platform/guard.Dockerfile',
-    'guest': 'deploy/demo/Dockerfile',
+    'guest': 'tests/fixtures/mcp-stack/platform/guest.Dockerfile',
 }
 TOOLS = {'node', 'bun', 'docker', 'openssl', 'skopeo', 'gh', 'oras', 'npm'}
 
@@ -338,6 +338,12 @@ class Producer:
         return identity
 
     def archive(self, role, dockerfile, context=None, build_args=None, local=False):
+        if role == 'guest':
+            # Append the fixture layer without copying the production recipe.
+            recipe = self.root / 'guest.Dockerfile'
+            self.put(recipe, (self.source / 'deploy/demo/Dockerfile').read_bytes() + b'\n' +
+                     (self.source / dockerfile).read_bytes())
+            dockerfile = recipe
         output = self.files / role if local else self.files / f'{role}.docker.tar'
         metadata = self.root / f'build-{role}.json'
         args = ['buildx', 'build', '--builder', 'default', '--platform', 'linux/' + self.arch,
@@ -443,6 +449,7 @@ class Producer:
             (self.source / name).chmod(0o755 if directory or entries[name] == '100755' else 0o644)
         # Outputs are private and outside this tracked-only build context.
         for role in [*SOURCE_IMAGES.values(), '.github/scripts/mcp-stack-inputs.mts',
+                     'deploy/demo/Dockerfile',
                      '.github/scripts/mcp-stack-fc.sh', '.github/scripts/mcp-stack-vz.sh',
                      'tests/fixtures/mcp-stack/platform/main.ts',
                      'tests/fixtures/mcp-stack/platform/host-agent.Dockerfile']:
