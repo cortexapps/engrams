@@ -184,6 +184,10 @@ mod linux {
         /// MISSING|MINOR; canonical faults resolve via UFFDIO_CONTINUE
         /// (shared), divergent via UFFDIO_COPY (private). Off when unset.
         pub base_shm: Option<PathBuf>,
+        /// Where to record the base shm file this handler actually opened
+        /// (empty when it falls back to running without one). The host
+        /// reads it to choose the Firecracker load's base file.
+        pub base_shm_ack: Option<PathBuf>,
         /// ADR 0045 C2 (post-copy destination): `host:port` of the SOURCE
         /// host-agent's page server. With `--peer-export-id`, arms peer
         /// mode: connect + authenticate + block for the `Seal` BEFORE
@@ -222,6 +226,7 @@ mod linux {
         let mut cache_root: Option<PathBuf> = None;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
         let mut base_shm: Option<PathBuf> = None;
+        let mut base_shm_ack: Option<PathBuf> = None;
         let mut fault_around_chunks = std::env::var("ENGRAM_UFFD_FAULT_AROUND")
             .unwrap_or_else(|_| engram_uffd_handler::peer::DEFAULT_FAULT_AROUND_CHUNKS.to_string());
         let mut peer_addr: Option<String> = None;
@@ -307,6 +312,12 @@ mod linux {
                         argv.next()
                             .ok_or_else(|| "--base-shm requires a value".to_string())?,
                     ));
+                }
+                "--base-shm-ack" => {
+                    base_shm_ack =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--base-shm-ack requires a value".to_string()
+                        })?));
                 }
                 "--recorder-window-ms" => {
                     let v = argv
@@ -400,6 +411,7 @@ mod linux {
             cache_root,
             recorder_window: Duration::from_millis(recorder_window_ms),
             base_shm,
+            base_shm_ack,
             peer_addr,
             peer_export_id,
             peer_token,
@@ -679,6 +691,11 @@ mod linux {
             }
             None => None,
         };
+        if let Some(ack) = args.base_shm_ack.as_ref() {
+            let opened = base_shm.as_ref().and(base_shm_arg);
+            engram_uffd_handler::base_shm::write_ack(ack, opened.map(PathBuf::as_path))
+                .map_err(|e| format!("write base shm ack {}: {e}", ack.display()))?;
+        }
 
         let result = tokio::task::spawn_blocking({
             let handle = handle.clone();
