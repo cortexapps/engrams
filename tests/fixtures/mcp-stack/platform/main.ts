@@ -120,10 +120,10 @@ export async function enableGuest(
     },
   );
   check(
-    result.job?.manifestDigest === expectedDigest &&
-      result.job.materializeHostId === ctx.hostId,
-    "enable_actual_host",
+    result.job?.manifestDigest === undefined || result.job.manifestDigest === expectedDigest,
+    "enable_ready_manifest",
   );
+  check(result.job?.materializeHostId === ctx.hostId, "enable_actual_host");
   const enabled = (await admin.images.listEnabledImages({})).images.filter(
     (v) => v.imageUri === uri && v.manifestDigest === expectedDigest,
   );

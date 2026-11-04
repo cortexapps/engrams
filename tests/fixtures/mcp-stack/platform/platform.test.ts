@@ -1289,10 +1289,21 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
   const uri = "registry.fixture.example/guest:fixture";
   for (const scenario of [
     {
+      name: "unobserved-ready",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: undefined,
+      host: "correct",
+      catalogDigest: expectedDigest,
+      error: undefined,
+    },
+    {
       name: "unobserved",
       id: "job-1",
       queuedDigest: undefined,
       readyDigest: expectedDigest,
+      host: "correct",
+      catalogDigest: expectedDigest,
       error: undefined,
     },
     {
@@ -1300,13 +1311,17 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       id: "job-1",
       queuedDigest: undefined,
       readyDigest: wrongDigest,
-      error: "enable_actual_host",
+      host: "correct",
+      catalogDigest: expectedDigest,
+      error: "enable_ready_manifest",
     },
     {
       name: "missing-id",
       id: "",
       queuedDigest: undefined,
       readyDigest: expectedDigest,
+      host: "correct",
+      catalogDigest: expectedDigest,
       error: "enable_manifest",
     },
     {
@@ -1314,7 +1329,36 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       id: "job-1",
       queuedDigest: wrongDigest,
       readyDigest: expectedDigest,
+      host: "correct",
+      catalogDigest: expectedDigest,
       error: "enable_manifest",
+    },
+    {
+      name: "unobserved-ready-wrong-catalog",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: undefined,
+      host: "correct",
+      catalogDigest: wrongDigest,
+      error: "enabled_image_identity",
+    },
+    {
+      name: "wrong-materialization-host",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: expectedDigest,
+      host: "wrong",
+      catalogDigest: expectedDigest,
+      error: "enable_actual_host",
+    },
+    {
+      name: "missing-materialization-host",
+      id: "job-1",
+      queuedDigest: undefined,
+      readyDigest: expectedDigest,
+      host: "missing",
+      catalogDigest: expectedDigest,
+      error: "enable_actual_host",
     },
   ]) {
     const ctx = await context();
@@ -1327,7 +1371,12 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
           id: "job-1",
           state: "ready",
           manifestDigest: scenario.readyDigest,
-          materializeHostId: ctx.hostId,
+          materializeHostId:
+            scenario.host === "correct"
+              ? ctx.hostId
+              : scenario.host === "wrong"
+                ? "00000000-0000-4000-8000-000000000002"
+                : undefined,
         },
       }),
     ];
@@ -1367,7 +1416,7 @@ test("guest enable accepts an unobserved queued digest and verifies the ready im
       }),
       spyOn(admin.images, "listEnabledImages").mockResolvedValue(
         create(ListEnabledImagesResponseSchema, {
-          images: [{ id: "enabled-1", imageUri: uri, manifestDigest: expectedDigest }],
+          images: [{ id: "enabled-1", imageUri: uri, manifestDigest: scenario.catalogDigest }],
         }),
       ),
     ];
