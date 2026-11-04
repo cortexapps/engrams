@@ -45,7 +45,7 @@ test("lost reserve response retains immutable identity and never regenerates or 
     };
     const managed = makeManagedPolicyAuthority({
       control,
-      readTarget: unavailable,
+      readPlacement: unavailable,
       readPublished: unavailable,
     });
     const response = async (phase: string) => {
@@ -166,6 +166,7 @@ for (const missingProof of [false, true])
       let state: ManagedCreationState | undefined, applied: ManagedAppliedState | undefined;
       let finalizeCalls = 0,
         applyCalls = 0;
+      const physicalNetworkIdentity = `sha256:${"8".repeat(64)}`;
       const publication = {
         generation: 1,
         identity: operatorPublication.identity,
@@ -249,7 +250,7 @@ for (const missingProof of [false, true])
                   : {
                       target: targetJson,
                       guest_ip: "192.0.2.6",
-                      network_identity: operatorPublication.networkIdentity,
+                      network_identity: physicalNetworkIdentity,
                     },
               };
               applied = create(ManagedAppliedStateSchema, {
@@ -264,7 +265,7 @@ for (const missingProof of [false, true])
                       networkProof: {
                         target,
                         guestIp: "192.0.2.6",
-                        networkIdentity: operatorPublication.networkIdentity,
+                        networkIdentity: physicalNetworkIdentity,
                       },
                     }),
               });
@@ -292,7 +293,16 @@ for (const missingProof of [false, true])
       const managed = makeManagedPolicyAuthority({
         control,
         readPublished: async () => publication,
-        readTarget: async () => target,
+        readPlacement: async () => {
+          const prepared = state?.boot?.prepared;
+          if (!prepared) throw Error("MCP managed placement unavailable");
+          return {
+            target,
+            networkIdentity: prepared.network_identity,
+            guestIp: prepared.guest_ip,
+            hostIncarnation: prepared.host_incarnation,
+          };
+        },
       });
       const encode = () => ({
         protocol: 1,
@@ -339,7 +349,7 @@ for (const missingProof of [false, true])
               prepared: {
                 request,
                 host_incarnation: "host-incarnation",
-                network_identity: operatorPublication.networkIdentity,
+                network_identity: physicalNetworkIdentity,
                 guest_ip: "192.0.2.6",
                 receipt_id: `sha256:${"a".repeat(64)}`,
               },

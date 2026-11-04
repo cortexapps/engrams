@@ -110,7 +110,7 @@ export async function coldFixture(
       prepared: {
         request,
         host_incarnation: "host-incarnation",
-        network_identity: policies[0]!.publication.networkIdentity,
+        network_identity: `sha256:${"8".repeat(64)}`,
         guest_ip: "192.0.2.7",
         receipt_id: `sha256:${"e".repeat(64)}`,
       },
@@ -176,7 +176,7 @@ export async function coldFixture(
       network_proof: {
         target: state.boot!.request.key.context.target,
         guest_ip: "192.0.2.7",
-        network_identity: policies[0]!.publication.networkIdentity,
+        network_identity: state.boot!.prepared!.network_identity,
       },
     };
     return create(ManagedAppliedStateSchema, {
@@ -188,7 +188,7 @@ export async function coldFixture(
       networkProof: {
         target: target(),
         guestIp: "192.0.2.7",
-        networkIdentity: policies[0]!.publication.networkIdentity,
+        networkIdentity: state.boot!.prepared!.network_identity,
       },
     });
   };
@@ -293,7 +293,16 @@ export async function coldFixture(
   const managed = makeManagedPolicyAuthority({
     control,
     readPublished: async () => publication(),
-    readTarget: async () => target(),
+    readPlacement: async () => {
+      const prepared = state.boot?.prepared;
+      if (!prepared) throw Error("MCP managed placement unavailable");
+      return {
+        target: target(),
+        networkIdentity: prepared.network_identity,
+        guestIp: prepared.guest_ip,
+        hostIncarnation: prepared.host_incarnation,
+      };
+    },
   });
   const makeRuntime = () =>
     makeManagedSessionRuntime({

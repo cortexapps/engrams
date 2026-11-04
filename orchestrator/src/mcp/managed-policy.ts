@@ -122,9 +122,25 @@ export function unionManagedPolicies(policies: readonly ManagedDenyPolicy[]): Ma
   };
   return { ...body, digest: canonicalDigest(body) };
 }
+type ManagedPlacement = {
+  target: ManagedPolicyTarget;
+  networkIdentity: string;
+  guestIp: string;
+  hostIncarnation: string;
+};
+function matchesPlacement(applied: ManagedAppliedState, placement: ManagedPlacement) {
+  const proof = applied.networkProof;
+  return (
+    !!proof?.target &&
+    equals(ManagedPolicyTargetSchema, proof.target, placement.target) &&
+    proof.networkIdentity === placement.networkIdentity &&
+    proof.guestIp === placement.guestIp &&
+    applied.hostIncarnation === placement.hostIncarnation
+  );
+}
 export function makeManagedPolicyAuthority(deps: {
   control: Pick<SessionPolicyControlClient, "readManagedPolicy" | "applyManagedPolicy">;
-  readTarget(sessionId: string): Promise<ManagedPolicyTarget>;
+  readPlacement(sessionId: string): Promise<ManagedPlacement>;
   readPublished(): Promise<PublishedOperator>;
 }) {
   async function read(target: ManagedPolicyTarget) {
@@ -152,7 +168,8 @@ export function makeManagedPolicyAuthority(deps: {
   return {
     read,
     async enforce(expected: ManagedDenyAck, policy: ManagedDenyPolicy): Promise<ManagedDenyAck> {
-      const target = await deps.readTarget(expected.sessionId);
+      const placement = await deps.readPlacement(expected.sessionId),
+        target = placement.target;
       if (
         target.sessionId !== expected.sessionId ||
         number(target.bindingEpoch) !== expected.bindingEpoch
@@ -167,8 +184,7 @@ export function makeManagedPolicyAuthority(deps: {
         applied.context.bindingHash !== expected.bindingHash ||
         applied.context.operatorGeneration !== BigInt(publication.generation) ||
         applied.context.operatorIdentity !== publication.identity ||
-        applied.networkProof?.networkIdentity !==
-          publication.policies[0]?.publication.networkIdentity ||
+        !matchesPlacement(applied, placement) ||
         canonicalJson(managedPolicy(applied.policy)) !== canonicalJson(policy) ||
         !state.retained ||
         canonicalJson(state.retained) !== canonicalJson(policy) ||
@@ -199,14 +215,15 @@ export function makeManagedPolicyAuthority(deps: {
       });
       if (result.protocol !== 1 || !result.applied) throw Error("MCP managed apply unavailable");
       managedAppliedJson(result.applied);
-      const context = result.applied.context!;
+      const context = result.applied.context!,
+        placement = await deps.readPlacement(target.sessionId);
       if (
         !context.target ||
         !equals(ManagedPolicyTargetSchema, context.target, target) ||
         context.bindingHash !== bindingHash ||
         context.phase !== ManagedPolicyPhase.FINAL ||
-        result.applied.networkProof?.networkIdentity !==
-          publication.policies[0]?.publication.networkIdentity ||
+        !equals(ManagedPolicyTargetSchema, placement.target, target) ||
+        !matchesPlacement(result.applied, placement) ||
         context.operatorGeneration !== BigInt(publication.generation) ||
         context.operatorIdentity !== publication.identity ||
         canonicalJson(managedPolicy(result.applied.policy!)) !== canonicalJson(policy)

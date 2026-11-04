@@ -99,22 +99,29 @@ export function makeMcpRuntime(deps: {
   const managed = makeManagedPolicyAuthority({
     control,
     readPublished: reader.read,
-    async readTarget(sessionId) {
+    async readPlacement(sessionId) {
       const { value, result } = await state(sessionId);
-      const key = result.boot?.request.key;
+      const key = result.boot?.request.key,
+        prepared = result.boot?.prepared;
       if (
         !key ||
+        !prepared ||
         result.state === "terminal" ||
         !value.sourceKey ||
         canonicalJson(key) !== canonicalJson(value.sourceKey)
       )
         throw Error("MCP managed placement unavailable");
-      return create(ManagedPolicyTargetSchema, {
-        sessionId,
-        sandboxId: key.context.target.sandbox_id,
-        hostId: key.context.target.host_id,
-        bindingEpoch: BigInt(key.context.target.binding_epoch),
-      });
+      return {
+        target: create(ManagedPolicyTargetSchema, {
+          sessionId,
+          sandboxId: key.context.target.sandbox_id,
+          hostId: key.context.target.host_id,
+          bindingEpoch: BigInt(key.context.target.binding_epoch),
+        }),
+        networkIdentity: prepared.network_identity,
+        guestIp: prepared.guest_ip,
+        hostIncarnation: prepared.host_incarnation,
+      };
     },
   });
   const policy = makeSessionWritePolicy(control);
