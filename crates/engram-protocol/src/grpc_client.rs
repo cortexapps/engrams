@@ -120,13 +120,20 @@ fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
     }
 }
 
-fn restore_rpc_timeout() -> Duration {
+/// Shared budget for restore and managed lifecycle calls.
+pub fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(240);
     Duration::from_secs(secs)
+}
+
+fn managed_request<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.set_timeout(restore_rpc_timeout());
+    request
 }
 
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
@@ -1697,7 +1704,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .read_managed_cold_assets(crate::grpc::ReadManagedColdAssetsRequest { payload_json })
+            .read_managed_cold_assets(managed_request(crate::grpc::ReadManagedColdAssetsRequest {
+                payload_json,
+            }))
             .await
             .map_err(|status| {
                 // An older host can share the wire version but lack this RPC.
@@ -1723,7 +1732,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .capture_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .capture_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1737,7 +1748,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .prepare_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .prepare_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1751,7 +1764,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .read_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .read_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1765,7 +1780,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .finalize_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .finalize_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1779,7 +1796,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .start_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .start_managed_boot(managed_request(crate::grpc::ManagedBootRequest {
+                payload_json,
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1792,9 +1811,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .read_managed_policy(crate::grpc::ReadManagedPolicyRequest {
+            .read_managed_policy(managed_request(crate::grpc::ReadManagedPolicyRequest {
                 target_bincode: encode_bincode(&target, "managed target")?,
-            })
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1808,9 +1827,9 @@ impl HostClient for GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .apply_managed_policy(crate::grpc::ApplyManagedPolicyRequest {
+            .apply_managed_policy(managed_request(crate::grpc::ApplyManagedPolicyRequest {
                 request_bincode: encode_bincode(&request, "managed apply")?,
-            })
+            }))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -2044,6 +2063,18 @@ mod grpc_err_tests {
             assert_eq!(
                 request.headers()[crate::wire::WIRE_VERSION_METADATA_KEY],
                 crate::WIRE_VERSION.to_string()
+            );
+            let mut deadline = tonic::Request::new(());
+            deadline.set_timeout(restore_rpc_timeout());
+            assert_eq!(
+                request
+                    .headers()
+                    .get("grpc-timeout")
+                    .map(|v| v.to_str().unwrap()),
+                deadline
+                    .metadata()
+                    .get("grpc-timeout")
+                    .map(|v| v.to_str().unwrap())
             );
             let status = match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                 0 => tonic::Status::unimplemented("cold asset inspection unavailable"),

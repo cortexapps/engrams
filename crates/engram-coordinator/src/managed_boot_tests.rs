@@ -12,10 +12,13 @@ use engram_core::{
 };
 use engram_sim::{ManualClock, MemBlobStorage, SimEntropy, SimMetadataStore};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 struct LossyHost {
+    prepare_stall: Mutex<Option<SessionId>>,
+    start_stall: AtomicBool,
+    read_stall: AtomicBool,
     chunks: engram_chunk_store::ChunkStore,
     captures: AtomicUsize,
     state: Mutex<Option<ManagedBootHostState>>,
@@ -99,6 +102,9 @@ impl HostClient for LossyHost {
         &self,
         request: ManagedBootPrepare,
     ) -> Result<ManagedBootPreparedReceipt, SandboxError> {
+        if *self.prepare_stall.lock().unwrap() == Some(request.key.creation.session_id) {
+            return std::future::pending().await;
+        }
         if let Some(ManagedBootHostState::Prepared { receipt }) =
             self.state.lock().unwrap().as_ref()
         {
@@ -173,12 +179,18 @@ impl HostClient for LossyHost {
     ) -> Result<ManagedBootHostState, SandboxError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         *self.state.lock().unwrap() = Some(ManagedBootHostState::Started { intent: start });
+        if self.start_stall.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
         Err(SandboxError::Unavailable("reply lost after spawn".into()))
     }
     async fn read_managed_boot(
         &self,
         _: ManagedBootKey,
     ) -> Result<ManagedBootHostState, SandboxError> {
+        if self.read_stall.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
         self.state
             .lock()
             .unwrap()
@@ -467,6 +479,9 @@ async fn fixture() -> (
         .unwrap();
     let blob = Arc::new(MemBlobStorage::new());
     let host = Arc::new(LossyHost {
+        prepare_stall: Mutex::new(None),
+        start_stall: AtomicBool::new(false),
+        read_stall: AtomicBool::new(false),
         chunks: engram_chunk_store::ChunkStore::new(blob.clone()),
         captures: AtomicUsize::new(0),
         state: Mutex::new(Some(ManagedBootHostState::Finalized {
@@ -1744,4 +1759,118 @@ impl engram_core::traits::BlobStorage for LostManifestReply {
     ) -> Result<engram_core::traits::ListPage, engram_core::BlobError> {
         self.inner.list_prefix_page(prefix, cursor, limit).await
     }
+}
+
+const RPC_TEST_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+const SCAN_TEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[tokio::test]
+async fn managed_boot_prepare_deadline_allows_next_row_without_replacing_attempt() {
+    let (state, meta, host, row) = fixture().await;
+    let key = &row.request.key;
+    let first = ManagedBootRecord::claimed(row.request.clone());
+    let mut second_request = row.request.clone();
+    let second_sid = SessionId::from(uuid::Uuid::from_u128(800));
+    let second_sandbox = SandboxId::from(uuid::Uuid::from_u128(801));
+    second_request.key.creation.session_id = second_sid;
+    second_request.key.context.target.session_id = second_sid;
+    second_request.key.context.target.sandbox_id = second_sandbox;
+    second_request.key.boot_attempt = "boot-two".into();
+    second_request.cold.session_id = second_sid;
+    second_request.cold.sandbox_id = second_sandbox;
+    second_request.cold.boot_attempt = second_request.key.boot_attempt.clone();
+    let second_key = second_request.key.clone();
+    meta.with_db_mut(|db| {
+        let mut session = db.sessions[&key.creation.session_id].clone();
+        session.session.id = second_sid;
+        session.session.sandbox_id = Some(second_sandbox);
+        let mut creation = db.managed_creations[&key.creation.session_id].clone();
+        creation.identity = second_request.key.creation.clone();
+        db.managed_creations.insert(second_sid, creation);
+        db.sessions.insert(second_sid, session);
+        db.managed_boots
+            .insert(key.creation.session_id, first.clone());
+        db.managed_boots.insert(
+            second_sid,
+            ManagedBootRecord::claimed(second_request.clone()),
+        );
+    });
+    *host.prepare_stall.lock().unwrap() = Some(key.creation.session_id);
+    let mut prepared = host.prepared.clone();
+    prepared.request = second_request;
+    *host.state.lock().unwrap() = Some(ManagedBootHostState::Prepared {
+        receipt: Box::new(prepared),
+    });
+    for _ in 0..2 {
+        tokio::time::timeout(
+            SCAN_TEST_LIMIT,
+            run_once_with_timeout(&state, RPC_TEST_BUDGET),
+        )
+        .await
+        .expect("one host must not block the next row")
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(meta.read_managed_boot(key).await.unwrap()).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert_eq!(
+            meta.read_managed_boot(&second_key).await.unwrap().phase,
+            ManagedBootPhase::Prepared
+        );
+    }
+    assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+    assert!(gate(&state, key.creation.session_id, true).await.is_err());
+}
+
+#[tokio::test]
+async fn managed_boot_start_deadline_reconciles_without_another_start() {
+    let (state, meta, host, row) = fixture().await;
+    let key = &row.request.key;
+    host.start_stall.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        SCAN_TEST_LIMIT,
+        drive_with_timeout(&state, key, RPC_TEST_BUDGET),
+    )
+    .await
+    .expect("start reply must have a deadline")
+    .unwrap_err();
+    assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+    let issued = meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(issued.phase, ManagedBootPhase::StartIssued);
+    assert_eq!(issued.request, row.request);
+    assert!(gate(&state, key.creation.session_id, true).await.is_err());
+    drive_with_timeout(&state, key, RPC_TEST_BUDGET)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.read_managed_boot(key).await.unwrap().phase,
+        ManagedBootPhase::Started
+    );
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+    gate(&state, key.creation.session_id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_boot_started_read_deadline_interrupts_without_releasing_owner() {
+    let (state, meta, host, row) = fixture().await;
+    let key = &row.request.key;
+    assert!(drive(&state, key).await.is_err());
+    drive(&state, key).await.unwrap();
+    host.read_stall.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        SCAN_TEST_LIMIT,
+        drive_with_timeout(&state, key, RPC_TEST_BUDGET),
+    )
+    .await
+    .expect("started read must have a deadline")
+    .unwrap_err();
+    assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+    let interrupted = meta.read_managed_boot(key).await.unwrap();
+    assert_eq!(interrupted.phase, ManagedBootPhase::Interrupted);
+    assert_eq!(interrupted.request, row.request);
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+    let session = meta.get_session(key.creation.session_id).await.unwrap();
+    assert_eq!(session.host_id, Some(key.context.target.host_id));
+    assert_eq!(session.sandbox_id, Some(key.context.target.sandbox_id));
+    assert!(gate(&state, key.creation.session_id, true).await.is_err());
 }

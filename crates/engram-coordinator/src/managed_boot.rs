@@ -2,8 +2,21 @@
 use crate::{error::ApiError, state::SharedState};
 use engram_core::{
     types::{managed_boot::*, managed_create::digest, mcp_policy::WriteEligibility},
-    SessionId,
+    SandboxError, SessionId,
 };
+use engram_protocol::grpc_client::restore_rpc_timeout;
+use std::{future::Future, time::Duration};
+
+// Expiry leaves the host outcome unknown. Detached commands can still complete;
+// the durable phase decides whether to retry the same command or only read it.
+pub(crate) async fn host_rpc<T>(
+    budget: Duration,
+    call: impl Future<Output = Result<T, SandboxError>>,
+) -> Result<T, SandboxError> {
+    tokio::time::timeout(budget, call).await.map_err(|_| {
+        SandboxError::Unavailable("managed host request deadline exceeded; outcome unknown".into())
+    })?
+}
 
 pub(crate) async fn gate(
     state: &SharedState,
@@ -48,11 +61,14 @@ pub(crate) async fn finalize(
     if old.phase != ManagedBootPhase::Prepared || prepared.receipt_id != input.prepared_receipt_id {
         return Err(conflict().into());
     }
-    let applied = state
-        .services
-        .host
-        .read_managed_policy(input.key.context.target.clone())
-        .await?;
+    let applied = host_rpc(
+        restore_rpc_timeout(),
+        state
+            .services
+            .host
+            .read_managed_policy(input.key.context.target.clone()),
+    )
+    .await?;
     if applied.as_ref() != Some(&input.policy) {
         return Err(conflict().into());
     }
@@ -190,6 +206,14 @@ async fn open_finalize(
 
 /// Each call performs at most one phase. A failed host response leaves authority closed.
 pub async fn drive(state: &SharedState, key: &ManagedBootKey) -> Result<(), ApiError> {
+    drive_with_timeout(state, key, restore_rpc_timeout()).await
+}
+
+async fn drive_with_timeout(
+    state: &SharedState,
+    key: &ManagedBootKey,
+    rpc_timeout: Duration,
+) -> Result<(), ApiError> {
     let row = state.services.meta.read_managed_boot(key).await?;
     if matches!(
         row.phase,
@@ -197,8 +221,11 @@ pub async fn drive(state: &SharedState, key: &ManagedBootKey) -> Result<(), ApiE
     ) {
         // Final policy installation can retire a prepared owner. Preserve its
         // exact nonrunning proof even when no finalization/start reply succeeds.
-        if let ManagedBootHostState::Retired { receipt } =
-            state.services.host.read_managed_boot(key.clone()).await?
+        if let ManagedBootHostState::Retired { receipt } = host_rpc(
+            rpc_timeout,
+            state.services.host.read_managed_boot(key.clone()),
+        )
+        .await?
         {
             state
                 .services
@@ -210,11 +237,14 @@ pub async fn drive(state: &SharedState, key: &ManagedBootKey) -> Result<(), ApiE
     }
     match row.phase {
         ManagedBootPhase::Claimed => {
-            let receipt = state
-                .services
-                .host
-                .prepare_managed_boot(row.request.clone())
-                .await?;
+            let receipt = host_rpc(
+                rpc_timeout,
+                state
+                    .services
+                    .host
+                    .prepare_managed_boot(row.request.clone()),
+            )
+            .await?;
             state
                 .services
                 .meta
@@ -227,7 +257,11 @@ pub async fn drive(state: &SharedState, key: &ManagedBootKey) -> Result<(), ApiE
         }
         ManagedBootPhase::Finalizing => {
             let command = open_finalize(state, &row).await?;
-            let receipt = state.services.host.finalize_managed_boot(command).await?;
+            let receipt = host_rpc(
+                rpc_timeout,
+                state.services.host.finalize_managed_boot(command),
+            )
+            .await?;
             state
                 .services
                 .meta
@@ -251,15 +285,25 @@ pub async fn drive(state: &SharedState, key: &ManagedBootKey) -> Result<(), ApiE
                 .await?;
             // Only this successful CAS holder can issue start. Failure or lost reply
             // is resolved by the read branch, never by another start command.
-            let observed = state.services.host.start_managed_boot(start).await?;
+            let observed =
+                host_rpc(rpc_timeout, state.services.host.start_managed_boot(start)).await?;
             confirm_started(state, &issued, observed).await?;
         }
         ManagedBootPhase::StartIssued => {
-            let observed = state.services.host.read_managed_boot(key.clone()).await?;
+            let observed = host_rpc(
+                rpc_timeout,
+                state.services.host.read_managed_boot(key.clone()),
+            )
+            .await?;
             confirm_started(state, &row, observed).await?;
         }
         ManagedBootPhase::Started => {
-            let observed = match state.services.host.read_managed_boot(key.clone()).await {
+            let observed = match host_rpc(
+                rpc_timeout,
+                state.services.host.read_managed_boot(key.clone()),
+            )
+            .await
+            {
                 Ok(observed) => observed,
                 Err(error) => {
                     state
@@ -335,6 +379,10 @@ async fn confirm_started(
     }
 }
 pub async fn run_once(state: &SharedState) -> Result<(), ApiError> {
+    run_once_with_timeout(state, restore_rpc_timeout()).await
+}
+
+async fn run_once_with_timeout(state: &SharedState, rpc_timeout: Duration) -> Result<(), ApiError> {
     crate::managed_bridge::run_once(state).await?;
     let mut after = None;
     loop {
@@ -344,7 +392,7 @@ pub async fn run_once(state: &SharedState) -> Result<(), ApiError> {
         }
         for key in keys {
             after = Some(key.creation.session_id);
-            if let Err(error) = drive(state, &key).await {
+            if let Err(error) = drive_with_timeout(state, &key, rpc_timeout).await {
                 tracing::debug!(session_id=%key.creation.session_id,error=%error,"managed boot remains closed");
             }
         }
@@ -395,11 +443,11 @@ pub async fn capture(
     {
         return Ok(authority);
     }
-    let authority = state
-        .services
-        .host
-        .capture_managed_boot(request.clone())
-        .await?;
+    let authority = host_rpc(
+        restore_rpc_timeout(),
+        state.services.host.capture_managed_boot(request.clone()),
+    )
+    .await?;
     if authority.request != request {
         return Err(conflict().into());
     }

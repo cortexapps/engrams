@@ -239,11 +239,14 @@ pub(crate) async fn drive(state: &SharedState, i: ManagedBootIntent) -> Result<(
     }
     if i.assets.is_none() {
         let request = i.assets_request()?;
-        let assets = state
-            .services
-            .host
-            .read_managed_cold_assets(request.clone())
-            .await?;
+        let assets = crate::managed_boot::host_rpc(
+            engram_protocol::grpc_client::restore_rpc_timeout(),
+            state
+                .services
+                .host
+                .read_managed_cold_assets(request.clone()),
+        )
+        .await?;
         assets.validate_for(&request)?;
         let h = meta.get_host(request.host_id).await?.ok_or_else(conflict)?;
         let backend = match assets.backend {
