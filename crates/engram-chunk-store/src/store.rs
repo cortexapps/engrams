@@ -117,7 +117,7 @@ impl ChunkStore {
     /// write-through tier: `put_chunk` will populate it after the durable
     /// blob write, so the producing host serves the chunk locally on the
     /// next read/resume. The host-agent passes the same cache its UFFD
-    /// handler + disk daemon read from; the coordinator omits it. Cheap
+    /// handler + disk stage read from; the coordinator omits it. Cheap
     /// clone (the cache is `Arc`-backed).
     pub fn with_chunk_cache(mut self, cache: crate::cache::ChunkCache) -> Self {
         self.cache = Some(cache);
@@ -200,8 +200,8 @@ impl ChunkStore {
 
     /// PUT a chunk WITHOUT the `exists()` dedup HEAD (ADR 0078 move 5).
     ///
-    /// For the flush paths — the NBD disk flush and the teleport memory
-    /// catch-up — whose input is freshly re-chunked dirty data that is
+    /// For the sparse dirty-range re-chunk, whose input is freshly
+    /// re-chunked dirty data that is
     /// **new by construction** (a content boundary shifted, so the hash
     /// changed). The HEAD there is pure waste: O(dirty) GCS round-trips
     /// per flush that always miss. Content-addressed PUTs are idempotent,

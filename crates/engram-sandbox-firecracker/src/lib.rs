@@ -2550,7 +2550,7 @@ impl FirecrackerBackend {
             .await?;
         }
 
-        // The disk daemon owns swap. Its canonical path is recorded in state.bin.
+        // Swap is a host volume. Its canonical path is recorded in state.bin.
         let has_swap = spec.swap_mib.is_some_and(|m| m > 0);
         if has_swap {
             let source = spec
@@ -5070,11 +5070,8 @@ impl SandboxBackend for FirecrackerBackend {
         path.exists().then_some(path)
     }
 
-    /// ADR 0044 K2: the rootfs `path_on_host` this sandbox's FC has
-    /// open — `/dev/nbdN` for a chunked rootfs. Survivor rehydrate
-    /// uses it to RECONFIGURE the same device instead of attaching a
-    /// fresh slot. Filtered to block-device paths so a file-backed
-    /// rootfs answers `None`.
+    /// The rootfs `path_on_host` this sandbox's FC has open, when it
+    /// is a block device. A file-backed rootfs answers `None`.
     fn rootfs_device(&self, id: SandboxId) -> Option<PathBuf> {
         let live = self.sandboxes.get(&id)?;
         let path = live.state.spec.rootfs_source.clone()?;
@@ -5120,8 +5117,8 @@ impl SandboxBackend for FirecrackerBackend {
     /// ADR 0018 commit 12m: pause the VM via FC's PATCH /vm
     /// {state: Paused}. Idempotent on FC's side — re-pausing a
     /// paused VM is a no-op success. Callers (PooledBackend) use
-    /// this to quiesce the guest before flushing the NBD-backed
-    /// disk, so memory + disk capture see the same point-in-time.
+    /// this to quiesce the guest before the disk checkpoint, so
+    /// memory + disk capture see the same point-in-time.
     async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
         let socket = self
             .sandboxes
@@ -5989,9 +5986,7 @@ impl SandboxBackend for FirecrackerBackend {
                 live.agent_ready.death_note.clone(),
             )
         };
-        // Generous deadline (180 s): the dev-vm's fake-gcs path can
-        // stretch chunked-NBD page-ins to ~2-3 min on a cold cache;
-        // prod is ~15-20 s. Failure means agentd never came up.
+        // Generous deadline (180 s). Failure means agentd never came up.
         let wait_deadline = Duration::from_secs(180);
         if !*agent_ready.borrow() {
             tracing::Instrument::instrument(
@@ -6048,8 +6043,8 @@ impl SandboxBackend for FirecrackerBackend {
         // immediately on those paths.
         let phase_start = std::time::Instant::now();
         // Step 1: wait for agentd's startup dial (ADR 0019: the dominant
-        // cold-boot phase — guest kernel boot + ext4 mount + chunked-NBD
-        // page-in + ready-port dial). Shared with the base-snapshot
+        // cold-boot phase — guest kernel boot + ext4 mount + ready-port
+        // dial). Shared with the base-snapshot
         // capture via `wait_agent_ready`.
         self.wait_agent_ready(id).await?;
         let t_ready = phase_start.elapsed().as_millis() as u64;
@@ -6645,9 +6640,9 @@ impl FirecrackerBackend {
         /// same reason `engram_sandbox_boot_seconds` is one: the registry
         /// crate depends on this one, not the other way round.
         const GUEST_CLOCK_STEP_SECONDS: &str = "engram_guest_clock_step_seconds";
-        /// Total budget. A guest still paging in over NBD can be slow to
-        /// accept; a wedged one must not hold up the handshake, which has
-        /// its own (much larger) retry ladder to spend.
+        /// Total budget. A guest still faulting in its memory after a
+        /// restore can be slow to accept; a wedged one must not hold up
+        /// the handshake, which has its own (much larger) retry ladder.
         const CLOCK_PUSH_BUDGET: Duration = Duration::from_secs(5);
         /// Attempts inside the budget. `connect_fc_vsock` can hit the FC
         /// vsock-muxer settle race right after `load_snapshot` (see
@@ -7056,9 +7051,8 @@ impl FirecrackerBackend {
             size_bytes,
             created_at,
             image_version: spec.image,
-            // FC snapshots capture VM state + memory only; disk state
-            // lives on the per-sandbox rootfs file. Phase 4's NBD work
-            // produces a disk_manifest here when it lands.
+            // FC snapshots capture VM state + memory only. The disk
+            // checkpoint in `PooledBackend` fills `disk_manifest`.
             swap_manifest: None,
             disk_manifest: None,
             // FC backend's bare snapshot writes memory.bin to disk

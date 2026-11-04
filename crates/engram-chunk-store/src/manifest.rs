@@ -41,8 +41,8 @@ pub const DEFAULT_MEMORY_CHUNK_SIZE: u64 = 512 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ManifestKind {
-    /// A virtual block device. Consumed by NBD daemon (Linux+FC) or
-    /// materialize-to-file (macOS+VZ).
+    /// A virtual block device. Staged into a session-disk volume
+    /// (thin volume on Linux+FC, sparse file on macOS+VZ).
     Disk,
     /// A virtual memory image. Consumed by the UFFD handler
     /// (Linux+FC). Combined with a canonical-base manifest for the
@@ -435,9 +435,8 @@ impl Manifest {
         // ADR 0099 H6 (site 2): the contract is "offset must be exactly
         // aligned to chunk_size" — a misaligned query silently returns
         // None (reads as zero-fill), masking a caller's index arithmetic
-        // bug as a hole in the image. debug_assert-tier: this is on the
-        // hot NBD fault path, so it fires under tests + the simulator and
-        // compiles out in prod. `validate()` guards the manifest's own
+        // bug as a hole in the image. debug_assert-tier: fires under
+        // tests + the simulator and compiles out in prod. `validate()` guards the manifest's own
         // entries, not the query offset, so this is not redundant.
         let sz = self.chunk_size.as_u64();
         debug_assert!(

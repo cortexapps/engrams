@@ -8,8 +8,8 @@
 //! ADR 0021 P1.4: the harness binary lives in the rootfs at the
 //! manifest-declared `[harness] exec` path (built-in templates plant
 //! it at `/opt/engram/harness/harness`; custom templates wherever the
-//! author COPY'd it). There's no drive mount, no NBD page-in on the
-//! spawn hot path; the supervisor just exec's argv. The egress-proxy
+//! author COPY'd it). There's no drive mount on the spawn hot path;
+//! the supervisor just exec's argv. The egress-proxy
 //! CA reaches the child via env vars pointing at the canonical
 //! [`crate::cacerts`] install paths — 2026-07 core-ops fold: the
 //! handler installs the CA (carried on this same `SpawnHarness`
@@ -208,8 +208,8 @@ impl HarnessSupervisor {
 
         // ADR 0021 P1.4: the harness binary is baked into the rootfs
         // at /opt/engram/harness/ (per the [harness] block in the
-        // image manifest). No drive mount, no NBD page-in on the
-        // spawn path; just exec the argv the host computed from the
+        // image manifest). No drive mount on the spawn path; just
+        // exec the argv the host computed from the
         // manifest's resolved `exec` + `args`.
         let mut cmd = Command::new(&argv0);
         cmd.args(&req.argv[1..]);

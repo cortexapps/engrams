@@ -2,7 +2,7 @@
 //!
 //! A host can run several independent bulk-upload workloads at once —
 //! the materialize ext4 chunking (64-wide), the capture memory-seed
-//! chunking (32-wide), the NBD disk flush (32-wide) — each bounded on
+//! chunking (32-wide), the disk checkpoint (64-wide) — each bounded on
 //! its own but with NO shared cap, so concurrent workloads stacked up
 //! to ~100+ in-flight GCS PUTs against one NIC (the 2026-07-13
 //! dev-brain enable's 40 s → 11.5 min memory-seed blowup). One FIFO
@@ -31,9 +31,8 @@ const PERMITS_ENV: &str = "ENGRAM_UPLOAD_BUDGET_PERMITS";
 
 /// Default nested cap on BACKGROUND-class PUTs (ADR 0116 C3). Sized
 /// well under the global cap so a background workload can never own
-/// the whole wire: the 2026-08-12 storm was one checkpoint re-chunk
-/// holding all 96 permits at 100-300 PUTs/s while a live NBD serve
-/// loop starved into the kernel's 90 s send timeout.
+/// the whole wire and starve the foreground uploads a live session
+/// waits on.
 const DEFAULT_BACKGROUND_PERMITS: usize = 24;
 
 /// Env override for the background cap (`0`/unparseable ⇒ default).
@@ -41,8 +40,8 @@ const BACKGROUND_PERMITS_ENV: &str = "ENGRAM_UPLOAD_BUDGET_BACKGROUND_PERMITS";
 
 /// ADR 0116 C3: which arbitration class a chunk PUT belongs to.
 ///
-/// `Foreground` = work a live session is waiting on right now: the NBD
-/// dirty-tier flush, eviction capture, the shutdown-spool export.
+/// `Foreground` = work a live session is waiting on right now: eviction
+/// capture, the shutdown-spool export.
 /// `Background` = bulk work nobody is blocked on: the periodic
 /// checkpoint re-chunk, materialize/enable chunking, base capture,
 /// peer fill. Background draws from a nested cap AND the global cap,
@@ -129,10 +128,8 @@ impl UploadBudget {
     /// so budget contention is visible, and the returned guard carries
     /// the per-class in-flight gauge (ADR 0116 C1/C3; `sum()` over the
     /// `class` label is the pre-C3 unlabeled series): a sustained
-    /// `background` gauge at its cap alongside idle `foreground` is the
-    /// storm ARBITRATED — the 2026-08-12 signature (a checkpoint
-    /// re-chunk holding all 96 while a live NBD serve loop starved)
-    /// can no longer form.
+    /// `background` gauge at its cap alongside idle `foreground` is a
+    /// bulk storm held to its nested cap.
     pub async fn acquire(&self, class: UploadClass) -> UploadPermit {
         let started = crate::time_source::metrics_now();
         let nested = match class {

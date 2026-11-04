@@ -81,15 +81,15 @@ fn main() -> ExitCode {
 
     // Root span parented on the host's cold-boot trace (if propagated via
     // `engram_traceparent`). Its start offset in the trace reveals how long
-    // the guest spent in kernel boot + ext4 mount + chunked-NBD page-in
-    // before agentd ran — the bulk of the `agent_handshake` wait (ADR 0019).
+    // the guest spent in kernel boot + ext4 mount before agentd ran — the
+    // bulk of the `agent_handshake` wait (ADR 0019).
     let span = tracing::info_span!("agentd.run", boot_elapsed_s = tracing::field::Empty);
     if let Some(tp) = kernel_cmdline_value("engram_traceparent") {
         engram_telemetry::set_parent_from_traceparent(&span, &tp);
     }
     // Record the pre-agentd boot duration on the span (and log it), so the
     // cold-boot trace separates "guest booting before agentd ran" (kernel +
-    // ext4 mount + page-in) from agentd's own startup. The shim's
+    // ext4 mount) from agentd's own startup. The shim's
     // `engram-init: mark` console lines split this further (firecracker.log).
     if let Some(secs) = boot_uptime_secs() {
         span.record("boot_elapsed_s", secs);
@@ -317,7 +317,7 @@ fn unblock_console_stdout() {}
 
 /// Seconds since kernel boot (`/proc/uptime` field 1), Linux only. At
 /// agentd's start this is ≈ the whole pre-agentd cold-boot window (kernel
-/// boot + rootfs ext4 mount + chunked-NBD page-in + engram-init), which the
+/// boot + rootfs ext4 mount + engram-init), which the
 /// host can't observe from outside the VM (ADR 0019).
 fn boot_uptime_secs() -> Option<f64> {
     if !cfg!(target_os = "linux") {
@@ -334,7 +334,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // PTP device. Must run inside the runtime — it spawns the tick loop.
     engram_agentd::clock::init();
 
-    // Readahead tuning for the chunked-NBD virtio disks (see `tuning`).
+    // Readahead tuning for the virtio disks (see `tuning`).
     // Runs before the harness so the base-snapshot capture freezes the
     // setting into every restored session.
     engram_agentd::tuning::apply_block_readahead();
@@ -459,15 +459,14 @@ async fn run_transport(
     // been GC'd. Log loudly; don't die.
     let agent_version = env!("CARGO_PKG_VERSION").to_string();
     // ADR 0020: retry the ready dial instead of giving up after one attempt.
-    // On a cold boot whose rootfs is a slow-backed drive (chunked-NBD), FC runs
-    // all virtio devices — including vsock — on a single device thread, and with
-    // the default Sync block io_engine that thread blocks in `read()` during the
-    // rootfs page-in storm. While it's blocked it can't service the vsock queue,
-    // so a guest→host connect can sit unanswered past the kernel's ~9s vsock
-    // connect timeout. Retrying waits out the slow-read window: once the device
-    // thread drains (the guest's own pages are in), a re-dial connects and the
-    // frame lands. The host's `wait_agent_ready` (180s) + its now-looping ready
-    // listener cover this window. On a fast boot the first dial succeeds, so this
+    // FC runs all virtio devices — including vsock — on a single device thread,
+    // and with the default Sync block io_engine that thread blocks in `read()`
+    // while a rootfs read is slow. While it's blocked it can't service the vsock
+    // queue, so a guest→host connect can sit unanswered past the kernel's ~9s
+    // vsock connect timeout. Retrying waits out the slow-read window: once the
+    // device thread drains, a re-dial connects and the frame lands. The host's
+    // `wait_agent_ready` (180s) + its now-looping ready listener cover this
+    // window. On a fast boot the first dial succeeds, so this
     // costs nothing; restored sandboxes don't re-run this path at all (the host
     // pre-sets agent_ready), so the restore tail is untouched.
     //

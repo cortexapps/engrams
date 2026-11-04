@@ -47,7 +47,7 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
 /// How many serial restore-destroy cycles to exercise. 3 is the
 /// smallest N that catches "first restore works but second fails"
-/// (state-bin path collisions, leaked TAP, leaked NBD slot, etc.).
+/// (state-bin path collisions, leaked TAP, etc.).
 const N: usize = 3;
 
 #[tokio::test]
@@ -101,7 +101,7 @@ async fn serial_restore_from_one_canonical_n_times() {
     // warm-pool-refill semantic: each iteration is what happens
     // when a leased slot gets consumed and the refill loop
     // produces a fresh one. We assert each cycle is independent
-    // — distinct restored SandboxIds, no leaked TAP / NBD / vsock
+    // — distinct restored SandboxIds, no leaked TAP / vsock
     // / firecracker child state across iterations.
     //
     // The test deliberately stops at "restore + verify list +
@@ -256,12 +256,12 @@ const OVERLAP_N: usize = 4;
 /// base — restore futures all IN FLIGHT AT ONCE, not awaited one-by-one like
 /// the serial siblings above. Every descendant shares the base's
 /// `source_rootfs_canonical` (FC's state.bin-embedded rootfs path; unlike
-/// vsock there's no load-time override to re-key it), so before the
-/// per-source-path serialization their `install_symlink` → `load_snapshot`
-/// windows raced: a TOCTOU `EEXIST` (the prod "…/<sb>.dev -> /dev/nbdN: File
-/// exists (os error 17)" 503) and, worse, one VM could repoint the shared path
-/// between a sibling's install and its load → FC opens the wrong device. All N
-/// concurrent restores must now succeed and coexist.
+/// vsock there's no load-time override to re-key it). Per-source-path
+/// serialization of their `install_symlink` → `load_snapshot` windows prevents
+/// a TOCTOU `EEXIST` ("…/<sb>.dev: File exists (os error 17)") and a VM
+/// repointing the shared path between a sibling's install and its load (FC
+/// would open the wrong device). All N concurrent restores must succeed and
+/// coexist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
 async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {

@@ -610,7 +610,7 @@ async fn main() -> Result<(), HostAgentError> {
     // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
     // base-snapshot residency). `blob` was created above the backend
     // match so the inner VZ backend could share it; reuse it here. Wire the
-    // SAME local cache the UFFD handler + disk daemon read from
+    // SAME local cache the UFFD handler + disk stage read from
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
     // served locally on the next resume instead of re-fetched from GCS.

@@ -107,7 +107,7 @@ pub struct SandboxSpec {
     /// stay in lockstep (an empty `Vec` still encodes as length 0).
     #[serde(default)]
     pub aux_ro_drives: Vec<AuxRoDrive>,
-    /// Guest swap capacity in MiB. The host serves this disk through NBD.
+    /// Guest swap capacity in MiB. The host backs this disk with a volume.
     /// The snapshot carries its contents together with guest memory.
     #[serde(default)]
     pub swap_mib: Option<u32>,

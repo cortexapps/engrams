@@ -70,7 +70,7 @@ impl GcsBlobStorage {
         // - bounded connect: a blackholed endpoint fails in 5 s and
         //   surfaces to the BlobClient retry layer, instead of pinning
         //   an attempt for the OS default (minutes).
-        // - sized keep-alive pool: the sparse re-chunk and NBD flush
+        // - sized keep-alive pool: the sparse re-chunk and disk checkpoint
         //   fan out dozens of concurrent chunk ops; idle-connection
         //   reuse keeps those off the TLS-handshake path — and keeps
         //   DNS off the hot path entirely, which is why hickory async
@@ -184,7 +184,7 @@ impl BlobStorage for GcsBlobStorage {
     /// refcounted (zero-copy) and carries Content-Length, which is
     /// both cheaper per request and what GCS's simple-upload path
     /// prefers. This is the chunk-upload hot path (sparse re-chunk,
-    /// NBD flush).
+    /// disk checkpoint).
     async fn put(&self, key: &str, body: bytes::Bytes) -> Result<u64, BlobError> {
         let len = body.len() as u64;
         let req = UploadObjectRequest {

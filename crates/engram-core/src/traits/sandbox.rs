@@ -400,9 +400,10 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C2: the blackout half. Pause → NBD fsync + dirty-tail
-    /// drain → vmstate-only snapshot (fork v3) → pagemap scan → seal
-    /// the page server's export (the parked dest handler unblocks).
+    /// ADR 0045 C2: the blackout half. Pause → disk seal (a volume
+    /// checkpoint and the chunks changed since presetup) → vmstate-only
+    /// snapshot (fork v3) → pagemap scan → seal the page server's export
+    /// (the parked dest handler unblocks).
     /// The guest stays paused serving pages until commit (post-drain)
     /// or abort; `state.bin` becomes fetchable via `migration_fetch`.
     async fn migration_capture_postcopy(
@@ -866,14 +867,9 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// ADR 0044 K2 survivor rehydrate: the host block device this
-    /// sandbox's rootfs drive reads (e.g. `/dev/nbd4` for a
-    /// chunked-NBD rootfs). After a host-agent restart the new
-    /// generation must re-serve EXACTLY this device — the surviving
-    /// FC holds an open fd to it, so attaching a fresh slot would
-    /// serve a device nobody reads. `None` for sandboxes whose
-    /// rootfs isn't a block device (file-backed, or backend doesn't
-    /// track it).
+    /// The host block device this sandbox's rootfs drive reads. `None`
+    /// for sandboxes whose rootfs isn't a block device (file-backed, or
+    /// backend doesn't track it).
     fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }

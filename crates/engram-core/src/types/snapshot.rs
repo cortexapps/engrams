@@ -267,9 +267,9 @@ pub struct MigrationPresetupOut {
     /// chunks override via the peer at fault/drain time).
     pub memory_manifest_json: Vec<u8>,
     pub memory_manifest_ref: super::manifest::ManifestRef,
-    /// The disk manifest the dest NBD-attaches at prepare (the live
-    /// published view; the post-pause drain's final manifest arrives
-    /// with the capture and the dest REBASES before FC load).
+    /// The disk lineage the dest stages at prepare. The capture seals
+    /// the chunks changed since it; the dest writes them into its
+    /// volume before it loads the VM state.
     pub disk_manifest_ref: Option<super::manifest::ManifestRef>,
     /// Swap base lineage; sealed changes arrive before the VM state.
     pub swap_manifest_ref: Option<super::manifest::ManifestRef>,
@@ -389,9 +389,9 @@ pub enum MigrationItem {
     StateBin,
     /// The disk seal descriptor and published base manifest.
     DiskSealInfo(DiskRole),
-    /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
-    /// by chunk index — demand-fetched (and drained) by the dest's
-    /// NBD backend straight out of the frozen source's RAM.
+    /// One sealed disk chunk's raw bytes, by chunk index, read from the
+    /// source's volume snapshot under the pause. The dest writes it into
+    /// its volume before it loads the VM state.
     DiskChunkAt(DiskRole, u64),
     /// Optional advisory hot-set hint, fetched after the required VM state.
     HotHint,

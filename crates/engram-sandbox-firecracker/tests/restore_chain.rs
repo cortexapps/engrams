@@ -32,10 +32,9 @@
 //! regression gate: it must get through at least two chained restores
 //! across BOTH devices.
 //!
-//! Flat-file rootfs (not NBD) is sufficient to reproduce — the bug
-//! lives in the canonical-path stamping layer
-//! (`source_{rootfs,vsock}_canonical`), identical for flat-file and
-//! NBD-backed rootfs.
+//! A flat-file rootfs is sufficient: the canonical-path stamping
+//! (`source_{rootfs,vsock}_canonical`) does not depend on what backs
+//! the drive.
 //!
 //! ADR 0021 P1.5 retired the harness virtio-blk drive (the harness
 //! lives in the rootfs now), so §12p's harness-drive lineage gate

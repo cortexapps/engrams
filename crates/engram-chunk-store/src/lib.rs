@@ -32,8 +32,8 @@
 //!
 //! # Layers above this crate
 //!
-//! - `engram-host-agent::disk_daemon` — NBD daemon serving chunked
-//!   manifests as Linux block devices (FC backend)
+//! - `engram-host-core::disk_flows` — stages a disk manifest into a
+//!   session-disk volume and checkpoints a volume back into a manifest
 //! - `engram-uffd-handler` — UFFD page-fault handler that resolves
 //!   guest memory faults to memory-manifest chunks (FC backend)
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev

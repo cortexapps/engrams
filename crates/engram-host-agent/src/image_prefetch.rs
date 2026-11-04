@@ -988,9 +988,7 @@ async fn prefetch_one(
     // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
     // files written at template-boot (Bun / node_modules / claude). Warming
-    // these on NVMe keeps the resuming guest's rootfs page-in off GCS — the
-    // serial 16 MiB-chunk fetches during `resume` were the measured substrate
-    // cost.
+    // these on NVMe lets the image volume stage from local disk, not GCS.
     let disk_manifest: Manifest = chunk_store
         .get_manifest(image.base_snapshot_disk_manifest)
         .await

@@ -83,7 +83,7 @@ pub fn harness_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
 /// ADR 0112: `<work_dir>/swap/<sandbox_id>.swap` — canonical symlink
 /// for the ephemeral swap drive, same shape as [`rootfs_canonical`]:
 /// `state.bin` embeds this path, and every restore re-points it at
-/// its own NBD device (under the per-source-path lock) before
+/// its own swap volume (under the per-source-path lock) before
 /// `load_snapshot` opens it. Present only when the spec has
 /// `swap_mib > 0`.
 pub fn swap_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {

@@ -497,8 +497,7 @@ impl ChunkStore {
                                 // Content no prior chunk and no batch
                                 // sibling carries — new to this chain, so
                                 // the dedup HEAD would almost always miss:
-                                // unchecked PUT, the ADR 0078 move-5
-                                // posture the NBD flush path already uses.
+                                // unchecked PUT (ADR 0078 move 5).
                                 store.put_chunk_unchecked_prehashed(hash, &slice).await?;
                             }
                             hash
