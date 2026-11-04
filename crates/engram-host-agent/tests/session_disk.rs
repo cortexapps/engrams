@@ -101,12 +101,15 @@ async fn the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate() {
     pooled.bind_session(engram_core::SessionId::new(), sandbox);
 
     // 64 MiB per round, every round fsynced; `/root/rounds` counts them.
+    assert_free_mib(&pooled, sandbox, 64 + 8).await;
     exec(
         &pooled,
         sandbox,
-        "nohup sh -c 'i=0; while :; do \
-           dd if=/dev/zero of=/root/fill bs=1M count=64 conv=notrunc,fsync 2>/dev/null; \
-           i=$((i+1)); echo $i > /root/rounds; done' >/dev/null 2>&1 &",
+        &in_background(
+            "i=0; while :; do \
+               dd if=/dev/zero of=/root/fill bs=1M count=64 conv=notrunc,fsync 2>/dev/null; \
+               i=$((i+1)); echo $i > /root/rounds; done",
+        ),
     )
     .await;
     let written =
@@ -169,9 +172,11 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     exec(
         &generation_a,
         sandbox,
-        "nohup sh -c 'i=0; while [ ! -e /root/stop ]; do \
-           i=$((i+1)); echo $i >> /root/seq; sync; done; \
-           echo done > /root/writer.done' >/dev/null 2>&1 &",
+        &in_background(
+            "i=0; while [ ! -e /root/stop ]; do \
+               i=$((i+1)); echo $i >> /root/seq; sync; done; \
+             echo done > /root/writer.done",
+        ),
     )
     .await;
     let before_roll =
@@ -233,6 +238,31 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     )
     .await;
     generation_b.destroy(sandbox).await.expect("destroy");
+}
+
+/// A guest command that runs `script` detached from the exec. The guest's
+/// busybox has no `nohup`; agentd's exec has no controlling tty, so none is
+/// needed. The shell's own stdio goes to /dev/null first: busybox ash leaks
+/// the fds it saves for a per-job redirection into a backgrounded child,
+/// which would hold the exec's pipes open.
+fn in_background(script: &str) -> String {
+    format!("exec </dev/null >/dev/null 2>&1; sh -c '{script}' &")
+}
+
+/// Fails the test, with the number, when the guest's root filesystem has
+/// less than `need_mib` free: a writer loop that hits a full disk stops
+/// counting its rounds and reads as never having started.
+async fn assert_free_mib(pooled: &Arc<PooledBackend>, sandbox: SandboxId, need_mib: u64) {
+    let free_kib: u64 = exec(pooled, sandbox, "df -k /root | awk 'NR==2 {print $4}'")
+        .await
+        .trim()
+        .parse()
+        .expect("df prints the free KiB of /root");
+    assert!(
+        free_kib / 1024 >= need_mib,
+        "the guest root has {} MiB free; the test writes {need_mib} MiB",
+        free_kib / 1024
+    );
 }
 
 async fn lines(pooled: &Arc<PooledBackend>, sandbox: SandboxId) -> u64 {

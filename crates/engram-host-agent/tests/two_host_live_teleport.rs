@@ -1142,14 +1142,28 @@ async fn two_host_teleport_seals_only_the_residual_under_steady_writes() {
     // of a 48 MiB window, so distinct bytes pile up before the move and
     // keep coming during it. The writer stops at a stop file and
     // reports when its last write is in.
+    //
+    // The guest's busybox has no `nohup`, and its ash leaks per-job
+    // redirection fds into a backgrounded child, so the shell points its
+    // own stdio at /dev/null and then backgrounds the loop.
+    let free_kib: u64 = exec(&host_a.pooled, vm, "df -k /root | awk 'NR==2 {print $4}'")
+        .await
+        .trim()
+        .parse()
+        .expect("df prints the free KiB of /root");
+    assert!(
+        free_kib / 1024 >= 48 + 8,
+        "the guest root has {} MiB free; the writer needs 48 MiB",
+        free_kib / 1024
+    );
     exec(
         &host_a.pooled,
         vm,
-        "nohup sh -c 'i=0; while [ ! -e /root/stop ]; do \
+        "exec </dev/null >/dev/null 2>&1; sh -c 'i=0; while [ ! -e /root/stop ]; do \
            dd if=/dev/urandom of=/root/stream bs=1M count=2 seek=$((2 * (i % 24))) \
               conv=notrunc,fsync 2>/dev/null; \
            i=$((i+1)); echo $i > /root/rounds; sleep 0.1; done; \
-           echo done > /root/writer.done' >/dev/null 2>&1 &",
+           echo done > /root/writer.done' &",
     )
     .await;
     let pooled_a = host_a.pooled.clone();
