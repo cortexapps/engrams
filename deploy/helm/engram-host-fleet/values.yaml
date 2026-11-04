@@ -197,18 +197,6 @@ storage:
   # is re-seeded deterministically from the node name.
   dedicatedDevices: []
 
-nbd:
-  # ADR 0049: warm-pool slot allocator. node-prep loads the nbd module
-  # with `nbdsMax` devices (`modprobe nbd nbds_max=<N>`); the host-agent
-  # sizes its slot pool from the kernel's nbds_max (capped at this same
-  # value) and keeps `warmSlots` pre-validated slots ready for an O(1)
-  # `acquire()`. Total is overridable per deployment. Set nbdsMax: 0 to
-  # disable NBD (materialize-to-file fallback).
-  # Two slots per swap-enabled guest. Changes require node recreation:
-  # the kernel reads nbds_max only when the module loads.
-  nbdsMax: 128
-  warmSlots: 128
-
 nodePrep:
   enabled: true
   image:

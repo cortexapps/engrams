@@ -114,7 +114,7 @@ echo "==> /dev/kvm present in '$PROFILE'"
 
 VM_USER="$(ssh_ id -un)"
 
-# --- in-VM host prep (packages, firecracker binary, nbd/uffd/kvm-perms,
+# --- in-VM host prep (packages, firecracker binary, uffd/kvm-perms,
 # loopback forwarders, working dirs). One ssh round-trip; every step below
 # checks state before acting so re-runs are cheap and side-effect free. ---
 echo "==> host prep + packages inside '$PROFILE'"
@@ -155,16 +155,6 @@ else
     echo "==> firecracker $FC_VERSION already installed"
 fi
 /usr/local/bin/firecracker --version
-
-# --- nbd: chunked-disk backing needs the module loaded with enough
-# devices, persistently (ADR 0024 gotcha: base-snapshot capture hangs
-# ~500s without it) ---
-echo nbd >/etc/modules-load.d/engram-nbd.conf
-echo "options nbd nbds_max=16" >/etc/modprobe.d/engram-nbd.conf
-if lsmod | grep -q '^nbd '; then
-    modprobe -r nbd 2>/dev/null || true
-fi
-modprobe nbd nbds_max=16
 
 # --- uffd: unprivileged userfaultfd for FC snapshot page-faulting ---
 echo "vm.unprivileged_userfaultfd=1" >/etc/sysctl.d/99-engram.conf
@@ -299,7 +289,7 @@ cat <<EOF
 Provisioned inside the VM:
   - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools
   - /usr/local/bin/firecracker ($FC_VERSION)
-  - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
+  - vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
   - dm-thin pool engram-pool (20G data / 1G metadata under /var/lib/engram/thin)
   - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no
     shadowing loopback listener — see the script comment for why not socat)
