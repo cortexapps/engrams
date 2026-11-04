@@ -313,63 +313,115 @@ pub trait SessionDisk: Send + Sync {
     }
 }
 
+/// Volumes as sparse files in one directory. This is the macOS
+/// implementation (APFS makes `fs::copy` a clone) and the development
+/// implementation on a Linux box with no thin pool. The simulator wraps
+/// it. It keeps the default `dirty_chunks`.
+#[derive(Clone, Debug)]
+pub struct FileDisk {
+    root: PathBuf,
+    chunk_size: u64,
+}
+
+impl FileDisk {
+    /// Create the directory when it does not exist.
+    pub fn new(root: impl Into<PathBuf>, chunk_size: u64) -> io::Result<Self> {
+        assert!(chunk_size > 0, "chunk_size must be non-zero");
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root, chunk_size })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn path_of(&self, name: &VolumeName) -> PathBuf {
+        self.root.join(name.as_str())
+    }
+}
+
+#[async_trait]
+impl SessionDisk for FileDisk {
+    async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
+        let path = self.path_of(name);
+        File::create_new(&path)?.set_len(size_bytes)?;
+        Volume::open(name.clone(), &path, size_bytes, self.chunk_size)
+    }
+
+    async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
+        let path = self.path_of(name);
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("volume {name} already exists"),
+            ));
+        }
+        let (from, to) = (origin.path.clone(), path.clone());
+        tokio::task::spawn_blocking(move || std::fs::copy(from, to))
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot task: {e}")))??;
+        Volume::open(name.clone(), &path, origin.size_bytes, origin.chunk_size)
+    }
+
+    async fn open(&self, name: &VolumeName) -> io::Result<Volume> {
+        let path = self.path_of(name);
+        let size_bytes = std::fs::metadata(&path)?.len();
+        Volume::open(name.clone(), &path, size_bytes, self.chunk_size)
+    }
+
+    async fn delete(&self, name: &VolumeName) -> io::Result<()> {
+        std::fs::remove_file(self.path_of(name))
+    }
+
+    async fn capacity(&self) -> io::Result<Capacity> {
+        let (free, total) = filesystem_space(&self.root)?;
+        Ok(Capacity {
+            data_free_bytes: free,
+            data_total_bytes: total,
+            metadata_free_bytes: free,
+            metadata_total_bytes: total,
+        })
+    }
+}
+
+/// Free and total bytes of the filesystem holding `path`.
+#[allow(unsafe_code)]
+fn filesystem_space(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `statvfs` reads a NUL-terminated path and fills the
+    // out-parameter in full on success. Both live for the whole call.
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a zero return means the kernel initialised every field.
+    let stat = unsafe { stat.assume_init() };
+    // Block counts are 32-bit on macOS and 64-bit on Linux; widen through
+    // a generic so neither platform's clippy sees a useless conversion.
+    fn widen(n: impl Into<u64>) -> u64 {
+        n.into()
+    }
+    let frag = widen(stat.f_frsize);
+    Ok((
+        widen(stat.f_bavail).saturating_mul(frag),
+        widen(stat.f_blocks).saturating_mul(frag),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const CHUNK: u64 = 4096;
 
-    /// A `SessionDisk` over sparse files in a temp dir: the smallest
-    /// implementation that exercises the shared code. Snapshot is a
-    /// byte copy, which is enough to test the default `dirty_chunks`.
-    struct TempDisk {
-        dir: tempfile::TempDir,
-    }
-
-    impl TempDisk {
-        fn new() -> Self {
-            Self {
-                dir: tempfile::tempdir().expect("tempdir"),
-            }
-        }
-
-        fn path_of(&self, name: &VolumeName) -> PathBuf {
-            self.dir.path().join(name.as_str())
-        }
-    }
-
-    #[async_trait]
-    impl SessionDisk for TempDisk {
-        async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
-            let path = self.path_of(name);
-            File::create_new(&path)?.set_len(size_bytes)?;
-            Volume::open(name.clone(), &path, size_bytes, CHUNK)
-        }
-
-        async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
-            let path = self.path_of(name);
-            std::fs::copy(&origin.path, &path)?;
-            Volume::open(name.clone(), &path, origin.size_bytes, origin.chunk_size)
-        }
-
-        async fn open(&self, name: &VolumeName) -> io::Result<Volume> {
-            let path = self.path_of(name);
-            let size_bytes = std::fs::metadata(&path)?.len();
-            Volume::open(name.clone(), &path, size_bytes, CHUNK)
-        }
-
-        async fn delete(&self, name: &VolumeName) -> io::Result<()> {
-            std::fs::remove_file(self.path_of(name))
-        }
-
-        async fn capacity(&self) -> io::Result<Capacity> {
-            Ok(Capacity {
-                data_free_bytes: u64::MAX,
-                data_total_bytes: u64::MAX,
-                metadata_free_bytes: u64::MAX,
-                metadata_total_bytes: u64::MAX,
-            })
-        }
+    fn disk() -> (tempfile::TempDir, FileDisk) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = FileDisk::new(dir.path().join("volumes"), CHUNK).expect("disk");
+        (dir, disk)
     }
 
     fn name(s: &str) -> VolumeName {
@@ -387,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_volume_reads_as_zeros_and_round_trips_a_write() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let v = disk.create(&name("v"), CHUNK * 3).await.unwrap();
         assert_eq!(v.chunk_count(), 3);
         assert!(is_zero_chunk(&v.read_chunk(ChunkIndex(1)).await.unwrap()));
@@ -400,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_final_chunk_is_short_when_size_is_not_a_multiple() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let v = disk.create(&name("v"), CHUNK * 2 + 100).await.unwrap();
         assert_eq!(v.chunk_count(), 3);
         assert_eq!(v.chunk_len(ChunkIndex(2)).unwrap(), 100);
@@ -415,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_index_past_the_end_is_refused_before_any_io() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let v = disk.create(&name("v"), CHUNK).await.unwrap();
         let err = v.read_chunk(ChunkIndex(1)).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -425,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_chunk_makes_a_written_chunk_read_as_zeros() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let v = disk.create(&name("v"), CHUNK * 2).await.unwrap();
         v.write_chunk(ChunkIndex(0), vec![7; CHUNK as usize])
             .await
@@ -436,8 +488,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_finds_a_created_volume_and_delete_removes_it() {
+        let (_dir, disk) = disk();
+        disk.create(&name("v"), CHUNK * 2).await.unwrap();
+        let v = disk.open(&name("v")).await.unwrap();
+        assert_eq!(v.size_bytes, CHUNK * 2);
+        disk.delete(&name("v")).await.unwrap();
+        assert_eq!(
+            disk.open(&name("v")).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // The name is free again.
+        assert!(disk.create(&name("v"), CHUNK).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_is_independent_of_its_origin() {
+        let (_dir, disk) = disk();
+        let origin = disk.create(&name("o"), CHUNK * 2).await.unwrap();
+        origin
+            .write_chunk(ChunkIndex(0), vec![1; CHUNK as usize])
+            .await
+            .unwrap();
+        let snap = disk.snapshot(&origin, &name("s")).await.unwrap();
+        origin
+            .write_chunk(ChunkIndex(0), vec![2; CHUNK as usize])
+            .await
+            .unwrap();
+        assert_eq!(snap.read_chunk(ChunkIndex(0)).await.unwrap()[0], 1);
+        assert_eq!(
+            disk.snapshot(&origin, &name("s")).await.unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_reports_the_underlying_filesystem() {
+        let (_dir, disk) = disk();
+        let c = disk.capacity().await.unwrap();
+        assert!(c.data_total_bytes > 0);
+        assert!(c.data_free_bytes <= c.data_total_bytes);
+    }
+
+    #[tokio::test]
     async fn dirty_chunks_refuses_volumes_of_different_sizes() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let a = disk.create(&name("a"), CHUNK * 2).await.unwrap();
         let b = disk.create(&name("b"), CHUNK * 3).await.unwrap();
         let err = disk.dirty_chunks(&a, &b).await.unwrap_err();
@@ -446,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_chunks_lists_exactly_the_chunks_that_changed() {
-        let disk = TempDisk::new();
+        let (_dir, disk) = disk();
         let fill = |byte: u8| vec![byte; CHUNK as usize];
 
         // Six chunks: 0 and 1 unchanged (one a hole, one written),

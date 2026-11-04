@@ -52,7 +52,7 @@ pub use coord::{
     LiveManifestPublishResponse,
 };
 pub use device::DeviceSync;
-pub use disk::{is_zero_chunk, Capacity, ChunkIndex, SessionDisk, Volume, VolumeName};
+pub use disk::{is_zero_chunk, Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName};
 pub use effects::HostEffects;
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
