@@ -65,8 +65,8 @@ const RESUME_MAX_ATTEMPTS: i32 = 60;
 /// (attempts=1, e.g. the host answered the restore with a real VM error)
 /// leaves the session where it was — and the deliver verb's next retry
 /// mints a FRESH Resume op, resetting the per-op budget forever. An
-/// unresumable session (prod 61dace68: the snapshot's uffd base file was
-/// re-baked away) then churns the outbox shim every 2s indefinitely.
+/// unresumable session (for example, its snapshot's uffd base file is
+/// gone) then churns the outbox shim every 2s indefinitely.
 /// After this many consecutive terminally-failed side-effectful resume
 /// attempts (`op_resume_failure_streak`: step restore/bind/finish, no
 /// successful resume in between), the session itself is declared
@@ -1240,15 +1240,12 @@ async fn forward_outbox_row(
             }
             // The VM is alive but no harness is attached past the grace:
             // the genuine harness-unbound desync (harness process gone,
-            // VM alive — the e35ed1fa class). The harness will NOT come
-            // back on its own — its connection loop only re-dials when
-            // its established link drops or agentd SIGUSR1s it — so
-            // `start_agent` is the remedy. (A #594-era "wait for
-            // in-guest self-reattach" window here was wrong for a real
-            // desync; ADR 0108's grace is different — it keys on a
+            // VM alive). The harness will NOT come back on its own — its
+            // connection loop only re-dials when its established link
+            // drops or agentd SIGUSR1s it — so `start_agent` is the
+            // remedy. The ADR 0108 grace above keys only on a
             // boot/resume that JUST completed, where the attach is
-            // provably in flight, and A1's handshake bounds guarantee
-            // the wait converges.)
+            // provably in flight.
             match crate::api::snapshot::reattach_harness_in_place(
                 state,
                 row.session_id,
@@ -1779,8 +1776,7 @@ mod tests {
 
     /// Issue #1314: the cross-op streak budget. Per-op budgets reset on
     /// every deliver-verb re-mint, so an unresumable Idle session churned
-    /// forever (prod 61dace68: ops 139201…139206, each `failed` at
-    /// attempts=1). With `RESUME_FAILURE_STREAK_BUDGET - 1` prior
+    /// forever, each op `failed` at attempts=1. With `RESUME_FAILURE_STREAK_BUDGET - 1` prior
     /// terminally-failed restore attempts on record, the NEXT terminal
     /// failure demotes the session to Dead — the deliver verb's terminal
     /// arm then acks the row consumed-by-termination and the churn ends.

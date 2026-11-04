@@ -748,13 +748,12 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // (RAII abort) before `op_finish` so the beat never re-stamps a
     // just-finished row.
     let heartbeat = spawn_op_heartbeat(state, op.id, epoch);
-    // ADR 0079 backstop / the 2026-07-17 resume-stall incident (session
-    // 03e6535e): the within-step liveness heartbeat above PROVES the
+    // ADR 0079 backstop: the within-step liveness heartbeat above PROVES the
     // executor is alive independently of step progress — by design, so a
     // long-but-healthy host RPC is never reclaimed. Its failure mode is an
     // executor that is alive but WEDGED: a verb `await` that never returns
-    // (there, `host.start_agent` on a resume `finish` step hung on a dead
-    // rootfs device) keeps the row heartbeating forever, so the 180s
+    // (for example, `host.start_agent` on a resume `finish` step hung on
+    // a dead rootfs device) keeps the row heartbeating forever, so the 180s
     // stale-op reclaim can never fire and the op is pinned until a deploy
     // rolls the pod (34 minutes, in the incident). The per-RPC
     // `grpc-timeout`s (restore/start_agent, 240s) are the first line; this

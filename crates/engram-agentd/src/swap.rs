@@ -17,10 +17,9 @@ use std::path::{Path, PathBuf};
 ///
 /// - `swappiness=100` (kernel 6.1 range 0-200): "anonymous and file
 ///   reclaim cost the same." Post-#1044 that is approximately true
-///   (ranged-pread refault ≈ swap-in on the same NVMe), and the
-///   measured incident (session f660f022, 22:1 scan-to-steal) was the
-///   default 60 forcing reclaim onto hot NBD-backed file pages because
-///   anon was unreclaimable.
+///   (ranged-pread refault ≈ swap-in on the same NVMe). The default 60
+///   forces reclaim onto hot NBD-backed file pages because anon is
+///   unreclaimable (measured at 22:1 scan-to-steal).
 /// - `page-cluster=0`: swap readahead is 2^n pages; swap-in here is
 ///   random 4 KiB against fast backing — cluster reads only amplify
 ///   I/O during exactly the reclaim storms swap exists to survive.

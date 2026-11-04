@@ -48,12 +48,9 @@ use crate::state::{IndexedEvent, SharedState};
 /// Page size for the log walk — a PAGE SIZE, **not** a ceiling. The
 /// replay keeps reading pages until it reaches the tail, so this bounds
 /// per-subscriber memory (one page in flight) and nothing else.
-///
-/// This was `REPLAY_LIMIT = 1000` behind a SINGLE read, which silently
-/// dropped every event past the first page: prod session
-/// `eafd98b5-f748-484e-a27b-ed6de8343204` rendered 1000 of its 1291
-/// events, hiding the run that opened its PR (ADR 0105). Raising a
-/// ceiling only moves the cliff; walking to the tail removes it.
+/// A single capped read silently drops every event past the first page
+/// (ADR 0105). Raising a ceiling only moves the cliff; walking to the
+/// tail removes it.
 const REPLAY_PAGE: i64 = 500;
 
 /// ADR 0051: the sequencing-sensitive prelude for the app-gRPC
@@ -437,10 +434,8 @@ mod tests {
             .expect("expected an event frame, got a lag notification")
     }
 
-    /// THE regression test for the prod incident. A session with more
-    /// events than one page must stream ALL of them. Before ADR 0105 this
-    /// stopped dead at the page size (1000 of 1291 events in prod, hiding
-    /// the run that opened the PR).
+    /// A session with more events than one page must stream ALL of them,
+    /// not stop at the page size (ADR 0105).
     #[tokio::test]
     async fn replay_walks_past_one_page() {
         // Spans three pages at REPLAY_PAGE=500: 500 + 500 + 200.

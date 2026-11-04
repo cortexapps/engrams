@@ -110,7 +110,7 @@ fn seed_96_host_lost_straggler_settles_via_sweep() {
     run(96, Profile::Chaos, 1500);
 }
 
-/// ADR 0098 coverage-gap G1 (PR #743, session 03e6535e): a resume-class op
+/// ADR 0098 coverage-gap G1 (PR #743): a resume-class op
 /// wedged forever inside its host RPC while the within-step heartbeat kept
 /// the op row fresh — stale-op reclaim never fired and the op pinned for
 /// 40 minutes until a pod roll. The fix (`op_deadline`, deliberately on the

@@ -101,13 +101,13 @@ pub struct HostCapacity {
 }
 
 /// The host chunk-cache disk floor (bytes): free work_dir space below
-/// which the host is treated as disk-pressured. Issue #528 / the
-/// `engrams-fc-xngk` post-mortem: 20 GiB is the margin under which the
-/// host-agent's idle-evict stops pushing candidates. The SINGLE owner of
-/// this value — the host-agent's `DEFAULT_DISK_FLOOR_BYTES` aliases it,
-/// and ADR 0078's placement affinity vetoes a snapshot-host whose free
-/// disk is below it (placing a resume on a host about to disk-evict its
-/// cache is pointless). Do not mint a second threshold.
+/// which the host is treated as disk-pressured (issue #528). 20 GiB is the
+/// margin under which the host-agent's idle-evict stops pushing
+/// candidates. The SINGLE owner of this value: the host-agent's
+/// `DEFAULT_DISK_FLOOR_BYTES` aliases it, and ADR 0078's placement
+/// affinity vetoes a snapshot-host whose free disk is below it (placing
+/// a resume on a host about to disk-evict its cache is pointless). Do not
+/// mint a second threshold.
 pub const HOST_DISK_CACHE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// [`HOST_DISK_CACHE_FLOOR_BYTES`] in MiB, for comparison against

@@ -1249,8 +1249,7 @@ impl HostService for HostServiceImpl {
 
     /// ADR 0014 issue #6: bidi WS-frame tunnel.
     ///
-    /// Wire contract (ADR 0015 follow-up, prod session 8725648d on
-    /// 2026-05-23): the FIRST message MUST be a `ProxyShellOpen`
+    /// Wire contract (ADR 0015 follow-up): the FIRST message MUST be a `ProxyShellOpen`
     /// carrying `sandbox_id`. Any other variant as the first message
     /// is `InvalidArgument`. Any subsequent `Open` is also
     /// `InvalidArgument` (the open variant has no meaning past the

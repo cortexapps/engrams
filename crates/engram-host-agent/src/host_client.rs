@@ -447,8 +447,7 @@ impl HostClient for LocalHostClient {
         // agentd probes a local TCP connect before replying, so
         // when we get here we're guaranteed a listener exists — no
         // more racing the warm-restore against the snapshot's init
-        // script (prod session 73fe33a3 on 2026-05-20 saw the host
-        // dial 48s after lease and still hit Connection refused).
+        // script.
         let port = self.sandbox.start_shell(sandbox_id).await?;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
         // ADR 0066: reach ttyd via the in-guest agentd relay (FC; VZ after its

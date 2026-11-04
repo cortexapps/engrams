@@ -895,9 +895,8 @@ impl HostAgent {
                                 // Binding records live on disk under work_dir
                                 // and survive the roll, so the survivor
                                 // harness's re-dial validates against the
-                                // durable record with zero rebuild step (the
-                                // b9b28452/#447 gap is closed by construction,
-                                // not by replay).
+                                // durable record with zero rebuild step (#447
+                                // is closed by construction, not by replay).
                                 // Issue #229: the coord echoes the wire
                                 // version it understands. Previously this was
                                 // deserialized and silently dropped. A skew is
@@ -1838,7 +1837,7 @@ mod tests {
     }
 
     /// ADR 0073 replacement for the retired `rebind_survivor_sessions`
-    /// coverage (regression b9b28452 / #447): a host-agent restart must
+    /// coverage (#447): a host-agent restart must
     /// accept a survivor harness's re-dial with ZERO rebuild pass. The
     /// binding record on disk IS the routing — a hub constructed fresh
     /// over a pre-populated bindings dir (what a restarted process

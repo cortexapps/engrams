@@ -782,8 +782,8 @@ async fn reconcile(
     // cache (both under the work dir) and its sweeper can't evict them —
     // reserve their allocated bytes out of the cache's ceiling so the
     // cache yields the space instead of racing the memfiles to the
-    // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
-    // a warm at-budget cache + 40 GB of unbudgeted memfiles).
+    // kubelet eviction line (a warm at-budget cache + 40 GB of
+    // unbudgeted memfiles trips DiskPressure).
     chunk_cache.set_co_tenant_reserved("memfiles", memfile_bytes);
 }
 
@@ -2231,9 +2231,8 @@ mod tests {
         // ADR 0092: the memfiles share the chunk cache's filesystem and
         // its sweeper can't evict them — every reconcile tick publishes
         // their allocated bytes as the cache's co-tenant reserve so the
-        // cache stops aiming for disk the memfiles occupy (the 2026-07-14
-        // w8wq DiskPressure incident: at-budget warm cache + 40 GB of
-        // unbudgeted memfiles).
+        // cache stops aiming for disk the memfiles occupy (an at-budget
+        // warm cache + 40 GB of unbudgeted memfiles trips DiskPressure).
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());

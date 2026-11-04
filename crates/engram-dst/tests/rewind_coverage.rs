@@ -5,10 +5,9 @@
 //! `Step::HostCheckpoint` stamps `events_cursor` (as the production
 //! checkpoint writers do), so a resume with guest history past the
 //! cursor runs a REAL rung-1 rewind in the swarm. This test drives the
-//! exact incident interleaving (prod 2026-08-03, session aa0829b0):
-//! user input AND guest history land after the checkpoint cursor; the
-//! resume must tombstone exactly the guest rows, keep every
-//! user-authored row, and emit exactly one
+//! interleaving that matters: user input AND guest history land after
+//! the checkpoint cursor; the resume must tombstone exactly the guest
+//! rows, keep every user-authored row, and emit exactly one
 //! `recovered_from_checkpoint{cause: checkpoint_lag}` with an honest
 //! `rolled_back` count.
 

@@ -1,9 +1,8 @@
-//! ADR 0108 Workstream E — pinned regression scenarios for the
-//! 2026-07-31 first-token-delivery incident (sessions 6f3dac3e /
-//! 454c5e21), plus the non-vacuity proofs for the two new oracles
-//! (`ttft-liveness`, `attach-disagreement`).
+//! ADR 0108 Workstream E: pinned regression scenarios for the
+//! first-token-delivery race, plus the non-vacuity proofs for the two
+//! new oracles (`ttft-liveness`, `attach-disagreement`).
 //!
-//! The incident interleaving: a create carries a prompt; the Deliver op
+//! The interleaving: a create carries a prompt; the Deliver op
 //! wakes on the boot milestone and races the harness attach (which
 //! lands 50–200 ms later), loses with `send_prompt` `NotFound`, fires
 //! the destructive `start_agent` reattach into the mid-attach harness,
@@ -19,8 +18,8 @@
 //!   - A8: fresh attach evidence recalls waiting outbox rows
 //!     (`outbox_make_due` at the attach signal, before the A3 wake),
 //!     and the heartbeat running-vs-attached disagreement is a REPAIR
-//!     (`harness_desync::run_once` — the prod-7eddce62 stale-handle
-//!     shape, pinned below).
+//!     (`harness_desync::run_once`: the stale-handle shape, pinned
+//!     below).
 //!
 //! Scenarios hand-drive `Sim::execute` (the pinned-regression pattern —
 //! an exact interleaving, not a swarm pick). Everything runs on the
@@ -45,9 +44,9 @@ fn rt() -> tokio::runtime::Runtime {
 
 /// Reserve + boot one session to Active with the real CreateBoot op.
 /// `create_prompt`: `Some` enqueues the prompt while the session is
-/// still Pending (the 2026-07-31 create shape — outbox row + Deliver
+/// still Pending (the create-with-prompt shape: outbox row + Deliver
 /// op exist BEFORE the boot completes; the deliver's first attempt
-/// defers on the A5 fixed cadence); `None` boots clean (the 7eddce62
+/// defers on the A5 fixed cadence); `None` boots clean (the
 /// steady-state shape). Returns (session, sandbox, host) with the
 /// session Active and the harness dial in flight.
 async fn boot_session(
@@ -142,12 +141,12 @@ async fn boot_session(
     )
 }
 
-/// The 2026-07-31 create shape (see [`boot_session`]).
+/// The create-with-prompt shape (see [`boot_session`]).
 async fn create_with_prompt(sim: &mut Sim, prompt_id: &str) -> (SessionId, SandboxId, HostId) {
     boot_session(sim, Some(prompt_id)).await
 }
 
-/// The 7eddce62 steady state: session Active, harness ATTACHED, no
+/// The steady state: session Active, harness ATTACHED, no
 /// outstanding prompt. Advances past the default 200 ms dial delay so
 /// the pump completes the attach (and announces Idle when the scenario
 /// opted in).
@@ -463,10 +462,10 @@ fn attach_disagreement_oracle_fires_on_a_black_holed_attach() {
     });
 }
 
-/// The prod-7eddce62 fourth stall shape (ADR 0108 A8), pinned. In prod:
-/// a 27-minute rung-2 park killed the harness vsock link while the hub
-/// still advertised the handle; the un-park took 120 ms; `send_prompt`
-/// returned Ok into the dead socket; the row waited out the full 30 s
+/// The fourth stall shape (ADR 0108 A8), pinned. In production a long
+/// rung-2 park kills the harness vsock link while the hub still
+/// advertises the handle; the un-park is fast; `send_prompt`
+/// returns Ok into the dead socket; the row waits out the full 30 s
 /// ACK_TIMEOUT. The world models no VM pause, so the severance is
 /// injected directly with the Stale fault (the documented entry point —
 /// destroy/crash severances stay immediate). Under test, both A8 call

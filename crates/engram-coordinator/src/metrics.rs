@@ -442,7 +442,7 @@ pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disag
 /// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
 /// re-drove: waiting outbox rows recalled to due + a Deliver op
 /// enqueued, for an Active session whose sandbox the host reports
-/// RUNNING with no attached harness (prod 7eddce62).
+/// RUNNING with no attached harness.
 pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";

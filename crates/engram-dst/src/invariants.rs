@@ -171,7 +171,7 @@ impl Oracles {
     /// believes the session is Active, the world host reports its bound
     /// sandbox running, and no harness is attached. That is a legal
     /// TRANSIENT (the dial is in flight) but must never persist: past
-    /// the bound it is the 2026-07-31 zombie — a black-holed attach
+    /// the bound it is a zombie: a black-holed attach
     /// with every component convinced someone else owns the wait.
     /// Stateful: the window is measured from the first step that
     /// OBSERVES the disagreement, against the WORLD clock (skew-free).
@@ -528,8 +528,7 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
     })
 }
 
-/// USER INPUT IS NEVER GUEST HISTORY (prod 2026-08-03, session
-/// aa0829b0): the rung-1 rewind's positive-provenance tombstone
+/// USER INPUT IS NEVER GUEST HISTORY: the rung-1 rewind's positive-provenance tombstone
 /// predicate must never touch a user-authored row — the receipt
 /// (`prompt_received`), the prompt echo (`agent_message` with role
 /// `user`), a deferred tool answer (`tool_result_submitted`), or an
@@ -686,7 +685,7 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
 
 /// ADR 0108 E: the TTFT liveness oracle. A session that is Active while
 /// a prompt outbox row for it sits unacked past [`TTFT_BOUND_SECS`] has
-/// a stalled delivery path — the exact 2026-07-31 symptom (prompt
+/// a stalled delivery path (prompt
 /// durable, session Active, `run_started` nowhere). The row is retired
 /// only by the confirming `run_started{prompt_id}` harness event, so
 /// this bounds the WHOLE chain: attach signal → deliver forward →

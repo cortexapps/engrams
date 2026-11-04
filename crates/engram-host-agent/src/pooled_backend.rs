@@ -1597,8 +1597,8 @@ impl PooledBackend {
     /// periodic checkpoint driver probes this and SKIPS the tick when
     /// it returns true — a best-effort checkpoint must never *queue*
     /// behind another capture, which is how one slow/hung capture
-    /// gridlocked the fleet (the 52–151 s dark `host.snapshot` waits in
-    /// the 5fadd364 incident). `try_lock` is the probe: a held lock
+    /// gridlocks the fleet (52–151 s dark `host.snapshot` waits).
+    /// `try_lock` is the probe: a held lock
     /// means a capture is in flight.
     ///
     /// A benign sub-ms race remains — a capture can start between this
@@ -1966,7 +1966,7 @@ impl PooledBackend {
         // chain seeds on the first (Full) capture below — so an
         // eviction on a long-running session is just the final diff
         // in its checkpoint chain, collapsing the multi-GiB-dump
-        // window the cf4d4afd incident sat in.
+        // window.
         let chain_prev = self
             .checkpoint_chains
             .get(&id)
@@ -2000,9 +2000,9 @@ impl PooledBackend {
         // and commit), tear down its artifacts BEFORE we mint a fresh
         // SnapshotId. This is the overwrite-in-place semantic that
         // keeps the host-side disk bounded under coord-side retry
-        // storms — the prod incident on `engrams-fc-xngk` leaked
-        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
-        // id and left the prior dir on disk.
+        // storms. Without it, each retry mints a fresh id and leaves
+        // the prior 4 GiB dir on disk; 25 retries fill a host in
+        // 13 min.
         if self.inflight_snapshots.contains_key(&id) {
             if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
                 tracing::warn!(
@@ -3195,8 +3195,8 @@ impl PooledBackend {
     /// whose successor `snapshot()` call is about to overwrite it).
     /// Removes only the per-snapshot local dir at
     /// `<work_dir>/sandboxes/snapshots/<snapshot_id>/` (4+ GiB on FC;
-    /// the 99 GB `engrams-fc-xngk` host filled in ~12 min by leaking 25
-    /// of these in 13 min) — host-disk hygiene, and rebuildable from
+    /// 25 leaked dirs fill a 99 GB host) — host-disk hygiene, and
+    /// rebuildable from
     /// BlobStorage on the next restore.
     ///
     /// It does NOT delete the per-snapshot BlobStorage objects
@@ -6408,10 +6408,7 @@ impl SandboxBackend for PooledBackend {
     /// to in-VM agentd would never fire — host's proxy_shell would
     /// then dial port 7681 blind and hit Connection refused whenever
     /// the bake's init didn't auto-start ttyd or the warm-restore
-    /// stripped the listening socket. Prod 2026-05-20 session
-    /// 5c8d0ce5: zero start_shell logs on the host-agent despite a
-    /// completed proxy_shell GRPC roundtrip, exactly because this
-    /// forward was missing.
+    /// stripped the listening socket.
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         self.inner.start_shell(id).await
     }
@@ -9753,7 +9750,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // ADR 0014 follow-up (prod 2026-05-20 session 5c8d0ce5):
+    // ADR 0014 follow-up:
     // PooledBackend MUST forward start_shell / guest_endpoints to its
     // inner backend. The SandboxBackend trait has default impls for
     // these (Ok(7681) / None respectively) that exist for backends
@@ -9887,9 +9884,7 @@ mod tests {
         /// the inner — host-agent's proxy_shell then dials port
         /// 7681 blind even when the FC backend would have correctly
         /// minted the connection (warm restore in a netns, lazy
-        /// ttyd spawn, etc.). Prod 2026-05-20 session 5c8d0ce5 was
-        /// exactly this: zero `start_shell:` log lines on the
-        /// host-agent despite a successful proxy_shell GRPC roundtrip.
+        /// ttyd spawn, etc.).
         #[tokio::test]
         async fn pooled_backend_forwards_start_shell_to_inner() {
             let inner = Arc::new(SpyInner::new());
@@ -10332,9 +10327,8 @@ mod tests {
         /// ADR 0111: the registry a host-agent restart wiped is
         /// rebuilt from the policies the previous process persisted
         /// beside its binding records — a local read, no coordinator.
-        /// (Prod 2026-08-03, session 51fc6af7: the in-RAM registry
-        /// died with a DaemonSet roll and the coordinator-side re-push
-        /// could not rebuild it, stranding a healthy VM egress-less.)
+        /// A coordinator-side re-push cannot rebuild it, and a healthy
+        /// VM stays without egress.
         #[tokio::test]
         async fn restart_rebuilds_egress_registry_from_persisted_policies() {
             let bindings_dir = tempfile::tempdir().expect("tempdir");

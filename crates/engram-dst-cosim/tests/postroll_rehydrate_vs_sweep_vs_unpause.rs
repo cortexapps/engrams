@@ -1,5 +1,5 @@
 //! Deliverable 4b (ADR 0098 R-CoSim, rung 1): the post-roll survivor family
-//! (the 731df805 / #739 / #769 shape), at the coordinator↔host BOUNDARY.
+//! (the #739 / #769 shape), at the coordinator↔host BOUNDARY.
 //!
 //! What this test co-simulates is the **ownership** leg of the family: the
 //! ADR 0090 survivor-reattach interaction between the coordinator's
@@ -21,7 +21,7 @@ use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// A `HostLost` survivor with a live VM but a dropped local binding must be
-/// REPAIRED by reconcile, never reaped (ADR 0090; the 731df805/#739 class).
+/// REPAIRED by reconcile, never reaped (ADR 0090; the #739 class).
 #[tokio::test(start_paused = true)]
 async fn hostlost_survivor_with_dropped_binding_is_repaired_not_reaped() {
     let mut sim = Cosim::new(0x0769_0001).await;
@@ -48,7 +48,7 @@ async fn hostlost_survivor_with_dropped_binding_is_repaired_not_reaped() {
 
     assert!(
         !sim.reconcile_destroys().contains(&sandbox),
-        "a HostLost survivor must NEVER be reaped (ADR 0090 / 731df805)"
+        "a HostLost survivor must NEVER be reaped (ADR 0090)"
     );
     assert!(
         sim.reconcile_binding_repairs()

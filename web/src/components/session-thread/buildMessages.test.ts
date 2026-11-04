@@ -687,12 +687,12 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(queue.map((q) => q.promptId)).toContain("p2");
   });
 
-  // prod session 68c70a65: the coordinator's SendPrompt path can append the
+  // The coordinator's SendPrompt path can append the
   // harness's run_started BEFORE the user echo — it forwards the prompt (which
   // starts the run) and only then emits the echo, so for an idle follow-up the
   // two invert. The held echo is then never consumed (its run_started already
-  // passed) and the user turn used to vanish. The prompt_id pre-scan keeps it.
-  test("a prompt_id user echo logged AFTER its run_started still renders (forward-before-echo inversion, 68c70a65)", () => {
+  // passed). The prompt_id pre-scan keeps the user turn.
+  test("a prompt_id user echo logged AFTER its run_started still renders (forward-before-echo inversion)", () => {
     const { messages } = buildMessages(
       indexed([
         // INVERTED: run_started lands first (lower idx)…
@@ -790,11 +790,10 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(users[0]!.metadata?.custom?.delivering).toBeUndefined();
   });
 
-  // Prod 963df54e (and every codex steer before it): a STEERED prompt is
-  // consumed inside the running turn, so no run_started{prompt_id} ever
-  // arrives to release its held echo, and the trailing pending render skips
-  // consumed ids — the user's own message vanished from the thread while the
-  // agent did react to it. The prompt_steered event is the consumption point.
+  // A STEERED prompt is consumed inside the running turn, so no
+  // run_started{prompt_id} ever arrives to release its held echo, and the
+  // trailing pending render skips consumed ids. The prompt_steered event is
+  // the consumption point.
   test("a steered prompt renders at its prompt_steered position, inside the running turn", () => {
     const { messages } = buildMessages(
       indexed([
@@ -2071,10 +2070,9 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     expect(toolParts).toHaveLength(0);
   });
 
-  // Session 4a70374e: the CLI called exit_plan_mode a SECOND time while the
-  // first call was already parked. The second start has no request behind it,
-  // which used to read as "the agent planned with plan mode off" — telling the
-  // user to turn on a chip that was already on.
+  // The CLI can call exit_plan_mode a SECOND time while the first call is
+  // parked. The second start has no request behind it, and must not read as
+  // "the agent planned with plan mode off".
   test("a re-call while plan mode is ON is not an out-of-mode attempt", () => {
     const { messages } = buildMessages(
       indexed([
@@ -2105,9 +2103,8 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     expect(kinds).not.toContain("plan_attempt");
   });
 
-  // Session 4a70374e: a plan card mid-run nulls `active`, so the next tool
-  // opened a NEW assistant bubble that `run_completed` never closed — its tool
-  // row span on "Waiting for tool: ToolSearch" beside a finished turn.
+  // A plan card mid-run nulls `active`, so the next tool opens a NEW assistant
+  // bubble. `run_completed` must close that bubble too.
   test("a completed run settles every bubble it produced, not just the last", () => {
     const { messages } = buildMessages(
       indexed([
@@ -2169,9 +2166,8 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     expect(stillRunning).toHaveLength(0);
   });
 
-  // Session 3728924b: the codex adapter interrupts the read-only turn to hand
-  // off to the revision/build turn. Rendering that as red "interrupted" told
-  // the reviewer their approval had broken something.
+  // The codex adapter interrupts the read-only turn to hand off to the
+  // revision/build turn. That must not render as red "interrupted".
   test("a plan decision's handoff interrupt is not an interruption", () => {
     const { messages } = buildMessages(
       indexed([
@@ -2214,9 +2210,9 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     expect(cancelled).toHaveLength(0);
   });
 
-  // Session 676b367f: codex holds its app-server turn open across the park, so
-  // `runOpen` stayed true and the composer showed "working…" (with a live Stop)
-  // under a card asking the reviewer for a decision.
+  // Codex holds its app-server turn open across the park, so `runOpen` stays
+  // true. The composer must not show "working…" under a card that asks the
+  // reviewer for a decision.
   test("a session awaiting a plan decision is not running", () => {
     const { isRunning } = buildMessages(
       indexed([
@@ -2399,8 +2395,8 @@ describe("buildMessages — a WINDOWED transcript (lib/sessionWindow.ts)", () =>
     ]);
   });
 
-  test("the summary fallback keeps the 68c70a65 inversion intact — one bubble, full text", () => {
-    // run_started BEFORE its echo (prod 68c70a65). The pre-scanned echo still
+  test("the summary fallback keeps the forward-before-echo inversion intact — one bubble, full text", () => {
+    // run_started BEFORE its echo. The pre-scanned echo still
     // wins over the summary, and the ADR 0108 trailing render must not add a
     // second bubble for the same prompt_id (the duplicate-id crash).
     const { messages } = buildMessages(

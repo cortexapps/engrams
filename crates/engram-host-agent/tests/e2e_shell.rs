@@ -14,11 +14,8 @@
 //!     `open_shell_tunnel_at(...)` (direct `dial_ip` dial) →
 //!     WS-frame round-trip with ttyd.
 //!
-//! That's the path prod session 5c8d0ce5 (2026-05-20) silently
-//! broke on: `PooledBackend.start_shell` was using the trait
-//! default `Ok(7681)` because the impl block was missing the
-//! forward to its inner FC backend. None of the existing tests
-//! went through `PooledBackend`; this one does.
+//! This test goes through `PooledBackend`, so a missing
+//! `start_shell` forward (the trait default `Ok(7681)`) fails it.
 //!
 //! Coverage matrix:
 //!   - shell_cold: cold-created FC sandbox, dial from host root.

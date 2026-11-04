@@ -257,13 +257,9 @@ async fn flip_missing(
     // ADR 0068 probe-before-host_lost: before flipping on nothing but
     // absence from the host's self-reported `running_sandboxes`, ask
     // the host directly whether the VMM process for THIS sandbox is
-    // actually alive. Rescues the fbd3794c incident shape (a provably-
-    // alive VM — in-guest uptime + a surviving marker file — declared
-    // `host_lost` and "resumed" 8 times in 12 minutes while the host
-    // was reachable the entire time): the desync producing a stale
-    // `running_sandboxes` list belongs to epic-binding-epoch-delivery;
-    // this is the belt that stops the coordinator killing sessions
-    // over it. A probe error (RPC unreachable, or `Unsupported` from
+    // actually alive. A stale `running_sandboxes` list must not make
+    // the coordinator declare a live VM `host_lost` and resume it over
+    // and over while the host stays reachable. A probe error (RPC unreachable, or `Unsupported` from
     // an old host-agent mid-roll with no `ProbeSandbox` handler yet)
     // falls through to the flip unchanged — only an explicit
     // `process_alive == true` answer rescues.
@@ -538,7 +534,7 @@ mod tests {
     /// wildcard-free so a new `SessionState` variant is a compile error
     /// here, not a silent inherit. The e2e stack caught the cost of
     /// getting this wrong in both directions: Active-only missed
-    /// vanished parked VMs (61a03b7e audit finding 3); every-resident
+    /// vanished parked VMs; every-resident
     /// struck the ADR 0101 C post-capture `Evicting` window and flipped
     /// clean evictions to HostLost.
     #[test]

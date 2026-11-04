@@ -61,8 +61,7 @@ export interface BuiltinToolDeps {
 // One flat object schema, NOT a discriminated union: the claude CLI
 // requires every MCP tool's inputSchema to be a top-level
 // `type: "object"` JSON Schema, and rejects the WHOLE tools/list when
-// one tool emits an `anyOf` (session 3acf9bd1 — every injected tool
-// vanished). Per-action requirements live in the refinement so a bad
+// one tool emits an `anyOf`, so every injected tool vanishes. Per-action requirements live in the refinement so a bad
 // call still names the missing field.
 const ArtifactActionSchema = z
   .object({
@@ -305,8 +304,8 @@ export function registerBuiltinTools(registry: ToolRegistry = tools, deps?: Buil
             };
             if (args.include_content) {
               // The reliable in-guest read: raw_url points at the
-              // browser-facing origin, which a sandbox may not reach
-              // (papercut, session c60ac26c) — so hand the source back
+              // browser-facing origin, which a sandbox may not reach,
+              // so hand the source back
               // through the tool instead.
               const wanted = args.version ?? row.currentVersion;
               const vrow = row.versions.find((v) => v.version === wanted);

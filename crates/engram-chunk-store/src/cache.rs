@@ -549,8 +549,7 @@ type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
 /// the slot — holding the leader's own sender — lingers forever and
 /// every waiter (and every later `get` for this hash, which joins the
 /// orphaned slot) blocks on a broadcast that never comes. That poisons
-/// the host's chunk cache (prod incident: session 9f82064b wedged every
-/// resume retry). This guard removes the slot on drop, dropping its
+/// the host's chunk cache and wedges every resume retry. This guard removes the slot on drop, dropping its
 /// senders so waiters observe `RecvError` and retry as a fresh leader.
 /// The leader disarms it once it has removed the slot itself.
 struct LeaderGuard<'a> {
@@ -1791,8 +1790,8 @@ impl ChunkCache {
         // sweeper can't evict (today: the per-image base memfiles that File
         // restores read). The static ceiling was derived assuming the cache
         // owns its disk fraction outright, so an unbudgeted 40 GB co-tenant
-        // silently authorizes overshooting the kubelet eviction line (the
-        // 2026-07-14 w8wq DiskPressure incident). Subtract whatever the
+        // silently authorizes overshooting the kubelet eviction line.
+        // Subtract whatever the
         // co-tenants currently claim so the cache *aims* below it — the
         // statvfs floor stays the independent backstop.
         let reserved = self
@@ -2851,7 +2850,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_leader_does_not_poison_the_inflight_slot() {
-        // Regression for the single-flight poison (prod: session 9f82064b).
+        // Regression for the single-flight poison.
         // A leader cancelled mid-fetch (FC `load_snapshot` 60 s timeout tears
         // down the restore) must clean its slot so a later `get` for the same
         // hash leads a fresh fetch instead of wedging forever as a waiter.

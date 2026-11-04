@@ -891,8 +891,7 @@ impl GrpcHostClient {
         // the host-side SpawnHarness round-trip can wedge (guest page-in
         // starvation, a dead rootfs device that never answers agentd), and
         // without a `grpc-timeout` header the coordinator's resume `finish`
-        // step inherits the hang unbounded (prod 2026-07-17 session
-        // 03e6535e: a 34-minute stall ended only by a pod roll). The host
+        // step inherits the hang unbounded. The host
         // reattach is idempotent, so a timed-out attempt that the op
         // executor retries reconciles cleanly rather than double-spawning.
         req.set_timeout(restore_rpc_timeout());

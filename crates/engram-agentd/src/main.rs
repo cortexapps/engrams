@@ -53,9 +53,7 @@ fn main() -> ExitCode {
     // agentd is pid 1 with stdout on /dev/console. After an FC snapshot
     // restore nothing drains the emulated serial port, so once the TTY
     // output buffer fills, a blocking write to the console wedges the
-    // writing thread FOREVER (prod incident 2026-06-03, session 5665bdd3:
-    // the harness froze mid-tracing-line and its prompt was never
-    // processed). Flip stdout to O_NONBLOCK before the first tracing line:
+    // writing thread FOREVER. Flip stdout to O_NONBLOCK before the first tracing line:
     // log writes to a full console then fail with EAGAIN and the fmt layer
     // drops them — lossy under pressure, but agentd (and /exec, eviction,
     // the flush path) stays alive. Cold-boot console logging is unaffected

@@ -279,9 +279,8 @@ pub const RECHUNK_BYTES_UPLOADED_TOTAL: &str = "engram_rechunk_bytes_uploaded_to
 pub const CAPTURE_LEG_SECONDS: &str = "engram_capture_leg_seconds";
 
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
-/// per-sandbox capture lock. The gridlock signal — the 5fadd364
-/// incident showed 52–151 s waits as captures queued behind a hung
-/// one. With B1 a periodic checkpoint skips rather than waits, so a
+/// per-sandbox capture lock. The gridlock signal: captures queued
+/// behind a hung one wait 52–151 s. With B1 a periodic checkpoint skips rather than waits, so a
 /// long tail here is an eviction/drain blocked on an in-flight capture.
 pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lock_wait_seconds";
 

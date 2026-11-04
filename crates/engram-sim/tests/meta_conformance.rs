@@ -3030,10 +3030,9 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 
     // A parked VM is RESIDENT: paused in place, sandbox bound, memory
-    // held. Every residency-derived surface must see it (the 2026-07-21
-    // 61a03b7e incident: the PG literal lists missed 'parked', so the
-    // parked survivor was invisible to the register-time rehydrate list
-    // and its paused VM was destroyed after a host-agent roll).
+    // held. Every residency-derived surface must see it. A status list that
+    // misses `parked` hides the VM from the register-time rehydrate list,
+    // and a host-agent roll then destroys the paused VM.
     assert!(
         meta.list_active_sessions()
             .await
@@ -5129,10 +5128,9 @@ async fn artifact_outlives_sessions(ctx: &Ctx) {
     assert_eq!(ctx.meta.artifact_usage(ghost).await.unwrap(), (1, 7));
 }
 
-/// Prod 2026-08-03 (session aa0829b0, 12 sessions/14d): a prompt sent
-/// to an idle session was appended before the un-park resume ran its
-/// rung-1 rewind, and the rewind tombstoned the user's own message —
-/// surfacing as a spurious `recovered_from_checkpoint{checkpoint_lag,
+/// A prompt sent to an idle session can append before the un-park resume
+/// runs its rung-1 rewind. A rewind that tombstones the user's own message
+/// surfaces as a spurious `recovered_from_checkpoint{checkpoint_lag,
 /// rolled_back: 1}`. The positive-provenance predicate makes user
 /// input un-tombstoneable by construction: the race is benign at every
 /// interleaving, and a clean idle resume (nothing but input past the

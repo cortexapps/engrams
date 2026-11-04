@@ -3630,7 +3630,7 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
 }
 
-/// #567 / prod session 8174b7aa: an agentd RPC recv that hits a bare
+/// #567: an agentd RPC recv that hits a bare
 /// early EOF (zero bytes back) is indistinguishable, on the wire,
 /// from agentd crashing mid-call -- but it's *exactly* what an older
 /// guest agentd produces when the host sends a `WireRequest` variant
@@ -5654,9 +5654,8 @@ impl SandboxBackend for FirecrackerBackend {
     /// port. Returns the bound port. ADR 0014 follow-up: replaces
     /// the prior assumption that the snapshot's in-VM init script
     /// would have ttyd bound by the time the host dialed — that
-    /// raced under warm restore (prod session 73fe33a3 saw
-    /// "Connection refused" 48s post-lease even though the VM had
-    /// been warm-running for 14 minutes).
+    /// races under warm restore and the dial gets "Connection
+    /// refused".
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or_else(|| {
@@ -6139,15 +6138,11 @@ impl SandboxBackend for FirecrackerBackend {
         // impossible to distinguish from — and structurally harmless
         // either way.
         //
-        // The round trip is bounded — per-attempt AND in total. The
-        // earlier shape carried NO deadline, keyed on a prod 299 s
-        // handshake that eventually succeeded under guest CPU/IO
-        // starvation during UFFD/NBD page-in. That reasoning let a single
-        // wedged exchange pin the caller unbounded: prod 2026-07-17
-        // (session 03e6535e) resumed a VM onto a dead rootfs device,
-        // agentd never answered the SpawnHarness read, and the
-        // coordinator's resume `finish` step hung for 34 minutes —
-        // bounded only by a deploy rolling the pod. Because SpawnHarness
+        // The round trip is bounded — per-attempt AND in total. With
+        // no deadline, one wedged exchange (a VM resumed onto a dead
+        // rootfs device, so agentd never answers the SpawnHarness read)
+        // hangs the coordinator's resume `finish` step until the pod
+        // rolls. Because SpawnHarness
         // is reattach-idempotent (above), a timeout is just another
         // retryable shape: the retry reconnects and `HarnessSupervisor::
         // spawn` reattaches whatever the earlier attempt actually

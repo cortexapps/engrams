@@ -1,16 +1,11 @@
 //! ADR 0073 phase 4: THE idle detector — the coordinator's PG-derived
 //! scanner, promoted from "L3 backstop" to the only detection plane.
 //!
-//! History: idle detection used to run twice — the host hub's
-//! in-memory TTL scan (soft `Idle` announcements + hard any-event
-//! silence, POSTed up as candidates) and this module's slow hard-TTL
-//! backstop, which existed precisely because the hub copy is lossy
-//! (detach/restart amnesia — prod 0782bea5 sat Active 8+ hours). The
-//! durable event log answers the same question without the amnesia
-//! class, and at the host tick's own cadence it matches the host
-//! detector's latency. So the hub scan, the candidates POST, and the
-//! backstop-vs-primary split are all deleted; what remains is this
-//! one scanner with the host detector's EXACT semantics:
+//! Detection reads the durable event log, not an in-memory hub scan:
+//! a hub copy forgets on detach or restart, and a session then stays
+//! Active for hours. At the host tick's cadence the log scan matches
+//! the host detector's latency. This one scanner has the host
+//! detector's EXACT semantics:
 //!
 //! - **soft TTL** (default 300s, `ENGRAM_IDLE_TTL_SECS`): newest event
 //!   is `harness_idle` and older than the TTL — the agent finished a

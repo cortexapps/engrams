@@ -187,7 +187,7 @@ impl HostView {
     }
     /// Drop the in-RAM local binding for a sandbox — models the post-roll
     /// survivor whose `PooledBackend` binding table died with the process
-    /// (ADR 0090 / 731df805). The VM stays live; reconcile must REPAIR the
+    /// (ADR 0090). The VM stays live; reconcile must REPAIR the
     /// binding from the coordinator, never reap.
     pub fn drop_binding(&self, id: SandboxId) {
         self.inner.lock().bindings.remove(&id);
@@ -479,9 +479,9 @@ impl CosimHost {
     // The REAL `BundleStore` (publish / materialize / sweep_unpinned) over
     // the SHARED blob bucket + this host's staged-bundle dir. The stamp is
     // the `current.json` analog; rotation models a node-assets roll staging
-    // a new bake. The 2026-08-10 incident's whole mechanism — attach the
-    // current generation at create, rotate the stamp, sweep the only copy,
-    // fail the capture's publish — is expressible through these ops.
+    // a new bake. These ops can express the sweep-before-publish failure:
+    // attach the current generation at create, rotate the stamp, sweep the
+    // only copy, fail the capture's publish.
 
     /// The staged-bundle dir (what the real `EvictionFinalizer` gets as
     /// `bundle_dir`).
@@ -892,8 +892,8 @@ impl CosimHost {
             disk_pending: vec![DiskRole::Root],
             // ADR 0035 amendment: the capture pins what the sandbox actually
             // has attached, so the REAL finalize's bundle-publish leg
-            // (`run_upload_blobs` → `BundleStore::publish`) runs — the exact
-            // leg the 2026-08-10 incident failed on.
+            // (`run_upload_blobs` → `BundleStore::publish`) runs (the leg a
+            // sweep-before-publish race breaks).
             aux_bundles,
             stage: FinalizeStage::Captured,
             attempts: 0,

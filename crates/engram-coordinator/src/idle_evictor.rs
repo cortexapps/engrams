@@ -378,8 +378,8 @@ pub(crate) async fn run_evict_pipeline(
     // (anything else). Without this, a coord-side flake leaves the
     // 4 GiB local snapshot dir + per-snapshot blob keys orphaned —
     // host-side `idle_evictor` re-POSTs the candidate on the next tick,
-    // a fresh SnapshotId is minted, and we leak ~4 GiB per retry. That
-    // was the failure on `engrams-fc-xngk` (25 dirs × 4 GiB in 13 min).
+    // a fresh SnapshotId is minted, and we leak ~4 GiB per retry, which
+    // fills a host disk in minutes.
     // ADR 0045 D5: for plain idle eviction (target Idle), split the
     // capture from the upload — the session is user-visibly Idle as soon
     // as the pause-side capture lands, and the chunk+upload runs in a
@@ -398,10 +398,10 @@ pub(crate) async fn run_evict_pipeline(
         // <100ms rather than pay a full 12.2s-p50 rebuild. The harness
         // PROCESS stays in RAM, but the vsock link does NOT survive a
         // long pause, and the hub can still advertise a stale handle
-        // at un-park — a forward then lands in a socket with no reader
-        // (prod 7eddce62). The ADR 0108 A8 attach-signal row recall +
-        // heartbeat disagreement repair bound that damage. Under real memory pressure this branch is
-        // skipped and the full eviction below runs (rung 4). Only the
+        // at un-park — a forward then lands in a socket with no reader.
+        // The ADR 0108 A8 attach-signal row recall + heartbeat
+        // disagreement repair bound that damage. Under real memory
+        // pressure this branch is skipped and the full eviction below runs (rung 4). Only the
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
         // parked, now forcing the full capture) — it must never re-park.
@@ -566,8 +566,7 @@ pub(crate) async fn run_evict_pipeline(
     // leg can run minutes; a coord↔PG partition that outlasts `RECLAIM_STALE`
     // lets a successor re-claim this session (bumping `current_epoch`) while
     // we're mid-capture. A plain INSERT here would land a phantom
-    // `recoverable` row a resume could pick (the 89f7984d durability-lie
-    // class), and we'd then issue `commit_snapshot` under the stale epoch.
+    // `recoverable` row a resume could pick (a durability lie), and we'd then issue `commit_snapshot` under the stale epoch.
     // `fenced_record_snapshot` writes NOTHING when the epoch has moved:
     match state
         .services
@@ -649,14 +648,11 @@ pub(crate) async fn run_evict_pipeline(
     // while the sandbox is still bound and its owner resolvable, and
     // BEFORE `unbind`/`destroy` below or the racing periodic-checkpoint
     // driver can `abort_prior_inflight_snapshot` the artifacts out from
-    // under the `recoverable = true` row we just wrote. The old
-    // placement (after destroy()) could NEVER succeed: destroy() plus
-    // the `sandbox_id = NULL` transition below make `resolve_owner`
-    // return NotFound, so commit no-op'd, the host kept the snapshot
-    // "in-flight", and the next checkpoint tick deleted
-    // state.bin/sidecar from BlobStorage while PG still advertised the
-    // snapshot as recoverable — bricking the resume. Prod incident
-    // 89f7984d (2026-06-04). Best-effort: a genuine host RPC failure
+    // under the `recoverable = true` row we just wrote. After
+    // destroy() and the `sandbox_id = NULL` transition, `resolve_owner`
+    // returns NotFound, the commit is a no-op, and the next checkpoint
+    // tick deletes state.bin/sidecar while PG still advertises the
+    // snapshot as recoverable — the resume is bricked. Best-effort: a genuine host RPC failure
     // here is rare and backstopped by resume-time blob verification
     // (see `api::snapshot::resume_from_idle`).
     if let Err(e) = state
@@ -685,7 +681,7 @@ pub(crate) async fn run_evict_pipeline(
     // pipeline's later `transition_session(Idle→Idle)` to fail
     // (state-machine rejects same-state), `abort_snapshot` to
     // fire spuriously, and the matched `pipeline completed` log
-    // never to appear. Validated on session 1edf09a3 (2026-05-24).
+    // never to appear.
     //
     // Reordering to PG-first means: by the time the host's next
     // heartbeat reports `running_sandboxes` missing this sandbox,
@@ -2027,9 +2023,8 @@ mod tests {
     /// ADR 0014 issue #1/#2 regression guard. When `record_snapshot`
     /// fails post-snapshot, the pipeline MUST call
     /// `host.abort_snapshot(sandbox_id)` before bubbling — without
-    /// this, the host leaks the per-snapshot dir (4 GiB on FC), which
-    /// is exactly the failure mode that filled `engrams-fc-xngk` in
-    /// 13 minutes.
+    /// this, the host leaks the per-snapshot dir (4 GiB on FC) on every
+    /// retry and fills its disk.
     #[tokio::test]
     async fn evict_op_aborts_snapshot_when_record_snapshot_fails() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2473,13 +2468,10 @@ mod tests {
 
     /// ADR 0034 durability regression guard. `commit_snapshot` MUST run
     /// while the sandbox is still bound — BEFORE `unbind`/`destroy`.
-    /// With the old ordering (commit after destroy), `resolve_owner`
-    /// returned NotFound, the host never cleared its in-flight tracking,
-    /// and the racing periodic-checkpoint driver
-    /// `abort_prior_inflight_snapshot`-ed the committed blobs out of
-    /// BlobStorage while PG still advertised the snapshot as
-    /// `recoverable=true` — bricking the resume (prod incident
-    /// 89f7984d). Asserts the call order snapshot → commit → destroy.
+    /// A commit after destroy finds no owner (`resolve_owner` returns
+    /// NotFound), the host never clears its in-flight tracking, and the
+    /// periodic-checkpoint driver aborts the committed blobs while PG
+    /// still advertises the snapshot as `recoverable=true`. Asserts the call order snapshot → commit → destroy.
     #[tokio::test]
     async fn evict_op_commits_before_destroy() {
         use std::sync::Arc as StdArc;

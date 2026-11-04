@@ -37,9 +37,8 @@ use crate::proto::SpawnHarnessRequest;
 /// with fds 0/1/2 on `/dev/console`, and after an FC snapshot restore
 /// nothing drains the emulated serial port — once the TTY output buffer
 /// fills, the next `write(2)` to the console blocks *forever*. A harness
-/// whose `tracing` output went to the console deadlocked mid-log-line in
-/// prod (session 5665bdd3, 2026-06-03): the prompt was never processed
-/// and the session sat "thinking" indefinitely. File writes can't block
+/// whose `tracing` output goes to the console deadlocks mid-log-line, and
+/// the session never processes its prompt. File writes can't block
 /// that way, and the log stays readable in-guest via `/exec`.
 const HARNESS_LOG_PATH: &str = "/var/log/engram/harness.log";
 

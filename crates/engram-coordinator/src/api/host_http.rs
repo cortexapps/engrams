@@ -273,8 +273,7 @@ pub async fn register(
     // ADR 0111: survivor egress recovery is host-local. The host
     // persists every applied policy beside its binding record and
     // rebuilds its proxy registry from those files at startup — the
-    // coordinator no longer re-pushes policies after a host restart
-    // (the 2026-07-13 dfa0face re-push watchdog is retired).
+    // coordinator does not re-push policies after a host restart.
 
     tracing::info!(
         host_id = %req.host_id,
@@ -532,15 +531,13 @@ pub async fn heartbeat(
         }
     }
 
-    // ADR 0068: persist BEFORE reconcile (was the reverse — see the
-    // git history on this handler). A heartbeat the coordinator
+    // ADR 0068: persist BEFORE reconcile. A heartbeat the coordinator
     // refuses to ack (5xx on persist failure, issue #231) must not
     // have ALREADY driven session flips from its `running_sandboxes`
     // payload — "Postgres is the authority" means reconcile can only
-    // act on a heartbeat that's actually landed. This closes one of
-    // the two candidate producers of the fbd3794c incident shape (the
-    // other, the dead-host detector's own probe, already gates
-    // correctly — see `dead_host.rs`).
+    // act on a heartbeat that's actually landed. (The dead-host
+    // detector's probe, the other path that flips sessions from host
+    // state, gates the same way — see `dead_host.rs`.)
     //
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
@@ -648,8 +645,8 @@ pub async fn heartbeat(
     // REPAIR now, not just an alarm. An Active session whose sandbox
     // the host reports RUNNING but not hub-ATTACHED has a delivery
     // hole: a forward into that hub reaches a socket with no reader,
-    // and the outbox row waits out the full ACK_TIMEOUT (prod
-    // 7eddce62). `harness_desync::run_once` recalls the waiting rows
+    // and the outbox row waits out the full ACK_TIMEOUT.
+    // `harness_desync::run_once` recalls the waiting rows
     // and enqueues the Deliver op directly; the decision logic lives
     // there — not here — so the DST swarm drives it without this HTTP
     // handler. Best-effort and deliberately coarse: sessions
@@ -1641,12 +1638,10 @@ pub async fn register_rehydrate_list_core(
         .collect())
 }
 
-/// ADR 0034: fast control-plane nomination. The pre-0034 handler ran
-/// the full snapshot pipeline inline here; a fat session's eviction
-/// (60-90s+) outlived the host's POST timeout, the connection drop
-/// cancelled the handler future mid-pipeline, and the eviction died
-/// silently (prod session 0782bea5 sat Active for 8+ hours). Now the
-/// handler only flips `Active → Evicting` — a single PG UPDATE — and
+/// ADR 0034: fast control-plane nomination. The snapshot pipeline must
+/// not run inline here: a fat session's eviction (60-90s+) outlives the
+/// host's POST timeout, the connection drop cancels the handler future
+/// mid-pipeline, and the eviction dies silently. The handler only flips `Active → Evicting` — a single PG UPDATE — and
 /// the eviction scanner (`idle_evictor::spawn_eviction_scanner`)
 /// drives the pipeline outside any request lifetime.
 ///

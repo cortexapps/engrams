@@ -203,8 +203,8 @@ service HostService {
   // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
   // for `reconcile::flip_missing` to check BEFORE flipping a session to
   // `host_lost` on nothing but absence from the host's self-reported
-  // `running_sandboxes` list (the fbd3794c incident shape — the host
-  // was reachable and the VM was alive the whole time). A proto
+  // `running_sandboxes` list (the host can be reachable and the VM
+  // alive while the list omits it). A proto
   // ADDITION is protobuf-compatible: an old host-agent mid-roll answers
   // `Unimplemented`, which the caller treats as "no probe available ⇒
   // proceed with the flip" — no WIRE_VERSION bump needed for this RPC
@@ -693,17 +693,12 @@ message CancelExecRequest {
 //
 // Wire shape: the coord opens the stream by sending exactly one
 // `ProxyShellOpen` carrying `sandbox_id`; subsequent messages from
-// either side are pure shell-frame variants. The earlier shape
-// (single `ProxyShellFrame` with a `bytes sandbox_id` populated only
-// on the first frame and a `ProxyShellKind` field that picked which
-// of `data`/`close_code`/`close_reason` were meaningful) was a flat
-// field-bag — the host receiver tried to "defensively forward" the
-// sentinel's empty payload as if it were a WS Binary frame, which
-// ttyd 1.7.8 treats as a protocol violation and TCP-RSTs (prod
-// session 8725648d on 2026-05-23). The oneof here makes every
+// either side are pure shell-frame variants. The oneof makes every
 // variant carry only its own meaningful fields, and makes Open a
-// distinct enum arm from any data variant so the bug class is
-// structurally impossible to express on either side.
+// distinct arm from any data variant. A receiver therefore cannot
+// forward an open sentinel's empty payload as a WS Binary frame,
+// which ttyd treats as a protocol violation (it resets the TCP
+// connection).
 
 message ProxyShellMessage {
   oneof body {

@@ -199,8 +199,8 @@ pub(crate) async fn snapshot_core(
     // but the host-side snapshot was never committed. The next periodic
     // checkpoint tick then `abort_prior_inflight_snapshot`s and deletes
     // this snapshot's `state.bin`/sidecar within one interval, leaving a
-    // `recoverable = true` row pointing at nothing — the exact 89f7984d
-    // phantom-snapshot state. Mirror the op-executor pattern: run the
+    // `recoverable = true` row pointing at nothing (a phantom snapshot).
+    // Mirror the op-executor pattern: run the
     // body in a `tokio::spawn`ed task that MOVES the op claim in, so the
     // capture always runs to a terminal arm regardless of the request's
     // fate, and the handler only awaits the JoinHandle to relay the result.
@@ -337,8 +337,8 @@ pub(crate) async fn snapshot_core(
                         // FENCE. This manual-snapshot claim can be reclaimed if a
                         // coord↔PG partition outlasts `RECLAIM_STALE` mid-capture;
                         // a plain insert would then land a phantom `recoverable=true`
-                        // row a resume could pick (the 89f7984d durability-lie
-                        // class). `Ok(false)` = fenced out → leave the row
+                        // row a resume could pick (a durability lie).
+                        // `Ok(false)` = fenced out → leave the row
                         // recoverable=false; the successor op owns the session.
                         match st
                             .services
@@ -1068,7 +1068,7 @@ pub(crate) async fn resume_from_idle(
     // stored `recoverable` flag is set at capture time and can go stale
     // — the eviction/checkpoint abort race deletes a committed
     // snapshot's `state.bin`/`sidecar.json` out from under a
-    // `recoverable = true` row (prod incident 89f7984d). Re-verifying at
+    // `recoverable = true` row. Re-verifying at
     // the point of use and falling back through the ADR-0028 checkpoint
     // chain means a single bricked row no longer dooms the session — it
     // self-heals to the previous good checkpoint. A demoted row is
@@ -1373,9 +1373,8 @@ pub async fn apply_rung1_rewind(
     // resumed behind events the user already saw). Expected to be small
     // and rare — genuine host death between checkpoints. WARN + an
     // alertable counter, labeled by cause, so a burst (or a large
-    // rolled_back) is visible without log spelunking: the 2026-07-21
-    // 61a03b7e incident rewound 93 events on a HEALTHY host and this
-    // path's INFO line was the only signal.
+    // rolled_back) is visible without log spelunking. A rewind on a
+    // HEALTHY host is a bug, and this signal is how it shows.
     ::metrics::counter!(
         crate::metrics::SESSION_REWOUND_EVENTS_TOTAL,
         "cause" => cause.as_str(),
@@ -1542,8 +1541,7 @@ pub(crate) async fn finish_resume_to_active(
 /// `(None, None)` for anything else — `materialize_state_if_missing`
 /// hard-errors on a missing blob, so a relocated restore must not be
 /// pointed at artifacts that were never uploaded (VZ disk-only /
-/// pre-chunk FC). See ADR 0028 (cross-host recovery) / incident
-/// 89f7984d.
+/// pre-chunk FC). See ADR 0028 (cross-host recovery).
 fn portable_blob_keys(
     id: engram_core::types::SnapshotId,
     memory_manifest: Option<&ManifestRef>,
@@ -1820,11 +1818,8 @@ async fn resume_from_fc_snapshot(
         // pass the (deterministic, id-derived) blob keys — a resume that
         // relocates to a host WITHOUT this snapshot's local dir then
         // materializes them from GCS instead of dying on a missing
-        // `manifest.json`. These were hardcoded `None` on the assumption
-        // that idle-resume stays same-host; prod incident 89f7984d
-        // disproved it (the self-heal fell back to a good checkpoint,
-        // but the resume landed on a non-capturing host and skipped
-        // materialization). `rootfs` is rebuilt from `disk_manifest`
+        // `manifest.json`. An idle resume can land on a host other than
+        // the one that captured it. `rootfs` is rebuilt from `disk_manifest`
         // chunks and `working_set` is a fresh-restore-only prefetch hint, so
         // both stay None.
         source_sandbox_id: None,
@@ -2293,7 +2288,7 @@ pub async fn verify_snapshot_recoverable(
 /// time and only checks the chunked manifests): this also HEADs the
 /// portable `state.bin` + `sidecar.json` blobs a memory-bearing FC
 /// snapshot restores from — exactly the blobs the eviction/checkpoint
-/// abort path deletes (prod incident 89f7984d), and which the stored
+/// abort path deletes, and which the stored
 /// `recoverable` flag does not re-check once it went stale. A few HEADs,
 /// cheap relative to the chunk prefetch a doomed restore would waste.
 async fn snapshot_artifacts_present(
@@ -2311,9 +2306,9 @@ async fn snapshot_artifacts_present(
         return true;
     };
     // Memory-bearing FC snapshot: re-verify the chunk manifests AND the
-    // portable state.bin + sidecar blobs the abort path deletes — the
-    // 89f7984d failure was exactly "manifests survived, state/sidecar
-    // did not, but the row still said recoverable=true".
+    // portable state.bin + sidecar blobs the abort path deletes: the
+    // manifests can survive while state/sidecar do not, and the row
+    // still says recoverable=true.
     if !verify_snapshot_recoverable(
         blob,
         record.disk_manifest.as_ref(),
@@ -2495,7 +2490,7 @@ mod recoverable_tests {
 
     #[tokio::test]
     async fn artifacts_present_false_when_sidecar_blob_deleted() {
-        // The 89f7984d failure mode: the chunked manifests survive
+        // The chunked manifests survive
         // (content-addressed, shared), but the abort path deleted the
         // per-snapshot state.bin/sidecar — so the `recoverable = true`
         // row is stale and the resume would die reading manifest.json.

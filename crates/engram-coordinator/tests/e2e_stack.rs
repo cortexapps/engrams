@@ -4,9 +4,8 @@
 //! The existing integration tests stop one layer short of the coord
 //! app-gRPC API: `e2e_harness.rs` and `e2e_shell.rs` drive `PooledBackend`
 //! directly; `ha_listener.rs` and friends use an in-proc `AppState`.
-//! That left the coord gRPC → host-agent → FC path uncovered, which is
-//! how prod session 8725648d's empty-Binary-frame bug shipped. This file
-//! covers the three core flows (ADR 0021 P1.3 wire shape):
+//! This file covers the coord gRPC → host-agent → FC path with three
+//! core flows (ADR 0021 P1.3 wire shape):
 //!
 //!   1. cold session with `mode = dev_vm` → `Exec ls` → assert stdout.
 //!      Harness in the image (if any) is left undriven.

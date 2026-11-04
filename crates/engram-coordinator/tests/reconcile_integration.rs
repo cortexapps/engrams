@@ -592,7 +592,7 @@ impl engram_core::traits::HostClient for ProbeBackend {
     }
 }
 
-/// ADR 0068 headline scenario — the fbd3794c incident shape: a
+/// ADR 0068 headline scenario: a
 /// sandbox that's genuinely alive (the probe says `process_alive =
 /// true`) but absent from the host's self-reported `running_sandboxes`
 /// for the full grace window must NOT flip to `host_lost`, and its

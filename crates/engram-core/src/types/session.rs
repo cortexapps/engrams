@@ -785,12 +785,7 @@ mod tests {
     /// and [`SessionState::host_memory_reserving_states`] promise: the
     /// typed matcher (every in-memory residency decision) and the
     /// string const (every SQL `status IN (…)` list, via
-    /// `reserving_states_sql`) must agree on every variant. This test
-    /// was CLAIMED by those docstrings long before it existed — the
-    /// 61a03b7e incident's PR routed all SQL through the const on the
-    /// strength of a guard nobody had written (engrams review on
-    /// PR #843). A drift between the two is now a test failure, not a
-    /// silent prod incident.
+    /// `reserving_states_sql`) must agree on every variant.
     #[test]
     fn reserving_states_match() {
         for s in all_states() {

@@ -6,8 +6,8 @@
 //! in the delivery path: `send_prompt` forwards into a socket with no
 //! reader, returns Ok, and the outbox row waits out the full
 //! ACK_TIMEOUT before the retry finds `NotFound` and re-establishes
-//! the harness (prod 7eddce62: a parked session un-parked in 120 ms,
-//! then stalled 35.5 s on exactly this shape). The repair recalls the
+//! the harness (a parked session that un-parks hits this shape). The
+//! repair recalls the
 //! session's waiting outbox rows (`outbox_make_due`) and enqueues a
 //! Deliver op directly, so recovery is bounded by the heartbeat
 //! cadence, not by the ack timeout.

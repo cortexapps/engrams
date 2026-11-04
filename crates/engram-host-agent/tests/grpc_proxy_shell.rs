@@ -1,12 +1,10 @@
 //! gRPC-layer integration test for `ProxyShell`.
 //!
-//! Closes the test gap that let the prod session 8725648d bug ship:
 //! `crates/engram-host-agent/tests/e2e_shell.rs` calls
-//! `proxy_shell::open_shell_tunnel_at` directly, bypassing the gRPC
-//! tunnel entirely. The bug lived in the gRPC server's
-//! `proxy_shell` handler — specifically a "defensively forward the
-//! first frame's payload" branch that turned the sandbox_id sentinel
-//! into an empty `Binary` WS frame to ttyd, which 1.7.8 TCP-RSTs on.
+//! `proxy_shell::open_shell_tunnel_at` directly and bypasses the gRPC
+//! tunnel. This test covers the gRPC server's `proxy_shell` handler,
+//! which must not forward the sandbox_id sentinel as an empty
+//! `Binary` WS frame to ttyd (ttyd 1.7.8 TCP-RSTs on it).
 //! This test stands up the real gRPC server with a stub HostClient
 //! and asserts the structural invariant the new schema enforces:
 //!
@@ -223,8 +221,8 @@ async fn proxy_shell_forwards_only_caller_frames_no_open_sentinel_leak() {
         ShellFrame::Binary(b) if b.is_empty() => {
             panic!(
                 "REGRESSION: gRPC server forwarded an empty Binary frame \
-                 before the caller's frame. This is the prod session \
-                 8725648d bug — ttyd 1.7.8 TCP-RSTs on this. The \
+                 before the caller's frame. ttyd 1.7.8 TCP-RSTs on \
+                 this. The \
                  ProxyShellMessage oneof was supposed to make this \
                  structurally impossible."
             );

@@ -2,7 +2,7 @@
 //!
 //! `engram-dst` drives the real coordinator drivers over `engram-sim` and
 //! never runs host-agent code, so the coordinator↔host boundary (where
-//! #570, #739, #602, #216, and 85e0298a all lived) is explored by nothing
+//! #570, #739, #602 and #216 all lived) is explored by nothing
 //! else. This crate is that boundary: rung 1 wires BOTH real sides against
 //! **one shared `SimClock` + `SimMetadataStore`** and fakes only the
 //! transport between them.

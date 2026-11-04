@@ -1,4 +1,4 @@
-//! ADR 0068 / issue #531 (PR #564 review, incident fbd3794c):
+//! ADR 0068 / issue #531:
 //! `FirecrackerBackend::probe_sandbox`'s map-vs-process DESYNC arm.
 //!
 //! `probe_sandbox` exists precisely because the in-memory `self.sandboxes`
@@ -110,7 +110,7 @@ fn write_manifest_pointing_at(work_dir: &std::path::Path, id: SandboxId, pid: u3
         .expect("write manifest");
 }
 
-/// The fbd3794c incident shape: `known_to_backend == false` (this
+/// The desync shape: `known_to_backend == false` (this
 /// `FirecrackerBackend` never `create()`d or reattached this sandbox — no
 /// map entry at all) while the manifest's recorded process is genuinely
 /// alive. `reconcile::flip_missing` must be able to tell this apart from

@@ -1498,8 +1498,7 @@ impl HarnessEventWriter {
             // from a forward into a dead link has no reason to
             // keep waiting. Without this recall the wake below
             // finds nothing due and no-ops; the row then sits out
-            // the full timeout (prod 7eddce62: 35.5 s after a
-            // 120 ms un-park).
+            // the full timeout.
             if let Err(e) = meta.outbox_make_due(session_id).await {
                 tracing::debug!(
                     session_id = %session_id,

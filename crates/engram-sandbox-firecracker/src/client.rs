@@ -895,13 +895,9 @@ struct FaultMessage {
 // VM will be unpaused on the next runtime tick, regardless of what
 // happened to the original future. On the happy path the guard's
 // `disarm` is called after the inline resume so we don't
-// double-resume.
-//
-// Surfaced on 2026-05-23 during the COW diagnostic spot-check on
-// session 96392fd3: 3 successful flushes on the host with 0 PG
-// snapshot rows, then a follow-up prompt that the harness never
-// processed — consistent with a partially-completed snapshot
-// pipeline leaving the VM stuck Paused.
+// double-resume. Without the guard, a partially-completed snapshot
+// pipeline leaves the VM Paused and the harness never processes
+// the next prompt.
 
 /// Defuse-on-success guard: if dropped while armed, spawns a
 /// detached `resume` so the VM doesn't stay paused on cancellation.

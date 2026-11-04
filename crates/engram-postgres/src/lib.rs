@@ -962,8 +962,8 @@ impl PostgresStore {
         // against a concurrent claim/reclaim CAS via `FOR UPDATE`). A
         // mismatch means the op executor was fenced by a successor's
         // re-claim: write NOTHING (a reclaimed-out predecessor must never
-        // land a phantom `recoverable` row a resume would pick — the
-        // 89f7984d durability-lie class) and return `Ok(None)`.
+        // land a phantom `recoverable` row a resume would pick) and return
+        // `Ok(None)`.
         if let Some(epoch) = fence {
             let session_id = snap.session_id.ok_or_else(|| {
                 MetaError::Serialization(
@@ -2755,7 +2755,7 @@ impl MetadataStore for PostgresStore {
         // `evicting` was missing, a roll mid-eviction dropped the session
         // from the active set, the scanner never re-picked it, and the
         // budget exhausted into a spurious HostLost with the VM still
-        // running (prod session 5cfb90b8, 2026-06-03). `parked` likewise
+        // running. `parked` likewise
         // holds a paused-in-place VM with its sandbox bound (ADR 0101 C).
         let sql = format!(
             r#"
@@ -3713,7 +3713,7 @@ impl MetadataStore for PostgresStore {
     async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
         // No `attempts` bump: this cancels a provably-pointless wait
         // (e.g. an ACK_TIMEOUT armed by a forward into a dead harness
-        // link, prod 7eddce62); it is not a delivery try, and a bump
+        // link); it is not a delivery try, and a bump
         // would inflate `failure_backoff` for the very retry being
         // made prompt. The `not_before > $2` predicate makes the call
         // idempotent across repeated heartbeats and never touches a
@@ -8192,8 +8192,8 @@ impl MetadataStore for PostgresStore {
         // state and fail `try_transition_to` with a bare `Conflict` (no
         // `fenced:` prefix) — callers matching `starts_with("fenced:")`
         // would drop to the generic Err arm and fire the compensation
-        // (`abort_inflight_snapshot`) that a fenced executor MUST NOT run
-        // (the 89f7984d brick class). Reading `current_epoch` in this same
+        // (`abort_inflight_snapshot`) that a fenced executor MUST NOT run.
+        // Reading `current_epoch` in this same
         // FOR UPDATE row and returning `Ok(None)` on a mismatch makes
         // epoch-staleness the silent-stop path regardless of the
         // successor's resulting state.

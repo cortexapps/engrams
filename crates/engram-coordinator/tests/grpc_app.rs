@@ -1272,10 +1272,9 @@ async fn session_list_events_windows_backward_and_filters() {
 /// ADR 0105 end-to-end: `StreamEvents` must deliver a transcript LONGER
 /// than the replay page size over the real RPC.
 ///
-/// This is the prod regression from session
-/// `eafd98b5-f748-484e-a27b-ed6de8343204`: the replay took ONE capped page
-/// and every event behind it became unreachable — not returned by the read
-/// (past the limit) and not on the live bus (already published). The web
+/// Failure mode: if the replay takes ONE capped page, every event behind it
+/// becomes unreachable: not returned by the read (past the limit) and not
+/// on the live bus (already published). The web
 /// transcript, Slack and every CLI watcher share this RPC, so the coverage
 /// belongs at the transport, not just on the merge function.
 ///

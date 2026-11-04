@@ -29,7 +29,7 @@ pub struct SimHostState {
     /// verbs STALL (ADR 0098 coverage-gap G1, the #743 op-wedge class).
     /// `Some(d)` = every RPC on this host sleeps `d` of virtual time
     /// before answering — above the verb's `op_deadline` this is the
-    /// 03e6535e wedge (the within-step heartbeat keeps the op row fresh
+    /// op wedge (the within-step heartbeat keeps the op row fresh
     /// while the dispatch never returns; only the tokio-timer deadline
     /// unwedges it), below it a plain delay. Replaces the fail-fast
     /// `rpc_partitioned` flag that was toggled but never read.
@@ -103,7 +103,7 @@ pub struct QueuedEffect {
 /// dials its vsock connection 50–200 ms AFTER `start_agent` returns, and
 /// the host hub answers `send_prompt` `NotFound` until the registration
 /// lands. Pre-0108 the sim collapsed the two into one atomic condition
-/// (`send_prompt` succeeded whenever the host was up), so the 2026-07-31
+/// (`send_prompt` succeeded whenever the host was up), so the
 /// boot/attach race class was structurally invisible.
 #[derive(Debug, Clone)]
 pub enum HarnessPhase {
@@ -120,7 +120,7 @@ pub enum HarnessPhase {
     },
     /// Registered on the hub: `send_prompt` succeeds.
     Attached,
-    /// ADR 0108 A8 (prod 7eddce62, the fourth stall shape): the link is
+    /// ADR 0108 A8 (the fourth stall shape): the link is
     /// DEAD but the hub has not reaped the handle yet. The hub view
     /// ([`SimHostWorld::harness_attached`]) still reports it attached,
     /// so a heartbeat counts it in the `attached` set and `send_prompt`
@@ -519,7 +519,7 @@ impl SimHostWorld {
         self.attach.lock().reap_window = window;
     }
 
-    /// The long-pause severance fault (prod 7eddce62): kill the harness
+    /// The long-pause severance fault: kill the harness
     /// link of an ATTACHED sandbox while the hub keeps advertising the
     /// handle. Returns `true` if the handle went Stale. Only `Attached`
     /// can go stale — a dial has no established link to sever, and a
@@ -708,7 +708,7 @@ impl SimHostWorld {
 
     /// The HUB's advertised view: does it hold a registered handle for
     /// this sandbox? A `Stale` handle IS attached here — the hub has
-    /// not noticed the dead link yet, which is the whole 7eddce62
+    /// not noticed the dead link yet, which is the whole stale-link
     /// shape: the heartbeat `attached` set carries it, `send_prompt`
     /// is accepted, and the attach-disagreement oracle stays quiet
     /// until the reap opens the window (as in prod, where the alarm
@@ -769,7 +769,7 @@ impl SimHostWorld {
     /// `Attached` accepts and records the prompt for the pump's
     /// `run_started` echo (the confirming event that retires the outbox
     /// row). `Stale` ACCEPTS (the hub still advertises the handle —
-    /// `Ok` into a socket with no reader, prod 7eddce62) but records
+    /// `Ok` into a socket with no reader) but records
     /// NOTHING: no echo ever follows. Dialing/absent answer `NotFound`.
     fn hub_accept_prompt(
         &self,

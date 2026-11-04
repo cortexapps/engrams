@@ -107,13 +107,9 @@ impl HttpCoordClient {
             // activity) but ensures slower lanes always pick a fresh
             // connection. Per-request overhead is one TCP connect
             // (~5-10ms over the internal LB) — negligible against
-            // the workload.
-            //
-            // Surfaced on 2026-05-23 during the COW diagnostic
-            // spot-check on session 96392fd3: the host's
-            // idle-eviction POSTs failed with `transport error`
-            // while heartbeats on the same `HttpCoordClient` succeeded.
-            // Diagnosis: stale pool connection, exactly this class.
+            // the workload. Without it, a slow lane picks a stale
+            // pooled connection and fails with `transport error` while
+            // heartbeats on the same client succeed.
             .pool_idle_timeout(Some(Duration::from_secs(10)))
             .timeout(Duration::from_secs(30))
             .build()

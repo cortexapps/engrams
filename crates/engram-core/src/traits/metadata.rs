@@ -1376,7 +1376,7 @@ pub trait MetadataStore: Send + Sync {
     /// for a session back to due (`not_before := now`), for when fresh
     /// evidence (an attach signal, a heartbeat disagreement) proves the
     /// wait is pointless — e.g. a row waiting out `ACK_TIMEOUT` after a
-    /// forward into a dead harness link (prod 7eddce62). Returns the
+    /// forward into a dead harness link. Returns the
     /// number of rows moved. Two REQUIRED properties: (a) `attempts` is
     /// NEVER bumped — this cancels a provably-pointless wait, it is not
     /// a delivery try, and a bump would inflate `failure_backoff` for
@@ -1903,7 +1903,7 @@ pub trait MetadataStore: Send + Sync {
     /// Returns `Ok(false)` when the op executor has been fenced by a
     /// successor's re-claim (the epoch moved) — NOTHING is written, so a
     /// reclaimed-out predecessor can never land a phantom `recoverable` row
-    /// a resume would later pick (the 89f7984d durability-lie class). The
+    /// a resume would later pick. The
     /// op-driven capture sites (idle eviction, manual snapshot) use this
     /// instead of the plain insert; the host-heartbeat reconcile and
     /// image-enable base captures keep [`record_snapshot`] (not op-fenced).

@@ -36,8 +36,8 @@ const MIB: u64 = 1024 * 1024;
 /// a percent of the filesystem (0-100) — the line
 /// [`metrics::HOST_DISK_HEADROOM_TO_KUBELET_BYTES`] measures distance
 /// to. Default 10 matches GKE's documented `nodefs.available < 10%`
-/// default and is consistent with the 611v prod incident's arithmetic
-/// (31,259,425,233 B free at eviction ≈ 10.5% of a 298.1 GB disk).
+/// default and matches an observed eviction at ≈ 10.5% free of a
+/// 298.1 GB disk.
 ///
 /// TODO(ADR 0070): this is a placeholder pending confirmation against
 /// the actual nodepool/kubelet config in the engrams-internal deploy

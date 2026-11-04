@@ -113,8 +113,7 @@ async fn evicting_round_trip_counter_and_sweep() {
 /// (ADR 0047, no in-memory registry). When `evicting` was missing from
 /// the status filter, a coord roll mid-eviction dropped the session
 /// from the active set; the scanner never re-picked it and the budget
-/// exhausted into a spurious HostLost with the VM still running
-/// (prod session 5cfb90b8, 2026-06-03).
+/// exhausted into a spurious HostLost with the VM still running.
 #[tokio::test]
 #[ignore]
 async fn evicting_sessions_listed_active_with_binding() {
