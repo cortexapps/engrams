@@ -34,6 +34,7 @@ use engram_chunk_store::{
     store::ChunkStore,
 };
 use engram_core::types::manifest::ManifestRef;
+use engram_host_core::disk::punch_hole;
 use engram_host_core::DeviceSync;
 use tokio::sync::{Mutex, Notify};
 
@@ -1003,43 +1004,6 @@ fn write_all_at_inner(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io
         bytes = &bytes[written..];
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn punch_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
-    // SAFETY: fallocate changes allocation metadata for an owned file
-    // descriptor. The offset and length are within the file size.
-    let result = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset as libc::off_t,
-            length as libc::off_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn punch_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
-    let mut request = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: offset as libc::off_t,
-        fp_length: length as libc::off_t,
-    };
-    // SAFETY: fcntl reads the initialized request and changes allocation
-    // metadata for an owned file descriptor.
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut request) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// Public data plane. One per FC sandbox.
