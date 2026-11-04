@@ -463,7 +463,32 @@ pub async fn fork_lineage(chunk_store: &ChunkStore, image: ManifestRef) -> Manif
     lineage
 }
 
-/// Session volumes over a file-backed disk under `work`: the shape the
+/// The session disk a pool-aware test runs over: the dm-thin pool
+/// `ENGRAM_TEST_THIN_POOL` names (Linux, root), else sparse files under
+/// `work`.
+pub async fn session_disk(work: &Path) -> std::sync::Arc<dyn engram_host_core::SessionDisk> {
+    #[cfg(target_os = "linux")]
+    if let Ok(pool) = std::env::var("ENGRAM_TEST_THIN_POOL") {
+        return std::sync::Arc::new(
+            engram_disk_thin::ThinPoolDisk::open(
+                &pool,
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+                Path::new("/dev/engram-test"),
+            )
+            .await
+            .expect("open the thin pool"),
+        );
+    }
+    std::sync::Arc::new(
+        engram_host_core::FileDisk::new(
+            work.join("volumes"),
+            engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+        )
+        .expect("file disk"),
+    )
+}
+
+/// Session volumes over sparse files under `work`: the shape the
 /// host-agent runs with no dm-thin pool.
 pub fn session_volumes(
     work: &Path,

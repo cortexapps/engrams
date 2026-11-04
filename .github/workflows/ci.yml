@@ -1152,30 +1152,30 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # ADR 0125: the session-disk pool. Built by the same script
-      # node-prep runs in production; the kernel's dm_thin_pool module
-      # decides availability, so the gate is the active pool, not the
-      # modprobe exit code.
+      # ADR 0125: the session-disk pool, built by the same script
+      # node-prep runs in production. A runner that cannot build one
+      # fails the lane: the pool tests are the production disk path.
       - name: Build the dm-thin pool
-        id: thin_pool
         run: |
           sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
-          if sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=2G POOL_META_SIZE=128M \
-               sh deploy/helm/engram-host-fleet/files/thin-pool.sh; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=dm-thin unavailable::thin-pool.sh failed on this runner — dm-thin disk tests skipped."
-          fi
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
 
+      # The disk over the pool, then the session disk under a real guest
+      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
       - name: dm-thin session-disk tests (root)
-        if: steps.thin_pool.outputs.available == 'true'
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test session_disk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
