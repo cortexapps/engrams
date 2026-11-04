@@ -694,9 +694,9 @@ mod tests {
 
     #[async_trait]
     impl SandboxBackend for MockBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             self.create_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SandboxId::new())
+            Ok(())
         }
         async fn exec_stream(
             &self,
@@ -711,7 +711,7 @@ mod tests {
         fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
             PathBuf::new()
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -731,7 +731,8 @@ mod tests {
             progress: tokio::sync::mpsc::Sender<CaptureProgress>,
         ) -> Result<engram_core::types::capture_job::CaptureJobResult, SandboxError> {
             let _ = req;
-            let id = self.create(live_spec("mock")).await?;
+            let id = SandboxId::new();
+            self.create(id, live_spec("mock")).await?;
             let _ = progress
                 .send(CaptureProgress {
                     phase: engram_core::types::CapturePhase::Boot,

@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -209,7 +210,8 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
     let session_id = engram_core::SessionId::new();
     pooled_a.bind_session(session_id, sandbox);
 
@@ -345,8 +347,9 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         paused_at: Some(checkpoint.paused_at),
         peer_hints: Vec::new(),
     };
-    let restored = pooled_b
-        .restore(metadata)
+    let restored = SandboxId::new();
+    pooled_b
+        .restore(restored, metadata)
         .await
         .expect("restore from the redriven eviction-final checkpoint");
     let out = exec(

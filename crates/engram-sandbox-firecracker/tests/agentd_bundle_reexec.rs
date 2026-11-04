@@ -34,6 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::{AgentRefresh, SandboxBackend};
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{
     AuxRoDrive, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
@@ -157,7 +158,8 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         swap_source: None,
         swap_manifest: None,
     };
-    let original = backend.create(spec).await.expect("create");
+    let original = SandboxId::new();
+    backend.create(original, spec).await.expect("create");
 
     // Property 1: the guest runs the v1 generation, staged from the bundle.
     let booted = exec_sh(&backend, original, "cat /run/engram/agentd.sha256").await;
@@ -186,8 +188,10 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         .exists());
 
     // ---- 5. Fresh restore pinning v2, then RefreshAgent ----
-    let restored = backend
+    let restored = SandboxId::new();
+    backend
         .restore_fresh(
+            restored,
             metadata,
             vec![AuxRoDrive {
                 drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::AGENTD_SLOT_INDEX),

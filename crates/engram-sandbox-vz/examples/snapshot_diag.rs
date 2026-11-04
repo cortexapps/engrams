@@ -98,6 +98,7 @@ async fn run_scenario(
 ) {
     use engram_core::traits::SandboxBackend;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+    use engram_core::SandboxId;
     use std::collections::HashMap;
 
     let cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
@@ -130,13 +131,11 @@ async fn run_scenario(
     };
 
     eprintln!("[diag] backend.create — booting VM");
-    let id = match backend.create(spec).await {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("create failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let id = SandboxId::new();
+    if let Err(e) = backend.create(id, spec).await {
+        eprintln!("create failed: {e}");
+        std::process::exit(1);
+    }
     eprintln!("[diag] sandbox_id={id}; sleeping 5s for boot to settle");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -202,8 +201,9 @@ async fn run_scenario(
         eprintln!("[diag] reconstructing fresh VzBackend; calling restore");
         let cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
         let backend = engram_sandbox_vz::VzBackend::new(work_dir, cfg).expect("backend rebuild");
-        match backend.restore(snap_metadata.clone()).await {
-            Ok(new_id) => {
+        let new_id = SandboxId::new();
+        match backend.restore(new_id, snap_metadata.clone()).await {
+            Ok(()) => {
                 eprintln!("[diag] restore ok! new_id={new_id}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let _ = backend.destroy(new_id).await;
@@ -216,8 +216,9 @@ async fn run_scenario(
     } else {
         eprintln!("[diag] same-instance restore: destroying then restoring on same backend");
         let _ = backend.destroy(id).await;
-        match backend.restore(snap_metadata).await {
-            Ok(new_id) => {
+        let new_id = SandboxId::new();
+        match backend.restore(new_id, snap_metadata).await {
+            Ok(()) => {
                 eprintln!("[diag] same-instance restore ok! new_id={new_id}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let _ = backend.destroy(new_id).await;

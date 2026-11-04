@@ -92,7 +92,7 @@ struct SurvivorInner {
 
 #[async_trait]
 impl SandboxBackend for SurvivorInner {
-    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec("unused".into()))
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -112,8 +112,8 @@ impl SandboxBackend for SurvivorInner {
             .then(|| self.rootfs_dev.clone())
             .flatten()
     }
-    async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        Ok(self.survivor)
+    async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
+        Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
         Ok(())
@@ -273,8 +273,10 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         peer_hints: Default::default(),
         working_set_blob_key: None,
     };
-    let restored = pooled_a.restore(metadata).await.expect("gen A restore");
-    assert_eq!(restored, sandbox_id);
+    pooled_a
+        .restore(sandbox_id, metadata)
+        .await
+        .expect("gen A restore");
     let marker = vec![0xABu8; 4096];
     let backend_a = pooled_a
         .__test_nbd_backend(sandbox_id)

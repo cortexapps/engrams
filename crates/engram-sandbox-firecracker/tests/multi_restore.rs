@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -87,7 +88,11 @@ async fn serial_restore_from_one_canonical_n_times() {
     };
 
     // Step 1: Create source + let it settle + snapshot + destroy.
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
@@ -107,8 +112,9 @@ async fn serial_restore_from_one_canonical_n_times() {
     // `snapshot.rs` round-trip test works around).
     let mut seen_ids = std::collections::HashSet::new();
     for i in 0..N {
-        let id = backend
-            .restore(metadata.clone())
+        let id = SandboxId::new();
+        backend
+            .restore(id, metadata.clone())
             .await
             .unwrap_or_else(|e| panic!("restore iter {i}: {e}"));
         assert!(
@@ -182,7 +188,11 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
         swap_manifest: None,
     };
 
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
@@ -191,8 +201,9 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
     // All N restores live simultaneously.
     let mut ids = Vec::new();
     for i in 0..N {
-        let id = backend
-            .restore(metadata.clone())
+        let id = SandboxId::new();
+        backend
+            .restore(id, metadata.clone())
             .await
             .unwrap_or_else(|e| panic!("concurrent restore {i}: {e}"));
         ids.push(id);
@@ -288,7 +299,11 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
         swap_manifest: None,
     };
 
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
@@ -300,14 +315,15 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     for i in 0..OVERLAP_N {
         let b = backend.clone();
         let md = metadata.clone();
+        let id = SandboxId::new();
         handles.push(tokio::spawn(async move {
-            (i, SandboxBackend::restore(b.as_ref(), md).await)
+            (i, id, SandboxBackend::restore(b.as_ref(), id, md).await)
         }));
     }
     let mut ids = Vec::new();
     for h in handles {
-        let (i, res) = h.await.expect("join restore task");
-        let id = res.unwrap_or_else(|e| panic!("overlapping restore {i} failed: {e}"));
+        let (i, id, res) = h.await.expect("join restore task");
+        res.unwrap_or_else(|e| panic!("overlapping restore {i} failed: {e}"));
         ids.push(id);
     }
 

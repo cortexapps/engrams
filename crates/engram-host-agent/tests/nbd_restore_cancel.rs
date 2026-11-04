@@ -110,16 +110,13 @@ fn preflight() -> Option<PathBuf> {
 }
 
 /// Mock inner FC backend whose `restore` blocks on a barrier so the test can
-/// drop the caller's future while the restore body is in-flight. Records the
-/// id it returned so the test can assert it registered in `nbd_sandboxes`.
+/// drop the caller's future while the restore body is in-flight.
 struct BarrierInner {
     staging_root: PathBuf,
     /// Fires when `restore` has been entered (the NBD attach already ran).
     entered: Arc<Notify>,
     /// `restore` waits on this before returning.
     release: Arc<Notify>,
-    /// The id `restore` will return (so the test can look it up).
-    restored_id: SandboxId,
 }
 
 impl BarrierInner {
@@ -130,7 +127,7 @@ impl BarrierInner {
 
 #[async_trait]
 impl SandboxBackend for BarrierInner {
-    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec("unused".into()))
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -147,12 +144,12 @@ impl SandboxBackend for BarrierInner {
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
         true
     }
-    async fn restore(&self, _meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
         // The NBD daemon is already serving /dev/nbdN and the sidecar is
         // patched to it by now — exactly the window the bug lives in.
         self.entered.notify_one();
         self.release.notified().await;
-        Ok(self.restored_id)
+        Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
         Ok(())
@@ -229,7 +226,6 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
         staging_root,
         entered: entered.clone(),
         release: release.clone(),
-        restored_id,
     });
     let inner_dyn: Arc<dyn SandboxBackend> = inner;
 
@@ -271,7 +267,7 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
     let entered_wait = entered.notified();
     let handle = {
         let pooled = pooled.clone();
-        tokio::spawn(async move { pooled.restore(metadata).await })
+        tokio::spawn(async move { pooled.restore(restored_id, metadata).await })
     };
     // Wait until the (fix: detached) inner.restore is in-flight past the NBD
     // attach. Bound it so a hang fails the test rather than wedging CI.

@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 use engram_storage_local::LocalBlobStorage;
@@ -168,7 +169,8 @@ async fn file_backend_siblings_share_clean_pages() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     // If the guest didn't survive to be snapshotted, the FC API socket
     // is gone (panic=1 reboot=k → KVM reset → FC exits) and we'd get a
@@ -197,8 +199,9 @@ async fn file_backend_siblings_share_clean_pages() {
     let mut vms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = match backend.restore(metadata.clone()).await {
-            Ok(id) => id,
+        let id = SandboxId::new();
+        match backend.restore(id, metadata.clone()).await {
+            Ok(()) => {}
             Err(e) => {
                 dump_fc_logs(work.path());
                 for v in &vms {
@@ -328,7 +331,8 @@ async fn file_backend_base_create_shares_residency_memfile() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
@@ -381,8 +385,12 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let mut latencies_ms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
-            Ok(id) => id,
+        let id = SandboxId::new();
+        match backend
+            .restore_fresh(id, metadata.clone(), Vec::new())
+            .await
+        {
+            Ok(()) => {}
             Err(e) => {
                 dump_fc_logs(work.path());
                 for v in &vms {
@@ -525,7 +533,8 @@ async fn substrate_base_create_density_and_latency_parity() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
@@ -582,8 +591,12 @@ async fn substrate_base_create_density_and_latency_parity() {
         let mut latencies_ms = Vec::new();
         for i in 0..SIBLINGS {
             let t = Instant::now();
-            let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
-                Ok(id) => id,
+            let id = SandboxId::new();
+            match backend
+                .restore_fresh(id, metadata.clone(), Vec::new())
+                .await
+            {
+                Ok(()) => {}
                 Err(e) => {
                     dump_fc_logs(work_path);
                     for v in &vms {

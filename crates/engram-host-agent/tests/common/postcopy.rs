@@ -42,8 +42,9 @@ pub async fn base(
 }
 
 pub async fn fresh(pooled: &Arc<PooledBackend>, base: SnapshotMetadata) -> SandboxId {
-    let vm = pooled
-        .restore_fresh(base, Vec::new())
+    let vm = SandboxId::new();
+    pooled
+        .restore_fresh(vm, base, Vec::new())
         .await
         .expect("File-mode fresh create");
     assert!(

@@ -74,7 +74,9 @@ impl LocalHostClient {
 #[async_trait]
 impl HostClient for LocalHostClient {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        self.sandbox.create(spec).await
+        let id = SandboxId::new();
+        self.sandbox.create(id, spec).await?;
+        Ok(id)
     }
 
     // ADR 0079: the `fence` params below are checked by the gRPC
@@ -256,7 +258,9 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
-        self.sandbox.restore(metadata).await
+        let id = SandboxId::new();
+        self.sandbox.restore(id, metadata).await?;
+        Ok(id)
     }
 
     async fn materialize_image(
@@ -287,9 +291,11 @@ impl HostClient for LocalHostClient {
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        let id = SandboxId::new();
         self.sandbox
-            .restore_base_for_session(metadata, session_env, selected_mounts)
-            .await
+            .restore_base_for_session(id, metadata, session_env, selected_mounts)
+            .await?;
+        Ok(id)
     }
 
     async fn start_agent(

@@ -32,6 +32,7 @@ use std::time::Duration;
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::traits::BlobStorage;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
@@ -94,7 +95,8 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         swap_manifest: None,
     };
 
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
     // Wait for the kernel to actually start (banner on the serial console
     // funneled to firecracker.log) rather than sleeping a fixed worst-case.
     // Fails fast on a kernel panic; returns the instant the VM is up.
@@ -188,8 +190,9 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         paused_at: metadata.paused_at,
         peer_hints: Vec::new(),
     };
-    let restored_id = match backend.restore(restore_metadata).await {
-        Ok(id) => id,
+    let restored_id = SandboxId::new();
+    match backend.restore(restored_id, restore_metadata).await {
+        Ok(()) => {}
         Err(e) => {
             // The preserved jail dir lives under work_dir; dump every
             // *.log we find so a CI failure shows the full picture.
@@ -328,7 +331,8 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         swap_manifest: None,
     };
 
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
     // Wait for the kernel to actually start (banner on the serial console
     // funneled to firecracker.log) rather than sleeping a fixed worst-case.
     // Fails fast on a kernel panic; returns the instant the VM is up.
@@ -418,8 +422,9 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         paused_at: metadata.paused_at,
         peer_hints: Vec::new(),
     };
-    let restored_id = match backend.restore(restore_metadata).await {
-        Ok(id) => id,
+    let restored_id = SandboxId::new();
+    match backend.restore(restored_id, restore_metadata).await {
+        Ok(()) => {}
         Err(e) => {
             // The prod bug surfaced as exactly this error. Dump logs
             // and panic with a message that calls it out by name.

@@ -28,9 +28,9 @@ struct Inner {
 
 #[async_trait]
 impl SandboxBackend for Inner {
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, _: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         *self.spec.lock().unwrap() = Some(spec);
-        Ok(self.id)
+        Ok(())
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
         Err(SandboxError::InvalidSpec("no guest".into()))
@@ -78,19 +78,20 @@ impl SandboxBackend for Inner {
     fn rootfs_device(&self, _: SandboxId) -> Option<PathBuf> {
         Some(self.root.clone())
     }
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, _: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
         let bytes =
             std::fs::read(self.snapshot_path_for(metadata.id).join("manifest.json")).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         *self.spec.lock().unwrap() = Some(serde_json::from_value(value["spec"].clone()).unwrap());
-        Ok(self.id)
+        Ok(())
     }
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         _: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
-        self.restore(metadata).await
+    ) -> Result<(), SandboxError> {
+        self.restore(id, metadata).await
     }
     fn swap_device(&self, _: SandboxId) -> Option<PathBuf> {
         self.spec.lock().unwrap().as_ref()?.swap_source.clone()
@@ -383,7 +384,7 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
         swap_source: None,
         swap_manifest: None,
     };
-    pooled.create(spec).await.unwrap();
+    pooled.create(inner.id, spec).await.unwrap();
     let live = inner.spec.lock().unwrap().clone().unwrap();
     assert_ne!(live.rootfs_source, live.swap_source);
     let swap_ref = live.swap_manifest.unwrap();
@@ -414,7 +415,7 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     drop(file);
     pooled.destroy(id).await.unwrap();
     common::postcopy::wait_devices_free(&devices);
-    pooled.restore(captured.clone()).await.unwrap();
+    pooled.restore(inner.id, captured.clone()).await.unwrap();
     let swap = inner
         .spec
         .lock()
@@ -433,7 +434,7 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     common::postcopy::wait_devices_free(&devices);
     let mut base = captured;
     base.swap_manifest = None;
-    pooled.restore_fresh(base, vec![]).await.unwrap();
+    pooled.restore_fresh(inner.id, base, vec![]).await.unwrap();
     let swap = inner
         .spec
         .lock()

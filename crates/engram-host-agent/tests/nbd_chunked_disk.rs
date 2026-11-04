@@ -51,6 +51,7 @@ use std::time::Duration;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::{BlobStorage, SandboxBackend};
+use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::disk_daemon::{attach_manifest, NbdSlotAllocator};
@@ -321,9 +322,9 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     // an explicit error path either way.
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
-    let create_result = backend.create(spec).await;
-    let sandbox_id = match create_result {
-        Ok(id) => id,
+    let sandbox_id = SandboxId::new();
+    match backend.create(sandbox_id, spec).await {
+        Ok(()) => {}
         Err(e) => {
             // The FC backend currently runs an `is_dir()` check on
             // rootfs_source. A device file passes that check, but
@@ -458,8 +459,9 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let sandbox_id = pooled
-        .create(spec)
+    let sandbox_id = SandboxId::new();
+    pooled
+        .create(sandbox_id, spec)
         .await
         .expect("disk-only cold boot via rootfs_manifest override");
     eprintln!("BOOTED: fresh kernel on the evolved rootfs lineage, sandbox {sandbox_id}");

@@ -556,7 +556,7 @@ impl VzBackend {
         w: &crate::snapshot::WarmMachineState,
         rootfs_path: &Path,
         spec: &SandboxSpec,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // ADR 0112: the warm-restore config must match the SAVED device
         // shape, so the swap drive rides the warm block's recorded size
         // (never a recompute from today's spec). Contents are a FRESH
@@ -603,7 +603,7 @@ impl VzBackend {
             sandbox_id = %new_id,
             "vz: WARM restore — saved machine state resumed (memory intact, no cold boot)"
         );
-        Ok(new_id)
+        Ok(())
     }
 
     /// ADR 0061/0096: shared resume path — WARM (machine-state resume,
@@ -614,9 +614,10 @@ impl VzBackend {
     /// `None` (resume) keeps the snapshot's pinned drives.
     async fn restore_impl(
         &self,
+        new_id: SandboxId,
         metadata: SnapshotMetadata,
         mounts_override: Option<Vec<AuxRoDrive>>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         let src = self.snapshot_dir_for(metadata.id);
         let manifest = crate::snapshot::read_manifest(&src).await?;
         let warm_requested = mounts_override.is_none();
@@ -638,7 +639,6 @@ impl VzBackend {
             )));
         }
 
-        let new_id = SandboxId::new();
         tokio::fs::create_dir_all(&self.work_dir).await?;
         let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
 
@@ -672,7 +672,7 @@ impl VzBackend {
                         .try_warm_restore(new_id, &src, &w, &rootfs_path, &spec)
                         .await
                     {
-                        Ok(id) => return Ok(id),
+                        Ok(()) => return Ok(()),
                         Err(e) => {
                             tracing::warn!(
                                 snapshot_id = %metadata.id,
@@ -767,7 +767,7 @@ impl VzBackend {
                 guest_endpoints: Mutex::new(None),
             },
         );
-        Ok(new_id)
+        Ok(())
     }
 }
 
@@ -976,7 +976,7 @@ impl SandboxBackend for VzBackend {
         &self.cfg.bundle_dir
     }
 
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         warn_vz_soft_egress_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
@@ -1013,9 +1013,6 @@ impl SandboxBackend for VzBackend {
         // live.
         tokio::fs::create_dir_all(&self.work_dir).await?;
 
-        // Allocate the sandbox id up front so we can name the
-        // per-sandbox rootfs deterministically before VM init.
-        let id = SandboxId::new();
         let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, id);
 
         // APFS-clone the bake image into a per-sandbox rootfs.
@@ -1131,7 +1128,7 @@ impl SandboxBackend for VzBackend {
                 guest_endpoints: Mutex::new(None),
             },
         );
-        Ok(id)
+        Ok(())
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
@@ -1582,22 +1579,23 @@ impl SandboxBackend for VzBackend {
         self.snapshot_dir_for(snapshot_id)
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
         // Resume: keep the snapshot's pinned aux drives (manifest.spec).
-        self.restore_impl(metadata, None).await
+        self.restore_impl(id, metadata, None).await
     }
 
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         selected_mounts: Vec<AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // ADR 0061: fresh session create — the base snapshot is skill-
         // agnostic; bind this session's resolved skills into the VM's aux
         // drives. The PooledBackend calls this for `fresh == true`
         // (pooled_backend.rs restore_with); `selected_mounts` carry
         // `sha256 = Some` resolved against the host's current generation.
-        self.restore_impl(metadata, Some(selected_mounts)).await
+        self.restore_impl(id, metadata, Some(selected_mounts)).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {

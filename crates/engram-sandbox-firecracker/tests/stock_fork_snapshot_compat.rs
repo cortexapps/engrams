@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 
@@ -85,8 +86,9 @@ async fn round_trip(
     };
 
     // Create + snapshot with the first binary.
-    let original_id = creator
-        .create(spec)
+    let original_id = SandboxId::new();
+    creator
+        .create(original_id, spec)
         .await
         .unwrap_or_else(|e| panic!("{label}: create: {e:?}"));
     // Wait for the source VM to reach early boot before snapshotting — poll the
@@ -118,8 +120,9 @@ async fn round_trip(
     // Restore the very same snapshot with the OTHER binary. A wire-format skew
     // (the R2 risk) would surface here as a deserialize/magic/version error.
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let restored_id = match restorer.restore(metadata).await {
-        Ok(id) => id,
+    let restored_id = SandboxId::new();
+    match restorer.restore(restored_id, metadata).await {
+        Ok(()) => {}
         Err(e) => {
             // Dump firecracker.log (carries the guest console) for any preserved jail.
             for entry in std::fs::read_dir(work.path())

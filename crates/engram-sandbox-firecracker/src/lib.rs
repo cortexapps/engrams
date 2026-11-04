@@ -1304,11 +1304,11 @@ impl FirecrackerBackend {
     /// differently.
     async fn restore_with(
         &self,
+        sandbox_id: SandboxId,
         metadata: SnapshotMetadata,
         swap_aux_to_current: bool,
         selected_mounts: Vec<AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
-        // ADR 0007 Phase 6: backend looks up its own staging dir.
+    ) -> Result<(), SandboxError> {
         let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
             .await
@@ -1326,9 +1326,6 @@ impl FirecrackerBackend {
             )));
         }
 
-        // Always allocate a *fresh* sandbox id — same on-disk state,
-        // different lifecycle handle.
-        let sandbox_id = SandboxId::new();
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
         // ADR 0022: base-create (swap_aux_to_current) may use File; resume
         // follows restore_mode.
@@ -1357,7 +1354,7 @@ impl FirecrackerBackend {
             )
             .await
         {
-            Ok(()) => Ok(sandbox_id),
+            Ok(()) => Ok(()),
             Err(e) => {
                 // Set ENGRAM_FC_KEEP_JAIL_ON_FAILURE=1 to keep the
                 // jail dir for post-mortem of firecracker.log /
@@ -5100,8 +5097,7 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
 
 #[async_trait]
 impl SandboxBackend for FirecrackerBackend {
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        let sandbox_id = SandboxId::new();
+    async fn create(&self, sandbox_id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
         // Two-pipe observability: span for forensics (one
@@ -5142,7 +5138,7 @@ impl SandboxBackend for FirecrackerBackend {
         );
 
         match result {
-            Ok(()) => Ok(sandbox_id),
+            Ok(()) => Ok(()),
             Err(e) => {
                 // Best-effort cleanup so a failed create doesn't leave
                 // dangling jail dirs and (via kill_on_drop) processes.
@@ -5565,20 +5561,27 @@ impl SandboxBackend for FirecrackerBackend {
         FirecrackerClient::new(&socket).resume().await
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*swap_aux_to_current=*/ false, Vec::new())
-            .await
+    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
+        self.restore_with(
+            id,
+            metadata,
+            /*swap_aux_to_current=*/ false,
+            Vec::new(),
+        )
+        .await
     }
 
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         selected_mounts: Vec<AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
         // generations AND patch the per-session selected skills into reserved
         // slots; both swaps happen load-paused inside restore_in_jail.
         self.restore_with(
+            id,
             metadata,
             /*swap_aux_to_current=*/ true,
             selected_mounts,
@@ -7694,7 +7697,7 @@ mod tests {
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
         sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
-        match b.create(sp).await {
+        match b.create(SandboxId::new(), sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains("stages no bundles"), "{msg}");
             }
@@ -7720,7 +7723,7 @@ mod tests {
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
         sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
-        match b.create(sp).await {
+        match b.create(SandboxId::new(), sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains("sentinel"), "{msg}");
             }
@@ -7755,12 +7758,12 @@ mod tests {
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
         sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
-        match b.create(sp).await {
+        match b.create(SandboxId::new(), sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 panic!("resolution should have passed, got InvalidSpec: {msg}")
             }
             Err(_) => {} // FC spawn failure — past the resolve step.
-            Ok(_) => panic!("create can't succeed without a real firecracker"),
+            Ok(()) => panic!("create can't succeed without a real firecracker"),
         }
     }
 
@@ -7786,7 +7789,7 @@ mod tests {
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs.clone());
         sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)];
-        match b.create(sp).await {
+        match b.create(SandboxId::new(), sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains(AuxRoDrive::AGENTD_STAMP_KEY), "{msg}");
             }
@@ -7819,7 +7822,7 @@ mod tests {
         // is much more useful than a Firecracker 400 from a deeper
         // call.
         let (b, _d) = backend();
-        match b.create(spec()).await {
+        match b.create(SandboxId::new(), spec()).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains("rootfs_source"), "got: {msg}");
             }
@@ -7835,7 +7838,7 @@ mod tests {
         let (b, dir) = backend();
         let mut s = spec();
         s.rootfs_source = Some(dir.path().to_path_buf());
-        match b.create(s).await {
+        match b.create(SandboxId::new(), s).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains("directory"), "got: {msg}");
             }
@@ -7848,7 +7851,7 @@ mod tests {
         let (b, dir) = backend();
         let mut s = spec();
         s.rootfs_source = Some(dir.path().join("does-not-exist.ext4"));
-        match b.create(s).await {
+        match b.create(SandboxId::new(), s).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 assert!(msg.contains("does not exist"), "got: {msg}");
             }
@@ -7894,7 +7897,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        match b.restore(metadata).await {
+        match b.restore(SandboxId::new(), metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("manifest"),
@@ -8056,7 +8059,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        match b.restore(metadata).await {
+        match b.restore(SandboxId::new(), metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
                 assert!(
                     msg.contains("not 'fc'") && msg.contains("cross-VMM"),

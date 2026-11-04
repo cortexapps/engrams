@@ -5,6 +5,7 @@
 mod common;
 use common::nbd_release::NbdReleaseGuard;
 use engram_core::traits::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -164,10 +165,11 @@ async fn moves_swapped_guest(live: bool) {
     };
     let base = timed("base capture", 120, common::postcopy::base(&source, spec)).await;
     assert!(base.swap_manifest.is_none(), "base must be swap-free");
-    let vm = timed(
+    let vm = SandboxId::new();
+    timed(
         "fresh restore",
         90,
-        source.restore_fresh(base.clone(), vec![]),
+        source.restore_fresh(vm, base.clone(), vec![]),
     )
     .await
     .unwrap();
@@ -262,9 +264,14 @@ async fn moves_swapped_guest(live: bool) {
             &store,
             &fixture.path().join("blob"),
         );
-        let restored = timed("restore on second host", 120, dest.restore(snapshot))
-            .await
-            .unwrap();
+        let restored = SandboxId::new();
+        timed(
+            "restore on second host",
+            120,
+            dest.restore(restored, snapshot),
+        )
+        .await
+        .unwrap();
         (dest, restored)
     };
     wait_for(&dest, restored, "grep -q /dev/vdb /proc/swaps", 20).await;

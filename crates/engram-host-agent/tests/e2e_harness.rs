@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -739,7 +740,8 @@ async fn e2e_harness_cold_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
     let endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // Register the session in the proxy registry. For COLD path
@@ -826,12 +828,14 @@ async fn e2e_harness_warm_via_pooled_backend() {
     // window that used to live here is now enforced inside
     // `PooledBackend::snapshot` via `inner.wait_agent_ready` — see the
     // comment there for the cold-boot race it guards against.
-    let cold_id = pooled.create(spec).await.expect("create");
+    let cold_id = SandboxId::new();
+    pooled.create(cold_id, spec).await.expect("create");
     let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     let metadata = pooled.snapshot(cold_id).await.expect("snapshot");
     pooled.destroy(cold_id).await.expect("destroy cold");
 
-    let warm_id = pooled.restore(metadata).await.expect("restore");
+    let warm_id = SandboxId::new();
+    pooled.restore(warm_id, metadata).await.expect("restore");
     let warm_endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
@@ -957,7 +961,8 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
     let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // The DevVm-mode AgentSpec: empty argv (resolve_harness → None),

@@ -141,7 +141,7 @@ struct ImmediateInner {
 
 #[async_trait]
 impl SandboxBackend for ImmediateInner {
-    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec("unused".into()))
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -161,8 +161,8 @@ impl SandboxBackend for ImmediateInner {
             .then(|| self.rootfs_dev.clone())
             .flatten()
     }
-    async fn restore(&self, _meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        Ok(self.restored_id)
+    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
+        Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
         Ok(())
@@ -321,8 +321,10 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     };
 
     // Resume: installs the NBD data plane in `nbd_sandboxes`.
-    let restored = pooled.restore(metadata).await.expect("restore");
-    assert_eq!(restored, restored_id);
+    pooled
+        .restore(restored_id, metadata)
+        .await
+        .expect("restore");
     assert!(
         pooled.__test_nbd_sandbox_registered(restored_id),
         "precondition: the survivor's NBD data plane must be registered",
@@ -534,8 +536,10 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         paused_at: None,
         peer_hints: Vec::new(),
     };
-    let restored = pooled.restore(metadata).await.expect("restore");
-    assert_eq!(restored, restored_id);
+    pooled
+        .restore(restored_id, metadata)
+        .await
+        .expect("restore");
 
     let session_id = SessionId::new();
     pooled.__test_bind_session(restored_id, session_id);
@@ -805,8 +809,10 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
         paused_at: None,
         peer_hints: Vec::new(),
     };
-    let restored = pooled.restore(metadata).await.expect("restore");
-    assert_eq!(restored, restored_id);
+    pooled
+        .restore(restored_id, metadata)
+        .await
+        .expect("restore");
 
     let session_id = SessionId::new();
     pooled.__test_bind_session(restored_id, session_id);

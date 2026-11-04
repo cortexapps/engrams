@@ -2056,8 +2056,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxBackend for D5SplitBackend {
-        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            self.inner.create(spec).await
+        async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
+            self.inner.create(id, spec).await
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.inner.destroy(id).await
@@ -2089,9 +2089,10 @@ mod tests {
         }
         async fn restore(
             &self,
+            id: SandboxId,
             metadata: engram_core::types::snapshot::SnapshotMetadata,
-        ) -> Result<SandboxId, SandboxError> {
-            self.inner.restore(metadata).await
+        ) -> Result<(), SandboxError> {
+            self.inner.restore(id, metadata).await
         }
         fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
             self.inner.snapshot_path_for(id)
@@ -4775,8 +4776,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxBackend for ManifestSnapshotBackend {
-        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            self.inner.create(spec).await
+        async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
+            self.inner.create(id, spec).await
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.inner.destroy(id).await
@@ -4803,9 +4804,10 @@ mod tests {
         }
         async fn restore(
             &self,
+            id: SandboxId,
             metadata: engram_core::types::snapshot::SnapshotMetadata,
-        ) -> Result<SandboxId, SandboxError> {
-            self.inner.restore(metadata).await
+        ) -> Result<(), SandboxError> {
+            self.inner.restore(id, metadata).await
         }
         fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
             self.inner.snapshot_path_for(id)

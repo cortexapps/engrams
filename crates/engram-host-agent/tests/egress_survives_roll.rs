@@ -36,6 +36,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::bindings::BindingStore;
 use engram_host_agent::egress::HostEgress;
@@ -182,7 +183,8 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
 
     let session_id = engram_core::SessionId::new();
     let guest_ip = std::net::Ipv4Addr::new(10, 200, 0, 2);

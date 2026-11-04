@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -203,8 +204,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         .await
         .expect("post-abort manifest durable");
     pooled.destroy(vm).await.expect("destroy vm1");
-    let restored = pooled
-        .restore(ckpt2)
+    let restored = SandboxId::new();
+    pooled
+        .restore(restored, ckpt2)
         .await
         .expect("restore post-abort checkpoint");
     let restored_sum = exec(
@@ -254,13 +256,14 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let out2 = pooled.migration_presetup(vm2).await.expect("presetup vm2");
     let metadata = common::postcopy::metadata(ckpt_v2, &out2, addr);
     let dest = pooled.clone();
-    let restore = tokio::spawn(async move { dest.restore(metadata).await });
+    let moved = SandboxId::new();
+    let restore = tokio::spawn(async move { dest.restore(moved, metadata).await });
     tokio::task::yield_now().await;
     pooled
         .migration_capture_postcopy(vm2, &out2.export_id)
         .await
         .expect("capture vm2");
-    let moved = restore.await.unwrap().expect("teleport restore");
+    restore.await.unwrap().expect("teleport restore");
     common::postcopy::drain(&pooled, moved).await;
     let check = exec(&pooled, moved, "sha256sum /dev/shm/marker7 | cut -d' ' -f1").await;
     assert_eq!(

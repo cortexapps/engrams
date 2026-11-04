@@ -50,6 +50,7 @@ use engram_chunk_store::ChunkStore;
 use engram_core::traits::sandbox::{BuildBaseSnapshotRequest, SandboxBackend};
 use engram_core::traits::{BlobStorage, ByteStream};
 use engram_core::types::capture_job::ColdBasePlan;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -714,8 +715,9 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
         "Miss + warm must have minted the pre-hook seed (the diff-shape precondition)",
     );
 
-    let restored = pooled
-        .restore_fresh(result.snapshot, Vec::new())
+    let restored = SandboxId::new();
+    pooled
+        .restore_fresh(restored, result.snapshot, Vec::new())
         .await
         .expect("UFFD restore from the warm base snapshot");
 

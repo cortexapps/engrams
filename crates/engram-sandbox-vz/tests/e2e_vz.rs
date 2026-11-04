@@ -284,7 +284,8 @@ async fn e2e_vz_swap_drive_arms() {
 
     let mut s = spec(&env.rootfs);
     s.swap_mib = Some(64);
-    let id = backend.create(s).await.expect("create with swap");
+    let id = SandboxId::new();
+    backend.create(id, s).await.expect("create with swap");
     await_agent(&backend, id).await;
 
     // Exactly one writable non-vda disk, sized 64 MiB (131072 sectors).
@@ -359,7 +360,8 @@ async fn e2e_vz_lifecycle() {
     //    drain listener keeps the guest handshake from stalling). The boot
     //    itself proves the ADR 0080 contract: agentd came out of its
     //    bundle slot, resolved from current.json.
-    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo hello-vz && uname -m").await;
     assert_eq!(code, Some(0), "exec exit; out={out}");
@@ -385,7 +387,11 @@ async fn e2e_vz_lifecycle() {
     );
     backend.destroy(id).await.expect("destroy");
 
-    let id2 = backend.restore(meta).await.expect("restore (cold-boot)");
+    let id2 = SandboxId::new();
+    backend
+        .restore(id2, meta)
+        .await
+        .expect("restore (cold-boot)");
     await_agent(&backend, id2).await;
     let (out, code) = exec(&backend, id2, "cat /root/z.txt").await;
     assert_eq!(code, Some(0), "post-restore read; out={out}");
@@ -410,8 +416,9 @@ async fn e2e_vz_skill_bundle_attaches() {
     let work = tempfile::tempdir().expect("workdir");
     let backend = backend(&env, work.path(), true);
 
-    let id = backend
-        .create(spec_with_skill(&env.rootfs, &sha))
+    let id = SandboxId::new();
+    backend
+        .create(id, spec_with_skill(&env.rootfs, &sha))
         .await
         .expect("create");
     await_agent(&backend, id).await;
@@ -455,7 +462,8 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     let work = tempfile::tempdir().expect("workdir");
     let backend = backend(&env, work.path(), false);
 
-    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
 
     // Bring loopback up (the relay dials 127.0.0.1; a minimal guest may leave
@@ -529,7 +537,8 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
     let work = tempfile::tempdir().expect("workdir");
     let b = backend(&env, work.path(), true);
 
-    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    b.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&b, id).await;
     let (_, code) = exec(
         &b,
@@ -563,7 +572,8 @@ async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
     // past a 2s threshold).
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    let id2 = b.restore(meta).await.expect("restore");
+    let id2 = SandboxId::new();
+    b.restore(id2, meta).await.expect("restore");
     await_agent(&b, id2).await;
     let (out, code) = exec(&b, id2, "cat /root/warm.txt /dev/shm/warm.txt").await;
     assert_eq!(code, Some(0), "post-restore read; out={out}");
@@ -606,7 +616,8 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
     let work = tempfile::tempdir().expect("workdir");
     let b = backend(&env, work.path(), true);
 
-    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    b.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&b, id).await;
     // NO explicit sync — the disk marker's survival across the COLD
     // path is the flush_guest_fs property this test now carries
@@ -629,7 +640,8 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
         .join("machine.vzs");
     let _ = std::fs::remove_file(&machine_state);
 
-    let id2 = b.restore(meta).await.expect("restore (cold fallback)");
+    let id2 = SandboxId::new();
+    b.restore(id2, meta).await.expect("restore (cold fallback)");
     await_agent(&b, id2).await;
     let (out, code) = exec(
         &b,
@@ -674,7 +686,8 @@ async fn e2e_vz_egress_steering_installs_guest_redirect() {
     )
     .expect("VzBackend::new");
 
-    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    b.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&b, id).await;
 
     let (out, code) = exec(&b, id, "iptables -t nat -S OUTPUT").await;
@@ -713,7 +726,8 @@ async fn e2e_vz_crash_detection_marks_dead() {
     let work = tempfile::tempdir().expect("workdir");
     let backend = backend(&env, work.path(), false);
 
-    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let probe = backend.probe_sandbox(id).await.expect("probe");
     assert!(
@@ -768,7 +782,8 @@ async fn e2e_vz_pause_freezes_and_resume_revives() {
     let work = tempfile::tempdir().expect("workdir");
     let backend = backend(&env, work.path(), true);
 
-    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo pre-pause").await;
     assert_eq!(code, Some(0), "pre-pause exec; out={out}");
@@ -866,7 +881,8 @@ async fn e2e_vz_forge_credential_round_trips() {
     });
     backend.set_forge_sink(sink);
 
-    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
 
     // The exec'd helper needs the session env the harness normally
@@ -977,8 +993,9 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
     let work = tempfile::tempdir().expect("workdir");
     let backend = backend(&env, work.path(), true);
 
-    let id = backend
-        .create(spec_with_skill(&env.rootfs, &sha))
+    let id = SandboxId::new();
+    backend
+        .create(id, spec_with_skill(&env.rootfs, &sha))
         .await
         .expect("create");
     await_agent(&backend, id).await;

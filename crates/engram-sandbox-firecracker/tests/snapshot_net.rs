@@ -34,6 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -196,7 +197,8 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     };
 
     // 1. create — provisions the TAP + reserves the /30
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
 
     // 2. let early-boot settle so the snapshot captures coherent state — poll the
     //    serial console (funneled to firecracker.log) for the kernel banner. The
@@ -237,7 +239,11 @@ async fn snapshot_restore_round_trips_per_vm_network() {
 
     // 5. restore — re-provisions the same /30 + recreates the TAP
     //    under the same name
-    let restored_id = backend.restore(metadata.clone()).await.expect("restore");
+    let restored_id = SandboxId::new();
+    backend
+        .restore(restored_id, metadata.clone())
+        .await
+        .expect("restore");
     assert_ne!(
         restored_id, original_id,
         "restore allocates fresh sandbox id"

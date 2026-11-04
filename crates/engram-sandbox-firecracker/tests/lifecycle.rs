@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -65,7 +66,8 @@ async fn create_list_destroy_round_trip() {
     };
 
     // create
-    let id = backend.create(spec).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec).await.expect("create");
 
     // list reflects the new sandbox
     let listed = backend.list().await.expect("list");
@@ -160,24 +162,28 @@ async fn init_exit_fails_ready_with_kernel_panic() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     let backend = FirecrackerBackend::new(work.path(), cfg);
-    let id = backend
-        .create(SandboxSpec {
-            image: "init-exit-fixture".into(),
-            rootfs_source: Some(rootfs),
-            image_uri: None,
-            rootfs_manifest: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 64 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: HashMap::new(),
-            workdir: None,
-            network: Default::default(),
-            aux_ro_drives: Vec::new(),
-            swap_mib: None,
-            swap_source: None,
-            swap_manifest: None,
-        })
+    let id = SandboxId::new();
+    backend
+        .create(
+            id,
+            SandboxSpec {
+                image: "init-exit-fixture".into(),
+                rootfs_source: Some(rootfs),
+                image_uri: None,
+                rootfs_manifest: None,
+                cpu: CpuLimit { vcpus: 1 },
+                memory: MemoryLimit { max_mib: 64 },
+                disk: DiskLimit { max_gib: 1 },
+                ttl: None,
+                env: HashMap::new(),
+                workdir: None,
+                network: Default::default(),
+                aux_ro_drives: Vec::new(),
+                swap_mib: None,
+                swap_source: None,
+                swap_manifest: None,
+            },
+        )
         .await
         .expect("boot exit fixture");
     let result = tokio::time::timeout(Duration::from_secs(15), backend.wait_agent_ready(id)).await;

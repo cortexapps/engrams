@@ -145,8 +145,6 @@ struct BarrierInner {
     entered: Arc<Notify>,
     /// `restore` waits on this before returning.
     release: Arc<Notify>,
-    /// The id `restore` will return.
-    restored_id: SandboxId,
 }
 
 impl BarrierInner {
@@ -157,7 +155,7 @@ impl BarrierInner {
 
 #[async_trait]
 impl SandboxBackend for BarrierInner {
-    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec("unused".into()))
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -172,12 +170,12 @@ impl SandboxBackend for BarrierInner {
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
         true
     }
-    async fn restore(&self, _meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, _: SandboxId, _meta: SnapshotMetadata) -> Result<(), SandboxError> {
         // The NBD daemon is already serving /dev/nbdN and the sidecar is
         // patched to it by now — exactly the window the bug lives in.
         self.entered.notify_one();
         self.release.notified().await;
-        Ok(self.restored_id)
+        Ok(())
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
         Ok(())
@@ -253,7 +251,6 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
         staging_root,
         entered: entered.clone(),
         release: release.clone(),
-        restored_id,
     });
     let inner_dyn: Arc<dyn SandboxBackend> = inner;
 
@@ -293,7 +290,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
     let entered_wait = entered.notified();
     let handle = {
         let pooled = pooled.clone();
-        tokio::spawn(async move { pooled.restore(metadata).await })
+        tokio::spawn(async move { pooled.restore(restored_id, metadata).await })
     };
     tokio::time::timeout(Duration::from_secs(30), entered_wait)
         .await
@@ -319,12 +316,11 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
     // `abandon_for_shutdown()`s the state in-place. Pre-fix it inserts a live
     // state into `nbd_sandboxes` after the sweep.
     release.notify_one();
-    let restored = tokio::time::timeout(Duration::from_secs(30), handle)
+    tokio::time::timeout(Duration::from_secs(30), handle)
         .await
         .expect("restore task hung")
         .expect("restore task panicked")
         .expect("restore returned an error");
-    assert_eq!(restored, restored_id, "restore must still return the id");
 
     // Give the detached body a beat to run its flag check + abandon/insert.
     // The state must NOT be registered: it was abandoned in-place, not

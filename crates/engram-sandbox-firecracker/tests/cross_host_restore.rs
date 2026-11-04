@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -86,7 +87,11 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
         swap_manifest: None,
     };
 
-    let source_id = source.create(spec).await.expect("create on source");
+    let source_id = SandboxId::new();
+    source
+        .create(source_id, spec)
+        .await
+        .expect("create on source");
     // Wait for the kernel banner on the serial console rather than a fixed
     // settle before snapshotting.
     let _ = common::wait_for_log_contains(
@@ -146,8 +151,9 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     receiver_cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
     let receiver = FirecrackerBackend::new(receiver_work.path(), receiver_cfg);
 
-    let restored_id = receiver
-        .restore(metadata.clone())
+    let restored_id = SandboxId::new();
+    receiver
+        .restore(restored_id, metadata.clone())
         .await
         .expect("cross-host restore should succeed");
 

@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::ChainHeadRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -199,7 +200,8 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
     let session_id = engram_core::SessionId::new();
     pooled_a.bind_session(session_id, sandbox);
 
@@ -258,8 +260,9 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
     // ---- 6. Byte fidelity of the roll-spanning diff: the surviving
     // VM's dirty-bitmap baseline really was the recorded head. ----
     pooled_b.destroy(sandbox).await.expect("destroy survivor");
-    let restored = pooled_b
-        .restore(ckpt2.clone())
+    let restored = SandboxId::new();
+    pooled_b
+        .restore(restored, ckpt2.clone())
         .await
         .expect("restore from the roll-spanning diff checkpoint");
     let out = exec(

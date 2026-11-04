@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::bindings::BindingStore;
 use engram_host_agent::egress::HostEgress;
@@ -297,7 +298,8 @@ async fn established_guest_stream_survives_a_host_agent_roll() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
     let endpoints = wait_for_guest_endpoints(&pooled_a, sandbox, Duration::from_secs(30)).await;
     let guest_ip = endpoints.egress_identity;
 

@@ -62,6 +62,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -117,7 +118,11 @@ async fn chained_restore_snapshot_lineage_holds() {
 
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the
     // snapshot we restore the first hop from.
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     // Fixed settle before S1. This test RE-snapshots a VM restored from S1, so
     // S1 must capture a fully-settled guest; a bare kernel-banner poll snapshots
     // too early and the restored VM is then too fragile to re-snapshot (FC
@@ -141,8 +146,9 @@ async fn chained_restore_snapshot_lineage_holds() {
     let mut seen = std::collections::HashSet::new();
     seen.insert(source_id);
     for hop in 1..=HOPS {
-        let restored = backend
-            .restore(metadata.clone())
+        let restored = SandboxId::new();
+        backend
+            .restore(restored, metadata.clone())
             .await
             .unwrap_or_else(|e| panic!("hop {hop}: restore failed: {e}"));
         assert!(

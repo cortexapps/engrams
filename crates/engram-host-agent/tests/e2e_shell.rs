@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -294,7 +295,8 @@ async fn e2e_shell_cold_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
 
     // ---- 4. Wait for in-VM agentd to come up so guest_endpoints resolves
     //         AND the bake's init has had a chance to spawn ttyd. ----
@@ -362,7 +364,8 @@ async fn e2e_shell_warm_via_pooled_backend() {
     };
 
     // ---- Cold create + wait for VM to be ready ----
-    let cold_id = pooled.create(spec).await.expect("create");
+    let cold_id = SandboxId::new();
+    pooled.create(cold_id, spec).await.expect("create");
     let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     sleep(Duration::from_secs(2)).await; // ttyd bind window
 
@@ -375,7 +378,8 @@ async fn e2e_shell_warm_via_pooled_backend() {
     //      bug: without it, guest_endpoints().netns returns None and the
     //      tunnel dial happens from host root, which has no route
     //      to the netns'd 10.200.0.x. ----
-    let warm_id = pooled.restore(metadata).await.expect("restore");
+    let warm_id = SandboxId::new();
+    pooled.restore(warm_id, metadata).await.expect("restore");
     let endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // ttyd's TCP listen socket should survive the snapshot/restore
     // (FC restores the kernel state including sockets). But give a

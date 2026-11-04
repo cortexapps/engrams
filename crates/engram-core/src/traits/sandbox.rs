@@ -167,7 +167,10 @@ pub enum AgentRefresh {
 
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
+    /// Boot a sandbox under `id`, which the caller mints. Every host
+    /// resource the sandbox owns (volumes, jail, sockets) is named by
+    /// `id` before the backend sees it.
+    async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError>;
 
     /// Start the long-running agent process for this sandbox (the
     /// harness adapter — Claude Code, the dev noop). Idempotent:
@@ -531,7 +534,7 @@ pub trait SandboxBackend: Send + Sync {
     /// the generation the snapshot pinned (live guest processes may
     /// hold fds into them). Fresh session creates go through
     /// [`Self::restore_fresh`].
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError>;
 
     /// ADR 0035/0055: restore for a *fresh* session (the base-snapshot path) —
     /// identical to [`Self::restore`] except, while the VM is load-paused,
@@ -542,10 +545,11 @@ pub trait SandboxBackend: Send + Sync {
     /// `selected_mounts` is ignored by the default.
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
-        self.restore(metadata).await
+    ) -> Result<(), SandboxError> {
+        self.restore(id, metadata).await
     }
 
     /// ADR 0020 P1: block until the guest's agentd has dialled its
@@ -800,10 +804,11 @@ pub trait SandboxBackend: Send + Sync {
     /// the snapshot itself. Implemented on `PooledBackend`.
     async fn restore_base_for_session(
         &self,
+        _id: SandboxId,
         _metadata: SnapshotMetadata,
         _session_env: std::collections::HashMap<String, String>,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `restore_base_for_session` (needs the pooled chunk-store wrapper)".into(),
         ))

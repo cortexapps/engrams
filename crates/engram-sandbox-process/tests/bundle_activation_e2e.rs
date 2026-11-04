@@ -20,6 +20,7 @@ use std::path::Path;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{AgentSpec, AuxRoDrive};
 use engram_core::types::{SnapshotId, SnapshotMetadata};
+use engram_core::SandboxId;
 use engram_sandbox_process::ProcessBackend;
 
 fn write_exec(path: &Path, body: &str) {
@@ -117,8 +118,10 @@ async fn generated_session_has_skills_and_browser_tooling() {
             sha256: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
         },
     ];
-    let id = backend
+    let id = SandboxId::new();
+    backend
         .restore_base_for_session(
+            id,
             SnapshotMetadata {
                 id: SnapshotId::new(),
                 size_bytes: 0,

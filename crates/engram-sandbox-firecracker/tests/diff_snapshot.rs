@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::ids::SnapshotId;
+use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::client::{FirecrackerClient, SnapshotType};
@@ -137,7 +137,8 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let vm1 = backend.create(spec).await.expect("create");
+    let vm1 = SandboxId::new();
+    backend.create(vm1, spec).await.expect("create");
 
     // ---- 3. Marker 1 in guest RAM, then the Full baseline capture ----
     let sum1 = plant_marker(&backend, vm1, 1).await;
@@ -200,8 +201,9 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     // below, after vm2 is destroyed.
     let rebased_mem = backend.snapshot_path_for(meta2.id).join("memory.bin");
     let t = Instant::now();
-    let vm2 = backend
-        .restore(meta2)
+    let vm2 = SandboxId::new();
+    backend
+        .restore(vm2, meta2)
         .await
         .expect("restore from rebased diff1");
     eprintln!("SPIKE: restore(full+diff1) {} ms", t.elapsed().as_millis());
@@ -258,8 +260,9 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         &[diff2_dir.path().join("memory.diff")],
         &full_dir.join("manifest.json"),
     );
-    let vm3 = backend
-        .restore(meta3)
+    let vm3 = SandboxId::new();
+    backend
+        .restore(vm3, meta3)
         .await
         .expect("restore from chained diff2");
     let out = exec(

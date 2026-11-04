@@ -1748,6 +1748,7 @@ impl PooledBackend {
     /// (fresh-create flavor) — see ADR 0035 §3 for the split.
     async fn restore_with(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         fresh: bool,
         // ADR 0077 phase 2: fork the disk manifest identity at NBD attach.
@@ -1764,7 +1765,8 @@ impl PooledBackend {
         // ADR 0055: per-session skills to patch into reserved slots (fresh only;
         // ignored on resume, which keeps the snapshot's pinned mounts).
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
+        let new_id = id;
         let post_copy_dest = self.postcopy_dests.contains_key(&metadata.id)
             || self
                 .inner
@@ -2190,10 +2192,12 @@ impl PooledBackend {
             let migration_roles = self.migration_roles.clone();
             let hint_pollers = self.hint_pollers.clone();
             let join = tokio::spawn(async move {
-                let new_id = if fresh {
-                    inner.restore_fresh(metadata, selected_mounts).await?
+                if fresh {
+                    inner
+                        .restore_fresh(new_id, metadata, selected_mounts)
+                        .await?
                 } else {
-                    inner.restore(metadata).await?
+                    inner.restore(new_id, metadata).await?
                 };
                 // Subscribe as soon as the backend exposes the restored VM.
                 // Replay covers a drain that finished during restore.
@@ -2267,7 +2271,7 @@ impl PooledBackend {
                     if let Some(swap) = pending_swap_state.take() {
                         swap.abandon_for_shutdown();
                     }
-                    return Ok::<SandboxId, SandboxError>(new_id);
+                    return Ok::<(), SandboxError>(());
                 }
                 nbd_sandboxes.insert(
                     new_id,
@@ -2288,7 +2292,7 @@ impl PooledBackend {
                 if let Some(poller) = hint_poller {
                     hint_pollers.insert(new_id, poller);
                 }
-                Ok::<SandboxId, SandboxError>(new_id)
+                Ok::<(), SandboxError>(())
             });
             // A JoinError here means the spawned task panicked; the FC restore
             // either never completed or panicked mid-flight — surface it as a
@@ -2303,10 +2307,12 @@ impl PooledBackend {
         let migration_roles = self.migration_roles.clone();
         let hint_pollers = self.hint_pollers.clone();
         tokio::spawn(async move {
-            let new_id = if fresh {
-                inner.restore_fresh(metadata, selected_mounts).await?
+            if fresh {
+                inner
+                    .restore_fresh(new_id, metadata, selected_mounts)
+                    .await?
             } else {
-                inner.restore(metadata).await?
+                inner.restore(new_id, metadata).await?
             };
             if let Some(poller) = hint_poller {
                 hint_pollers.insert(
@@ -2317,7 +2323,7 @@ impl PooledBackend {
             if post_copy_dest {
                 migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
             }
-            Ok(new_id)
+            Ok(())
         })
         .await
         .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
@@ -7544,7 +7550,8 @@ impl SandboxBackend for PooledBackend {
         self.inner.guest_memory_stats().await
     }
 
-    async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, id: SandboxId, mut spec: SandboxSpec) -> Result<(), SandboxError> {
+        let sandbox_id = id;
         // Issue #224: once SIGTERM has engaged terminal-abandon mode,
         // refuse new cold-creates outright. Unlike resume/rehydrate
         // (which re-serve a SURVIVING FC's already-attached device and
@@ -7708,7 +7715,7 @@ impl SandboxBackend for PooledBackend {
                     .resolved_dirty_root()
                     .expect("NBD state requires a dirty root");
                 let join = tokio::spawn(async move {
-                    let sandbox_id = inner.create(spec).await?;
+                    inner.create(sandbox_id, spec).await?;
                     if let Err(error) = state
                         .backend
                         .relocate_dirty_file(
@@ -7782,10 +7789,17 @@ impl SandboxBackend for PooledBackend {
                 join.await
                     .map_err(|e| SandboxError::Vm(format!("create task panicked: {e}").into()))?
             } else {
-                self.inner.create(spec).await
+                self.inner
+                    .create(sandbox_id, spec)
+                    .await
+                    .map(|()| sandbox_id)
             };
             #[cfg(not(target_os = "linux"))]
-            let create_result: Result<SandboxId, SandboxError> = self.inner.create(spec).await;
+            let create_result: Result<SandboxId, SandboxError> = self
+                .inner
+                .create(sandbox_id, spec)
+                .await
+                .map(|()| sandbox_id);
             create_result
         }
         .await;
@@ -7816,7 +7830,7 @@ impl SandboxBackend for PooledBackend {
             "kind" => "cold",
         )
         .record(phase_total.elapsed().as_secs_f64());
-        result
+        result.map(|_| ())
     }
 
     async fn exec_stream(
@@ -8983,7 +8997,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.swap_device(id)
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, id: SandboxId, metadata: SnapshotMetadata) -> Result<(), SandboxError> {
         // ADR 0038 B2: capture the source's memory manifest before
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
@@ -9022,14 +9036,14 @@ impl SandboxBackend for PooledBackend {
         }
         let memory_ref = metadata.memory_manifest;
         // Resume keeps the snapshot's pinned mounts — no per-session selection.
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ false,
-                /*fork_disk_at_attach=*/ false,
-                Vec::new(),
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ false,
+            /*fork_disk_at_attach=*/ false,
+            Vec::new(),
+        )
+        .await?;
         // Peer pages differ from the source chain. A post-copy destination
         // starts with a full checkpoint after drain; only ordinary restores
         // can seed a sparse checkpoint chain here.
@@ -9039,14 +9053,15 @@ impl SandboxBackend for PooledBackend {
             }
         }
         self.spawn_prefault_stats_probe(id);
-        Ok(id)
+        Ok(())
     }
 
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // ADR 0045 seed-at-create: guest RAM right after a fresh restore
         // is byte-identical to the base snapshot's memory manifest, and
         // FC dirty-page tracking runs from the restore — exactly the
@@ -9056,18 +9071,18 @@ impl SandboxBackend for PooledBackend {
         // manifest is shared across sessions, so the chain must own a
         // fresh lineage (see seed_checkpoint_chain_forked).
         let memory_ref = metadata.memory_manifest;
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ true,
-                /*fork_disk_at_attach=*/ true,
-                selected_mounts,
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ true,
+            /*fork_disk_at_attach=*/ true,
+            selected_mounts,
+        )
+        .await?;
         if let Some(memory_ref) = memory_ref {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
         }
-        Ok(id)
+        Ok(())
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -9399,14 +9414,15 @@ impl SandboxBackend for PooledBackend {
                 // `fresh=false`: this is a resume of the cold base's
                 // pinned device model, not a session fresh-create — no
                 // per-session mount swap, resume memory semantics.
-                let id = self
-                    .restore_with(
-                        (**snapshot).clone(),
-                        /*fresh=*/ false,
-                        /*fork_disk_at_attach=*/ true,
-                        Vec::new(),
-                    )
-                    .await?;
+                let id = SandboxId::new();
+                self.restore_with(
+                    id,
+                    (**snapshot).clone(),
+                    /*fresh=*/ false,
+                    /*fork_disk_at_attach=*/ true,
+                    Vec::new(),
+                )
+                .await?;
                 if let Some(memory_ref) = memory_ref {
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
                 }
@@ -9418,7 +9434,11 @@ impl SandboxBackend for PooledBackend {
                 self.spawn_prefault_stats_probe(id);
                 id
             }
-            ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => self.create(spec).await?,
+            ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => {
+                let id = SandboxId::new();
+                self.create(id, spec).await?;
+                id
+            }
         };
 
         // Capture-time egress (ADR 0080): register the coordinator-assembled
@@ -9885,24 +9905,25 @@ impl SandboxBackend for PooledBackend {
     #[tracing::instrument(name = "host.restore_base_for_session", skip_all)]
     async fn restore_base_for_session(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
         //    harness baked into the rootfs at /opt/engram/harness/.
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
         let memory_ref = metadata.memory_manifest;
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ true,
-                /*fork_disk_at_attach=*/ true,
-                selected_mounts,
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ true,
+            /*fork_disk_at_attach=*/ true,
+            selected_mounts,
+        )
+        .await?;
         // ADR 0045 seed-at-create: the session's RAM == the base
         // manifest at this instant (see `restore_fresh`); seed the
         // chain so the first eviction diffs instead of Full-dumping.
@@ -9949,7 +9970,7 @@ impl SandboxBackend for PooledBackend {
         // ADR 0021 P1.5: option-D substrate swap retired. The harness
         // travels in the rootfs (manifest `[harness] exec`); there's
         // no per-session harness file to materialize or swap.
-        Ok(id)
+        Ok(())
     }
 
     // ADR 0021 P1.5: `swap_harness_drive` wrapper retired with the
@@ -11521,8 +11542,8 @@ mod tests {
         struct DeadGuest(Arc<std::sync::atomic::AtomicBool>);
         #[async_trait]
         impl SandboxBackend for DeadGuest {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Err(SandboxError::Vm(
@@ -11543,7 +11564,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!("dead guest has no snapshot")
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 unreachable!("cold boot")
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11601,8 +11622,8 @@ mod tests {
         struct SlowBootMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for SlowBootMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
                 // Longer than 2 keepalive ticks (1s each): proves the
@@ -11656,7 +11677,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11726,8 +11747,8 @@ mod tests {
         struct EarlySignalKillMock;
         #[async_trait]
         impl SandboxBackend for EarlySignalKillMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -11750,7 +11771,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11824,8 +11845,8 @@ mod tests {
         struct SilentAfterStartMock;
         #[async_trait]
         impl SandboxBackend for SilentAfterStartMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -11850,7 +11871,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11943,8 +11964,8 @@ mod tests {
         struct ChattyStuckStageMock;
         #[async_trait]
         impl SandboxBackend for ChattyStuckStageMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -11982,7 +12003,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12066,8 +12087,8 @@ mod tests {
         struct NoiseThenLineMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for NoiseThenLineMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12132,7 +12153,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12208,8 +12229,8 @@ mod tests {
         struct TwoStageMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for TwoStageMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12271,7 +12292,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12392,9 +12413,9 @@ mod tests {
 
         #[async_trait]
         impl SandboxBackend for ColdBaseMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 self.create_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12452,9 +12473,9 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 self.restore_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 self.destroy_calls.fetch_add(1, Ordering::SeqCst);
@@ -13379,7 +13400,7 @@ mod tests {
         ) -> Result<Vec<u8>, SandboxError> {
             Ok(b"{}".to_vec())
         }
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -13395,7 +13416,7 @@ mod tests {
         fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
             PathBuf::new()
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -13993,7 +14014,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14062,7 +14083,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14143,7 +14164,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14204,7 +14225,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14285,7 +14306,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for AssertingInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14346,7 +14367,11 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                meta: SnapshotMetadata,
+            ) -> Result<(), SandboxError> {
                 // Capture what was on disk at the moment inner.restore ran.
                 let dest = self.dir_for(meta.id);
                 let state = tokio::fs::read(dest.join("state.bin"))
@@ -14357,7 +14382,7 @@ mod tests {
                     .expect("manifest.json must be materialised before inner.restore");
                 *self.saw_state.lock() = Some(state);
                 *self.saw_sidecar.lock() = Some(sidecar);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14405,7 +14430,7 @@ mod tests {
 
         // Restore — wrap must re-download state.bin + sidecar
         // before delegating to inner.
-        pooled.restore(metadata).await.unwrap();
+        pooled.restore(SandboxId::new(), metadata).await.unwrap();
 
         let seen_state = inner.saw_state.lock().clone().expect("inner.restore ran");
         assert_eq!(&seen_state[..], b"upload-me-state");
@@ -14443,7 +14468,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for LiteralNbdSidecarInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14506,7 +14531,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 self.restored.store(true, Ordering::SeqCst);
                 Err(SandboxError::InvalidSpec(
                     "inner.restore must not be reached".into(),
@@ -14546,7 +14571,10 @@ mod tests {
         let md = pooled.snapshot(SandboxId::new()).await.unwrap();
         assert!(md.disk_manifest.is_none(), "fixture precondition");
 
-        let err = pooled.restore(md).await.expect_err("restore must refuse");
+        let err = pooled
+            .restore(SandboxId::new(), md)
+            .await
+            .expect_err("restore must refuse");
         assert!(
             matches!(err, SandboxError::Snapshot(_)),
             "expected a Snapshot refusal, got {err:?}",
@@ -14580,7 +14608,7 @@ mod tests {
         struct NbdRootfsInner;
         #[async_trait]
         impl SandboxBackend for NbdRootfsInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14602,7 +14630,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 std::env::temp_dir().join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14659,12 +14687,13 @@ mod tests {
         let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir));
         let pooled = PooledBackend::new(inner);
 
-        let _id = pooled.create(live_spec("warm-test")).await.unwrap();
+        let id = SandboxId::new();
+        pooled.create(id, live_spec("warm-test")).await.unwrap();
         // ProcessBackend's snapshot writes the directory structure
         // without a memory.bin (no guest RAM concept). The wrap
         // skips chunking silently and metadata.memory_manifest
         // stays None.
-        let metadata = pooled.snapshot(_id).await.expect("ProcessBackend snapshot");
+        let metadata = pooled.snapshot(id).await.expect("ProcessBackend snapshot");
         assert!(
             metadata.memory_manifest.is_none(),
             "no chunk_store wired must leave memory_manifest unset",
@@ -14716,7 +14745,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for CapturingInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14732,9 +14761,9 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging_root.join(id.to_string())
             }
-            async fn restore(&self, m: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, m: SnapshotMetadata) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(m);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14814,7 +14843,10 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        pooled.restore(metadata.clone()).await.unwrap();
+        pooled
+            .restore(SandboxId::new(), metadata.clone())
+            .await
+            .unwrap();
 
         // Inner backend saw the metadata; memory.bin is now
         // present and byte-equal to the original.
@@ -14894,7 +14926,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for StagedInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14910,10 +14942,10 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 self.snap_dir.clone()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 // Inner restore is irrelevant for this test — we
                 // only assert the materialize branch was a no-op.
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14946,7 +14978,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        let _ = pooled.restore(metadata).await;
+        let _ = pooled.restore(SandboxId::new(), metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
         assert_eq!(after, original, "memory.bin must not be overwritten");
     }
@@ -15115,9 +15147,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for Capturing {
-            async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(spec);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -15134,7 +15166,7 @@ mod tests {
                     .join("engram-test-snaps")
                     .join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -15183,7 +15215,7 @@ mod tests {
             swap_manifest: None,
         };
         spec.image_uri = Some("test:1".into());
-        let _id = pooled.create(spec).await.unwrap();
+        pooled.create(SandboxId::new(), spec).await.unwrap();
 
         // 7. The inner backend must have received the chunked
         //    materialized path, NOT the OCI-pulled rootfs.ext4.
@@ -15268,7 +15300,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for SpyInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15284,7 +15316,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15507,7 +15539,7 @@ mod tests {
         struct NoopInner;
         #[async_trait]
         impl SandboxBackend for NoopInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15523,7 +15555,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15736,7 +15768,7 @@ mod tests {
         struct FixedListInner(Vec<SandboxId>);
         #[async_trait]
         impl SandboxBackend for FixedListInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15752,7 +15784,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15876,7 +15908,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for LifecycleInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15939,7 +15971,7 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -16195,8 +16227,8 @@ mod tests {
 
     #[async_trait]
     impl SandboxBackend for CustodyBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            Ok(self.id)
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+            Ok(())
         }
         async fn exec_stream(
             &self,
@@ -16212,9 +16244,9 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.root.join(id.to_string())
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
             self.park("restore").await;
-            Ok(self.id)
+            Ok(())
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
             self.park("destroy").await;
@@ -16310,8 +16342,12 @@ mod tests {
         )
         .unwrap();
         let caller = pooled.clone();
-        let restore =
-            tokio::spawn(async move { caller.restore_with(metadata, false, false, vec![]).await });
+        let id = inner.id;
+        let restore = tokio::spawn(async move {
+            caller
+                .restore_with(id, metadata, false, false, vec![])
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(2), inner.entered.notified())
             .await
             .unwrap();
@@ -16579,7 +16615,7 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for FakeCaptureBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -16619,7 +16655,7 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.dir_for(id)
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -17152,7 +17188,7 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for SurvivorListBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -17171,7 +17207,7 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -17318,7 +17354,7 @@ mod tests {
             }
 
             // ---- unused required surface ----
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 unreachable!()
             }
             async fn exec_stream(
@@ -17334,7 +17370,7 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(&self, _: SandboxId, _: SnapshotMetadata) -> Result<(), SandboxError> {
                 unreachable!()
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -17449,8 +17485,8 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for HoldBackend {
-        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            self.inner.create(spec).await
+        async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
+            self.inner.create(id, spec).await
         }
         async fn exec_stream(
             &self,
@@ -17500,8 +17536,8 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-            self.inner.restore(meta).await
+        async fn restore(&self, id: SandboxId, meta: SnapshotMetadata) -> Result<(), SandboxError> {
+            self.inner.restore(id, meta).await
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.inner.destroy(id).await

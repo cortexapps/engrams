@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::disk_daemon::NbdSlotAllocator;
 use engram_host_agent::migrate_peer::PeerServer;
@@ -68,8 +69,9 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
     // A fresh create: File mode by construction (ADR 0092) — the guest's
     // RAM is a private mapping of the base snapshot's memfile, and the
     // chain is seeded at create from the base manifest.
-    let vm = pooled
-        .restore_fresh(result.snapshot, Vec::new())
+    let vm = SandboxId::new();
+    pooled
+        .restore_fresh(vm, result.snapshot, Vec::new())
         .await
         .expect("fresh create from the base snapshot");
     let view = pooled
