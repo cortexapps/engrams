@@ -342,6 +342,14 @@ impl DiskRole {
         *self == Self::Root
     }
 
+    /// The lowercase name, the same one serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Swap => "swap",
+        }
+    }
+
     pub fn dirty_file_name(self, id: crate::SandboxId) -> String {
         match self {
             Self::Root => format!("{id}.cache"),
@@ -353,6 +361,24 @@ impl DiskRole {
         match self {
             Self::Root => "disk-seal.json",
             Self::Swap => "disk-seal.swap.json",
+        }
+    }
+}
+
+impl std::fmt::Display for DiskRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DiskRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "root" => Ok(Self::Root),
+            "swap" => Ok(Self::Swap),
+            other => Err(format!("unknown disk role {other:?}")),
         }
     }
 }

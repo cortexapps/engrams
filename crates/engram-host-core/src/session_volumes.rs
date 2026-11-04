@@ -21,38 +21,16 @@ use std::sync::Arc;
 use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
+use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
-use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
+use crate::disk::{Capacity, ChunkIndex, SessionDisk, Volume, VolumeName};
 use crate::disk_flows::{checkpoint_split, stage};
 use crate::image_volumes;
 
 const LIVE_PREFIX: &str = "sb-";
 const TRANSIENT_PREFIX: &str = "tmp-sb-";
 const CHECKPOINT_INFIX: &str = "-ckpt-";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Role {
-    Root,
-    Swap,
-}
-
-impl Role {
-    fn as_str(self) -> &'static str {
-        match self {
-            Role::Root => "root",
-            Role::Swap => "swap",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "root" => Some(Role::Root),
-            "swap" => Some(Role::Swap),
-            _ => None,
-        }
-    }
-}
 
 /// What a volume name says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +43,7 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Parsed {
     pub sandbox: SandboxId,
-    pub role: Role,
+    pub role: DiskRole,
     pub kind: Kind,
 }
 
@@ -73,31 +51,31 @@ fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
 }
 
-pub fn live_name(sandbox: SandboxId, role: Role) -> VolumeName {
+pub fn live_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     VolumeName::new(format!(
         "{LIVE_PREFIX}{}-{}",
         sandbox.as_uuid().simple(),
-        role.as_str()
+        role
     ))
     .expect("a live volume name is 40 bytes of [a-z0-9-]")
 }
 
-pub fn checkpoint_name(sandbox: SandboxId, role: Role, manifest: ManifestRef) -> VolumeName {
+pub fn checkpoint_name(sandbox: SandboxId, role: DiskRole, manifest: ManifestRef) -> VolumeName {
     VolumeName::new(format!(
         "{LIVE_PREFIX}{}-{}{CHECKPOINT_INFIX}{}-v{}",
         sandbox.as_uuid().simple(),
-        role.as_str(),
+        role,
         manifest.manifest_id.simple(),
         manifest.version
     ))
     .expect("a checkpoint volume name is at most 100 bytes of [a-z0-9-]")
 }
 
-fn transient_name(sandbox: SandboxId, role: Role) -> VolumeName {
+fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     VolumeName::new(format!(
         "{TRANSIENT_PREFIX}{}-{}",
         sandbox.as_uuid().simple(),
-        role.as_str()
+        role
     ))
     .expect("a transient volume name is 44 bytes of [a-z0-9-]")
 }
@@ -114,7 +92,7 @@ pub fn parse(name: &VolumeName) -> Option<Parsed> {
         Some((role, manifest)) => (role, Some(manifest)),
         None => (rest, None),
     };
-    let role = Role::parse(role)?;
+    let role: DiskRole = role.parse().ok()?;
     let kind = match (transient, rest) {
         (true, None) => Kind::Transient,
         (false, None) => Kind::Live,
@@ -158,12 +136,30 @@ pub struct Provisioned {
     pub swap: Option<PathBuf>,
 }
 
-/// A snapshot taken under the guest pause, not yet published.
+/// A snapshot taken under the guest pause, not yet published. Dropping
+/// it leaves the transient volume for the next `take`, `pending` or
+/// `release` to find.
+#[derive(Debug)]
 pub struct PendingCheckpoint {
     sandbox: SandboxId,
-    role: Role,
+    role: DiskRole,
     snapshot: Volume,
     previous: ManifestRef,
+}
+
+impl PendingCheckpoint {
+    pub fn sandbox(&self) -> SandboxId {
+        self.sandbox
+    }
+
+    pub fn role(&self) -> DiskRole {
+        self.role
+    }
+
+    /// The paused state, readable while the guest runs on.
+    pub fn snapshot(&self) -> &Volume {
+        &self.snapshot
+    }
 }
 
 #[derive(Debug, Default)]
@@ -200,9 +196,9 @@ impl SessionVolumes {
         swap: Option<Source>,
     ) -> io::Result<Provisioned> {
         let provisioned = async {
-            let root = self.provision_role(sandbox, Role::Root, root).await?;
+            let root = self.provision_role(sandbox, DiskRole::Root, root).await?;
             let swap = match swap {
-                Some(source) => Some(self.provision_role(sandbox, Role::Swap, source).await?),
+                Some(source) => Some(self.provision_role(sandbox, DiskRole::Swap, source).await?),
                 None => None,
             };
             Ok(Provisioned { root, swap })
@@ -219,7 +215,7 @@ impl SessionVolumes {
     async fn provision_role(
         &self,
         sandbox: SandboxId,
-        role: Role,
+        role: DiskRole,
         source: Source,
     ) -> io::Result<PathBuf> {
         let tmp = transient_name(sandbox, role);
@@ -282,17 +278,22 @@ impl SessionVolumes {
         Ok(live.path)
     }
 
+    /// A live volume, the one the hypervisor opens.
+    pub async fn live(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Volume> {
+        self.disk.open(&live_name(sandbox, role)).await
+    }
+
     /// The device path of a live volume.
-    pub async fn path(&self, sandbox: SandboxId, role: Role) -> io::Result<PathBuf> {
-        Ok(self.disk.open(&live_name(sandbox, role)).await?.path)
+    pub async fn path(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<PathBuf> {
+        Ok(self.live(sandbox, role).await?.path)
     }
 
     /// Under the guest pause: sync the live volume and snapshot it.
-    pub async fn take(&self, sandbox: SandboxId, role: Role) -> io::Result<PendingCheckpoint> {
+    pub async fn take(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<PendingCheckpoint> {
         let previous = self.checkpoint_of(sandbox, role).await?;
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
-        let live = self.disk.open(&live_name(sandbox, role)).await?;
+        let live = self.live(sandbox, role).await?;
         let snapshot = checkpoint_split::take(self.disk.as_ref(), &live, &tmp).await?;
         Ok(PendingCheckpoint {
             sandbox,
@@ -300,6 +301,38 @@ impl SessionVolumes {
             snapshot,
             previous,
         })
+    }
+
+    /// The checkpoint a `take` left unpublished, found by name: a new
+    /// process redrives the publish after a crash. `NotFound` when
+    /// there is none.
+    pub async fn pending(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<PendingCheckpoint> {
+        let previous = self.checkpoint_of(sandbox, role).await?;
+        let snapshot = self.disk.open(&transient_name(sandbox, role)).await?;
+        Ok(PendingCheckpoint {
+            sandbox,
+            role,
+            snapshot,
+            previous,
+        })
+    }
+
+    /// Ascending indices of the chunks the pending snapshot changed
+    /// since the sandbox's checkpoint: what a live move has to carry.
+    pub async fn changed(&self, pending: &PendingCheckpoint) -> io::Result<Vec<ChunkIndex>> {
+        let previous = self
+            .disk
+            .open(&checkpoint_name(
+                pending.sandbox,
+                pending.role,
+                pending.previous,
+            ))
+            .await?;
+        self.disk.dirty_chunks(&previous, &pending.snapshot).await
     }
 
     /// Outside the pause: upload what changed since the last checkpoint,
@@ -351,7 +384,7 @@ impl SessionVolumes {
 
     /// [`Self::take`] then [`Self::publish`], for a guest that is paused
     /// throughout or has no guest.
-    pub async fn checkpoint(&self, sandbox: SandboxId, role: Role) -> io::Result<ManifestRef> {
+    pub async fn checkpoint(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<ManifestRef> {
         let pending = self.take(sandbox, role).await?;
         self.publish(pending).await
     }
@@ -371,12 +404,13 @@ impl SessionVolumes {
     }
 
     /// Delete what no live sandbox needs: every volume of a sandbox not
-    /// in `live`, every transient volume, and every checkpoint volume
-    /// but the newest of its role. Run once after the live set is
+    /// in `live` and every checkpoint volume but the newest of its role.
+    /// A live sandbox keeps its transient volume: it may be a checkpoint
+    /// whose publish is being redriven. Run once after the live set is
     /// known, before any sandbox is provisioned.
     pub async fn reconcile(&self, live: &[SandboxId]) -> io::Result<Report> {
         let mut report = Report::default();
-        let mut newest: std::collections::HashMap<(SandboxId, Role), u64> = Default::default();
+        let mut newest: std::collections::HashMap<(SandboxId, DiskRole), u64> = Default::default();
         let parsed: Vec<(VolumeName, Parsed)> = self
             .disk
             .list()
@@ -393,8 +427,7 @@ impl SessionVolumes {
         for (name, p) in parsed {
             let unwanted = !live.contains(&p.sandbox)
                 || match p.kind {
-                    Kind::Live => false,
-                    Kind::Transient => true,
+                    Kind::Live | Kind::Transient => false,
                     Kind::Checkpoint(m) => m.version < newest[&(p.sandbox, p.role)],
                 };
             if !unwanted {
@@ -408,7 +441,7 @@ impl SessionVolumes {
         Ok(report)
     }
 
-    async fn checkpoint_of(&self, sandbox: SandboxId, role: Role) -> io::Result<ManifestRef> {
+    async fn checkpoint_of(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<ManifestRef> {
         let mut found: Option<ManifestRef> = None;
         for name in self.disk.list().await? {
             if let Some(Parsed {
@@ -425,10 +458,7 @@ impl SessionVolumes {
         found.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "sandbox {sandbox} has no {} checkpoint volume",
-                    role.as_str()
-                ),
+                format!("sandbox {sandbox} has no {} checkpoint volume", role),
             )
         })
     }
@@ -446,7 +476,7 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
 
     use super::*;
-    use crate::disk::{ChunkIndex, FileDisk};
+    use crate::disk::FileDisk;
     use crate::disk_flows::checkpoint;
 
     const CHUNK: u64 = 4096;
@@ -531,7 +561,7 @@ mod tests {
         names
     }
 
-    async fn checkpoints_of(r: &Rig, sandbox: SandboxId, role: Role) -> Vec<ManifestRef> {
+    async fn checkpoints_of(r: &Rig, sandbox: SandboxId, role: DiskRole) -> Vec<ManifestRef> {
         let mut out = Vec::new();
         for name in r.disk.list().await.unwrap() {
             if let Some(Parsed {
@@ -553,26 +583,26 @@ mod tests {
         let sandbox = SandboxId::new();
         let manifest = ManifestRef::new();
         assert_eq!(
-            parse(&live_name(sandbox, Role::Root)),
+            parse(&live_name(sandbox, DiskRole::Root)),
             Some(Parsed {
                 sandbox,
-                role: Role::Root,
+                role: DiskRole::Root,
                 kind: Kind::Live
             })
         );
         assert_eq!(
-            parse(&checkpoint_name(sandbox, Role::Swap, manifest)),
+            parse(&checkpoint_name(sandbox, DiskRole::Swap, manifest)),
             Some(Parsed {
                 sandbox,
-                role: Role::Swap,
+                role: DiskRole::Swap,
                 kind: Kind::Checkpoint(manifest)
             })
         );
         assert_eq!(
-            parse(&transient_name(sandbox, Role::Root)),
+            parse(&transient_name(sandbox, DiskRole::Root)),
             Some(Parsed {
                 sandbox,
-                role: Role::Root,
+                role: DiskRole::Root,
                 kind: Kind::Transient
             })
         );
@@ -583,7 +613,7 @@ mod tests {
             None
         );
         assert_eq!(
-            image_volumes::image_of(&live_name(sandbox, Role::Root)),
+            image_volumes::image_of(&live_name(sandbox, DiskRole::Root)),
             None
         );
     }
@@ -601,9 +631,12 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 0, 3]);
         assert_eq!(p.swap, None);
-        assert_eq!(r.volumes.path(sandbox, Role::Root).await.unwrap(), p.root);
+        assert_eq!(
+            r.volumes.path(sandbox, DiskRole::Root).await.unwrap(),
+            p.root
+        );
 
-        let lineage = checkpoints_of(&r, sandbox, Role::Root).await;
+        let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await;
         assert_eq!(lineage.len(), 1);
         assert_ne!(lineage[0].manifest_id, image.manifest_id);
         assert_eq!(lineage[0].version, 1);
@@ -613,8 +646,8 @@ mod tests {
             names(&r).await,
             vec![
                 image_volumes::volume_name(image).as_str().to_string(),
-                live_name(sandbox, Role::Root).as_str().to_string(),
-                checkpoint_name(sandbox, Role::Root, lineage[0])
+                live_name(sandbox, DiskRole::Root).as_str().to_string(),
+                checkpoint_name(sandbox, DiskRole::Root, lineage[0])
                     .as_str()
                     .to_string(),
             ]
@@ -632,7 +665,7 @@ mod tests {
             .await
             .unwrap();
         write_byte(&p.root, 1, 9).await;
-        let published = r.volumes.checkpoint(first, Role::Root).await.unwrap();
+        let published = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
         r.volumes.release(first).await.unwrap();
 
         let second = SandboxId::new();
@@ -650,7 +683,7 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
         assert_eq!(
-            checkpoints_of(&r, second, Role::Root).await,
+            checkpoints_of(&r, second, DiskRole::Root).await,
             vec![published]
         );
 
@@ -689,13 +722,13 @@ mod tests {
             .unwrap();
         let swap = p.swap.expect("swap path");
         assert_eq!(bytes_at(&swap).await, vec![0, 0]);
-        let lineage = checkpoints_of(&r, sandbox, Role::Swap).await;
+        let lineage = checkpoints_of(&r, sandbox, DiskRole::Swap).await;
         let manifest = r.store.get_manifest(lineage[0]).await.unwrap();
         assert!(manifest.chunks.is_empty());
         assert_eq!(manifest.total_bytes, CHUNK * 2);
 
         write_byte(&swap, 1, 7).await;
-        let published = r.volumes.checkpoint(sandbox, Role::Swap).await.unwrap();
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Swap).await.unwrap();
         let manifest = r.store.get_manifest(published).await.unwrap();
         assert_eq!(
             manifest.chunks.iter().map(|c| c.offset).collect::<Vec<_>>(),
@@ -734,10 +767,10 @@ mod tests {
             .provision(sandbox, Source::Image(image), None)
             .await
             .unwrap();
-        let lineage = checkpoints_of(&r, sandbox, Role::Root).await[0];
+        let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
 
         write_byte(&p.root, 2, 3).await;
-        let v2 = r.volumes.checkpoint(sandbox, Role::Root).await.unwrap();
+        let v2 = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
         assert_eq!(v2, lineage.next_version());
         let m1 = r.store.get_manifest(lineage).await.unwrap();
         let m2 = r.store.get_manifest(v2).await.unwrap();
@@ -747,10 +780,10 @@ mod tests {
             vec![2 * CHUNK]
         );
         assert!(delta.zero.is_empty());
-        assert_eq!(checkpoints_of(&r, sandbox, Role::Root).await, vec![v2]);
+        assert_eq!(checkpoints_of(&r, sandbox, DiskRole::Root).await, vec![v2]);
 
         write_byte(&p.root, 0, 8).await;
-        let v3 = r.volumes.checkpoint(sandbox, Role::Root).await.unwrap();
+        let v3 = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
         assert_eq!(v3, v2.next_version());
         let m3 = r.store.get_manifest(v3).await.unwrap();
         let delta = m3.delta_from(&m2).unwrap();
@@ -758,7 +791,7 @@ mod tests {
             delta.write.iter().map(|c| c.offset).collect::<Vec<_>>(),
             vec![0]
         );
-        assert_eq!(checkpoints_of(&r, sandbox, Role::Root).await, vec![v3]);
+        assert_eq!(checkpoints_of(&r, sandbox, DiskRole::Root).await, vec![v3]);
 
         let resumed = SandboxId::new();
         let p = r
@@ -787,7 +820,7 @@ mod tests {
             .await
             .unwrap();
         write_byte(&p.root, 0, 5).await;
-        let pending = r.volumes.take(sandbox, Role::Root).await.unwrap();
+        let pending = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
         // The guest runs again before the upload.
         write_byte(&p.root, 0, 6).await;
         let published = r.volumes.publish(pending).await.unwrap();
@@ -795,6 +828,54 @@ mod tests {
         assert_eq!(
             m.chunks[0].hash,
             engram_chunk_store::ChunkHash::of(&vec![5; CHUNK as usize])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_checkpoint_is_found_by_name_and_says_what_changed() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 3]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, Source::Image(image), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.volumes
+                .pending(sandbox, DiskRole::Root)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        write_byte(&p.root, 2, 9).await;
+        let taken = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        assert_eq!(
+            r.volumes.changed(&taken).await.unwrap(),
+            vec![ChunkIndex(2)]
+        );
+        assert_eq!(
+            taken.snapshot().read_chunk(ChunkIndex(2)).await.unwrap()[0],
+            9
+        );
+        // The process that took it is gone.
+        drop(taken);
+        let found = r.volumes.pending(sandbox, DiskRole::Root).await.unwrap();
+        assert_eq!((found.sandbox(), found.role()), (sandbox, DiskRole::Root));
+        let published = r.volumes.publish(found).await.unwrap();
+        assert_eq!(
+            r.store.get_manifest(published).await.unwrap().chunks.len(),
+            3
+        );
+        assert_eq!(
+            r.volumes
+                .pending(sandbox, DiskRole::Root)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
         );
     }
 
@@ -808,7 +889,7 @@ mod tests {
             .provision(sandbox, Source::Image(image), None)
             .await
             .unwrap();
-        let lineage = checkpoints_of(&r, sandbox, Role::Root).await[0];
+        let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
         // A crash between `put_manifest` and the rename: v2 is in the
         // store, the snapshot is still transient.
         let m1 = r.store.get_manifest(lineage).await.unwrap();
@@ -817,15 +898,15 @@ mod tests {
             .await
             .unwrap();
         r.disk
-            .create(&transient_name(sandbox, Role::Root), CHUNK)
+            .create(&transient_name(sandbox, DiskRole::Root), CHUNK)
             .await
             .unwrap();
 
         write_byte(&p.root, 0, 2).await;
-        let published = r.volumes.checkpoint(sandbox, Role::Root).await.unwrap();
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
         assert_eq!(published.version, 3);
         assert_eq!(
-            checkpoints_of(&r, sandbox, Role::Root).await,
+            checkpoints_of(&r, sandbox, DiskRole::Root).await,
             vec![published]
         );
         assert!(!names(&r)
@@ -852,21 +933,25 @@ mod tests {
             .provision(dead, Source::Image(image), None)
             .await
             .unwrap();
-        let lineage = checkpoints_of(&r, live, Role::Root).await[0];
-        let dead_lineage = checkpoints_of(&r, dead, Role::Root).await[0];
+        let lineage = checkpoints_of(&r, live, DiskRole::Root).await[0];
+        let dead_lineage = checkpoints_of(&r, dead, DiskRole::Root).await[0];
         // A crash after the rename and before the old checkpoint's
-        // delete, and one between a snapshot and its rename.
+        // delete, and a checkpoint of the live sandbox not yet published.
         let stale = r
             .disk
             .create(
-                &checkpoint_name(live, Role::Root, lineage.next_version()),
+                &checkpoint_name(live, DiskRole::Root, lineage.next_version()),
                 CHUNK,
             )
             .await
             .unwrap();
         drop(stale);
         r.disk
-            .create(&transient_name(live, Role::Swap), CHUNK)
+            .create(&transient_name(live, DiskRole::Swap), CHUNK)
+            .await
+            .unwrap();
+        r.disk
+            .create(&transient_name(dead, DiskRole::Root), CHUNK)
             .await
             .unwrap();
 
@@ -879,22 +964,27 @@ mod tests {
             .collect();
         deleted.sort();
         let mut expected = vec![
-            live_name(dead, Role::Root).as_str().to_string(),
-            checkpoint_name(dead, Role::Root, dead_lineage)
+            live_name(dead, DiskRole::Root).as_str().to_string(),
+            checkpoint_name(dead, DiskRole::Root, dead_lineage)
                 .as_str()
                 .to_string(),
-            checkpoint_name(live, Role::Root, lineage)
+            checkpoint_name(live, DiskRole::Root, lineage)
                 .as_str()
                 .to_string(),
-            transient_name(live, Role::Swap).as_str().to_string(),
+            transient_name(dead, DiskRole::Root).as_str().to_string(),
         ];
         expected.sort();
         assert_eq!(deleted, expected);
         assert_eq!(
-            checkpoints_of(&r, live, Role::Root).await,
+            checkpoints_of(&r, live, DiskRole::Root).await,
             vec![lineage.next_version()]
         );
-        assert!(r.disk.open(&live_name(live, Role::Swap)).await.is_ok());
+        assert!(r.disk.open(&live_name(live, DiskRole::Swap)).await.is_ok());
+        assert!(r
+            .disk
+            .open(&transient_name(live, DiskRole::Swap))
+            .await
+            .is_ok());
         assert!(r
             .disk
             .open(&image_volumes::volume_name(image))
@@ -928,7 +1018,7 @@ mod tests {
             .iter()
             .all(|n| !n.contains(&a.as_uuid().simple().to_string())));
         assert_eq!(
-            r.volumes.path(a, Role::Root).await.unwrap_err().kind(),
+            r.volumes.path(a, DiskRole::Root).await.unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
     }
