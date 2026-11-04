@@ -223,6 +223,14 @@ impl HostClient for LocalHostClient {
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.write_file(id, spec, bytes).await;
+        }
         self.ordinary_only(id)?;
         self.sandbox.write_file(id, spec, bytes).await
     }
@@ -232,6 +240,14 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         path: String,
     ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.read_file(id, path).await;
+        }
         self.ordinary_only(id)?;
         self.sandbox.read_file(id, path).await
     }

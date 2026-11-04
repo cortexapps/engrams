@@ -1,4 +1,8 @@
 //! Exact managed VZ ownership from CLOSED preparation through source retirement.
+use engram_core::{
+    types::sandbox::{SessionFileMetadata, SessionFileSpec, SessionFileStream},
+    SandboxError,
+};
 use std::{io, path::Path};
 
 fn verify_file(path: &Path, digest: &str, size: Option<u64>) -> io::Result<()> {
@@ -187,6 +191,42 @@ impl PreparedManagedVz {
             durable,
         )
         .await
+    }
+    pub async fn prepare_read_file(
+        &mut self,
+        epoch: u64,
+        path: String,
+        mut closed: tokio::sync::watch::Receiver<()>,
+    ) -> Result<
+        impl std::future::Future<
+                Output = Result<(SessionFileMetadata, SessionFileStream), SandboxError>,
+            > + Send
+            + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        // This future owns the exact connection and has no reconnect capability.
+        Ok(engram_agentd::file_transfer::read_file_until_closed(
+            connection,
+            path,
+            async move {
+                let _ = closed.changed().await;
+            },
+        ))
+    }
+    pub async fn prepare_write_file(
+        &mut self,
+        epoch: u64,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<
+        impl std::future::Future<Output = Result<SessionFileMetadata, SandboxError>> + Send + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        Ok(engram_agentd::file_transfer::write_file(
+            connection, spec, bytes,
+        ))
     }
     pub async fn cancel_exec(
         &mut self,

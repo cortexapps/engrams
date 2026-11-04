@@ -11,6 +11,8 @@ mod network;
 #[cfg(target_os = "linux")]
 mod process;
 
+#[cfg(target_os = "linux")]
+use engram_core::types::sandbox::{SessionFileMetadata, SessionFileSpec, SessionFileStream};
 use engram_core::{
     types::{
         managed_cold::{ManagedColdPrepare, ManagedColdPrepared},
@@ -241,6 +243,44 @@ impl PreparedManagedFc {
             None,
         )
         .await
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_read_file(
+        &mut self,
+        epoch: u64,
+        path: String,
+        mut closed: tokio::sync::watch::Receiver<()>,
+    ) -> Result<
+        impl std::future::Future<
+                Output = Result<(SessionFileMetadata, SessionFileStream), SandboxError>,
+            > + Send
+            + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        // This future owns the exact connection and has no reconnect capability.
+        Ok(engram_agentd::file_transfer::read_file_until_closed(
+            connection,
+            path,
+            async move {
+                let _ = closed.changed().await;
+            },
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_write_file(
+        &mut self,
+        epoch: u64,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<
+        impl std::future::Future<Output = Result<SessionFileMetadata, SandboxError>> + Send + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        Ok(engram_agentd::file_transfer::write_file(
+            connection, spec, bytes,
+        ))
     }
     #[cfg(target_os = "linux")]
     pub async fn cancel_exec(&mut self, epoch: u64, exec_id: String) -> Result<(), SandboxError> {

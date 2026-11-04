@@ -1573,13 +1573,12 @@ impl HostService for HostServiceImpl {
         use futures::StreamExt;
         let request = req.into_inner();
         let sandbox_id = decode_sandbox_id(&request.sandbox_id)?;
-        let (metadata, mut bytes) = self
+        let (metadata, bytes) = self
             .inner
             .read_file(sandbox_id, request.path)
             .await
             .map_err(sandbox_to_status)?;
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(Ok(HostReadFileResponse {
+        let metadata = HostReadFileResponse {
             frame: Some(
                 engram_protocol::grpc::host_read_file_response::Frame::Metadata(
                     HostReadFileMetadata {
@@ -1589,28 +1588,21 @@ impl HostService for HostServiceImpl {
                     },
                 ),
             ),
-        }))
-        .await
-        .map_err(|_| Status::cancelled("read client closed before metadata"))?;
-        tokio::spawn(async move {
-            while let Some(item) = bytes.next().await {
-                let frame = item
-                    .map(|chunk| HostReadFileResponse {
-                        frame: Some(
-                            engram_protocol::grpc::host_read_file_response::Frame::Chunk(
-                                chunk.to_vec(),
-                            ),
+        };
+        // The response owns the source, so downstream cancellation drops it even
+        // while its next chunk is pending.
+        let response =
+            futures::stream::once(async move { Ok(metadata) }).chain(bytes.map(|item| {
+                item.map(|chunk| HostReadFileResponse {
+                    frame: Some(
+                        engram_protocol::grpc::host_read_file_response::Frame::Chunk(
+                            chunk.to_vec(),
                         ),
-                    })
-                    .map_err(sandbox_to_status);
-                if tx.send(frame).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+                    ),
+                })
+                .map_err(sandbox_to_status)
+            }));
+        Ok(Response::new(Box::pin(response)))
     }
 
     /// ADR 0014 issue #6: bidi WS-frame tunnel.

@@ -595,6 +595,18 @@ these owners. A lost owner stays closed. A durable start intent precedes the
 single `SpawnHarness` write into a fresh guest. The host persists only digests
 of the final agent environment, not plaintext credentials.
 
+Managed execution and session file reads and writes use the same exact Started
+owner check: current host incarnation, start receipt, durable session binding,
+boot identity, epoch and fresh backend readiness. The lifecycle lock covers
+connection setup, with a bounded readiness and connection check. Body transfer
+runs outside that lock, without a new body deadline. A fresh close signal belongs
+to each prepared owner and cancels pending transfer work before native close.
+File transfers use one connection from that owner and the existing agentd
+protocol. An open transfer cannot reconnect to a replacement owner. Download
+responses own their source streams, and socket reads observe receiver closure.
+Cancellation, source failure or owner closure ends the transfer I/O;
+a missing owner never permits an ordinary backend fallback.
+
 The initial private allocation holds a deny-only bootstrap policy lease. There
 is one narrow exception to ordinary policy replacement: a NEVER-BOUND private
 allocation with no flow work can transfer that lease to its final policy. The

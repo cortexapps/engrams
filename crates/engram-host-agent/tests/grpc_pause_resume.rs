@@ -25,11 +25,12 @@ use engram_core::{SandboxId, SessionId};
 use parking_lot::Mutex;
 
 /// Records the (verb, sandbox_id) of every pause/resume the gRPC server
-/// forwarded. Every other trait method is `unreachable!()` — a loud
-/// failure if the test starts touching surface it doesn't intend to cover.
+/// forwarded. File reads supply a stalled source for cancellation tests.
+/// Other operations fail if a test calls them.
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<(&'static str, SandboxId)>>,
+    file_drop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[async_trait]
@@ -41,6 +42,27 @@ impl HostClient for FakeHost {
     async fn resume(&self, id: SandboxId, _: SessionFence) -> Result<(), SandboxError> {
         self.calls.lock().push(("resume", id));
         Ok(())
+    }
+
+    async fn read_file(
+        &self,
+        _: SandboxId,
+        path: String,
+    ) -> Result<
+        (
+            engram_core::types::sandbox::SessionFileMetadata,
+            engram_core::types::sandbox::SessionFileStream,
+        ),
+        SandboxError,
+    > {
+        Ok((
+            engram_core::types::sandbox::SessionFileMetadata {
+                path,
+                size_bytes: 1,
+                sha256: "a".repeat(64),
+            },
+            Box::pin(StalledFile(self.file_drop.lock().take())),
+        ))
     }
 
     async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
@@ -182,4 +204,55 @@ async fn pause_then_resume_round_trip_to_the_host_with_the_right_sandbox() {
         vec![("pause", sandbox_id), ("resume", sandbox_id)],
         "pause/resume did not round-trip in order with the right sandbox id",
     );
+}
+
+struct StalledFile(Option<tokio::sync::oneshot::Sender<()>>);
+impl futures::Stream for StalledFile {
+    type Item = Result<bytes::Bytes, SandboxError>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Pending
+    }
+}
+impl Drop for StalledFile {
+    fn drop(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_stalled_file_response_drops_host_source() {
+    use engram_protocol::grpc::host_service_server::HostService;
+    use futures::StreamExt;
+    let (signal, dropped) = tokio::sync::oneshot::channel();
+    let host = Arc::new(FakeHost::default());
+    *host.file_drop.lock() = Some(signal);
+    let service = engram_host_agent::grpc_server::HostServiceImpl::new(
+        host,
+        engram_host_agent::session_epochs::ephemeral(),
+    );
+    let mut response = service
+        .read_file(tonic::Request::new(
+            engram_protocol::grpc::HostReadFileRequest {
+                sandbox_id: SandboxId::new().as_uuid().as_bytes().to_vec(),
+                path: "/tmp/stalled.bin".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        response.next().await.unwrap().unwrap().frame,
+        Some(engram_protocol::grpc::host_read_file_response::Frame::Metadata(_))
+    ));
+    tokio::task::yield_now().await;
+    drop(response);
+    tokio::time::timeout(Duration::from_millis(100), dropped)
+        .await
+        .expect("downstream cancellation must drop the stalled host source")
+        .unwrap();
 }

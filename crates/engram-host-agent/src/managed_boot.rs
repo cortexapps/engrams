@@ -11,7 +11,10 @@ use engram_core::{
         managed_create::digest,
         managed_deny::*,
         manifest::ManifestRef,
-        sandbox::{AgentSpec, ExecRequest, ExecStream},
+        sandbox::{
+            AgentSpec, ExecRequest, ExecStream, SessionFileMetadata, SessionFileSpec,
+            SessionFileStream,
+        },
     },
     HostId, SandboxError, SandboxId,
 };
@@ -67,6 +70,12 @@ impl ManagedBackend {
         }
     }
 }
+type FileRead = futures::future::BoxFuture<
+    'static,
+    Result<(SessionFileMetadata, SessionFileStream), SandboxError>,
+>;
+type FileWrite = futures::future::BoxFuture<'static, Result<SessionFileMetadata, SandboxError>>;
+
 enum Owner {
     #[cfg(test)]
     ExecTest(Box<tests::ExecOwner>),
@@ -157,6 +166,43 @@ impl Owner {
             Self::ExecTest(owner) => owner.cancel_exec(exec_id),
         }
     }
+    async fn prepare_read_file(
+        &mut self,
+        epoch: u64,
+        path: String,
+        closed: tokio::sync::watch::Receiver<()>,
+    ) -> Result<FileRead, SandboxError> {
+        Ok(match self {
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => {
+                Box::pin(owner.prepare_read_file(epoch, path, closed).await?)
+            }
+            #[cfg(target_os = "macos")]
+            Self::Vz(owner) => Box::pin(owner.prepare_read_file(epoch, path, closed).await?),
+            #[cfg(test)]
+            Self::ExecTest(owner) => {
+                let result = owner.read_file(path, closed);
+                Box::pin(async move { result })
+            }
+        })
+    }
+    async fn prepare_write_file(
+        &mut self,
+        epoch: u64,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<FileWrite, SandboxError> {
+        Ok(match self {
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => {
+                Box::pin(owner.prepare_write_file(epoch, spec, bytes).await?)
+            }
+            #[cfg(target_os = "macos")]
+            Self::Vz(owner) => Box::pin(owner.prepare_write_file(epoch, spec, bytes).await?),
+            #[cfg(test)]
+            Self::ExecTest(owner) => owner.prepare_write_file(spec, bytes),
+        })
+    }
     async fn retire_disk(&mut self, path: &Path) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
@@ -170,7 +216,10 @@ impl Owner {
     async fn close(self) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
-            Self::ExecTest(owner) => {
+            Self::ExecTest(mut owner) => {
+                if let Some(wait) = owner.close_wait.take() {
+                    let _ = wait.await;
+                }
                 if owner.close_fails {
                     Err(invalid("test close failed"))
                 } else {
@@ -210,6 +259,8 @@ struct Record {
     retired: Option<(String, u64)>,
 }
 struct Entry {
+    /// Replaced with each prepared owner; close signals before native I/O.
+    transfer_stop: tokio::sync::watch::Sender<()>,
     record: Record,
     close_failed: bool,
     attach_owner: Option<crate::harness::ManagedHarnessOwner>,
@@ -446,6 +497,7 @@ impl ManagedBootHost {
         }
     }
     async fn close_resources(&self, entry: &mut Entry) -> Result<(), SandboxError> {
+        entry.transfer_stop.send_replace(());
         if entry.close_failed {
             return Err(invalid("prior owner cleanup was uncertain"));
         }
@@ -586,6 +638,7 @@ impl ManagedBootHost {
                 self.persist(&record)?;
                 entry
                     .insert(Arc::new(Mutex::new(Entry {
+                        transfer_stop: tokio::sync::watch::channel(()).0,
                         close_failed: false,
                         record,
                         attach_owner: None,
@@ -716,6 +769,7 @@ impl ManagedBootHost {
             };
             receipt.receipt_id = digest(&serde_json::to_vec(&receipt).map_err(invalid)?);
             receipt.validate().map_err(invalid)?;
+            entry.transfer_stop = tokio::sync::watch::channel(()).0;
             entry.owner = Some(owner);
             entry.record.prepared = Some(receipt.clone());
             entry.record.state = ManagedBootHostState::Prepared {
@@ -977,6 +1031,7 @@ impl ManagedBootHost {
             .clone()
             .ok_or_else(|| invalid("prepared receipt absent"))?;
         let key = entry.record.request.key.clone();
+        entry.transfer_stop.send_replace(());
         entry.attach_owner = None;
         entry.record.state = ManagedBootHostState::Failed { key: key.clone() };
         entry.agent = None;
@@ -1254,6 +1309,7 @@ impl ManagedBootHost {
                     .entry(request.key.context.target.sandbox_id)
                     .or_insert_with(|| {
                         Arc::new(Mutex::new(Entry {
+                            transfer_stop: tokio::sync::watch::channel(()).0,
                             close_failed: false,
                             record,
                             attach_owner: None,
@@ -1320,6 +1376,7 @@ impl ManagedBootHost {
                     .await
                     .map_err(invalid)??;
                 } else {
+                    entry.transfer_stop.send_replace(());
                     entry
                         .owner
                         .as_mut()
@@ -1545,6 +1602,67 @@ impl ManagedBootHost {
         .await
         .map_err(|_| SandboxError::Unavailable("managed execution cancellation timed out".into()))?
     }
+    async fn transfer<T>(
+        mut closed: tokio::sync::watch::Receiver<()>,
+        transfer: impl std::future::Future<Output = Result<T, SandboxError>>,
+    ) -> Result<T, SandboxError> {
+        tokio::select! {
+            biased;
+            _ = closed.changed() => Err(SandboxError::Unavailable("managed file owner closed".into())),
+            result = transfer => result,
+        }
+    }
+    pub async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let (closed, transfer) = {
+            let entry = self
+                .entries
+                .get(&id)
+                .map(|e| e.clone())
+                .ok_or_else(|| invalid("owner"))?;
+            let mut entry = entry.lock().await;
+            let closed = entry.transfer_stop.subscribe();
+            let transfer = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let (epoch, owner) = self.execution_owner(id, &mut entry).await?;
+                owner.prepare_read_file(epoch, path, closed.clone()).await
+            })
+            .await
+            .map_err(|_| {
+                SandboxError::Unavailable("managed file read submission timed out".into())
+            })??;
+            (closed, transfer)
+        };
+        Self::transfer(closed, transfer).await
+    }
+    pub async fn write_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let (closed, transfer) = {
+            let entry = self
+                .entries
+                .get(&id)
+                .map(|e| e.clone())
+                .ok_or_else(|| invalid("owner"))?;
+            let mut entry = entry.lock().await;
+            let closed = entry.transfer_stop.subscribe();
+            let transfer = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let (epoch, owner) = self.execution_owner(id, &mut entry).await?;
+                owner.prepare_write_file(epoch, spec, bytes).await
+            })
+            .await
+            .map_err(|_| {
+                SandboxError::Unavailable("managed file write submission timed out".into())
+            })??;
+            (closed, transfer)
+        };
+        Self::transfer(closed, transfer).await
+    }
     pub async fn guard_running(&self, id: SandboxId) -> Result<(), SandboxError> {
         let entry = self
             .entries
@@ -1691,13 +1809,21 @@ mod tests {
         },
     };
 
+    struct TestFile {
+        metadata: SessionFileMetadata,
+        chunks: Vec<bytes::Bytes>,
+    }
     pub(super) struct ExecOwner {
         pub(super) close_fails: bool,
+        pub(super) close_wait: Option<tokio::sync::oneshot::Receiver<()>>,
         epoch: u64,
         live: bool,
         pub(super) blocked: bool,
         id: SandboxId,
         pub(super) request: ManagedColdPrepare,
+        file: Arc<std::sync::Mutex<Option<TestFile>>>,
+        file_read_fails: bool,
+        file_read_stalls: bool,
     }
     impl ExecOwner {
         pub(super) fn exec_stream(&self, cmd: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -1717,6 +1843,58 @@ mod tests {
             } else {
                 Err(invalid("wrong cancel ticket"))
             }
+        }
+        pub(super) fn prepare_write_file(
+            &self,
+            spec: SessionFileSpec,
+            bytes: SessionFileStream,
+        ) -> FileWrite {
+            let file = self.file.clone();
+            Box::pin(async move {
+                use futures::TryStreamExt;
+                let chunks = bytes.try_collect::<Vec<_>>().await?;
+                let metadata = SessionFileMetadata {
+                    path: spec.path,
+                    size_bytes: spec.size_bytes,
+                    sha256: spec.sha256,
+                };
+                *file.lock().unwrap() = Some(TestFile {
+                    metadata: metadata.clone(),
+                    chunks,
+                });
+                Ok(metadata)
+            })
+        }
+        pub(super) fn read_file(
+            &self,
+            path: String,
+            closed: tokio::sync::watch::Receiver<()>,
+        ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+            let file = self.file.lock().unwrap();
+            let TestFile { metadata, chunks } = file.as_ref().ok_or(SandboxError::NotFound)?;
+            if path != metadata.path {
+                return Err(SandboxError::NotFound);
+            }
+            let metadata = metadata.clone();
+            let mut events = chunks.iter().cloned().map(Ok).collect::<Vec<_>>();
+            if self.file_read_fails {
+                events.push(Err(SandboxError::Unavailable("owner stream closed".into())));
+            }
+            let events: SessionFileStream = if self.file_read_stalls {
+                Box::pin(futures::stream::pending())
+            } else {
+                Box::pin(futures::stream::iter(events))
+            };
+            let stream = futures::stream::unfold(Some((events, closed)), |state| async move {
+                use futures::StreamExt;
+                let (mut events, mut closed) = state?;
+                tokio::select! {
+                    biased;
+                    _ = closed.changed() => Some((Err(SandboxError::Unavailable("owner stream closed".into())), None)),
+                    item = events.next() => item.map(|item| (item, Some((events, closed)))),
+                }
+            });
+            Ok((metadata, Box::pin(stream)))
         }
         pub(super) fn ready(&self, epoch: u64) -> Result<(), SandboxError> {
             if self.live && self.epoch == epoch {
@@ -1751,16 +1929,21 @@ mod tests {
             intent: intent.clone(),
         };
         let entry = Arc::new(Mutex::new(Entry {
+            transfer_stop: tokio::sync::watch::channel(()).0,
             close_failed: false,
             record,
             attach_owner: Some(host.hub.managed_owner(intent)),
             owner: Some(Owner::ExecTest(Box::new(ExecOwner {
                 close_fails: false,
+                close_wait: None,
                 epoch: 1,
                 live: true,
                 blocked: false,
                 id,
                 request: request.cold.clone(),
+                file: Arc::new(std::sync::Mutex::new(None)),
+                file_read_fails: false,
+                file_read_stalls: false,
             }))),
             agent: None,
         }));
@@ -1935,6 +2118,447 @@ mod tests {
             Err(SandboxError::Unavailable(_))
         ));
         assert!(entry.try_lock().is_ok());
+    }
+
+    #[derive(Default)]
+    struct FileBackendCalls(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl SandboxBackend for FileBackendCalls {
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            panic!("unexpected ordinary execution")
+        }
+        fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+            panic!("unexpected ordinary snapshot path")
+        }
+        async fn create(
+            &self,
+            _: engram_core::types::sandbox::SandboxSpec,
+        ) -> Result<SandboxId, SandboxError> {
+            panic!("unexpected ordinary create")
+        }
+        async fn snapshot(
+            &self,
+            _: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            panic!("unexpected ordinary snapshot")
+        }
+        async fn restore(
+            &self,
+            _: engram_core::types::snapshot::SnapshotMetadata,
+        ) -> Result<SandboxId, SandboxError> {
+            panic!("unexpected ordinary restore")
+        }
+        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+            panic!("unexpected ordinary destroy")
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn read_file(
+            &self,
+            _: SandboxId,
+            _: String,
+        ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SandboxError::NotFound)
+        }
+        async fn write_file(
+            &self,
+            _: SandboxId,
+            _: SessionFileSpec,
+            _: SessionFileStream,
+        ) -> Result<SessionFileMetadata, SandboxError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SandboxError::NotFound)
+        }
+    }
+    fn file_spec() -> SessionFileSpec {
+        SessionFileSpec {
+            path: "/tmp/uploads/file.bin".into(),
+            size_bytes: 11,
+            sha256: "a".repeat(64),
+            mode: Some(0o640),
+        }
+    }
+    fn file_bytes() -> SessionFileStream {
+        Box::pin(futures::stream::iter([Ok(bytes::Bytes::from_static(
+            b"owner-bytes",
+        ))]))
+    }
+    fn file_client(
+        host: &Arc<ManagedBootHost>,
+        ordinary: &Arc<FileBackendCalls>,
+    ) -> crate::host_client::LocalHostClient {
+        crate::host_client::LocalHostClient::new(ordinary.clone(), host.hub.clone())
+            .with_managed_boot(host.clone())
+    }
+    #[tokio::test]
+    async fn managed_file_io_uses_current_owner() {
+        use futures::TryStreamExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        install_exec_owner(&host, &request);
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        let metadata = local
+            .write_file(id, file_spec(), file_bytes())
+            .await
+            .expect("managed upload uses its current owner");
+        assert_eq!(metadata.path, "/tmp/uploads/file.bin");
+        assert_eq!(metadata.size_bytes, 11);
+        assert_eq!(metadata.sha256, "a".repeat(64));
+        let (download, stream) = local
+            .read_file(id, metadata.path.clone())
+            .await
+            .expect("managed download uses its current owner");
+        assert_eq!(download, metadata);
+        assert_eq!(
+            stream.try_collect::<Vec<_>>().await.unwrap(),
+            [bytes::Bytes::from_static(b"owner-bytes")]
+        );
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn managed_file_io_rejects_stale_or_closed_owner() {
+        for case in 0..13 {
+            let temp = tempfile::tempdir().unwrap();
+            let (host, request) = fixture(temp.path());
+            let id = request.key.context.target.sandbox_id;
+            let entry = install_exec_owner(&host, &request);
+            {
+                let mut entry = entry.lock().await;
+                match case {
+                    0 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.live = false;
+                        }
+                    }
+                    1 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.epoch = 2;
+                        }
+                    }
+                    2 => entry.owner = None,
+                    3 => entry.record.incarnation = "old-host".into(),
+                    4 => {
+                        entry.record.state = ManagedBootHostState::Failed {
+                            key: request.key.clone(),
+                        }
+                    }
+                    5 => host
+                        .hub
+                        .bind_session(request.key.creation.session_id, id, 2)
+                        .unwrap(),
+                    6 => {
+                        if let ManagedBootHostState::Started { intent } = &mut entry.record.state {
+                            intent.receipt.key.boot_attempt = "other-boot".into();
+                        }
+                    }
+                    7 => entry.attach_owner = None,
+                    8 => entry.record.request.key.context.target.host_id = HostId::new(),
+                    9 => entry.record.request.key.context.target.sandbox_id = SandboxId::new(),
+                    10 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.request.boot_attempt = "replacement".into();
+                        }
+                    }
+                    11 => {
+                        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+                            owner.blocked = true;
+                        }
+                    }
+                    _ => {
+                        host.entries.remove(&id);
+                    }
+                }
+            }
+            let ordinary = Arc::new(FileBackendCalls::default());
+            let local = file_client(&host, &ordinary);
+            let read = local
+                .read_file(id, file_spec().path)
+                .await
+                .err()
+                .expect("stale read denied");
+            let write = local
+                .write_file(id, file_spec(), file_bytes())
+                .await
+                .unwrap_err();
+            if case == 11 {
+                assert!(
+                    matches!(read, SandboxError::Unavailable(_)),
+                    "blocked read readiness is bounded"
+                );
+                assert!(
+                    matches!(write, SandboxError::Unavailable(_)),
+                    "blocked write readiness is bounded"
+                );
+            } else {
+                assert!(
+                    matches!(read, SandboxError::InvalidSpec(_)),
+                    "read case {case}"
+                );
+                assert!(
+                    matches!(write, SandboxError::InvalidSpec(_)),
+                    "write case {case}"
+                );
+            }
+            assert!(
+                entry.try_lock().is_ok(),
+                "submission must release the lifecycle lock"
+            );
+            assert_eq!(
+                ordinary.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "case {case}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn managed_file_io_never_uses_ordinary_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        entry.lock().await.owner = None;
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        assert!(matches!(
+            local.read_file(id, file_spec().path).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            local.write_file(id, file_spec(), file_bytes()).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        let no_boot = crate::host_client::LocalHostClient::new(ordinary.clone(), host.hub.clone());
+        assert!(matches!(
+            no_boot.read_file(id, file_spec().path).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            no_boot.write_file(id, file_spec(), file_bytes()).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let ordinary_id = SandboxId::new();
+        assert!(matches!(
+            local.read_file(ordinary_id, file_spec().path).await,
+            Err(SandboxError::NotFound)
+        ));
+        assert!(matches!(
+            local
+                .write_file(ordinary_id, file_spec(), file_bytes())
+                .await,
+            Err(SandboxError::NotFound)
+        ));
+        assert_eq!(
+            ordinary.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "ordinary IDs still use the ordinary backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_file_io_cancellation_and_replacement_keep_stream_owner() {
+        use futures::TryStreamExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        local
+            .write_file(id, file_spec(), file_bytes())
+            .await
+            .unwrap();
+        let (_, opened) = local.read_file(id, file_spec().path).await.unwrap();
+        if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
+            owner.file_read_fails = true;
+        }
+        let (_, mut failed_stream) = local.read_file(id, file_spec().path).await.unwrap();
+        let mut upload =
+            Box::pin(local.write_file(id, file_spec(), Box::pin(futures::stream::pending())));
+        tokio::select! {
+            result = &mut upload => panic!("upload must wait for its source: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert!(
+            entry.try_lock().is_ok(),
+            "body transfer releases the lifecycle lock"
+        );
+        drop(upload);
+        assert!(
+            entry.try_lock().is_ok(),
+            "cancelled upload releases its lifecycle lock"
+        );
+        let replacement = install_exec_owner(&host, &request);
+        local
+            .write_file(
+                id,
+                file_spec(),
+                Box::pin(futures::stream::iter([Ok(bytes::Bytes::from_static(
+                    b"other-bytes",
+                ))])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            opened.try_collect::<Vec<_>>().await.unwrap(),
+            [bytes::Bytes::from_static(b"owner-bytes")],
+            "opened download never reads the replacement owner"
+        );
+        use futures::StreamExt;
+        assert_eq!(
+            failed_stream.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"owner-bytes")
+        );
+        assert!(failed_stream.next().await.unwrap().is_err());
+        assert!(
+            failed_stream.next().await.is_none(),
+            "failed stream must end without reading its replacement"
+        );
+        let (_, current) = local.read_file(id, file_spec().path).await.unwrap();
+        assert_eq!(
+            current.try_collect::<Vec<_>>().await.unwrap(),
+            [bytes::Bytes::from_static(b"other-bytes")]
+        );
+        assert!(local
+            .write_file(
+                id,
+                file_spec(),
+                Box::pin(futures::stream::iter([Err(SandboxError::Unavailable(
+                    "source stopped".into()
+                ))]))
+            )
+            .await
+            .is_err());
+        assert!(replacement.try_lock().is_ok());
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_file_progressing_upload_can_exceed_submission_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        install_exec_owner(&host, &request);
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        let source = futures::stream::unfold(0, |n| async move {
+            if n == 4 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Some((Ok(bytes::Bytes::from_static(b"a")), n + 1))
+        });
+        let mut spec = file_spec();
+        spec.size_bytes = 4;
+        let result = local
+            .write_file(id, spec, Box::pin(source))
+            .await
+            .expect("progressing body has no fixed submission deadline");
+        assert_eq!(result.size_bytes, 4);
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_file_close_cancels_stalled_upload_outside_lifecycle_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        let mut upload =
+            Box::pin(local.write_file(id, file_spec(), Box::pin(futures::stream::pending())));
+        tokio::select! {
+            result = &mut upload => panic!("stalled upload must wait for source: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        let mut entry = entry
+            .try_lock()
+            .expect("body transfer must release lifecycle lock");
+        let (release_close, native_close) = tokio::sync::oneshot::channel();
+        if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
+            owner.close_wait = Some(native_close);
+        }
+        let mut close = Box::pin(host.close_resources(&mut entry));
+        tokio::select! {
+            result = &mut close => panic!("native close must wait: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut upload).await,
+            Ok(Err(SandboxError::Unavailable(_)))
+        ));
+        release_close.send(()).unwrap();
+        close.await.unwrap();
+        assert!(entry.owner.is_none());
+        drop(entry);
+        let replacement = install_exec_owner(&host, &request);
+        assert!(replacement.try_lock().is_ok());
+        local
+            .write_file(id, file_spec(), file_bytes())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_file_close_stalled_read_before_native_close_completes() {
+        use futures::StreamExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.key.context.target.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        let ordinary = Arc::new(FileBackendCalls::default());
+        let local = file_client(&host, &ordinary);
+        local
+            .write_file(id, file_spec(), file_bytes())
+            .await
+            .unwrap();
+        let (release_close, native_close) = tokio::sync::oneshot::channel();
+        if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
+            owner.file_read_stalls = true;
+            owner.close_wait = Some(native_close);
+        }
+        let (_, mut stream) = local.read_file(id, file_spec().path).await.unwrap();
+        let mut entry = entry.lock().await;
+        let mut close = Box::pin(host.close_resources(&mut entry));
+        tokio::select! {
+            result = &mut close => panic!("native close must wait: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await,
+                Ok(Some(Err(SandboxError::Unavailable(_))))
+            ),
+            "old owner close must end the returned read before native close completes"
+        );
+        release_close.send(()).unwrap();
+        close.await.unwrap();
+        drop(entry);
+        install_exec_owner(&host, &request);
+        local
+            .write_file(id, file_spec(), file_bytes())
+            .await
+            .unwrap();
+        assert!(
+            stream.next().await.is_none(),
+            "closed read cannot adopt replacement bytes"
+        );
+        let (_, mut current) = local.read_file(id, file_spec().path).await.unwrap();
+        assert_eq!(
+            current.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"owner-bytes")
+        );
+        assert_eq!(ordinary.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     fn fixture(path: &Path) -> (Arc<ManagedBootHost>, ManagedBootPrepare) {
@@ -2617,6 +3241,7 @@ mod tests {
         };
         host.persist(&record).unwrap();
         let entry = Arc::new(Mutex::new(Entry {
+            transfer_stop: tokio::sync::watch::channel(()).0,
             close_failed: false,
             record,
             attach_owner: Some(host.hub.managed_owner(intent)),
@@ -2787,6 +3412,7 @@ mod tests {
             }),
         };
         let entry = Arc::new(Mutex::new(Entry {
+            transfer_stop: tokio::sync::watch::channel(()).0,
             close_failed: false,
             record,
             attach_owner: None,
@@ -3150,6 +3776,7 @@ mod tests {
             Some(ManagedDenyPolicy::new(2, ["other.example".into()]).unwrap());
         assert!(!bootstrap_retirement_allowed(&record, &changed));
         let entry = Arc::new(Mutex::new(Entry {
+            transfer_stop: tokio::sync::watch::channel(()).0,
             close_failed: false,
             record,
             attach_owner: None,
@@ -3245,6 +3872,7 @@ mod tests {
         host.entries.insert(
             id,
             Arc::new(Mutex::new(Entry {
+                transfer_stop: tokio::sync::watch::channel(()).0,
                 close_failed: false,
                 record,
                 attach_owner: None,
