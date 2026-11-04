@@ -1,6 +1,6 @@
 import { request as httpsRequest } from "node:https";
 import { checkServerIdentity, type ConnectionOptions } from "node:tls";
-import { createClient, type Interceptor } from "@connectrpc/connect";
+import { ConnectError, createClient, type Interceptor } from "@connectrpc/connect";
 import {
   createConnectTransport,
   createGrpcTransport,
@@ -27,6 +27,11 @@ import {
   type Context,
   type Endpoint,
 } from "./context.ts";
+
+const publicRpcMethods = new WeakMap<ConnectError, string>();
+export function publicRpcMethod(error: ConnectError): string | undefined {
+  return publicRpcMethods.get(error);
+}
 
 export type Credential =
   | { kind: "cookie"; value: string }
@@ -66,10 +71,32 @@ export async function tlsOptions(
 export async function publicClient(ctx: Context, credential: Credential) {
   const headers = credentialHeaders(credential);
   const authenticate: Interceptor = (next) => async (req) => {
-    for (const [key, value] of Object.entries(headers))
-      req.header.set(key, value);
+    for (const [key, value] of Object.entries(headers)) req.header.set(key, value);
     req.header.set("origin", ctx.endpoints.app.origin);
-    return next(req);
+    const method = `${req.service.name}.${req.method.name}`;
+    const remember = (error: unknown) => {
+      if (error instanceof ConnectError && /^[A-Za-z0-9_]{1,80}\.[A-Za-z0-9_]{1,80}$/.test(method))
+        publicRpcMethods.set(error, method);
+    };
+    try {
+      const response = await next(req);
+      if (!response.stream) return response;
+      const message = response.message;
+      return {
+        ...response,
+        message: (async function* () {
+          try {
+            yield* message;
+          } catch (error) {
+            remember(error);
+            throw error;
+          }
+        })(),
+      };
+    } catch (error) {
+      remember(error);
+      throw error;
+    }
   };
   const transport = createConnectTransport({
     baseUrl: ctx.endpoints.app.origin + "/rpc",

@@ -17,7 +17,9 @@ import {
   type CaseResult,
 } from "./manifest.ts";
 import { credentialHeaders, publicClient } from "./transport.ts";
-import { modelToolName } from "./bootstrap.ts";
+import { expectRejected, modelToolName } from "./bootstrap.ts";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { ExecOutputSchema } from "../../src/gen/engram/app/v1/session_pb.ts";
 import { StatusSchema } from "./supervisor.ts";
 import { Evidence } from "./evidence.ts";
 import { requirePrerequisites } from "./preflight.ts";
@@ -815,6 +817,138 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
       "guest_file_download",
     );
     expect(requests.every((request) => request.url.startsWith("/api/v1/sessions/"))).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+
+test("public RPC diagnostics retain descriptor methods and keep error data private", async () => {
+  const keyPath = join(root, "rpc-method.key");
+  const certPath = join(root, "rpc-method.pem");
+  const certificate = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "subjectAltName=DNS:localhost",
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  expect(await certificate.exited).toBe(0);
+  await chmod(certPath, 0o600);
+  const cert = await readFile(certPath);
+  const secret = "private-body-message-token";
+  const errorBody = { code: "failed_precondition", message: secret };
+  let streamFailure = true;
+  const envelope = (flags: number, bytes: Uint8Array) => {
+    const header = Buffer.alloc(5);
+    header[0] = flags;
+    header.writeUInt32BE(bytes.length, 1);
+    return Buffer.concat([header, bytes]);
+  };
+  const first = create(ExecOutputSchema, {
+    event: { case: "started", value: { execId: "exec-fixed" } },
+  });
+  const server = createServer({ key: await readFile(keyPath), cert }, (req, res) => {
+    if (req.url === "/rpc/engram.app.v1.IntegrationService/DiscoverMcp") {
+      res.writeHead(400, { "content-type": "application/json", "x-private": secret });
+      res.end(JSON.stringify(errorBody));
+    } else if (req.url === "/rpc/engram.app.v1.SessionService/Exec") {
+      res.writeHead(200, { "content-type": "application/connect+proto" });
+      res.write(envelope(0, toBinary(ExecOutputSchema, first)));
+      res.end(
+        envelope(
+          2,
+          Buffer.from(
+            JSON.stringify(
+              streamFailure ? { error: errorBody, metadata: { "x-private": [secret] } } : {},
+            ),
+          ),
+        ),
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server_address");
+    const ctx = ContextSchema.parse(validContext());
+    ctx.runRoot = root;
+    ctx.endpoints.app = {
+      origin: `https://localhost:${address.port}`,
+      ca: { path: certPath, sha256: sha256(cert) },
+      serverFingerprint: new X509Certificate(cert).fingerprint256,
+    };
+    const client = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture_session=private-cookie",
+    });
+    let original: unknown;
+    try {
+      await client.integration.discoverMcp({ connectionId: "private-input" });
+    } catch (error) {
+      original = error;
+    }
+    expect(original).toBeInstanceOf(ConnectError);
+    if (!(original instanceof ConnectError)) throw new Error("expected_connect_error");
+    expect(original.code).toBe(Code.FailedPrecondition);
+    expect(original.rawMessage).toBe(secret);
+    expect(original.metadata.get("x-private")).toBe(secret);
+    expect(await expectRejected(() => Promise.reject(original), [Code.FailedPrecondition])).toBe(
+      Code.FailedPrecondition,
+    );
+    const failure = safeFailure(original);
+    expect(failure.seam).toBe("public_rpc_IntegrationService.DiscoverMcp_code_9");
+    expect(safeFailure(original).seam).toBe(failure.seam);
+    expect(original.rawMessage).toBe(secret);
+    expect(Object.keys(original).sort()).toEqual(
+      Object.keys(new ConnectError(secret, Code.FailedPrecondition)).sort(),
+    );
+    expect(JSON.stringify(failure)).not.toContain("private");
+    expect(safeFailure(new ConnectError(secret, Code.FailedPrecondition)).seam).toBe(
+      "public_rpc_code_9",
+    );
+    expect(safeFailure(new Error(secret)).seam).toBe("unexpected_runner_error");
+    const stream = client.sessions
+      .exec({ sessionId: "private-session", argv: ["private-arg"] })
+      [Symbol.asyncIterator]();
+    expect((await stream.next()).value).toEqual(first);
+    let deferred: unknown;
+    try {
+      await stream.next();
+    } catch (error) {
+      deferred = error;
+    }
+    expect(deferred).toBeInstanceOf(ConnectError);
+    if (!(deferred instanceof ConnectError)) throw new Error("expected_stream_error");
+    expect(deferred.rawMessage).toBe(secret);
+    expect(deferred.metadata.get("x-private")).toBe(secret);
+    expect(safeFailure(deferred).seam).toBe("public_rpc_SessionService.Exec_code_9");
+    expect(JSON.stringify(safeFailure(deferred))).not.toContain("private");
+    streamFailure = false;
+    const complete = [];
+    for await (const message of client.sessions.exec({ sessionId: "session" }))
+      complete.push(message);
+    expect(complete).toEqual([first]);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>

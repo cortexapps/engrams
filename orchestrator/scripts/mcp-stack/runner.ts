@@ -14,6 +14,7 @@ import { canonicalJson } from "./guest.ts";
 import { REQUIRED_CASES, SCENARIOS, type ScenarioId } from "./manifest.ts";
 import { DatabaseObserver } from "./observer.ts";
 import { preflight, publicPrerequisites } from "./preflight.ts";
+import { publicRpcMethod } from "./transport.ts";
 
 export type DriverRegistry = Record<ScenarioId, CaseDriver>;
 export function validateDrivers(
@@ -33,11 +34,13 @@ export function safeFailure(error: unknown): RunnerFailure {
     /^[A-Za-z0-9_./:-]{1,200}$/.test(error.seam)
   )
     return error;
-  if (error instanceof ConnectError)
+  if (error instanceof ConnectError) {
+    const method = publicRpcMethod(error);
     return new RunnerFailure(
       "TRANSPORT_FAILED",
-      `public_rpc_code_${error.code}`,
+      `public_rpc_${method ? method + "_" : ""}code_${error.code}`,
     );
+  }
   return new RunnerFailure("ASSERTION_FAILED", "unexpected_runner_error");
 }
 
