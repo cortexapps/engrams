@@ -132,11 +132,6 @@ export const evictLocal = SessionService.method.evictLocal;
 export const evictIdle = SessionService.method.evictIdle;
 
 /**
- * @generated from rpc engram.app.v1.SessionService.GetCowState
- */
-export const getCowState = SessionService.method.getCowState;
-
-/**
  * @generated from rpc engram.app.v1.SessionService.ListCheckpoints
  */
 export const listCheckpoints = SessionService.method.listCheckpoints;

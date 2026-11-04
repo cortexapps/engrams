@@ -18,7 +18,6 @@ pub mod bundle_gc;
 pub mod checkpoint_retention;
 pub mod chunk_gc;
 pub mod config;
-pub mod cow_state;
 pub mod dead_host;
 pub mod enable_scanner;
 pub mod error;

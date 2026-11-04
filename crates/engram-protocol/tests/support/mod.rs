@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use engram_protocol::wire::WireExecRequest;
 use proptest::prelude::*;
 
 pub fn s() -> impl Strategy<Value = String> {
@@ -57,25 +57,6 @@ pub fn wire_exec_request() -> impl Strategy<Value = WireExecRequest> {
                 stdout_offset,
                 stderr_offset,
                 wake,
-            },
-        )
-}
-
-pub fn wire_reap_stats() -> impl Strategy<Value = WireReapStats> {
-    (
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-    )
-        .prop_map(
-            |(files_scanned, files_deleted, bytes_freed, unparseable, too_young)| WireReapStats {
-                files_scanned,
-                files_deleted,
-                bytes_freed,
-                files_skipped_unparseable: unparseable,
-                files_skipped_too_young: too_young,
             },
         )
 }

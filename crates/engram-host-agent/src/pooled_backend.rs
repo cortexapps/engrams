@@ -3717,14 +3717,9 @@ impl SnapshotFinisher {
                 // sandbox_id. Also lets a retry of this same sandbox's
                 // snapshot() find and tear down the prior attempt.
                 self.inflight_snapshots.insert(id, m.id);
-                // ADR 0016 Phase A: stamp the memory-tier RPO signal
-                // the `cow_state` RPC reports. Done AFTER post-
-                // processing succeeded — a snapshot whose state.bin /
-                // sidecar upload failed isn't durable and shouldn't
-                // advance the RPO indicator on the diagnostic
-                // surface. Pre-`commit_snapshot` is fine: the row
-                // hasn't been "claimed" by PG yet but the bytes are
-                // in BlobStorage, which is what the RPO measures.
+                // Stamped after post-processing succeeded: a snapshot
+                // whose state.bin / sidecar upload failed is not a
+                // durable capture and must not advance the pacing epoch.
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)

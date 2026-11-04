@@ -10,45 +10,10 @@
 //! - `GET /api/hosts/:id` — one host's view.
 //! - `POST /api/hosts/:id/drain` — flip the row + scheduler view
 //!   to Draining so the scheduler stops picking it.
-//! - `GET /api/hosts/:id/cow-state` — ADR 0016 Phase A: per-sandbox
-//!   COW diagnostic for every chunk-tracked sandbox on this host.
 
 use chrono::{DateTime, Utc};
 use engram_core::HostId;
 use serde::Serialize;
-
-use crate::state::SharedState;
-
-/// Memory-tier enrichment: project the session's latest snapshot row
-/// into the diagnostic view's `memory_manifest` +
-/// `last_snapshot_at` fields. Returns `(None, None)` when the
-/// session has never been snapshotted — `CowStateView` falls back to
-/// the host's in-memory `last_snapshot_unix_ms` in that case.
-pub(crate) async fn enrichment_for_session(
-    state: &SharedState,
-    session_id: engram_core::SessionId,
-) -> (
-    Option<engram_core::types::manifest::ManifestRef>,
-    Option<chrono::DateTime<chrono::Utc>>,
-) {
-    match state
-        .services
-        .meta
-        .latest_snapshot_for_session(session_id)
-        .await
-    {
-        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
-        Ok(None) => (None, None),
-        Err(e) => {
-            tracing::debug!(
-                %session_id,
-                error = %e,
-                "cow-state enrichment: snapshot lookup failed; rendering without memory tier",
-            );
-            (None, None)
-        }
-    }
-}
 
 #[derive(Serialize)]
 pub struct HostView {

@@ -7,18 +7,11 @@ import "engram/app/v1/session.proto";
 // Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
 // The caller is a single trusted service (bearer-authed); there is no
 // per-user anything here. Attribution and authz live in the orchestrator.
-//
-// INTENTIONAL DROPS: `GET /api/admin/chunk-gc/candidates` and
-// `POST /api/admin/reap-materialize-dir` get NO RPC — neither has a web
-// caller today. A later task decides keep-behind-bearer vs delete.
 service FleetService {
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
   rpc GetHost(GetHostRequest) returns (GetHostResponse);
   // ADR 0123 A3: the retirement grant entry point (see RetireHostRequest).
   rpc RetireHost(RetireHostRequest) returns (RetireHostResponse);
-  // ADR 0016 Phase A per-host COW diagnostic
-  // (GET /api/hosts/:id/cow-state).
-  rpc GetHostCowState(GetHostCowStateRequest) returns (GetHostCowStateResponse);
   // Soft drain — the member-facing POST /hosts/:id/drain (status flip,
   // the one the web calls: web/src/api.ts drainHost). The scheduler
   // stops picking the host; in-flight sessions stay put.
@@ -39,9 +32,6 @@ service FleetService {
   rpc DeleteHost(DeleteHostRequest) returns (DeleteHostResponse);
   // ADR 0029 Storage page rollup (GET /api/storage/summary).
   rpc GetStorageSummary(GetStorageSummaryRequest) returns (GetStorageSummaryResponse);
-  // ADR 0016 Phase B explicit flush trigger
-  // (POST /api/admin/sessions/:id/flush-now).
-  rpc FlushSession(FlushSessionRequest) returns (FlushSessionResponse);
   // ADR 0123 B: admit one teleport for a session (synchronous admission;
   // the durable machine drives it). Replaces the ADR 0018 evacuate route.
   rpc TeleportSession(TeleportSessionRequest) returns (TeleportSessionResponse);
@@ -166,20 +156,6 @@ message GetHostResponse {
   HostView host = 1;
 }
 
-message GetHostCowStateRequest {
-  string host_id = 1;
-}
-
-// Mirrors api/hosts.rs HostCowStateResponse. `CowStateView` is the
-// shared diagnostic row from session.proto.
-message GetHostCowStateResponse {
-  string host_id = 1;
-  // One entry per chunk-tracked sandbox on this host. Sandboxes without
-  // a chunk view (Process backend, VZ-without-NBD) are omitted by the
-  // host-agent — they don't appear here either.
-  repeated CowStateView sessions = 2;
-}
-
 message DrainHostRequest {
   string host_id = 1;
 }
@@ -257,10 +233,10 @@ message DeleteHostResponse {}
 
 message GetStorageSummaryRequest {}
 
-// Mirrors api/storage.rs StorageSummaryResponse (ADR 0029): fleet-wide
-// COW/chunk rollups + the per-sandbox durability ledger. "chunks
-// stored" and "dedup ratio" are intentionally absent — each would need
-// an O(objects) blob-store walk on a polled endpoint.
+// Mirrors api/storage.rs StorageSummaryResponse: snapshot totals and the
+// chunk-GC backlog. "chunks stored" and "dedup ratio" are intentionally
+// absent — each would need an O(objects) blob-store walk on a polled
+// endpoint.
 message GetStorageSummaryResponse {
   // `snapshots` row count (Postgres).
   uint64 snapshots = 1;
@@ -268,52 +244,13 @@ message GetStorageSummaryResponse {
   uint64 snapshot_bytes = 2;
   // Chunks parked in chunk_gc_candidates awaiting their grace window.
   uint64 gc_pending = 3;
-  // Number of chunk-tracked sandboxes across the fleet (ledger length).
-  uint64 tracked_sandboxes = 4;
-  // Sum of dirty chunks across the ledger.
-  uint64 dirty_chunks = 5;
-  // Sum of dirty (unflushed) bytes across the ledger.
-  uint64 unflushed_bytes = 6;
-  // Mean base-chunk locality (%) over sandboxes that reference any base
-  // chunks. 0 when nothing is tracked yet.
-  uint32 avg_locality_pct = 7;
-  repeated DurabilityRow rows = 8;
+  // 4-8 were the per-sandbox dirty-chunk ledger of the retired host
+  // disk daemon.
+  reserved 4 to 8;
+  reserved "tracked_sandboxes", "dirty_chunks", "unflushed_bytes", "avg_locality_pct", "rows";
   // False when `gc_pending` is the stats system's live-tuple estimate:
   // past 100k rows an exact count is a full scan (30s at 22.7M rows).
   bool gc_pending_exact = 9;
-}
-
-// One per-sandbox row of the durability ledger.
-message DurabilityRow {
-  string sandbox_id = 1;
-  // Unset when the sandbox→session join failed or lagged.
-  optional string session_id = 2;
-  string host_id = 3;
-  // Dirty chunks resident in host RAM, not yet flushed to BlobStorage.
-  uint32 dirty_chunks = 4;
-  uint64 dirty_bytes = 5;
-  // Total chunks the live disk manifest references.
-  uint32 base_chunks = 6;
-  // Of base_chunks, how many are resident on the host's NVMe cache.
-  uint32 base_chunks_local = 7;
-  // ISO-8601 of the last successful flush; unset = never flushed.
-  optional string last_flush_at = 8;
-}
-
-message FlushSessionRequest {
-  string session_id = 1;
-}
-
-// Mirrors api/admin.rs FlushNowResult.
-message FlushSessionResponse {
-  // FlushNowOutcome, snake_case: "applied" (host drained dirty chunks
-  // and coord wrote the new manifest_ref) | "idle" (nothing dirty / not
-  // chunk-tracked; no PG write) | "stale" (host flushed but coord's
-  // UPDATE was guarded out — sandbox_id drifted between flush and
-  // publish).
-  string outcome = 1;
-  // New manifest version coord persisted. Unset on "idle"/"stale".
-  optional uint64 manifest_version = 2;
 }
 
 message TeleportSessionRequest {

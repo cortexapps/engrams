@@ -59,7 +59,7 @@ service HostService {
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
   // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
   // pause vCPUs without snapshotting, destroying, or changing session
-  // state. An admin affordance to exercise + observe the pause/flush
+  // state. An admin affordance to exercise + observe the pause/resume
   // path; maps to SandboxBackend::pause / ::resume.
   rpc PauseSandbox(FencedSandboxRequest) returns (Empty);
   rpc ResumeSandbox(FencedSandboxRequest) returns (Empty);
@@ -137,34 +137,6 @@ service HostService {
   // snapshotted.
   rpc StartIde(SandboxIdMessage) returns (IdePortResponse);
   rpc StopIde(SandboxIdMessage) returns (Empty);
-
-  // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
-  rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
-
-  // ---- ADR 0016 Phase A: COW observability ----
-  //
-  // Per-sandbox diagnostic: dirty/synced chunk counts, current disk
-  // manifest version, last flush timestamp, and the snapshot-bounded
-  // memory-tier RPO signal. Read-only; coord fans these out to power
-  // `GET /api/{hosts,sessions}/:id/cow-state`. Caller caches the
-  // response for ~1s to keep the host load low under web-app polling.
-  rpc CowState(SandboxIdMessage) returns (CowStateResponse);
-  rpc CowStateAll(Empty) returns (CowStateAllResponse);
-
-  // ---- ADR 0016 Phase B: admin flush trigger ----
-  //
-  // Force an immediate ChunkedDiskBackend::flush() on `id`. Pairs
-  // the FlushScheduler's implicit 30s tick with an explicit admin
-  // trigger per `[explicit_admin_triggers_for_testability]`. E2E
-  // tests drive this to verify the publish-to-PG round-trip without
-  // sleeping a full cadence; operators use it to flush a stuck
-  // sandbox's pending dirty bytes on demand.
-  //
-  // Response carries an optional manifest_ref: empty bytes encode
-  // `None` (sandbox not chunk-tracked, or zero dirty chunks), a
-  // full bincode blob encodes the new `ManifestRef` that the coord
-  // immediately funnels into `update_live_disk_manifest`.
-  rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
 
   // ADR 0113: bounded-memory session file transfer.
   rpc WriteFile(stream HostWriteFileRequest) returns (HostWriteFileResponse);
@@ -640,22 +612,6 @@ message StartAgentRequest {
   uint64 fencing_epoch = 5;  // 0 = unfenced interim caller
 }
 
-// --- ReapMaterializeDir ---
-
-message ReapMaterializeDirRequest {
-  uint64 min_age_secs = 1;
-  // Each entry is a 16-byte UUID. Coord ships this snapshot of
-  // `list_live_disk_manifest_ids` inline; hosts have no DB access.
-  // 1M IDs = 16 MiB — bump the per-method max_decoding_message_size
-  // on the host server.
-  repeated bytes live_disk_manifest_ids = 2;
-}
-
-message ReapMaterializeDirResponse {
-  // bincode-encoded `engram_protocol::wire::WireReapStats`.
-  bytes stats_bincode = 1;
-}
-
 message HostWriteFileMetadata {
   bytes sandbox_id = 1; // 16-byte UUID
   string path = 2;
@@ -831,38 +787,3 @@ message ProxyPortData {
 // side say "I'm done writing" explicitly when it has no trailing data.
 message ProxyPortClose {}
 
-// --- ADR 0016 Phase A: CowState / CowStateAll ---
-
-// `Some(CowState)` if the host hosts a chunk-tracked view of this
-// sandbox; `None` (state_bincode empty) otherwise. Wire shape uses
-// bincode for the payload (same pattern as `SnapshotResponse`), so
-// schema evolution stays in Rust-land and proto is just envelope.
-message CowStateResponse {
-  // bincode-encoded `engram_core::types::cow_state::CowState`.
-  // Empty bytes encode the `None` case — distinguished from a
-  // present-but-empty payload because `CowState` always carries a
-  // populated `disk_manifest`.
-  bytes state_bincode = 1;
-}
-
-message CowStateAllResponse {
-  // bincode-encoded `Vec<engram_core::types::cow_state::CowStateRecord>`.
-  // Empty vec is encoded as a non-empty bincode blob (the length
-  // prefix is 0); the proto field is non-optional.
-  bytes records_bincode = 1;
-}
-
-// --- ADR 0016 Phase B commit 4a: FlushSandbox response ---
-
-// Outcome of `HostService.FlushSandbox`. `manifest_ref_bincode`
-// carries `Some(ManifestRef)` (bincode-encoded `Option<ManifestRef>`)
-// when chunks were drained, `None` otherwise. The wire shape mirrors
-// `CowStateResponse`'s empty-means-None convention: empty bytes
-// distinguish "sandbox not chunk-tracked OR zero dirty chunks" from
-// "drained N chunks, here's the new manifest version."
-message FlushSandboxResponse {
-  // bincode-encoded `Option<engram_core::types::manifest::ManifestRef>`.
-  // Empty bytes encode `None` (no chunk tracking / no dirty bytes);
-  // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
-  bytes manifest_ref_bincode = 1;
-}

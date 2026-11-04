@@ -63,7 +63,6 @@ impl Clients {
         delete_host => "DeleteHost", DeleteHostRequest, DeleteHostResponse;
         uncordon_host => "UncordonHost", UncordonHostRequest, UncordonHostResponse;
         teleport_session => "TeleportSession", TeleportSessionRequest, TeleportSessionResponse;
-        flush_session => "FlushSession", FlushSessionRequest, FlushSessionResponse;
         bundle_gc => "BundleGc", BundleGcRequest, BundleGcResponse;
         snapshot_blob_gc => "SnapshotBlobGc", SnapshotBlobGcRequest, SnapshotBlobGcResponse;
         chunk_gc => "ChunkGc", ChunkGcRequest, ChunkGcResponse;

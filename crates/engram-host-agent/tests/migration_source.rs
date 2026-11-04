@@ -228,7 +228,6 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     tokio::spawn(engram_host_agent::grpc_server::boot(
         addr,
         serve_inner,
-        None,
         engram_host_agent::session_epochs::ephemeral(),
         None,
     ));

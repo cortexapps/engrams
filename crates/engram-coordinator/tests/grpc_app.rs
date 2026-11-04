@@ -761,9 +761,8 @@ async fn fleet_list_hosts_and_storage_summary() {
         .await
         .expect("GetStorageSummary must succeed")
         .into_inner();
-    assert_eq!(summary.tracked_sandboxes, 0, "empty fleet: no sandboxes");
     assert_eq!(summary.snapshots, 0, "empty fleet: no snapshots");
-    assert_eq!(summary.dirty_chunks, 0, "empty fleet: no dirty chunks");
+    assert_eq!(summary.gc_pending, 0, "empty fleet: no GC backlog");
 
     server.abort();
 }

@@ -20,27 +20,25 @@ use std::sync::Arc;
 use engram_core::traits::{HostClient, SessionFence};
 use engram_core::types::sandbox::{ExecEvent, ExecEventStream, SessionFileSpec};
 use engram_core::SandboxError;
-use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest, CowStateAllResponse,
-    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
-    DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
-    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
-    HostReadFileMetadata, HostReadFileRequest, HostReadFileResponse, HostWriteFileRequest,
-    HostWriteFileResponse, IdePortResponse, InterruptHarnessRequest, ListSandboxesResponse,
-    MaterializeImageDone, MaterializeImageEvent, MaterializeImageFailed, MaterializeImageRequest,
-    MaterializeProgress, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
-    MigrationPresetupResponse, PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse,
-    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest, CreateSandboxRequest,
+    CreateSandboxResponse, DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse,
+    EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame, ExecStartRequest,
+    FencedSandboxRequest, GuestIpResponse, HostReadFileMetadata, HostReadFileRequest,
+    HostReadFileResponse, HostWriteFileRequest, HostWriteFileResponse, IdePortResponse,
+    InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
+    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationExportRef,
+    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PeerChunkFrame,
+    PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData,
+    ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
     SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
-use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use engram_protocol::wire::WireExecRequest;
 use futures::Stream;
 use std::pin::Pin;
 use tokio::sync::mpsc;
@@ -65,11 +63,9 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 
 /// Concrete `HostService` impl. Holds the in-proc
 /// `Arc<dyn HostClient>` (typically a `LocalHostClient` wrapping
-/// the host's SandboxBackend + HarnessHub). Optional
-/// `HostAdminHandler` services ReapMaterializeDir.
+/// the host's SandboxBackend + HarnessHub).
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
-    admin: Option<Arc<dyn HostAdminHandler>>,
     /// ADR 0079: per-session fencing-epoch high-water, durable under
     /// work_dir. Gates every session-scoped lifecycle RPC.
     epochs: SessionEpochStore,
@@ -84,15 +80,9 @@ impl HostServiceImpl {
     pub fn new(inner: Arc<dyn HostClient>, epochs: SessionEpochStore) -> Self {
         Self {
             inner,
-            admin: None,
             epochs,
             peer: None,
         }
-    }
-
-    pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
-        self.admin = Some(admin);
-        self
     }
 
     pub fn with_peer_serve(mut self, peer: Arc<crate::peer_fill::PeerServe>) -> Self {
@@ -171,14 +161,10 @@ impl HostServiceImpl {
 pub async fn boot(
     listen_addr: std::net::SocketAddr,
     inner: Arc<dyn HostClient>,
-    admin: Option<Arc<dyn HostAdminHandler>>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
     let mut svc = HostServiceImpl::new(inner, epochs);
-    if let Some(a) = admin {
-        svc = svc.with_admin_handler(a);
-    }
     if let Some(p) = peer {
         svc = svc.with_peer_serve(p);
     }
@@ -1088,98 +1074,6 @@ impl HostService for HostServiceImpl {
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
         self.inner.stop_ide(id).await.map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
-    }
-
-    async fn reap_materialize_dir(
-        &self,
-        req: Request<ReapMaterializeDirRequest>,
-    ) -> Result<Response<ReapMaterializeDirResponse>, Status> {
-        let Some(admin) = self.admin.as_ref() else {
-            return Err(Status::unimplemented(
-                "host did not register a HostAdminHandler; ReapMaterializeDir unsupported",
-            ));
-        };
-        let r = req.into_inner();
-        let live: Vec<uuid::Uuid> = r
-            .live_disk_manifest_ids
-            .iter()
-            .map(|b| {
-                if b.len() != 16 {
-                    Err(Status::invalid_argument(format!(
-                        "live_disk_manifest_id must be 16 bytes, got {}",
-                        b.len()
-                    )))
-                } else {
-                    let mut buf = [0u8; 16];
-                    buf.copy_from_slice(b);
-                    Ok(uuid::Uuid::from_bytes(buf))
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        let stats: WireReapStats = admin
-            .reap_materialize_dir(r.min_age_secs, live)
-            .await
-            .map_err(|e| Status::internal(format!("reap_materialize_dir: {e}")))?;
-        Ok(Response::new(ReapMaterializeDirResponse {
-            stats_bincode: encode_bincode(&stats, "WireReapStats")?,
-        }))
-    }
-
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic. Returns an
-    /// empty bincode blob when the host has no chunk-tracked view
-    /// of the sandbox — distinguishes "not chunk-tracked" from
-    /// "tracked but zero dirty" on the wire so the coord can render
-    /// the two states differently.
-    async fn cow_state(
-        &self,
-        req: Request<SandboxIdMessage>,
-    ) -> Result<Response<CowStateResponse>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        let state = self.inner.cow_state(id).await.map_err(sandbox_to_status)?;
-        let state_bincode = match state {
-            Some(s) => encode_bincode(&s, "CowState")?,
-            None => Vec::new(),
-        };
-        Ok(Response::new(CowStateResponse { state_bincode }))
-    }
-
-    /// ADR 0016 Phase A: bulk COW fetch. The bincode payload is a
-    /// `Vec<CowStateRecord>` — empty vec encodes as a non-empty
-    /// blob (the length prefix is 0).
-    async fn cow_state_all(
-        &self,
-        _req: Request<Empty>,
-    ) -> Result<Response<CowStateAllResponse>, Status> {
-        let records = self
-            .inner
-            .cow_state_all()
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(CowStateAllResponse {
-            records_bincode: encode_bincode(&records, "Vec<CowStateRecord>")?,
-        }))
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin flush trigger. Returns
-    /// `Some(ManifestRef)` (bincode-encoded) if chunks were drained;
-    /// empty bytes otherwise.
-    async fn flush_sandbox(
-        &self,
-        req: Request<SandboxIdMessage>,
-    ) -> Result<Response<engram_protocol::grpc::FlushSandboxResponse>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        let outcome = self
-            .inner
-            .flush_sandbox(id)
-            .await
-            .map_err(sandbox_to_status)?;
-        let manifest_ref_bincode = match outcome {
-            Some(mref) => encode_bincode(&mref, "ManifestRef")?,
-            None => Vec::new(),
-        };
-        Ok(Response::new(engram_protocol::grpc::FlushSandboxResponse {
-            manifest_ref_bincode,
-        }))
     }
 
     /// Server-streaming exec. First frame is `started` (carries the

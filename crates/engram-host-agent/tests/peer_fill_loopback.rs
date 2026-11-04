@@ -152,7 +152,6 @@ async fn boot_peer_server(peer: Arc<PeerServe>) -> String {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             host_dyn,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             Some(peer),
         )

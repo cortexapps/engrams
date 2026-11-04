@@ -100,7 +100,6 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             inner,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             None,
         )

@@ -937,11 +937,6 @@ pub struct AppState {
     /// counter and the policy knob (`grace_ticks`). Invoked on
     /// every inbound `NotifyKind::Heartbeat` in `api/hosts.rs`.
     pub reconciler: crate::reconcile::Reconciler,
-    /// ADR 0016 Phase A: per-host COW diagnostic cache. The
-    /// `GET /api/{hosts,sessions}/:id/cow-state` handlers route
-    /// through this to avoid storming the host on web-app polling.
-    /// 1s TTL; cache eviction on host unregister.
-    pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
     /// ADR 0023/0047: per-session credential-broker tokens (session →
     /// expected bearer). PURE READ-THROUGH CACHE over the KEK-sealed
     /// `session_broker_tokens` PG rows (the authority — minted
@@ -1052,7 +1047,6 @@ impl AppState {
             session_ops_wake: Arc::new(tokio::sync::Notify::new()),
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
-            cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),

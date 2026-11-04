@@ -65,7 +65,7 @@ struct BundleEntry {
 
 /// Read-through cache, shared across the coordinator's replica via a
 /// `pg_listener`-driven invalidation (see module docs). Cheap to clone
-/// (`Arc`-wrapped by the caller, like `harness_hub`/`cow_state_cache` on
+/// (`Arc`-wrapped by the caller, like `harness_hub` on
 /// `AppState`).
 pub struct BootBundleCache {
     /// Injected time source for TTL freshness checks (ADR 0098 D1).

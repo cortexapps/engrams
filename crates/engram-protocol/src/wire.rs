@@ -319,18 +319,6 @@ impl WireExecRequest {
     }
 }
 
-/// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
-/// Defined here so `engram-protocol` doesn't drag a dep on the
-/// host-agent crate.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WireReapStats {
-    pub files_scanned: u64,
-    pub files_deleted: u64,
-    pub bytes_freed: u64,
-    pub files_skipped_unparseable: u64,
-    pub files_skipped_too_young: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,21 +438,5 @@ mod tests {
             parse_wire_skew_message(&harness_spawn_message("NotFound", "x")),
             None
         );
-    }
-
-    #[test]
-    fn wire_reap_stats_round_trips() {
-        let stats = WireReapStats {
-            files_scanned: 12,
-            files_deleted: 5,
-            bytes_freed: 1024,
-            files_skipped_unparseable: 1,
-            files_skipped_too_young: 2,
-        };
-        let bytes = bincode::serialize(&stats).unwrap();
-        let back: WireReapStats = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(back.files_scanned, stats.files_scanned);
-        assert_eq!(back.files_deleted, stats.files_deleted);
-        assert_eq!(back.bytes_freed, stats.bytes_freed);
     }
 }

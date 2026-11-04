@@ -1,20 +1,13 @@
-import type { HostView, StorageSummaryResponse } from "./lib/types";
-import { secondsSince } from "./format";
+import type { HostView } from "./lib/types";
 
-// The single source of truth for what counts as a fleet/storage problem and how
+// The single source of truth for what counts as a fleet problem and how
 // serious it is. Both surfaces that judge platform health — the Fleet page's
 // verdict cell (pages/Fleet.tsx) and the Settings rail's Fleet row
 // (hooks/useOperatorHealth.ts) — read from here, so the dot and the page can
 // never disagree about whether something is wrong.
 
 export type HealthTone = "caution" | "critical";
-export type HealthIssueKind =
-  | "offline"
-  | "capacity"
-  | "locality"
-  | "draining"
-  | "flush_window"
-  | "caps";
+export type HealthIssueKind = "offline" | "capacity" | "draining" | "caps";
 export interface HealthIssue {
   kind: HealthIssueKind;
   tone: HealthTone;
@@ -22,19 +15,11 @@ export interface HealthIssue {
   text: string;
 }
 
-/** The flush window: a chunk-tracked sandbox whose last flush is older than
- * this has dirty chunks at risk. The Storage ledger judges each row by it. */
-export const FLUSH_WINDOW_S = 60;
-const RPO_WINDOW_S = FLUSH_WINDOW_S;
-
 export interface HealthMetrics {
   dead: number;
   draining: number;
   /** Fleet capacity used, 0–100; 0 when nothing is registered. */
   capPct: number;
-  /** Average base locality 0–100, or null when nothing is chunk-tracked yet. */
-  locality: number | null;
-  rpoStale: number;
   /** ADR 0068: hosts reporting at least one failing capability
    *  (`Failed`/`Unknown` on a probed vector) — the fleet-view surface
    *  for what used to be the silent "no capacity with free hosts"
@@ -42,24 +27,16 @@ export interface HealthMetrics {
   capsFailing: number;
 }
 
-export function deriveHealthMetrics(
-  hosts: HostView[],
-  storage: StorageSummaryResponse | undefined,
-): HealthMetrics {
+export function deriveHealthMetrics(hosts: HostView[]): HealthMetrics {
   const dead = hosts.filter((x) => x.status === "dead").length;
   const draining = hosts.filter((x) => x.status === "draining").length;
   const used = hosts.reduce((a, x) => a + x.capacity_used_mib, 0);
   const tot = hosts.reduce((a, x) => a + x.capacity_total_mib, 0);
   const capPct = tot > 0 ? Math.round((used / tot) * 100) : 0;
 
-  const hasStorage = storage != null && storage.tracked_sandboxes > 0;
-  const locality = hasStorage ? storage.avg_locality_pct : null;
-  const rpoStale = (storage?.rows ?? []).filter(
-    (r) => secondsSince(r.last_flush_at) > RPO_WINDOW_S,
-  ).length;
   const capsFailing = hosts.filter((x) => x.failing_capabilities.length > 0).length;
 
-  return { dead, draining, capPct, locality, rpoStale, capsFailing };
+  return { dead, draining, capPct, capsFailing };
 }
 
 // Worst-first: critical issues precede caution ones, and within a tier the push
@@ -82,13 +59,6 @@ export function operatorIssues(m: HealthMetrics): HealthIssue[] {
       tone: "critical",
       text: `fleet at ${m.capPct}% capacity`,
     });
-  if (m.locality != null && m.locality < 50)
-    issues.push({
-      kind: "locality",
-      sev: 3,
-      tone: "critical",
-      text: `base locality ${m.locality}%`,
-    });
   // Caution — worth a glance.
   if (m.draining > 0)
     issues.push({
@@ -103,20 +73,6 @@ export function operatorIssues(m: HealthMetrics): HealthIssue[] {
       sev: 2,
       tone: "caution",
       text: `fleet at ${m.capPct}% capacity`,
-    });
-  if (m.locality != null && m.locality >= 50 && m.locality < 80)
-    issues.push({
-      kind: "locality",
-      sev: 2,
-      tone: "caution",
-      text: `base locality ${m.locality}%`,
-    });
-  if (m.rpoStale > 0)
-    issues.push({
-      kind: "flush_window",
-      sev: 2,
-      tone: "caution",
-      text: `${m.rpoStale} sandbox${m.rpoStale > 1 ? "es" : ""} past flush window`,
     });
   if (m.capsFailing > 0)
     issues.push({

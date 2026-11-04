@@ -14,7 +14,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::traits::{HostClient, SessionFence};
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
@@ -963,68 +962,6 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
-    /// `state_bincode` on the wire encodes `None` (host has no
-    /// chunk-tracked view of this sandbox) so coord can distinguish
-    /// "not chunk-tracked" from "really nothing dirty".
-    pub async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .cow_state(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.state_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(&resp.state_bincode, "CowState")?))
-    }
-
-    /// ADR 0016 Phase A: bulk COW fetch for one host. Returns one
-    /// record per chunk-tracked sandbox; ordering not guaranteed.
-    pub async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        let resp = self
-            .inner
-            .clone()
-            .cow_state_all(Empty {})
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        decode_bincode(&resp.records_bincode, "Vec<CowStateRecord>")
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin flush trigger. Coord's
-    /// `POST /api/admin/sessions/:id/flush-now` calls this. Empty
-    /// `manifest_ref_bincode` on the wire encodes `None` (no chunk
-    /// tracking / no dirty chunks); non-empty decodes to the new
-    /// `Some(ManifestRef)`.
-    pub async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .flush_sandbox(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.manifest_ref_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(
-            &resp.manifest_ref_bincode,
-            "ManifestRef",
-        )?))
-    }
-
     /// Server-streaming exec. The first frame is `started` (carries
     /// the canonical `exec_id`); subsequent frames carry
     /// stdout/stderr bytes. A terminal result ends with exactly one `exit` or
@@ -1804,21 +1741,6 @@ impl HostClient for GrpcHostClient {
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC
     // doesn't carry static capability or in-proc sink wiring.
-
-    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        Self::cow_state(self, id).await
-    }
-
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Self::cow_state_all(self).await
-    }
-
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        Self::flush_sandbox(self, id).await
-    }
 }
 
 /// Map a tonic Status into the same `SandboxError` shape today's WS

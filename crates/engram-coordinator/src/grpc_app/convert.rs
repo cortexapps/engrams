@@ -18,7 +18,6 @@ use engram_protocol::app;
 
 use crate::api::exec::ExecRequest as ApiExecRequest;
 use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
-use crate::cow_state::CowStateView;
 use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
@@ -287,41 +286,6 @@ pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
     }
 }
 
-/// [`CowStateView`] → proto [`CowStateView`] (session.proto).
-///
-/// Exhaustive destructure below is the totality guard — a new field on
-/// `CowStateView` must be handled here or the build fails.
-pub(crate) fn cow_state_to_proto(v: &CowStateView) -> app::CowStateView {
-    let CowStateView {
-        sandbox_id,
-        session_id,
-        disk_manifest_id,
-        disk_manifest_version,
-        dirty_chunks,
-        dirty_bytes,
-        last_flush_at,
-        base_chunks,
-        base_chunks_local,
-        memory_manifest_id,
-        memory_manifest_version,
-        last_snapshot_at,
-    } = v;
-    app::CowStateView {
-        sandbox_id: sandbox_id.to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        disk_manifest_id: disk_manifest_id.clone(),
-        disk_manifest_version: *disk_manifest_version,
-        dirty_chunks: *dirty_chunks,
-        dirty_bytes: *dirty_bytes,
-        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
-        base_chunks: *base_chunks,
-        base_chunks_local: *base_chunks_local,
-        memory_manifest_id: memory_manifest_id.clone(),
-        memory_manifest_version: *memory_manifest_version,
-        last_snapshot_at: last_snapshot_at.map(|t| t.to_rfc3339()),
-    }
-}
-
 /// api `ConversationEntry` → proto `ConversationEntry`.
 ///
 /// The exhaustive destructure below is the totality guard — if a field is
@@ -490,65 +454,12 @@ pub(crate) fn storage_summary_to_proto(
         snapshot_bytes,
         gc_pending,
         gc_pending_exact,
-        tracked_sandboxes,
-        dirty_chunks,
-        unflushed_bytes,
-        avg_locality_pct,
-        rows,
     } = r;
     app::GetStorageSummaryResponse {
         snapshots,
         snapshot_bytes,
         gc_pending,
         gc_pending_exact,
-        tracked_sandboxes,
-        dirty_chunks,
-        unflushed_bytes,
-        avg_locality_pct,
-        rows: rows.into_iter().map(durability_row_to_proto).collect(),
-    }
-}
-
-fn durability_row_to_proto(r: crate::api::storage::DurabilityRow) -> app::DurabilityRow {
-    let crate::api::storage::DurabilityRow {
-        sandbox_id,
-        session_id,
-        host_id,
-        dirty_chunks,
-        dirty_bytes,
-        base_chunks,
-        base_chunks_local,
-        last_flush_at,
-    } = r;
-    app::DurabilityRow {
-        sandbox_id: sandbox_id.to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        host_id: host_id.to_string(),
-        dirty_chunks,
-        dirty_bytes,
-        base_chunks,
-        base_chunks_local,
-        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
-    }
-}
-
-/// api `FlushNowResult` → proto `FlushSessionResponse`.
-///
-/// The exhaustive destructure below is the totality guard.
-pub(crate) fn flush_now_result_to_proto(
-    r: crate::api::admin::FlushNowResult,
-) -> app::FlushSessionResponse {
-    let crate::api::admin::FlushNowResult {
-        outcome,
-        manifest_version,
-    } = r;
-    app::FlushSessionResponse {
-        outcome: match outcome {
-            crate::api::admin::FlushNowOutcome::Applied => "applied".to_string(),
-            crate::api::admin::FlushNowOutcome::Idle => "idle".to_string(),
-            crate::api::admin::FlushNowOutcome::Stale => "stale".to_string(),
-        },
-        manifest_version,
     }
 }
 

@@ -984,14 +984,8 @@ impl HostAgent {
                 )
                 .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) = grpc_server::boot(
-                        addr,
-                        local_for_grpc,
-                        None,
-                        epochs,
-                        peer_for_grpc,
-                    )
-                    .await
+                    if let Err(e) =
+                        grpc_server::boot(addr, local_for_grpc, epochs, peer_for_grpc).await
                     {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
                     }

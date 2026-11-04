@@ -8,13 +8,13 @@
 //! round-trips prove `encode → decode == identity` across the valid-value
 //! space — catching an encode/decode asymmetry on a new trailing field.
 //!
-//! Covers the two crate-local wire payloads; the shared engram-core types the
+//! Covers the crate-local wire payload; the shared engram-core types the
 //! decode suite also fuzzes have no valid-value strategy here (their
 //! round-trips belong with their defining crate). Both types gained
 //! `PartialEq`/`Eq` for this suite — a no-op on byte layout. Strategies are
 //! shared with the decode suite via `tests/support/mod.rs`.
 
-use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use engram_protocol::wire::WireExecRequest;
 use proptest::prelude::*;
 
 mod support;
@@ -37,11 +37,6 @@ roundtrip!(
     wire_exec_request_roundtrips,
     WireExecRequest,
     support::wire_exec_request()
-);
-roundtrip!(
-    wire_reap_stats_roundtrips,
-    WireReapStats,
-    support::wire_reap_stats()
 );
 
 // ADR 0109: the session egress policy carries the whole permission boundary —

@@ -8,7 +8,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
 use crate::types::capture_job::{CaptureJobResult, ColdBasePlan};
-use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::endpoints::GuestEndpoints;
 use crate::types::ids::SandboxId;
@@ -1058,28 +1057,6 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
-    /// `None` for backends without an NBD-chunked disk view
-    /// (Process, VZ-without-NBD, FC before its NBD attach lands) —
-    /// the diagnostic surface treats absence as "this sandbox isn't
-    /// chunk-tracked" rather than "this sandbox has zero dirty
-    /// bytes." Only `PooledBackend` overrides today; the FC + VZ
-    /// inner backends inherit the default. See [`CowState`] for
-    /// what the fields mean and ADR 0016 for the design.
-    async fn cow_state(&self, _id: SandboxId) -> Option<CowState> {
-        None
-    }
-
-    /// Bulk variant: one record per sandbox this backend hosts that
-    /// *has* a COW view. Skips sandboxes whose individual
-    /// `cow_state()` would return `None`. Default empty; only
-    /// `PooledBackend` overrides. Lets the host-side gRPC server
-    /// answer `CowStateAll` with one map-iteration rather than
-    /// `list() + N × cow_state()`.
-    async fn cow_state_all(&self) -> Vec<CowStateRecord> {
-        Vec::new()
-    }
-
     /// ADR 0035 amendment D2: the aux bundle generations attached to each
     /// running sandbox, from the backend's live view (post any
     /// create-time stamp swap, and rebuilt from the persisted manifest
@@ -1091,28 +1068,6 @@ pub trait SandboxBackend: Send + Sync {
     /// bundle GC's grace period tolerates.
     async fn aux_bundles_all(&self) -> Vec<crate::types::sandbox::SandboxAuxBundles> {
         Vec::new()
-    }
-
-    /// ADR 0016 Phase B commit 4a — explicit admin trigger for the
-    /// FlushScheduler's primitive. Forces an immediate
-    /// `ChunkedDiskBackend::flush()` on `id` and, if any chunks were
-    /// drained, returns the freshly-published `ManifestRef`. Returns
-    /// `Ok(None)` when this backend has no chunk-tracked view of
-    /// the sandbox (mirrors `cow_state` semantics) or when there
-    /// were no dirty chunks.
-    ///
-    /// Paired with the 30s tick + threshold-notify in
-    /// `FlushScheduler` per `[explicit_admin_triggers_for_testability]`:
-    /// the scheduler is the implicit trigger; this is the explicit
-    /// one. E2E tests use this to drive the publish-to-PG round-trip
-    /// without sleeping a full cadence. Operators use it to flush a
-    /// stuck sandbox's pending dirty bytes on demand. Default
-    /// `Ok(None)` so non-chunked backends compile unchanged.
-    async fn flush_sandbox(
-        &self,
-        _id: SandboxId,
-    ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
-        Ok(None)
     }
 }
 

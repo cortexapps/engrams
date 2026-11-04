@@ -16,7 +16,7 @@ function Progress({
       data-slot="progress"
       // A progress bar is work in flight, so it takes the running tone
       // (`--ring`), not lime — lime means something you can do. Readings
-      // with thresholds (disk, locality) are a `Meter`, not a Progress.
+      // with thresholds (disk, memory) are a `Meter`, not a Progress.
       className={cn("relative h-1.5 w-full overflow-hidden rounded-[3px] bg-border", className)}
       {...props}
     >

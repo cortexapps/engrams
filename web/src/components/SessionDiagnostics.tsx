@@ -1,5 +1,4 @@
 import { type ReactNode, useState } from "react";
-import { useSessionCowState } from "../hooks/useCowState";
 import { useSessionCheckpoints } from "../hooks/useCheckpoints";
 import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
@@ -7,7 +6,6 @@ import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
 
 import { relativeTime } from "@/lib/relative-time";
-import { SessionCowState } from "./CowState";
 import { DurabilityTimeline } from "./DurabilityTimeline";
 import { MetricRow } from "./MetricRow";
 import { Button } from "@/components/ui/button";
@@ -22,27 +20,21 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type {
-  CheckpointSummary,
-  CowStateView,
-  IndexedEvent,
-  Session,
-  SessionState,
-} from "../lib/types";
+import type { CheckpointSummary, IndexedEvent, Session, SessionState } from "../lib/types";
 
 // The session's operator/forensic surface, kept OUT of the developer's way.
 // A standing right rail spent the work surface's width, all session, on data
-// the 90%-case developer never reads (chunk-level COW telemetry, the recovery
-// ladder, admin live-ops). It splits into two:
+// the 90%-case developer never reads (the recovery ladder, admin live-ops). It
+// splits into two:
 //
 //   - DurabilityReadout — the only durability the developer sees inline: a
 //     calm "is my work safe" telltale (glyph + word), driven by
 //     useDurabilitySummary. Honest about every lifecycle state; silent rather
-//     than alarming when telemetry is absent.
-//   - DiagnosticsPanel — a view inside the work pane: the full COW gauges + the
-//     checkpoint ladder + the image/created/events facts + the raw event
-//     stream, with the admin-only teleport / pause-resume controls gated INSIDE
-//     (a non-admin sees a read-only durability ledger). It sits beside Shell +
+//     than alarming when there is no checkpoint yet.
+//   - DiagnosticsPanel — a view inside the work pane: the checkpoint ladder +
+//     the image/created/events facts + the raw event stream, with the
+//     admin-only teleport / pause-resume controls gated INSIDE (a non-admin
+//     sees a read-only durability ledger). It sits beside Shell +
 //     Browser in the same resizable pane rather than in its own drawer.
 
 // ---------------------------------------------------------------------------
@@ -59,28 +51,12 @@ export type DurabilitySummary = {
   title: string;
 };
 
-/** The most recent of several ISO timestamps, or null if all are absent. */
-function mostRecentIso(...isos: (string | null | undefined)[]): string | null {
-  let best: string | null = null;
-  let bestT = -Infinity;
-  for (const iso of isos) {
-    if (!iso) continue;
-    const t = new Date(iso).getTime();
-    if (Number.isFinite(t) && t > bestT) {
-      bestT = t;
-      best = iso;
-    }
-  }
-  return best;
-}
-
-/** Reduce the raw durability telemetry to a one-line, developer-grade
- * reassurance. Returns null whenever there's nothing honest + calming to say —
- * the header simply shows no telltale rather than operator noise or alarm.
- * Exported for the unit test that pins this honest-state contract. */
+/** Reduce the checkpoint chain to a one-line, developer-grade reassurance.
+ * Returns null whenever there's nothing honest + calming to say — the header
+ * simply shows no telltale rather than operator noise or alarm. Exported for
+ * the unit test that pins this honest-state contract. */
 export function durabilitySummary(
   status: SessionState,
-  state: CowStateView | null,
   checkpoints: CheckpointSummary[],
 ): DurabilitySummary | null {
   // Terminal — the status glyph already says completed/failed/dead. Stay silent.
@@ -88,8 +64,8 @@ export function durabilitySummary(
 
   const recoverable = checkpoints.find((c) => c.recoverable) ?? null;
 
-  // Suspended / transitional: there's no live disk tier; durability rides the
-  // latest snapshot. Reassure only when a recoverable point exists; never alarm.
+  // Suspended / transitional: durability rides the latest snapshot. Reassure
+  // only when a recoverable point exists; never alarm.
   if (
     status === "idle" ||
     status === "host_lost" ||
@@ -106,48 +82,28 @@ export function durabilitySummary(
     return null;
   }
 
-  // Active-ish (active / created / pending / queued). Without live
-  // COW telemetry there's nothing honest to claim, and "unavailable" is operator
-  // noise — stay quiet; the drawer explains the why.
-  if (!state) return null;
-
-  const anchor = mostRecentIso(
-    state.last_flush_at,
-    state.last_snapshot_at,
-    checkpoints[0]?.created_at,
-  );
-  if (anchor) {
-    const n = checkpoints.length;
-    return {
-      tone: "nominal",
-      label: `Work saved · ${relativeTime(anchor)}`,
-      title: `Last flush ${relativeTime(state.last_flush_at)} · last snapshot ${relativeTime(
-        state.last_snapshot_at,
-      )} · ${n} checkpoint${n === 1 ? "" : "s"}`,
-    };
-  }
-  // Dirty but nothing durable yet — in flight, not lost. Caution, calm.
-  if (state.dirty_chunks > 0) {
-    return {
-      tone: "caution",
-      label: "Saving…",
-      title: "Changes are not yet flushed to durable storage",
-    };
-  }
-  // A clean slate with nothing written yet.
-  return null;
+  // Active-ish (active / created / pending / queued): the newest checkpoint
+  // is the durable point. Before the first one there is nothing honest to
+  // claim — stay quiet.
+  const latest = checkpoints[0];
+  if (!latest) return null;
+  const n = checkpoints.length;
+  return {
+    tone: "nominal",
+    label: `Work saved · ${relativeTime(latest.created_at)}`,
+    title: `Last checkpoint ${relativeTime(latest.created_at)} · ${n} checkpoint${n === 1 ? "" : "s"}`,
+  };
 }
 
-/** Owns the two polling queries once and derives the header telltale. Shared by
- * React Query with the drawer's gauges, so there's a single poll per session. */
+/** Owns the checkpoint poll once and derives the header telltale. Shared by
+ * React Query with the drawer's ladder, so there's a single poll per session. */
 export function useDurabilitySummary(
   sessionId: string,
   status: SessionState | undefined,
 ): DurabilitySummary | null {
-  const cow = useSessionCowState(sessionId);
   const ckpt = useSessionCheckpoints(sessionId);
   if (!status) return null;
-  return durabilitySummary(status, cow.data?.state ?? null, ckpt.data?.checkpoints ?? []);
+  return durabilitySummary(status, ckpt.data?.checkpoints ?? []);
 }
 
 /** The inline header telltale: a tone-coloured dot + the plain-language word,
@@ -208,10 +164,7 @@ export function DiagnosticsPanel({
             before the session row resolves. */}
         <section>
           <SectionLabel>Durability</SectionLabel>
-          <SessionCowState sessionId={sessionId} />
-          <div className="mt-3">
-            <DurabilityTimeline sessionId={sessionId} />
-          </div>
+          <DurabilityTimeline sessionId={sessionId} />
         </section>
 
         {session && (
@@ -363,7 +316,7 @@ function TeleportControl({ session, events }: { session: Session; events: Indexe
 }
 
 // Freeze / unfreeze this session's microVM in place — the admin affordance to
-// drive + observe the pause/flush path. Does not change session state (the row
+// drive + observe the pause/resume path. Does not change session state (the row
 // stays `active`), so both buttons are always offered; the operator picks.
 // Admin-only, Active-only.
 function PauseResumeControl({ session }: { session: Session }) {

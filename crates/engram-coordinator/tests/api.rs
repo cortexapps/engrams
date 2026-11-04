@@ -653,15 +653,6 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     assert_eq!(still_stored.version, 7);
 }
 
-// ---------------------------------------------------------------------
-// ADR 0016 Phase B commit 4a: admin flush-now endpoint
-//
-// 404, 409, and "idle" paths are reachable against the existing
-// ProcessBackend wiring (whose flush_sandbox default returns None).
-// The "applied" + "stale" outcomes exercise the full FC chunked-disk
-// pipeline and live in commit 4b's e2e test.
-// ---------------------------------------------------------------------
-
 #[tokio::test]
 async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     let meta = sim_meta();
