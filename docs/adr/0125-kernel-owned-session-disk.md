@@ -137,10 +137,11 @@ has `dm_thin_pool` as a signed in-tree module, and `dmsetup` and
 creating thin volumes and snapshots were verified end to end on that
 image. The chart's node-prep init container is privileged with
 `/lib/modules` mounted and already runs `modprobe nbd`. The node
-contributes only the kernel module: the host-agent image bundles
-`dmsetup` and the thin-provisioning tools (`thin_check`, `thin_delta`,
-`thin_repair`) it calls, so the design does not depend on the node
-userland. Nothing outside the in-tree kernel is needed.
+contributes the kernel module and the tools node-prep runs once per
+boot (`dmsetup`, `thin_check`, `losetup`). The host-agent drives
+device-mapper through its ioctl interface and bundles the
+thin-provisioning tools it calls at run time (`thin_dump`,
+`thin_delta`). Nothing outside the in-tree kernel is needed.
 
 ## Decision
 
@@ -174,8 +175,9 @@ userland. Nothing outside the in-tree kernel is needed.
    origin; it is never captured. Every volume a session owns is
    recorded in its `sandbox.json`.
 4. **Firecracker opens the device path.** The guest's virtio-blk drive
-   is `/dev/mapper/<volume>`, opened as buffered host I/O as it is
-   today. No userspace process is in the data path. A write is acked
+   is a device node the host-agent makes itself under `/dev/engram/`
+   (`mknod` from the kernel's major:minor, so no udev rule is in the
+   path), opened as buffered host I/O as it is today. No userspace process is in the data path. A write is acked
    from the host page cache; a flush is a page-cache writeback into the
    pool.
 5. **A checkpoint is a snapshot.** Pause the VM, sync the device's page
@@ -196,9 +198,14 @@ userland. Nothing outside the in-tree kernel is needed.
    restart the host-agent reattaches each VM by pidfd (ADR 0009, as
    today) and reads its volume names from `sandbox.json`. It does not
    open, reconfigure, suspend or verify the volume. The only
-   disk-related startup work is `dmsetup ls` to confirm the recorded
-   volumes exist; a missing volume is a corruption-class invariant
-   failure (ADR 0099 H6), not a recovery case.
+   disk-related startup work is a table read per recorded volume to
+   confirm it exists; a missing volume is a corruption-class invariant
+   failure (ADR 0099 H6), not a recovery case. Thin ids come from a
+   counter seeded from `thin_dump` at startup; the kernel refuses a
+   duplicate and `create` takes the next number, so the counter is
+   never persisted. Startup also deletes any thin the pool holds that
+   has no device: a crash between removing a device and the pool's
+   `delete` message.
 7. **The heartbeat reports facts, never events.** Per node: pool data
    and metadata free space. Per sandbox: the volumes exist. The
    `quarantined_sandboxes` field, its host-side map, the coordinator's
@@ -227,12 +234,12 @@ userland. Nothing outside the in-tree kernel is needed.
 ### Objects on a node
 
 ```text
-/dev/mapper/engram-pool                  the pool (metadata + data partitions)
-/dev/mapper/img-<manifest_id>-v<N>       one volume per staged image version
-/dev/mapper/sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
-/dev/mapper/sb-<sandbox_id>-swap         session swap (fresh volume, no origin)
-/dev/mapper/sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
-<work_dir>/<sandbox_id>/sandbox.json     records the volume names and the thin ids
+/dev/mapper/engram-pool                  the pool (loop-backed metadata + data files)
+/dev/engram/img-<manifest_id>-v<N>       one volume per staged image version
+/dev/engram/sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
+/dev/engram/sb-<sandbox_id>-swap         session swap (fresh volume, no origin)
+/dev/engram/sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
+<work_dir>/<sandbox_id>/sandbox.json     records the volume names
 ```
 
 Thin ids are allocated by the host-agent from a counter persisted under
@@ -259,7 +266,8 @@ backed the daemon is deleted; it has no other reader.
 
 **Create a session.** Snapshot the image volume, create the swap
 volume, write both names into `sandbox.json`, start Firecracker with
-the device paths. Cost: two `dmsetup` calls, about 30 ms each.
+the device paths. Cost: two snapshot sequences of four ioctls each,
+tens of milliseconds in all.
 
 **Checkpoint.** Decision 5. The driver (`checkpoint.rs`) and the
 durable `CheckpointRecord` are unchanged; only the disk capture
@@ -362,8 +370,8 @@ pub mod checkpoint_split { pub async fn take(..); pub async fn upload(..); }
   guest pause; `upload` runs after the guest resumes. The one-call form
   composes them.
 
-Implementations: `ThinPoolDisk` (Linux, phase 3, overrides
-`dirty_chunks` with `thin_delta`), `FileDisk` (host-core: sparse files
+Implementations: `ThinPoolDisk` (`engram-disk-thin`, Linux: seven
+device-mapper ioctls, `thin_delta` for `dirty_chunks`), `FileDisk` (host-core: sparse files
 in a directory, `fs::copy` for snapshot, which APFS makes a clone; the
 macOS implementation and the Linux one without a pool), and `CrashDisk`
 (`engram-dst-host`: `FileDisk` with every call traced and cut at an
@@ -470,10 +478,11 @@ that adds code without retiring the row it replaces is incomplete.
 
 ## Testing
 
-- **Unit (host-agent, Linux-gated):** the `dmsetup` command builder and
-  the `thin_delta` XML parser, against recorded fixtures; the thin id
-  counter's crash states (ADR 0099 H5: every torn write of the counter
-  file is externally constructed).
+- **Unit (`engram-disk-thin`):** the `dm_ioctl` packing (request
+  codes, target specs, the reply walk, the `dev` field decoding) and the
+  parsers for target params, pool status, `thin_dump` and `thin_delta`
+  output, against recorded fixtures. The id counter has no on-disk
+  state to crash-test.
 - **Firecracker integration (KVM runners, `ci.yml`):** create → write →
   checkpoint → verify the manifest's chunks equal the guest's bytes;
   checkpoint under a guest writing at full rate, assert the pause is
@@ -507,17 +516,23 @@ thin-pool host and the reverse.
    re-run, `thin_check` on re-attach, `thin_delta` reports a single
    written block, `BLKDISCARD` on a thin unmaps the range and reads
    back zero.
-3. **The real implementations.** `ThinPoolDisk` with its `dmsetup`
-   builder and `thin_delta` parser, tested against the default
-   `dirty_chunks` on the KVM runners; VZ switches to `FileDisk` and the
-   shared flows, retiring its `rootfs_source` restore input and its
-   host-local snapshot-file clone.
+3. **`ThinPoolDisk`.** The `engram-disk-thin` crate: device-mapper
+   over ioctls, `thin_delta` for `dirty_chunks`, tested against the
+   default full compare on the KVM root lane, which builds a pool with
+   `thin-pool.sh`. The host-agent opens the pool behind `--thin-pool`
+   and logs its capacity. The VZ switch moved to step 5: it is the same
+   change as moving Firecracker's disk ownership into `PooledBackend`,
+   and doing it once retires the VZ clone, chunk and restore code in
+   one move.
 4. **Image staging into volumes.** The prefetch supervisor stages each
    enabled version into a thin volume beside the chunk cache; readiness
    requires the volume.
-5. **Sessions on the pool.** Create, resume, checkpoint, evict and
-   teleport go through `stage` and `checkpoint`; the heartbeat reports
-   pool capacity and the scheduler gates on it. One deploy cycle where
+5. **Sessions on the pool.** `PooledBackend` owns the disk for both
+   backends: create, resume, checkpoint, evict and teleport go through
+   `stage` and `checkpoint`, and each backend only attaches the path it
+   is given. VZ switches to `FileDisk`, retiring its `rootfs_source`
+   restore input and its host-local snapshot-file clone. The heartbeat
+   reports pool capacity and the scheduler gates on it. One deploy cycle where
    a host-agent runs both paths: new sessions on the pool, the last NBD
    sessions on the daemon until they evict. The small-synchronous-write
    measurement from Tradeoffs runs here on a real image.
