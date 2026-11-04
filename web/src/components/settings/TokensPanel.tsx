@@ -8,6 +8,7 @@ import {
   useDeleteHarnessEnv,
   type HarnessEnvVar,
 } from "../../hooks/useHarnessEnv";
+import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
@@ -162,7 +163,7 @@ function ConnectorTokenForm({ provider, onDone }: { provider: string; onDone: ()
       { provider, value: data.value },
       {
         onSuccess: onDone,
-        onError: (e) => form.setError("root", { message: String(e) }),
+        onError: (e) => form.setError("root", { message: errorMessage(e) }),
       },
     );
 
@@ -375,7 +376,7 @@ function EnvVarForm({ envVar, onDone }: { envVar: string; onDone: () => void }) 
       { envVar, value: data.value },
       {
         onSuccess: onDone,
-        onError: (e) => form.setError("root", { message: String(e) }),
+        onError: (e) => form.setError("root", { message: errorMessage(e) }),
       },
     );
 
