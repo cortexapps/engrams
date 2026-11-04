@@ -1002,7 +1002,7 @@ pub fn capture_candidate_hosts_from(
     };
     let mut survivors: Vec<(u64, HostId)> = Vec::new();
     for h in hosts {
-        if !host_is_schedulable(h, now, ttl) {
+        if new_session_veto(h, now, ttl).is_some() {
             continue;
         }
         if host_meets_capabilities(h, &caps).is_err() {
