@@ -449,6 +449,18 @@ impl VzVm {
         self.dead.load(Ordering::SeqCst)
     }
 
+    /// Liveness from the framework, not from the sandbox map: the stop
+    /// delegate has not fired and the machine is in a running-family
+    /// state. `Stopped` and `Error` are dead.
+    pub async fn is_alive(&self) -> bool {
+        use VZVirtualMachineState as S;
+        !self.is_dead()
+            && matches!(
+                self.state().await,
+                S::Running | S::Paused | S::Starting | S::Pausing | S::Resuming
+            )
+    }
+
     /// Start the VM. Resolves once VZ's `startWithCompletionHandler`
     /// fires its callback (success) or returns an NSError (failure).
     pub async fn start(&self) -> Result<(), VzError> {

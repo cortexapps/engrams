@@ -1175,12 +1175,17 @@ impl SandboxBackend for VzBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // A dead VM leaves the list so the heartbeat reports ground truth;
         // its map entry stays until the coordinator destroys it.
-        let mut ids: std::collections::HashSet<_> = self
+        let vms: Vec<(SandboxId, Arc<VzVm>)> = self
             .sandboxes
             .iter()
-            .filter(|kv| !kv.value().vm.is_dead())
-            .map(|kv| *kv.key())
+            .map(|kv| (*kv.key(), kv.value().vm.clone()))
             .collect();
+        let mut ids = std::collections::HashSet::new();
+        for (id, vm) in vms {
+            if vm.is_alive().await {
+                ids.insert(id);
+            }
+        }
         ids.extend(self.teardowns.keys());
         Ok(ids.into_iter().collect())
     }
@@ -1223,16 +1228,9 @@ impl SandboxBackend for VzBackend {
                 })
             }
         };
-        use objc2_virtualization::VZVirtualMachineState as S;
-        let state = vm.state().await;
-        let alive = !vm.is_dead()
-            && matches!(
-                state,
-                S::Running | S::Paused | S::Starting | S::Pausing | S::Resuming
-            );
         Ok(SandboxProbe {
             known_to_backend: true,
-            process_alive: alive,
+            process_alive: vm.is_alive().await,
             control_alive: None,
         })
     }
