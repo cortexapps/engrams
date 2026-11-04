@@ -15,6 +15,7 @@ use crate::parse::{self, DevNo};
 
 const HEADER_LEN: usize = 0x138;
 const DM_IOCTL: u32 = 0xfd;
+const DM_LIST_DEVICES_CMD: u32 = 2;
 const DM_DEV_CREATE_CMD: u32 = 3;
 const DM_DEV_REMOVE_CMD: u32 = 4;
 const DM_DEV_RENAME_CMD: u32 = 5;
@@ -42,6 +43,12 @@ const SPEC_OFF_LENGTH: usize = 0x08;
 const SPEC_OFF_NEXT: usize = 0x14;
 const SPEC_OFF_TYPE: usize = 0x18;
 const TYPE_LEN: usize = 16;
+
+/// `struct dm_name_list`: the device number, the offset of the next
+/// entry (0 on the last) and the name.
+const NAME_LIST_OFF_DEV: usize = 0;
+const NAME_LIST_OFF_NEXT: usize = 8;
+const NAME_LIST_OFF_NAME: usize = 12;
 
 /// `_IOWR(DM_IOCTL, cmd, struct dm_ioctl)`.
 const fn request(cmd: u32) -> libc::Ioctl {
@@ -125,10 +132,40 @@ impl Request {
     }
 
     fn dev(&self) -> DevNo {
-        let dev = u64::from_ne_bytes(self.buf[OFF_DEV..OFF_DEV + 8].try_into().unwrap());
-        DevNo {
-            major: ((dev >> 8) & 0xfff) as u32,
-            minor: ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32,
+        decode_dev(u64::from_ne_bytes(
+            self.buf[OFF_DEV..OFF_DEV + 8].try_into().unwrap(),
+        ))
+    }
+
+    /// The devices the kernel listed: an empty list is one entry with
+    /// an empty name.
+    fn name_list(&self) -> io::Result<Vec<(String, DevNo)>> {
+        let mut at = u32::from_ne_bytes(self.field(OFF_DATA_START)) as usize;
+        let mut devices = Vec::new();
+        loop {
+            let entry = self
+                .buf
+                .get(at..)
+                .filter(|e| e.len() > NAME_LIST_OFF_NAME)
+                .ok_or_else(|| invalid("device list entry past the end of the reply"))?;
+            let dev = u64::from_ne_bytes(
+                entry[NAME_LIST_OFF_DEV..NAME_LIST_OFF_DEV + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let next = u32::from_ne_bytes(
+                entry[NAME_LIST_OFF_NEXT..NAME_LIST_OFF_NEXT + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let name = c_str(&entry[NAME_LIST_OFF_NAME..]);
+            if !name.is_empty() {
+                devices.push((name, decode_dev(dev)));
+            }
+            if next == 0 {
+                return Ok(devices);
+            }
+            at += next as usize;
         }
     }
 
@@ -167,16 +204,39 @@ impl Request {
 
     /// Issue `cmd` on a blocking thread; the kernel reads and rewrites
     /// the buffer in place.
-    async fn ioctl(mut self, control: Arc<File>, cmd: u32) -> io::Result<Self> {
-        tokio::task::spawn_blocking(move || {
-            let size = self.buf.len() as u32;
-            self.buf[OFF_DATA_SIZE..OFF_DATA_SIZE + 4].copy_from_slice(&size.to_ne_bytes());
-            ioctl_in_place(&control, request(cmd), &mut self.buf)?;
-            Ok(self)
-        })
-        .await
-        .map_err(io::Error::other)?
+    async fn ioctl(self, control: Arc<File>, cmd: u32) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || self.ioctl_blocking(&control, cmd))
+            .await
+            .map_err(io::Error::other)?
     }
+
+    fn ioctl_blocking(mut self, control: &File, cmd: u32) -> io::Result<Self> {
+        let size = self.buf.len() as u32;
+        self.buf[OFF_DATA_SIZE..OFF_DATA_SIZE + 4].copy_from_slice(&size.to_ne_bytes());
+        ioctl_in_place(control, request(cmd), &mut self.buf)?;
+        Ok(self)
+    }
+}
+
+/// The kernel's "huge" device number encoding.
+fn decode_dev(dev: u64) -> DevNo {
+    DevNo {
+        major: ((dev >> 8) & 0xfff) as u32,
+        minor: ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32,
+    }
+}
+
+/// `busy` is the kind `EBUSY` maps to: the kernel uses it both for
+/// "the name is taken" (create, rename) and "the device is open"
+/// (remove). The returned error carries no raw errno.
+fn describe(op: &str, name: &str, busy: io::ErrorKind, e: io::Error) -> io::Error {
+    let kind = match e.raw_os_error() {
+        Some(libc::ENXIO) => io::ErrorKind::NotFound,
+        Some(libc::EEXIST) => io::ErrorKind::AlreadyExists,
+        Some(libc::EBUSY) => busy,
+        _ => e.kind(),
+    };
+    io::Error::new(kind, format!("dm {op} {name}: {e}"))
 }
 
 /// SAFETY: `buf` is at least `HEADER_LEN` bytes, its `data_size` field
@@ -220,9 +280,6 @@ impl Dm {
         })
     }
 
-    /// `busy` is the kind `EBUSY` maps to: the kernel uses it both for
-    /// "the name is taken" (create, rename) and "the device is open"
-    /// (remove). The returned error carries no raw errno.
     async fn call(
         &self,
         op: &str,
@@ -231,15 +288,31 @@ impl Dm {
         cmd: u32,
         busy: io::ErrorKind,
     ) -> io::Result<Request> {
-        req.ioctl(self.control.clone(), cmd).await.map_err(|e| {
-            let kind = match e.raw_os_error() {
-                Some(libc::ENXIO) => io::ErrorKind::NotFound,
-                Some(libc::EEXIST) => io::ErrorKind::AlreadyExists,
-                Some(libc::EBUSY) => busy,
-                _ => e.kind(),
-            };
-            io::Error::new(kind, format!("dm {op} {name}: {e}"))
-        })
+        req.ioctl(self.control.clone(), cmd)
+            .await
+            .map_err(|e| describe(op, name, busy, e))
+    }
+
+    /// Every device-mapper device on the host: name and number.
+    pub async fn list(&self) -> io::Result<Vec<(String, DevNo)>> {
+        let mut room = 4096;
+        loop {
+            let mut req = Request::new("", 0)?;
+            req.reserve(room);
+            let reply = self
+                .call(
+                    "list",
+                    "",
+                    req,
+                    DM_LIST_DEVICES_CMD,
+                    io::ErrorKind::ResourceBusy,
+                )
+                .await?;
+            if reply.flags() & DM_BUFFER_FULL_FLAG == 0 {
+                return reply.name_list();
+            }
+            room *= 2;
+        }
     }
 
     /// Create a device, load its single target and resume it.
@@ -348,6 +421,15 @@ impl Dm {
         .map(drop)
     }
 
+    /// [`Self::message`] on the calling thread, for a `Drop`.
+    pub fn message_blocking(&self, name: &str, text: &str) -> io::Result<()> {
+        let mut req = Request::new(name, 0)?;
+        req.push_message(text);
+        req.ioctl_blocking(&self.control, DM_TARGET_MSG_CMD)
+            .map(drop)
+            .map_err(|e| describe("message", name, io::ErrorKind::ResourceBusy, e))
+    }
+
     pub async fn devno(&self, name: &str) -> io::Result<DevNo> {
         let reply = self
             .call(
@@ -399,32 +481,6 @@ impl Dm {
 pub async fn device_path(devno: DevNo) -> io::Result<PathBuf> {
     let uevent = tokio::fs::read_to_string(format!("{}/uevent", devno.sysfs_path())).await?;
     Ok(PathBuf::from("/dev").join(parse::devname(&uevent)?))
-}
-
-/// Names of the device-mapper devices stacked on `pool`.
-pub async fn devices_on(pool: DevNo) -> io::Result<Vec<String>> {
-    let pool_link = tokio::fs::read_link(pool.sysfs_path()).await?;
-    let pool_dm = pool_link
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| invalid("pool sysfs link has no name"))?;
-    let mut names = Vec::new();
-    let mut entries = tokio::fs::read_dir("/sys/block").await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let dir = entry.path();
-        if !entry.file_name().to_string_lossy().starts_with("dm-") {
-            continue;
-        }
-        if tokio::fs::metadata(dir.join("slaves").join(&pool_dm))
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        let name = tokio::fs::read_to_string(dir.join("dm/name")).await?;
-        names.push(name.trim_end().to_string());
-    }
-    Ok(names)
 }
 
 /// Create a block device node, replacing one that points elsewhere.

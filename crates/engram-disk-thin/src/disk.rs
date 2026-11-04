@@ -3,6 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use crate::dm;
 use crate::parse::{self, DevNo, ThinParams, METADATA_BLOCK_BYTES};
@@ -12,6 +13,10 @@ use engram_host_core::disk::{Capacity, ChunkIndex, SessionDisk, Volume, VolumeNa
 const SECTOR_BYTES: u64 = 512;
 /// dm-thin device ids are 24 bits wide.
 const ID_MASK: u32 = 0x00FF_FFFF;
+/// A `delete` waits this long in all for the last holder of a device
+/// to close it.
+const REMOVE_ATTEMPTS: u32 = 10;
+const REMOVE_RETRY: Duration = Duration::from_millis(100);
 
 pub struct ThinPoolDisk {
     dm: dm::Dm,
@@ -83,12 +88,37 @@ impl ThinPoolDisk {
     }
 
     async fn active_ids(&self) -> io::Result<Vec<u32>> {
-        let mut ids = Vec::new();
-        for name in dm::devices_on(self.pool_dev).await? {
-            let params = single_target(&self.dm.table(&name).await?, "thin")?;
-            ids.push(parse::thin_params(&params)?.id);
+        Ok(self
+            .thins()
+            .await?
+            .into_iter()
+            .map(|t| t.params.id)
+            .collect())
+    }
+
+    /// Every thin device on this pool, from one device list and one
+    /// table read per device. A device that goes away between the two
+    /// is not on the pool.
+    async fn thins(&self) -> io::Result<Vec<Thin>> {
+        let mut thins = Vec::new();
+        for (name, _) in self.dm.list().await? {
+            let targets = match self.dm.table(&name).await {
+                Ok(targets) => targets,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let [target] = targets.as_slice() else {
+                continue;
+            };
+            if target.kind != "thin" {
+                continue;
+            }
+            let params = parse::thin_params(&target.params)?;
+            if params.pool == self.pool_dev {
+                thins.push(Thin { name, params });
+            }
         }
-        Ok(ids)
+        Ok(thins)
     }
 
     /// The thin behind `name` and its size, refused when it belongs to
@@ -108,12 +138,30 @@ impl ThinPoolDisk {
         Ok((params, targets[0].length_sectors))
     }
 
+    /// A device over thin `id`. On failure the thin is deleted from the
+    /// pool again, so a failed create or snapshot leaves nothing.
     async fn activate(&self, name: &VolumeName, id: u32, sectors: u64) -> io::Result<Volume> {
         let params = format!("{} {id}", self.pool_dev);
-        self.dm
-            .create(name.as_str(), sectors, "thin", &params)
-            .await?;
-        self.volume(name, sectors).await
+        let activated = async {
+            self.dm
+                .create(name.as_str(), sectors, "thin", &params)
+                .await?;
+            match self.volume(name, sectors).await {
+                Ok(volume) => Ok(volume),
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(self.node_of(name)).await;
+                    let _ = self.dm.remove(name.as_str()).await;
+                    Err(e)
+                }
+            }
+        }
+        .await;
+        if activated.is_err() {
+            if let Err(error) = self.dm.message(&self.pool, &format!("delete {id}")).await {
+                tracing::warn!(pool = %self.pool, id, %error, "thin left behind by a failed activate");
+            }
+        }
+        activated
     }
 
     async fn volume(&self, name: &VolumeName, sectors: u64) -> io::Result<Volume> {
@@ -122,15 +170,25 @@ impl ThinPoolDisk {
         Volume::open(name.clone(), &node, sectors * SECTOR_BYTES, self.chunk_size)
     }
 
+    /// Run `read` over a reserved metadata snapshot. The reserve is
+    /// released when the guard drops, so a cancelled read releases it
+    /// too. A reserve another holder left behind (a process that died,
+    /// a read cancelled before this guard existed) is released first.
     async fn with_metadata_snap<T>(
         &self,
         read: impl std::future::Future<Output = io::Result<T>>,
     ) -> io::Result<T> {
         let _held = self.metadata_snap.lock().await;
-        self.dm.message(&self.pool, "reserve_metadata_snap").await?;
-        let result = read.await;
-        self.dm.message(&self.pool, "release_metadata_snap").await?;
-        result
+        if let Err(error) = self.dm.message(&self.pool, "reserve_metadata_snap").await {
+            tracing::warn!(pool = %self.pool, %error, "metadata snapshot not reserved; releasing a stale one");
+            self.dm.message(&self.pool, "release_metadata_snap").await?;
+            self.dm.message(&self.pool, "reserve_metadata_snap").await?;
+        }
+        let _reserved = MetadataSnap {
+            dm: &self.dm,
+            pool: &self.pool,
+        };
+        read.await
     }
 
     fn sectors_of(size_bytes: u64) -> io::Result<u64> {
@@ -141,6 +199,25 @@ impl ThinPoolDisk {
             ));
         }
         Ok(size_bytes / SECTOR_BYTES)
+    }
+}
+
+struct Thin {
+    name: String,
+    params: ThinParams,
+}
+
+/// A reserved metadata snapshot; released on drop.
+struct MetadataSnap<'a> {
+    dm: &'a dm::Dm,
+    pool: &'a str,
+}
+
+impl Drop for MetadataSnap<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.dm.message_blocking(self.pool, "release_metadata_snap") {
+            tracing::warn!(pool = self.pool, %error, "metadata snapshot not released");
+        }
     }
 }
 
@@ -190,9 +267,19 @@ impl SessionDisk for ThinPoolDisk {
         self.volume(name, sectors).await
     }
 
+    /// Waits a bounded time for the last holder to close the device.
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
         let (thin, _) = self.thin_of(name).await?;
-        self.dm.remove(name.as_str()).await?;
+        let mut attempt = 1;
+        loop {
+            match self.dm.remove(name.as_str()).await {
+                Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(REMOVE_RETRY).await;
+                }
+                removed => break removed?,
+            }
+        }
         match tokio::fs::remove_file(self.node_of(name)).await {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -203,10 +290,11 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn list(&self) -> io::Result<Vec<VolumeName>> {
-        Ok(dm::devices_on(self.pool_dev)
+        Ok(self
+            .thins()
             .await?
             .into_iter()
-            .filter_map(|name| VolumeName::new(name).ok())
+            .filter_map(|t| VolumeName::new(t.name).ok())
             .collect())
     }
 

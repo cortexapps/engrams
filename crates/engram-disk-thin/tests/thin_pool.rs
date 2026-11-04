@@ -282,3 +282,85 @@ async fn open_deletes_a_thin_whose_device_is_gone_and_create_skips_a_taken_id() 
         .unwrap();
     assert!(deleted.success());
 }
+
+/// A reserve left behind by a holder that died: the next read releases
+/// it, reserves its own and releases that one too.
+#[tokio::test]
+#[ignore]
+async fn a_stale_metadata_reserve_is_released_and_the_read_proceeds() {
+    let disk = pool_or_skip!();
+    let reserved = tokio::process::Command::new("dmsetup")
+        .args(["message", disk.pool(), "0", "reserve_metadata_snap"])
+        .status()
+        .await
+        .unwrap();
+    assert!(reserved.success());
+
+    disk.thin_ids().await.unwrap();
+
+    let nothing_held = tokio::process::Command::new("dmsetup")
+        .args(["message", disk.pool(), "0", "release_metadata_snap"])
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        !nothing_held.success(),
+        "the read released the reserve it took"
+    );
+}
+
+/// A device name the kernel refuses (taken by another device) fails the
+/// create and the snapshot without a thin left in the pool.
+#[tokio::test]
+#[ignore]
+async fn a_failed_activation_leaves_no_thin_in_the_pool() {
+    let disk = pool_or_skip!();
+    let taken = name("decoy", "taken");
+    let decoy = tokio::process::Command::new("dmsetup")
+        .args(["create", taken.as_str(), "--table", "0 8 zero"])
+        .status()
+        .await
+        .unwrap();
+    assert!(decoy.success());
+    let origin = name("decoy", "origin");
+    let v = disk.create(&origin, CHUNK).await.unwrap();
+    let before = disk.thin_ids().await.unwrap().len();
+
+    assert_eq!(
+        disk.create(&taken, CHUNK).await.unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        disk.snapshot(&v, &taken).await.unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(disk.thin_ids().await.unwrap().len(), before);
+
+    drop(v);
+    disk.delete(&origin).await.unwrap();
+    let removed = tokio::process::Command::new("dmsetup")
+        .args(["remove", taken.as_str()])
+        .status()
+        .await
+        .unwrap();
+    assert!(removed.success());
+}
+
+/// A holder that closes the device within the delete's wait does not
+/// fail it.
+#[tokio::test]
+#[ignore]
+async fn delete_waits_for_a_holder_that_closes_soon() {
+    let disk = Arc::new(pool_or_skip!());
+    let live = name("wait", "live");
+    let v = disk.create(&live, CHUNK).await.unwrap();
+    let deleting = {
+        let disk = disk.clone();
+        let live = live.clone();
+        tokio::spawn(async move { disk.delete(&live).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(v);
+    deleting.await.unwrap().unwrap();
+    assert!(!disk.list().await.unwrap().contains(&live));
+}
