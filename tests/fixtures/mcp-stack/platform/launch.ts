@@ -1208,61 +1208,88 @@ export class Stack {
       if (requireRelease) await this.engine.fc.requireStopped();
       return;
     }
+    const host = this.host;
+    const leader = host && this.nativeIdentities.get(host.child.pid!);
     const before = await this.nativeProcesses();
     await put(
       join(this.root, `native-stop-${randomBytes(8).toString("hex")}.json`),
       JSON.stringify({ version: 1, identities: before }),
     );
-    if (this.host?.running())
+    check(
+      host ||
+        !before.some(
+          (p) => p.executable === this.assets.binaries.hostAgent.path,
+        ),
+      "native_host_handle_missing",
+    );
+    if (host?.running())
       check(
-        before.some((identity) => identity.pid === this.host?.child.pid),
+        leader &&
+          leader.executable === this.assets.binaries.hostAgent.path &&
+          before.some((p) => nativeKey(p) === nativeKey(leader)),
         "native_host_identity_before_stop",
       );
-    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-      for (const identity of await this.nativeProcesses()) {
-        // Compare the kernel birth time and executable again immediately before signaling.
-        const current = (await this.nativeProcesses()).find(
-          (p) => p.pid === identity.pid,
-        );
-        if (!current) continue;
-        check(
-          nativeKey(identity) === nativeKey(current),
-          "native_identity_changed",
-        );
-        try {
-          process.kill(identity.pid, signal);
-        } catch (error) {
-          if (
-            !(
-              error instanceof Error &&
-              "code" in error &&
-              error.code === "ESRCH"
-            )
-          )
-            throw error;
-        }
+    const signalIdentity = async (
+      identity: NativeIdentity,
+      signal: NodeJS.Signals,
+    ) => {
+      // Compare the kernel birth time and executable again immediately before signaling.
+      const current = (await this.nativeProcesses()).find(
+        (p) => p.pid === identity.pid,
+      );
+      if (!current) return;
+      check(
+        nativeKey(identity) === nativeKey(current),
+        "native_identity_changed",
+      );
+      try {
+        process.kill(identity.pid, signal);
+      } catch (error) {
+        if (
+          !(error instanceof Error && "code" in error && error.code === "ESRCH")
+        )
+          throw error;
       }
+    };
+    if (host) {
+      let closed = false;
+      void host.done.then(() => {
+        closed = true;
+      });
+      const leaderPresent = async () =>
+        leader &&
+        (await this.nativeProcesses()).some(
+          (p) => nativeKey(p) === nativeKey(leader),
+        );
+      // The host restarts its proxy. Stop and reap the leader before selecting children.
+      for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+        if (leader) await signalIdentity(leader, signal);
+        const until = performance.now() + 1500;
+        while (performance.now() < until) {
+          const present = await leaderPresent();
+          if (closed && !host.running() && !present) break;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        if (closed && !host.running() && !(await leaderPresent())) break;
+      }
+      check(closed && !host.running(), "native_host_handle_cleanup");
+      check(!(await leaderPresent()), "native_host_survivor");
+      this.host = undefined;
+    }
+    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+      const children = await this.nativeProcesses();
+      check(
+        children.every(
+          (p) => p.executable !== this.assets.binaries.hostAgent.path,
+        ),
+        "native_host_survivor",
+      );
+      for (const identity of children) await signalIdentity(identity, signal);
       const until = performance.now() + 1500;
       while ((await this.nativeProcesses()).length && performance.now() < until)
         await new Promise((r) => setTimeout(r, 20));
     }
     check((await this.nativeProcesses()).length === 0, "native_survivors");
-    if (this.host) {
-      const host = this.host;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const closed = await Promise.race([
-          host.done.then(() => true),
-          new Promise<boolean>((resolve) => {
-            timer = setTimeout(() => resolve(false), 1500);
-          }),
-        ]);
-        check(closed && !host.running(), "native_host_handle_cleanup");
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-      this.host = undefined;
-    }
     this.nativeIdentities.clear();
   }
 }

@@ -261,6 +261,222 @@ test("native ownership rejects foreign executables, UID and incomplete birth ide
     ).toThrow();
 });
 
+// Replace the native inventory and signal boundaries. No host or VM is started.
+async function nativeCleanupFixture() {
+  const { Stack, parseNativeIdentities } = await import("./launch.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/native-cleanup-"),
+  );
+  const stack = new Stack(
+    { backend: "vz" } as Inputs,
+    root,
+    {} as ConstructorParameters<typeof Stack>[2],
+    {
+      binaries: { hostAgent: { path: join(root, "assets/hostAgent") } },
+    } as ConstructorParameters<typeof Stack>[3],
+    {} as ConstructorParameters<typeof Stack>[4],
+    {} as ConstructorParameters<typeof Stack>[5],
+  );
+  const leader = {
+    pid: 41001,
+    uid: process.getuid!(),
+    parent: 1,
+    group: 41001,
+    seconds: "1730000000",
+    microseconds: "123456",
+    executable: join(root, "assets/hostAgent"),
+  };
+  let identities = [
+    leader,
+    { ...leader, pid: 41002, executable: join(root, "assets/proxy") },
+  ];
+  let alive = true;
+  let finish!: () => void;
+  const events: string[] = [];
+  const done = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const complete = () => {
+    alive = false;
+    identities = identities.filter((p) => p.pid !== leader.pid);
+    events.push("host-complete");
+    finish();
+  };
+  Reflect.set(stack, "host", {
+    child: { pid: leader.pid },
+    running: () => alive,
+    done,
+    stop: () => {
+      throw new Error("group stop must not run");
+    },
+  });
+  Reflect.set(stack, "nativeIdentities", new Map([[leader.pid, leader]]));
+  let scan = () => identities;
+  Reflect.set(stack, "nativeProcesses", async () =>
+    parseNativeIdentities(scan(), root),
+  );
+  const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    expect(pid).toBeGreaterThan(1);
+    events.push(`${pid}:${signal}`);
+    if (pid === leader.pid) complete();
+    else identities = identities.filter((p) => p.pid !== pid);
+    return true;
+  });
+  return {
+    stack,
+    leader,
+    events,
+    complete,
+    alive: () => alive,
+    identities: () => identities,
+    setIdentities: (next: typeof identities) => {
+      identities = next;
+    },
+    setScan: (next: typeof scan) => {
+      scan = next;
+    },
+    kill,
+    close: async () => {
+      kill.mockRestore();
+      await rm(root, { recursive: true });
+    },
+  };
+}
+
+test("native cleanup waits for host completion before scanning and signaling replacement proxies", async () => {
+  const fixture = await nativeCleanupFixture();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  fixture.kill.mockImplementation((pid, signal) => {
+    fixture.events.push(`${pid}:${signal}`);
+    if (pid === fixture.leader.pid) {
+      // The supervisor replaces its proxy while the leader still exits.
+      fixture.setIdentities([
+        fixture.leader,
+        {
+          ...fixture.identities()[1]!,
+          pid: 41003,
+        },
+      ]);
+      timer = setTimeout(fixture.complete, 5);
+    } else {
+      fixture.events.push(
+        fixture.alive() ? "proxy-before-completion" : "proxy-after-completion",
+      );
+      fixture.setIdentities(fixture.identities().filter((p) => p.pid !== pid));
+    }
+    return true;
+  });
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual([
+      "41001:SIGTERM",
+      "host-complete",
+      "41003:SIGTERM",
+      "proxy-after-completion",
+    ]);
+    expect(fixture.identities()).toEqual([]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await fixture.close();
+  }
+});
+
+test("native cleanup refuses a host inventory without its retained handle", async () => {
+  const fixture = await nativeCleanupFixture();
+  Reflect.set(fixture.stack, "host", undefined);
+  try {
+    await expect(fixture.stack.cleanupHost()).rejects.toThrow(
+      "native_host_handle_missing",
+    );
+    expect(fixture.events).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup does not adopt a reused PID after an uncaptured host exits", async () => {
+  const fixture = await nativeCleanupFixture();
+  fixture.complete();
+  fixture.events.length = 0;
+  Reflect.set(fixture.stack, "nativeIdentities", new Map());
+  fixture.setIdentities([
+    { ...fixture.leader, seconds: "1730000001" },
+    fixture.identities()[0]!,
+  ]);
+  try {
+    await expect(fixture.stack.cleanupHost()).rejects.toThrow(
+      "native_host_survivor",
+    );
+    expect(fixture.events).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup removes remaining proxies when no host exists", async () => {
+  const fixture = await nativeCleanupFixture();
+  Reflect.set(fixture.stack, "host", undefined);
+  fixture.setIdentities(
+    fixture.identities().filter((p) => p.pid !== fixture.leader.pid),
+  );
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual(["41002:SIGTERM"]);
+    expect(fixture.identities()).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native cleanup kills a TERM-resistant host before signaling its proxy", async () => {
+  const fixture = await nativeCleanupFixture();
+  fixture.kill.mockImplementation((pid, signal) => {
+    fixture.events.push(`${pid}:${signal}`);
+    if (pid === fixture.leader.pid) {
+      if (signal === "SIGKILL") fixture.complete();
+    } else {
+      fixture.events.push(
+        fixture.alive() ? "proxy-before-completion" : "proxy-after-completion",
+      );
+      fixture.setIdentities(fixture.identities().filter((p) => p.pid !== pid));
+    }
+    return true;
+  });
+  try {
+    await fixture.stack.cleanupHost();
+    expect(fixture.events).toEqual([
+      "41001:SIGTERM",
+      "41001:SIGKILL",
+      "host-complete",
+      "41002:SIGTERM",
+      "proxy-after-completion",
+    ]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const change of [
+  { seconds: "1730000001" },
+  { executable: "/foreign/hostAgent" },
+]) {
+  test(`native cleanup sends no signal when the retained host changes (${Object.keys(change)[0]})`, async () => {
+    const fixture = await nativeCleanupFixture();
+    let scans = 0;
+    fixture.setScan(() =>
+      ++scans === 1
+        ? fixture.identities()
+        : [{ ...fixture.leader, ...change }, fixture.identities()[1]!],
+    );
+    try {
+      await expect(fixture.stack.cleanupHost()).rejects.toThrow();
+      expect(fixture.events).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
 test("cancelled engine control runs no command and drains its control lease", async () => {
   const engine = new Engine(
     {} as Inputs,
