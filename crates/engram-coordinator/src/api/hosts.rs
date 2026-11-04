@@ -17,10 +17,6 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct HostView {
-    pub pool_data_free_mib: u64,
-    pub pool_data_total_mib: u64,
-    pub pool_metadata_free_mib: u64,
-    pub pool_metadata_total_mib: u64,
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
@@ -48,6 +44,12 @@ pub struct HostView {
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
+    /// The session-disk pool from the latest heartbeat; a zero total
+    /// means the host has no pool.
+    pub pool_data_free_mib: u64,
+    pub pool_data_total_mib: u64,
+    pub pool_metadata_free_mib: u64,
+    pub pool_metadata_total_mib: u64,
     /// Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
     /// residency, and the running/parked split of guest PSS. `0` until
     /// the host's first post-0078 heartbeat. `base_shm_pending_mib` is

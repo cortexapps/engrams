@@ -472,6 +472,7 @@ if fc_colima_profile:
     # vars on purpose: prod must be able to tune idle eviction without
     # silently loosening placement's disk gate.
     coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
+    coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
 
 if bin_dir:

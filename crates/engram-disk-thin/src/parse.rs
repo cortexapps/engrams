@@ -85,10 +85,16 @@ pub struct PoolStatus {
 
 pub const METADATA_BLOCK_BYTES: u64 = 4096;
 
+/// A pool that is not read-write (`ro`, `out_of_data_space`, or a
+/// single-word `Fail`) is an error: its numbers do not describe a pool
+/// that can take a session.
 pub fn pool_status(status: &str) -> io::Result<PoolStatus> {
     let fields: Vec<&str> = status.split_whitespace().collect();
     match fields.as_slice() {
-        [_, metadata, data, ..] => {
+        [_, _, _, _, mode, ..] if *mode != "rw" => {
+            Err(invalid(format!("thin-pool is {mode}: {status:?}")))
+        }
+        [_, metadata, data, _, "rw", ..] => {
             let (metadata_used_blocks, metadata_total_blocks) = fraction(metadata)?;
             let (data_used_blocks, data_total_blocks) = fraction(data)?;
             Ok(PoolStatus {
@@ -219,6 +225,17 @@ mod tests {
                 data_total_blocks: 65536,
             }
         );
+    }
+
+    #[test]
+    fn pool_status_rejects_a_pool_that_is_not_read_write() {
+        for status in [
+            "0 4115/65536 65536/65536 - out_of_data_space discard_passdown error_if_no_space - 1024",
+            "0 4115/65536 5/65536 - ro discard_passdown queue_if_no_space - 1024",
+            "Fail",
+        ] {
+            assert!(pool_status(status).is_err(), "{status}");
+        }
     }
 
     #[test]

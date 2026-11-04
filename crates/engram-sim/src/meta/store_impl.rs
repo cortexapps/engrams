@@ -271,7 +271,7 @@ impl SimMetadataStore {
                 .min_by_key(|(free, id)| (*free, *id))
                 .map(|(_, id)| id)
         };
-        // Keep the original affinity boundary when a slot-full host drops out.
+        // Keep the original affinity boundary when an ineligible host drops out.
         let prefix = &candidates[..affinity_len.min(candidates.len())];
         let (affinity, rest): (Vec<_>, Vec<_>) = eligible
             .iter()

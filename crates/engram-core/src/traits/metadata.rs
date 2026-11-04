@@ -291,7 +291,7 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0090: reverse ownership lookup — which session (if any)
     /// currently binds `sandbox_id` on `host_id`? Answers the teardown
     /// reconciler's unknown-binding arm: a host-agent generation whose
-    /// in-memory binding table missed a sandbox (NBD rehydrate failed
+    /// in-memory binding table missed a sandbox (binding rehydrate failed
     /// mid-roll) must ask the coordinator before counting an orphan
     /// strike — local absence-of-binding is NOT ownership truth
     /// (2026-07-11 campaign: a healthy pidfd-reattached VM was SIGKILLed

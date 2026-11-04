@@ -117,14 +117,15 @@ pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 *
 
 /// Placement stops choosing a host whose session-disk pool has less data
 /// space free than this. A full data pool queues guest I/O instead of
-/// failing it, so the floor keeps resident sessions running while the
-/// idle evictor drains the node.
+/// failing it, so the floor keeps the resident sessions running.
 pub const HOST_POOL_DATA_FLOOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const HOST_POOL_DATA_FLOOR_MIB: u64 = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
 
 /// Placement stops choosing a host whose pool metadata has less space
 /// free than this. Metadata is sized so this never trips; the heartbeat
 /// reports it so an alert fires first.
 pub const HOST_POOL_METADATA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+pub const HOST_POOL_METADATA_FLOOR_MIB: u64 = HOST_POOL_METADATA_FLOOR_BYTES / (1024 * 1024);
 
 /// Observed host resource utilization, sampled fresh on every
 /// heartbeat. Distinct from [`HostCapacity`], which is the
@@ -140,7 +141,7 @@ pub const HOST_POOL_METADATA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostUtilization {
     /// Free / total MiB of the session-disk pool's data device. A zero
-    /// total means the host has no pool (file-backed disks) or has not
+    /// total means the host has no pool (sparse-file volumes) or has not
     /// reported one; placement treats it as unmeasured.
     #[serde(default)]
     pub pool_data_free_mib: u64,
@@ -230,7 +231,7 @@ pub enum CapStatus {
     /// The probe ran and failed. `detail` is the errno/message.
     Failed(String),
     /// This backend never has this capability (e.g. VZ has no
-    /// uffd/nbd/base_shm substrate) — distinct from `Failed` so the fleet
+    /// uffd/base_shm substrate) — distinct from `Failed` so the fleet
     /// view doesn't render a VZ host's substrate row as broken.
     NotApplicable,
 }

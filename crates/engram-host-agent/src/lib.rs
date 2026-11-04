@@ -829,7 +829,10 @@ impl HostAgent {
                         uffd_base_dir: cfg.uffd_base_dir.clone(),
                     }
                 }),
-                has_session_disk: pooled.session_volumes().is_some(),
+                session_disk: match pooled.session_volumes() {
+                    Some(_) => capabilities::SessionDiskState::Ready,
+                    None => capabilities::SessionDiskState::Absent,
+                },
             };
 
             // ADR 0013: per-process HttpCoordClient for HTTP traffic
@@ -1313,8 +1316,9 @@ impl HostAgent {
                         })
                         .collect();
                     let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    let mut probe_inputs = probe_inputs_for_heartbeat.clone();
                     if let Some(disk) = &session_disk_for_heartbeat {
-                        match disk.capacity().await {
+                        probe_inputs.session_disk = match disk.capacity().await {
                             Ok(cap) => {
                                 const MIB: u64 = 1024 * 1024;
                                 utilization.pool_data_free_mib = cap.data_free_bytes / MIB;
@@ -1322,18 +1326,17 @@ impl HostAgent {
                                 utilization.pool_metadata_free_mib = cap.metadata_free_bytes / MIB;
                                 utilization.pool_metadata_total_mib =
                                     cap.metadata_total_bytes / MIB;
+                                capabilities::SessionDiskState::Ready
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "session disk capacity probe failed");
+                                capabilities::SessionDiskState::Faulted(e.to_string())
                             }
-                        }
+                        };
                     }
-                    // ADR 0068: re-run every probe this tick. Cheap
-                    // (statfs/stat/one TCP connect/a memfd-backed uffd
-                    // self-test; the FC binary version is cached after
-                    // its first call) — this IS the retry for whatever
-                    // the old blocking gRPC gate used to loop on.
-                    let capabilities = capabilities::probe_all(&probe_inputs_for_heartbeat).await;
+                    // Every probe re-runs each tick, so a withdrawn
+                    // capability returns by itself.
+                    let capabilities = capabilities::probe_all(&probe_inputs).await;
                     // ADR 0084 P1b: re-advertise every un-acked capture-job
                     // report (running progress + un-acked terminal outcomes)
                     // until the coord's ack names it — the

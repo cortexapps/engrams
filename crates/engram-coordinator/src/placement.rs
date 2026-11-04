@@ -23,8 +23,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore, SessionFence};
 use engram_core::types::host::{
-    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_DATA_FLOOR_BYTES,
-    HOST_POOL_METADATA_FLOOR_BYTES,
+    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_DATA_FLOOR_MIB,
+    HOST_POOL_METADATA_FLOOR_MIB,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId};
@@ -392,46 +392,68 @@ pub fn host_can_serve_chunks(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) 
     }
 }
 
+/// Why `h` cannot take a session under `ctx`, or `None` when it can.
+/// The one definition of schedulability every pick path reads: the
+/// ranked candidate set, the tier-0 snapshot-affinity veto and the
+/// exclusion diagnostics. First-match order: `excluded` (an explicit
+/// `exclude_host`) → `not_ready` → `cordoned` → `wire_skew` → `stale`
+/// (heartbeat older than `ttl`) → `cap:<name>` (a required capability
+/// failed) → `pool_full` (the session-disk pool is below the floor) →
+/// `digest_not_ready` (image not staged).
+fn exclusion_reason(
+    h: &HostRecord,
+    ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> Option<std::borrow::Cow<'static, str>> {
+    if Some(h.id) == ctx.exclude_host {
+        return Some("excluded".into());
+    }
+    if h.status != HostStatus::Ready {
+        return Some("not_ready".into());
+    }
+    if h.cordoned {
+        return Some("cordoned".into());
+    }
+    if !host_wire_version_ok(h) {
+        return Some("wire_skew".into());
+    }
+    if now
+        .signed_duration_since(h.last_heartbeat_at)
+        .to_std()
+        .is_ok_and(|age| age > ttl)
+    {
+        return Some("stale".into());
+    }
+    if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
+        return Some(format!("cap:{cap}").into());
+    }
+    if !host_pool_floor_ok(h) {
+        return Some("pool_full".into());
+    }
+    if ctx
+        .required_image_digest
+        .as_ref()
+        .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
+    {
+        return Some("digest_not_ready".into());
+    }
+    None
+}
+
 fn host_passes_filters(
     h: &HostRecord,
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> bool {
-    if Some(h.id) == ctx.exclude_host {
-        return false;
-    }
-    if !host_is_schedulable(h, now, ttl) {
-        return false;
-    }
-    if host_meets_capabilities(h, &ctx.caps).is_err() {
-        return false;
-    }
-    if !host_pool_floor_ok(h) {
-        return false;
-    }
-    match ctx.required_image_digest.as_ref() {
-        Some(d) => h.ready_images.iter().any(|r| r == d.as_str()),
-        None => true,
-    }
+    exclusion_reason(h, ctx, now, ttl).is_none()
 }
 
-/// ADR 0068: the first reason each host in `hosts` is excluded from
-/// `ctx`, in row order — the "no capacity with free hosts" mystery mode
-/// killer. `host_wire_version_ok` used to silently drop a skewed host
-/// from the candidate set with the caller seeing only bare
-/// `PickError::NoCapacity`; this makes the drop visible. Pure (no I/O) —
-/// callers log/metric it themselves, only on the `NoCapacity` path (this
-/// walks every host, so it's not free — don't call it on the happy
-/// path).
-///
-/// One reason per host, first-match order: `excluded` (an explicit
-/// `exclude_host`) → `not_ready` (`HostStatus != Ready`) → `cordoned` →
-/// `wire_skew` → `stale` (heartbeat older than `ttl`) → `cap:<name>` (a
-/// required capability failed) → `digest_not_ready` (image not
-/// prefetched) → `no_fit` (schedulable but this predicate found nothing
-/// else wrong — a capacity-dimension miss the caller's own fit logic
-/// will re-discover).
+/// The first [`exclusion_reason`] of each host in `hosts`, in row order,
+/// with `no_fit` for a schedulable host (a capacity miss the caller's
+/// own fit logic re-discovers). Pure; callers log it only on the
+/// `NoCapacity` path, because it walks every host.
 pub fn exclusion_summary(
     hosts: &[HostRecord],
     ctx: &ScheduleContext<'_>,
@@ -441,31 +463,9 @@ pub fn exclusion_summary(
     hosts
         .iter()
         .map(|h| {
-            let reason = if Some(h.id) == ctx.exclude_host {
-                "excluded".to_string()
-            } else if h.status != HostStatus::Ready {
-                "not_ready".to_string()
-            } else if h.cordoned {
-                "cordoned".to_string()
-            } else if !host_wire_version_ok(h) {
-                "wire_skew".to_string()
-            } else if now
-                .signed_duration_since(h.last_heartbeat_at)
-                .to_std()
-                .is_ok_and(|age| age > ttl)
-            {
-                "stale".to_string()
-            } else if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
-                format!("cap:{cap}")
-            } else if ctx
-                .required_image_digest
-                .as_ref()
-                .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
-            {
-                "digest_not_ready".to_string()
-            } else {
-                "no_fit".to_string()
-            };
+            let reason = exclusion_reason(h, ctx, now, ttl)
+                .map(|r| r.into_owned())
+                .unwrap_or_else(|| "no_fit".to_string());
             (h.id, reason)
         })
         .collect()
@@ -545,33 +545,6 @@ pub fn pick_from(
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
     ttl: Duration,
-) -> Result<HostId, PickError> {
-    pick_from_2d(hosts, reserved, ctx, now, ttl, false)
-}
-
-/// The ranked RAM/CPU pick, with an explicit `require_fit` knob.
-///
-/// `require_fit=false` (the historical `pick_from` behavior) keeps the
-/// ADR 0046 capacity-SOFT last-resort fallback: when nothing fits both
-/// budgets, place on the first-ranked host anyway (a resume/evac never
-/// stranded on a blip). `require_fit=true` is the #800 RESERVED-placement
-/// mode: it drops that fallback and returns `NoCapacity` when no ranked host
-/// fits — the HARD reserved bound the create path already honors. The evac
-/// resumer uses it so a drain-driven relocation queues (honest overflow)
-/// rather than binding a measured-full survivor and driving Σ reserved >
-/// allocatable (the #722/#795 over-reservation class on the evac leg).
-///
-/// The named steering tiers (tier-0 snapshot affinity, tier-2 prefer) are
-/// unaffected: they already carry their own `ram_full`/`cpu_full` vetoes
-/// (`named_host_fit_veto`), so a full named host is vetoed and falls through
-/// to best-fit under BOTH modes; only the terminal fallback differs.
-pub fn pick_from_2d(
-    hosts: &[HostRecord],
-    reserved: &HashMap<HostId, ReservedBudget>,
-    ctx: &ScheduleContext<'_>,
-    now: DateTime<Utc>,
-    ttl: Duration,
-    require_fit: bool,
 ) -> Result<HostId, PickError> {
     let ranked = rank_hosts(hosts, ctx, now, ttl);
     if ranked.hosts.is_empty() {
@@ -654,39 +627,18 @@ pub fn pick_from_2d(
     if let Some((_, id)) = best {
         return Ok(id);
     }
-    // 4. No MEASURED host fits both budgets.
-    if require_fit {
-        // RESERVED mode (#800): honor the hard bound — but an UNMEASURED host
-        // (allocatable == 0: brand-new / dev / non-Linux) still counts as
-        // fitting, exactly the last-resort soft posture `placement_preview`,
-        // `reserve_placement`/`pick_host_2d`, and the sim's queue re-placement
-        // all take. Consistency matters: if the reserved evac pick returned
-        // NoCapacity here while the queue scanner's `placement_preview` said
-        // "fits" on the same unmeasured fleet, a queued evac would churn
-        // Queued↔Idle forever (the #795 livelock, reincarnated). So only a
-        // fleet where every MEASURED host is full AND no unmeasured host
-        // exists is a true no-fit that queues.
-        if let Some(&id) = ranked
-            .hosts
-            .iter()
-            .find(|&&id| free_mib_of(id).is_none() && cpu_fits(id))
-        {
-            return Ok(id);
-        }
-        return Err(PickError::NoCapacity);
-    }
-    // Otherwise: capacity-soft last-resort fallback (the pre-existing
-    // ADR 0046 resume/evac posture — place on the first-ranked host).
+    // 4. No MEASURED host fits both budgets: the capacity-soft last
+    //    resort (ADR 0046). A resume is never stranded on a blip; only
+    //    the create path's reservation is a hard bound.
     Ok(ranked.hosts[0])
 }
 
 /// ADR 0078 tier-0: why (if at all) the authoritative `snapshot_host` is
 /// NOT usable for this placement — the label for
 /// `engram_resume_affinity_fallback_total{reason}`. `None` means "usable,
-/// place there". First-match order mirrors [`exclusion_summary`], then
-/// adds the disk + capacity vetoes tier-0 layers on top:
-/// `dead` (gone from the fleet / not Ready / stale heartbeat) → `cordoned`
-/// → `wire_skew` → `cap:<name>` / `digest_not_ready` (schedulability) →
+/// place there". First the [`exclusion_reason`] every pick applies, with
+/// `dead` for a host gone from the fleet, not Ready or stale; then the
+/// disk + capacity vetoes tier-0 layers on top:
 /// `disk_full` (free work_dir below the chunk-cache floor — a host about
 /// to disk-evict its cache is a pointless affinity target) → `ram_full` /
 /// `cpu_full` (won't fit the session's committed budget).
@@ -703,38 +655,12 @@ fn snapshot_host_veto(
         // The capturing host row is gone (deleted / never re-registered).
         return Some("dead".into());
     };
-    // Schedulability, in the same order `exclusion_summary` reports.
-    if Some(h.id) == ctx.exclude_host {
-        return Some("excluded".into());
-    }
-    if h.status != HostStatus::Ready {
-        return Some("dead".into());
-    }
-    if h.cordoned {
-        return Some("cordoned".into());
-    }
-    if !host_wire_version_ok(h) {
-        return Some("wire_skew".into());
-    }
-    if now
-        .signed_duration_since(h.last_heartbeat_at)
-        .to_std()
-        .is_ok_and(|age| age > ttl)
-    {
-        return Some("dead".into());
-    }
-    if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
-        // `cap:<name>` — a fleet-wide fallback spike labeled by WHICH
-        // capability failed (fc_snapshot_version vs bundle_stamp vs
-        // base_shm_tmpfs need very different remediations).
-        return Some(format!("cap:{cap}").into());
-    }
-    if ctx
-        .required_image_digest
-        .as_ref()
-        .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
-    {
-        return Some("digest_not_ready".into());
+    match exclusion_reason(h, ctx, now, ttl) {
+        // Not Ready and stale are both "dead" to the metric: the host
+        // that held the chunks is not there to serve them.
+        Some(r) if r == "not_ready" || r == "stale" => return Some("dead".into()),
+        Some(r) => return Some(r),
+        None => {}
     }
     // Disk + capacity: the shared named-host fit gate (also applied by
     // the tier-2 prefer arm) so the two can never drift.
@@ -984,7 +910,7 @@ pub async fn pick_for_session(
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
-    let result = pick_for_session_inner(meta, registry, ctx, now, false).await;
+    let result = pick_for_session_inner(meta, registry, ctx, now).await;
     let outcome = match &result {
         Ok(_) => "placed",
         Err(PickError::NoCapacity) => "no_capacity",
@@ -1006,60 +932,14 @@ async fn pick_for_session_inner(
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
-    require_fit: bool,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let id = pick_from_2d(&hosts, &reserved, ctx, now, placement_ttl(), require_fit)?;
+    let id = pick_from(&hosts, &reserved, ctx, now, placement_ttl())?;
     let backend = registry
         .backend_for(id)
         .await
         .map_err(|e| PickError::HostUnreachable(id, e.to_string()))?;
     Ok((id, backend))
-}
-
-/// ADR 0045 Phase F: validate + resolve a SPECIFIC host (operator-pinned
-/// teleport target). Not image-readiness gated (the target
-/// lazy-materializes); capacity-soft like the affinity tier, but a host
-/// with a measured allocatable and no free RAM is rejected.
-pub async fn pick_specific_host(
-    meta: &dyn MetadataStore,
-    registry: &HostRegistry,
-    host_id: HostId,
-    exclude_host: Option<HostId>,
-    now: DateTime<Utc>,
-) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
-    if Some(host_id) == exclude_host {
-        return Err(PickError::NoCapacity);
-    }
-    let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let ttl = placement_ttl();
-    let Some(h) = hosts.iter().find(|h| h.id == host_id) else {
-        return Err(PickError::NoCapacity);
-    };
-    if !host_is_schedulable(h, now, ttl) {
-        return Err(PickError::NoCapacity);
-    }
-    // ADR 0068: an operator pin still gets the BASE gate (a host that
-    // can't prove its own gRPC listener is up or has no bundle staged
-    // can't safely take any session) — but not the requirement-specific
-    // gates (`needs_uffd_substrate`/`fc_snapshot_version`), which stay
-    // soft for an explicit pin.
-    if host_meets_capabilities(h, &CapabilityRequirements::default()).is_err() {
-        return Err(PickError::NoCapacity);
-    }
-    if !host_pool_floor_ok(h) {
-        return Err(PickError::NoCapacity);
-    }
-    let alloc = h.utilization.allocatable_mib as i64;
-    let reserved_mib = reserved.get(&host_id).map(|r| r.mem_mib).unwrap_or(0);
-    if alloc > 0 && alloc - reserved_mib <= 0 {
-        return Err(PickError::NoCapacity);
-    }
-    let backend = registry
-        .backend_for(host_id)
-        .await
-        .map_err(|e| PickError::HostUnreachable(host_id, e.to_string()))?;
-    Ok((host_id, backend))
 }
 
 /// ADR 0084 §C: the free work_dir disk (MiB) `capture_candidate_hosts` ranks
@@ -1082,7 +962,7 @@ fn free_disk_mib(h: &HostRecord) -> Option<u64> {
 /// unit-tested directly against a `&[HostRecord]` fixture, no I/O.
 ///
 /// Filters: schedulable ∧ the base capability gate (+ `fc_snapshot_version`
-/// pin when `required_fc_version` names one) ∧ the ADR 0078 disk floor ∧
+/// pin when `required_fc_version` names one) ∧ the disk and pool floors ∧
 /// `need.disk_mib` headroom (an unmeasured host is soft here too — same
 /// posture as the floor) ∧ NOT already running a live capture job
 /// (`live_capture_hosts` — one-capture-per-host anti-affinity, ADR 0084
@@ -1109,7 +989,7 @@ pub fn capture_candidate_hosts_from(
         if host_meets_capabilities(h, &caps).is_err() {
             continue;
         }
-        if !host_disk_floor_ok(h) {
+        if !host_disk_floor_ok(h) || !host_pool_floor_ok(h) {
             continue;
         }
         if live_capture_hosts.contains(&h.id) {
@@ -1197,9 +1077,8 @@ pub async fn pick_materialize_host(
 }
 
 /// Shared eligibility for the enable pipeline's host-side stages:
-/// schedulable, base-capable (ADR 0068 — see `pick_specific_host`), and
-/// above the ADR 0078 tier-0 disk floor (same unmeasured-is-soft
-/// posture as `named_host_fit_veto`).
+/// schedulable, base-capable, and above the disk and pool floors (same
+/// unmeasured-is-soft posture as `named_host_fit_veto`).
 fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
     host_is_schedulable(h, now, ttl)
         && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
@@ -1208,15 +1087,17 @@ fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> b
 }
 
 /// The session-disk pool floor: a host whose pool has less data or
-/// metadata space free than the floors takes no new session. A hard gate
-/// in every tier, including an operator pin, because a full data pool
-/// stalls every guest on the node. A zero data total (no pool reported)
-/// is soft, the same posture as unmeasured RAM.
-fn host_pool_floor_ok(h: &HostRecord) -> bool {
+/// metadata space free than the floors takes no new session, in every
+/// tier, because a full data pool stalls every guest on the node. A
+/// zero data total (no pool: a sparse-file volume store, or an agent
+/// that has not reported yet) is soft, the same posture as unmeasured
+/// RAM; a pool whose probe fails withdraws the `session_disk`
+/// capability instead, which is a hard exclusion.
+pub(crate) fn host_pool_floor_ok(h: &HostRecord) -> bool {
     let u = &h.utilization;
     u.pool_data_total_mib == 0
         || (u.pool_data_free_mib >= host_pool_data_floor_mib()
-            && u.pool_metadata_free_mib >= HOST_POOL_METADATA_FLOOR_BYTES / (1024 * 1024))
+            && u.pool_metadata_free_mib >= HOST_POOL_METADATA_FLOOR_MIB)
 }
 
 /// `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` overrides the pool data floor for
@@ -1225,8 +1106,8 @@ fn host_pool_data_floor_mib() -> u64 {
     std::env::var("ENGRAM_PLACEMENT_POOL_FLOOR_BYTES")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(HOST_POOL_DATA_FLOOR_BYTES)
-        / (1024 * 1024)
+        .map(|bytes| bytes / (1024 * 1024))
+        .unwrap_or(HOST_POOL_DATA_FLOOR_MIB)
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
@@ -1298,11 +1179,13 @@ fn fleet_capability_req() -> CapabilityRequirements {
 }
 
 /// The autoscaler's per-host capacity predicate: a host counts only if
-/// PLACEMENT would rank it — `host_is_schedulable` AND
-/// `host_meets_capabilities` under the fleet posture. Pure so the
-/// gate is unit-testable without a store.
+/// PLACEMENT would rank it — schedulable, capable under the fleet
+/// posture, and above the pool floor. Pure so the gate is unit-testable
+/// without a store.
 pub fn host_counts_as_capacity(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
-    host_is_schedulable(h, now, ttl) && host_meets_capabilities(h, &fleet_capability_req()).is_ok()
+    host_is_schedulable(h, now, ttl)
+        && host_meets_capabilities(h, &fleet_capability_req()).is_ok()
+        && host_pool_floor_ok(h)
 }
 
 /// Fleet-wide autoscaling counts (ADR 0044 K4 + ADR 0048 CPU dims),
@@ -1774,39 +1657,78 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scheduler_rejects_hosts_below_pool_low_water() {
-        let floor_mib = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
-        let mut h = host(1);
-        h.utilization.pool_data_total_mib = 4 * floor_mib;
-        h.utilization.pool_data_free_mib = floor_mib - 1;
+    fn pool_full(h: &mut HostRecord) {
+        h.utilization.pool_data_total_mib = 4 * HOST_POOL_DATA_FLOOR_MIB;
+        h.utilization.pool_data_free_mib = HOST_POOL_DATA_FLOOR_MIB - 1;
         h.utilization.pool_metadata_free_mib = 1024;
+    }
+
+    #[test]
+    fn scheduler_rejects_hosts_below_pool_floor() {
+        let mut h = host(1);
+        pool_full(&mut h);
         let mut c = ctx();
         c.snapshot_host = Some(h.id);
         c.prefer_host = Some(h.id);
         let reserved = HashMap::new();
-        for require_fit in [false, true] {
-            assert!(
-                pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, require_fit).is_err(),
-                "a pool below the data floor is rejected in every tier"
-            );
-        }
-        h.utilization.pool_data_free_mib = floor_mib;
+        assert!(
+            pick_from(&[h.clone()], &reserved, &c, Utc::now(), TTL).is_err(),
+            "a pool below the data floor is rejected in every tier"
+        );
         assert_eq!(
-            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
+            exclusion_summary(&[h.clone()], &c, Utc::now(), TTL)[0].1,
+            "pool_full"
+        );
+        h.utilization.pool_data_free_mib = HOST_POOL_DATA_FLOOR_MIB;
+        assert_eq!(
+            pick_from(&[h.clone()], &reserved, &c, Utc::now(), TTL).unwrap(),
             h.id
         );
         h.utilization.pool_metadata_free_mib = 0;
         assert!(
-            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).is_err(),
+            pick_from(&[h.clone()], &reserved, &c, Utc::now(), TTL).is_err(),
             "exhausted metadata is rejected too"
         );
         h.utilization.pool_data_total_mib = 0;
         assert_eq!(
-            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
+            pick_from(&[h.clone()], &reserved, &c, Utc::now(), TTL).unwrap(),
             h.id,
             "no pool reported is soft"
         );
+    }
+
+    /// The snapshot host is the tier-0 pick unless its pool is full; then
+    /// the resume falls through to another host, like a fresh session.
+    #[test]
+    fn pool_full_snapshot_host_falls_through_to_another_host() {
+        let mut affinity = host(1);
+        pool_full(&mut affinity);
+        let other = host(2);
+        let mut c = ctx();
+        c.snapshot_host = Some(affinity.id);
+        let reserved = HashMap::new();
+        assert_eq!(
+            pick_from(
+                &[affinity.clone(), other.clone()],
+                &reserved,
+                &c,
+                Utc::now(),
+                TTL
+            )
+            .unwrap(),
+            other.id
+        );
+        assert!(!host_counts_as_capacity(&affinity, Utc::now(), TTL));
+        assert!(capture_candidate_hosts_from(
+            &[affinity.clone(), other.clone()],
+            &Default::default(),
+            CaptureFootprint::default(),
+            None,
+            Utc::now(),
+            TTL,
+        )
+        .iter()
+        .all(|id| *id != affinity.id));
     }
 
     fn ctx<'a>() -> ScheduleContext<'a> {

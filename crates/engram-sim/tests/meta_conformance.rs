@@ -6993,3 +6993,96 @@ conformance!(
     t_pool_capacity_round_trips_through_heartbeat,
     super::pool_capacity_round_trips_through_heartbeat
 );
+
+/// A capture job's epoch fences stale reports: a reassignment or a
+/// redrive bumps the epoch, and a call that names the old one is a
+/// no-op.
+async fn capture_job_epoch_fences_reassignment_and_redrive(ctx: &Ctx) {
+    use engram_core::types::capture_job::CaptureJobProgress;
+    let m = &ctx.meta;
+    let h = HostId::new();
+    m.upsert_host(host_record(h, "capture-epoch", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.utilization.allocatable_mib = 32768;
+    m.touch_host_heartbeat(h, hb).await.unwrap();
+    let parent = m
+        .create_or_get_enable_job("conf:capture-epoch", None, &ImageConfig::default())
+        .await
+        .unwrap()
+        .id;
+    let job = m.insert_capture_job(new_capture(parent)).await.unwrap();
+    let placed = m.place_capture_job(job.id, &[h]).await.unwrap().unwrap();
+    assert_eq!(placed.host_id, Some(h));
+    assert!(m
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: placed.epoch,
+            stage: CaptureJobStage::Booting,
+            progress: Some(CaptureJobProgress {
+                sandbox_id: Some(engram_core::SandboxId::new()),
+                ..Default::default()
+            }),
+            fc_snapshot_version: None,
+            terminal: None,
+        })
+        .await
+        .unwrap());
+    let reassigned = m
+        .reassign_capture_job(job.id, placed.epoch, &[h])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reassigned.host_id, Some(h));
+    assert_eq!(reassigned.epoch, placed.epoch + 1);
+    assert!(m
+        .reassign_capture_job(job.id, placed.epoch, &[h])
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        !m.record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: placed.epoch,
+            stage: CaptureJobStage::Booting,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: None,
+        })
+        .await
+        .unwrap(),
+        "a report from the fenced epoch is dropped"
+    );
+    assert!(m
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: job.id,
+            epoch: reassigned.epoch,
+            stage: CaptureJobStage::Failed,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Failed {
+                error: "retry".into(),
+                error_stage: "boot".into(),
+                retryable: true
+            }),
+        })
+        .await
+        .unwrap());
+    let retry = m
+        .redrive_failed_capture_job(job.id, reassigned.epoch, &[h], 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.host_id, Some(h));
+    assert_eq!(retry.epoch, reassigned.epoch + 1);
+    assert!(m
+        .redrive_failed_capture_job(job.id, reassigned.epoch, &[h], 10)
+        .await
+        .unwrap()
+        .is_none());
+}
+conformance!(
+    t_capture_job_epoch_fences_reassignment_and_redrive,
+    super::capture_job_epoch_fences_reassignment_and_redrive
+);

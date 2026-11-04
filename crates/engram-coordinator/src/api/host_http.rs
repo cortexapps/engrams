@@ -1715,7 +1715,7 @@ pub struct SandboxOwnershipResponse {
 
 /// ADR 0090: the teardown reconciler's unknown-binding form — "does ANY
 /// session own sandbox Y on this host?" A fresh host-agent generation
-/// whose NBD rehydrate failed has no local binding for a pidfd-reattached
+/// whose binding rehydrate failed has no local binding for a pidfd-reattached
 /// survivor; before the reconciler may count an orphan strike it must ask
 /// here. Returns the owning session id (non-terminal states only, incl.
 /// `host_lost`) so the host can also repopulate its binding table.

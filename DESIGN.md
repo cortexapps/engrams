@@ -225,7 +225,7 @@ the test named beside it.
 - The host reports the pool's data and metadata free space every heartbeat
   (`capacity_falls_by_the_blocks_written`, `pool_capacity_round_trips_through_heartbeat`).
   Placement never chooses a node whose pool is below the floor
-  (`scheduler_rejects_hosts_below_pool_low_water`). A full data pool queues guest I/O
+  (`scheduler_rejects_hosts_below_pool_floor`). A full data pool queues guest I/O
   instead of failing it, so a session stalls rather than corrupts.
 - The chunk-store manifest is the only cross-host representation of a disk; any host
   stages any manifest (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,

@@ -27,6 +27,7 @@ const DM_TARGET_MSG_CMD: u32 = 14;
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
 const DM_STATUS_TABLE_FLAG: u32 = 1 << 4;
 const DM_BUFFER_FULL_FLAG: u32 = 1 << 8;
+const DM_NOFLUSH_FLAG: u32 = 1 << 11;
 
 const OFF_DATA_SIZE: usize = 0x0c;
 const OFF_DATA_START: usize = 0x10;
@@ -365,9 +366,11 @@ impl Dm {
         self.targets(name, DM_STATUS_TABLE_FLAG).await
     }
 
-    /// The active table's status lines.
+    /// The active table's status lines. `DM_NOFLUSH_FLAG` so a status
+    /// read never commits the pool's metadata: the heartbeat samples it
+    /// every second.
     pub async fn status(&self, name: &str) -> io::Result<Vec<Target>> {
-        self.targets(name, 0).await
+        self.targets(name, DM_NOFLUSH_FLAG).await
     }
 
     async fn targets(&self, name: &str, flags: u32) -> io::Result<Vec<Target>> {

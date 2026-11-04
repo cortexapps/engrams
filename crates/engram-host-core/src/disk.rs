@@ -53,8 +53,9 @@ impl std::fmt::Display for VolumeName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkIndex(pub u64);
 
-/// Room left on the platform's store. A platform with no separate
-/// metadata pool reports metadata equal to data.
+/// Room left in the platform's pool. All zeros means the platform has
+/// no bounded pool (sparse files on a filesystem); placement treats
+/// that as unmeasured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub data_free_bytes: u64,
@@ -373,40 +374,13 @@ impl SessionDisk for FileDisk {
     }
 
     async fn capacity(&self) -> io::Result<Capacity> {
-        let (free, total) = filesystem_space(&self.root)?;
         Ok(Capacity {
-            data_free_bytes: free,
-            data_total_bytes: total,
-            metadata_free_bytes: free,
-            metadata_total_bytes: total,
+            data_free_bytes: 0,
+            data_total_bytes: 0,
+            metadata_free_bytes: 0,
+            metadata_total_bytes: 0,
         })
     }
-}
-
-/// Free and total bytes of the filesystem holding `path`.
-#[allow(unsafe_code)]
-fn filesystem_space(path: &Path) -> io::Result<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: `statvfs` reads a NUL-terminated path and fills the
-    // out-parameter in full on success. Both live for the whole call.
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    let result = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a zero return means the kernel initialised every field.
-    let stat = unsafe { stat.assume_init() };
-    // Block counts are 32-bit on macOS and 64-bit on Linux.
-    fn widen(n: impl Into<u64>) -> u64 {
-        n.into()
-    }
-    let frag = widen(stat.f_frsize);
-    Ok((
-        widen(stat.f_bavail).saturating_mul(frag),
-        widen(stat.f_blocks).saturating_mul(frag),
-    ))
 }
 
 #[cfg(test)]
@@ -556,11 +530,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_reports_the_underlying_filesystem() {
+    async fn capacity_reports_no_pool() {
         let (_dir, disk) = disk();
         let c = disk.capacity().await.unwrap();
-        assert!(c.data_total_bytes > 0);
-        assert!(c.data_free_bytes <= c.data_total_bytes);
+        assert_eq!(c.data_total_bytes, 0);
+        assert_eq!(c.metadata_total_bytes, 0);
     }
 
     #[tokio::test]

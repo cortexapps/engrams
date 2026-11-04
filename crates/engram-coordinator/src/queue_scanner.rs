@@ -832,23 +832,32 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
                 });
             }
             if let Ok(hosts) = state.services.meta.list_active_hosts().await {
-                let ids: Vec<_> = hosts.iter().map(|h| h.id).collect();
+                // A host below the pool floor never reaches the fit
+                // arithmetic, so it is labelled here, not `fits_now`.
+                let (pool_full, ids): (Vec<_>, Vec<_>) = hosts
+                    .iter()
+                    .map(|h| (h.id, crate::placement::host_pool_floor_ok(h)))
+                    .partition(|(_, ok)| !ok);
+                let ids: Vec<_> = ids.into_iter().map(|(id, _)| id).collect();
                 if let Ok(details) = state
                     .services
                     .meta
                     .placement_no_fit_details(&ids, q.mem_budget_mib, q.cpu_budget_vcpus)
                     .await
                 {
-                    payload["hosts"] = details
+                    payload["hosts"] = pool_full
                         .iter()
-                        .take(16)
-                        .map(|d| {
+                        .map(|(id, _)| {
+                            serde_json::json!({ "id": id.to_string(), "reason": "pool_full" })
+                        })
+                        .chain(details.iter().map(|d| {
                             serde_json::json!({
                                 "id": d.host_id.to_string(),
                                 "reason": d.reason,
                                 "free_mib": d.free_mib,
                             })
-                        })
+                        }))
+                        .take(16)
                         .collect();
                 }
             }

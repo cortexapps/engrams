@@ -633,7 +633,7 @@ names the test that guards each one. As landed, the guards are:
 - The base image is staged on a node before the image is ready there.
   (`only_images_with_a_volume_on_disk_stay_ready`)
 - Placement never chooses a node whose pool is below the floor.
-  (`scheduler_rejects_hosts_below_pool_low_water`)
+  (`scheduler_rejects_hosts_below_pool_floor`)
 - The chunk store manifest is the only cross-host representation of a
   disk; any host stages any manifest.
   (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
