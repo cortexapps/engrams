@@ -1138,17 +1138,18 @@ async fn two_host_teleport_seals_only_the_residual_under_steady_writes() {
     } = &hosts;
     let (vm, ckpt) = hosts.guest().await;
 
-    // Two fsynced MiB every tenth of a second or slower, over a 96 MiB
-    // window, so distinct bytes pile up before the move and keep coming
-    // during it.
+    // Two fsynced MiB every tenth of a second or slower, over 24 slots
+    // of a 48 MiB window, so distinct bytes pile up before the move and
+    // keep coming during it. The writer stops at a stop file and
+    // reports when its last write is in.
     exec(
         &host_a.pooled,
         vm,
-        "nohup sh -c 'i=0; while :; do \
-           dd if=/dev/urandom of=/root/stream bs=1M count=2 seek=$((i % 48)) \
+        "nohup sh -c 'i=0; while [ ! -e /root/stop ]; do \
+           dd if=/dev/urandom of=/root/stream bs=1M count=2 seek=$((2 * (i % 24))) \
               conv=notrunc,fsync 2>/dev/null; \
-           i=$((i+1)); echo $i > /root/rounds; sleep 0.1; done' \
-         >/dev/null 2>&1 & echo $! > /root/writer.pid",
+           i=$((i+1)); echo $i > /root/rounds; sleep 0.1; done; \
+           echo done > /root/writer.done' >/dev/null 2>&1 &",
     )
     .await;
     let pooled_a = host_a.pooled.clone();
@@ -1237,7 +1238,7 @@ async fn two_host_teleport_seals_only_the_residual_under_steady_writes() {
     let same = exec(
         &host_b.pooled,
         moved,
-        "kill $(cat /root/writer.pid); sync; \
+        "touch /root/stop; while [ ! -e /root/writer.done ]; do sleep 0.1; done; sync; \
          a=$(sha256sum /root/stream | cut -d' ' -f1); \
          echo 3 > /proc/sys/vm/drop_caches; \
          b=$(sha256sum /root/stream | cut -d' ' -f1); \

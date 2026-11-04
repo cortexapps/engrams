@@ -165,11 +165,13 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
         .await
         .expect("create");
     // Every line is the next integer, fsynced, so a lost write is a gap.
+    // The writer stops at a stop file and reports when its last line is in.
     exec(
         &generation_a,
         sandbox,
-        "nohup sh -c 'i=0; while :; do i=$((i+1)); echo $i >> /root/seq; sync; done' \
-         >/dev/null 2>&1 & echo $! > /root/writer.pid",
+        "nohup sh -c 'i=0; while [ ! -e /root/stop ]; do \
+           i=$((i+1)); echo $i >> /root/seq; sync; done; \
+           echo done > /root/writer.done' >/dev/null 2>&1 &",
     )
     .await;
     let before_roll =
@@ -182,8 +184,10 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     let disk_writes_before = counted.writes.load(Ordering::Relaxed);
 
     // The roll: generation A dies with no destructors; generation B
-    // reattaches the running guest over the same disk.
+    // reattaches the running guest over the same disk, with its own view
+    // of the volumes.
     let _generation_a_dead = generation_a;
+    drop(volumes);
     let inner_b = Arc::new(FirecrackerBackend::new(rig.work.path(), rig.cfg.clone()));
     let report = engram_host_agent::live_attach::reattach_pass(rig.work.path(), &inner_b)
         .await
@@ -199,7 +203,10 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     let generation_b = Arc::new(
         PooledBackend::new(inner_b as Arc<dyn SandboxBackend>)
             .with_chunk_store(rig.chunk_store.clone())
-            .with_session_volumes(volumes.clone())
+            .with_session_volumes(Arc::new(SessionVolumes::new(
+                counted.clone(),
+                rig.chunk_store.clone(),
+            )))
             .with_checkpoint_dir(rig.work.path().join("checkpoints")),
     );
     generation_b.set_self_ref(&generation_b);
@@ -207,21 +214,22 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     assert_eq!(
         counted.writes.load(Ordering::Relaxed),
         disk_writes_before,
-        "the roll makes no disk call"
+        "the roll changes nothing on the disk"
     );
 
+    let at_roll = lines(&generation_b, sandbox).await;
     let after_roll =
         common::poll_until_async(Duration::from_secs(60), Duration::from_millis(250), || {
             let pooled = generation_b.clone();
-            async move { lines(&pooled, sandbox).await >= 100 }
+            async move { lines(&pooled, sandbox).await >= at_roll + 50 }
         })
         .await;
     assert!(after_roll, "the guest keeps writing through the roll");
-    exec(&generation_b, sandbox, "kill $(cat /root/writer.pid)").await;
     exec(
         &generation_b,
         sandbox,
-        "sync && awk 'NR != $1 { exit 1 }' /root/seq",
+        "touch /root/stop; while [ ! -e /root/writer.done ]; do sleep 0.1; done; \
+         sync && awk 'NR != $1 { exit 1 }' /root/seq",
     )
     .await;
     generation_b.destroy(sandbox).await.expect("destroy");
