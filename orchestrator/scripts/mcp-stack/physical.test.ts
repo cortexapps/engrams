@@ -16,7 +16,7 @@ const id = (n: number) =>
 const h = "a".repeat(64),
   d = `sha256:${h}`;
 const aux = Array.from({ length: 3 }, (_, i) => ({
-  drive_id: `dyn-${i}`,
+  drive_id: `dyn_${i}`,
   guest_mount: `/opt/engram/dyn/${i}`,
   fs_type: "squashfs",
   sha256: h,
@@ -107,6 +107,25 @@ function encoded(value: unknown) {
     JSON.stringify({ schema: 1, content_hash: sha256(body), id: id(2), body }),
   );
 }
+test("host envelope accepts production slot IDs in failed boot records", () => {
+  const raw = {
+    ...rawRecord(),
+    state: { state: "failed", key: key() },
+  };
+  expect(
+    parseHostRecord(encoded(raw), id(2)).record.request.cold.aux_ro_drives.map(
+      (drive) => drive.drive_id,
+    ),
+  ).toEqual(["dyn_0", "dyn_1", "dyn_2"]);
+});
+test("host envelope rejects hyphenated slot IDs", () => {
+  const raw = rawRecord();
+  raw.request.cold.aux_ro_drives = aux.map((drive, i) => ({
+    ...drive,
+    drive_id: `dyn-${i}`,
+  }));
+  expect(() => parseHostRecord(encoded(raw), id(2))).toThrow();
+});
 test("host envelope rejects corruption, target substitution, environment and unknown fields", () => {
   expect(parseHostRecord(encoded(rawRecord()), id(2)).record.version).toBe(1);
   const corrupt = JSON.parse(encoded(rawRecord()).toString());

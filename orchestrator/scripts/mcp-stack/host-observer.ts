@@ -31,10 +31,7 @@ const auxDrives = z
   .min(3)
   .max(12)
   .refine((items) =>
-    items.every(
-      (v, i) =>
-        v.drive_id === `dyn-${i}` && v.guest_mount === `/opt/engram/dyn/${i}`,
-    ),
+    items.every((v, i) => v.drive_id === `dyn_${i}` && v.guest_mount === `/opt/engram/dyn/${i}`),
   );
 const captureRequest = z.strictObject({
   key: sourceKeySchema,
