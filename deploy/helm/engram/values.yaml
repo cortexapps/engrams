@@ -498,6 +498,14 @@ orchestrator:
   # dispatch API and auto-on-open triggers still work.
   githubAppLogin: ""
 
+  # Request tracing. `endpoint` is an OTLP/HTTP collector base URL (for
+  # example http://otel-collector:4318); the orchestrator posts spans to
+  # `<endpoint>/v1/traces` and sends W3C `traceparent` on every coordinator
+  # RPC, so a request is one trace across the orchestrator, the coordinator
+  # and the host. Empty ⇒ no tracing.
+  otel:
+    endpoint: ""
+
   # The three REQUIRED env vars come from ONE Secret (keys below). The chart
   # never inlines them. `databaseSecret.url` MUST point at a SEPARATE database
   # (`engram_orchestrator`), NOT the coordinator's DB — the orchestrator owns
