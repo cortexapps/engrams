@@ -9,7 +9,7 @@
 
 # Keep this major in step with the web CI lane (.github/workflows/ci.yml)
 # and flake.nix — see the note beside `setup-node` in that workflow.
-FROM node:24-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /src/web
 
 # pnpm v9, matching the CI web lane (pnpm/action-setup version 9 in
@@ -17,7 +17,7 @@ WORKDIR /src/web
 #
 # Installed directly rather than through corepack: Node stopped shipping
 # corepack in v25 (nodejs/node#57617), so `corepack enable` is a dead end
-# — it would break again at the next even LTS. npm is in the base image.
+# on 26+. npm is in the base image.
 RUN npm install -g pnpm@9
 
 # Lockfile first so the install layer stays warm across source edits.
