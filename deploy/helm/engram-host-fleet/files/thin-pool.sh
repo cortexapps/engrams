@@ -76,6 +76,10 @@ fi
 
 data_sectors=$(( $(stat -c %s "$DATA") / 512 ))
 log "dmsetup create $POOL_NAME ($DATA_DEV data, $META_DEV metadata, block $POOL_BLOCK_SECTORS sectors)"
-dmsetup create "$POOL_NAME" --table \
+# Node prep shares the host's mount namespace but not its IPC namespace,
+# so udev can never release dmsetup's sync semaphore: create without the
+# wait and make the device node here.
+dmsetup create --noudevsync "$POOL_NAME" --table \
     "0 $data_sectors thin-pool $META_DEV $DATA_DEV $POOL_BLOCK_SECTORS $POOL_LOW_WATER 0"
+dmsetup mknodes "$POOL_NAME"
 dmsetup status "$POOL_NAME"
