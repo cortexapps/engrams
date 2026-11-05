@@ -146,6 +146,14 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         .expect("app-gRPC reflection descriptor is malformed (engram-protocol build.rs)");
 
     tonic::transport::Server::builder()
+        .trace_fn(|req| {
+            engram_telemetry::grpc_server_span(
+                req.uri().path(),
+                req.headers()
+                    .get("traceparent")
+                    .and_then(|v| v.to_str().ok()),
+            )
+        })
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(reflection)
