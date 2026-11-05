@@ -34,6 +34,7 @@ use engram_core::{HostId, SandboxId, SessionId, SessionState};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
@@ -764,10 +765,22 @@ pub async fn heartbeat(
     // un-acked advert just rides the next heartbeat.
     let mut acked_checkpoints = Vec::new();
     for adv in &hb.checkpoints {
+        // The advert carries no trace context; `snapshot_id` joins this
+        // span to the host's `host.evict_finalize` spans.
+        let span = tracing::info_span!(
+            "checkpoint.reconcile",
+            session_id = %adv.session_id,
+            snapshot_id = %adv.snapshot_id,
+            kind = ?adv.kind,
+            recoverable = tracing::field::Empty,
+            inserted = tracing::field::Empty,
+            settled = tracing::field::Empty,
+        );
         let events_cursor = state
             .services
             .meta
             .latest_event_idx_at_or_before(adv.session_id, adv.paused_at)
+            .instrument(span.clone())
             .await
             .unwrap_or_default();
         let recoverable = crate::api::snapshot::verify_snapshot_recoverable(
@@ -776,7 +789,9 @@ pub async fn heartbeat(
             adv.memory_manifest.as_ref(),
             adv.swap_manifest.as_ref(),
         )
+        .instrument(span.clone())
         .await;
+        span.record("recoverable", recoverable);
         let record = engram_core::types::snapshot::SnapshotRecord {
             id: adv.snapshot_id,
             session_id: Some(adv.session_id),
@@ -798,8 +813,15 @@ pub async fn heartbeat(
             // to ask PG for it).
             fc_snapshot_version: hb.capabilities.fc_snapshot_version.clone(),
         };
-        match state.services.meta.record_snapshot(record).await {
+        match state
+            .services
+            .meta
+            .record_snapshot(record)
+            .instrument(span.clone())
+            .await
+        {
             Ok(inserted) => {
+                span.record("inserted", inserted);
                 acked_checkpoints.push(adv.snapshot_id);
                 // Issue #529: the eviction finalize job is host-owned and
                 // never talks to the coordinator again once
@@ -870,9 +892,11 @@ pub async fn heartbeat(
                             adv.snapshot_id,
                             &wire,
                         )
+                        .instrument(tracing::info_span!(parent: &span, "checkpoint.settle_idle"))
                         .await
                     {
                         Ok(Some(indices)) => {
+                            span.record("settled", true);
                             // Best-effort rung clear (the park stamp is
                             // ascent/ledger metadata; lifecycle already
                             // settled above).
