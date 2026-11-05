@@ -19,16 +19,29 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   node-prep disabled, the node image must provide the pool. The node needs the
   `dm_thin_pool` module and `thin-provisioning-tools`. The `nbd` chart values, the node-prep
   NBD step, and `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
-- **Sessions move across the upgrade through their checkpoints.** A session that is idle
-  with a recoverable snapshot resumes on a new host from its manifest. A session whose only
-  recoverable state was the host's live disk manifest is marked dead by migration 0126
-  before the column is dropped. Roll the host fleet after the coordinator so every running
-  session gets a checkpoint first.
+- **The upgrade drains every host first.** The new host agent cannot adopt VMs whose disk
+  the old one served, so `helm upgrade` of either chart runs a job, before it changes
+  anything, that cordons every host and evicts each running session to a checkpoint (taking
+  one first for a session that never had one). A session the job cannot evict within
+  `upgradeDrain.timeoutSeconds` stops the upgrade before any change. After the host fleet
+  chart upgrades, a second job replaces the drained host pods (the operator does it when it
+  is enabled), and each host's cordon lifts when it registers on the new build. Each session
+  resumes from its checkpoint the next time it is used. An idle session whose only
+  recoverable state was the host's live disk manifest is marked dead by migration 0126.
+- **Node-prep makes room for the pool.** On a host whose chunk cache fills the disk,
+  node-prep clears the cache before it creates the pool's data file; the cache refills from
+  the chunk store. `storage.chunkCacheDiskFraction` now defaults to `0.3`, so the pool's half
+  of the disk and the cache fit together.
 - **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
   queued evictions of the retired quarantine flavour, and replace the NBD slot columns with
-  the pool capacity columns. Roll the coordinator before the hosts: an older host agent
-  still heartbeats to the new coordinator, but it takes no new sessions because it does not
-  report the `session_disk` capability.
+  the pool capacity columns. Either chart can be upgraded first; both run the drain.
+  Until the old coordinator pods stop, they fail requests that read the dropped columns. If
+  a drain job fails with a database error about a missing column, run the same
+  `helm upgrade` again; the drain is safe to repeat.
+- **With the operator enabled, the roll needs room under `operator.capacityFloor`.** The
+  operator replaces a host pod only when the fleet keeps at least `capacityFloor` Ready
+  hosts without it. A fleet with no more hosts than the floor waits with every host
+  cordoned. Set the floor below the host count (`0` for a single host) before you upgrade.
 - **Removed metrics and knobs.** `engram_quarantine_stuck_total`,
   `engram_durability_rollback_total`, and `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` no longer
   exist; delete alert policies that read them. The capability vector reports `session_disk`

@@ -214,6 +214,14 @@ the test named beside it.
   is in the host page cache or the pool, never in host-agent memory. A host-agent restart
   reattaches a running guest with no change to the disk and loses none of its writes
   (`a_host_agent_restart_keeps_the_guest_and_every_write`).
+- Reattach holds only between builds with the same `engram_protocol::REATTACH_GENERATION`
+  (ADR 0126). An upgrade to a higher generation first drains every host on a lower one:
+  the chart's pre-upgrade hook cordons it, checkpoints each active session that has no
+  checkpoint, and evicts every session, and fails the upgrade before any change when a
+  session cannot be evicted
+  (`an_old_host_is_cordoned_and_each_session_state_gets_its_action`). A host that
+  registers with a higher generation has the drain's cordon lifted
+  (`only_a_higher_reattach_generation_lifts_a_cordon`).
 - A checkpoint pauses the guest only for the page-cache sync and the volume snapshot; the
   upload runs after the guest resumes
   (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`) and carries only the
@@ -252,6 +260,11 @@ the test named beside it.
   answer with the older checkpoint and drop the writes since it
   (`a_lost_pending_checkpoint_fails_the_disk_leg`,
   `quarantined_finalize_releases_the_capture_lock`).
+- Node prep builds the pool on a node's first boot and re-activates it after `thin_check` on
+  every later one. On a used disk it clears the chunk cache when the pool's data file needs
+  the room; a disk too small even then fails node prep with a clear message and leaves no
+  partial file. A metadata file a crash left before the first activation is formatted, not
+  rejected (`scripts/thin-pool-states-test.sh`).
 - A stage reads the node's chunk cache before blob storage
   (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
   prefetch pulled are not fetched a second time.

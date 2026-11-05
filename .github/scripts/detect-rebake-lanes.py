@@ -188,6 +188,12 @@ IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "deploy/migrations/"] + BINA
 # not in the image's base still surfaces on main, as it does today.)
 DOCKERFILE_PATHS = ["docker/"]
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
+# Node prep's pool script and the test that builds every pool state it can
+# find; that test runs on the Firecracker root lane, which needs /dev/kvm.
+FC_POOL_PATHS = [
+    "deploy/helm/engram-host-fleet/files/thin-pool.sh",
+    "scripts/thin-pool-states-test.sh",
+]
 # ADR 0027: the RO session bundles (skills / browser / …). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image
 # re-baked to pull the new squashfs. Independent of the Rust/OS lanes.
@@ -561,7 +567,7 @@ def main():
     # fixtures and mount bundles via the sandbox crates already in the closure;
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
-    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork
+    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(changed, FC_POOL_PATHS)
     # web / orchestrator: their own sources or the protos they codegen from.
     # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)

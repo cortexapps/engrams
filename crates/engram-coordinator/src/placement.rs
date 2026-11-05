@@ -1282,6 +1282,7 @@ mod tests {
                 bundle_stamp: bundle,
                 fc_snapshot_version: fc_snapshot_version.map(str::to_string),
                 wire_version: 7,
+                reattach_generation: 0,
             }
         }
 
@@ -2282,6 +2283,7 @@ mod tests {
                 bundle_stamp: engram_core::types::host::CapStatus::Ok(None),
                 fc_snapshot_version: Some("v9.0.0".into()),
                 wire_version: 7,
+                reattach_generation: 0,
             };
             let mut right = wrong.clone();
             right.id = hid(2);

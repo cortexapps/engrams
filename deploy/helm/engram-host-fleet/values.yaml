@@ -150,9 +150,11 @@ storage:
   # floor holds below the kubelet eviction line). Set to override the
   # ceiling as an absolute byte count.
   chunkCacheBudgetBytes: ""
-  # ADR 0070: override the 0.60 disk-fraction the default budget derives
-  # from (see chunkCacheBudgetBytes). "" => host-agent default (0.60).
-  chunkCacheDiskFraction: ""
+  # ADR 0070: the disk fraction the default budget derives from (see
+  # chunkCacheBudgetBytes). The session-disk pool takes thinPool.dataSize
+  # of the same filesystem and the free-space floor keeps 20%, so the
+  # cache gets what is left. "" => host-agent default (0.60).
+  chunkCacheDiskFraction: "0.3"
   # ADR 0070: the kubelet's ephemeral-storage hard-eviction threshold, as
   # a percent of the filesystem backing workDirHostPath — the line
   # engram_host_disk_headroom_to_kubelet_bytes measures distance to.
@@ -308,6 +310,22 @@ metrics:
 # operator (ADR 0044) drives drain-gated, node-by-node rollouts rather
 # than K8s rolling pods out from under live microVMs.
 updateStrategy: OnDelete
+
+# ADR 0126: the drain before an incompatible upgrade. When the new
+# release's host-agent cannot adopt the VMs a host runs now, a pre-upgrade
+# hook cordons every such host and evicts each session to a checkpoint
+# before Helm changes anything, and a post-upgrade hook rolls the drained
+# host-agent pods onto the new build (the operator rolls them when it is
+# enabled). A no-op otherwise. The hooks run the operator image.
+upgradeDrain:
+  enabled: true
+  # The drain's budget; a session not evicted by then fails the upgrade
+  # before any change.
+  timeoutSeconds: 3600
+  # The coordinator's app-gRPC address. "" -> operator.coordinatorUrl, else
+  # the host of coordinator.endpoint on coordinatorGrpcPort.
+  coordinatorUrl: ""
+  coordinatorGrpcPort: 50061
 
 operator:
   # ADR 0044 K3: the drain-gated rollout operator. OFF by default until the

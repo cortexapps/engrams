@@ -93,6 +93,30 @@ Do steps 3 and 4 together. The coordinator and the host agents share a wire vers
 refuse to talk across a mismatch, so after a release that changes it, new sessions queue
 until the first host is on the new version.
 
+## When a release changes how hosts run VMs
+
+Most releases roll the host pods in place, and the new pod reattaches to the running VMs.
+Some releases change how a host serves a VM's disk or memory, so the new host agent cannot
+adopt the VMs the old one started. The charts handle that release for you, and both
+`helm upgrade` commands stay the same:
+
+1. Before the upgrade changes anything, a job compares the new host agent with every host.
+   If a host runs VMs the new build cannot adopt, the job cordons it and evicts each session
+   on it to a checkpoint. A session that never had a checkpoint gets one first; a paused
+   session is resumed so it can be evicted. Both charts run this job, so either can go
+   first.
+2. If the job cannot evict a session within `upgradeDrain.timeoutSeconds` (an hour by
+   default), it fails and the upgrade stops before any change. The release notes and the
+   job's log name the sessions.
+3. After the host fleet chart upgrades, a second job replaces the drained host pods so they
+   start the new build; with the operator enabled, the operator does it. On a disk the chunk
+   cache has filled, node-prep clears the cache to make room for what the new build needs.
+4. Each host comes back on the new build, and the coordinator lifts the job's cordon. A
+   session resumes from its checkpoint the next time someone uses it.
+
+Every running session sees one eviction and one resume, not a live move. An upgrade like
+this also lifts any cordon you placed by hand on the hosts it drains.
+
 ## Run a build that is not a release
 
 Set the image tags to the full commit SHA of a commit on `main`; every build is published

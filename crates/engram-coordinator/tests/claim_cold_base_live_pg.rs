@@ -133,6 +133,7 @@ async fn seed_fc_host(meta: &Arc<dyn MetadataStore>, fc_version: &str) -> HostId
             bundle_stamp: CapStatus::Ok(None),
             fc_snapshot_version: Some(fc_version.to_string()),
             wire_version: engram_protocol::WIRE_VERSION,
+            reattach_generation: 0,
         },
         lease_expires_at: None,
         lease_state: Default::default(),

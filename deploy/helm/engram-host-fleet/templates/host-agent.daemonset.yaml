@@ -134,6 +134,7 @@ spec:
                 POOL_META_SIZE={{ .Values.thinPool.metadataSize | quote }} \
                 POOL_BLOCK_SECTORS={{ .Values.thinPool.blockSizeSectors | quote }} \
                 POOL_LOW_WATER={{ .Values.thinPool.lowWaterMarkBlocks | quote }} \
+                POOL_CACHE_DIR={{ printf "%s/sandboxes/chunk-cache" .Values.storage.workDirHostPath | quote }} \
                 sh -s < /opt/engram/thin-pool.sh
               echo "[node-prep] done"
           volumeMounts:

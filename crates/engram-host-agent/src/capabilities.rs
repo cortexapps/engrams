@@ -380,6 +380,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         bundle_stamp,
         fc_snapshot_version,
         wire_version: engram_protocol::WIRE_VERSION,
+        reattach_generation: engram_protocol::REATTACH_GENERATION,
     }
 }
 
