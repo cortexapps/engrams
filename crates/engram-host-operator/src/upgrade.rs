@@ -1,167 +1,15 @@
-//! ADR 0126: the drain before an incompatible upgrade, and the roll after it.
-//!
-//! The drain runs as a Helm `pre-upgrade` hook against the coordinator that
-//! still serves, so it uses only RPCs the previous release has. `plan` is the
-//! pure step; `drain` repeats it until no host the target build cannot adopt
-//! runs a session VM.
+//! ADR 0126: the host-fleet side of an upgrade the host agents cannot
+//! adopt. The drain itself is `engram_upgrade_drain`; this module records
+//! that it ran and, after the upgrade, rolls the host-agent pods.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::collections::BTreeMap;
 
+use engram_upgrade_drain::Coordinator;
 use k8s_openapi::api::apps::v1::DaemonSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 
-use crate::coord::{CoordClient, SessionOps, UpgradeHost, UpgradeSession};
 use crate::error::OperatorError;
-
-/// The drain's cordon owner. The coordinator lifts it when the host
-/// registers with a higher reattach generation.
-const DRAIN_CORDON_OWNER: &str = "admin";
-
-/// How many session actions run at once.
-const CONCURRENCY: usize = 4;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DrainAction {
-    Cordon(engram_core::HostId),
-    /// Checkpoint the session if it has none, then evict it.
-    Evict(String),
-    /// A parked session's VM is paused in place; resume it so it can be
-    /// evicted.
-    Resume(String),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DrainStep {
-    /// Every live host already runs the target's generation.
-    NotNeeded,
-    /// No session VM is left on a host the target cannot adopt. The
-    /// unreachable sessions keep their last checkpoint and resume from it.
-    Done { unreachable: Vec<String> },
-    Work {
-        actions: Vec<DrainAction>,
-        /// Sessions in a transition that ends on its own.
-        waiting: Vec<String>,
-    },
-}
-
-/// One drain step over the coordinator's view of the fleet.
-pub fn plan(target: u32, hosts: &[UpgradeHost], sessions: &[UpgradeSession]) -> DrainStep {
-    let old: BTreeSet<_> = hosts
-        .iter()
-        .filter(|h| h.live && h.reattach_generation < target)
-        .map(|h| h.id)
-        .collect();
-    if old.is_empty() {
-        return DrainStep::NotNeeded;
-    }
-    let mut actions: Vec<DrainAction> = hosts
-        .iter()
-        .filter(|h| old.contains(&h.id) && !h.cordoned)
-        .map(|h| DrainAction::Cordon(h.id))
-        .collect();
-    let (mut waiting, mut unreachable) = (Vec::new(), Vec::new());
-    for s in sessions {
-        if !s.host_id.is_some_and(|h| old.contains(&h)) {
-            continue;
-        }
-        match s.state.as_str() {
-            "active" => actions.push(DrainAction::Evict(s.id.clone())),
-            "parked" => actions.push(DrainAction::Resume(s.id.clone())),
-            "pending" | "created" | "evacuating" | "evicting" => waiting.push(s.id.clone()),
-            "unreachable" => unreachable.push(s.id.clone()),
-            _ => {}
-        }
-    }
-    if actions.is_empty() && waiting.is_empty() {
-        DrainStep::Done { unreachable }
-    } else {
-        DrainStep::Work { actions, waiting }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DrainOutcome {
-    NotNeeded,
-    Drained { unreachable: Vec<String> },
-}
-
-/// Repeat [`plan`] until it is done, or fail at `deadline` with the sessions
-/// still left and the last error of each.
-pub async fn drain(
-    fleet: &CoordClient,
-    sessions: &SessionOps,
-    target: u32,
-    deadline: Duration,
-    poll: Duration,
-) -> Result<DrainOutcome, OperatorError> {
-    let started = crate::time_source::metrics_now_tokio();
-    let mut last_error: BTreeMap<String, String> = BTreeMap::new();
-    loop {
-        let hosts = fleet.list_upgrade_hosts().await?;
-        let listed = sessions.list().await?;
-        let (actions, waiting) = match plan(target, &hosts, &listed) {
-            DrainStep::NotNeeded => return Ok(DrainOutcome::NotNeeded),
-            DrainStep::Done { unreachable } => {
-                return Ok(DrainOutcome::Drained { unreachable });
-            }
-            DrainStep::Work { actions, waiting } => (actions, waiting),
-        };
-        tracing::info!(
-            actions = actions.len(),
-            waiting = waiting.len(),
-            "upgrade drain step"
-        );
-        for chunk in actions.chunks(CONCURRENCY) {
-            let results =
-                futures::future::join_all(chunk.iter().map(|a| run(fleet, sessions, a))).await;
-            for (action, result) in chunk.iter().zip(results) {
-                let key = format!("{action:?}");
-                match result {
-                    Ok(()) => {
-                        last_error.remove(&key);
-                    }
-                    Err(e) => {
-                        tracing::warn!(?action, error = %e, "upgrade drain action failed; retrying");
-                        last_error.insert(key, e.to_string());
-                    }
-                }
-            }
-        }
-        if started.elapsed() >= deadline {
-            let left: Vec<String> = actions
-                .iter()
-                .map(|a| format!("{a:?}"))
-                .chain(waiting.iter().map(|s| format!("waiting {s}")))
-                .collect();
-            return Err(OperatorError::Upgrade(format!(
-                "the drain did not finish in {}s; left: {}; last errors: {:?}",
-                deadline.as_secs(),
-                left.join(", "),
-                last_error
-            )));
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-async fn run(
-    fleet: &CoordClient,
-    sessions: &SessionOps,
-    action: &DrainAction,
-) -> Result<(), OperatorError> {
-    match action {
-        DrainAction::Cordon(host) => fleet.cordon(*host, DRAIN_CORDON_OWNER).await,
-        DrainAction::Resume(id) => sessions.resume(id).await,
-        DrainAction::Evict(id) => {
-            if !sessions.has_checkpoint(id).await? {
-                sessions.snapshot(id).await?;
-            }
-            sessions.evict(id).await
-        }
-    }
-}
 
 /// Record, in `namespace`, that a drain ran, so the post-upgrade roll
 /// knows the nodes are empty.
@@ -218,7 +66,7 @@ pub enum RollOutcome {
 /// remove the marker. With the operator enabled the operator rolls them.
 pub async fn roll(
     client: kube::Client,
-    fleet: &CoordClient,
+    coord: &Coordinator,
     namespace: &str,
     daemon_set: &str,
     marker: &str,
@@ -228,8 +76,8 @@ pub async fn roll(
     if markers.get_opt(marker).await?.is_none() {
         return Ok(RollOutcome::NoDrain);
     }
-    let busy: Vec<_> = fleet
-        .list_upgrade_hosts()
+    let busy: Vec<_> = coord
+        .list_hosts()
         .await?
         .into_iter()
         .filter(|h| {
@@ -282,80 +130,6 @@ pub async fn roll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::HostId;
-
-    fn host(generation: u32, cordoned: bool) -> UpgradeHost {
-        UpgradeHost {
-            id: HostId::new(),
-            live: true,
-            cordoned,
-            running_sandboxes: 0,
-            reattach_generation: generation,
-        }
-    }
-
-    fn session(id: &str, state: &str, host: &UpgradeHost) -> UpgradeSession {
-        UpgradeSession {
-            id: id.into(),
-            state: state.into(),
-            host_id: Some(host.id),
-        }
-    }
-
-    #[test]
-    fn a_fleet_on_the_target_generation_needs_no_drain() {
-        let h = host(1, false);
-        let sessions = [session("s1", "active", &h)];
-        assert_eq!(plan(1, &[h], &sessions), DrainStep::NotNeeded);
-    }
-
-    #[test]
-    fn dead_hosts_do_not_need_a_drain() {
-        let mut h = host(0, false);
-        h.live = false;
-        assert_eq!(plan(1, &[h], &[]), DrainStep::NotNeeded);
-    }
-
-    #[test]
-    fn an_old_host_is_cordoned_and_each_session_state_gets_its_action() {
-        let old = host(0, false);
-        let new = host(1, false);
-        let sessions = [
-            session("active", "active", &old),
-            session("parked", "parked", &old),
-            session("evicting", "evicting", &old),
-            session("pending", "pending", &old),
-            session("unreachable", "unreachable", &old),
-            session("idle", "idle", &old),
-            session("on-new-host", "active", &new),
-        ];
-        assert_eq!(
-            plan(1, &[old.clone(), new], &sessions),
-            DrainStep::Work {
-                actions: vec![
-                    DrainAction::Cordon(old.id),
-                    DrainAction::Evict("active".into()),
-                    DrainAction::Resume("parked".into()),
-                ],
-                waiting: vec!["evicting".into(), "pending".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn a_cordoned_empty_old_host_is_done_and_names_unreachable_sessions() {
-        let old = host(0, true);
-        let sessions = [
-            session("gone", "idle", &old),
-            session("stuck", "unreachable", &old),
-        ];
-        assert_eq!(
-            plan(1, &[old], &sessions),
-            DrainStep::Done {
-                unreachable: vec!["stuck".into()]
-            }
-        );
-    }
 
     #[test]
     fn stale_pods_are_the_ones_off_the_current_template() {

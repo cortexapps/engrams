@@ -1,0 +1,19 @@
+[package]
+name = "engram-upgrade-drain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The drain before an upgrade whose host agents cannot adopt the running VMs"
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+engram-protocol.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

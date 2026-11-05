@@ -119,59 +119,15 @@ fn required_env(name: &str) -> Result<String, OperatorError> {
     std::env::var(name).map_err(|_| OperatorError::Invalid(format!("{name} must be set")))
 }
 
-/// The coordinator address and one bearer token. The coordinator chart's
-/// token Secret holds its comma-separated allowlist; any entry is accepted.
-fn coordinator_from_env() -> Result<(String, Option<String>), OperatorError> {
-    Ok((
-        required_env("ENGRAM_COORDINATOR_URL")?,
-        std::env::var("ENGRAM_COORDINATOR_TOKEN")
-            .ok()
-            .and_then(|t| {
-                t.split(',')
-                    .map(str::trim)
-                    .find(|t| !t.is_empty())
-                    .map(String::from)
-            }),
-    ))
-}
-
-/// The `pre-upgrade` hook: drain every host the target build cannot adopt,
-/// and, with `ENGRAM_UPGRADE_MARKER` set, record that it drained.
+/// The host-fleet `pre-upgrade` hook: the drain, then, with
+/// `ENGRAM_UPGRADE_MARKER` set, a record that it drained.
 async fn upgrade_drain() -> Result<(), OperatorError> {
-    let (url, token) = coordinator_from_env()?;
-    let timeout_secs: u64 = std::env::var("ENGRAM_UPGRADE_TIMEOUT_SECS")
-        .unwrap_or_else(|_| "3600".into())
-        .parse()
-        .map_err(|e| OperatorError::Invalid(format!("ENGRAM_UPGRADE_TIMEOUT_SECS: {e}")))?;
-    let fleet = coord::CoordClient::new(url.clone(), token.clone());
-    let sessions = coord::SessionOps::new(url, token, Duration::from_secs(timeout_secs));
-    let target = engram_protocol::REATTACH_GENERATION;
-    match upgrade::drain(
-        &fleet,
-        &sessions,
-        target,
-        Duration::from_secs(timeout_secs),
-        Duration::from_secs(5),
-    )
-    .await?
+    let outcome = engram_upgrade_drain::run_from_env().await?;
+    if let (engram_upgrade_drain::DrainOutcome::Drained { .. }, Ok(marker)) =
+        (outcome, std::env::var("ENGRAM_UPGRADE_MARKER"))
     {
-        upgrade::DrainOutcome::NotNeeded => {
-            tracing::info!(
-                target,
-                "every live host runs the target's reattach generation; no drain"
-            );
-        }
-        upgrade::DrainOutcome::Drained { unreachable } => {
-            tracing::info!(
-                target,
-                ?unreachable,
-                "drained every host the target cannot adopt; unreachable sessions resume from their last checkpoint",
-            );
-            if let Ok(marker) = std::env::var("ENGRAM_UPGRADE_MARKER") {
-                let namespace = required_env("POD_NAMESPACE")?;
-                upgrade::write_marker(Client::try_default().await?, &namespace, &marker).await?;
-            }
-        }
+        let namespace = required_env("POD_NAMESPACE")?;
+        upgrade::write_marker(Client::try_default().await?, &namespace, &marker).await?;
     }
     Ok(())
 }
@@ -179,15 +135,15 @@ async fn upgrade_drain() -> Result<(), OperatorError> {
 /// The host-fleet `post-upgrade` hook: after a drain, roll the host-agent
 /// pods onto the new build.
 async fn upgrade_roll() -> Result<(), OperatorError> {
-    let (url, token) = coordinator_from_env()?;
-    let fleet = coord::CoordClient::new(url, token);
+    let (url, token) = engram_upgrade_drain::coordinator_from_env()?;
+    let coord = engram_upgrade_drain::Coordinator::new(&url, token, Duration::from_secs(10));
     let namespace = required_env("POD_NAMESPACE")?;
     let daemon_set = required_env("ENGRAM_HOST_AGENT_DAEMONSET")?;
     let marker = required_env("ENGRAM_UPGRADE_MARKER")?;
     let operator_rolls = std::env::var("ENGRAM_OPERATOR_ENABLED").as_deref() == Ok("true");
     let outcome = upgrade::roll(
         Client::try_default().await?,
-        &fleet,
+        &coord,
         &namespace,
         &daemon_set,
         &marker,

@@ -2278,6 +2278,7 @@ dependencies = [
  "engram-telemetry",
  "engram-testkit",
  "engram-tls",
+ "engram-upgrade-drain",
  "flate2",
  "futures",
  "hex",
@@ -2726,6 +2727,7 @@ dependencies = [
  "engram-cloud-gcp",
  "engram-core",
  "engram-protocol",
+ "engram-upgrade-drain",
  "futures",
  "k8s-openapi",
  "kube",
@@ -3274,6 +3276,19 @@ dependencies = [
  "tracing-subscriber",
  "userfaultfd",
  "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-upgrade-drain"
+version = "0.1.0"
+dependencies = [
+ "engram-core",
+ "engram-protocol",
+ "futures",
+ "tokio",
+ "tonic",
+ "tracing",
  "workspace-hack",
 ]
 

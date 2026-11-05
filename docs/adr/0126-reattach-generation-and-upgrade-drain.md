@@ -43,9 +43,13 @@ no extra steps, and it must lose only sessions that cannot be checkpointed.
    reports it at registration and in every heartbeat. The coordinator stores
    it on the host row and shows it in `HostView`.
 2. **Drain before an incompatible upgrade.** Both charts carry a
-   `pre-upgrade` Helm hook. It runs the target build's
-   `engram-host-operator upgrade-drain` against the coordinator that still
-   serves, before Helm changes anything. If every live host reports the
+   `pre-upgrade` Helm hook. It runs the target build's drain (the
+   `engram-upgrade-drain` crate) against the coordinator that still serves,
+   before Helm changes anything. Each chart runs it from an image it already
+   deploys: the coordinator chart as `engram-coordinator upgrade-drain`, the
+   host-fleet chart as `engram-host-operator upgrade-drain`. So no user sets
+   an extra image value, and a mirrored or pinned coordinator image carries
+   the drain with it. If every live host reports the
    target's generation, it does nothing. Otherwise it cordons every live host
    (owner `admin`), takes a checkpoint of each active session that has none,
    resumes each parked session, and evicts every session with the no-park
@@ -108,3 +112,11 @@ is outside this ADR.
   directory, and on a filesystem that is too small even without it.
 - End to end: an upgrade from the previous release to this one on the
   development cluster, with sessions in each state.
+
+## Divergences
+
+- The first coordinator chart ran the drain from the host-operator image at
+  the chart's app version. A deployment that pins the coordinator image tag
+  then ran an operator image that did not match it, and the hook failed
+  before it drained. The drain moved into its own crate, and the coordinator
+  binary runs it, so the hook uses the coordinator's own image.
