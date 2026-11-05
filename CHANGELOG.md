@@ -35,6 +35,13 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
   queued evictions of the retired quarantine flavour, and replace the NBD slot columns with
   the pool capacity columns. Either chart can be upgraded first; both run the drain.
+  Until the old coordinator pods stop, they fail requests that read the dropped columns. If
+  a drain job fails with a database error about a missing column, run the same
+  `helm upgrade` again; the drain is safe to repeat.
+- **With the operator enabled, the roll needs room under `operator.capacityFloor`.** The
+  operator replaces a host pod only when the fleet keeps at least `capacityFloor` Ready
+  hosts without it. A fleet with no more hosts than the floor waits with every host
+  cordoned. Set the floor below the host count (`0` for a single host) before you upgrade.
 - **Removed metrics and knobs.** `engram_quarantine_stuck_total`,
   `engram_durability_rollback_total`, and `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` no longer
   exist; delete alert policies that read them. The capability vector reports `session_disk`
