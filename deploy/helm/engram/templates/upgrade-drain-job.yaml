@@ -3,9 +3,10 @@
 ADR 0126: before an upgrade changes anything, drain every host the new
 build's host-agent cannot adopt (an older reattach generation): cordon it and
 evict each session to a checkpoint. A no-op when every host already runs the
-new generation. The host-fleet chart runs the same drain, so either chart
-can be upgraded first. A session it cannot evict fails the hook, and Helm
-then changes nothing.
+new generation. It runs the new release's coordinator image, which carries
+the drain, against the coordinator that still serves. The host-fleet chart
+runs the same drain, so either chart can be upgraded first. A session it
+cannot evict fails the hook, and Helm then changes nothing.
 */ -}}
 {{- $agSecret := .Values.appGrpc.tokensSecret.existingSecret | default .Values.auth.existingSecret }}
 {{- $agKey := .Values.appGrpc.tokensSecret.secretKey | default .Values.auth.secretKey }}
@@ -38,8 +39,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: drain
-          image: "{{ .Values.upgradeDrain.image.repository }}:{{ .Values.upgradeDrain.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.upgradeDrain.image.pullPolicy }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["upgrade-drain"]
           env:
             - name: ENGRAM_COORDINATOR_URL

@@ -334,6 +334,12 @@ async fn main() -> Result<(), CoordinatorError> {
     // spans on shutdown (ADR 0019).
     let _telemetry = init_tracing();
 
+    // The chart's pre-upgrade hook runs this image with `upgrade-drain`.
+    if std::env::args().nth(1).as_deref() == Some("upgrade-drain") {
+        engram_upgrade_drain::run_from_env().await?;
+        return Ok(());
+    }
+
     // ADR 0098 D1: time/entropy are injected world inputs. Built once
     // here so pre-`Services` boot code (host-row upsert, heartbeat
     // loop) reads the same clock the rest of the coordinator gets.

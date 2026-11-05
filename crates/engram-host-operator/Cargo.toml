@@ -26,6 +26,7 @@ serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
 engram-protocol.workspace = true
+engram-upgrade-drain.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -593,6 +593,7 @@ async fn shutdown_signal() {
 pub enum CoordinatorError {
     Config(String),
     Io(std::io::Error),
+    UpgradeDrain(engram_upgrade_drain::DrainError),
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -600,6 +601,7 @@ impl std::fmt::Display for CoordinatorError {
         match self {
             Self::Config(msg) => write!(f, "coordinator config error: {msg}"),
             Self::Io(e) => write!(f, "coordinator io error: {e}"),
+            Self::UpgradeDrain(e) => write!(f, "{e}"),
         }
     }
 }
@@ -608,7 +610,14 @@ impl std::error::Error for CoordinatorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::UpgradeDrain(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<engram_upgrade_drain::DrainError> for CoordinatorError {
+    fn from(e: engram_upgrade_drain::DrainError) -> Self {
+        Self::UpgradeDrain(e)
     }
 }

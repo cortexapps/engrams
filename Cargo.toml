@@ -9,6 +9,7 @@ members = [
     "crates/engram-host-core",
     "crates/engram-disk-thin",
     "crates/engram-host-operator",
+    "crates/engram-upgrade-drain",
     "crates/engram-chunk-store",
     "crates/engram-rootfs-materializer",
     "crates/engram-publish-builtin-harness",
@@ -113,6 +114,7 @@ schemars = "1.2"
 engram-core = { path = "crates/engram-core" }
 engram-ids = { path = "crates/engram-ids" }
 engram-protocol = { path = "crates/engram-protocol" }
+engram-upgrade-drain = { path = "crates/engram-upgrade-drain" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-coordinator = { path = "crates/engram-coordinator" }
 engram-dst = { path = "crates/engram-dst" }

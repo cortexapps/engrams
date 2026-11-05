@@ -1,25 +1,17 @@
-//! ADR 0044 K3 / ADR 0051: app-gRPC client for the coordinator `FleetService`
-//! used for image rolls and durable host retirement (ADR 0123 E).
+//! The coordinator `FleetService` calls the operator makes for image rolls,
+//! scaling, and durable host retirement (ADR 0044 K3, ADR 0123 E).
 //!
-//! This was a REST (`reqwest`) client until the coordinator retired its
-//! HTTP control plane (ADR 0051, gRPC-only). The REST routes the operator
-//! called (`/api/v1/admin/hosts/:id/{cordon,uncordon,drain}`, `DELETE
-//! /admin/hosts/:id`, `GET /hosts[/:id]`, `/admin/fleet/demand`) were
-//! removed but the operator was never migrated, so every call 404'd and the
-//! fleet silently stopped rolling. This client now talks `FleetService`.
-//!
-//! Auth: a service bearer token via `ENGRAM_COORDINATOR_TOKEN`, sent as
-//! `Authorization: Bearer <token>` gRPC metadata (the same scheme the cli
-//! uses). In a synthetic-admin dev coord (no accepted tokens) it's omitted.
+//! Auth: `ENGRAM_COORDINATOR_TOKEN` as `Authorization: Bearer <token>`
+//! metadata; a coordinator with no accepted tokens gets no header.
 
 use std::time::Duration;
 
 use engram_core::HostId;
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
-use engram_protocol::app::session_service_client::SessionServiceClient;
+use engram_upgrade_drain::Bearer;
 use tonic::codegen::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::autoscale::Retirement;
 use crate::error::OperatorError;
@@ -60,60 +52,7 @@ pub struct HostLoad {
     pub free_vcpus: u64,
 }
 
-/// A host as the upgrade drain reads it (ADR 0126).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpgradeHost {
-    pub id: HostId,
-    /// `ready` or `draining`: the host may still run VMs.
-    pub live: bool,
-    pub cordoned: bool,
-    pub running_sandboxes: u32,
-    pub reattach_generation: u32,
-}
-
-/// A session as the upgrade drain reads it (ADR 0126).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpgradeSession {
-    pub id: String,
-    /// The coordinator's state name (`engram_core::SessionState::as_str`).
-    pub state: String,
-    pub host_id: Option<HostId>,
-}
-
-/// `Authorization: Bearer <token>` gRPC metadata interceptor (mirrors the
-/// cli's `BearerFn`). `None` omits the header — a dev coord with no accepted
-/// tokens.
-#[derive(Clone)]
-struct BearerFn {
-    token: Option<String>,
-}
-
-impl tonic::service::Interceptor for BearerFn {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(token) = &self.token {
-            req.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {token}")
-                    .parse()
-                    .map_err(|_| tonic::Status::invalid_argument("bearer token is not ASCII"))?,
-            );
-        }
-        Ok(req)
-    }
-}
-
-type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
-type SessionClient = SessionServiceClient<InterceptedService<Channel, BearerFn>>;
-
-/// Ensure the endpoint carries a scheme so `Channel::from_shared` parses it
-/// — the CR's `coordinator_url` may be set scheme-less (mirrors the cli).
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.contains("://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    }
-}
+type FleetClient = FleetServiceClient<InterceptedService<Channel, Bearer>>;
 
 pub struct CoordClient {
     fleet: FleetClient,
@@ -122,18 +61,13 @@ pub struct CoordClient {
 impl CoordClient {
     /// `endpoint` is the coordinator's app-gRPC address (e.g.
     /// `http://engram-coordinator:50061`), from the CR's `coordinator_url`.
-    /// Connects lazily (`connect_lazy`) so construction stays infallible +
-    /// synchronous; a down coordinator surfaces as `Unavailable` on the
-    /// first RPC (which the reconcile loop already requeues on).
+    /// It connects lazily; a down coordinator surfaces as `Unavailable` on
+    /// the first RPC, which the reconcile loop requeues.
     pub fn new(endpoint: String, token: Option<String>) -> Self {
-        let endpoint = normalize_endpoint(&endpoint);
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .unwrap_or_else(|e| panic!("invalid coordinator gRPC endpoint {endpoint:?}: {e}"))
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .connect_lazy();
-        let fleet = FleetServiceClient::with_interceptor(channel, BearerFn { token });
-        Self { fleet }
+        let channel = engram_upgrade_drain::channel(&endpoint, Duration::from_secs(10));
+        Self {
+            fleet: FleetServiceClient::with_interceptor(channel, Bearer::new(token)),
+        }
     }
 
     /// `FleetService.CordonHost` — stop the picker placing new sessions on
@@ -247,23 +181,6 @@ impl CoordClient {
             .collect()
     }
 
-    /// `FleetService.ListHosts`, as the upgrade drain reads it.
-    pub async fn list_upgrade_hosts(&self) -> Result<Vec<UpgradeHost>, OperatorError> {
-        self.host_views()
-            .await?
-            .into_iter()
-            .map(|v| {
-                Ok(UpgradeHost {
-                    id: parse_host_id(&v.id)?,
-                    live: matches!(v.status.as_str(), "ready" | "draining"),
-                    cordoned: v.cordoned,
-                    running_sandboxes: v.running_sandboxes,
-                    reattach_generation: v.reattach_generation,
-                })
-            })
-            .collect()
-    }
-
     async fn host_views(&self) -> Result<Vec<app::HostView>, OperatorError> {
         let resp = self
             .fleet
@@ -325,15 +242,9 @@ impl CoordClient {
 }
 
 /// proto `HostView` → the operator's `HostLoad` (the wave-relevant subset).
-fn parse_host_id(id: &str) -> Result<HostId, OperatorError> {
-    id.parse().map_err(|_| {
-        OperatorError::Invalid(format!("coordinator returned malformed host id {id:?}"))
-    })
-}
-
 fn host_view_to_load(v: app::HostView) -> Result<HostLoad, OperatorError> {
     Ok(HostLoad {
-        id: parse_host_id(&v.id)?,
+        id: engram_upgrade_drain::parse_host_id(&v.id)?,
         cordoned: v.cordoned,
         running_sandboxes: v.running_sandboxes,
         reserved_mib: v.reserved_mib,
@@ -341,102 +252,6 @@ fn host_view_to_load(v: app::HostView) -> Result<HostLoad, OperatorError> {
         reserved_vcpus: v.reserved_vcpus,
         free_vcpus: v.free_vcpus,
     })
-}
-
-/// The `SessionService` calls the upgrade drain makes. An eviction captures
-/// the guest, so `call_timeout` must cover the largest guest's capture.
-pub struct SessionOps {
-    sessions: SessionClient,
-}
-
-impl SessionOps {
-    pub fn new(endpoint: String, token: Option<String>, call_timeout: Duration) -> Self {
-        let endpoint = normalize_endpoint(&endpoint);
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .unwrap_or_else(|e| panic!("invalid coordinator gRPC endpoint {endpoint:?}: {e}"))
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(call_timeout)
-            .connect_lazy();
-        Self {
-            sessions: SessionServiceClient::with_interceptor(channel, BearerFn { token }),
-        }
-    }
-
-    pub async fn list(&self) -> Result<Vec<UpgradeSession>, OperatorError> {
-        let resp = self
-            .sessions
-            .clone()
-            .list_sessions(app::ListSessionsRequest {})
-            .await
-            .map_err(|status| rpc_err("list_sessions", status))?;
-        resp.into_inner()
-            .sessions
-            .into_iter()
-            .filter_map(|item| item.session)
-            .map(|s| {
-                Ok(UpgradeSession {
-                    host_id: s.host_id.as_deref().map(parse_host_id).transpose()?,
-                    id: s.id,
-                    state: s.status,
-                })
-            })
-            .collect()
-    }
-
-    /// Whether the session has a checkpoint it can resume from.
-    pub async fn has_checkpoint(&self, id: &str) -> Result<bool, OperatorError> {
-        let resp = self
-            .sessions
-            .clone()
-            .list_checkpoints(app::ListCheckpointsRequest {
-                session_id: id.into(),
-            })
-            .await
-            .map_err(|status| rpc_err("list_checkpoints", status))?;
-        Ok(resp.into_inner().checkpoints.iter().any(|c| c.recoverable))
-    }
-
-    pub async fn snapshot(&self, id: &str) -> Result<(), OperatorError> {
-        self.sessions
-            .clone()
-            .snapshot(app::SnapshotRequest {
-                session_id: id.into(),
-            })
-            .await
-            .map_err(|status| rpc_err("snapshot", status))?;
-        Ok(())
-    }
-
-    pub async fn resume(&self, id: &str) -> Result<(), OperatorError> {
-        self.sessions
-            .clone()
-            .resume(app::ResumeRequest {
-                session_id: id.into(),
-            })
-            .await
-            .map_err(|status| rpc_err("resume", status))?;
-        Ok(())
-    }
-
-    /// The no-park eviction: the session ends at `idle` behind a fresh
-    /// checkpoint, its VM destroyed.
-    pub async fn evict(&self, id: &str) -> Result<(), OperatorError> {
-        self.sessions
-            .clone()
-            .evict_local(app::EvictLocalRequest {
-                session_id: id.into(),
-            })
-            .await
-            .map_err(|status| rpc_err("evict_local", status))?;
-        Ok(())
-    }
-}
-
-fn rpc_err(op: &'static str, status: tonic::Status) -> OperatorError {
-    OperatorError::Rpc {
-        op,
-        status: Box::new(status),
-    }
 }
 
 fn retirement_from_response(response: app::RetireHostResponse) -> Retirement {
