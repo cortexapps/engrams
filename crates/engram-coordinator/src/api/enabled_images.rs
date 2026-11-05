@@ -627,42 +627,38 @@ pub(crate) async fn try_reuse_base_snapshot(
 /// (`host_http::claim_capture_job`), which resolves secrets fresh at
 /// claim time rather than once at job-creation time (ADR 0084 §A).
 ///
-/// ADR 0084 §C: the placement pick uses the honest
-/// [`crate::placement::CaptureFootprint`] inputs for a capture job —
-/// `mem_mib` from the image's declared/default resources,
-/// `image_size_mib` read off the ALREADY-materialized disk
-/// manifest's chunk-store `Manifest::total_bytes` (a metadata-only read,
-/// no chunk bytes fetched). Falls back to [`CaptureFootprint::floor_only`]
-/// (LOUDLY logged) if the manifest can't be read — a capture must never
-/// fail to even GET a placement pick over a sizing-metadata hiccup.
+/// ADR 0084 §C: the placement footprint for a capture of `config` from
+/// `disk_manifest`: the memory from the image's resources, the populated
+/// image size from the manifest's listed chunks (a metadata read). An
+/// unreadable manifest falls back to floor-only sizing, loudly: a capture
+/// must still get a placement pick over a sizing hiccup.
 pub(crate) async fn capture_footprint_for(
     state: &SharedState,
     disk_manifest: engram_core::types::manifest::ManifestRef,
     config: &ImageConfig,
 ) -> crate::placement::CaptureFootprint {
-    let mem_mib = config.resolved_memory_mib() as u64;
     match state.services.chunk_store.get_manifest(disk_manifest).await {
         Ok(manifest) => {
-            let image_size_mib = (manifest.total_bytes / (1024 * 1024)).max(1);
-            crate::placement::CaptureFootprint::for_capture(image_size_mib, mem_mib)
+            let populated = manifest.chunks.len() as u64 * manifest.chunk_size.as_u64();
+            crate::placement::CaptureFootprint::for_capture(
+                config.resolved_memory_mib() as u64,
+                populated.div_ceil(1024 * 1024),
+            )
         }
         Err(e) => {
             tracing::warn!(
                 manifest = %disk_manifest,
                 error = %e,
-                "capture footprint: could not read the disk manifest's total_bytes; \
-                 falling back to FLOOR-ONLY sizing (no footprint headroom veto) for this pick",
+                "capture footprint: could not read the disk manifest; \
+                 falling back to floor-only sizing for this pick",
             );
             crate::placement::CaptureFootprint::floor_only()
         }
     }
 }
 
-/// Same as [`capture_footprint_for`] but reads its inputs off an
-/// existing `capture_jobs` row (the deadline-scan reassign pick and the
-/// scanner's retryable-failure reassign pick both already have one) —
-/// parses `row.disk_manifest` and merges `row.image_config` over
-/// `row.oci_defaults` the same way the claim handler does.
+/// [`capture_footprint_for`] over an existing `capture_jobs` row, with its
+/// image config merged over the OCI defaults as the claim handler does.
 pub(crate) async fn capture_footprint_for_job_row(
     state: &SharedState,
     row: &engram_core::types::capture_job::CaptureJobRow,
@@ -679,7 +675,7 @@ pub(crate) async fn capture_footprint_for_job_row(
                 disk_manifest = %row.disk_manifest,
                 error = %e,
                 "capture footprint: capture_jobs.disk_manifest failed to parse; \
-                 falling back to FLOOR-ONLY sizing for this reassign pick",
+                 falling back to floor-only sizing for this pick",
             );
             crate::placement::CaptureFootprint::floor_only()
         }

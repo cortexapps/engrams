@@ -202,36 +202,27 @@ pub fn host_meets_capabilities(
     Ok(())
 }
 
-/// ADR 0084 §C: how much host disk a capture/materialize job needs —
-/// threaded into [`capture_candidate_hosts`] so placement can veto a host that
-/// technically clears the ADR 0078 disk FLOOR but doesn't have headroom
-/// for the job's own write volume (the old picker only checked the
-/// floor, never the job's size).
+/// ADR 0084 §C: what a capture writes on a host beyond the floors, so
+/// placement can veto a host that clears a floor but has no room for the
+/// capture itself. Two places take writes: the work dir and the pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CaptureFootprint {
+    /// Work dir: the memory dump plus a fixed slack for state files and
+    /// chunk staging.
     pub disk_mib: u64,
+    /// Session-disk pool: the image's populated bytes, which staging
+    /// writes into an image volume. The capture VM's root disk is a
+    /// snapshot of that volume and adds only the blocks it writes.
+    pub pool_mib: u64,
 }
 
 impl CaptureFootprint {
-    /// A base-snapshot capture writes: the materialized rootfs (already
-    /// on disk from the `materializing` stage, ≈1×image) PLUS the
-    /// capture VM's own COW/scratch overlay of that rootfs (another
-    /// ≈1×image) PLUS the memory dump (`mem_mib`, chunked+uploaded
-    /// before the scratch is freed) PLUS a fixed slack for the host's
-    /// other bookkeeping (state.bin/sidecar, temp chunk-store staging).
-    pub fn for_capture(image_size_mib: u64, mem_mib: u64) -> Self {
+    /// `image_populated_mib` counts the chunks the disk manifest lists;
+    /// zero-filled ranges are absent from it and take no pool space.
+    pub fn for_capture(mem_mib: u64, image_populated_mib: u64) -> Self {
         Self {
-            disk_mib: 2 * image_size_mib + mem_mib + 4096,
-        }
-    }
-
-    /// A materialize pulls the OCI layers, flattens them, and packs a
-    /// bootable ext4 — roughly 2.5x the final image size once you
-    /// count the flattened-layer scratch tree alongside the packed
-    /// ext4 output, plus a fixed slack for the OCI pull cache.
-    pub fn for_materialize(image_size_mib: u64) -> Self {
-        Self {
-            disk_mib: (image_size_mib as f64 * 2.5).ceil() as u64 + 1024,
+            disk_mib: mem_mib + 4096,
+            pool_mib: image_populated_mib,
         }
     }
 
@@ -247,7 +238,10 @@ impl CaptureFootprint {
     /// this must justify why in a comment, not use it as a silent
     /// default.
     pub const fn floor_only() -> Self {
-        Self { disk_mib: 0 }
+        Self {
+            disk_mib: 0,
+            pool_mib: 0,
+        }
     }
 }
 
@@ -976,16 +970,12 @@ fn free_disk_mib(h: &HostRecord) -> Option<u64> {
     )
 }
 
-/// ADR 0084 §C: the pure filter+rank core of [`capture_candidate_hosts`] —
-/// unit-tested directly against a `&[HostRecord]` fixture, no I/O.
-///
-/// Filters: schedulable ∧ the base capability gate (+ `fc_snapshot_version`
-/// pin when `required_fc_version` names one) ∧ the disk and pool floors ∧
-/// `need.disk_mib` headroom (an unmeasured host is soft here too — same
-/// posture as the floor) ∧ NOT already running a live capture job
-/// (`live_capture_hosts` — one-capture-per-host anti-affinity, ADR 0084
-/// §C). Ranking: MAX free disk among survivors (replacing the old
-/// first-fit) — row order breaks ties among unmeasured/equal hosts.
+/// The pure core of [`capture_candidate_hosts`]. A host qualifies when it
+/// takes new sessions, meets the capability gate (and the
+/// `required_fc_version` pin), clears the disk and pool floors, has room
+/// for `need` on the work dir and in the pool, and runs no other capture.
+/// Unmeasured disk or pool is soft. Hosts come back roomiest work dir
+/// first; row order breaks ties.
 pub fn capture_candidate_hosts_from(
     hosts: &[HostRecord],
     live_capture_hosts: &std::collections::HashSet<HostId>,
@@ -1015,6 +1005,9 @@ pub fn capture_candidate_hosts_from(
         }
         let free = free_disk_mib(h);
         if free.is_some_and(|free| free < need.disk_mib) {
+            continue;
+        }
+        if !pool_fits(h, need.pool_mib) {
             continue;
         }
         survivors.push((free.unwrap_or(0), h.id));
@@ -1115,6 +1108,13 @@ fn host_pool_floor_ok(h: &HostRecord) -> bool {
     u.pool_data_total_mib == 0
         || (u.pool_data_free_mib >= host_pool_data_floor_mib()
             && u.pool_metadata_free_mib >= HOST_POOL_METADATA_FLOOR_MIB)
+}
+
+/// Pool data free space covers `pool_mib` on top of the pool floor. An
+/// unmeasured pool is soft, the same posture as the floor itself.
+fn pool_fits(h: &HostRecord, pool_mib: u64) -> bool {
+    let u = &h.utilization;
+    u.pool_data_total_mib == 0 || u.pool_data_free_mib >= host_pool_data_floor_mib() + pool_mib
 }
 
 fn host_pool_data_floor_mib() -> u64 {
@@ -2181,14 +2181,41 @@ mod tests {
         }
 
         #[test]
-        fn footprint_math_matches_the_documented_formula() {
-            // 2×image + mem + 4096 slack.
-            let f = CaptureFootprint::for_capture(1000, 2048);
-            assert_eq!(f.disk_mib, 2 * 1000 + 2048 + 4096);
-            // ceil(2.5×image) + 1024.
-            let f = CaptureFootprint::for_materialize(1001);
-            assert_eq!(f.disk_mib, 2503 + 1024);
-            assert_eq!(CaptureFootprint::floor_only().disk_mib, 0);
+        fn capture_footprint_is_the_memory_dump_and_the_populated_image() {
+            let f = CaptureFootprint::for_capture(2048, 26_000);
+            assert_eq!((f.disk_mib, f.pool_mib), (2048 + 4096, 26_000));
+            assert_eq!(CaptureFootprint::floor_only(), CaptureFootprint::default());
+        }
+
+        #[test]
+        fn a_large_disk_image_captures_beside_the_pool_data_file() {
+            // The pool's data file holds half the work-dir filesystem; a
+            // 32 GiB guest with a 300 GiB disk still fits in the rest.
+            let mut h = host(1);
+            h.utilization.disk_total_mib = 700_000;
+            h.utilization.disk_used_mib = 380_000;
+            h.utilization.pool_data_total_mib = 375_000;
+            h.utilization.pool_data_free_mib = 370_000;
+            h.utilization.pool_metadata_free_mib = HOST_POOL_METADATA_FLOOR_MIB;
+            let need = CaptureFootprint::for_capture(32 * 1024, 26 * 1024);
+            let cands = capture_candidate_hosts_from(&[h], &live(), need, None, Utc::now(), TTL);
+            assert_eq!(cands, vec![hid(1)]);
+        }
+
+        #[test]
+        fn a_pool_without_room_for_the_image_is_vetoed() {
+            let mut roomy = host(1);
+            roomy.utilization.pool_data_total_mib = 375_000;
+            roomy.utilization.pool_data_free_mib = HOST_POOL_DATA_FLOOR_MIB + 30_000;
+            roomy.utilization.pool_metadata_free_mib = HOST_POOL_METADATA_FLOOR_MIB;
+            let mut tight = host(2);
+            tight.utilization.pool_data_total_mib = 375_000;
+            tight.utilization.pool_data_free_mib = HOST_POOL_DATA_FLOOR_MIB + 10_000;
+            tight.utilization.pool_metadata_free_mib = HOST_POOL_METADATA_FLOOR_MIB;
+            let need = CaptureFootprint::for_capture(2048, 20_000);
+            let cands =
+                capture_candidate_hosts_from(&[roomy, tight], &live(), need, None, Utc::now(), TTL);
+            assert_eq!(cands, vec![hid(1)], "the tight pool cannot stage the image");
         }
 
         #[test]
@@ -2199,7 +2226,10 @@ mod tests {
             let mut tight = host(2);
             tight.utilization.disk_total_mib = 200_000;
             tight.utilization.disk_used_mib = 190_000; // 10,000 free
-            let need = CaptureFootprint { disk_mib: 50_000 };
+            let need = CaptureFootprint {
+                disk_mib: 50_000,
+                pool_mib: 0,
+            };
             let cands =
                 capture_candidate_hosts_from(&[roomy, tight], &live(), need, None, Utc::now(), TTL);
             assert_eq!(
@@ -2216,6 +2246,7 @@ mod tests {
             let unmeasured = host(1);
             let need = CaptureFootprint {
                 disk_mib: 1_000_000,
+                pool_mib: 1_000_000,
             };
             let cands =
                 capture_candidate_hosts_from(&[unmeasured], &live(), need, None, Utc::now(), TTL);
