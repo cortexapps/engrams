@@ -88,14 +88,10 @@ impl CoordClient {
     }
 
     /// ADR 0116 A-D2: `FleetService.BeginHostHandoff` — declare the
-    /// planned roll so the coordinator's binding-lease deadline covers
-    /// the whole pod replacement. ANY failure is an error the caller
-    /// treats exactly like a cordon failure: with the A3 cutover the
-    /// lease is the ONLY shield (the staleness heuristics that used to
-    /// cover an undeclared roll are retired), so a roll must never
-    /// delete the pod without a durable deadline in PG. (The
-    /// Unimplemented-tolerant arm for pre-A2 coordinators died here in
-    /// A3, per the ADR's scaffolding ledger — coord fleet ≥ A2.)
+    /// planned roll so the coordinator's binding-lease deadline covers the
+    /// whole pod replacement. The lease is the only shield for a roll, so
+    /// the caller treats any failure like a cordon failure and never deletes
+    /// the pod without a durable deadline in PG.
     pub async fn handoff(&self, host: HostId, ttl_secs: u64) -> Result<bool, OperatorError> {
         self.fleet
             .clone()
