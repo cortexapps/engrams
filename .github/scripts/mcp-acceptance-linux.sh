@@ -36,6 +36,6 @@ test -x "$ENGRAM_TEST_DRIVER_BIN"
 timeout --signal=KILL 240s "$CARGO_TARGET_DIR/debug/examples/linux_mcp_supervisor" \
   --check-cleanup-and-run 2>&1 | tee "$state/entrypoint.log"
 grep -Fq 'forced deadline cleanup: passed; all descendants reaped before state removal' "$state/entrypoint.log"
-grep -Fq 'running 8 tests' "$state/entrypoint.log"
-grep -Fq 'test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out' "$state/entrypoint.log"
+grep -Fq 'running 9 tests' "$state/entrypoint.log"
+grep -Fq 'test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out' "$state/entrypoint.log"
 test "$(cat "$state/cleanup-complete")" = complete

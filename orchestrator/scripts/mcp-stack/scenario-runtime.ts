@@ -572,7 +572,7 @@ async function pollSelectedProof(
   );
   return waitFor(
     ctx,
-    "native_completed_proof",
+    `native_completed_proof_${input.callId}`,
     async () => {
       const paths = await proofPaths(
         ctx,

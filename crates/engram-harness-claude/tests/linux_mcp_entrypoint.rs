@@ -99,6 +99,15 @@ impl Drop for Harness {
 }
 impl Harness {
     async fn start(wrapper: Wrapper, mode: &str, deferred: bool) -> Self {
+        Self::start_with_plan(wrapper, mode, deferred, None).await
+    }
+
+    async fn start_with_plan(
+        wrapper: Wrapper,
+        mode: &str,
+        deferred: bool,
+        plan: Option<&Value>,
+    ) -> Self {
         let base =
             PathBuf::from(std::env::var_os("ENGRAM_TEST_STATE_ROOT").expect("owned state root"));
         assert!(base.is_absolute());
@@ -132,7 +141,11 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let session = SessionId::new();
         let sandbox = SandboxId::new();
-        let manifest = json!([{"name":TOOL,"description":"Fixture inventory","inputSchema":{"type":"object","properties":{"fixture":{"type":"string"}},"required":["fixture"],"additionalProperties":false},"execution":if deferred {"deferred"} else {"sync"},"nativeBindings":{},"resultFormat":"mcp"}]);
+        let manifest = if plan.is_some() {
+            json!([])
+        } else {
+            json!([{"name":TOOL,"description":"Fixture inventory","inputSchema":{"type":"object","properties":{"fixture":{"type":"string"}},"required":["fixture"],"additionalProperties":false},"execution":if deferred {"deferred"} else {"sync"},"nativeBindings":{},"resultFormat":"mcp"}])
+        };
         let mut command = Command::new(wrapper.binary());
         command
             .env_clear()
@@ -155,13 +168,17 @@ impl Harness {
             .env("ENGRAM_SANDBOX_ID", sandbox.to_string())
             .env("ENGRAM_BINDING_EPOCH", "1")
             .env("ENGRAM_TOOLS", manifest.to_string())
-            .env("ENGRAM_FIXTURE_TOOL", TOOL)
             .env("ENGRAM_FIXTURE_MODE", mode)
             .env("ENGRAM_FIXTURE_STATE_DIR", &proof)
             .env("ENGRAM_FIXTURE_PROOF", proof.join("launch-{pid}.json"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(plan) = plan {
+            command.env("ENGRAM_FIXTURE_CALL_PLAN_JSON", plan.to_string());
+        } else {
+            command.env("ENGRAM_FIXTURE_TOOL", TOOL);
+        }
         if wrapper == Wrapper::Codex {
             command.env("CODEX_API_KEY", "fixture-placeholder");
         }
@@ -518,6 +535,48 @@ async fn omitted_forged_tool_is_rejected_by_wrapper() {
             .iter()
             .any(|e| matches!(e, HarnessEvent::RunCompleted { .. })));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires current Linux wrapper and fixture artifacts"]
+async fn empty_manifest_absent_tool_returns_native_denial_proof() {
+    let plan = json!({"steps":[{"marker":"missing","tool":"mcp_read_counter","arguments":{},"callId":"grant-missing","resultFormat":"mcp","expectExposure":"absent"}]});
+    let mut h = Harness::start_with_plan(Wrapper::Claude, "read", false, Some(&plan)).await;
+    h.send(HarnessCommand::Prompt {
+        text: "[[fixture:missing]]".into(),
+        prompt_id: "fixture-missing".into(),
+        mode: None,
+    })
+    .await;
+    h.until(|event| matches!(event, HarnessEvent::RunCompleted { .. }))
+        .await;
+    let proofs: Vec<_> = h
+        .proofs()
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("launch-")
+        })
+        .collect();
+    assert_eq!(proofs.len(), 1);
+    let proof: Value = serde_json::from_slice(&fs::read(&proofs[0]).unwrap()).unwrap();
+    assert_eq!(
+        proof,
+        json!({
+            "callId":"grant-missing",
+            "tool":"mcp_read_counter",
+            "selectedToolName":"mcp_read_counter",
+            "planSha256":"sha256:8e9af5f9f44fe85c47bd540d29ca82f2084934aef94a5fb9ce9655439e06a3c5",
+            "exposedMcpToolNamesSha256":"sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+            "expectExposure":"absent",
+            "requestAttempted":true,
+            "protocolDenialCode":"unknown_tool",
+            "nativeDenialCode":-32602
+        })
+    );
+    h.finish(0).await;
 }
 #[tokio::test]
 #[ignore = "requires current Linux wrapper and fixture artifacts"]
