@@ -299,31 +299,33 @@ impl SessionVolumes {
                     .map_err(store_err)?;
                 (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
             }
-            Source::Continue { manifest, base } => match self.kept(role, manifest).await? {
-                Some((owner, volume, _, held)) if held == manifest => (
-                    self.adopt(owner, volume, sandbox, role, held).await?,
-                    manifest,
-                ),
-                kept => {
-                    let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
-                    match kept {
-                        Some((_, volume, held_manifest, _))
-                            if volume.size_bytes == wanted.total_bytes =>
-                        {
-                            stage(
-                                self.disk.as_ref(),
-                                &self.store,
-                                &tmp,
-                                &wanted,
-                                Some((&volume, &held_manifest)),
-                            )
-                            .await?
-                        }
-                        _ => self.stage_into(&tmp, &wanted, base).await?,
-                    };
-                    (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
+            Source::Continue { manifest, base } => {
+                match self.kept(sandbox, role, manifest).await? {
+                    Some((owner, volume, _, held)) if held == manifest => (
+                        self.adopt(owner, volume, sandbox, role, held).await?,
+                        manifest,
+                    ),
+                    kept => {
+                        let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                        match kept {
+                            Some((_, volume, held_manifest, _))
+                                if volume.size_bytes == wanted.total_bytes =>
+                            {
+                                stage(
+                                    self.disk.as_ref(),
+                                    &self.store,
+                                    &tmp,
+                                    &wanted,
+                                    Some((&volume, &held_manifest)),
+                                )
+                                .await?
+                            }
+                            _ => self.stage_into(&tmp, &wanted, base).await?,
+                        };
+                        (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
+                    }
                 }
-            },
+            }
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
                 let lineage = ManifestRef::new();
@@ -346,8 +348,8 @@ impl SessionVolumes {
     }
 
     /// Give the staged transient volume its checkpoint name and delete
-    /// the role's other checkpoints, and any older checkpoint of the same
-    /// lineage another sandbox kept on this host.
+    /// the role's other checkpoints, and any checkpoint of the same
+    /// lineage a released sandbox kept on this host.
     async fn commit(
         &self,
         tmp: &VolumeName,
@@ -357,13 +359,16 @@ impl SessionVolumes {
     ) -> io::Result<Volume> {
         let name = checkpoint_name(sandbox, role, lineage);
         self.disk.rename(tmp, &name).await?;
+        let released = self.released();
         for other in self.disk.list().await? {
             if other != name
                 && parse(&other).is_some_and(|p| {
                     p.role == role
                         && match p.kind {
                             Kind::Checkpoint(m) => {
-                                p.sandbox == sandbox || m.manifest_id == lineage.manifest_id
+                                p.sandbox == sandbox
+                                    || (m.manifest_id == lineage.manifest_id
+                                        && released.contains(&p.sandbox))
                             }
                             _ => false,
                         }
@@ -375,15 +380,19 @@ impl SessionVolumes {
         self.disk.open(&name).await
     }
 
-    /// The newest checkpoint volume of `role` this host kept for the
-    /// lineage of `wanted`, no newer than it: the sandbox that kept it,
-    /// the volume, its manifest and ref. A resume runs in a new sandbox,
-    /// so the volume is found by lineage, whichever sandbox kept it.
+    /// The newest checkpoint volume of `role` that `sandbox` or a released
+    /// sandbox kept for the lineage of `wanted`, no newer than it: the
+    /// sandbox that kept it, the volume, its manifest and ref. A resume
+    /// runs in a new sandbox, so the volume is found by lineage. A live
+    /// sandbox's checkpoint is never a candidate: a same-host move's source
+    /// shares the lineage with its destination while both run.
     async fn kept(
         &self,
+        sandbox: SandboxId,
         role: DiskRole,
         wanted: ManifestRef,
     ) -> io::Result<Option<(SandboxId, Volume, Manifest, ManifestRef)>> {
+        let released = self.released();
         let newest = self
             .disk
             .list()
@@ -393,6 +402,7 @@ impl SessionVolumes {
             .filter_map(|p| match p.kind {
                 Kind::Checkpoint(m)
                     if p.role == role
+                        && (p.sandbox == sandbox || released.contains(&p.sandbox))
                         && m.manifest_id == wanted.manifest_id
                         && m.version <= wanted.version =>
                 {
@@ -746,6 +756,11 @@ impl SessionVolumes {
             }
         }
         Ok(report)
+    }
+
+    /// The released sandboxes whose kept checkpoints a resume may take.
+    fn released(&self) -> Vec<SandboxId> {
+        self.kept.lock().unwrap().iter().copied().collect()
     }
 
     fn remember_kept(&self, sandbox: SandboxId, age_unknown: bool) {
@@ -1692,6 +1707,46 @@ mod tests {
         assert!(
             checkpoints_of(&r, sandbox, DiskRole::Root).await.is_empty(),
             "the old sandbox's kept checkpoint is retired by the new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_sandbox_keeps_its_checkpoint_when_another_continues_its_lineage() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let source = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(source, fork(image), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let published = r.volumes.checkpoint(source, DiskRole::Root).await.unwrap();
+
+        // A same-host move: the destination continues the lineage while
+        // the source still runs.
+        let destination = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                destination,
+                Source::Continue {
+                    manifest: published,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+        assert_eq!(
+            checkpoints_of(&r, source, DiskRole::Root).await,
+            vec![published],
+            "the live source keeps its checkpoint"
+        );
+        assert_eq!(
+            checkpoints_of(&r, destination, DiskRole::Root).await,
+            vec![published]
         );
     }
 
