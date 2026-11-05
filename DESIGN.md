@@ -214,6 +214,14 @@ the test named beside it.
   is in the host page cache or the pool, never in host-agent memory. A host-agent restart
   reattaches a running guest with no change to the disk and loses none of its writes
   (`a_host_agent_restart_keeps_the_guest_and_every_write`).
+- Reattach holds only between builds with the same `engram_protocol::REATTACH_GENERATION`
+  (ADR 0126). An upgrade to a higher generation first drains every host on a lower one:
+  the chart's pre-upgrade hook cordons it, checkpoints each active session that has no
+  checkpoint, and evicts every session, and fails the upgrade before any change when a
+  session cannot be evicted
+  (`an_old_host_is_cordoned_and_each_session_state_gets_its_action`). A host that
+  registers with a higher generation has the drain's cordon lifted
+  (`only_a_higher_reattach_generation_lifts_a_cordon`).
 - A checkpoint pauses the guest only for the page-cache sync and the volume snapshot; the
   upload runs after the guest resumes
   (`a_checkpoint_split_across_the_pause_publishes_the_paused_state`) and carries only the

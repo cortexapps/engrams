@@ -91,6 +91,7 @@ at boot.
 | `service`, `serviceInternal`, `ingress` | The coordinator's Services and the Ingress that should stay disabled. |
 | `hpa`, `pdb`, `networkPolicy`, `resources`, `nodeSelector`, `tolerations`, `affinity` | Scheduling and availability. |
 | `otel` | An OTLP endpoint for the coordinator's own traces. |
+| `upgradeDrain` | The job that runs before an upgrade whose host agents cannot adopt the VMs running now: whether it runs, its time budget, and the operator image it uses. See [Upgrade engrams](../../guides/upgrade/#when-a-release-changes-how-hosts-run-vms). |
 | `probes`, `drainSeconds`, `terminationGracePeriodSeconds` | Liveness on `/healthz`, readiness on `/readyz`, and how long a replica drains before it stops. |
 | `web` | The dashboard: image, Ingress, and the annotations that attach a managed certificate. |
 | `orchestrator` | The orchestrator: image, its Secret with the session-signing key, `auth` (see [Sign-in](#sign-in)), the public URL, and integration settings. |
@@ -102,6 +103,8 @@ Deployment's template changed. Sessions live on the hosts and are untouched by a
 roll; dashboard event streams reconnect with `Last-Event-ID`, and hosts re-register when the
 coordinator comes back. Roll the two charts together when you upgrade engrams: the
 coordinator and the host agents share a wire version and refuse to talk across a mismatch.
+When a release's host agents cannot adopt the VMs a host runs now, a job evicts every
+running session to a checkpoint before the upgrade changes anything.
 
 An image tag you leave empty falls back to the chart's `appVersion`, which is the release the
 checkout is. [Upgrade engrams](../../guides/upgrade/) is the procedure from one release to

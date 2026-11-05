@@ -50,6 +50,7 @@ by hand and drain each host first.
 | `otel`, `metrics` | Traces and Prometheus metrics from the host agent. |
 | `updateStrategy` | `OnDelete`. Leave it. |
 | `operator` | Whether the operator runs, its image, its own ServiceAccount, and `scaler`: `noop`, `gke`, or `asg`. |
+| `upgradeDrain` | The jobs that run around an upgrade whose host agents cannot adopt the VMs running now: whether they run, the time budget, and the coordinator's RPC address (by default `operator.coordinatorUrl`, else the host of `coordinator.endpoint`). See [Upgrade engrams](../../guides/upgrade/#when-a-release-changes-how-hosts-run-vms). |
 
 ## The custom resource
 
