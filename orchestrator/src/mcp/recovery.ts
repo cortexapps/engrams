@@ -5,6 +5,7 @@ import { sessions } from "../control-plane/client.ts";
 import { getDb } from "../db/client.ts";
 import { mcpExecution, taskSession } from "../db/schema.ts";
 import { requestPolicyContext } from "./journal-review.ts";
+import { McpAuthorityStale } from "./authority-error.ts";
 import type { SessionPolicyControlClient } from "./control-client.ts";
 import type { ToolCallCompleter } from "../tools/complete.ts";
 import {
@@ -237,6 +238,8 @@ export function makeMcpRecovery(deps: {
           const winner = await existing(ref);
           if (winner) return { kind: "accepted", execution: marker(winner) };
           if (error instanceof McpRequestDenied) return { kind: "denied", code: error.code };
+          if (error instanceof McpAuthorityStale)
+            return { kind: "denied", code: "authority_changed" };
           throw error;
         }
       } catch {

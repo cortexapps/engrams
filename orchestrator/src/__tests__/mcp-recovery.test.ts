@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { eq } from "drizzle-orm";
 import { effectFixture } from "./mcp-effect-fixture.ts";
-import { mcpExecution, mcpAdmissionScope } from "../db/schema.ts";
+import { mcpExecution, mcpAdmissionScope, profile } from "../db/schema.ts";
 import { makeMcpRecovery } from "../mcp/recovery.ts";
 
 import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
@@ -390,6 +390,69 @@ test("request decision rejects mismatched event references with a fixed private 
     await f.cleanup();
   }
 });
+
+test("revoked profile grants produce a local denial before execution", async () => {
+  const f = await effectFixture();
+  try {
+    let delivered: unknown;
+    const runtime = makeMcpRecovery({
+      db: f.db,
+      driver: f.driver,
+      deploymentId: f.deploymentId,
+      now: () => new Date(),
+      completer: {
+        async completeToolCall(input) {
+          delivered = JSON.parse(input.resultJson);
+        },
+      },
+      async readRequestEvent(_sessionId, idx) {
+        return {
+          idx,
+          kind: "tool_call_requested",
+          payloadJson: JSON.stringify({
+            run_id: f.request.runId,
+            tool_call_id: idx === 1n ? f.request.toolCallId : "revoked-call",
+            name: f.request.modelToolName,
+            args_json: f.request.originalArguments,
+          }),
+        };
+      },
+    });
+    const ref = {
+      sessionId: f.sessionId,
+      runId: f.request.runId,
+      toolCallId: f.request.toolCallId,
+      requestEventIdx: "1",
+      deadlineMs: Date.now() + 930000,
+    };
+    const winner = await runtime.decideRequest(ref);
+    expect(winner.kind).toBe("accepted");
+    await f.db.update(profile).set({ integrationGrants: [] }).where(eq(profile.id, f.profileId));
+    expect(await runtime.decideRequest(ref)).toEqual(winner);
+    const revoked = { ...ref, toolCallId: "revoked-call", requestEventIdx: "2" };
+    const decision = await runtime.decideRequest(revoked);
+    expect(decision).toEqual({ kind: "denied", code: "authority_changed" });
+    if (decision.kind !== "denied") throw Error("expected denial");
+    await runtime.deliverDenial(revoked, decision.code);
+    expect(delivered).toEqual({
+      source: "runtime",
+      denial: "authority_changed",
+      delivery: "available",
+      output: {
+        isError: true,
+        content: [{ type: "text", text: "External tool request denied." }],
+      },
+    });
+    const calls = await f.db
+      .select()
+      .from(mcpExecution)
+      .where(eq(mcpExecution.sessionId, f.sessionId));
+    expect(calls.map((call) => call.toolCallId)).toEqual([f.request.toolCallId]);
+    expect((await f.command("stats")).calls).toBe(0);
+  } finally {
+    await f.cleanup();
+  }
+}, 20000);
 
 test("transient binding authority failure is retried while a verified absent tool is denied", async () => {
   const f = await effectFixture();
