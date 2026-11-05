@@ -368,25 +368,30 @@ updates:
       docker-base:
         patterns: ["*"]
     ignore:
-      # Only even Node majors ever become LTS; odd ones are Current-only and
-      # go EOL about 7 months after release. Dependabot proposed
-      # `node:25-alpine` in #130 — a line that was ALREADY EOL (2026-06-01)
-      # on the day the PR was opened, and the release that stopped shipping
-      # `corepack` (nodejs/node#57617), which is what web.Dockerfile used to
-      # install pnpm. So it could not have built either. Under the OLD
-      # two-per-year model, odd majors were skipped and even ones (26, 28, …)
-      # arrived normally; the block below carries that historical record.
+      # Two reasons a node major is held back, and the OLD two-per-year model
+      # made them line up with parity. The NEW annual schedule (from Node 27
+      # onward) breaks that alignment, which is why this list is now two
+      # differently-shaped entries instead of "all odd majors".
       #
-      # Only even majors under the OLD model ever became LTS. Node 26 (Lithium)
-      # is the last release on that cadence — it entered Active LTS on
-      # 2026-10-28 and is now the newest LTS line, so the temporary
-      # `>= 26, < 27` hold is dropped and the tree pins node:26. From Node 27
-      # onward the schedule becomes one annual major per year and EVERY major
-      # becomes LTS (no odd/even distinction), so the odd-major ignore entries
-      # below (`>= 27, < 32` odd steps) stop being "skip Current-only majors"
-      # and instead just skip majors that are not published yet. Revisit that
-      # shape when the first post-26 major (27) actually ships as Current in
-      # 2027-04; until it exists there is nothing for Dependabot to propose.
+      # 1. Node 25 is EOL and never LTS. It was Current-only under the old
+      #    model, went EOL 2026-06-01, and its release also dropped `corepack`
+      #    (nodejs/node#57617) — which web.Dockerfile used to install pnpm, so
+      #    #130 could not have built regardless. It is a wrong version to
+      #    adopt, permanently (`>= 25, < 26`).
+      #
+      # 2. Node 26 ("Lithium") is the LAST release on the old cadence. It
+      #    entered Active LTS on 2026-10-28 and is the newest LTS line, so the
+      #    temporary `>= 26, < 27` hold is dropped and the tree pins node:26.
+      #
+      # From Node 27 the schedule is one annual major per year and EVERY major
+      # becomes LTS — no odd/even distinction. So the "skip odd majors" rule
+      # is dead; the surviving rule is the standard deferral this repo already
+      # used for 26: hold the newest major while it is Current-only (not yet
+      # LTS), advance the floor when it reaches LTS. The `>= 27, < 28` entry
+      # is that same TEMPORARY hold — REMOVE it once 27 enters LTS
+      # (2027-10-20), then repeat for 28, and so on. 27 ships stable as
+      # Current 2027-04-22; until then it does not exist as a stable tag, so
+      # the hold is cheap.
       #
       # NOTE THE SYNTAX. For `package-ecosystem: docker`, `versions:` entries
       # are RubyGems requirement strings — NOT the npm/NuGet `x`-wildcards.
@@ -403,6 +408,3 @@ updates:
         versions:
           - ">= 25, < 26"
           - ">= 27, < 28"
-          - ">= 29, < 30"
-          - ">= 31, < 32"
-          - ">= 33, < 34"
