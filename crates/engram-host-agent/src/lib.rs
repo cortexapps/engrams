@@ -1218,6 +1218,10 @@ impl HostAgent {
             // heartbeat/registration path anyway.)
             const HEARTBEAT_FAILURES_BEFORE_ESCALATION: u32 = 6; // ~30s at 5s cadence
             let mut consecutive_heartbeat_failures: u32 = 0;
+            // The enabled-images channel starts empty, which is not an ack.
+            // The first ack always notifies, even when the set is empty, so
+            // the supervisors can tell "no images" from "not told yet".
+            let mut enabled_acked = false;
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1466,15 +1470,11 @@ impl HostAgent {
                                     &resp.enabled_images,
                                     &resp.prestage_images,
                                 );
-                                // send_modify avoids notifying on
-                                // no-op (same set as last tick).
+                                let first = !std::mem::replace(&mut enabled_acked, true);
                                 tx.send_if_modified(|cur| {
-                                    if *cur == union {
-                                        false
-                                    } else {
-                                        *cur = union;
-                                        true
-                                    }
+                                    let changed = first || *cur != union;
+                                    *cur = union;
+                                    changed
                                 });
                             }
                             // ADR 0035 §5: hand the pin set to the

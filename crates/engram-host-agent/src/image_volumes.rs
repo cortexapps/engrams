@@ -17,7 +17,10 @@ pub fn spawn(
     mut enabled: watch::Receiver<Vec<EnabledImageRef>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
+        // The channel's initial value is not a heartbeat ack. A pass on it
+        // would delete every image volume, so the first pass waits for the
+        // set the coordinator sends.
+        while enabled.changed().await.is_ok() {
             let desired: Vec<ManifestRef> = enabled
                 .borrow_and_update()
                 .iter()
@@ -28,7 +31,10 @@ pub fn spawn(
                     for (name, error) in &report.failed {
                         tracing::warn!(volume = %name, %error, "image volume operation failed");
                     }
-                    if !report.deleted.is_empty() || !report.failed.is_empty() {
+                    if !report.staged.is_empty()
+                        || !report.deleted.is_empty()
+                        || !report.failed.is_empty()
+                    {
                         tracing::info!(
                             staged = report.staged.len(),
                             deleted = report.deleted.len(),
@@ -38,9 +44,6 @@ pub fn spawn(
                     }
                 }
                 Err(error) => tracing::error!(%error, "image volumes: the disk cannot be listed"),
-            }
-            if enabled.changed().await.is_err() {
-                return;
             }
         }
     })
@@ -87,6 +90,56 @@ mod tests {
             base_snapshot_memory_manifest: None,
             warm_peers: Vec::new(),
         }
+    }
+
+    async fn volume_exists(disk: &FileDisk, name: &engram_host_core::VolumeName) -> bool {
+        disk.list().await.unwrap().contains(name)
+    }
+
+    /// Poll until `cond` holds, for at most two seconds.
+    async fn eventually(mut cond: impl AsyncFnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_staged_volumes_until_the_coordinator_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(FileDisk::new(dir.path().join("volumes"), 4096).unwrap());
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(dir.path().join("blob")),
+        );
+        let staged_ref = ManifestRef::new();
+        let staged_name = volume_name(staged_ref);
+        disk.create(&staged_name, 4096).await.unwrap();
+
+        // A fresh process: the channel holds its empty initial value.
+        let (tx, rx) = watch::channel(Vec::<EnabledImageRef>::new());
+        let task = spawn(disk.clone(), ChunkStore::new(blob), rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            volume_exists(&disk, &staged_name).await,
+            "the initial empty value is not an ack and must delete nothing"
+        );
+
+        tx.send_replace(vec![image("a", staged_ref)]);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            volume_exists(&disk, &staged_name).await,
+            "an enabled image keeps its volume"
+        );
+
+        tx.send_replace(Vec::new());
+        assert!(
+            eventually(async || !volume_exists(&disk, &staged_name).await).await,
+            "an acked empty set deletes the volume"
+        );
+        task.abort();
     }
 
     #[tokio::test]
