@@ -567,6 +567,18 @@ async fn main() -> Result<(), HostAgentError> {
                 "--thin-pool {pool} needs Linux device-mapper"
             )));
         }
+        // A file-backed snapshot copies the whole volume while the guest
+        // is paused: fine for a macOS dev box, a frozen guest on a
+        // Firecracker host.
+        #[cfg(target_os = "linux")]
+        None if matches!(cli.sandbox_backend, BackendChoice::Firecracker) => {
+            return Err(HostAgentError::Config(
+                "the Firecracker backend needs a session-disk pool: set --thin-pool \
+                 (ENGRAM_THIN_POOL) to the pool node prep builds (the host-fleet chart's \
+                 thinPool.enabled, or deploy/helm/engram-host-fleet/files/thin-pool.sh)"
+                    .into(),
+            ));
+        }
         None => {
             let disk = engram_host_core::FileDisk::new(
                 cli.work_dir.join("volumes"),

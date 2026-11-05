@@ -42,8 +42,8 @@ rule) and the sysctl `vm.unprivileged_userfaultfd = 1`.
 **Session disks.** The kernel needs device-mapper thin provisioning (the `dm_thin_pool`
 module, shipped with the Ubuntu cloud image kernel) and the node needs `thin-provisioning-tools`. The node-prep step
 builds a pool from two files on the host's working filesystem and checks it on every boot;
-`ENGRAM_THIN_POOL` gives the host agent the pool's name. Without a pool, volumes are sparse
-files under the working directory, which is for development only.
+`ENGRAM_THIN_POOL` gives the host agent the pool's name. A Firecracker host agent refuses to
+start without one.
 
 **The guest kernel and the bundles.** Each host stages a guest kernel and the read-only
 bundles for the in-guest daemon, the harnesses, and the skills. The VM boots with

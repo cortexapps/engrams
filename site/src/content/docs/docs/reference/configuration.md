@@ -38,7 +38,7 @@ coordinator's ServiceAccount. There are no key files.
 | `ENGRAM_SANDBOX_BACKEND` | `firecracker` in production. |
 | `ENGRAM_KERNEL_IMAGE_PATH` | The guest kernel staged on the node. |
 | `ENGRAM_BLOB_BACKEND` and the bucket variables | Must match the coordinator's. |
-| `ENGRAM_THIN_POOL` | The name of the node's session-disk pool, as node-prep built it. Unset, volumes are sparse files under the working directory (development only). |
+| `ENGRAM_THIN_POOL` | The name of the node's session-disk pool, as node-prep built it. Required for the Firecracker backend; unset, the macOS and process backends keep volumes as sparse files under the working directory. |
 | `ENGRAM_FC_UFFD_BASE_DIR` | The tmpfs that holds each image's canonical memory. |
 | `ENGRAM_FC_VM_CGROUP_PARENT` | A node-level cgroup the VMs move into, so a host-agent pod restart does not kill them. |
 | `ENGRAM_EGRESS_PROXY_PORT`, `ENGRAM_EGRESS_DNS_PORT`, `ENGRAM_GUEST_GATEWAY_PORT` | The proxy's listeners. Mandatory and non-zero; guest traffic is redirected to them. |

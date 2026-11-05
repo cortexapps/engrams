@@ -463,12 +463,12 @@ if sandbox_backend == 'process':
     if process_image_catalog:
         coord_env['ENGRAM_PROCESS_IMAGE_CATALOG'] = process_image_catalog
 
-# ADR 0125: the session disk runs over a dm-thin pool when one is named
-# (`thin-pool.sh` builds one; the fc-dev VM has a 20 GiB one called
+# ADR 0125: a Firecracker host-agent needs a dm-thin pool for its session
+# disks (`thin-pool.sh` builds one; the fc-dev VM has a 20 GiB one called
 # engram-pool). A dev pool is far under the 16 GiB production floor, so
 # the placement floor drops with it; the host-agent reads the same
 # variable to decide when to reap kept checkpoint volumes.
-dev_thin_pool = env_or('ENGRAM_THIN_POOL', 'engram-pool' if fc_colima_profile else '')
+dev_thin_pool = env_or('ENGRAM_THIN_POOL', 'engram-pool' if sandbox_backend == 'firecracker' else '')
 dev_pool_floor = env_or('ENGRAM_PLACEMENT_POOL_FLOOR_BYTES', '3221225472')
 if dev_thin_pool:
     coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor

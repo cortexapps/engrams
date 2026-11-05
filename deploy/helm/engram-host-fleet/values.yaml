@@ -210,11 +210,12 @@ nodePrep:
     vm.unprivileged_userfaultfd: "1"
     net.ipv4.ip_forward: "1"
 
-# A dm-thin pool over two preallocated files on the work-dir filesystem,
-# attached as loop devices (ADR 0125). node-prep builds it on first boot
-# and re-activates it (after thin_check) on every later one.
+# The session-disk pool every host needs (ADR 0125): dm-thin over two
+# preallocated files on the work-dir filesystem, attached as loop devices.
+# node-prep builds it on first boot and re-activates it (after thin_check)
+# on every later one. With nodePrep disabled, the node image must provide
+# a pool under `name`; the host-agent refuses to start without one.
 thinPool:
-  enabled: false
   name: engram-pool
   dir: /var/lib/engram/thin
   # Absolute (300G) or a percentage of the filesystem holding `dir`.

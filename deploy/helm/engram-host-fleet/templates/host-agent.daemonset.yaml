@@ -124,7 +124,6 @@ spec:
               nsenter -t 1 -m -- sh -c \
                 'mkdir -p {{ . }} && { mountpoint -q {{ . }} || mount -t tmpfs -o size={{ $.Values.firecracker.uffdBaseTmpfsSize }} engram-base-shm {{ . }}; }'
               {{- end }}
-              {{- if .Values.thinPool.enabled }}
               # The node's own dmsetup / thin_check / losetup, in the host
               # mount namespace; the script arrives on stdin.
               echo "[node-prep] thin pool {{ .Values.thinPool.name }} in {{ .Values.thinPool.dir }}"
@@ -136,13 +135,10 @@ spec:
                 POOL_BLOCK_SECTORS={{ .Values.thinPool.blockSizeSectors | quote }} \
                 POOL_LOW_WATER={{ .Values.thinPool.lowWaterMarkBlocks | quote }} \
                 sh -s < /opt/engram/thin-pool.sh
-              {{- end }}
               echo "[node-prep] done"
           volumeMounts:
             - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
-            {{- if .Values.thinPool.enabled }}
             - {name: thin-pool-script, mountPath: /opt/engram/thin-pool.sh, subPath: thin-pool.sh, readOnly: true}
-            {{- end }}
           resources:
             requests: {cpu: "10m", memory: 32Mi}
             limits: {cpu: "100m", memory: 64Mi}
@@ -263,10 +259,8 @@ spec:
             # in the configmap, and matches the emptyDir layout).
             - name: ENGRAM_FIRECRACKER_BIN
               value: /opt/engram/firecracker
-            {{- if and .Values.nodePrep.enabled .Values.thinPool.enabled }}
             - name: ENGRAM_THIN_POOL
               value: {{ .Values.thinPool.name | quote }}
-            {{- end }}
             {{- if .Values.coordinator.tokenSecretName }}
             - name: ENGRAM_COORDINATOR_TOKEN
               valueFrom:
@@ -347,7 +341,7 @@ spec:
         {{- if .Values.nodePrep.enabled }}
         - {name: lib-modules, hostPath: {path: /lib/modules, type: Directory}}
         {{- end }}
-        {{- if and .Values.nodePrep.enabled .Values.thinPool.enabled }}
+        {{- if .Values.nodePrep.enabled }}
         - name: thin-pool-script
           configMap:
             name: {{ include "hostfleet.hostAgent.fullname" . }}-thin-pool

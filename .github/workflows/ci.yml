@@ -1997,6 +1997,14 @@ jobs:
       - name: Install squashfs-tools (for bundles-squashfs)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
+      # A Firecracker host-agent needs a session-disk pool; Tilt names
+      # engram-pool for the Firecracker backend.
+      - name: Build the dm-thin pool
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=12G POOL_META_SIZE=256M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+
       - name: Bring up prod-shape stack (tilt)
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release

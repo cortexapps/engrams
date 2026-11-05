@@ -201,7 +201,8 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Session disk
 
 A session's disk is a volume the kernel owns. On Linux it is a thin volume in a
-device-mapper pool that node-prep builds (`thinPool` in the host-fleet chart); on macOS
+device-mapper pool that node-prep builds (`thinPool` in the host-fleet chart; a Firecracker
+host agent refuses to start without one); on macOS
 it is a sparse file under the work dir. Both sit behind `engram_host_core::SessionDisk`
 and the two flows in `engram_host_core::disk_flows`: `stage` turns a chunk-store manifest
 into a volume, and `checkpoint` turns a volume into a manifest. The guard for each fact is

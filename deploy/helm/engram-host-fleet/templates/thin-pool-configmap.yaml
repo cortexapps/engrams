@@ -1,4 +1,4 @@
-{{- if and .Values.nodePrep.enabled .Values.thinPool.enabled }}
+{{- if .Values.nodePrep.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
