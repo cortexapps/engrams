@@ -311,6 +311,22 @@ metrics:
 # than K8s rolling pods out from under live microVMs.
 updateStrategy: OnDelete
 
+# ADR 0126: the drain before an incompatible upgrade. When the new
+# release's host-agent cannot adopt the VMs a host runs now, a pre-upgrade
+# hook cordons every such host and evicts each session to a checkpoint
+# before Helm changes anything, and a post-upgrade hook rolls the drained
+# host-agent pods onto the new build (the operator rolls them when it is
+# enabled). A no-op otherwise. The hooks run the operator image.
+upgradeDrain:
+  enabled: true
+  # The drain's budget; a session not evicted by then fails the upgrade
+  # before any change.
+  timeoutSeconds: 3600
+  # The coordinator's app-gRPC address. "" -> operator.coordinatorUrl, else
+  # the host of coordinator.endpoint on coordinatorGrpcPort.
+  coordinatorUrl: ""
+  coordinatorGrpcPort: 50061
+
 operator:
   # ADR 0044 K3: the drain-gated rollout operator. OFF by default until the
   # operator image is published + a coordinatorUrl is set; with it off, the

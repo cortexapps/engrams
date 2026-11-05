@@ -1,0 +1,120 @@
+{{- $url := include "hostfleet.upgrade.coordinatorUrl" . -}}
+{{- if and .Values.upgradeDrain.enabled $url -}}
+{{- /*
+ADR 0126: an upgrade whose host-agent cannot adopt the VMs a host runs now
+(an older reattach generation) drains every such host before Helm changes
+anything, then rolls the drained host-agent pods onto the new build. A no-op
+when the generation does not change. The coordinator chart runs the same
+drain, so either chart can be upgraded first.
+*/ -}}
+{{- $name := include "hostfleet.upgrade.fullname" . -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hostfleet.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,post-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hostfleet.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,post-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  # The drain's marker, read and removed by the roll.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, delete]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hostfleet.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,post-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- range $phase := list "drain" "roll" }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-{{ $phase }}
+  labels:
+    {{- include "hostfleet.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": {{ if eq $phase "drain" }}pre-upgrade{{ else }}post-upgrade{{ end }}
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add $.Values.upgradeDrain.timeoutSeconds 300 }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ $phase }}
+          image: "{{ $.Values.operator.image.repository }}:{{ $.Values.operator.image.tag | default $.Chart.AppVersion }}"
+          imagePullPolicy: {{ $.Values.operator.image.pullPolicy }}
+          args: [{{ printf "upgrade-%s" $phase | quote }}]
+          env:
+            - name: ENGRAM_COORDINATOR_URL
+              value: {{ $url | quote }}
+            {{- if $.Values.coordinator.tokenSecretName }}
+            - name: ENGRAM_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.coordinator.tokenSecretName }}
+                  key: {{ $.Values.coordinator.tokenSecretKey }}
+            {{- end }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENGRAM_UPGRADE_MARKER
+              value: {{ printf "%s-drained" $name | quote }}
+            - name: ENGRAM_UPGRADE_TIMEOUT_SECS
+              value: {{ $.Values.upgradeDrain.timeoutSeconds | quote }}
+            - name: ENGRAM_HOST_AGENT_DAEMONSET
+              value: {{ include "hostfleet.hostAgent.fullname" $ | quote }}
+            - name: ENGRAM_OPERATOR_ENABLED
+              value: {{ $.Values.operator.enabled | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}
+{{- end -}}

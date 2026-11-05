@@ -119,12 +119,19 @@ fn required_env(name: &str) -> Result<String, OperatorError> {
     std::env::var(name).map_err(|_| OperatorError::Invalid(format!("{name} must be set")))
 }
 
+/// The coordinator address and one bearer token. The coordinator chart's
+/// token Secret holds its comma-separated allowlist; any entry is accepted.
 fn coordinator_from_env() -> Result<(String, Option<String>), OperatorError> {
     Ok((
         required_env("ENGRAM_COORDINATOR_URL")?,
         std::env::var("ENGRAM_COORDINATOR_TOKEN")
             .ok()
-            .filter(|t| !t.is_empty()),
+            .and_then(|t| {
+                t.split(',')
+                    .map(str::trim)
+                    .find(|t| !t.is_empty())
+                    .map(String::from)
+            }),
     ))
 }
 

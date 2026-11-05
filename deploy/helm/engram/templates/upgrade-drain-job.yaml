@@ -1,0 +1,61 @@
+{{- if .Values.upgradeDrain.enabled -}}
+{{- /*
+ADR 0126: before an upgrade changes anything, drain every host the new
+build's host-agent cannot adopt (an older reattach generation): cordon it and
+evict each session to a checkpoint. A no-op when every host already runs the
+new generation. The host-fleet chart runs the same drain, so either chart
+can be upgraded first. A session it cannot evict fails the hook, and Helm
+then changes nothing.
+*/ -}}
+{{- $agSecret := .Values.appGrpc.tokensSecret.existingSecret | default .Values.auth.existingSecret }}
+{{- $agKey := .Values.appGrpc.tokensSecret.secretKey | default .Values.auth.secretKey }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "engram.coordinator.fullname" . }}-upgrade-drain
+  labels:
+    {{- include "engram.coordinator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add .Values.upgradeDrain.timeoutSeconds 300 }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: drain
+          image: "{{ .Values.upgradeDrain.image.repository }}:{{ .Values.upgradeDrain.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.upgradeDrain.image.pullPolicy }}
+          args: ["upgrade-drain"]
+          env:
+            - name: ENGRAM_COORDINATOR_URL
+              value: "http://{{ include "engram.coordinator.fullname" . }}:{{ .Values.appGrpc.port }}"
+            {{- if $agSecret }}
+            - name: ENGRAM_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $agSecret }}
+                  key: {{ $agKey }}
+            {{- end }}
+            - name: ENGRAM_UPGRADE_TIMEOUT_SECS
+              value: {{ .Values.upgradeDrain.timeoutSeconds | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end -}}
