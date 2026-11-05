@@ -28,6 +28,8 @@ pub enum OperatorError {
     Invalid(String),
     /// A cloud node-pool actuator (e.g. the GKE scaler) call failed.
     Cloud(engram_core::BackendError),
+    /// The upgrade drain or roll could not finish (ADR 0126).
+    Upgrade(String),
 }
 
 impl fmt::Display for OperatorError {
@@ -41,6 +43,7 @@ impl fmt::Display for OperatorError {
             ),
             Self::Invalid(msg) => write!(f, "invalid host-fleet state: {msg}"),
             Self::Cloud(e) => write!(f, "cloud scaler error: {e}"),
+            Self::Upgrade(msg) => write!(f, "upgrade: {msg}"),
         }
     }
 }
