@@ -31,8 +31,48 @@ import { applyCors, wsOriginAllowed } from "./auth/cors.ts";
 import { isUnderPreviewDomain } from "./apps/hostname.ts";
 import { config } from "./config.ts";
 import { log } from "./log.ts";
+import { parseTraceparent, SPAN_KIND_SERVER, tracer } from "./telemetry/trace.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
+
+/** Serve one request inside a server span, a child of the caller's
+ * `traceparent` when it sends one. The span ends when the response closes,
+ * so for a stream it covers the whole stream. */
+export function traceRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  handle: (req: IncomingMessage, res: ServerResponse) => void,
+): void {
+  if (!tracer.enabled) {
+    handle(req, res);
+    return;
+  }
+  const path = (req.url ?? "/").split("?")[0] ?? "/";
+  const rpc = path.startsWith("/rpc/") ? path.slice("/rpc/".length) : undefined;
+  const header = req.headers.traceparent;
+  void tracer.inSpan(
+    rpc ?? `HTTP ${req.method ?? "GET"}`,
+    {
+      kind: SPAN_KIND_SERVER,
+      parent: parseTraceparent(Array.isArray(header) ? header[0] : header),
+      attributes: {
+        "http.request.method": req.method,
+        "url.path": rpc ? undefined : path,
+        "rpc.method": rpc,
+      },
+    },
+    (span) =>
+      new Promise<void>((resolve) => {
+        const done = () => {
+          span.setAttribute("http.response.status_code", res.statusCode);
+          resolve();
+        };
+        res.once("finish", done);
+        res.once("close", done);
+        handle(req, res);
+      }),
+  );
+}
 
 /** A raw WS-upgrade hook, tried in order; an upgrade no hook claims is
  * destroyed. Returns `true` if it handled the upgrade, `false` to fall
@@ -73,7 +113,7 @@ export function buildServer(
   // abort correctly — unlike the hand-rolled fetch bridge it replaces.
   const honoListener = getRequestListener(app.fetch);
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const handle = (req: IncomingMessage, res: ServerResponse) => {
     // CORS gate runs before EVERYTHING — a preflight OPTIONS carries no
     // cookie and no IAP assertion by spec, so the fail-closed bridge below
     // would 401 it and no cross-origin call (split-host SPA → api host)
@@ -124,7 +164,14 @@ export function buildServer(
       // Everything else: delegate to Hono via getRequestListener.
       honoListener(req, res);
     });
-  });
+  };
+
+  // Preview hosts carry a session app's own traffic, not the orchestrator's.
+  const server = createServer((req: IncomingMessage, res: ServerResponse) =>
+    isUnderPreviewDomain(req.headers.host, previewBaseDomain)
+      ? handle(req, res)
+      : traceRequest(req, res, handle),
+  );
 
   // WebSocket upgrades: dispatch to the accept-first hooks.
   server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {

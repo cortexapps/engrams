@@ -160,6 +160,9 @@ import { retireProviderWebhookSchemes } from "./automations/retire-provider-webh
 import { makeAutomationStore } from "./db/automations.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
+import { initTracing, tracer } from "./telemetry/trace.ts";
+
+initTracing(process.env.OTEL_EXPORTER_OTLP_ENDPOINT);
 
 const app = new Hono();
 const warnSpecDocument = (message: string) => log.warn({ message }, "spec document warning");
@@ -576,8 +579,17 @@ const server = buildServer(
       "SessionService.SendPrompt": async (request) => {
         const sessionId = (request as { sessionId?: unknown }).sessionId;
         if (typeof sessionId !== "string") return;
-        const response = await controlPlaneSessions.getSession({ sessionId });
-        await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
+        await tracer.inSpan(
+          "send_prompt.prepare",
+          { attributes: { "session.id": sessionId } },
+          async () => {
+            const response = await controlPlaneSessions.getSession({ sessionId });
+            await productionSpecProjection.preparePrompt(
+              sessionId,
+              response.session?.status ?? "",
+            );
+          },
+        );
       },
     });
   },
@@ -743,6 +755,7 @@ process.on("SIGTERM", () => {
     // shutdownDbos() returns, and another pod must see this owner as live.
     await shutdownDbos();
     await heartbeat.stop();
+    await tracer.flush();
     if (serverError) {
       log.error({ err: serverError }, "orchestrator: error during shutdown");
       process.exit(1);
