@@ -261,8 +261,9 @@ and the site's CLI reference describe the user side.
     wrote: durable records on a node, chunk-store manifests, and the coordinator↔host wire.
     Both builds run at once during a roll.
   - **Ending sessions or deleting user data is an explicit decision.** A change that does
-    either says so in its PR description, with the count from production, and the owner
-    approves it.
+    either says so in its PR description, and the owner approves it after reviewing the
+    count from production. The count and any production detail stay out of this public
+    repository.
   - **Transitional code has an end.** Compatibility code lands with the follow-up that
     removes it, so the code returns to one path. No permanent shims, no "deprecated" stubs,
     no dangling references to old versions.
