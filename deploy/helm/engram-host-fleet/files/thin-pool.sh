@@ -11,8 +11,11 @@
 #   POOL_META_SIZE     metadata file size           (8G)
 #   POOL_BLOCK_SECTORS thin block size in 512-byte sectors (128 = 64 KiB)
 #   POOL_LOW_WATER     low-water mark in blocks     (32768 = 2 GiB at 64 KiB)
+#   POOL_RESERVE       free space left after the pool files are created
+#                      (15%); below the kubelet's eviction threshold the
+#                      node admits no pods, the host-agent included
 #   POOL_CACHE_DIR     the host-agent's chunk cache; cleared to make room
-#                      when the data file is first created on a used disk
+#                      when the pool files are first created on a used disk
 set -eu
 
 POOL_NAME=${POOL_NAME:-engram-pool}
@@ -21,6 +24,7 @@ POOL_DATA_SIZE=${POOL_DATA_SIZE:-50%}
 POOL_META_SIZE=${POOL_META_SIZE:-8G}
 POOL_BLOCK_SECTORS=${POOL_BLOCK_SECTORS:-128}
 POOL_LOW_WATER=${POOL_LOW_WATER:-32768}
+POOL_RESERVE=${POOL_RESERVE:-15%}
 
 META="$POOL_DIR/metadata.img"
 DATA="$POOL_DIR/data.img"
@@ -41,41 +45,53 @@ fi
 
 mkdir -p "$POOL_DIR"
 
-# A percentage is of the filesystem holding POOL_DIR.
-case "$POOL_DATA_SIZE" in
-    *%)
-        pct=${POOL_DATA_SIZE%\%}
-        total_kib=$(df -Pk "$POOL_DIR" | awk 'NR==2 {print $2}')
-        POOL_DATA_SIZE="$(( total_kib * pct / 100 ))K"
-        ;;
-esac
+# A size in KiB: a percentage of the filesystem holding POOL_DIR, or a
+# number with a K, M, G, or T suffix.
+total_kib=$(df -Pk "$POOL_DIR" | awk 'NR==2 {print $2}')
+kib() {
+    n=${1%?}
+    case "$1" in
+        *%) echo $(( total_kib * n / 100 )) ;;
+        *K) echo "$n" ;;
+        *M) echo $(( n * 1024 )) ;;
+        *G) echo $(( n * 1024 * 1024 )) ;;
+        *T) echo $(( n * 1024 * 1024 * 1024 )) ;;
+        *) log "FATAL: size $1 has no unit" >&2; exit 1 ;;
+    esac
+}
+avail_kib() { df -Pk "$POOL_DIR" | awk 'NR==2 {print $4}'; }
+data_kib=$(kib "$POOL_DATA_SIZE")
+meta_kib=$(kib "$POOL_META_SIZE")
+reserve_kib=$(kib "$POOL_RESERVE")
 
-# The data file first. On a used disk the chunk cache may hold the space
-# it needs; the cache refills from the chunk store, and no host-agent runs
-# while node-prep does.
-if [ ! -e "$DATA" ]; then
-    log "creating $DATA ($POOL_DATA_SIZE)"
-    if ! fallocate -l "$POOL_DATA_SIZE" "$DATA" 2>/dev/null; then
-        rm -f "$DATA"
-        if [ -n "${POOL_CACHE_DIR:-}" ] && [ -d "$POOL_CACHE_DIR" ]; then
-            log "not enough free space; clearing the chunk cache $POOL_CACHE_DIR"
-            rm -rf -- "$POOL_CACHE_DIR"
-            mkdir -p "$POOL_CACHE_DIR"
-        fi
-        if ! fallocate -l "$POOL_DATA_SIZE" "$DATA" 2>/dev/null; then
-            rm -f "$DATA"
-            log "FATAL: $POOL_DIR has too little free space for a $POOL_DATA_SIZE data file"
-            df -Pk "$POOL_DIR" >&2
-            exit 1
-        fi
+# The pool files are created once. They must leave the reserve free, or
+# the node reports disk pressure and admits no host-agent. On a used disk
+# the chunk cache may hold that space; the cache refills from the chunk
+# store, and no host-agent runs while node-prep does.
+need_kib=$reserve_kib
+[ -e "$DATA" ] || need_kib=$(( need_kib + data_kib ))
+[ -e "$META" ] || need_kib=$(( need_kib + meta_kib ))
+if [ "$need_kib" -gt "$reserve_kib" ] && [ "$(avail_kib)" -lt "$need_kib" ]; then
+    if [ -n "${POOL_CACHE_DIR:-}" ] && [ -d "$POOL_CACHE_DIR" ]; then
+        log "the pool files would leave less than $POOL_RESERVE free; clearing the chunk cache $POOL_CACHE_DIR"
+        rm -rf -- "$POOL_CACHE_DIR"
+        mkdir -p "$POOL_CACHE_DIR"
+    fi
+    if [ "$(avail_kib)" -lt "$need_kib" ]; then
+        log "FATAL: $POOL_DIR has too little free space for the pool files and a $POOL_RESERVE reserve"
+        df -Pk "$POOL_DIR" >&2
+        exit 1
     fi
 fi
-
+if [ ! -e "$DATA" ]; then
+    log "creating $DATA (${data_kib}K)"
+    fallocate -l "${data_kib}K" "$DATA" || { rm -f "$DATA"; exit 1; }
+fi
 # A metadata file whose superblock is still zero was never activated:
 # the kernel formats it on the first create, so it is fresh, not corrupt.
 if [ ! -e "$META" ]; then
-    log "creating $META ($POOL_META_SIZE)"
-    fallocate -l "$POOL_META_SIZE" "$META"
+    log "creating $META (${meta_kib}K)"
+    fallocate -l "${meta_kib}K" "$META" || { rm -f "$META"; exit 1; }
 fi
 fresh=0
 if [ "$(head -c 4096 "$META" | tr -d '\000' | wc -c)" -eq 0 ]; then
