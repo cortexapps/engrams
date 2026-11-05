@@ -1,7 +1,7 @@
 #!/bin/sh
 # Every state node prep's thin-pool.sh can find on a node, constructed on a
 # small loop-mounted filesystem so free space is under the test's control.
-# Needs root, device-mapper, and thin-provisioning-tools. Run from the repo
+# Needs root, device-mapper, thin-provisioning-tools, and a running udev. Run from the repo
 # root: sudo sh scripts/thin-pool-states-test.sh
 set -eu
 
@@ -33,10 +33,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Run the script with the chart's environment; output goes to $WORK/out.
+# Run the script as node prep does: the chart's environment, and an IPC
+# namespace of its own (node prep enters only the host's mount namespace),
+# so a step that waits on udev hangs here too. The timeout turns that hang
+# into a failure. Output goes to $WORK/out.
 prep() {
-    env POOL_NAME="$POOL" POOL_DIR="$MNT/thin" POOL_DATA_SIZE=50% POOL_META_SIZE=32M \
-        POOL_CACHE_DIR="$MNT/cache" sh "$SCRIPT" > "$WORK/out" 2>&1
+    timeout 120 unshare --ipc env POOL_NAME="$POOL" POOL_DIR="$MNT/thin" POOL_DATA_SIZE=50% \
+        POOL_META_SIZE=32M POOL_CACHE_DIR="$MNT/cache" sh "$SCRIPT" > "$WORK/out" 2>&1
 }
 
 fresh_fs() {
@@ -55,6 +58,7 @@ mount "$FS_LOOP" "$MNT"
 fresh_fs
 prep || { cat "$WORK/out"; fail "a fresh disk did not build the pool"; }
 dmsetup status "$POOL" | grep -q thin-pool || fail "no pool after a fresh build"
+[ -b "/dev/mapper/$POOL" ] || fail "no device node for the pool"
 pass "a fresh disk builds the pool"
 
 # 2. A chunk cache that holds the space is cleared, and the pool builds.
