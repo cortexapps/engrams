@@ -81,7 +81,16 @@ pub struct Volume {
     pub size_bytes: u64,
     pub chunk_size: u64,
     file: Arc<File>,
+    /// The same device opened for direct I/O, where the platform and the
+    /// filesystem allow it. Volume data the host writes goes through it,
+    /// so the host leaves no dirty pages behind: block-device writeback
+    /// of a bio-based device such as dm-thin issues page-sized writes, and
+    /// a close that must flush them can block for minutes.
+    direct: Option<Arc<File>>,
 }
+
+/// Alignment for a direct write's offset, length and buffer.
+const DIRECT_ALIGN: usize = 4096;
 
 impl Volume {
     /// Open the device or file at `path` read-write.
@@ -99,6 +108,7 @@ impl Volume {
             size_bytes,
             chunk_size,
             file: Arc::new(file),
+            direct: open_direct(path).map(Arc::new),
         })
     }
 
@@ -156,10 +166,7 @@ impl Volume {
                 ),
             ));
         }
-        let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
-            .await
-            .map_err(|e| io::Error::other(format!("write_chunk task: {e}")))?
+        self.write_at(offset, bytes, "write_chunk").await
     }
 
     /// Make chunk `index` read as zeros and hold no space.
@@ -188,10 +195,22 @@ impl Volume {
     /// Write `bytes` at `offset`; the range must lie inside the volume.
     pub async fn write_range(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
         self.check_range(offset, bytes.len() as u64)?;
+        self.write_at(offset, bytes, "write_range").await
+    }
+
+    /// Write through the direct handle when `offset` and the length are
+    /// aligned for it, otherwise through the page cache.
+    async fn write_at(&self, offset: u64, bytes: Vec<u8>, what: &'static str) -> io::Result<()> {
+        let aligned =
+            offset.is_multiple_of(DIRECT_ALIGN as u64) && bytes.len().is_multiple_of(DIRECT_ALIGN);
+        let direct = self.direct.as_ref().filter(|_| aligned).map(Arc::clone);
         let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
-            .await
-            .map_err(|e| io::Error::other(format!("write_range task: {e}")))?
+        tokio::task::spawn_blocking(move || match direct.zip(AlignedBuf::copy_of(&bytes)) {
+            Some((direct, buf)) => direct.write_all_at(buf.as_slice(), offset),
+            None => file.write_all_at(&bytes, offset),
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("{what} task: {e}")))?
     }
 
     fn check_range(&self, offset: u64, len: u64) -> io::Result<()> {
@@ -213,6 +232,51 @@ impl Volume {
         tokio::task::spawn_blocking(move || file.sync_all())
             .await
             .map_err(|e| io::Error::other(format!("sync task: {e}")))?
+    }
+}
+
+/// `path` opened read-write for direct I/O, or `None` where the platform
+/// or the filesystem refuses it (tmpfs, macOS).
+#[cfg(target_os = "linux")]
+fn open_direct(path: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_direct(_path: &Path) -> Option<File> {
+    None
+}
+
+/// A copy of some bytes at an address aligned for direct I/O: a buffer
+/// with `DIRECT_ALIGN` spare bytes, sliced at its first aligned address.
+struct AlignedBuf {
+    buf: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl AlignedBuf {
+    /// `None` when the allocation offers no aligned address.
+    fn copy_of(bytes: &[u8]) -> Option<Self> {
+        let mut buf = vec![0u8; bytes.len() + DIRECT_ALIGN];
+        let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        buf.get_mut(start..start.checked_add(bytes.len())?)?
+            .copy_from_slice(bytes);
+        Some(Self {
+            buf,
+            start,
+            len: bytes.len(),
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.start + self.len]
     }
 }
 
@@ -497,6 +561,26 @@ mod tests {
         assert!(VolumeName::new("has/slash").is_err());
         assert!(VolumeName::new("a".repeat(127)).is_ok());
         assert!(VolumeName::new("a".repeat(128)).is_err());
+    }
+
+    #[test]
+    fn an_aligned_copy_starts_on_the_boundary_and_keeps_the_bytes() {
+        for len in [0, 1, 4095, 4096, 65536 + 7] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let buf = AlignedBuf::copy_of(&bytes).expect("a heap buffer has an aligned address");
+            assert_eq!(buf.as_slice().as_ptr() as usize % DIRECT_ALIGN, 0);
+            assert_eq!(buf.as_slice(), &bytes[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn unaligned_and_aligned_range_writes_both_land() {
+        let (_dir, disk) = disk();
+        let v = disk.create(&name("v"), 4 * CHUNK).await.unwrap();
+        v.write_range(4096, vec![0xAA; 8192]).await.unwrap();
+        v.write_range(3, vec![0xBB; 5]).await.unwrap();
+        assert_eq!(v.read_range(4096, 8192).await.unwrap(), vec![0xAA; 8192]);
+        assert_eq!(v.read_range(3, 5).await.unwrap(), vec![0xBB; 5]);
     }
 
     #[tokio::test]

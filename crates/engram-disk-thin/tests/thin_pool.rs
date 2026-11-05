@@ -391,3 +391,51 @@ async fn delete_waits_for_a_holder_that_closes_soon() {
     deleting.await.unwrap().unwrap();
     assert!(!disk.list().await.unwrap().contains(&live));
 }
+
+/// Writes completed and sectors written at the block device behind `path`.
+fn device_writes(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = std::fs::metadata(path).unwrap().rdev();
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    let stat = std::fs::read_to_string(format!("/sys/dev/block/{major}:{minor}/stat")).unwrap();
+    let fields: Vec<u64> = stat
+        .split_whitespace()
+        .map(|f| f.parse().unwrap())
+        .collect();
+    (fields[4], fields[6])
+}
+
+#[tokio::test]
+async fn chunk_writes_reach_the_device_whole_and_without_a_sync() {
+    let disk = pool_or_skip!();
+    let v = disk
+        .create(&name("direct", "root"), CHUNK * CHUNKS)
+        .await
+        .unwrap();
+    let (writes_before, sectors_before) = device_writes(&v.path);
+    for i in 0..CHUNKS {
+        v.write_chunk(ChunkIndex(i), fill(i as u8 + 1))
+            .await
+            .unwrap();
+    }
+    let (writes_after, sectors_after) = device_writes(&v.path);
+    let (writes, sectors) = (writes_after - writes_before, sectors_after - sectors_before);
+    assert_eq!(
+        sectors * 512,
+        CHUNK * CHUNKS,
+        "every chunk is on the device before any sync, so nothing waits in the page cache"
+    );
+    assert!(
+        sectors * 512 / writes.max(1) >= CHUNK / 2,
+        "{writes} writes for {sectors} sectors: chunk writes must not split into pages"
+    );
+    for i in 0..CHUNKS {
+        assert_eq!(
+            v.read_chunk(ChunkIndex(i)).await.unwrap(),
+            fill(i as u8 + 1)
+        );
+    }
+    drop(v);
+    disk.delete(&name("direct", "root")).await.unwrap();
+}
