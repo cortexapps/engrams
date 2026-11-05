@@ -11,6 +11,8 @@
 #   POOL_META_SIZE     metadata file size           (8G)
 #   POOL_BLOCK_SECTORS thin block size in 512-byte sectors (128 = 64 KiB)
 #   POOL_LOW_WATER     low-water mark in blocks     (32768 = 2 GiB at 64 KiB)
+#   POOL_CACHE_DIR     the host-agent's chunk cache; cleared to make room
+#                      when the data file is first created on a used disk
 set -eu
 
 POOL_NAME=${POOL_NAME:-engram-pool}
@@ -48,15 +50,36 @@ case "$POOL_DATA_SIZE" in
         ;;
 esac
 
-fresh=0
+# The data file first. On a used disk the chunk cache may hold the space
+# it needs; the cache refills from the chunk store, and no host-agent runs
+# while node-prep does.
+if [ ! -e "$DATA" ]; then
+    log "creating $DATA ($POOL_DATA_SIZE)"
+    if ! fallocate -l "$POOL_DATA_SIZE" "$DATA" 2>/dev/null; then
+        rm -f "$DATA"
+        if [ -n "${POOL_CACHE_DIR:-}" ] && [ -d "$POOL_CACHE_DIR" ]; then
+            log "not enough free space; clearing the chunk cache $POOL_CACHE_DIR"
+            rm -rf -- "$POOL_CACHE_DIR"
+            mkdir -p "$POOL_CACHE_DIR"
+        fi
+        if ! fallocate -l "$POOL_DATA_SIZE" "$DATA" 2>/dev/null; then
+            rm -f "$DATA"
+            log "FATAL: $POOL_DIR has too little free space for a $POOL_DATA_SIZE data file"
+            df -Pk "$POOL_DIR" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# A metadata file whose superblock is still zero was never activated:
+# the kernel formats it on the first create, so it is fresh, not corrupt.
 if [ ! -e "$META" ]; then
     log "creating $META ($POOL_META_SIZE)"
     fallocate -l "$POOL_META_SIZE" "$META"
-    fresh=1
 fi
-if [ ! -e "$DATA" ]; then
-    log "creating $DATA ($POOL_DATA_SIZE)"
-    fallocate -l "$POOL_DATA_SIZE" "$DATA"
+fresh=0
+if [ "$(head -c 4096 "$META" | tr -d '\000' | wc -c)" -eq 0 ]; then
+    fresh=1
 fi
 
 attach() {

@@ -252,6 +252,11 @@ the test named beside it.
   answer with the older checkpoint and drop the writes since it
   (`a_lost_pending_checkpoint_fails_the_disk_leg`,
   `quarantined_finalize_releases_the_capture_lock`).
+- Node prep builds the pool on a node's first boot and re-activates it after `thin_check` on
+  every later one. On a used disk it clears the chunk cache when the pool's data file needs
+  the room; a disk too small even then fails node prep with a clear message and leaves no
+  partial file. A metadata file a crash left before the first activation is formatted, not
+  rejected (`scripts/thin-pool-states-test.sh`).
 - A stage reads the node's chunk cache before blob storage
   (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
   prefetch pulled are not fetched a second time.
