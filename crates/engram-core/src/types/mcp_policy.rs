@@ -220,7 +220,10 @@ pub fn pending_request<'a>(
             e.payload["tool_call_id"].as_str() == Some(call)
                 && matches!(
                     e.kind.as_str(),
-                    "tool_call_requested" | "tool_result_submitted" | "tool_call_completed"
+                    "tool_call_requested"
+                        | "tool_result_submitted"
+                        | "tool_call_completed"
+                        | "tool_call_cancel_requested"
                 )
         })
         .collect();
@@ -235,7 +238,7 @@ pub fn pending_request<'a>(
         || relevant.iter().any(|e| {
             matches!(
                 e.kind.as_str(),
-                "tool_result_submitted" | "tool_call_completed"
+                "tool_result_submitted" | "tool_call_completed" | "tool_call_cancel_requested"
             ) || (e.kind == "tool_call_requested" && request_digest(e) != request_digest(first))
         })
     {
@@ -334,6 +337,29 @@ pub fn execution_identity_fence(
                 "run_started" | "run_completed" | "run_interrupted"
             )
     });
+    let run_is_current = last_run.is_some_and(|e| {
+        e.payload["run_id"].as_str() == Some(&ctx.run_id)
+            && match e.kind.as_str() {
+                "run_started" => true,
+                "run_completed" => {
+                    e.payload["ok"].as_bool() == Some(true)
+                        && request.idx < e.idx
+                        && e.payload["deferred_tool_call_ids"]
+                            .as_array()
+                            .is_some_and(|ids| {
+                                let mut seen = std::collections::BTreeSet::new();
+                                ids.len() <= 128
+                                    && ids.iter().all(|id| {
+                                        id.as_str().is_some_and(|id| {
+                                            !id.is_empty() && id.len() <= 256 && seen.insert(id)
+                                        })
+                                    })
+                                    && seen.contains(ctx.tool_call_id.as_str())
+                            })
+                }
+                _ => false,
+            }
+    });
     if expected.model_tool_name.is_empty()
         || expected.model_tool_name.len() > 256
         || expected.original_arguments.len() > 256 * 1024
@@ -341,9 +367,7 @@ pub fn execution_identity_fence(
         || request.payload["args_json"].as_str() != Some(&expected.original_arguments)
         || ctx.run_id.is_empty()
         || request.payload["run_id"].as_str() != Some(&ctx.run_id)
-        || last_run.is_none_or(|e| {
-            e.kind != "run_started" || e.payload["run_id"].as_str() != Some(&ctx.run_id)
-        })
+        || !run_is_current
     {
         return Ok(DispatchFence::Stale);
     }

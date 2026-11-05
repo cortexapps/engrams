@@ -73,7 +73,7 @@ async fn events(
 ) -> Result<Vec<PersistedEvent>, MetaError> {
     // At most one run event accompanies call history. A truncated history always
     // contains at least 1024 call events, which the shared validator rejects.
-    let rows=sqlx::query("SELECT idx,kind,payload,created_at,recovery_epoch::bigint AS recovery_epoch,rewound_at FROM session_events WHERE session_id=$1 AND ((payload->>'tool_call_id'=$2 AND kind IN ('tool_call_requested','tool_result_submitted','tool_call_completed')) OR idx=(SELECT max(idx) FROM session_events WHERE session_id=$1 AND rewound_at IS NULL AND kind IN ('run_started','run_completed','run_interrupted'))) ORDER BY idx LIMIT 1025")
+    let rows=sqlx::query("SELECT idx,kind,payload,created_at,recovery_epoch::bigint AS recovery_epoch,rewound_at FROM session_events WHERE session_id=$1 AND ((payload->>'tool_call_id'=$2 AND kind IN ('tool_call_requested','tool_result_submitted','tool_call_completed','tool_call_cancel_requested')) OR idx=(SELECT max(idx) FROM session_events WHERE session_id=$1 AND rewound_at IS NULL AND kind IN ('run_started','run_completed','run_interrupted'))) ORDER BY idx LIMIT 1025")
         .bind(id.as_uuid()).bind(call).fetch_all(&mut **tx).await.map_err(db_err)?;
     rows.into_iter()
         .map(|r| {

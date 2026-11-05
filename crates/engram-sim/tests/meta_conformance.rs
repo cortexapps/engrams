@@ -8443,6 +8443,263 @@ conformance!(
     super::mcp_write_policy_projections_and_fences
 );
 
+async fn mcp_write_policy_deferred_execution_identity(ctx: &Ctx) {
+    use engram_core::types::mcp_policy::*;
+    use serde_json::json;
+
+    let deferred = json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a"]});
+    for (name, completion, followup, expected) in [
+        (
+            "ordinary",
+            json!({"run_id":"run-a","ok":true}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "parked marker only",
+            json!({"run_id":"run-a","ok":true}),
+            Some(("harness_parked", json!({}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "empty association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":[]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "unrelated call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-b"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "failed run",
+            json!({"run_id":"run-a","ok":false,"deferred_tool_call_ids":["write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "wrong run",
+            json!({"run_id":"run-b","ok":true,"deferred_tool_call_ids":["write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "duplicate call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a","write-a"]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "empty call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a",""]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "long call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a","x".repeat(257)]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "nonstring call",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":["write-a",1]}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "nonarray association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids":"write-a"}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "too many calls",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids": std::iter::once("write-a".to_owned()).chain((0..128).map(|n| format!("call-{n}"))).collect::<Vec<_>>()}),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "interrupted",
+            deferred.clone(),
+            Some(("run_interrupted", json!({"run_id":"run-a"}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "new run",
+            deferred.clone(),
+            Some(("run_started", json!({"run_id":"run-b"}))),
+            DispatchFence::Stale,
+        ),
+        (
+            "submitted result",
+            deferred.clone(),
+            Some((
+                "tool_result_submitted",
+                json!({"tool_call_id":"write-a","result_json":"{}"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "completed call",
+            deferred.clone(),
+            Some((
+                "tool_call_completed",
+                json!({"run_id":"run-a","tool_call_id":"write-a","ok":true}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "canceled call",
+            deferred.clone(),
+            Some((
+                "tool_call_cancel_requested",
+                json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "changed request",
+            deferred.clone(),
+            Some((
+                "tool_call_requested",
+                json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write","args_json":"{\"changed\":true}"}),
+            )),
+            DispatchFence::Stale,
+        ),
+        (
+            "request after completion",
+            deferred.clone(),
+            None,
+            DispatchFence::Stale,
+        ),
+        (
+            "deferred before parked marker",
+            deferred.clone(),
+            None,
+            DispatchFence::Current,
+        ),
+        (
+            "maximum association",
+            json!({"run_id":"run-a","ok":true,"deferred_tool_call_ids": std::iter::once("write-a".to_owned()).chain((0..127).map(|n| format!("call-{n}"))).collect::<Vec<_>>()}),
+            None,
+            DispatchFence::Current,
+        ),
+    ] {
+        let id = SessionId::new();
+        mcp_write_policy_create(ctx, id, None, WriteEligibility::WriteEligible).await;
+        for status in [
+            SessionState::Pending,
+            SessionState::Created,
+            SessionState::Active,
+        ] {
+            ctx.meta
+                .transition_session(id, status, BindingDisposition::Retain)
+                .await
+                .unwrap();
+        }
+        ctx.meta
+            .append_session_event(id, "run_started", json!({"run_id":"run-a"}))
+            .await
+            .unwrap();
+        let call = json!({"run_id":"run-a","tool_call_id":"write-a","name":"mcp__fixture__write","args_json":"{}"});
+        if name != "request after completion" {
+            ctx.meta
+                .append_session_event(id, "tool_call_requested", call.clone())
+                .await
+                .unwrap();
+        }
+        let policy = ctx.meta.read_mcp_write_policy(id).await.unwrap();
+        let request = RequestPolicyContext {
+            session_id: id,
+            run_id: "run-a".into(),
+            tool_call_id: "write-a".into(),
+            accepted_policy_ref: policy.reference,
+            accepted_write_eligibility: policy.write_eligibility,
+            ancestor_policy_refs: policy.ancestor_policy_refs,
+        };
+        let execution = ExecutionRequest {
+            model_tool_name: "mcp__fixture__write".into(),
+            original_arguments: "{}".into(),
+        };
+        ctx.meta
+            .append_session_event(id, "run_completed", completion)
+            .await
+            .unwrap();
+        if name == "request after completion" {
+            ctx.meta
+                .append_session_event(id, "tool_call_requested", call)
+                .await
+                .unwrap();
+        }
+        if let Some((kind, payload)) = followup {
+            ctx.meta
+                .append_session_event(id, kind, payload)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_execution_identity(&request, &execution)
+                .await
+                .unwrap(),
+            expected,
+            "{name}"
+        );
+        assert_eq!(
+            ctx.meta
+                .validate_mcp_dispatch_fence(&request, &execution)
+                .await
+                .unwrap(),
+            expected,
+            "{name}"
+        );
+        if expected == DispatchFence::Current {
+            let mut forged = request.clone();
+            forged.run_id = "other-run".into();
+            assert_eq!(
+                ctx.meta
+                    .validate_mcp_execution_identity(&forged, &execution)
+                    .await
+                    .unwrap(),
+                DispatchFence::Stale
+            );
+            for changed in [
+                ExecutionRequest {
+                    model_tool_name: "mcp__fixture__other".into(),
+                    ..execution.clone()
+                },
+                ExecutionRequest {
+                    original_arguments: "{ }".into(),
+                    ..execution.clone()
+                },
+            ] {
+                assert_eq!(
+                    ctx.meta
+                        .validate_mcp_execution_identity(&request, &changed)
+                        .await
+                        .unwrap(),
+                    DispatchFence::Stale
+                );
+            }
+            ctx.meta.rewind_session_to_cursor(id, 0).await.unwrap();
+            assert_eq!(
+                ctx.meta
+                    .validate_mcp_execution_identity(&request, &execution)
+                    .await
+                    .unwrap(),
+                DispatchFence::Stale
+            );
+        }
+    }
+}
+conformance!(
+    t_mcp_write_policy_deferred_execution_identity,
+    super::mcp_write_policy_deferred_execution_identity
+);
+
 async fn mcp_write_policy_restore_and_generic_results(ctx: &Ctx) {
     use engram_core::types::mcp_policy::*;
     let id = SessionId::new();

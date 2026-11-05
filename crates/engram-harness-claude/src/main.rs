@@ -2408,6 +2408,20 @@ mod adapter {
         ]
     }
 
+    fn unresolved_deferred_ids(
+        run_id: &str,
+        calls: &HashMap<String, hook_server::DeferredCall>,
+        results: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut ids: Vec<_> = calls
+            .iter()
+            .filter(|(id, call)| call.run_id == run_id && !results.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The single in-flight turn, owned by the session loop. `run_id` is
     /// minted on prompt-accept — BEFORE any claude output — so no event
     /// can be emitted without a valid `run_id`. The bare-event desync
@@ -2976,11 +2990,37 @@ mod adapter {
                                         interrupted_run = None;
                                         interrupt_deadline = None;
                                     }
+                                    // Only the hook ledger can establish a deferred request.
+                                    // The model's terminal marker and transcript are not authority.
+                                    let mut deferred_ids = Vec::new();
+                                    if !abort_requested
+                                        && !marker.is_error
+                                        && (tool_deferred || narrated_past)
+                                        && pending.is_empty()
+                                        && bg_agents == 0
+                                    {
+                                        let results = results_in_hand.lock().await;
+                                        if !is_delivery_resume || results.is_empty() {
+                                            let calls = deferred_calls.lock().await;
+                                            deferred_ids = unresolved_deferred_ids(&run_id, &calls, &results);
+                                        }
+                                    }
+                                    let invalid_deferred_ids = deferred_ids.len() > 128
+                                        || deferred_ids.iter().any(|id| id.is_empty() || id.len() > 256);
                                     if abort_requested
                                         && marker.subtype == "error_during_execution"
                                     {
                                         // The `control_request` abort landed.
                                         emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
+                                    } else if !deferred_ids.is_empty() && !invalid_deferred_ids {
+                                        emit(
+                                            evt_tx,
+                                            HarnessEvent::RunDeferred {
+                                                run_id,
+                                                deferred_tool_call_ids: deferred_ids,
+                                            },
+                                        )
+                                        .await;
                                     } else {
                                         // Either no abort was requested, or
                                         // the turn COMPLETED in the
@@ -2994,7 +3034,7 @@ mod adapter {
                                             evt_tx,
                                             HarnessEvent::RunCompleted {
                                                 run_id,
-                                                ok: !marker.is_error,
+                                                ok: !marker.is_error && !invalid_deferred_ids,
                                             },
                                         )
                                         .await;
@@ -8720,6 +8760,117 @@ mod adapter {
             (cli, state.hook_sock(), state.mcp_sock())
         }
 
+        #[test]
+        fn deferred_association_excludes_other_runs_and_received_results() {
+            let calls = [
+                ("current", "run-a"),
+                ("received", "run-a"),
+                ("stale", "run-b"),
+            ]
+            .into_iter()
+            .map(|(id, run)| {
+                (
+                    id.to_string(),
+                    hook_server::DeferredCall {
+                        run_id: run.to_string(),
+                        tool_name: "save_memory".to_string(),
+                    },
+                )
+            })
+            .collect();
+            let results = [("received".to_string(), "{}".to_string())]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                unresolved_deferred_ids("run-a", &calls, &results),
+                ["current"]
+            );
+        }
+
+        #[tokio::test]
+        async fn forged_failed_and_invalid_deferred_calls_do_not_authorize_suspension() {
+            use std::os::unix::fs::PermissionsExt;
+
+            for (case, hook_id, is_error, expected_ok) in [
+                ("forged", None, false, true),
+                ("failed", Some("toolu_failed".to_string()), true, false),
+                ("oversized", Some("x".repeat(257)), false, false),
+            ] {
+                let base =
+                    std::env::temp_dir().join(format!("deferred-check-{}", uuid::Uuid::new_v4()));
+                let script = base.with_extension("sh");
+                let gate = base.with_extension("gate");
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\nIFS= read -r _prompt\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"forged\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"forged-id\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{}}}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"{}\",\"is_error\":{},\"terminal_reason\":\"tool_deferred\"}}'\nwhile IFS= read -r _line; do :; done\n",
+                    gate.display(),
+                    if is_error { "error_during_execution" } else { "success" },
+                    is_error,
+                );
+                tokio::fs::write(&script, body).await.unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let (cli, hook, _) = deferred_engine_cli(script.to_string_lossy().into_owned());
+                let (cmd_tx, cmd_rx) = mpsc::channel(8);
+                let (evt_tx, mut evt_rx) = mpsc::channel(64);
+                let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+                assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+                cmd_tx
+                    .send(HarnessCommand::Prompt {
+                        prompt_id: case.into(),
+                        text: "test".into(),
+                        mode: None,
+                    })
+                    .await
+                    .unwrap();
+                let run_id = expect_run_started(&mut evt_rx).await;
+                if let Some(id) = hook_id {
+                    assert!(matches!(
+                        hook_fire_named(
+                            &hook,
+                            &id,
+                            "mcp__engrams__save_memory",
+                            serde_json::json!({"text":"remember"})
+                        )
+                        .await,
+                        hook_server::HookVerdict::Defer
+                    ));
+                    assert!(
+                        matches!(evt_rx.recv().await, Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == id)
+                    );
+                }
+                tokio::fs::write(&gate, "go").await.unwrap();
+                let event = tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        match evt_rx.recv().await {
+                            Some(event @ HarnessEvent::RunCompleted { .. })
+                            | Some(event @ HarnessEvent::RunDeferred { .. }) => break event,
+                            Some(_) => {}
+                            None => panic!("event stream closed for {case}"),
+                        }
+                    }
+                })
+                .await
+                .expect("terminal event");
+                assert_eq!(
+                    event,
+                    HarnessEvent::RunCompleted {
+                        run_id,
+                        ok: expected_ok
+                    },
+                    "{case}"
+                );
+                cmd_tx
+                    .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), engine)
+                    .await
+                    .expect("engine exits")
+                    .expect("engine task");
+                let _ = tokio::fs::remove_file(script).await;
+                let _ = tokio::fs::remove_file(gate).await;
+            }
+        }
+
         #[tokio::test]
         async fn deferred_result_after_process_death_resumes_and_serves_refire() {
             let counter =
@@ -8739,7 +8890,7 @@ mod adapter {
                 })
                 .await
                 .unwrap();
-            let _ = expect_run_started(&mut evt_rx).await;
+            let deferred_run = expect_run_started(&mut evt_rx).await;
             assert!(matches!(
                 hook_fire_named(
                     &hook,
@@ -8759,12 +8910,20 @@ mod adapter {
             // Drain the deferred turn's tool log/completion and both Parked
             // announcements: one at turn-end, one from the respawned process.
             let mut waiting = Vec::new();
+            let mut terminal = None;
             tokio::time::timeout(Duration::from_secs(8), async {
                 while waiting.len() < 2 {
                     match evt_rx.recv().await {
                         Some(HarnessEvent::Parked) => waiting.push("parked"),
                         Some(HarnessEvent::Idle) => waiting.push("idle"),
-                        Some(_) => {}
+                        Some(event) => {
+                            let value = serde_json::to_value(event).unwrap();
+                            if value.get("RunCompleted").is_some()
+                                || value.get("RunDeferred").is_some()
+                            {
+                                terminal = Some(value);
+                            }
+                        }
                         None => panic!("engine event channel closed before parked re-announce"),
                     }
                 }
@@ -8772,6 +8931,12 @@ mod adapter {
             .await
             .expect("the dead first process should respawn");
             assert_eq!(waiting, ["parked", "parked"]);
+            assert_eq!(
+                terminal,
+                Some(serde_json::json!({
+                    "RunDeferred": {"run_id": deferred_run, "deferred_tool_call_ids": ["toolu_deferred"]}
+                }))
+            );
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {

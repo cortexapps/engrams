@@ -270,6 +270,12 @@ session, run, call, connection, catalog, generation, and canonical argument hash
 It cannot expand grants or be replayed. Automation-plan approval cannot approve
 MCP writes. Unrestricted automation constraints `{}` must be selected explicitly.
 
+A successful model turn can suspend on deferred calls. The harness records their
+exact call IDs atomically with completion; this does not grant access. The fence
+still requires the same current run and unresolved request. Ordinary or failed
+completion, interruption, a newer run, and invalid associations remain stale.
+The appended harness event requires matching version 42 host and guest artifacts.
+
 Keep the authoritative call journal separate from the UI pending projection.
 Use unique `(session_id, tool_call_id)` and immutable request digests. Enforce
 `waiting_approval -> authorized -> dispatching -> succeeded/failed/canceled/outcome_unknown`

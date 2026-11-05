@@ -174,7 +174,9 @@ use serde::{Deserialize, Serialize};
 // v39 appends the harness per-call cancellation signal. Older fleets cannot decode it.
 // v40 adds immutable managed creation reservation and native-manifest reads.
 // v41: exact managed prepare/read/finalize/start authority. No ordinary fallback.
-pub const WIRE_VERSION: u32 = 41;
+// v42 appends exact deferred-call association to harness turn completion.
+// Coordinator, host and baked harness artifacts must roll together.
+pub const WIRE_VERSION: u32 = 42;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

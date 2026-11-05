@@ -109,6 +109,12 @@ pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
             }
         ),
         (s(), any::<bool>()).prop_map(|(run_id, ok)| HarnessEvent::RunCompleted { run_id, ok }),
+        (s(), prop::collection::vec(s(), 0..5)).prop_map(|(run_id, deferred_tool_call_ids)| {
+            HarnessEvent::RunDeferred {
+                run_id,
+                deferred_tool_call_ids,
+            }
+        }),
         s().prop_map(|run_id| HarnessEvent::RunInterrupted { run_id }),
         s().prop_map(|run_id| HarnessEvent::RunContinued { run_id }),
         Just(HarnessEvent::Idle),
@@ -385,6 +391,7 @@ fn _exhaustiveness_harness_event(e: &HarnessEvent) {
         HarnessEvent::ToolCallStarted { .. } => {}
         HarnessEvent::ToolCallCompleted { .. } => {}
         HarnessEvent::RunCompleted { .. } => {}
+        HarnessEvent::RunDeferred { .. } => {}
         HarnessEvent::RunInterrupted { .. } => {}
         HarnessEvent::RunContinued { .. } => {}
         HarnessEvent::Idle => {}

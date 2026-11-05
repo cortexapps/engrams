@@ -478,6 +478,13 @@ pub enum HarnessEvent {
         call_id: String,
         name: String,
     },
+    /// Successful turn suspension on these exact, still-pending deferred calls.
+    /// Appended to preserve existing positional encodings. This is a lifecycle
+    /// association only; the coordinator must still authorize each request.
+    RunDeferred {
+        run_id: String,
+        deferred_tool_call_ids: Vec<String>,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -506,6 +513,7 @@ impl HarnessEvent {
             | Self::ToolCallStarted { run_id, .. }
             | Self::ToolCallCompleted { run_id, .. }
             | Self::RunCompleted { run_id, .. }
+            | Self::RunDeferred { run_id, .. }
             | Self::RunInterrupted { run_id }
             | Self::AgentMessageChunk { run_id, .. }
             | Self::FileChanged { run_id, .. }
@@ -533,6 +541,7 @@ impl HarnessEvent {
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::RunCompleted { .. } => "run_completed",
+            Self::RunDeferred { .. } => "run_completed",
             Self::RunInterrupted { .. } => "run_interrupted",
             Self::RunContinued { .. } => "run_continued",
             Self::PromptQueued { .. } => "prompt_queued",
@@ -1219,6 +1228,14 @@ mod tests {
         assert_eq!(
             HarnessEvent::RunInterrupted { run_id: "x".into() }.kind(),
             "run_interrupted"
+        );
+        assert_eq!(
+            HarnessEvent::RunDeferred {
+                run_id: "x".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            }
+            .kind(),
+            "run_completed"
         );
         assert_eq!(
             HarnessEvent::PromptQueued {

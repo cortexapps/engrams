@@ -208,6 +208,8 @@ pub enum SessionEvent {
     HarnessRunCompleted {
         run_id: String,
         ok: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_tool_call_ids: Vec<String>,
         at: DateTime<Utc>,
     },
     /// ADR 0030: the in-flight run was stopped by an operator interrupt
@@ -661,9 +663,21 @@ impl SessionEvent {
                 name,
                 at,
             },
-            HarnessEvent::RunCompleted { run_id, ok } => {
-                Self::HarnessRunCompleted { run_id, ok, at }
-            }
+            HarnessEvent::RunCompleted { run_id, ok } => Self::HarnessRunCompleted {
+                run_id,
+                ok,
+                deferred_tool_call_ids: Vec::new(),
+                at,
+            },
+            HarnessEvent::RunDeferred {
+                run_id,
+                deferred_tool_call_ids,
+            } => Self::HarnessRunCompleted {
+                run_id,
+                ok: true,
+                deferred_tool_call_ids,
+                at,
+            },
             HarnessEvent::RunContinued { run_id } => Self::HarnessRunContinued { run_id, at },
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted {
                 run_id,
@@ -2114,6 +2128,36 @@ pub(crate) mod tests {
             SessionEvent::PromptReceived { prompt_id, .. } => assert_eq!(prompt_id, "p-1"),
             other => panic!("expected PromptReceived, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deferred_completion_keeps_exact_association_and_old_records_default_closed() {
+        let at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let event = SessionEvent::from_harness(
+            HarnessEvent::RunDeferred {
+                run_id: "r1".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            },
+            at,
+        );
+        assert_eq!(event.kind(), "run_completed");
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["deferred_tool_call_ids"], serde_json::json!(["t1"]));
+        let old = SessionEvent::from_harness(
+            HarnessEvent::RunCompleted {
+                run_id: "r1".into(),
+                ok: true,
+            },
+            at,
+        );
+        let old_json = serde_json::to_value(&old).unwrap();
+        assert!(old_json.get("deferred_tool_call_ids").is_none());
+        assert!(
+            matches!(serde_json::from_value::<SessionEvent>(old_json).unwrap(),
+            SessionEvent::HarnessRunCompleted { deferred_tool_call_ids, .. }
+                if deferred_tool_call_ids.is_empty())
+        );
     }
 
     #[test]
