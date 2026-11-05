@@ -70,7 +70,16 @@ fn agentd_musl_bin() -> PathBuf {
 /// — every InRelease fetch timed out after 40s). So we do all the
 /// network work HOST-side (download ttyd via `curl`) and use only
 /// `COPY` inside Docker, which doesn't need DNS.
-async fn bake_shell_rootfs(busybox: &Path) -> PathBuf {
+/// The baked rootfs file, the chunk store holding its manifest, and the
+/// manifest: a cold test boots the file, a warm test restores through
+/// session volumes staged from the manifest.
+async fn bake_shell_rootfs(
+    busybox: &Path,
+) -> (
+    PathBuf,
+    engram_chunk_store::ChunkStore,
+    engram_core::ManifestRef,
+) {
     let src = tempfile::tempdir().expect("source dir");
 
     // Download ttyd host-side (where network works). ADR 0080 §D moves ttyd
@@ -129,7 +138,7 @@ async fn bake_shell_rootfs(busybox: &Path) -> PathBuf {
     )
     .await;
 
-    outcome.rootfs_path
+    (outcome.rootfs_path, chunk_store, outcome.disk_manifest)
 }
 
 /// Drive a WS round-trip through the ShellTunnel.
@@ -260,7 +269,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
     cleanup_host_state();
 
     // ---- 1. Bake a real rootfs with ttyd + agentd ----
-    let rootfs_path = bake_shell_rootfs(&busybox).await;
+    let (rootfs_path, _, _) = bake_shell_rootfs(&busybox).await;
 
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
@@ -329,7 +338,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
     };
     cleanup_host_state();
 
-    let rootfs_path = bake_shell_rootfs(&busybox).await;
+    let (_, chunk_store, image) = bake_shell_rootfs(&busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -340,13 +349,19 @@ async fn e2e_shell_warm_via_pooled_backend() {
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
-    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+    let pooled = Arc::new(
+        PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>)
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
+            .with_checkpoint_dir(work.path().join("checkpoints")),
+    );
+    pooled.set_self_ref(&pooled);
 
     let spec = SandboxSpec {
         image: "engram-e2e-shell-warm".into(),
-        rootfs_source: Some(rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, image).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
