@@ -22,4 +22,4 @@ pub mod heartbeat;
 pub mod wire;
 
 pub use heartbeat::*;
-pub use wire::{WireExecRequest, WIRE_VERSION};
+pub use wire::{WireExecRequest, REATTACH_GENERATION, WIRE_VERSION};

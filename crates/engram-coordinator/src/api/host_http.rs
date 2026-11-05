@@ -165,6 +165,11 @@ pub async fn register(
             "host register adopts a declared handoff (roll succession)",
         );
     }
+    let stored = state.services.meta.get_host(req.host_id).await?;
+    let lifts_cordon = stored
+        .as_ref()
+        .is_some_and(|h| engram_core::types::host::register_lifts_cordon(h, &req.capabilities));
+    let reattach_generation = req.capabilities.reattach_generation;
     let record = HostRecord {
         id: req.host_id,
         hostname: req.hostname,
@@ -217,6 +222,18 @@ pub async fn register(
         lease_epoch: 0,
     };
     state.services.meta.upsert_host(record).await?;
+    if lifts_cordon {
+        state
+            .services
+            .meta
+            .set_host_cordon(req.host_id, None, None)
+            .await?;
+        tracing::info!(
+            host_id = %req.host_id,
+            reattach_generation,
+            "host registers a higher reattach generation; the upgrade drain's cordon is lifted",
+        );
+    }
 
     // ADR 0013: warm the gRPC pool entry + register the host's
     // GrpcHostClient with `HostRegistry` so subsequent

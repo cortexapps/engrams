@@ -147,6 +147,9 @@ message HostView {
   uint64 pool_data_total_mib = 38;
   uint64 pool_metadata_free_mib = 39;
   uint64 pool_metadata_total_mib = 40;
+  // Which host-agent builds can adopt this host's running VMs, as its
+  // last capability vector reported. 0 for a build that predates it.
+  uint32 reattach_generation = 41;
 }
 
 message GetHostRequest {

@@ -324,6 +324,10 @@ pub struct HostCapabilities {
     /// `host_wire_version_ok` against `HostRecord::wire_version`.
     #[serde(default)]
     pub wire_version: u32,
+    /// Mirror of `engram_protocol::REATTACH_GENERATION`: which builds can
+    /// adopt this host's running VMs. `0` for a build that predates it.
+    #[serde(default)]
+    pub reattach_generation: u32,
 }
 
 impl HostCapabilities {
@@ -463,6 +467,13 @@ pub struct HostRecord {
     /// Read-only on this struct (the store owns the bump).
     #[serde(default)]
     pub lease_epoch: u64,
+}
+
+/// Whether a register lifts the host's cordon (ADR 0126). Only an upgrade
+/// across a reattach generation raises the generation a host reports, and
+/// that upgrade's drain placed the cordon.
+pub fn register_lifts_cordon(stored: &HostRecord, reported: &HostCapabilities) -> bool {
+    stored.cordoned && reported.reattach_generation > stored.capabilities.reattach_generation
 }
 
 /// ADR 0116 A-D2: hard ceiling on a declared handoff TTL, shared by the
@@ -816,6 +827,7 @@ mod tests {
             bundle_stamp: CapStatus::Failed("no stamp".to_string()),
             fc_snapshot_version: None,
             wire_version: 7,
+            reattach_generation: 0,
         };
         assert_eq!(vz_like.failing_capabilities(), vec!["bundle_stamp"]);
     }
@@ -841,6 +853,7 @@ mod tests {
             bundle_stamp: CapStatus::Ok(None),
             fc_snapshot_version: None,
             wire_version: 7,
+            reattach_generation: 0,
         };
         assert_eq!(
             broken.failing_capabilities(),
@@ -852,6 +865,52 @@ mod tests {
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
+
+    #[test]
+    fn only_a_higher_reattach_generation_lifts_a_cordon() {
+        let host = |cordoned, generation| HostRecord {
+            id: HostId::new(),
+            hostname: "h".into(),
+            cloud_metadata: Default::default(),
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            status: HostStatus::Ready,
+            last_heartbeat_at: chrono::DateTime::UNIX_EPOCH,
+            host_addr: None,
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
+            cordoned,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: false,
+            capabilities: HostCapabilities {
+                reattach_generation: generation,
+                ..Default::default()
+            },
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
+        };
+        let reports = |generation| HostCapabilities {
+            reattach_generation: generation,
+            ..Default::default()
+        };
+        assert!(register_lifts_cordon(&host(true, 0), &reports(1)));
+        assert!(!register_lifts_cordon(&host(true, 1), &reports(1)));
+        assert!(!register_lifts_cordon(&host(true, 2), &reports(1)));
+        assert!(!register_lifts_cordon(&host(false, 0), &reports(1)));
+    }
     #[test]
     fn blocker_kind_strings() {
         let cases = [

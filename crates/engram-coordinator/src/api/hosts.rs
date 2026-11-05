@@ -86,6 +86,8 @@ pub struct HostView {
     /// vector (pre-0068 row, or mid-roll) — the soft-pass posture.
     /// `>= 1` once it has.
     pub capabilities_schema: u32,
+    /// Which host-agent builds can adopt this host's running VMs (ADR 0126).
+    pub reattach_generation: u32,
     /// ADR 0088: in-flight enable work bound to this host — live
     /// materializes (fresh-claimed `materializing` enable_jobs) and
     /// non-terminal capture_jobs. The host-operator's roll/drain gates
@@ -114,6 +116,7 @@ impl HostView {
             .collect();
         let fc_snapshot_version = row.capabilities.fc_snapshot_version.clone();
         let capabilities_schema = row.capabilities.schema;
+        let reattach_generation = row.capabilities.reattach_generation;
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -149,6 +152,7 @@ impl HostView {
             failing_capabilities,
             fc_snapshot_version,
             capabilities_schema,
+            reattach_generation,
             live_materializes: enable_work.materializes,
             live_capture_jobs: enable_work.captures,
         }
