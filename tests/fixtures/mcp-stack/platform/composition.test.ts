@@ -2856,6 +2856,220 @@ test("cleanup selects only authenticated fixture or managed-principal sessions o
   ).toEqual([]);
 });
 
+test("session teardown ignores a deleted old automation task and cleans the exact pending session", async () => {
+  const { create } = await import(
+    "../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js"
+  );
+  const { WhoAmIResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts"
+  );
+  const { GetAutomationResponseSchema, GetRunResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts"
+  );
+  const { GetTaskResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts"
+  );
+  const { ListSessionsResponseSchema, DeleteSessionResponseSchema } =
+    await import(
+      "../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts"
+    );
+  const { recordOwnedAutomation } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts"
+  );
+  const { canonicalJson } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/guest.ts"
+  );
+  const { publicClient } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/transport.ts"
+  );
+  const { destroyRunSessions } = await import("./main.ts");
+  const root = await mkdtemp(
+    join(process.cwd(), "var/mcp-platform-composition/automation-cleanup-"),
+  );
+  try {
+    const ctx = await handoffFixture(root);
+    await mkdir(ctx.observer.hostManagedRoot, { mode: 0o700 });
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const automationId = "fixture-automation";
+    const runId = "autorun:fixture-automation:manual:fixture-event";
+    const taskId = "fixture-root-task";
+    const definition = {
+      blocks: [
+        {
+          id: "launch",
+          type: "create_session",
+          config: { profileId: "fixture-profile" },
+        },
+      ],
+    };
+    const reference = {
+      automationId,
+      definitionActorId: "fixture-admin",
+      definitionSha256: hash(canonicalJson(definition)),
+      profileId: "fixture-profile",
+    };
+    await recordOwnedAutomation(ctx, reference);
+    await recordOwnedAutomation(ctx, { ...reference, runId });
+    const oldAutomationId = "fixture-old-automation";
+    const oldRunId = "autorun:fixture-old-automation:manual:old-event";
+    const oldSessionId = "22222222-2222-4222-8222-222222222222";
+    const oldTaskId = "deleted-old-task";
+    const oldReference = { ...reference, automationId: oldAutomationId };
+    await recordOwnedAutomation(ctx, oldReference);
+    await recordOwnedAutomation(ctx, { ...oldReference, runId: oldRunId });
+    await recordOwnedAutomation(ctx, {
+      ...oldReference,
+      runId: oldRunId,
+      sessionId: oldSessionId,
+      taskId: oldTaskId,
+    });
+    const admin = await publicClient(ctx, {
+      kind: "cookie",
+      value: "fixture=bootstrap",
+    });
+    const destroyed: string[] = [];
+    const spies = [
+      spyOn(admin.identity, "whoAmI").mockResolvedValue(
+        create(WhoAmIResponseSchema, {
+          email: "bootstrap@fixture.example",
+          role: "admin",
+          userId: "fixture-admin",
+        }),
+      ),
+      spyOn(admin.automations, "getAutomation").mockImplementation(
+        async (request) => {
+          const id = request.lookup?.case === "id" ? request.lookup.value : "";
+          return create(GetAutomationResponseSchema, {
+            automation: {
+              id,
+              kind: "user",
+              createdByUserId: "fixture-admin",
+              currentVersion: 1,
+              version: {
+                automationId: id,
+                number: 1,
+                definitionJson: JSON.stringify(definition),
+                createdByUserId: "fixture-admin",
+              },
+            },
+          });
+        },
+      ),
+      spyOn(admin.automationRuns, "getRun").mockImplementation(
+        async (request) => {
+          const old = request.runId === oldRunId;
+          const sid = old ? oldSessionId : sessionId,
+            tid = old ? oldTaskId : taskId;
+          return create(GetRunResponseSchema, {
+            run: {
+              brief: {
+                id: request.runId,
+                automationId: old ? oldAutomationId : automationId,
+                version: 1,
+                triggerSource: "manual",
+                status: old ? "completed" : "waiting",
+              },
+              steps: [
+                {
+                  blockId: "launch",
+                  status: "succeeded",
+                  sessionId: sid,
+                  outputsJson: JSON.stringify({
+                    session_id: sid,
+                    task_id: tid,
+                    initial_prompt: false,
+                    prompt: "",
+                  }),
+                },
+              ],
+              sessionIds: [sid],
+            },
+          });
+        },
+      ),
+      spyOn(admin.tasks, "getTask").mockImplementation(async (request) => {
+        if (request.taskId === oldTaskId)
+          throw new Error("old_task_was_deleted");
+        return create(GetTaskResponseSchema, {
+          task: {
+            id: taskId,
+            type: "automation",
+            sourceJson: JSON.stringify({
+              provider: "automation",
+              automationId,
+              runId,
+            }),
+            sessions: [{ sessionId, role: "primary" }],
+          },
+        });
+      }),
+      spyOn(admin.sessions, "listSessions").mockImplementation(async () =>
+        create(ListSessionsResponseSchema, {
+          sessions: destroyed.length
+            ? []
+            : [{ session: { id: sessionId, status: "creating" } }],
+        }),
+      ),
+      spyOn(admin.sessions, "deleteSession").mockImplementation(
+        async (request) => {
+          if (request.sessionId !== sessionId)
+            throw new Error("foreign_cleanup_request");
+          destroyed.push(request.sessionId);
+          return create(DeleteSessionResponseSchema);
+        },
+      ),
+    ];
+    try {
+      await destroyRunSessions(ctx, admin);
+      expect(
+        JSON.parse(
+          await readFile(join(ctx.runRoot, "session-cleanup.json"), "utf8"),
+        ),
+      ).toEqual({ destroyed: [sessionId], remaining: [] });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cleanup admits only the exact proven automation session before host assignment", async () => {
+  const { ownedCleanupSessions } = await import("./main.ts");
+  const id = "11111111-1111-4111-8111-111111111111";
+  const session = { id, status: "active" };
+  expect(
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map(),
+      new Set(),
+      new Set([id]),
+    ),
+  ).toEqual([id]);
+  for (const row of [
+    { session: { ...session, id: "22222222-2222-4222-8222-222222222222" } },
+    { session: { ...session, hostId: "foreign-host" } },
+  ])
+    expect(() =>
+      ownedCleanupSessions(
+        [row],
+        "owned-host",
+        new Map(),
+        new Set(),
+        new Set([id]),
+      ),
+    ).toThrow("cleanup_foreign_session");
+  expect(() =>
+    ownedCleanupSessions(
+      [{ session }],
+      "owned-host",
+      new Map([[id, "automation:foreign"]]),
+      new Set(),
+    ),
+  ).toThrow("cleanup_foreign_session");
+});
+
 test("VZ guard acquires and revalidates its exact link with complete address metadata", async () => {
   const calls: string[][] = [];
   const id = "b".repeat(64),

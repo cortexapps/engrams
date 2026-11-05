@@ -45,6 +45,10 @@ import {
   type RunSelection,
 } from "../../../../orchestrator/scripts/mcp-stack/manifest.ts";
 import { RunnerFailure } from "../../../../orchestrator/scripts/mcp-stack/failure.ts";
+import {
+  ownedAutomationCleanupSessions,
+  type ManagedAutomationSession,
+} from "../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts";
 
 export function platformFailureLabel(error: unknown): string {
   if (error instanceof PlatformFailure) return `${error.code}:${error.seam}`;
@@ -268,6 +272,7 @@ export function ownedCleanupSessions(
   hostId: string,
   managed: Map<string, string>,
   actors: Set<string>,
+  automationSessions: ReadonlySet<string> = new Set(),
 ) {
   check(rows.length <= 4096, "cleanup_session_bound");
   const seen = new Set<string>();
@@ -290,7 +295,8 @@ export function ownedCleanupSessions(
           "other@fixture.example",
           "bootstrap@fixture.example",
         ].includes(row.ownerEmail ?? "") ||
-          actors.has(managed.get(session.id) ?? "")),
+          actors.has(managed.get(session.id) ?? "") ||
+          automationSessions.has(session.id)),
       "cleanup_foreign_session",
     );
     ids.push(session.id);
@@ -299,6 +305,7 @@ export function ownedCleanupSessions(
 }
 export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
   const managed = new Map<string, string>(),
+    automationManaged = new Map<string, ManagedAutomationSession>(),
     actors = new Set<string>();
   const principal = await admin.identity.whoAmI({});
   check(
@@ -373,12 +380,41 @@ export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
       record.request.cold.session_id,
       record.request.key.creation.policy.actorId,
     );
+    automationManaged.set(record.request.cold.session_id, {
+      sessionId: record.request.key.context.target.session_id,
+      actorId: record.request.key.creation.policy.actorId,
+      hostId: record.request.key.context.target.host_id,
+      taskId: record.request.key.creation.task_id,
+    });
   }
   const destroyed = new Set<string>();
   const deadline = performance.now() + 60000;
   while (performance.now() < deadline) {
     const rows = (await admin.sessions.listSessions({})).sessions;
-    const ids = ownedCleanupSessions(rows, ctx.hostId, managed, actors);
+    check(rows.length <= 4096, "cleanup_session_bound");
+    const candidates = new Set(
+      rows.flatMap(({ session }) =>
+        session && !["completed", "failed", "dead"].includes(session.status)
+          ? [session.id]
+          : [],
+      ),
+    );
+    const automationSessions = candidates.size
+      ? await ownedAutomationCleanupSessions(
+          ctx,
+          admin,
+          automationManaged,
+          actors,
+          candidates,
+        )
+      : new Set<string>();
+    const ids = ownedCleanupSessions(
+      rows,
+      ctx.hostId,
+      managed,
+      actors,
+      automationSessions,
+    );
     if (!ids.length) {
       await put(
         join(ctx.runRoot, "session-cleanup.json"),

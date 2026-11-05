@@ -3,6 +3,7 @@ import { waitFor } from "./bootstrap.ts";
 import { requireThat, sha256, type Context } from "./context.ts";
 import { canonicalJson } from "./guest.ts";
 import type { Principals } from "./scenario-runtime.ts";
+import { recordOwnedAutomation } from "./automation-ownership.ts";
 
 export type CreatedScenarioTask = {
   taskId: string;
@@ -37,6 +38,11 @@ export async function createAutomationTask(
           keepOnFinish: true,
         },
       },
+      {
+        id: "lifetime",
+        type: "wait_session",
+        config: { session: { blockId: "launch" }, until: "ended" },
+      },
     ],
     inputsSchema: [],
     settings: { endSessionsOnFinish: false, runDeadlineSeconds: 120 },
@@ -49,10 +55,18 @@ export async function createAutomationTask(
   });
   requireThat(created.automation?.id, "public_automation_created");
   const automationId = created.automation.id;
+  const ownership = {
+    automationId,
+    definitionActorId: principals.actorIds.admin,
+    definitionSha256: sha256(canonicalJson(definition)),
+    profileId,
+  };
+  await recordOwnedAutomation(ctx, ownership);
   const launched = await principals.automation.automations.runNow({
     automationId,
   });
   requireThat(launched.runId, "public_automation_run");
+  await recordOwnedAutomation(ctx, { ...ownership, runId: launched.runId });
   const observed = await waitFor(
     ctx,
     "automation_actual_launch",
@@ -67,13 +81,15 @@ export async function createAutomationTask(
         "actual_manual_automation_run",
       );
       requireThat(
-        !["failed", "halted", "deadline", "superseded"].includes(
-          value.run.brief.status,
-        ),
+        ["pending", "running"].includes(value.run.brief.status) &&
+          !value.run.brief.endedAt,
         "automation_launch_failed",
       );
-      return value.run.steps.some(
-        (step) => step.blockId === "launch" && step.status === "succeeded",
+      return (
+        value.run.brief.status === "running" &&
+        value.run.steps.some(
+          (step) => step.blockId === "launch" && step.status === "succeeded",
+        )
       );
     },
   );
@@ -95,6 +111,12 @@ export async function createAutomationTask(
       observed.run!.sessionIds[0] === outputs.data.session_id,
     "automation_public_session_identity",
   );
+  await recordOwnedAutomation(ctx, {
+    ...ownership,
+    runId: launched.runId,
+    sessionId: outputs.data.session_id,
+    taskId: outputs.data.task_id,
+  });
   const titled = await principals.admin.tasks.updateTask({
     taskId: outputs.data.task_id,
     title: "Fixture automation task",
@@ -112,7 +134,7 @@ export async function createAutomationTask(
       runtimeActorId: `automation:${automationId}`,
       definitionActorId: principals.actorIds.admin,
       triggerActorId: principals.actorIds.automation,
-      definitionSha256: sha256(canonicalJson(definition)),
+      definitionSha256: ownership.definitionSha256,
     },
   };
 }

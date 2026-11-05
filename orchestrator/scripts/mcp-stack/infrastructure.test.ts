@@ -18,6 +18,12 @@ import { IntegrationService } from "../../src/gen/engram/app/v1/integration_pb.t
 import { ProfileService } from "../../src/gen/engram/app/v1/profile_pb.ts";
 import { TaskService } from "../../src/gen/engram/app/v1/task_pb.ts";
 import { SessionService } from "../../src/gen/engram/app/v1/session_pb.ts";
+import {
+  AutomationService,
+  AutomationRunService,
+} from "../../src/gen/engram/app/v1/automation_pb.ts";
+import { createAutomationTask } from "./automation.ts";
+import { readOwnedAutomationRuns } from "./automation-ownership.ts";
 
 let root: string;
 let cert: Buffer;
@@ -737,6 +743,227 @@ for (const failure of [
       started.mockRestore();
       lifecycle.mockRestore();
       await database.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+for (const state of [
+  "running",
+  "pending-visible-launch",
+  "completed",
+  "filtered",
+  "failed",
+  "superseded",
+  "halted",
+  "deadline",
+  "ended",
+] as const)
+  test(`automation fixture keeps live authority through the case: ${state}`, async () => {
+    const ctx = ContextSchema.parse(validContext());
+    ctx.runRoot = root;
+    const automationId = `fixture-automation-${state}`;
+    const runId = `autorun:${automationId}:manual:fixture`;
+    const sessionId = "11111111-1111-4111-8111-111111111112";
+    const taskId = "fixture-task";
+    const events: string[] = [];
+    let definitionJson: string | undefined;
+    let observations = 0;
+    const terminal = !["running", "pending-visible-launch"].includes(state);
+    const handler = connectNodeAdapter({
+      requestPathPrefix: "/rpc",
+      routes(router) {
+        router.service(AutomationService, {
+          createAutomation(req, rpc) {
+            expect(rpc.requestHeader.get("cookie")).toBe(
+              "fixture_session=admin",
+            );
+            expect(req.name).toBe(`Fixture ${state}`);
+            expect(req.enabled).toBe(true);
+            expect(req.inputsJson).toBe("{}");
+            events.push("create");
+            definitionJson = req.definitionJson;
+            return { automation: { id: automationId } };
+          },
+          runNow(req, rpc) {
+            expect(rpc.requestHeader.get("x-api-key")).toBe(
+              "engk_fixture_automation",
+            );
+            expect(req.automationId).toBe(automationId);
+            events.push("run");
+            return { runId };
+          },
+        });
+        router.service(AutomationRunService, {
+          async getRun(req, rpc) {
+            expect(rpc.requestHeader.get("x-api-key")).toBe(
+              "engk_fixture_automation",
+            );
+            expect(req.runId).toBe(runId);
+            expect(
+              (await readOwnedAutomationRuns(ctx)).find(
+                (receipt) => receipt.runId === runId,
+              ),
+            ).toMatchObject({
+              automationId,
+              runId,
+              definitionActorId: "definition-actor",
+              profileId: "fixture-profile",
+              fixtureRunId: ctx.runId,
+              sourceCommit: ctx.sourceCommit,
+              hostId: ctx.hostId,
+            });
+            events.push("observe");
+            observations++;
+            return {
+              run: {
+                brief: {
+                  id: runId,
+                  automationId,
+                  status:
+                    state === "pending-visible-launch"
+                      ? observations === 1
+                        ? "pending"
+                        : "running"
+                      : state === "ended"
+                        ? "running"
+                        : state,
+                  triggerSource: "manual",
+                  dryRun: false,
+                  ...(state === "ended"
+                    ? { endedAt: "2026-01-01T00:00:00Z" }
+                    : {}),
+                },
+                sessionIds: [sessionId],
+                steps: [
+                  {
+                    blockId: "launch",
+                    status: "succeeded",
+                    outputsJson: JSON.stringify({
+                      session_id: sessionId,
+                      task_id: taskId,
+                      initial_prompt: false,
+                      prompt: "",
+                    }),
+                  },
+                ],
+              },
+            };
+          },
+        });
+        router.service(TaskService, {
+          async updateTask(req, rpc) {
+            expect(rpc.requestHeader.get("cookie")).toBe(
+              "fixture_session=admin",
+            );
+            expect(req.taskId).toBe(taskId);
+            expect(req.title).toBe("Fixture automation task");
+            expect(
+              (await readOwnedAutomationRuns(ctx)).find(
+                (receipt) => receipt.runId === runId,
+              ),
+            ).toMatchObject({ automationId, runId, sessionId, taskId });
+            events.push("title");
+            return { task: { id: taskId, titleIsCustom: true } };
+          },
+        });
+        router.service(SessionService, {
+          sendPrompt() {
+            events.push("prompt");
+            return {};
+          },
+        });
+      },
+    });
+    const server = createServer({ cert, key }, handler);
+    await new Promise<void>((resolve) =>
+      server.listen(0, "localhost", resolve),
+    );
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("address");
+      ctx.endpoints.app = {
+        origin: `https://localhost:${address.port}`,
+        ca: { path: join(root, "https.pem"), sha256: sha256(cert) },
+        serverFingerprint: new X509Certificate(cert).fingerprint256,
+      };
+      const admin = await publicClient(ctx, {
+        kind: "cookie",
+        value: "fixture_session=admin",
+      });
+      const automation = await publicClient(ctx, {
+        kind: "api-key",
+        value: "engk_fixture_automation",
+      });
+      const principals = {
+        admin,
+        automation,
+        owner: admin,
+        other: admin,
+        unattended: admin,
+        actorIds: {
+          admin: "definition-actor",
+          automation: "trigger-actor",
+          owner: "owner",
+          other: "other",
+          unattended: "unattended",
+        },
+      };
+      const pending = createAutomationTask(
+        ctx,
+        principals,
+        "fixture-profile",
+        state,
+      );
+      if (terminal) {
+        await expect(pending).rejects.toThrow("automation_launch_failed");
+        expect(events).toEqual(["create", "run", "observe"]);
+      } else {
+        const result = await pending;
+        expect(result).toMatchObject({
+          taskId,
+          sessionId,
+          automation: {
+            id: automationId,
+            runId,
+            runtimeActorId: `automation:${automationId}`,
+            definitionActorId: "definition-actor",
+            triggerActorId: "trigger-actor",
+          },
+        });
+        expect(events).toEqual(
+          state === "pending-visible-launch"
+            ? ["create", "run", "observe", "observe", "title"]
+            : ["create", "run", "observe", "title"],
+        );
+        expect(JSON.parse(definitionJson!)).toEqual({
+          engine: 1,
+          trigger: { kind: "manual" },
+          blocks: [
+            {
+              id: "launch",
+              type: "create_session",
+              config: {
+                profileId: "fixture-profile",
+                promptTemplate: "",
+                titleTemplate: "Fixture automation task",
+                includeEventContext: false,
+                keepOnFinish: true,
+              },
+            },
+            {
+              id: "lifetime",
+              type: "wait_session",
+              config: { session: { blockId: "launch" }, until: "ended" },
+            },
+          ],
+          inputsSchema: [],
+          settings: { endSessionsOnFinish: false, runDeadlineSeconds: 120 },
+        });
+      }
+    } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
