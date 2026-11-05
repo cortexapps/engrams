@@ -13,11 +13,12 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 ### Upgrade notes
 
 - **Firecracker hosts need a session-disk pool.** The host agent no longer serves disks
-  over NBD. Set `thinPool.enabled: true` in the `engram-host-fleet` chart; node-prep builds
-  a device-mapper thin pool from two files on the host's working filesystem and the host
-  agent opens it through `ENGRAM_THIN_POOL`. The node needs the `dm_thin_pool` module and
-  `thin-provisioning-tools`. The `nbd` chart values, the node-prep NBD step, and
-  `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
+  over NBD, and it refuses to start the Firecracker backend without a pool. Node-prep in
+  the `engram-host-fleet` chart builds a device-mapper thin pool from two files on the
+  host's working filesystem, and the host agent opens it through `ENGRAM_THIN_POOL`; with
+  node-prep disabled, the node image must provide the pool. The node needs the
+  `dm_thin_pool` module and `thin-provisioning-tools`. The `nbd` chart values, the node-prep
+  NBD step, and `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
 - **Sessions move across the upgrade through their checkpoints.** A session that is idle
   with a recoverable snapshot resumes on a new host from its manifest. A session whose only
   recoverable state was the host's live disk manifest is marked dead by migration 0126
