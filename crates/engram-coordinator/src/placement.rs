@@ -226,17 +226,8 @@ impl CaptureFootprint {
         }
     }
 
-    /// Floor-only sizing: imposes NO footprint veto beyond the ADR 0078
-    /// disk floor `host_disk_floor_ok` already checks. Used ONLY when
-    /// the job's image size is genuinely unknown at pick time — today
-    /// that's every `materialize_image_on_host` call, because
-    /// materialize is what PRODUCES the disk manifest a size could be
-    /// read from; there is no size signal to read yet (the OCI
-    /// manifest's compressed layer sizes are a poor proxy for the
-    /// flattened+packed ext4 output, so we deliberately don't guess
-    /// from them). LOUD by design: every call site that reaches for
-    /// this must justify why in a comment, not use it as a silent
-    /// default.
+    /// No veto beyond the floors. Only for a pick whose disk manifest
+    /// cannot be read; each call site logs why it falls back.
     pub const fn floor_only() -> Self {
         Self {
             disk_mib: 0,
@@ -954,11 +945,8 @@ async fn pick_for_session_inner(
     Ok((id, backend))
 }
 
-/// ADR 0084 §C: the free work_dir disk (MiB) `capture_candidate_hosts` ranks
-/// hosts by — `None` for an unmeasured host (dev/brand-new; the same
-/// soft posture `host_disk_floor_ok` gives it: it neither vetoes NOR
-/// ranks above a measured host, so a fleet of unmeasured hosts falls
-/// back to row order, matching pre-ADR-0084 first-fit behavior).
+/// Free work-dir disk in MiB, or `None` for a host that has not reported
+/// it. An unmeasured host is neither vetoed nor ranked above a measured one.
 fn free_disk_mib(h: &HostRecord) -> Option<u64> {
     if h.utilization.disk_total_mib == 0 {
         return None;
@@ -1012,25 +1000,16 @@ pub fn capture_candidate_hosts_from(
         }
         survivors.push((free.unwrap_or(0), h.id));
     }
-    // Roomiest disk first — the candidate ORDER the atomic 2D RAM/CPU fit
-    // (`pick_host_2d`) inherits, so a RAM-tie breaks toward the host with
-    // the most disk headroom (replaces the P2 first-fit/max-free-disk
-    // single-pick; the RAM/CPU dimension is now enforced in PG).
+    // The RAM/CPU fit in PG (`pick_host_2d`) keeps this order, so a RAM
+    // tie goes to the host with the most disk headroom.
     survivors.sort_by_key(|(free, _)| std::cmp::Reverse(*free));
     survivors.into_iter().map(|(_, id)| id).collect()
 }
 
-/// ADR 0084 §C + (c): the CANDIDATE SET for a base-snapshot capture's
-/// RESERVING pick — every host passing the ADR 0078 tier-0 disk floor,
-/// the job's own [`CaptureFootprint`] disk headroom, one-capture-per-host
-/// anti-affinity (`hosts_with_live_capture_jobs`), and an optional
-/// `fc_snapshot_version` pin (ADR 0084 §B5), ordered roomiest-disk-first.
-/// Deliberately RAM/CPU-BLIND here: the 2D fit + reservation happen
-/// atomically in PG (`place_capture_job` / `reassign_capture_job` /
-/// `redrive_failed_capture_job` → `pick_host_2d`), the same split
-/// `capture_candidates`/`reserve_capture_host` had before this row moved
-/// onto `capture_jobs`. An empty vec means no host is even disk-eligible
-/// (the caller leaves the job WAITING, not failed).
+/// The hosts a base-snapshot capture may reserve, per
+/// [`capture_candidate_hosts_from`]. RAM and CPU are not checked here: the
+/// fit and the reservation happen together in PG (`pick_host_2d`). An
+/// empty result leaves the job waiting, not failed.
 pub async fn capture_candidate_hosts(
     meta: &dyn MetadataStore,
     need: CaptureFootprint,
@@ -1055,16 +1034,10 @@ pub async fn capture_candidate_hosts(
     ))
 }
 
-/// ADR 0080 phase 3b: a host for the MATERIALIZE stage (docker pull +
-/// ext4 pack + chunk) — no VM boots, so NOT gated on image readiness or
-/// RAM/CPU capacity, but it IS gated on the ADR 0078 tier-0 disk floor:
-/// materialize writes image-sized data under the host's work dir, so a
-/// host already below the chunk-cache floor (about to disk-evict its
-/// cache) must never be handed more disk work (the `capture-host picker
-/// ignores disk` incident class). Distinct from [`capture_candidate_hosts`]:
-/// materialize boots no VM, so it carries no [`CaptureFootprint`] /
-/// anti-affinity / RAM reservation — those belong only to the capture
-/// stage (ADR 0084 §C + the ADR 0081 reservation re-attach).
+/// A host for the materialize stage: pull the image's layers into work-dir
+/// scratch, pack the ext4 root disk, and stream its chunks to the store.
+/// No VM boots, so only the disk floor gates it; there is no footprint,
+/// capture anti-affinity, or RAM reservation.
 pub async fn pick_materialize_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
@@ -1087,9 +1060,8 @@ pub async fn pick_materialize_host(
     Ok((id, backend))
 }
 
-/// Shared eligibility for the enable pipeline's host-side stages:
-/// takes a new session, base-capable, and above the disk floor (same
-/// unmeasured-is-soft posture as `named_host_fit_veto`).
+/// A host the enable pipeline may use: it takes new sessions and clears
+/// the disk floor (unmeasured is soft).
 fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
     new_session_veto(h, now, ttl).is_none()
         && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
@@ -1121,16 +1093,13 @@ fn host_pool_data_floor_mib() -> u64 {
     engram_core::types::host::pool_data_floor_bytes() / (1024 * 1024)
 }
 
-/// ADR 0078's tier-0 disk floor as a standalone predicate: free
-/// work_dir space at or above the host disk-cache floor.
-/// Unmeasured (`disk_total_mib == 0`) is soft — no veto, the same
-/// posture as unmeasured RAM (brand-new / dev hosts). Kept in lockstep
-/// with the disk arm of [`named_host_fit_veto`].
+/// Free work-dir space is at or above the disk floor; an unmeasured host
+/// (`disk_total_mib == 0`) passes. Must agree with the disk arm of
+/// [`named_host_fit_veto`].
 fn host_disk_floor_ok(h: &HostRecord) -> bool {
     if h.utilization.disk_total_mib == 0 {
         return true;
     }
-    // Root and swap dirty files are included in measured disk use.
     let free_disk_mib = h
         .utilization
         .disk_total_mib
@@ -1138,13 +1107,9 @@ fn host_disk_floor_ok(h: &HostRecord) -> bool {
     free_disk_mib >= host_disk_cache_floor_mib()
 }
 
-/// The placement disk floor gets its OWN env override — deliberately
-/// NOT `ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES`, which the idle detector
-/// (this process) and the host-agent's idle evictor already read.
-/// Reusing that name would couple two independent knobs: tuning idle
-/// eviction would silently also loosen placement's disk gate (tighter
-/// packing → disk-full hosts). Small-disk dev rigs (the fc-colima VM)
-/// set both.
+/// The placement disk floor, from `ENGRAM_PLACEMENT_DISK_FLOOR_BYTES`. It
+/// is a separate knob from the idle evictor's floor, so tuning eviction
+/// never loosens placement.
 fn host_disk_cache_floor_mib() -> u64 {
     static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| {
@@ -1847,11 +1812,8 @@ mod tests {
         assert_eq!(pick, hid(1), "RAM-full snapshot_host → soft fallback");
     }
 
-    /// ADR 0080 phase 3b: the capture/materialize picker's disk gate —
-    /// `host_disk_floor_ok` shares the exact floor + unmeasured-is-soft
-    /// posture with `named_host_fit_veto`'s `disk_full` arm, so a host
-    /// the resume path would veto for disk can't be handed an
-    /// image-sized materialize/capture either.
+    /// The enable pipeline's disk gate agrees with the resume path's
+    /// `disk_full` veto.
     #[test]
     fn capture_picker_disk_floor_matches_the_tier0_veto() {
         // Unmeasured disk (dev / brand-new host): soft, no veto.
