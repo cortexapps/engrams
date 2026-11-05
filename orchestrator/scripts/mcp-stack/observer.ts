@@ -278,7 +278,7 @@ export class DatabaseObserver {
   }
   own(taskId: string, sessionId: string) {
     requireThat(
-      /^[A-Za-z0-9_-]{1,128}$/.test(taskId) &&
+      /^[A-Za-z0-9_:-]{1,128}$/.test(taskId) &&
         z.uuid().safeParse(sessionId).success &&
         !this.owned.has(sessionId),
       "observer_owned_session",

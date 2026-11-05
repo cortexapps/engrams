@@ -1609,6 +1609,56 @@ for (const stage of [
   });
 }
 
+test("observer accepts the production automation task id and retains ownership guards", async () => {
+  const { DatabaseObserver } = await import("./observer.ts");
+  const { automationRunId } = await import("../../src/automations/ids.ts");
+  const ctx = ContextSchema.parse(validContext());
+  ctx.runRoot = root;
+  ctx.observer.coordinatorDsnFile = join(root, "observer-own-c.dsn");
+  ctx.observer.orchestratorDsnFile = join(root, "observer-own-o.dsn");
+  for (const path of [
+    ctx.observer.coordinatorDsnFile,
+    ctx.observer.orchestratorDsnFile,
+  ])
+    await writeFile(
+      path,
+      "postgres://fixture:neutral@database.fixture.example/mcp_unit",
+      { mode: 0o600 },
+    );
+  // The pools are lazy. Registering ownership does not send a database query.
+  const database = await DatabaseObserver.connect(ctx);
+  const taskId = `automation:${automationRunId(
+    "11111111-1111-4111-8111-111111111111",
+    "manual:22222222-2222-4222-8222-222222222222",
+  )}`;
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  try {
+    expect(() => database.own(taskId, sessionId)).not.toThrow();
+    expect(() => database.own(taskId, sessionId)).toThrow(
+      "observer_owned_session",
+    );
+    expect(() => database.own("different-task", sessionId)).toThrow(
+      "observer_owned_session",
+    );
+    expect(() => database.own(taskId, "not-a-session")).toThrow(
+      "observer_owned_session",
+    );
+    for (const invalid of [
+      "",
+      "task space",
+      "task\nname",
+      "task/name",
+      "task\u0000name",
+      "a".repeat(129),
+    ])
+      expect(() =>
+        database.own(invalid, "44444444-4444-4444-8444-444444444444"),
+      ).toThrow("observer_owned_session");
+  } finally {
+    await database.close();
+  }
+});
+
 test("selected dispatcher executes only canonical selected cases and preserves assertion failures", async () => {
   const { runSelectedCases } = await import("./runner.ts");
   const { DatabaseObserver } = await import("./observer.ts");
