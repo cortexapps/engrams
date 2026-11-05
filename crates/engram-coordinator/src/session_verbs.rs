@@ -859,6 +859,16 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             Ok(None) => return OpOutcome::Done,
             Err(e) => return OpOutcome::Retry(format!("outbox next-due fetch: {e}")),
         };
+        // A span event on the op's span: how long this row waited since
+        // SendPrompt enqueued it, joined to the orchestrator's trace by
+        // `prompt_id`.
+        tracing::info!(
+            session_id = %id,
+            prompt_id = %row.prompt_id,
+            prompt.attempts = row.attempts,
+            prompt.queued_ms = (state.services.clock.now_utc() - row.created_at).num_milliseconds(),
+            "deliver op: outbox row due",
+        );
         match retire_legacy_answer_row(state, &row).await {
             Ok(true) => continue,
             Ok(false) => {}
