@@ -34,7 +34,45 @@ use crate::image_cache::{CachedImage, ImageCache};
 /// (~2.5 GB/s aggregate) saturates closer to line rate without tripping
 /// GCS per-object rate limits. Mirrors the re-chunk/upload bound so the
 /// save and load paths use the same fleet-tuned fan-out.
-const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
+const DEFAULT_MEMORY_PREFETCH_CONCURRENCY: usize = 32;
+
+/// Measurement knobs for the cold-restore memory prefetch, read once:
+/// `ENGRAM_MEMORY_PREFETCH_MODE` ∈ {`full` (default), `off`} (`off` skips
+/// the background warm of a lazy restore; faults then fetch on demand) and
+/// `ENGRAM_MEMORY_PREFETCH_CONCURRENCY` (default 32).
+#[derive(Clone, Copy)]
+struct MemoryPrefetchConfig {
+    background: bool,
+    concurrency: usize,
+}
+
+fn memory_prefetch_config() -> MemoryPrefetchConfig {
+    static CONFIG: std::sync::OnceLock<MemoryPrefetchConfig> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let background = match std::env::var("ENGRAM_MEMORY_PREFETCH_MODE") {
+            Ok(s) if s.eq_ignore_ascii_case("off") => false,
+            Ok(s) if !s.trim().is_empty() && !s.eq_ignore_ascii_case("full") => {
+                tracing::warn!(value = %s, "unrecognised ENGRAM_MEMORY_PREFETCH_MODE; defaulting to full");
+                true
+            }
+            _ => true,
+        };
+        let concurrency = match std::env::var("ENGRAM_MEMORY_PREFETCH_CONCURRENCY") {
+            Ok(s) => match s.trim().parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    tracing::warn!(value = %s, "unrecognised ENGRAM_MEMORY_PREFETCH_CONCURRENCY; defaulting to 32");
+                    DEFAULT_MEMORY_PREFETCH_CONCURRENCY
+                }
+            },
+            Err(_) => DEFAULT_MEMORY_PREFETCH_CONCURRENCY,
+        };
+        MemoryPrefetchConfig {
+            background,
+            concurrency,
+        }
+    })
+}
 
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
@@ -1268,7 +1306,11 @@ impl PooledBackend {
                     "chunked restore memory chunk prefetch failed; falling back to serial fault path",
                 );
             }
-        } else if let Some(cs) = self.chunk_store.clone() {
+        } else if let Some(cs) = self
+            .chunk_store
+            .clone()
+            .filter(|_| memory_prefetch_config().background)
+        {
             let md = metadata.clone();
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
@@ -3148,7 +3190,7 @@ impl PooledBackend {
     /// when the cache is already warm) and best-effort (errors
     /// degrade to the serial fault path inside materialize_to_file).
     ///
-    /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
+    /// Concurrency is bounded by [`memory_prefetch_config`] (default 32).
     /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
     /// the prior bound of 8 (~640 MB/s) left most of the 10 Gbps line
     /// rate idle while the cold resume waited 66.5 s on this prefetch
@@ -3229,7 +3271,7 @@ impl PooledBackend {
         };
         let chunk_count = hashes_to_prefetch.len();
         chunk_store
-            .prefetch_chunks(hashes_to_prefetch, MEMORY_PREFETCH_CONCURRENCY)
+            .prefetch_chunks(hashes_to_prefetch, memory_prefetch_config().concurrency)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks: {e}")))?;
         tracing::debug!(
