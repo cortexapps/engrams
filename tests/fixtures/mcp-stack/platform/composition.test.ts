@@ -889,6 +889,148 @@ test("effective container audit rejects added authority and environment", async 
   await expect(engine.audit(id)).resolves.toBeDefined();
 });
 
+test("platform output keeps only approved runner failure classifications", async () => {
+  const { platformFailureLabel } = await import("./main.ts");
+  const { RunnerFailure } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/failure.ts"
+  );
+  for (const [code, seam, label] of [
+    [
+      "INVALID_CONTEXT",
+      "owned_path",
+      "FAILED:runner_invalid_context_owned_path",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "private_file",
+      "FAILED:runner_invalid_context_private_file",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "request_route",
+      "FAILED:runner_invalid_context_request_route",
+    ],
+    [
+      "INVALID_CONTEXT",
+      "request_size",
+      "FAILED:runner_invalid_context_request_size",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "observer_token",
+      "FAILED:runner_assertion_failed_observer_token",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "fixture_observer_status",
+      "FAILED:runner_assertion_failed_fixture_observer_status",
+    ],
+    [
+      "ASSERTION_FAILED",
+      "fixture_identity",
+      "FAILED:runner_assertion_failed_fixture_identity",
+    ],
+    [
+      "TRANSPORT_FAILED",
+      "https_request",
+      "FAILED:runner_transport_failed_https_request",
+    ],
+  ] as const) {
+    const error = new RunnerFailure(code, seam);
+    error.message = "private response body";
+    error.stack = "private stack";
+    expect(platformFailureLabel(error)).toBe(label);
+  }
+  const changedCode = new RunnerFailure("TRANSPORT_FAILED", "https_request");
+  Reflect.set(changedCode, "code", "PRIVATE_CODE");
+  for (const error of [
+    changedCode,
+    new RunnerFailure("ASSERTION_FAILED", "https_request"),
+    new RunnerFailure("TRANSPORT_FAILED", "private_value"),
+    new RunnerFailure("TRANSPORT_FAILED", "https_request\nprivate_value"),
+    new Error("TRANSPORT_FAILED:https_request private_value"),
+    { code: "TRANSPORT_FAILED", seam: "https_request" },
+    "private_value",
+    null,
+  ])
+    expect(platformFailureLabel(error)).toBe("FAILED:platform_composition");
+  expect(
+    platformFailureLabel(
+      new PlatformFailure("NEEDS_CONTEXT", "native_dns_lookup"),
+    ),
+  ).toBe("NEEDS_CONTEXT:native_dns_lookup");
+});
+
+for (const kind of ["modern", "legacy"] as const) {
+  test(`fixture ${kind} readiness gives unknown errors a fixed phase label`, async () => {
+    const { Stack } = await import("./launch.ts");
+    const { FixtureObserver } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/observer.ts"
+    );
+    const { RunnerFailure } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/failure.ts"
+    );
+    const inputs = {
+      images: { fixture: { id: "fixture-image" } },
+    } as Inputs;
+    const ctx = {
+      protocolFixtures: {
+        modern: {
+          runRoot: "/owned/modern",
+          configuration: { path: "/owned/modern/config" },
+        },
+        legacy: {
+          runRoot: "/owned/legacy",
+          configuration: { path: "/owned/legacy/config" },
+        },
+      },
+    } as import("../../../../orchestrator/scripts/mcp-stack/context.ts").Context;
+    const engine = new Engine(inputs, "/owned", "mcp-123456789012345678901234");
+    engine.networkOptions = () => [];
+    engine.create = async (role) => role;
+    engine.nativeDns = async () => {};
+    const stack = new Stack(
+      inputs,
+      "/owned",
+      {} as ConstructorParameters<typeof Stack>[2],
+      {} as ConstructorParameters<typeof Stack>[3],
+      {} as ConstructorParameters<typeof Stack>[4],
+      engine,
+    );
+    for (const failure of [
+      new Error("private path and response"),
+      new RunnerFailure("TRANSPORT_FAILED", "https_request"),
+      new PlatformFailure("INVALID_CONTEXT", "private_file"),
+    ]) {
+      let index = 0;
+      const ready = spyOn(
+        FixtureObserver.prototype,
+        "ready",
+      ).mockImplementation(async () => {
+        if (["modern", "legacy"][index++] === kind) throw failure;
+      });
+      try {
+        const preparing = stack.fixtures(ctx);
+        if (
+          failure instanceof RunnerFailure ||
+          failure instanceof PlatformFailure
+        )
+          await expect(preparing).rejects.toBe(failure);
+        else
+          await expect(preparing).rejects.toMatchObject({
+            code: "FAILED",
+            seam:
+              kind === "modern"
+                ? "fixture_modern_readiness"
+                : "fixture_legacy_readiness",
+          });
+      } finally {
+        ready.mockRestore();
+      }
+    }
+  });
+}
+
 test("entrypoint rejects a foreign backend before creating output or invoking a matrix", async () => {
   const { main, matrixArguments } = await import("./main.ts");
   const { BINARIES, IMAGES } = await import("./preflight.ts");

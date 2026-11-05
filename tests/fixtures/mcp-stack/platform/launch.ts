@@ -18,6 +18,7 @@ import {
 } from "../../../../orchestrator/scripts/mcp-stack/transport.ts";
 import { ZonePolicy } from "../../../../mcp-worker/src/network.ts";
 import { FixtureObserver } from "../../../../orchestrator/scripts/mcp-stack/observer.ts";
+import { RunnerFailure } from "../../../../orchestrator/scripts/mcp-stack/failure.ts";
 import {
   check,
   childEnvironment,
@@ -1165,8 +1166,20 @@ export class Stack {
       this.active.set(role, { id, configuration: "normal" });
     }
     await this.engine.nativeDns();
-    for (const kind of ["modern", "legacy"] as const)
-      await new FixtureObserver(ctx, kind).ready();
+    for (const kind of ["modern", "legacy"] as const) {
+      try {
+        await new FixtureObserver(ctx, kind).ready();
+      } catch (error) {
+        if (error instanceof RunnerFailure || error instanceof PlatformFailure)
+          throw error;
+        throw new PlatformFailure(
+          "FAILED",
+          kind === "modern"
+            ? "fixture_modern_readiness"
+            : "fixture_legacy_readiness",
+        );
+      }
+    }
   }
   private async nativeProcesses(): Promise<NativeIdentity[]> {
     check(this.assets.nativeProbe, "native_probe");

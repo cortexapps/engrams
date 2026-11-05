@@ -44,6 +44,32 @@ import {
   selectedCases,
   type RunSelection,
 } from "../../../../orchestrator/scripts/mcp-stack/manifest.ts";
+import { RunnerFailure } from "../../../../orchestrator/scripts/mcp-stack/failure.ts";
+
+export function platformFailureLabel(error: unknown): string {
+  if (error instanceof PlatformFailure) return `${error.code}:${error.seam}`;
+  if (error instanceof RunnerFailure) {
+    switch (`${error.code}:${error.seam}`) {
+      case "INVALID_CONTEXT:owned_path":
+        return "FAILED:runner_invalid_context_owned_path";
+      case "INVALID_CONTEXT:private_file":
+        return "FAILED:runner_invalid_context_private_file";
+      case "INVALID_CONTEXT:request_route":
+        return "FAILED:runner_invalid_context_request_route";
+      case "INVALID_CONTEXT:request_size":
+        return "FAILED:runner_invalid_context_request_size";
+      case "ASSERTION_FAILED:observer_token":
+        return "FAILED:runner_assertion_failed_observer_token";
+      case "ASSERTION_FAILED:fixture_observer_status":
+        return "FAILED:runner_assertion_failed_fixture_observer_status";
+      case "ASSERTION_FAILED:fixture_identity":
+        return "FAILED:runner_assertion_failed_fixture_identity";
+      case "TRANSPORT_FAILED:https_request":
+        return "FAILED:runner_transport_failed_https_request";
+    }
+  }
+  return "FAILED:platform_composition";
+}
 
 export const matrixArguments = (
   contextPath: string,
@@ -662,11 +688,7 @@ export async function main(args: string[]) {
 if (import.meta.main) {
   main(process.argv.slice(2)).catch((error) => {
     // Never print external messages, arguments, response bodies, or credentials.
-    const label =
-      error instanceof PlatformFailure
-        ? `${error.code}:${error.seam}`
-        : "FAILED:platform_composition";
-    process.stderr.write(label + "\n");
+    process.stderr.write(platformFailureLabel(error) + "\n");
     process.exitCode = 2;
   });
 }
