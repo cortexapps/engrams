@@ -52,7 +52,7 @@
             protobuf                # protoc, for tonic-build when grpc lands
             llvmPackages.libclang   # bindgen for userfaultfd-sys (Linux only,
                                     # but harmless on macOS)
-            nodejs_24               # web SPA dev server (`just web` -> vite).
+            nodejs_26               # web SPA dev server (`just web` -> vite).
                                     # Keep this major in step with the web CI
                                     # lane (.github/workflows/ci.yml) and
                                     # docker/web.Dockerfile — see the note

@@ -373,18 +373,20 @@ updates:
       # `node:25-alpine` in #130 — a line that was ALREADY EOL (2026-06-01)
       # on the day the PR was opened, and the release that stopped shipping
       # `corepack` (nodejs/node#57617), which is what web.Dockerfile used to
-      # install pnpm. So it could not have built either. Skip odd majors; the
-      # even ones (26, 28, …) still arrive normally.
+      # install pnpm. So it could not have built either. Under the OLD
+      # two-per-year model, odd majors were skipped and even ones (26, 28, …)
+      # arrived normally; the block below carries that historical record.
       #
-      # TEMPORARY exception to "even majors arrive normally": node 26. 26 is an
-      # even major and WILL become LTS, but it is not LTS *yet* — v26.0.0
-      # shipped 2026-05 and the line only enters Active LTS on 2026-10-28.
-      # Until then it is a Current (non-LTS) line, and this repo pins runtimes
-      # to the newest LTS (node 24 today), so #1155 (`24-alpine` -> `26-alpine`)
-      # is deferred rather than merged. This is NOT a permanent skip like the
-      # odd majors above: REMOVE the `>= 26, < 27` entry once 26 reaches Active
-      # LTS (2026-10-28), at which point it is the newest LTS line and the right
-      # next bump from 24.
+      # Only even majors under the OLD model ever became LTS. Node 26 (Lithium)
+      # is the last release on that cadence — it entered Active LTS on
+      # 2026-10-28 and is now the newest LTS line, so the temporary
+      # `>= 26, < 27` hold is dropped and the tree pins node:26. From Node 27
+      # onward the schedule becomes one annual major per year and EVERY major
+      # becomes LTS (no odd/even distinction), so the odd-major ignore entries
+      # below (`>= 27, < 32` odd steps) stop being "skip Current-only majors"
+      # and instead just skip majors that are not published yet. Revisit that
+      # shape when the first post-26 major (27) actually ships as Current in
+      # 2027-04; until it exists there is nothing for Dependabot to propose.
       #
       # NOTE THE SYNTAX. For `package-ecosystem: docker`, `versions:` entries
       # are RubyGems requirement strings — NOT the npm/NuGet `x`-wildcards.
@@ -400,7 +402,6 @@ updates:
       - dependency-name: "node"
         versions:
           - ">= 25, < 26"
-          - ">= 26, < 27"
           - ">= 27, < 28"
           - ">= 29, < 30"
           - ">= 31, < 32"
