@@ -124,11 +124,11 @@ test("absent-tool proof requires the actual native unknown-tool refusal", () => 
 });
 
 test("guest success projection cannot become journal authority or result", () => {
-  const pending = { state: "waiting_approval", approvalDecision: "" };
+  const pending = { state: "waiting_approval", approvalDecision: "pending" };
   expect(() => assertNoProjectedAuthority(pending, undefined)).not.toThrow();
   expect(() =>
     assertNoProjectedAuthority({ ...pending, state: "canceled" }, undefined),
-  ).not.toThrow();
+  ).toThrow();
   for (const state of ["authorized", "dispatching", "succeeded"])
     expect(() =>
       assertNoProjectedAuthority({ ...pending, state }, undefined),
@@ -144,13 +144,47 @@ test("guest success projection cannot become journal authority or result", () =>
   ).toThrow();
 });
 
-test("retired guest projection can be denied without creating authority", () => {
+test("a real pending approval has no projected authority", () => {
   expect(() =>
     assertNoProjectedAuthority(
-      { state: "canceled", approvalDecision: "denied" },
+      { state: "waiting_approval", approvalDecision: "pending" },
       undefined,
     ),
   ).not.toThrow();
+});
+
+test("an unknown outcome cannot prove that no dispatch occurred", () => {
+  expect(() =>
+    assertNoProjectedAuthority(
+      { state: "outcome_unknown", approvalDecision: "" },
+      undefined,
+    ),
+  ).toThrow();
+});
+
+test("retired guest projection can be denied without creating authority", () => {
+  expect(() =>
+    assertNoProjectedAuthority(
+      {
+        state: "canceled",
+        approvalDecision: "denied",
+        executionId: "call",
+        cancellationReceipt: { executionId: "call", state: "canceled" },
+      },
+      undefined,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    assertNoProjectedAuthority(
+      {
+        state: "canceled",
+        approvalDecision: "denied",
+        executionId: "call",
+        cancellationReceipt: { executionId: "other", state: "canceled" },
+      },
+      undefined,
+    ),
+  ).toThrow();
 });
 
 test("intersection retains independent repeated schema roots without widening", () => {

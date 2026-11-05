@@ -641,5 +641,5 @@ export async function closeScenario(
   }
   await principals.admin.tasks.deleteTask({ taskId: scenario.taskId });
   await principals.admin.profiles.deleteProfile({ id: scenario.profileId });
-  // Archived profiles retain grants. Keep the connection and journal for run-owned teardown.
+  // Archived profiles retain grants. Keep the connection for run-owned teardown.
 }

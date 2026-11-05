@@ -11,7 +11,7 @@ import {
 import { grantUpdateRequest } from "./rebind.ts";
 export { grantUpdateRequest } from "./rebind.ts";
 import type { CallPlan } from "./call-plan.ts";
-import { requireThat, sha256 } from "./context.ts";
+import { requireThat, RunnerFailure, sha256 } from "./context.ts";
 import {
   completeAssertions,
   type CaseDriver,
@@ -89,18 +89,22 @@ export function assertAbsentToolDenial(
   );
 }
 export function assertNoProjectedAuthority(
-  call: { state: string; approvalDecision: string },
+  call: {
+    state: string;
+    approvalDecision: string;
+    executionId?: string;
+    cancellationReceipt?: { executionId: string; state: string };
+  },
   resultJson: string | undefined,
 ) {
   requireThat(
-    [
-      "waiting_approval",
-      "denied",
-      "failed",
-      "canceled",
-      "outcome_unknown",
-    ].includes(call.state) && ["", "denied"].includes(call.approvalDecision),
-    "guest_projection_has_no_journal_authority",
+    (call.state === "waiting_approval" && call.approvalDecision === "pending") ||
+      (call.state === "canceled" &&
+        call.approvalDecision === "denied" &&
+        !!call.executionId &&
+        call.cancellationReceipt?.executionId === call.executionId &&
+        call.cancellationReceipt.state === "canceled"),
+    `guest_projection_has_no_journal_authority_${projectionState(call)}`,
   );
   if (resultJson !== undefined) {
     const result = z
@@ -111,6 +115,18 @@ export function assertNoProjectedAuthority(
       "guest_projection_has_no_success_result",
     );
   }
+}
+function projectionState(
+  call: { state: string; approvalDecision: string } | undefined,
+) {
+  const state = [
+    "waiting_approval", "authorized", "dispatching", "succeeded", "denied",
+    "failed", "canceled", "outcome_unknown",
+  ].includes(call?.state ?? "") ? call!.state : "other";
+  const decision = ["", "pending", "approved", "denied"].includes(
+    call?.approvalDecision ?? "",
+  ) ? call?.approvalDecision || "empty" : "other";
+  return `${state}_${decision}`;
 }
 async function absentCall(
   input: Parameters<CaseDriver>[0],
@@ -606,10 +622,28 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
       observation: "prematureBarrierHeld",
     });
     requireThat(held.length === 1, "single_premature_barrier");
-    const pending = await execution(ctx, forged, false);
+    let lastPending: Awaited<ReturnType<typeof execution>>;
+    const pending = await waitFor(
+      ctx,
+      "real_pending_call_before_guest_projection",
+      async () => (lastPending = await execution(ctx, forged, false)),
+      (call) =>
+        call?.state === "waiting_approval" &&
+        call.approvalDecision === "pending" &&
+        !!call.runId,
+    ).catch((error: unknown) => {
+      if (
+        !(error instanceof RunnerFailure) ||
+        error.seam !== "real_pending_call_before_guest_projection"
+      ) throw error;
+      requireThat(
+        false,
+        `real_pending_call_before_guest_projection_${projectionState(lastPending)}`,
+      );
+    });
     requireThat(
       pending?.state === "waiting_approval" &&
-        pending.approvalDecision === "" &&
+        pending.approvalDecision === "pending" &&
         pending.runId,
       "real_pending_call_before_guest_projection",
     );

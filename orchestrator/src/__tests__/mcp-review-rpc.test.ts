@@ -20,6 +20,7 @@ import { mcpHandlers, type McpServices } from "../mcp/contracts.ts";
 import { makePendingToolCallStore } from "../tools/pending-tool-calls.ts";
 import { makeExternalToolCompletionGuard } from "../rpc/tool-completion-guard.ts";
 import { registerPassthrough } from "../rpc/passthrough.ts";
+import { assertNoProjectedAuthority } from "../../scripts/mcp-stack/case-grants.ts";
 
 const reachable = process.env.ORCHESTRATOR_DATABASE_URL ? await checkDb() : false;
 async function wire(f: Awaited<ReturnType<typeof reviewFixture>>, producers = true) {
@@ -222,6 +223,7 @@ test.skipIf(!reachable)(
     try {
       const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
       await f.journal.requestApproval(call.id, f.deploymentId, f.now);
+      const beforeProjection = (await f.journal.get(call.id))!;
       const projection = makePendingToolCallStore(f.db);
       await projection.recordRequested({
         sessionId: f.sessionId,
@@ -240,7 +242,11 @@ test.skipIf(!reachable)(
       );
       await projection.markSubmitted(f.sessionId, f.input.toolCallId, f.now);
       await projection.markCompleted(f.sessionId, f.input.toolCallId, f.now);
-      expect((await f.journal.get(call.id))!.state).toBe("waiting_approval");
+      const afterProjection = (await f.journal.get(call.id))!;
+      expect(afterProjection.state).toBe("waiting_approval");
+      expect(afterProjection.version).toBe(beforeProjection.version);
+      expect(afterProjection.intentId).toBeNull();
+      expect(afterProjection.result).toBeNull();
       const [approval] = await f.db
         .select()
         .from(mcpApproval)
@@ -248,6 +254,16 @@ test.skipIf(!reachable)(
       expect(approval!.decision).toBe("pending");
       expect(approval!.consumedAt).toBeNull();
       expect(s.forwarded()).toBe(0);
+      const state = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      const execution = state.executions.find((value) => value.executionId === call.id)!;
+      expect(execution.state).toBe("waiting_approval");
+      expect(execution.approvalDecision).toBe("pending");
+      const result = await s.client.getMcpExecutionResult({
+        sessionId: f.sessionId,
+        executionId: call.id,
+      });
+      expect(result.resultJson).toBeUndefined();
+      expect(() => assertNoProjectedAuthority(execution, result.resultJson)).not.toThrow();
     } finally {
       await f.db.delete(pendingToolCall).where(eq(pendingToolCall.sessionId, f.sessionId));
       await s.close();
