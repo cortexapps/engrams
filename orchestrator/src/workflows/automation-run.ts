@@ -53,6 +53,7 @@ import { sessionRelayDeps } from "../automations/session-relay.ts";
 import { isRouterConnected } from "../model-routers/connected.ts";
 import { getOpenRouterDecisions } from "../integrations/openrouter.ts";
 import { loadProfileCards } from "../automations/profile-cards.ts";
+import { tracer } from "../telemetry/trace.ts";
 
 export interface AutomationRunWorkflowInput {
   runId: string;
@@ -268,8 +269,15 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
 function productionEngineDeps(): EngineDeps {
   const store = makeAutomationEngineStore();
   return {
-    step: (fn, name) => DBOS.runStep(fn, { name }),
-    recv: (topic, timeoutSeconds) => DBOS.recv<AutomationInbox>(topic, timeoutSeconds),
+    step: (fn, name) =>
+      tracer.inSpan("automation.step", { attributes: { "step.name": name } }, () =>
+        DBOS.runStep(fn, { name }),
+      ),
+    // A recv is the run waiting for its next inbox message.
+    recv: (topic, timeoutSeconds) =>
+      tracer.inSpan("automation.recv", { attributes: { "recv.topic": topic } }, () =>
+        DBOS.recv<AutomationInbox>(topic, timeoutSeconds),
+      ),
     store,
     sessions: makeProductionSessionOps({ store }),
     clock: { nowMs: () => Date.now() },

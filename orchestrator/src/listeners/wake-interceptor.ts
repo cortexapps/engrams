@@ -10,6 +10,7 @@ import type { Interceptor } from "@connectrpc/connect";
 import type { Logger } from "pino";
 
 import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
+import { tracer } from "../telemetry/trace.ts";
 
 /** Unary SessionService methods that can resume or end a parked session.
  * Reads (GetSession, ListSessions, ListSessionEvents, GetLog, …) are not
@@ -64,9 +65,13 @@ export function makeListenerWakeInterceptor(
       // orchestrator's database. A lost or failed wake is healed by the
       // dormant reconcile within its interval.
       if (sessionId !== undefined) {
-        void wake(sessionId).catch((err: unknown) => {
-          log.warn({ sessionId, err }, "listener wake failed after a session rpc");
-        });
+        void tracer
+          .inSpan("listener.wake", { attributes: { "session.id": sessionId } }, () =>
+            wake(sessionId),
+          )
+          .catch((err: unknown) => {
+            log.warn({ sessionId, err }, "listener wake failed after a session rpc");
+          });
       }
     }
   };

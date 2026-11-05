@@ -16,6 +16,7 @@ import { makeProductionToolConsumer } from "./tool-consumer.ts";
 import { config } from "../config.ts";
 import { makeSpecProjectionConsumer } from "./spec-projection-consumer.ts";
 import { productionSpecProjection } from "../specs/projection.ts";
+import { tracer } from "../telemetry/trace.ts";
 
 const log = rootLog.child({ component: "listener-manager" });
 const SCAN_INTERVAL_MS = 5_000;
@@ -57,7 +58,7 @@ export class ListenerManager {
   }
 
   scanOnce(): Promise<void> {
-    this.#scan ??= this.#scanImpl().finally(() => {
+    this.#scan ??= tracer.inSpan("listener.scan", {}, () => this.#scanImpl()).finally(() => {
       this.#scan = null;
     });
     return this.#scan;
@@ -83,10 +84,10 @@ export class ListenerManager {
       if (this.#listeners.has(sessionId)) continue;
       let acquired = false;
       try {
-        acquired = await this.#deps.leaseStore.tryAcquire(
-          sessionId,
-          this.#deps.owner,
-          this.#deps.ttlMs,
+        acquired = await tracer.inSpan(
+          "listener.acquire",
+          { attributes: { "session.id": sessionId } },
+          () => this.#deps.leaseStore.tryAcquire(sessionId, this.#deps.owner, this.#deps.ttlMs),
         );
         if (!acquired) continue;
         log.info({ sessionId }, "listener lease acquired");
