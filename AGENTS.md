@@ -251,9 +251,21 @@ and the site's CLI reference describe the user side.
   four lists in hand, and the commit message says what it turned up.
 
 **Code philosophy**
-- **Clean breaks over compat shims.** Favor simple one-path code; backwards-incompatible
-  changes (image re-bakes, schema changes) are acceptable. No "deprecated" stubs, no dangling
-  references to old versions.
+- **Live users: every change is safe to deploy and to roll back.** The service has real
+  users, so a change must keep their sessions and data through a rolling deploy:
+  - **Expand, then contract.** A schema change that removes or reshapes data lands in two
+    steps. First add and backfill, so the old build still runs on the new schema during the
+    roll and after a rollback. Drop the old shape in a later change, after no deployed build
+    reads it.
+  - **Formats stay readable across one release.** A new build reads what the previous build
+    wrote: durable records on a node, chunk-store manifests, and the coordinator↔host wire.
+    Both builds run at once during a roll.
+  - **Ending sessions or deleting user data is an explicit decision.** A change that does
+    either says so in its PR description, with the count from production, and the owner
+    approves it.
+  - **Transitional code has an end.** Compatibility code lands with the follow-up that
+    removes it, so the code returns to one path. No permanent shims, no "deprecated" stubs,
+    no dangling references to old versions.
 - **Simplify via abstractions** — a refactor should *retire* code; a new trait should subsume
   existing surfaces, not sit alongside them.
 - **New crate over stuffing** — shared logic that deserves its own crate gets one (workspace
