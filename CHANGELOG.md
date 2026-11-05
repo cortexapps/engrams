@@ -28,9 +28,11 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   is enabled), and each host's cordon lifts when it registers on the new build. Each session
   resumes from its checkpoint the next time it is used. An idle session whose only
   recoverable state was the host's live disk manifest is marked dead by migration 0126.
-- **Node-prep makes room for the pool.** On a host whose chunk cache fills the disk,
-  node-prep clears the cache before it creates the pool's data file; the cache refills from
-  the chunk store. `storage.chunkCacheDiskFraction` now defaults to `0.3`, so the pool's half
+- **Node-prep makes room for the pool.** When the pool's files would leave less than 15% of
+  the disk free (`POOL_RESERVE` in the node-prep script), node-prep clears the chunk cache
+  before it creates them; the cache refills from the chunk store, so the first resumes on
+  that host are slower. A disk without that room even then fails node-prep with a clear
+  message and no change. `storage.chunkCacheDiskFraction` now defaults to `0.3`, so the pool's half
   of the disk and the cache fit together.
 - **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
   queued evictions of the retired quarantine flavour, and replace the NBD slot columns with

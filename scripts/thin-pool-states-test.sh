@@ -70,7 +70,21 @@ grep -q "clearing the chunk cache" "$WORK/out" || fail "the cache was not cleare
 dmsetup status "$POOL" | grep -q thin-pool || fail "no pool after clearing the cache"
 pass "a full chunk cache is cleared to make room"
 
-# 3. Too little room even without the cache: a clear failure, nothing left
+# 3. A chunk cache that leaves room for the pool files but not for the
+#    reserve is also cleared: a node left near full reports disk pressure
+#    and admits no host-agent.
+fresh_fs
+total_k=$(df -Pk "$MNT" | awk 'NR==2 {print $2}')
+avail_k=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
+cache_m=$(( (avail_k - total_k / 2 - 32 * 1024 - total_k / 20) / 1024 ))
+dd if=/dev/zero of="$MNT/cache/chunk" bs=1M count="$cache_m" status=none
+prep || { cat "$WORK/out"; fail "a near-full disk did not build the pool"; }
+grep -q "clearing the chunk cache" "$WORK/out" || fail "the cache was not cleared on a near-full disk"
+left_k=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
+[ "$left_k" -ge $(( total_k * 15 / 100 )) ] || fail "the pool left less than the reserve free"
+pass "a cache that leaves no reserve is cleared"
+
+# 4. Too little room even without the cache: a clear failure, nothing left
 #    half-made, and a clean build once the space is free.
 fresh_fs
 dd if=/dev/zero of="$MNT/filler" bs=1M count=700 status=none
@@ -82,7 +96,7 @@ rm -f "$MNT/filler"
 prep || { cat "$WORK/out"; fail "the retry after freeing space failed"; }
 pass "a disk without room fails clearly and retries cleanly"
 
-# 4. A metadata file a crash left before the first activation (all zeros)
+# 5. A metadata file a crash left before the first activation (all zeros)
 #    is fresh, not corrupt.
 fresh_fs
 mkdir -p "$MNT/thin"
@@ -91,7 +105,7 @@ prep || { cat "$WORK/out"; fail "a zeroed metadata file stopped the build"; }
 dmsetup status "$POOL" | grep -q thin-pool || fail "no pool over a zeroed metadata file"
 pass "a zeroed metadata file is formatted, not rejected"
 
-# 5. A restart re-activates the pool after thin_check, data intact.
+# 6. A restart re-activates the pool after thin_check, data intact.
 fresh_fs
 prep
 dmsetup message "$POOL" 0 "create_thin 7"
@@ -106,7 +120,7 @@ after=$(sha256sum /dev/mapper/sentinel | cut -d' ' -f1)
 [ "$before" = "$after" ] || fail "a volume's bytes changed across re-activation"
 pass "a restart re-activates the pool with its data"
 
-# 6. An active pool is left alone.
+# 7. An active pool is left alone.
 prep || fail "a run against an active pool failed"
 grep -q "is active" "$WORK/out" || fail "an active pool was not recognised"
 pass "an active pool is left alone"

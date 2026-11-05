@@ -109,8 +109,9 @@ adopt the VMs the old one started. The charts handle that release for you, and b
    default), it fails and the upgrade stops before any change. The release notes and the
    job's log name the sessions.
 3. After the host fleet chart upgrades, a second job replaces the drained host pods so they
-   start the new build; with the operator enabled, the operator does it. On a disk the chunk
-   cache has filled, node-prep clears the cache to make room for what the new build needs.
+   start the new build; with the operator enabled, the operator does it. When the new build's
+   files would leave the disk nearly full, node-prep clears the chunk cache first; it refills
+   from the chunk store.
 4. Each host comes back on the new build, and the coordinator lifts the job's cordon. A
    session resumes from its checkpoint the next time someone uses it.
 
