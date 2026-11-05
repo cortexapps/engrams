@@ -3,6 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dm;
@@ -27,8 +28,9 @@ pub struct ThinPoolDisk {
     chunk_size: u64,
     block_bytes: u64,
     /// Seeded from the pool at `open`. The kernel refuses a duplicate id
-    /// and `create` moves on, so a wrap of the 24-bit space is safe.
-    next_id: AtomicU32,
+    /// and `create` and `snapshot` move on, so a wrap of the 24-bit space
+    /// is safe.
+    next_id: Arc<AtomicU32>,
     /// The pool holds one reserved metadata snapshot at a time.
     metadata_snap: tokio::sync::Mutex<()>,
 }
@@ -59,7 +61,7 @@ impl ThinPoolDisk {
             nodes_dir: nodes_dir.to_path_buf(),
             chunk_size,
             block_bytes,
-            next_id: AtomicU32::new(1),
+            next_id: Arc::new(AtomicU32::new(1)),
             metadata_snap: tokio::sync::Mutex::new(()),
         };
         let in_pool = disk.thin_ids().await?;
@@ -83,8 +85,15 @@ impl ThinPoolDisk {
             .await
     }
 
+    /// The device-mapper name of a volume. Device names are global to the
+    /// kernel, so each pool's volumes carry its name: two host-agents on
+    /// one machine, each with its own pool, never share a device or a node.
+    pub fn device_name(&self, name: &VolumeName) -> String {
+        format!("{}.{}", self.pool, name.as_str())
+    }
+
     fn node_of(&self, name: &VolumeName) -> PathBuf {
-        self.nodes_dir.join(name.as_str())
+        self.nodes_dir.join(self.device_name(name))
     }
 
     async fn active_ids(&self) -> io::Result<Vec<u32>> {
@@ -124,7 +133,7 @@ impl ThinPoolDisk {
     /// The thin behind `name` and its size, refused when it belongs to
     /// another pool.
     async fn thin_of(&self, name: &VolumeName) -> io::Result<(ThinParams, u64)> {
-        let targets = self.dm.table(name.as_str()).await?;
+        let targets = self.dm.table(&self.device_name(name)).await?;
         let params = parse::thin_params(&single_target(&targets, "thin")?)?;
         if params.pool != self.pool_dev {
             return Err(io::Error::new(
@@ -144,13 +153,13 @@ impl ThinPoolDisk {
         let params = format!("{} {id}", self.pool_dev);
         let activated = async {
             self.dm
-                .create(name.as_str(), sectors, "thin", &params)
+                .create(&self.device_name(name), sectors, "thin", &params)
                 .await?;
             match self.volume(name, sectors).await {
                 Ok(volume) => Ok(volume),
                 Err(e) => {
                     let _ = tokio::fs::remove_file(self.node_of(name)).await;
-                    let _ = self.dm.remove(name.as_str()).await;
+                    let _ = self.dm.remove(&self.device_name(name)).await;
                     Err(e)
                 }
             }
@@ -166,7 +175,7 @@ impl ThinPoolDisk {
 
     async fn volume(&self, name: &VolumeName, sectors: u64) -> io::Result<Volume> {
         let node = self.node_of(name);
-        dm::make_node(&node, self.dm.devno(name.as_str()).await?)?;
+        dm::make_node(&node, self.dm.devno(&self.device_name(name)).await?)?;
         Volume::open(name.clone(), &node, sectors * SECTOR_BYTES, self.chunk_size)
     }
 
@@ -251,22 +260,29 @@ impl SessionDisk for ThinPoolDisk {
 
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
         let (thin, sectors) = self.thin_of(&origin.name).await?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
         let dm = self.dm.clone();
         let pool = self.pool.clone();
-        let origin_name = origin.name.as_str().to_owned();
+        let next_id = self.next_id.clone();
+        let origin_name = self.device_name(&origin.name);
         // The origin holds all I/O while it is suspended, so the resume
-        // must run whatever happens to the caller: the three calls are
-        // one owned task.
-        tokio::spawn(async move {
+        // must run whatever happens to the caller: the calls are one owned
+        // task.
+        let id = tokio::spawn(async move {
             dm.suspend(&origin_name).await?;
-            let created = dm
-                .message(&pool, &format!("create_snap {id} {}", thin.id))
-                .await;
+            let created = loop {
+                let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
+                match dm
+                    .message(&pool, &format!("create_snap {id} {}", thin.id))
+                    .await
+                {
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    created => break created.map(|()| id),
+                }
+            };
             let resumed = dm.resume(&origin_name).await;
             match (created, resumed) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Ok(()), Err(e)) => {
+                (Ok(id), Ok(())) => Ok(id),
+                (Ok(id), Err(e)) => {
                     // The snapshot exists but nothing will activate it.
                     if let Err(error) = dm.message(&pool, &format!("delete {id}")).await {
                         tracing::warn!(pool = %pool, id, %error, "thin left behind by a failed resume");
@@ -291,7 +307,7 @@ impl SessionDisk for ThinPoolDisk {
         let (thin, _) = self.thin_of(name).await?;
         let mut attempt = 1;
         loop {
-            match self.dm.remove(name.as_str()).await {
+            match self.dm.remove(&self.device_name(name)).await {
                 Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
                     attempt += 1;
                     tokio::time::sleep(REMOVE_RETRY).await;
@@ -313,12 +329,17 @@ impl SessionDisk for ThinPoolDisk {
             .thins()
             .await?
             .into_iter()
-            .filter_map(|t| VolumeName::new(t.name).ok())
+            .filter_map(|t| {
+                let volume = t.name.strip_prefix(&self.pool)?.strip_prefix('.')?;
+                VolumeName::new(volume.to_string()).ok()
+            })
             .collect())
     }
 
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
-        self.dm.rename(from.as_str(), to.as_str()).await?;
+        self.dm
+            .rename(&self.device_name(from), &self.device_name(to))
+            .await?;
         tokio::fs::rename(self.node_of(from), self.node_of(to)).await
     }
 

@@ -245,19 +245,22 @@ thin-provisioning tools it calls at run time (`thin_dump`,
 ### Objects on a node
 
 ```text
-/dev/mapper/engram-pool                  the pool (loop-backed metadata + data files)
-/dev/engram/img-<manifest_id>-v<N>       one volume per staged image version
-/dev/engram/tmp-img-<manifest_id>-v<N>   an image version whose stage has not finished
-/dev/engram/sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
-/dev/engram/sb-<sandbox_id>-swap         session swap (a fresh volume at first; checkpointed like root)
-/dev/engram/sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
-<work_dir>/<sandbox_id>/sandbox.json     records the volume names
+/dev/mapper/engram-pool                              the pool (loop-backed metadata + data files)
+/dev/engram/engram-pool.img-<manifest_id>-v<N>       one volume per staged image version
+/dev/engram/engram-pool.tmp-img-<manifest_id>-v<N>   an image version whose stage has not finished
+/dev/engram/engram-pool.sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
+/dev/engram/engram-pool.sb-<sandbox_id>-swap         session swap (a fresh volume at first; checkpointed like root)
+/dev/engram/engram-pool.sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
+<work_dir>/<sandbox_id>/sandbox.json                 records the volume names
 ```
 
 The pool's metadata is the only record of which thins exist and the
 device-mapper table the only record of which name maps to which thin
-(Decision 6). The device nodes under `/dev/engram` are made by the
-host-agent with `mknod`, so nothing waits on udev.
+(Decision 6). Device-mapper names are global to the kernel, so a volume's
+device carries its pool's name before a `.`; two host-agents on one machine,
+each with its own pool, never share a device. The device nodes under
+`/dev/engram` are made by the host-agent with `mknod`, so nothing waits on
+udev.
 
 ### Lifecycles
 

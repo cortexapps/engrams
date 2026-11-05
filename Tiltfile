@@ -560,7 +560,7 @@ if two_hosts and fc_colima_profile:
     fail('ENGRAM_INTEG_TWO_HOSTS is not supported together with ' +
          'ENGRAM_FC_COLIMA_PROFILE yet.')
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_port, egress_dns_port, guest_gateway_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_port, egress_dns_port, guest_gateway_port, thin_pool):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -642,9 +642,9 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_po
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
     # The session-disk pool and its floor, see `dev_thin_pool` above.
     # Both must be in this map: the Linux host-agent runs under sudo
-    # --preserve-env=<these keys>.
-    if dev_thin_pool:
-        env['ENGRAM_THIN_POOL'] = dev_thin_pool
+    # --preserve-env=<these keys>. Each host-agent has its own pool.
+    if thin_pool:
+        env['ENGRAM_THIN_POOL'] = thin_pool
         env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor
 
     if fc_colima_profile:
@@ -945,7 +945,7 @@ if _guest_gateway_base < 1 or _guest_gateway_base > 65535:
 if two_hosts and (_proxy_base == 65535 or _dns_base == 65535 or _guest_gateway_base == 65535):
     fail('two-host mode needs room for the second host egress ports (base must be <= 65534)')
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', str(_proxy_base), str(_dns_base), str(_guest_gateway_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', str(_proxy_base), str(_dns_base), str(_guest_gateway_base), dev_thin_pool)
     if fc_colima_profile:
         # ADR 0082: the coordinator dials the host-agent's advertised
         # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
@@ -994,7 +994,7 @@ if dev_split:
         # netns), else host-agent-b fails closed on Address already in use
         # (ADR 0083).
         _proxy_b = str(_proxy_base + 1)
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', _proxy_b, str(_dns_base + 1), str(_guest_gateway_base + 1))
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', _proxy_b, str(_dns_base + 1), str(_guest_gateway_base + 1), dev_thin_pool + '-b' if dev_thin_pool else '')
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.

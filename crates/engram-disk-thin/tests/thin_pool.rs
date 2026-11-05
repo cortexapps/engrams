@@ -40,9 +40,9 @@ fn fill(byte: u8) -> Vec<u8> {
     vec![byte; CHUNK as usize]
 }
 
-async fn thin_id(volume: &Volume) -> u32 {
+async fn thin_id(disk: &ThinPoolDisk, volume: &Volume) -> u32 {
     let output = tokio::process::Command::new("dmsetup")
-        .args(["table", volume.name.as_str()])
+        .args(["table", &disk.device_name(&volume.name)])
         .output()
         .await
         .unwrap();
@@ -104,6 +104,33 @@ async fn list_sees_a_volume_and_rename_keeps_the_open_handle_valid() {
     assert_eq!(reopened.read_chunk(ChunkIndex(3)).await.unwrap(), fill(3));
     drop((v, reopened));
     disk.delete(&b).await.unwrap();
+}
+
+/// Device names are global to the kernel: a volume's device carries its
+/// pool's name, so two host-agents on one machine, each with a pool, never
+/// collide on a volume name. The volume list still speaks volume names.
+#[tokio::test]
+#[ignore]
+async fn a_volume_device_is_named_for_its_pool() {
+    let disk = pool_or_skip!();
+    let volume = name("scoped", "live");
+    let v = disk.create(&volume, CHUNK).await.unwrap();
+    let devices = tokio::process::Command::new("dmsetup")
+        .args(["ls"])
+        .output()
+        .await
+        .unwrap();
+    let devices = String::from_utf8(devices.stdout).unwrap();
+    let device = format!("{}.{}", disk.pool(), volume.as_str());
+    assert!(
+        devices
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(device.as_str())),
+        "no device {device} in {devices}"
+    );
+    assert!(disk.list().await.unwrap().contains(&volume));
+    drop(v);
+    disk.delete(&volume).await.unwrap();
 }
 
 #[tokio::test]
@@ -238,11 +265,11 @@ async fn open_deletes_a_thin_whose_device_is_gone_and_create_skips_a_taken_id() 
     let disk = pool_or_skip!();
     let orphan = name("reap", "orphan");
     let v = disk.create(&orphan, CHUNK).await.unwrap();
-    let orphan_id = thin_id(&v).await;
+    let orphan_id = thin_id(&disk, &v).await;
     drop(v);
     // A crash between `dmsetup remove` and the pool's `delete` message.
     let removed = tokio::process::Command::new("dmsetup")
-        .args(["remove", orphan.as_str()])
+        .args(["remove", &disk.device_name(&orphan)])
         .status()
         .await
         .unwrap();
@@ -271,7 +298,7 @@ async fn open_deletes_a_thin_whose_device_is_gone_and_create_skips_a_taken_id() 
     assert!(created.success());
     let live = name("reap", "live");
     let v = disk.create(&live, CHUNK).await.unwrap();
-    assert_eq!(thin_id(&v).await, taken + 1);
+    assert_eq!(thin_id(&disk, &v).await, taken + 1);
 
     drop(v);
     disk.delete(&live).await.unwrap();
@@ -317,7 +344,7 @@ async fn a_failed_activation_leaves_no_thin_in_the_pool() {
     let disk = pool_or_skip!();
     let taken = name("decoy", "taken");
     let decoy = tokio::process::Command::new("dmsetup")
-        .args(["create", taken.as_str(), "--table", "0 8 zero"])
+        .args(["create", &disk.device_name(&taken), "--table", "0 8 zero"])
         .status()
         .await
         .unwrap();
@@ -339,7 +366,7 @@ async fn a_failed_activation_leaves_no_thin_in_the_pool() {
     drop(v);
     disk.delete(&origin).await.unwrap();
     let removed = tokio::process::Command::new("dmsetup")
-        .args(["remove", taken.as_str()])
+        .args(["remove", &disk.device_name(&taken)])
         .status()
         .await
         .unwrap();
