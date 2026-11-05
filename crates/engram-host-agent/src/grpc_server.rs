@@ -110,6 +110,8 @@ impl HostServiceImpl {
     ///
     /// Returns the decoded [`SessionFence`] so the handler can thread it
     /// to the inner `HostClient` without re-decoding.
+    /// Epoch zero preserves a supplied identity without accessing the
+    /// high-water store. Empty bytes retain the unfenced sentinel.
     ///
     /// `fencing_epoch == 0` (allow WITHOUT advancing the high-water; the
     /// store's `check_and_advance` holds the reject-zero semantics for
@@ -134,10 +136,13 @@ impl HostServiceImpl {
         session_id: &[u8],
         fencing_epoch: u64,
     ) -> Result<SessionFence, Status> {
-        if fencing_epoch == 0 {
+        if fencing_epoch == 0 && session_id.is_empty() {
             return Ok(SessionFence::unfenced());
         }
         let session_id = decode_session_id(session_id)?;
+        if fencing_epoch == 0 {
+            return Ok(SessionFence::new(session_id, 0));
+        }
         self.epochs
             .check_and_advance(session_id, fencing_epoch)
             .map_err(|e| match e {
@@ -1264,12 +1269,7 @@ impl HostService for HostServiceImpl {
         check_wire_version(&req)?;
         async move {
             let r = req.into_inner();
-            let mut fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
-            // Epoch zero skips high-water updates, but must not erase a supplied
-            // identity before the start gate compares it with the policy.
-            if r.fencing_epoch == 0 && !r.session_id.is_empty() {
-                fence.session_id = decode_session_id(&r.session_id)?;
-            }
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
             let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
             let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
@@ -2064,6 +2064,69 @@ mod wire_version_tests {
     use engram_core::types::sandbox::ExecEventStream;
     use engram_protocol::wire::WIRE_VERSION_METADATA_KEY;
     use futures::StreamExt;
+
+    #[test]
+    fn epoch_zero_preserves_session_identity_without_high_water_access() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let path = work.path().join("epochs");
+        let epochs = SessionEpochStore::open(&path).unwrap();
+        let service = HostServiceImpl::new(host, epochs.clone());
+        let session = engram_core::SessionId::new();
+        let uuid = session.as_uuid();
+        let bytes = uuid.as_bytes();
+
+        assert_eq!(
+            service.check_session_epoch(&[], 0).unwrap(),
+            SessionFence::unfenced()
+        );
+        assert_eq!(
+            service.check_session_epoch(&[0; 16], 0).unwrap(),
+            SessionFence::unfenced()
+        );
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert!(epochs.read(session).unwrap().is_none());
+        assert_eq!(
+            service.check_session_epoch(bytes, 5).unwrap(),
+            SessionFence::new(session, 5)
+        );
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert_eq!(epochs.read(session).unwrap().unwrap().epoch, 5);
+        let stale = service.check_session_epoch(bytes, 4).unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert!(stale.message().contains("stored high-water 5, incoming 4"));
+        assert_eq!(epochs.read(session).unwrap().unwrap().epoch, 5);
+
+        // A zero epoch must not read or repair even a corrupt high-water record.
+        let record = path.join(format!("{session}.json"));
+        std::fs::write(&record, b"corrupt").unwrap();
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert_eq!(std::fs::read(record).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn epoch_zero_rejects_malformed_session_identity() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        for bytes in [&[1][..], &[1; 15][..], &[1; 17][..]] {
+            assert_eq!(
+                service.check_session_epoch(bytes, 0).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
 
     fn exec_events<I>(events: I) -> ExecEventStream
     where

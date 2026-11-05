@@ -7639,6 +7639,8 @@ mod adapter {
         #[test]
         fn bash_hook_carries_cwd_across_shells_and_background_cannot_move_it() {
             let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("engram-bash-cwd-'quote'-{}", uuid::Uuid::new_v4()));
             let child = base.join("child with 'quote'");
             let tracker = base.join("bash-cwd");
@@ -7699,6 +7701,8 @@ mod adapter {
         #[test]
         fn bash_hook_records_cwd_when_command_replaces_exit_trap() {
             let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("engram-bash-cwd-own-trap-{}", uuid::Uuid::new_v4()));
             let child = base.join("child");
             let tracker = base.join("bash-cwd");

@@ -994,14 +994,14 @@ async fn boot_prepared(
         async move {
             // ADR 0079: the direct (capacity-available) create pipeline is
             // deliberately out-of-op — see the epoch-0 disposition note in
-            // the host's `check_session_epoch` — so the boot RPCs are
-            // unfenced here. The queued-create path fences via the
-            // create_boot verb.
+            // the host's `check_session_epoch`. Keep the session identity
+            // with epoch zero; this does not claim an op epoch. The
+            // queued-create path fences via the create_boot verb.
             match crate::session_boot::boot_on_reserved_host(
                 &st,
                 inputs,
                 host_id,
-                SessionFence::unfenced(),
+                SessionFence::new(session_id, 0),
             )
             .await
             {

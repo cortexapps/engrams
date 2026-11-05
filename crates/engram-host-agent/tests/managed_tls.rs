@@ -410,43 +410,96 @@ async fn managed_host_requires_pinned_mutual_tls() {
         }))
         .unwrap();
     let managed_fence = engram_core::traits::SessionFence::new(target.session_id, 1);
-    let ordinary_fence = engram_core::traits::SessionFence::new(engram_core::SessionId::new(), 1);
+    let ordinary_session = engram_core::SessionId::new();
+    let mut managed_source = snapshot.clone();
+    managed_source.source_sandbox_id = Some(target.sandbox_id);
     for host in [&*local as &dyn HostClient, &remote as &dyn HostClient] {
-        assert!(host.restore(snapshot.clone(), ordinary_fence).await.is_ok());
-        assert!(host
-            .restore_base_for_session(snapshot.clone(), Default::default(), vec![], ordinary_fence)
-            .await
-            .is_ok());
-        assert!(host
-            .resume(engram_core::SandboxId::new(), ordinary_fence)
-            .await
-            .is_ok());
-        for error in [
-            host.resume(target.sandbox_id, ordinary_fence)
+        for epoch in [1, 0] {
+            let ordinary_fence = engram_core::traits::SessionFence::new(ordinary_session, epoch);
+            let managed_fence = engram_core::traits::SessionFence::new(target.session_id, epoch);
+            let calls = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+            host.restore(snapshot.clone(), ordinary_fence)
                 .await
-                .unwrap_err(),
-            host.restore(snapshot.clone(), managed_fence)
-                .await
-                .unwrap_err(),
+                .expect("ordinary restore preserves session identity");
             host.restore_base_for_session(
                 snapshot.clone(),
                 Default::default(),
                 vec![],
-                managed_fence,
+                ordinary_fence,
             )
             .await
-            .unwrap_err(),
-            host.resume(target.sandbox_id, managed_fence)
+            .expect("ordinary base restore preserves session identity");
+            host.resume(engram_core::SandboxId::new(), ordinary_fence)
+                .await
+                .expect("ordinary resume preserves session identity");
+            assert_eq!(
+                backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls + 3
+            );
+            for error in [
+                host.resume(target.sandbox_id, ordinary_fence)
+                    .await
+                    .unwrap_err(),
+                host.restore(managed_source.clone(), ordinary_fence)
+                    .await
+                    .unwrap_err(),
+                host.restore_base_for_session(
+                    managed_source.clone(),
+                    Default::default(),
+                    vec![],
+                    ordinary_fence,
+                )
+                .await
+                .unwrap_err(),
+                host.restore(snapshot.clone(), managed_fence)
+                    .await
+                    .unwrap_err(),
+                host.restore_base_for_session(
+                    snapshot.clone(),
+                    Default::default(),
+                    vec![],
+                    managed_fence,
+                )
+                .await
+                .unwrap_err(),
+                host.resume(target.sandbox_id, managed_fence)
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("managed restore quarantine unavailable"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls + 3
+            );
+        }
+        let calls = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let nil = engram_core::traits::SessionFence::unfenced();
+        for error in [
+            host.restore(snapshot.clone(), nil).await.unwrap_err(),
+            host.restore_base_for_session(snapshot.clone(), Default::default(), vec![], nil)
+                .await
+                .unwrap_err(),
+            host.resume(engram_core::SandboxId::new(), nil)
                 .await
                 .unwrap_err(),
         ] {
             assert!(
                 error
                     .to_string()
-                    .contains("managed restore quarantine unavailable"),
+                    .contains("restore session identity required"),
                 "{error}"
             );
         }
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
     }
     // Missing desired state and a corrupt marker still identify a known managed session.
     std::fs::remove_file(
@@ -587,6 +640,7 @@ impl engram_core::traits::SandboxBackend for EndpointFixture {
         &self,
         _: engram_core::types::snapshot::SnapshotMetadata,
     ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(engram_core::SandboxId::new())
     }
     async fn restore_base_for_session(
@@ -595,9 +649,11 @@ impl engram_core::traits::SandboxBackend for EndpointFixture {
         _: std::collections::HashMap<String, String>,
         _: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(engram_core::SandboxId::new())
     }
     async fn resume(&self, _: engram_core::SandboxId) -> Result<(), engram_core::SandboxError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn destroy(&self, _: engram_core::SandboxId) -> Result<(), engram_core::SandboxError> {

@@ -197,8 +197,8 @@ pub(crate) async fn boot_on_reserved_host(
     host_id: HostId,
     // ADR 0079: the caller's fencing epoch, stamped into every session-
     // scoped host RPC below. The create_boot verb threads its op fence;
-    // the direct (capacity-available) create pipeline is out-of-op and
-    // passes `SessionFence::unfenced()`.
+    // the direct (capacity-available) create pipeline preserves the
+    // session identity with epoch zero, without claiming an op epoch.
     fence: SessionFence,
 ) -> Result<(), BootError> {
     crate::managed_boot::gate(state, inputs.session_id, false)
