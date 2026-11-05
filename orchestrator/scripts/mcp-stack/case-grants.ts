@@ -27,6 +27,7 @@ import {
   pollGuestObservation,
   sendScenarioPrompt,
   startScenario,
+  scenarioBindingTools,
   verifiedCounterResult,
   type StartedScenario,
 } from "./scenario-runtime.ts";
@@ -119,7 +120,7 @@ async function absentCall(
   tool: string,
 ) {
   const before = await scenario.fixture.observe();
-  const tools = await bindingTools(scenario.reviewClient, scenario.sessionId);
+  const tools = await scenarioBindingTools(scenario);
   requireThat(
     !tools.some((value) => value.modelToolName === tool),
     "absent_alias_public_binding",

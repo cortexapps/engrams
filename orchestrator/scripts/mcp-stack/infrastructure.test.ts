@@ -5,8 +5,13 @@ import { createServer } from "node:https";
 import { X509Certificate } from "node:crypto";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { ContextSchema, realOwnedPath, sha256 } from "./context.ts";
-import { modelToolName } from "./bootstrap.ts";
+import {
+  ContextSchema,
+  realOwnedPath,
+  sha256,
+  RunnerFailure,
+} from "./context.ts";
+import { bindingTools, modelToolName } from "./bootstrap.ts";
 import { DatabaseObserver } from "./observer.ts";
 import { publicClient } from "./transport.ts";
 import { IntegrationService } from "../../src/gen/engram/app/v1/integration_pb.ts";
@@ -189,8 +194,20 @@ for (const failure of [
   "publication",
   "owner",
   "profile",
+  "scenario-ordinary",
+  "scenario-managed",
+  "scenario-owner",
+  "scenario-receipt",
+  "scenario-tools",
+  "scenario-executions",
+  "scenario-policy",
+  "scenario-pagination",
+  "scenario-malformed",
 ] as const)
   test(`infrastructure uses public owner tasks, managed authority and exact cleanup: ${failure}`, async () => {
+    const scenarioTest = failure.startsWith("scenario-");
+    const ordinaryScenario = scenarioTest && failure !== "scenario-managed";
+    const managedIndex = scenarioTest ? 0 : 1;
     const ctx = ContextSchema.parse(validContext());
     ctx.runRoot = root;
     ctx.protocolFixtures.modern.resourceKeyFile = join(root, "resource.key");
@@ -221,8 +238,8 @@ for (const failure of [
     ];
     const source_key = {
       creation: {
-        session_id: sessionIds[1]!,
-        task_id: "task-2",
+        session_id: sessionIds[managedIndex]!,
+        task_id: scenarioTest ? "task-1" : "task-2",
         policy: {
           actorId: failure === "owner" ? "other" : "owner",
           inputId: "input",
@@ -233,8 +250,8 @@ for (const failure of [
       },
       context: {
         target: {
-          session_id: sessionIds[1]!,
-          sandbox_id: sessionIds[1]!,
+          session_id: sessionIds[managedIndex]!,
+          sandbox_id: sessionIds[managedIndex]!,
           host_id: ctx.hostId,
           binding_epoch: 1,
         },
@@ -250,7 +267,12 @@ for (const failure of [
     };
     const started = spyOn(database, "started").mockImplementation(
       async (sessionId, hostId) => {
-        expect(sessionId).toBe(sessionIds[1]!);
+        if (ordinaryScenario)
+          throw new RunnerFailure(
+            "ASSERTION_FAILED",
+            "coordinator_managed_boot_row",
+          );
+        expect(sessionId).toBe(sessionIds[managedIndex]!);
         expect(hostId).toBe(ctx.hostId);
         events.push("managed-started");
         return {
@@ -267,7 +289,7 @@ for (const failure of [
     );
     const lifecycle = spyOn(database, "managedLifecycle").mockImplementation(
       async (sessionId) => {
-        expect(sessionId).toBe(sessionIds[1]!);
+        expect(sessionId).toBe(sessionIds[managedIndex]!);
         events.push("managed-lifecycle");
         return {
           phase: "started",
@@ -318,7 +340,8 @@ for (const failure of [
             expect(req.harness).toBe("claude");
             expect(req.modelRouter).toBe("openrouter");
             expect(req.model).toBe("z-ai/glm-5.2");
-            if (profiles === 1) expect(req.integrationGrants).toEqual([]);
+            if (profiles === 1 && failure !== "scenario-managed")
+              expect(req.integrationGrants).toEqual([]);
             else {
               expect(req.integrationGrants).toHaveLength(1);
               expect(req.integrationGrants[0]).toMatchObject({
@@ -370,6 +393,16 @@ for (const failure of [
             if (failure === "update")
               throw new ConnectError("private", Code.FailedPrecondition);
             return { task: { id: req.taskId, titleIsCustom: true } };
+          },
+          getTask(req) {
+            return {
+              task: {
+                id: req.taskId,
+                createdByUserId:
+                  failure === "scenario-owner" ? "other" : "owner",
+                sessions: [{ sessionId: sessionIds[0]! }],
+              },
+            };
           },
           deleteTask(req) {
             deletedTasks.push(req.taskId);
@@ -440,7 +473,28 @@ for (const failure of [
             return { connection };
           },
           getSessionMcpState(req) {
-            expect(req.sessionId).toBe(sessionIds[1]!);
+            if (ordinaryScenario) {
+              expect(req.sessionId).toBe(sessionIds[0]!);
+              expect(req.omitBindings).toBe(false);
+              return {
+                availability:
+                  failure === "scenario-malformed" ? "" : "unavailable",
+                ...(failure === "scenario-receipt"
+                  ? { bindingReceipt: { current: false } }
+                  : {}),
+                ...(failure === "scenario-policy" ? { writePolicy: {} } : {}),
+                ...(failure === "scenario-tools"
+                  ? { bindingTools: [{ modelToolName: alias }] }
+                  : {}),
+                ...(failure === "scenario-executions"
+                  ? { executions: [{ executionId: "unexpected" }] }
+                  : {}),
+                ...(failure === "scenario-pagination"
+                  ? { hasMoreBindingTools: true }
+                  : {}),
+              };
+            }
+            expect(req.sessionId).toBe(sessionIds[managedIndex]!);
             events.push("binding");
             return {
               bindingReceipt: { current: true },
@@ -574,6 +628,50 @@ for (const failure of [
         },
       };
       const { runInfrastructure } = await import("./infrastructure.ts");
+      if (scenarioTest) {
+        const { startScenario, scenarioBindingTools } = await import(
+          "./scenario-runtime.ts"
+        );
+        const pending = startScenario(ctx, principals, database, {
+          harness: "claude",
+          suffix: "claude-grant-missing",
+          protocol: "modern",
+          upstreamName: "read_counter",
+          mode: "read",
+          caller: "owner",
+          automationWrite: false,
+          arguments: {},
+          constraints: [],
+          callId: "grant-missing",
+          ...(ordinaryScenario ? { grant: false } : {}),
+        });
+        if (failure === "scenario-ordinary" || failure === "scenario-managed") {
+          const scenario = await pending;
+          expect(scenario.sessionId).toBe(sessionIds[0]!);
+          const observed = await scenarioBindingTools(scenario);
+          if (ordinaryScenario) {
+            expect(observed).toEqual([]);
+            expect(() => scenario.coordinator).toThrow(
+              "managed_scenario_required",
+            );
+            await expect(
+              bindingTools(owner, scenario.sessionId),
+            ).rejects.toThrow("current_binding");
+          } else {
+            expect(observed.map((tool) => tool.modelToolName)).toEqual([alias]);
+            expect(scenario.coordinator.phase).toBe("started");
+          }
+        } else {
+          await expect(pending).rejects.toThrow(
+            failure === "scenario-owner"
+              ? "ordinary_owner_task_session"
+              : "ordinary_empty_mcp_authority",
+          );
+        }
+        expect(started).toHaveBeenCalledTimes(ordinaryScenario ? 0 : 1);
+        expect(lifecycle).toHaveBeenCalledTimes(ordinaryScenario ? 0 : 1);
+        return;
+      }
       if (failure === "none") {
         const rows = await runInfrastructure(ctx, principals, database);
         expect(rows).toEqual(
@@ -599,7 +697,7 @@ for (const failure of [
         expect(started).toHaveBeenCalledTimes(1);
         expect(lifecycle).toHaveBeenCalledTimes(1);
       } else {
-        const seam = {
+        const seams: Partial<Record<typeof failure, string>> = {
           upload: "guest_file_status_http_400_rpc_code_3",
           download: "guest_file_status_http_404",
           update: "private",
@@ -612,7 +710,9 @@ for (const failure of [
           publication: "infrastructure_started_owner_publication",
           owner: "infrastructure_started_owner_publication",
           profile: "published_fixture_profile",
-        }[failure];
+        };
+        const seam = seams[failure];
+        expect(seam).toBeDefined();
         await expect(
           runInfrastructure(ctx, principals, database),
         ).rejects.toThrow(seam);

@@ -100,32 +100,49 @@ export async function startScenario(
       value.session?.status === "active" && value.session.hostId === ctx.hostId,
   );
   database.own(task.taskId, task.sessionId);
-  const coordinator = await waitFor(
-    ctx,
-    "coordinator_started",
-    () => database.started(task.sessionId, ctx.hostId),
-    (state) => state.phase === "started",
-  );
-  requireThat(
-    coordinator.source_key.context.operator_identity ===
-      ctx.publication.candidateIdentity &&
-      coordinator.source_key.context.target.session_id === task.sessionId &&
-      coordinator.source_key.context.target.host_id === ctx.hostId,
-    "started_target_publication",
-  );
-  if (task.automation)
+  let coordinator: Awaited<ReturnType<DatabaseObserver["started"]>> | undefined;
+  if (input.grant === false) {
+    requireThat(input.caller === "owner", "ordinary_missing_grant_owner");
+    const observed = await client.tasks.getTask({ taskId: task.taskId });
     requireThat(
-      coordinator.source_key.creation.policy.actorId ===
-        task.automation.runtimeActorId,
-      "actual_automation_runtime_actor",
+      observed.task?.id === task.taskId &&
+        observed.task.createdByUserId === principals.actorIds.owner &&
+        observed.task.sessions.length === 1 &&
+        observed.task.sessions[0]?.sessionId === task.sessionId,
+      "ordinary_owner_task_session",
     );
-  await waitFor(
-    ctx,
-    "orchestrator_started",
-    () => database.managedLifecycle(task.sessionId, coordinator),
-    (state) => state.phase === "started",
-  );
-  if (input.grant !== false) {
+    await scenarioBindingTools({
+      input,
+      reviewClient,
+      sessionId: task.sessionId,
+    });
+  } else {
+    coordinator = await waitFor(
+      ctx,
+      "coordinator_started",
+      () => database.started(task.sessionId, ctx.hostId),
+      (state) => state.phase === "started",
+    );
+    requireThat(
+      coordinator.source_key.context.operator_identity ===
+        ctx.publication.candidateIdentity &&
+        coordinator.source_key.context.target.session_id === task.sessionId &&
+        coordinator.source_key.context.target.host_id === ctx.hostId,
+      "started_target_publication",
+    );
+    if (task.automation)
+      requireThat(
+        coordinator.source_key.creation.policy.actorId ===
+          task.automation.runtimeActorId,
+        "actual_automation_runtime_actor",
+      );
+    const managedCoordinator = coordinator;
+    await waitFor(
+      ctx,
+      "orchestrator_started",
+      () => database.managedLifecycle(task.sessionId, managedCoordinator),
+      (state) => state.phase === "started",
+    );
     const bound = await bindingTool(
       reviewClient,
       task.sessionId,
@@ -143,11 +160,6 @@ export async function startScenario(
           canonicalJson(JSON.parse(reviewed.inputSchemaJson)),
       "exact_delivered_binding_schema",
     );
-  } else {
-    requireThat(
-      (await bindingTools(reviewClient, task.sessionId)).length === 0,
-      "missing_grant_empty_binding",
-    );
   }
   await guestReady(ctx, client, task.sessionId);
   return {
@@ -162,10 +174,45 @@ export async function startScenario(
     connection,
     catalog,
     before,
-    coordinator,
+    get coordinator() {
+      requireThat(coordinator, "managed_scenario_required");
+      return coordinator;
+    },
     input,
   };
 }
+/** Only the explicit no-grant fixture may observe ordinary empty authority. */
+export async function scenarioBindingTools(
+  scenario: Pick<StartedScenario, "input" | "reviewClient" | "sessionId">,
+) {
+  if (scenario.input.grant !== false)
+    return bindingTools(scenario.reviewClient, scenario.sessionId);
+  const state = await scenario.reviewClient.integration.getSessionMcpState({
+    sessionId: scenario.sessionId,
+    omitBindings: false,
+    omitExecutions: false,
+    bindingPageSize: 16,
+    pageSize: 16,
+  });
+  requireThat(
+    state.bindingReceipt === undefined &&
+      state.writePolicy === undefined &&
+      state.availability === "unavailable" &&
+      state.bindingTools.length === 0 &&
+      state.executions.length === 0 &&
+      state.approvals.length === 0 &&
+      state.unknownWriteBlocks.length === 0 &&
+      state.resolutionReceipts.length === 0 &&
+      state.allowedActions.length === 0 &&
+      state.hasMoreBindingTools === false &&
+      state.hasMoreExecutions === false &&
+      state.nextBindingToolName === "" &&
+      state.nextExecutionId === "",
+    "ordinary_empty_mcp_authority",
+  );
+  return state.bindingTools;
+}
+
 export async function sendScenarioPrompt(
   scenario: StartedScenario,
   plan = false,
