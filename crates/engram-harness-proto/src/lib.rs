@@ -119,8 +119,8 @@ pub enum AttachReject {
     UnknownBinding,
     /// The presented epoch is older than the host's durable record —
     /// a newer generation owns this session. FATAL: exit; retrying
-    /// can never succeed (ADR 0073 makes the fbd3794c competing-bind
-    /// loop unrepresentable via exactly this arm).
+    /// can never succeed (this arm makes a competing-bind loop
+    /// unrepresentable, ADR 0073).
     Superseded,
     /// Token internally inconsistent (session/sandbox pair does not
     /// match the record). TRANSIENT: treated like `UnknownBinding`.

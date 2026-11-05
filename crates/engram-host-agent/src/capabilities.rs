@@ -1,17 +1,11 @@
-//! ADR 0068: self-verified host capability probes.
+//! Self-verified host capability probes (ADR 0068).
 //!
-//! Each probe answers one question the host can prove about itself —
-//! "am I actually ready for X" — instead of the coordinator inferring
-//! it from a registered boolean or a later-discovered side-gate (the
-//! gRPC listener gate, the tmpfs substrate withhold, the NBD dev
-//! fallback, wire-version skew: four separate incident-driven bandages
-//! at four different layers, none of them a property the scheduler
-//! could see). `probe_all` is run once at startup (before the first
-//! register) and re-run on every heartbeat tick; every probe here is
-//! cheap by construction — statfs/stat/one TCP connect/a memfd-backed
-//! uffd self-test are all sub-millisecond, and the FC binary version
-//! is probed once and cached (a subprocess spawn per tick would not
-//! be).
+//! Each probe answers one question the host can prove about itself,
+//! "am I ready for X", so the scheduler reads a measured vector instead
+//! of a registered boolean. `probe_all` runs before the first register
+//! and again on every heartbeat tick, so every probe is cheap: a
+//! statfs, a stat, one TCP connect, a memfd-backed uffd self-test. The
+//! FC binary version is probed once and cached.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -44,6 +38,19 @@ pub struct ProbeInputs {
     pub bundle_dir: PathBuf,
     /// `Some` only when `backend == "firecracker"`.
     pub fc: Option<FcProbeInputs>,
+    pub session_disk: SessionDiskState,
+}
+
+/// What the heartbeat tick knows about the session-disk pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionDiskState {
+    /// No session volumes are wired.
+    Absent,
+    /// Wired, and the last capacity probe answered.
+    Ready,
+    /// Wired, but the last capacity probe failed. The host takes no new
+    /// session until the pool answers again.
+    Faulted(String),
 }
 
 /// FC-only probe inputs.
@@ -239,20 +246,16 @@ pub fn probe_uffd_minor_shmem(_substrate_configured: bool) -> CapStatus {
     CapStatus::NotApplicable
 }
 
-/// The `nbd` kernel module is loaded (`/sys/module/nbd/parameters/nbds_max`
-/// readable). `NotApplicable` off the FC backend. Deliberately does
-/// NOT change `disk_daemon::slot::build_from_kernel`'s
-/// materialize-to-file dev fallback (that stays exactly as it is) —
-/// this only makes a prod misconfiguration (module never loaded on a
-/// host that should have it) visible instead of a silent capability
-/// downgrade.
-pub fn probe_nbd(is_fc_backend: bool) -> CapStatus {
+/// The host owns a session-disk pool that answers. `NotApplicable` off
+/// the FC backend.
+pub fn probe_session_disk(is_fc_backend: bool, state: &SessionDiskState) -> CapStatus {
     if !is_fc_backend {
         return CapStatus::NotApplicable;
     }
-    match crate::disk_daemon::slot::kernel_nbds_max() {
-        Some(n) => CapStatus::Ok(Some(format!("nbds_max={n}"))),
-        None => CapStatus::Failed("nbd module not loaded (no /sys/module/nbd)".to_string()),
+    match state {
+        SessionDiskState::Ready => CapStatus::Ok(Some("session volumes".to_string())),
+        SessionDiskState::Absent => CapStatus::Failed("no session disk configured".to_string()),
+        SessionDiskState::Faulted(e) => CapStatus::Failed(format!("pool probe failed: {e}")),
     }
 }
 
@@ -361,7 +364,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         CapStatus::NotApplicable
     };
     let uffd_minor_shmem = probe_uffd_minor_shmem(substrate_configured);
-    let nbd = probe_nbd(is_fc);
+    let session_disk = probe_session_disk(is_fc, &inputs.session_disk);
     let bundle_stamp = probe_bundle_stamp(&inputs.bundle_dir).await;
     let fc_snapshot_version =
         fc_snapshot_version(inputs.fc.as_ref().map(|fc| fc.firecracker_bin.as_path())).await;
@@ -372,7 +375,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         grpc_self_connect,
         base_shm_tmpfs,
         uffd_minor_shmem,
-        nbd,
+        session_disk,
         page_idle: probe_page_idle(is_fc),
         bundle_stamp,
         fc_snapshot_version,
@@ -491,8 +494,23 @@ mod tests {
     }
 
     #[test]
-    fn nbd_not_applicable_off_fc_backend() {
-        assert_eq!(probe_nbd(false), CapStatus::NotApplicable);
+    fn session_disk_is_not_applicable_off_the_fc_backend_and_required_on_it() {
+        assert_eq!(
+            probe_session_disk(false, &SessionDiskState::Absent),
+            CapStatus::NotApplicable
+        );
+        assert!(matches!(
+            probe_session_disk(true, &SessionDiskState::Absent),
+            CapStatus::Failed(_)
+        ));
+        assert!(matches!(
+            probe_session_disk(true, &SessionDiskState::Faulted("EIO".into())),
+            CapStatus::Failed(_)
+        ));
+        assert!(matches!(
+            probe_session_disk(true, &SessionDiskState::Ready),
+            CapStatus::Ok(_)
+        ));
     }
 
     #[tokio::test]

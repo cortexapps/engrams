@@ -77,12 +77,9 @@ pub enum SessionState {
     /// (`resume_from_idle`) is the sole consumer of that residue.
     Idle,
     /// Heartbeat-loss against the bound host. Non-terminal: the
-    /// dead-host detector's second stage moves it onward —
-    /// `HostLost → Idle` when the session is recoverable (a snapshot
-    /// OR a live disk manifest exists; the user/exec `/resume`s on
-    /// next access, ADR 0045 Phase A), or `HostLost → Dead` when
-    /// there is nothing to recover. The detector no longer routes
-    /// into `Evacuating` (the reactive auto-evac is retired).
+    /// dead-host detector's second stage moves it to `Idle` when a
+    /// recoverable snapshot exists (the next `/resume` recovers it) or
+    /// to `Dead` when nothing is recoverable.
     HostLost,
     /// ADR 0123: a durable teleport owns this relocation. The source binding
     /// stays in place until commit atomically installs the destination binding.
@@ -472,7 +469,6 @@ impl QueueOrigin {
 /// boot the session for the delivery driver to forward it.
 #[derive(Clone, Debug)]
 pub struct QueuedSession {
-    pub nbd_slot_need: u32,
     pub session: Session,
     pub origin: QueueOrigin,
     pub mem_budget_mib: i64,
@@ -617,18 +613,6 @@ pub struct Session {
     /// than by the last state transition.
     #[serde(default)]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// ADR 0016 Phase B: the host's last-published live disk
-    /// manifest from the FlushScheduler. Updated by
-    /// `MetadataStore::update_live_disk_manifest`; cleared by
-    /// `fenced_assign_sandbox(None)`. Coord's
-    /// `effective_resume_disk_manifest` picks the newer of this
-    /// and `snapshots.disk_manifest` so the first resume after
-    /// continuous flush is enabled doesn't silently roll back to
-    /// the snapshot's stale disk lineage. `None` for sessions
-    /// that haven't gotten a publish (non-NBD hosts /
-    /// pre-Phase-B sessions).
-    #[serde(default)]
-    pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,
     /// ADR 0074 parking ladder: which rung this session's sandbox is
     /// currently parked at. `0` = not parked (normal). `1` = nominated
     /// for eviction (still Active, cancellable). `2` = parked-paused
@@ -801,12 +785,7 @@ mod tests {
     /// and [`SessionState::host_memory_reserving_states`] promise: the
     /// typed matcher (every in-memory residency decision) and the
     /// string const (every SQL `status IN (…)` list, via
-    /// `reserving_states_sql`) must agree on every variant. This test
-    /// was CLAIMED by those docstrings long before it existed — the
-    /// 61a03b7e incident's PR routed all SQL through the const on the
-    /// strength of a guard nobody had written (engrams review on
-    /// PR #843). A drift between the two is now a test failure, not a
-    /// silent prod incident.
+    /// `reserving_states_sql`) must agree on every variant.
     #[test]
     fn reserving_states_match() {
         for s in all_states() {
@@ -1101,7 +1080,6 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: Some(Utc::now()),
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

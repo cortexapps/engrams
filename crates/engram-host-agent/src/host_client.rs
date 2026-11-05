@@ -23,7 +23,6 @@ use async_trait::async_trait;
 
 use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, SessionFence};
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
@@ -74,7 +73,9 @@ impl LocalHostClient {
 #[async_trait]
 impl HostClient for LocalHostClient {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        self.sandbox.create(spec).await
+        let id = SandboxId::new();
+        self.sandbox.create(id, spec).await?;
+        Ok(id)
     }
 
     // ADR 0079: the `fence` params below are checked by the gRPC
@@ -256,7 +257,9 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
-        self.sandbox.restore(metadata).await
+        let id = SandboxId::new();
+        self.sandbox.restore(id, metadata, None).await?;
+        Ok(id)
     }
 
     async fn materialize_image(
@@ -287,9 +290,11 @@ impl HostClient for LocalHostClient {
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        let id = SandboxId::new();
         self.sandbox
-            .restore_base_for_session(metadata, session_env, selected_mounts)
-            .await
+            .restore_base_for_session(id, metadata, session_env, selected_mounts)
+            .await?;
+        Ok(id)
     }
 
     async fn start_agent(
@@ -442,8 +447,7 @@ impl HostClient for LocalHostClient {
         // agentd probes a local TCP connect before replying, so
         // when we get here we're guaranteed a listener exists — no
         // more racing the warm-restore against the snapshot's init
-        // script (prod session 73fe33a3 on 2026-05-20 saw the host
-        // dial 48s after lease and still hit Connection refused).
+        // script.
         let port = self.sandbox.start_shell(sandbox_id).await?;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
         // ADR 0066: reach ttyd via the in-guest agentd relay (FC; VZ after its
@@ -556,21 +560,6 @@ impl HostClient for LocalHostClient {
 
     fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
         self.sandbox.set_upload_sink(sink);
-    }
-
-    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        Ok(self.sandbox.cow_state(id).await)
-    }
-
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Ok(self.sandbox.cow_state_all().await)
-    }
-
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        self.sandbox.flush_sandbox(id).await
     }
 }
 

@@ -7,9 +7,7 @@
 //! entombed — the sweep records a tombstone, settles the ROW
 //! immediately, and never destroys the serving VM (the tombstone rides
 //! the heartbeat and the VM's own host destroys it). A VM the probe
-//! reports gone gets the inline belt destroy instead. This is the exact
-//! boundary interaction rung 1 could not co-simulate (its host had no
-//! device plane and the sweep was never driven).
+//! reports gone gets the inline belt destroy instead.
 
 use engram_core::types::session::SessionState;
 use engram_core::types::BindingDisposition;

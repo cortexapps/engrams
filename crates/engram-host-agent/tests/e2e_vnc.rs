@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
 };
@@ -500,7 +501,8 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
 
     // ---- 4. Wait for in-VM agentd (guest_endpoints resolves once vsock answers) ----
     let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;

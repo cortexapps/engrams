@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::sandbox_manifest;
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
@@ -100,8 +101,9 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
 
     // --- Generation A: create the VM ---
     let backend_a = FirecrackerBackend::new(work.path(), mk_cfg());
-    let id = backend_a
-        .create(test_spec(local_rootfs.clone()))
+    let id = SandboxId::new();
+    backend_a
+        .create(id, test_spec(local_rootfs.clone()))
         .await
         .expect("create");
     assert_eq!(backend_a.list().await.expect("list"), vec![id]);
@@ -194,7 +196,11 @@ async fn post_copy_restore_persists_role_before_list() {
     cfg.net_pool = None;
     // File restore isolates the manifest transaction from peer transport.
     let backend = FirecrackerBackend::new(work.path(), cfg);
-    let source = backend.create(test_spec(rootfs)).await.unwrap();
+    let source = SandboxId::new();
+    backend
+        .create(source, test_spec(rootfs.clone()))
+        .await
+        .unwrap();
     let snapshot = backend.snapshot(source).await.unwrap();
     backend.destroy(source).await.unwrap();
     std::fs::write(
@@ -204,19 +210,20 @@ async fn post_copy_restore_persists_role_before_list() {
         b"{}",
     )
     .unwrap();
-    let restore = backend.restore(snapshot);
+    let id = SandboxId::new();
+    let restore = backend.restore(id, snapshot, common::disks(&rootfs));
     tokio::pin!(restore);
-    let id = loop {
+    loop {
         tokio::select! {
             result = &mut restore => break result.unwrap(),
             () = tokio::task::yield_now() => {
-                for id in backend.list().await.unwrap() {
-                    let manifest = sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();
+                for listed in backend.list().await.unwrap() {
+                    let manifest = sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), listed)).unwrap();
                     assert_eq!(manifest.migration_role.as_deref(), Some(sandbox_manifest::ROLE_POST_COPY_DEST));
                 }
             }
         }
-    };
+    }
     assert!(backend.list().await.unwrap().contains(&id));
     let manifest =
         sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();

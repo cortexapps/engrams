@@ -35,7 +35,7 @@ pub fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
 /// ADR 0014 issue #4: should the host's idle_evictor *push* idle
 /// candidates this tick? Free disk under the floor → pause idle-
 /// eviction so a runaway retry loop or slow snapshot uploader can't
-/// fill the host disk (the `engrams-fc-xngk` failure mode). Returns
+/// fill the host disk. Returns
 /// `(should_push, free_bytes)` so the caller can both gate AND
 /// publish the gauge.
 pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (bool, Option<u64>) {

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -72,7 +73,8 @@ async fn snapshot_then_restore_round_trips_microvm() {
     };
 
     // Step 1: create
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
 
     // Step 2: let the kernel reach early-boot before snapshotting —
     // snapshotting a half-initialised VM can hang on resume. Poll the serial
@@ -120,7 +122,11 @@ async fn snapshot_then_restore_round_trips_microvm() {
     );
 
     // Step 6: restore from the snapshot — gets a *new* sandbox id
-    let restored_id = backend.restore(metadata.clone()).await.expect("restore");
+    let restored_id = SandboxId::new();
+    backend
+        .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
+        .await
+        .expect("restore");
     assert_ne!(
         restored_id, original_id,
         "restore must allocate a fresh sandbox id"
@@ -193,7 +199,8 @@ async fn balloon_inflate_shrinks_full_memory_dump() {
         swap_source: None,
         swap_manifest: None,
     };
-    let id = backend.create(spec).await.expect("create");
+    let id = SandboxId::new();
+    backend.create(id, spec).await.expect("create");
     let _ = common::wait_for_log_contains(
         &work.path().join(id.to_string()).join("firecracker.log"),
         &["Linux version"],

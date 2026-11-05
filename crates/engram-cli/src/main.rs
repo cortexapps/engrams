@@ -329,11 +329,6 @@ enum ApikeyCmd {
 
 #[derive(Subcommand, Debug)]
 enum AdminCmd {
-    /// force an immediate chunked-disk flush of one session
-    Flush {
-        #[arg(value_name = "session-id")]
-        session_id: String,
-    },
     /// run the idle-eviction pipeline now (synchronous; session ends Idle)
     EvictIdle {
         #[arg(value_name = "session-id")]
@@ -509,7 +504,6 @@ async fn run(cli: Cli) -> CliResult {
         Commands::Admin { cmd } => {
             let c = ctx.clients()?;
             match cmd {
-                AdminCmd::Flush { session_id } => admin::flush(&c, &session_id, json).await,
                 AdminCmd::EvictIdle { session_id } => {
                     admin::evict_idle(&c, &session_id, json).await
                 }

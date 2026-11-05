@@ -57,7 +57,7 @@ Hosts never need an inbound port, which is what makes a fleet behind NAT or acro
 work.
 
 The host agent owns everything a VM needs on the machine: the chunk cache on local NVMe, the
-NBD daemon that serves chunked disks to VMs, the page-fault handler that lazily loads VM
+thin pool that holds image and session volumes, the page-fault handler that lazily loads VM
 memory from chunks, and the egress proxy that every VM's outbound traffic goes through. It
 composes a sandbox backend, which is the driver for the VM technology in use, with the
 harness routing that carries prompts and events between a session and the coordinator.

@@ -133,6 +133,7 @@ impl HostClient for ScriptedHost {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -273,7 +274,8 @@ impl HostClient for ScriptedHost {
             disk_drain_ms: 0,
             vmstate_ms: 0,
             scan_ms: 0,
-            sealed_disk_chunks: 1,
+            sealed_disk_blocks: 1,
+            precopy_disk_blocks: 0,
             paused_at_unix_ms: 0,
         })
     }

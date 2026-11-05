@@ -165,7 +165,7 @@ function DecisionCard({
 }) {
   // The pinned document owns the headings. The server falls back to the raw
   // section id when no transcript action named the section, which rendered
-  // "§9d23bd84-…" in the ledger.
+  // "§<section id>" in the ledger.
   const titles = new Map(sections.map((section) => [section.id, section.title]));
   const sectionTitle = (decision: SpecDecision) =>
     titles.get(decision.sectionId) ?? decision.sectionTitle;

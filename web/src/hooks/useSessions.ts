@@ -4,7 +4,7 @@ import type { Session as ProtoSession } from "../gen/engram/app/v1/session_pb";
 import type { Session } from "../lib/types";
 
 /** ADR 0051 Task 24: map a proto Session to the legacy snake_case Session shape
- * that all consumers (SessionDetail, CowState, useRailSessions, etc.) expect.
+ * that all consumers (SessionDetail, useRailSessions, etc.) expect.
  * Keeps consumers unchanged — the proto camelCase fields are converted here.
  * `user_id` is intentionally null: the proto Session omits attribution (ADR §2.1). */
 function protoSessionToSession(s: ProtoSession): Session {
@@ -23,7 +23,7 @@ function protoSessionToSession(s: ProtoSession): Session {
 
 /** ADR 0051 Task 24: migrated to connect-query via the gated passthrough
  * (GetSession). Returns the legacy Session shape via protoSessionToSession so
- * all consumers (SessionDetail, CowState, useRailSessions) are unchanged.
+ * all consumers (SessionDetail, useRailSessions) are unchanged.
  * Poll interval carried from the original 2s.
  *
  * ADR 0051 Task 28: useSessions (REST list) removed — use useTasksAsSessionList

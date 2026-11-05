@@ -5,7 +5,7 @@
 //! What this pins (the property the whole redesign exists for):
 //!
 //!   1. `snapshot_begin` on a real FC guest durably persists the
-//!      `EvictionFinalizeRecord` (+ any drained NBD disk-pending chunks)
+//!      `EvictionFinalizeRecord` (+ the pending disk checkpoints)
 //!      BEFORE returning.
 //!   2. "Generation A" (the host-agent process that started the
 //!      finalize) is simulated as DYING mid-upload: its spawned
@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -58,14 +59,21 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
-/// A `BlobStorage` whose FIRST `put_streaming` blocks until released —
-/// freezes generation A's finalize job mid-leg (after the disk leg,
-/// inside the memory leg's chunk upload) so generation B's redrive has
-/// real, unfinished work to pick up.
+/// A `BlobStorage` whose first `put_streaming` after [`Self::arm`] blocks
+/// until released. Armed just before the eviction capture, it freezes
+/// generation A's finalize job mid-upload so generation B's redrive has
+/// real, unfinished work to pick up. The create before it writes a
+/// manifest of its own, so the gate starts disarmed.
 struct GateFirstPut {
     inner: engram_storage_local::LocalBlobStorage,
     gate: Arc<tokio::sync::Notify>,
-    armed: AtomicBool,
+    spent: AtomicBool,
+}
+
+impl GateFirstPut {
+    fn arm(&self) {
+        self.spent.store(false, Ordering::SeqCst);
+    }
 }
 #[async_trait::async_trait]
 impl engram_core::traits::BlobStorage for GateFirstPut {
@@ -74,7 +82,7 @@ impl engram_core::traits::BlobStorage for GateFirstPut {
         key: &str,
         body: engram_core::traits::ByteStream,
     ) -> Result<u64, engram_core::error::BlobError> {
-        if !self.armed.swap(true, Ordering::SeqCst) {
+        if !self.spent.swap(true, Ordering::SeqCst) {
             self.gate.notified().await;
         }
         self.inner.put_streaming(key, body).await
@@ -166,12 +174,12 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
 
     // ---- 2. Generation A: PooledBackend wrapping a GATED chunk store ----
     let gate = Arc::new(tokio::sync::Notify::new());
-    let gated_blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(GateFirstPut {
+    let gated = Arc::new(GateFirstPut {
         inner: local_blob,
         gate: gate.clone(),
-        armed: AtomicBool::new(false),
+        spent: AtomicBool::new(true),
     });
-    let gated_chunk_store = engram_chunk_store::ChunkStore::new(gated_blob);
+    let gated_chunk_store = engram_chunk_store::ChunkStore::new(gated.clone());
 
     let mut cfg = FirecrackerConfig::with_kernel(kernel.clone());
     cfg.net_pool = None;
@@ -186,16 +194,19 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     let checkpoint_dir = work.path().join("checkpoints");
     let pooled_a = Arc::new(
         PooledBackend::new(inner_a)
-            .with_chunk_store(gated_chunk_store.clone(), work.path().join("materialize"))
+            .with_chunk_store(gated_chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &gated_chunk_store))
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_a.set_self_ref(&pooled_a);
 
     let spec = SandboxSpec {
         image: "engram-evict-finalize-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(
+            common::fork_lineage(&gated_chunk_store, outcome.disk_manifest).await,
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -209,16 +220,18 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let sandbox = pooled_a.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled_a.create(sandbox, spec).await.expect("create");
     let session_id = engram_core::SessionId::new();
     pooled_a.bind_session(session_id, sandbox);
 
     let marker_sum = plant_marker(&pooled_a, sandbox).await;
 
     // ---- 3. snapshot_begin: durably persists, THEN the background job
-    // freezes in the memory leg (the gated blob's first PUT) — standing
-    // in for generation A dying between the durable persist and the
-    // upload completing. ----
+    // freezes at its first upload (the gated blob's first PUT after the
+    // arm) — standing in for generation A dying between the durable
+    // persist and the upload completing. ----
+    gated.arm();
     let t = Instant::now();
     let snapshot_id = pooled_a
         .snapshot_begin(sandbox)
@@ -260,7 +273,8 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
 
     let pooled_b = Arc::new(
         PooledBackend::new(inner_b)
-            .with_chunk_store(gated_chunk_store, work.path().join("materialize"))
+            .with_chunk_store(gated_chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &gated_chunk_store))
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_b.set_self_ref(&pooled_b);
@@ -335,6 +349,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         disk_manifest: checkpoint.disk_manifest,
         memory_manifest: Some(memory_manifest),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: None,
         state_blob_key: None,
@@ -345,8 +360,9 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         paused_at: Some(checkpoint.paused_at),
         peer_hints: Vec::new(),
     };
-    let restored = pooled_b
-        .restore(metadata)
+    let restored = SandboxId::new();
+    pooled_b
+        .restore(restored, metadata, None)
         .await
         .expect("restore from the redriven eviction-final checkpoint");
     let out = exec(

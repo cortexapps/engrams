@@ -6,8 +6,7 @@
 //! back up automatically. In practice this raced — VMs that had been
 //! warm-restored for >10 minutes were still failing host→guest dials
 //! with `Connection refused`, the in-browser shell timed out, and
-//! the user got an "abnormal close" with no useful signal (prod
-//! session 73fe33a3 on 2026-05-20).
+//! the user got an "abnormal close" with no useful signal.
 //!
 //! The fix here is to make shell start *lazy*: ttyd is spawned by
 //! agentd the first time the host calls

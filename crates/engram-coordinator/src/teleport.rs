@@ -413,6 +413,7 @@ mod steps {
                 .trim_start_matches("https://");
             let hostname = hostpart.rsplit_once(':').map_or(hostpart, |(h, _)| h);
             let peer_addr = format!("{hostname}:{}", presetup.peer_port);
+            let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
             let metadata = SnapshotMetadata {
                 id: engram_core::SnapshotId::from(state.services.entropy.uuid()),
                 size_bytes: durable.as_ref().map_or(0, |s| s.size_bytes),
@@ -423,11 +424,8 @@ mod steps {
                 swap_manifest: presetup.swap_manifest_ref,
                 disk_manifest: presetup.disk_manifest_ref,
                 memory_manifest: Some(presetup.memory_manifest_ref),
-                base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                    state,
-                    &session.image,
-                )
-                .await,
+                base_memory_manifest: base.memory,
+                base_disk_manifest: base.disk,
                 migration_source: Some(engram_core::types::snapshot::MigrationSourceInfo {
                     export_id: presetup.export_id.clone(),
                     source_addr,
@@ -621,8 +619,8 @@ mod steps {
         Ok(Some(OpOutcome::Done))
     }
     /// Where a session rests when its move fails: the dead-host predicate
-    /// (`recovery_target`: Idle with a recoverable memory snapshot or a live
-    /// disk manifest, Dead otherwise), except that a session parked at
+    /// (`recovery_target`: Idle with a recoverable snapshot, Dead
+    /// otherwise), except that a session parked at
     /// Created by a deterministic spawn failure has no Dead edge and rests
     /// at Failed. `allow_snapshot = false` discards the snapshot evidence
     /// (the move itself produced it and it is not trusted).
@@ -640,10 +638,7 @@ mod steps {
                 .latest_snapshot_for_session(row.session_id)
                 .await?
                 .is_some_and(|s| s.recoverable);
-        let target = crate::dead_host::recovery_target(
-            has_recoverable_snapshot,
-            session.live_disk_manifest.is_some(),
-        );
+        let target = crate::dead_host::recovery_target(has_recoverable_snapshot);
         Ok(match (session.status, target) {
             (SessionState::Created, SessionState::Dead) => SessionState::Failed,
             (_, t) => t,
@@ -681,7 +676,6 @@ mod steps {
         };
         let candidates_for = |caps: crate::placement::CapabilityRequirements| {
             let context = crate::placement::ScheduleContext {
-                nbd_slot_need: 1,
                 repo: &session.image,
                 image_version: "",
                 snapshot_host: None,
@@ -871,6 +865,7 @@ mod steps {
             })
             .into_iter()
             .collect();
+        let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
         let metadata = SnapshotMetadata {
             id: snapshot.id,
             size_bytes: snapshot.size_bytes,
@@ -879,11 +874,8 @@ mod steps {
             swap_manifest: snapshot.swap_manifest,
             disk_manifest: snapshot.disk_manifest,
             memory_manifest: snapshot.memory_manifest,
-            base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                state,
-                &session.image,
-            )
-            .await,
+            base_memory_manifest: base.memory,
+            base_disk_manifest: base.disk,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
@@ -1162,8 +1154,7 @@ mod steps {
     /// The source is gone during a rollback (dead or retired host, or a
     /// destroyed sandbox): entomb it and settle the session the way a lost
     /// host settles it (`dead_host::recovery_target`): Idle with a
-    /// recoverable memory snapshot or a live disk manifest (the disk-only
-    /// cold boot), Dead with nothing recoverable.
+    /// recoverable snapshot, Dead with nothing recoverable.
     async fn settle_lost_source(
         ctx: &OpCtx<'_>,
         row: &TeleportRow,

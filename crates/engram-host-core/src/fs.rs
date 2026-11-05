@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 /// Granular durable-filesystem operations. The prod impl ([`TokioFs`])
-/// delegates to `tokio::fs`; the sim impl (in `engram-dst-host`) drives a
-/// per-run tempdir and injects crashes between calls.
+/// delegates to `tokio::fs`; a test impl can inject crashes between calls.
 #[async_trait]
 pub trait HostFs: Send + Sync {
     /// Write `bytes` to `path`, creating/truncating it. Does NOT fsync —

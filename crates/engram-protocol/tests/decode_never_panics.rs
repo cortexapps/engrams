@@ -20,20 +20,19 @@ use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::SandboxSpec;
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use engram_protocol::wire::WireExecRequest;
 use proptest::prelude::*;
 
 // The valid-value strategies live in the shared `support` module; ADR 0099
 // H3's `codec_roundtrip.rs` reuses the exact same generators.
 mod support;
-use support::{wire_exec_request, wire_reap_stats};
+use support::wire_exec_request;
 
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
     // Crate-local payloads.
     let _ = bincode::deserialize::<WireExecRequest>(bytes);
-    let _ = bincode::deserialize::<WireReapStats>(bytes);
     // A representative slice of the shared engram-core payloads that cross
     // this boundary inside gRPC `bytes` fields.
     let _ = bincode::deserialize::<ManifestRef>(bytes);
@@ -97,16 +96,6 @@ proptest! {
         mutate_and_decode::<WireExecRequest>(&encoded, flip_pos, flip_val, &garbage);
     }
 
-    #[test]
-    fn mutated_reap_stats_never_panic(
-        stats in wire_reap_stats(),
-        flip_pos in any::<usize>(),
-        flip_val in any::<u8>(),
-        garbage in proptest::collection::vec(any::<u8>(), 0..=32),
-    ) {
-        let encoded = bincode::serialize(&stats).expect("encode");
-        mutate_and_decode::<WireReapStats>(&encoded, flip_pos, flip_val, &garbage);
-    }
 }
 
 // ---- shape (c): allocation bound (bincode slice) -----------------------

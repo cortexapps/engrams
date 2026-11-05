@@ -7,12 +7,6 @@
 //!
 //! All endpoints sit behind the same bearer-auth middleware as the
 //! other protected routes.
-//!
-//! ADR 0007 / Phase 7: the cold-tier flush endpoints (`flush_one`
-//! and `flush_idle`) are retired. Durability now flows through the
-//! chunk store; `reap_materialize_dir` is the ongoing admin
-//! surface. The chunk-store GC endpoint was removed 2026-05-23
-//! (see ADR 0015 M5 "Known regression — chunk-store GC deleted").
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -23,106 +17,6 @@ use engram_core::SessionId;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
-
-// ---------------------------------------------------------------------
-// ADR 0007 — materialize-dir orphan reap
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// ADR 0016 Phase B commit 4a — flush-now admin trigger
-// ---------------------------------------------------------------------
-
-#[derive(Serialize)]
-pub struct FlushNowResult {
-    /// `applied`: the host drained dirty chunks and coord wrote the
-    /// new manifest_ref. `idle`: host returned `None` (sandbox not
-    /// chunk-tracked OR no dirty bytes); no PG write. `stale`: host
-    /// returned a manifest_ref but coord's UPDATE was guarded out
-    /// because `sessions.sandbox_id` no longer matches (rebind /
-    /// destroy raced).
-    pub outcome: FlushNowOutcome,
-    /// New manifest version coord persisted, or `None` on `idle`/`stale`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_version: Option<u64>,
-}
-
-#[derive(Serialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum FlushNowOutcome {
-    Applied,
-    Idle,
-    Stale,
-}
-
-/// Transport-agnostic core for the flush-now primitive (ADR 0016 Phase B,
-/// ADR 0051) — the explicit trigger for the FlushScheduler. Forces an
-/// immediate flush on the session's bound sandbox + writes the new
-/// `sessions.live_disk_manifest_*` row + bumps `chunk_generation`, so e2e
-/// tests and operators can drive the publish-to-PG round-trip without
-/// sleeping the scheduler's cadence. 404 if the session is unknown; 409 if
-/// it has no bound sandbox; otherwise an `outcome` where `idle` means the
-/// host had no dirty bytes and `stale` means coord's row-update was guarded
-/// out by sandbox_id drift. The gRPC `FleetService::flush_session` calls this.
-pub(crate) async fn flush_now_core(
-    state: &SharedState,
-    session_id: SessionId,
-) -> Result<FlushNowResult, ApiError> {
-    // Look up the session's bound sandbox. NotFound on the session
-    // row bubbles as 404; bound=None is a domain-level conflict.
-    let session = state.services.meta.get_session(session_id).await?;
-    let Some(sandbox_id) = session.sandbox_id else {
-        return Err(ApiError::Conflict(format!(
-            "session {session_id} has no bound sandbox (status={})",
-            session.status.as_str(),
-        )));
-    };
-    // Dispatch to the host that owns this sandbox.
-    let host_client = state.services.host.clone();
-    let flush_outcome = host_client.flush_sandbox(sandbox_id).await?;
-    let Some(manifest_ref) = flush_outcome else {
-        return Ok(FlushNowResult {
-            outcome: FlushNowOutcome::Idle,
-            manifest_version: None,
-        });
-    };
-    // Funnel directly into the same MetadataStore method the
-    // publisher's drain task uses. The sandbox_id guard inside the
-    // UPDATE catches the (rare) destroy-or-rebind race; coord just
-    // surfaces the outcome to the caller.
-    match state
-        .services
-        .meta
-        .update_live_disk_manifest(session_id, sandbox_id, manifest_ref)
-        .await?
-    {
-        engram_core::traits::UpdateOutcome::Applied => {
-            tracing::info!(
-                %session_id,
-                %sandbox_id,
-                manifest_id = %manifest_ref.manifest_id,
-                manifest_version = manifest_ref.version,
-                "admin flush_now: applied",
-            );
-            Ok(FlushNowResult {
-                outcome: FlushNowOutcome::Applied,
-                manifest_version: Some(manifest_ref.version),
-            })
-        }
-        engram_core::traits::UpdateOutcome::DroppedStale => {
-            tracing::warn!(
-                %session_id,
-                %sandbox_id,
-                manifest_id = %manifest_ref.manifest_id,
-                manifest_version = manifest_ref.version,
-                "admin flush_now: stale (sandbox_id mismatch on UPDATE)",
-            );
-            Ok(FlushNowResult {
-                outcome: FlushNowOutcome::Stale,
-                manifest_version: None,
-            })
-        }
-    }
-}
 
 // Administrative eviction and durable drain planning.
 
@@ -442,8 +336,7 @@ pub(crate) async fn admin_drain_host_core(
 // ADR 0016 Phase C — chunk-GC admin endpoints
 // ---------------------------------------------------------------------
 //
-// Three routes mirror the `reap_materialize_dir` shape: explicit
-// triggers for the primitives the background sweep loop in
+// Explicit triggers for the primitives the background sweep loop in
 // `chunk_gc.rs` drives implicitly. Tests + ops fire these without
 // waiting on the hourly cadence.
 

@@ -199,8 +199,8 @@ pub(crate) async fn snapshot_core(
     // but the host-side snapshot was never committed. The next periodic
     // checkpoint tick then `abort_prior_inflight_snapshot`s and deletes
     // this snapshot's `state.bin`/sidecar within one interval, leaving a
-    // `recoverable = true` row pointing at nothing — the exact 89f7984d
-    // phantom-snapshot state. Mirror the op-executor pattern: run the
+    // `recoverable = true` row pointing at nothing (a phantom snapshot).
+    // Mirror the op-executor pattern: run the
     // body in a `tokio::spawn`ed task that MOVES the op claim in, so the
     // capture always runs to a terminal arm regardless of the request's
     // fate, and the handler only awaits the JoinHandle to relay the result.
@@ -337,8 +337,8 @@ pub(crate) async fn snapshot_core(
                         // FENCE. This manual-snapshot claim can be reclaimed if a
                         // coord↔PG partition outlasts `RECLAIM_STALE` mid-capture;
                         // a plain insert would then land a phantom `recoverable=true`
-                        // row a resume could pick (the 89f7984d durability-lie
-                        // class). `Ok(false)` = fenced out → leave the row
+                        // row a resume could pick (a durability lie).
+                        // `Ok(false)` = fenced out → leave the row
                         // recoverable=false; the successor op owns the session.
                         match st
                             .services
@@ -975,10 +975,8 @@ pub(crate) async fn resume_from_created(
             )));
         }
     };
-    // No SnapshotResponse.snapshot_id — the session might've been
-    // relocated via live_disk_manifest-only path (no snapshot row
-    // backed the restore). The caller cares about session_id +
-    // note; size_bytes is unknown here.
+    // No SnapshotResponse.snapshot_id: the caller cares about session_id
+    // + note; size_bytes is unknown here.
     Ok(SnapshotResponse {
         session_id: id,
         snapshot_id: None,
@@ -1070,7 +1068,7 @@ pub(crate) async fn resume_from_idle(
     // stored `recoverable` flag is set at capture time and can go stale
     // — the eviction/checkpoint abort race deletes a committed
     // snapshot's `state.bin`/`sidecar.json` out from under a
-    // `recoverable = true` row (prod incident 89f7984d). Re-verifying at
+    // `recoverable = true` row. Re-verifying at
     // the point of use and falling back through the ADR-0028 checkpoint
     // chain means a single bricked row no longer dooms the session — it
     // self-heals to the previous good checkpoint. A demoted row is
@@ -1101,14 +1099,6 @@ pub(crate) async fn resume_from_idle(
         }
     }
 
-    // No snapshot row had live artifacts. ADR 0028 Fix B: a continuous-
-    // sync disk manifest → recover via the disk-only cold boot (rung 2)
-    // instead of declaring the session dead. This is also the documented
-    // recovery path for `ColdBootUnavailable` Idle fallbacks: re-enable
-    // the image, then /resume lands here.
-    if let Some(rootfs) = session.live_disk_manifest {
-        return resume_disk_only_cold_boot(ctx, session, rootfs).await;
-    }
     tracing::warn!(
         session_id = %id,
         "resume requested but no snapshot row had recoverable artifacts — marking Dead",
@@ -1145,13 +1135,10 @@ pub(crate) async fn destroy_retained_sandbox(
     }
 }
 
-/// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
-/// fresh kernel boot mounting `rootfs` on whichever host can take it,
-/// fresh harness. On-disk work survives; in-RAM context does not. This
-/// path runs when no coherent memory snapshot was recorded (`rootfs` is
-/// the session's `live_disk_manifest`), or when the host refused the
-/// memory image as unusable (`rootfs` is the newest disk of the live
-/// and snapshot lineages).
+/// The disk-only cold boot: a fresh kernel boot on `rootfs` on whichever
+/// host can take it, with a fresh harness. On-disk work survives; in-RAM
+/// context does not. This path runs when the host refused the memory
+/// image as unusable (`rootfs` is the snapshot's disk).
 async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
@@ -1172,7 +1159,6 @@ async fn resume_disk_only_cold_boot(
     let budget =
         crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let context = crate::placement::ScheduleContext {
-        nbd_slot_need: 1 + u32::from(spec.swap_mib.unwrap_or(0) > 0),
         repo,
         image_version: tag,
         snapshot_host: None,
@@ -1297,57 +1283,6 @@ async fn transition_to_dead_if_no_snapshot(
     Ok(())
 }
 
-/// Same-host resume path: the snapshot's chunked manifests are
-/// durable in `BlobStorage`, and the host that captured the snapshot
-/// still holds the dir under
-/// `<cfg.local_path>/snapshots/<session>/<snapshot_id>`. The scheduler
-/// routes restore back to that host via snapshot-affinity.
-///
-/// Cross-host materialization (where the picked host doesn't have a
-/// local copy and reconstructs from chunks) is a follow-up task —
-/// the chunked manifests are the portable form, but FC's restore
-/// API still wants a directory on local disk today.
-/// ADR 0016 Phase B commit 6 — pick the disk manifest that should
-/// drive the resume. Returns the newer of `live_disk_manifest`
-/// (the host's last-published FlushScheduler manifest) and
-/// `snapshot_disk_manifest` (the lineage recorded at snapshot
-/// time).
-///
-/// Behaviour matrix:
-///
-/// | live      | snapshot  | result           | rationale                            |
-/// |-----------|-----------|------------------|--------------------------------------|
-/// | None      | None      | None             | Legacy session, no chunked manifest. |
-/// | None      | Some(s)   | Some(s)          | No live publish; snapshot wins.      |
-/// | Some(l)   | None      | Some(l)          | No snapshot manifest; live wins.     |
-/// | Some(l)   | Some(s)   | Some(newer)      | Same manifest_id → max(version).     |
-/// |           |           |                  | Different manifest_id → snapshot     |
-/// |           |           |                  | (live can't supersede a different    |
-/// |           |           |                  | lineage; safer fallback).            |
-///
-/// The "different manifest_id" branch is defensive: today both
-/// columns track the same `manifest_id` over a session's
-/// lifetime (the chunk-store version chain keeps the id stable;
-/// only `version` ticks). If we ever see them diverge, the
-/// snapshot lineage is authoritative because that's the
-/// (memory, disk) pair the user actually paused at.
-fn effective_resume_disk_manifest(
-    live: Option<engram_core::types::manifest::ManifestRef>,
-    snapshot: Option<engram_core::types::manifest::ManifestRef>,
-) -> Option<engram_core::types::manifest::ManifestRef> {
-    match (live, snapshot) {
-        (None, snap) => snap,
-        (Some(l), None) => Some(l),
-        (Some(l), Some(s)) => {
-            if l.manifest_id == s.manifest_id && l.version > s.version {
-                Some(l)
-            } else {
-                Some(s)
-            }
-        }
-    }
-}
-
 /// ADR 0019 / telemetry restoration (#526): classify a resume's
 /// placement against the snapshot record's capturing host — the
 /// `engram_session_resume_total{placement=...}` label. Pure so it's
@@ -1438,9 +1373,8 @@ pub async fn apply_rung1_rewind(
     // resumed behind events the user already saw). Expected to be small
     // and rare — genuine host death between checkpoints. WARN + an
     // alertable counter, labeled by cause, so a burst (or a large
-    // rolled_back) is visible without log spelunking: the 2026-07-21
-    // 61a03b7e incident rewound 93 events on a HEALTHY host and this
-    // path's INFO line was the only signal.
+    // rolled_back) is visible without log spelunking. A rewind on a
+    // HEALTHY host is a bug, and this signal is how it shows.
     ::metrics::counter!(
         crate::metrics::SESSION_REWOUND_EVENTS_TOTAL,
         "cause" => cause.as_str(),
@@ -1607,8 +1541,7 @@ pub(crate) async fn finish_resume_to_active(
 /// `(None, None)` for anything else — `materialize_state_if_missing`
 /// hard-errors on a missing blob, so a relocated restore must not be
 /// pointed at artifacts that were never uploaded (VZ disk-only /
-/// pre-chunk FC). See ADR 0028 (cross-host recovery) / incident
-/// 89f7984d.
+/// pre-chunk FC). See ADR 0028 (cross-host recovery).
 fn portable_blob_keys(
     id: engram_core::types::SnapshotId,
     memory_manifest: Option<&ManifestRef>,
@@ -1623,31 +1556,42 @@ fn portable_blob_keys(
     }
 }
 
-/// ADR 0045 D4: the IMAGE's base-snapshot memory manifest for a session's
-/// image — the CANONICAL ref for substrate resumes (base-identical pages
-/// CONTINUE against the shared per-image base shm). Best-effort: any miss
-/// (image disabled, no base snapshot, no memory manifest) returns `None`
-/// and the restore falls back to canonical == session (pre-D4 behavior).
-pub(crate) async fn base_memory_manifest_for_image(
+/// The manifests of the image's base snapshot: what a fresh session
+/// of the image starts from, so a resumed session shares them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ImageBaseManifests {
+    pub memory: Option<engram_core::types::manifest::ManifestRef>,
+    pub disk: Option<engram_core::types::manifest::ManifestRef>,
+}
+
+pub(crate) async fn base_manifests_for_image(
     state: &SharedState,
     image_uri: &str,
-) -> Option<engram_core::types::manifest::ManifestRef> {
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image_any(image_uri)
-        .await
-        .ok()
-        .flatten()?;
-    let base_id = enabled.base_snapshot_id?;
-    state
-        .services
-        .meta
-        .get_snapshot(base_id)
-        .await
-        .ok()
-        .flatten()?
-        .memory_manifest
+) -> ImageBaseManifests {
+    let base = async {
+        let enabled = state
+            .services
+            .meta
+            .get_enabled_image_any(image_uri)
+            .await
+            .ok()
+            .flatten()?;
+        state
+            .services
+            .meta
+            .get_snapshot(enabled.base_snapshot_id?)
+            .await
+            .ok()
+            .flatten()
+    }
+    .await;
+    match base {
+        Some(snapshot) => ImageBaseManifests {
+            memory: snapshot.memory_manifest,
+            disk: snapshot.disk_manifest,
+        },
+        None => ImageBaseManifests::default(),
+    }
 }
 
 async fn resume_from_fc_snapshot(
@@ -1686,7 +1630,6 @@ async fn resume_from_fc_snapshot(
     let resume_budget =
         crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let ctx = ScheduleContext {
-        nbd_slot_need: 1 + u32::from(record.swap_manifest.is_some()),
         repo: image_repo,
         image_version: image_tag,
         // ADR 0078: authoritative affinity — the host that holds this
@@ -1821,53 +1764,6 @@ async fn resume_from_fc_snapshot(
             });
         }
     }
-    // ADR 0016 Phase B commit 6: pick the newer of
-    // `session.live_disk_manifest` and `record.disk_manifest`.
-    // Without this, the first resume after Phase B's continuous
-    // flush is enabled silently rolls the session back to the
-    // snapshot's stale disk lineage, throwing away every flush
-    // since the snapshot.
-    //
-    // `session.live_disk_manifest` is `None` when:
-    // - The session never went through Phase B (non-NBD host /
-    //   never had a publish land).
-    // - The session is mid-eviction and the detach cleared the column.
-    //
-    // In both `None` cases the resolver falls back to the
-    // snapshot's manifest, preserving the pre-Phase-B behaviour.
-    //
-    // ADR 0028 rung-1 coherence rule: a record with a
-    // `memory_manifest` is a COHERENT (memory, disk) checkpoint — its
-    // restored RAM describes ITS OWN disk version. Pairing that memory
-    // with a newer `live_disk_manifest` corrupts (the same Defect-B
-    // incoherence the evac path guards). So when memory is present we
-    // restore the checkpoint's own disk — which IS the "rewind to the
-    // checkpoint" the recovery ladder prescribes; the post-checkpoint
-    // flushes are deliberately discarded for coherence.
-    //
-    // Why this is newly load-bearing (it wasn't pre-Fix-A): without
-    // periodic checkpoints the only snapshot was the eviction one,
-    // whose disk == live at the pause instant — live-wins was a no-op.
-    // With checkpoints, the latest *recorded* snapshot can be an
-    // earlier checkpoint while live advanced (e.g. the cf4d4afd
-    // eviction snapshot never recorded), so live-wins would now
-    // actively mis-pair. The live-wins branch survives only for the
-    // memory-less record (VZ / disk-only), where there's no RAM to be
-    // incoherent with.
-    let effective_disk_manifest = if record.memory_manifest.is_some() {
-        record.disk_manifest
-    } else {
-        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest)
-    };
-    if effective_disk_manifest != record.disk_manifest {
-        tracing::info!(
-            session_id = %id,
-            snapshot_disk_manifest = ?record.disk_manifest,
-            live_disk_manifest = ?session.live_disk_manifest,
-            effective_disk_manifest = ?effective_disk_manifest,
-            "resume: preferred live_disk_manifest over snapshot's stale lineage (memory-less record)",
-        );
-    }
     // Derive the portable state/sidecar blob keys (see the field
     // comment below). Borrow memory_manifest here, before it's moved
     // into the struct.
@@ -1878,7 +1774,7 @@ async fn resume_from_fc_snapshot(
     // the engine type the backend expects.
     // ADR 0045 D4: hand the host the image's base manifest so resumed
     // sessions share the per-image base shm with fresh creates.
-    let base_memory_manifest = base_memory_manifest_for_image(state, &session.image).await;
+    let base = base_manifests_for_image(state, &session.image).await;
     // ADR 0095: peer-fill hint — if the snapshot host is alive and
     // wire-compatible, tell the destination where the chunks are
     // resident. Stamped unconditionally BEFORE placement (the pick
@@ -1911,21 +1807,19 @@ async fn resume_from_fc_snapshot(
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version.clone(),
-        base_memory_manifest,
+        base_memory_manifest: base.memory,
+        base_disk_manifest: base.disk,
         migration_source: None,
         swap_manifest: record.swap_manifest,
-        disk_manifest: effective_disk_manifest,
+        disk_manifest: record.disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0028 cross-host recovery: a memory-bearing FC snapshot
         // uploads its VMM `state.bin` + FC sidecar to BlobStorage, so
         // pass the (deterministic, id-derived) blob keys — a resume that
         // relocates to a host WITHOUT this snapshot's local dir then
         // materializes them from GCS instead of dying on a missing
-        // `manifest.json`. These were hardcoded `None` on the assumption
-        // that idle-resume stays same-host; prod incident 89f7984d
-        // disproved it (the self-heal fell back to a good checkpoint,
-        // but the resume landed on a non-capturing host and skipped
-        // materialization). `rootfs` is rebuilt from `disk_manifest`
+        // `manifest.json`. An idle resume can land on a host other than
+        // the one that captured it. `rootfs` is rebuilt from `disk_manifest`
         // chunks and `working_set` is a fresh-restore-only prefetch hint, so
         // both stay None.
         source_sandbox_id: None,
@@ -1959,13 +1853,9 @@ async fn resume_from_fc_snapshot(
         // The host refused the memory image (for example, one that can
         // reference swap pages no snapshot holds). Every host refuses
         // it the same way, so a retry cannot help, but the disk is
-        // intact: boot a fresh kernel on the newest disk. The memory
-        // pairing rule above does not apply, because no memory is
-        // restored, so the live lineage wins when it is newer.
+        // intact: boot a fresh kernel on the snapshot's disk.
         Err(SandboxError::MemoryImageUnusable(reason)) => {
-            let Some(rootfs) =
-                effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest)
-            else {
+            let Some(rootfs) = record.disk_manifest else {
                 return Err(ApiError::Internal(format!(
                     "memory image unusable and the session has no disk manifest: {reason}"
                 )));
@@ -2195,9 +2085,7 @@ async fn bind_resumed_session(
 /// session→sandbox mapping on the target host-agent.
 ///
 /// `host.bind_session(id, sandbox_id)` is what the in-VM adapter's
-/// vsock-accept path uses to route reconnects, and what the
-/// FlushScheduler's live-manifest publisher uses to attach session_id
-/// to the publish RPC. The coordinator-side binding is NOT updated
+/// vsock-accept path uses to route reconnects. The coordinator-side binding is NOT updated
 /// here — it lives only in `sessions.sandbox_id` (Postgres), written by
 /// the caller through a guarded binding write BEFORE this call, so every
 /// replica's `/exec` / `/shell` / `/prompt` resolves the new sandbox by
@@ -2400,7 +2288,7 @@ pub async fn verify_snapshot_recoverable(
 /// time and only checks the chunked manifests): this also HEADs the
 /// portable `state.bin` + `sidecar.json` blobs a memory-bearing FC
 /// snapshot restores from — exactly the blobs the eviction/checkpoint
-/// abort path deletes (prod incident 89f7984d), and which the stored
+/// abort path deletes, and which the stored
 /// `recoverable` flag does not re-check once it went stale. A few HEADs,
 /// cheap relative to the chunk prefetch a doomed restore would waste.
 async fn snapshot_artifacts_present(
@@ -2418,9 +2306,9 @@ async fn snapshot_artifacts_present(
         return true;
     };
     // Memory-bearing FC snapshot: re-verify the chunk manifests AND the
-    // portable state.bin + sidecar blobs the abort path deletes — the
-    // 89f7984d failure was exactly "manifests survived, state/sidecar
-    // did not, but the row still said recoverable=true".
+    // portable state.bin + sidecar blobs the abort path deletes: the
+    // manifests can survive while state/sidecar do not, and the row
+    // still says recoverable=true.
     if !verify_snapshot_recoverable(
         blob,
         record.disk_manifest.as_ref(),
@@ -2602,7 +2490,7 @@ mod recoverable_tests {
 
     #[tokio::test]
     async fn artifacts_present_false_when_sidecar_blob_deleted() {
-        // The 89f7984d failure mode: the chunked manifests survive
+        // The chunked manifests survive
         // (content-addressed, shared), but the abort path deleted the
         // per-snapshot state.bin/sidecar — so the `recoverable = true`
         // row is stale and the resume would die reading manifest.json.
@@ -2666,123 +2554,6 @@ mod recoverable_tests {
     }
 }
 
-#[cfg(test)]
-// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
-#[allow(clippy::disallowed_methods)]
-mod effective_resume_disk_manifest_tests {
-    use super::*;
-    use engram_core::types::manifest::ManifestRef;
-    use uuid::Uuid;
-
-    fn mref(version: u64) -> ManifestRef {
-        ManifestRef {
-            manifest_id: Uuid::new_v4(),
-            version,
-        }
-    }
-
-    /// Same `manifest_id`, live is newer → resolver picks live.
-    /// This is the load-bearing case: post-snapshot continuous
-    /// flushes (commit 4's FlushScheduler) advance the chain past
-    /// what the snapshot row captured.
-    #[test]
-    fn live_newer_than_snapshot_wins() {
-        let mid = Uuid::new_v4();
-        let live = ManifestRef {
-            manifest_id: mid,
-            version: 7,
-        };
-        let snap = ManifestRef {
-            manifest_id: mid,
-            version: 5,
-        };
-        assert_eq!(
-            effective_resume_disk_manifest(Some(live), Some(snap)),
-            Some(live),
-        );
-    }
-
-    /// Live and snapshot at the same version → snapshot wins (or
-    /// equivalently, both are valid; the resolver's defensive
-    /// `>` not `>=` keeps the choice deterministic). No real flush
-    /// landed between snapshot creation and now.
-    #[test]
-    fn live_equal_to_snapshot_picks_snapshot() {
-        let mid = Uuid::new_v4();
-        let live = ManifestRef {
-            manifest_id: mid,
-            version: 5,
-        };
-        let snap = ManifestRef {
-            manifest_id: mid,
-            version: 5,
-        };
-        assert_eq!(
-            effective_resume_disk_manifest(Some(live), Some(snap)),
-            Some(snap),
-        );
-    }
-
-    /// Live BEHIND snapshot (live=3, snap=5). Possible if the live
-    /// column wasn't refreshed before the snapshot wrote, OR a
-    /// stale publish landed pre-Phase-3's unbind-clear (defensive).
-    /// Snapshot wins.
-    #[test]
-    fn live_behind_snapshot_picks_snapshot() {
-        let mid = Uuid::new_v4();
-        let live = ManifestRef {
-            manifest_id: mid,
-            version: 3,
-        };
-        let snap = ManifestRef {
-            manifest_id: mid,
-            version: 5,
-        };
-        assert_eq!(
-            effective_resume_disk_manifest(Some(live), Some(snap)),
-            Some(snap),
-        );
-    }
-
-    /// Different manifest_ids → snapshot wins. Defensive: live
-    /// can't supersede a snapshot belonging to a different
-    /// chunked-disk lineage; the (memory, disk) pair the user
-    /// paused at is what we restore.
-    #[test]
-    fn different_manifest_ids_picks_snapshot() {
-        let live = mref(99);
-        let snap = mref(1);
-        assert_eq!(
-            effective_resume_disk_manifest(Some(live), Some(snap)),
-            Some(snap),
-        );
-    }
-
-    /// No live publish — never had Phase B running, or unbind
-    /// cleared it. Snapshot is the only signal.
-    #[test]
-    fn live_none_picks_snapshot() {
-        let snap = mref(2);
-        assert_eq!(effective_resume_disk_manifest(None, Some(snap)), Some(snap),);
-    }
-
-    /// No snapshot manifest — legacy snapshot row or a Phase-B-
-    /// only recovery path (M4.1 evacuation, future). Live wins.
-    #[test]
-    fn snapshot_none_picks_live() {
-        let live = mref(4);
-        assert_eq!(effective_resume_disk_manifest(Some(live), None), Some(live),);
-    }
-
-    /// Both None — no chunked-disk lineage on either side.
-    /// Resolver returns None; resume falls through to the legacy
-    /// materialize/flat-file path (commit 5's else branch).
-    #[test]
-    fn both_none_passes_through() {
-        assert_eq!(effective_resume_disk_manifest(None, None), None);
-    }
-}
-
 /// ADR 0019 / telemetry restoration (#526): `resume_placement_label`
 /// covers all three `engram_session_resume_total{placement=...}` values.
 #[cfg(test)]
@@ -2838,7 +2609,6 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3223,7 +2993,6 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -3319,7 +3088,6 @@ mod resume_queue_fence_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

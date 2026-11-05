@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 use engram_storage_local::LocalBlobStorage;
@@ -168,7 +169,8 @@ async fn file_backend_siblings_share_clean_pages() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     // If the guest didn't survive to be snapshotted, the FC API socket
     // is gone (panic=1 reboot=k → KVM reset → FC exits) and we'd get a
@@ -197,8 +199,12 @@ async fn file_backend_siblings_share_clean_pages() {
     let mut vms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = match backend.restore(metadata.clone()).await {
-            Ok(id) => id,
+        let id = SandboxId::new();
+        match backend
+            .restore(id, metadata.clone(), common::disks(&baked.rootfs))
+            .await
+        {
+            Ok(()) => {}
             Err(e) => {
                 dump_fc_logs(work.path());
                 for v in &vms {
@@ -328,7 +334,8 @@ async fn file_backend_base_create_shares_residency_memfile() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
@@ -348,13 +355,13 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let store_root = tempfile::tempdir().expect("store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(LocalBlobStorage::new(store_root.path().join("blob")));
-    let chunk_store = ChunkStore::new(blob);
     let cache = ChunkCache::new(ChunkCacheConfig {
         root: store_root.path().join("cache"),
         budget_bytes: 4 * 1024 * 1024 * 1024,
         sweep_debounce_ms: 0,
         eviction_enabled: true,
     });
+    let chunk_store = ChunkStore::new(blob).with_chunk_cache(cache);
     let memory_manifest = chunk_store
         .chunk_file(&mem_path, ManifestKind::Memory, None)
         .await
@@ -363,7 +370,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
     std::fs::remove_file(&mem_path).expect("delete captured memory.bin");
     let mat = Instant::now();
     chunk_store
-        .materialize_to_file_cached(&memory_manifest, &mem_path, &cache)
+        .materialize_to_file(&memory_manifest, &mem_path)
         .await
         .expect("re-materialize memory.bin from manifest");
     eprintln!(
@@ -381,8 +388,17 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let mut latencies_ms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
-            Ok(id) => id,
+        let id = SandboxId::new();
+        match backend
+            .restore_fresh(
+                id,
+                metadata.clone(),
+                common::disks(&baked.rootfs),
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(()) => {}
             Err(e) => {
                 dump_fc_logs(work.path());
                 for v in &vms {
@@ -525,7 +541,8 @@ async fn substrate_base_create_density_and_latency_parity() {
         swap_source: None,
         swap_manifest: None,
     };
-    let source = backend.create(spec).await.expect("create");
+    let source = SandboxId::new();
+    backend.create(source, spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
@@ -576,14 +593,19 @@ async fn substrate_base_create_density_and_latency_parity() {
         label: &str,
         backend: &FirecrackerBackend,
         metadata: &engram_core::types::snapshot::SnapshotMetadata,
+        rootfs: &Path,
         work_path: &Path,
     ) -> (u64, u128) {
         let mut vms = Vec::new();
         let mut latencies_ms = Vec::new();
         for i in 0..SIBLINGS {
             let t = Instant::now();
-            let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
-                Ok(id) => id,
+            let id = SandboxId::new();
+            match backend
+                .restore_fresh(id, metadata.clone(), common::disks(rootfs), Vec::new())
+                .await
+            {
+                Ok(()) => {}
                 Err(e) => {
                     dump_fc_logs(work_path);
                     for v in &vms {
@@ -704,8 +726,14 @@ async fn substrate_base_create_density_and_latency_parity() {
     cfg_file.firecracker_bin = fork_bin.clone();
     cfg_file.restore_mode = RestoreMode::Uffd;
     let backend_file = FirecrackerBackend::new(work.path(), cfg_file);
-    let (pct_file, median_file) =
-        measure_arm("file-mode", &backend_file, &metadata, work.path()).await;
+    let (pct_file, median_file) = measure_arm(
+        "file-mode",
+        &backend_file,
+        &metadata,
+        &baked.rootfs,
+        work.path(),
+    )
+    .await;
 
     // ---- Arm B: the substrate (Uffd + base shm on the fork) ----
     let base_dir = PathBuf::from(format!(
@@ -723,8 +751,14 @@ async fn substrate_base_create_density_and_latency_parity() {
     let backend_sub = FirecrackerBackend::new(work.path(), cfg_sub);
     let mut metadata_sub = metadata.clone();
     metadata_sub.memory_manifest = Some(manifest_ref);
-    let (pct_sub, median_sub) =
-        measure_arm("substrate", &backend_sub, &metadata_sub, work.path()).await;
+    let (pct_sub, median_sub) = measure_arm(
+        "substrate",
+        &backend_sub,
+        &metadata_sub,
+        &baked.rootfs,
+        work.path(),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&base_dir);
 
     eprintln!(

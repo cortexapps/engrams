@@ -7,10 +7,8 @@
 //!   `path_on_host` for every drive. Tens of KiB to low MiB.
 //! - **sidecar.json** — FC snapshot manifest (`FcSnapshotManifest`):
 //!   spec, network config, memory_manifest ref, source sandbox_id.
-//! - **rootfs.tar.zst** (M2 interim) — writable rootfs blob for
-//!   sessions whose disk state isn't already represented as a
-//!   chunked-disk manifest. Replaced by the chunked path when the
-//!   writable-NBD plumbing lands.
+//! - **rootfs.tar.zst** — writable rootfs blob key. No producer writes
+//!   it: the session disk travels as a chunk-store manifest.
 //!
 //! All three are opaque blobs (not chunked). Keys are derived from
 //! the snapshot_id so the same scheme works for base template
@@ -39,8 +37,7 @@ pub fn sidecar_blob_key(snapshot_id: SnapshotId) -> String {
 }
 
 /// `snapshots/<snapshot_id>/rootfs.tar.zst` — writable rootfs
-/// upload, M2 interim. Replaced by chunked-disk manifest when the
-/// writable-NBD plumbing lands.
+/// upload key.
 pub fn rootfs_blob_key(snapshot_id: SnapshotId) -> String {
     format!("snapshots/{snapshot_id}/rootfs.tar.zst")
 }

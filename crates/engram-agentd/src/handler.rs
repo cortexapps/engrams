@@ -135,12 +135,10 @@ where
             // understands).
             //
             // Without this, that skew is indistinguishable from
-            // agentd crashing mid-call: prod session 8174b7aa ran a
-            // dev-brain image whose agentd predated
-            // `WireRequest::StartBrowser`; the unknown variant failed
-            // to decode, `serve_connection` returned `Err` having
-            // written zero bytes, and the host only ever logged
-            // `start_browser: recv: early eof` (#567). Best-effort
+            // agentd crashing mid-call: the unknown variant fails to
+            // decode, `serve_connection` returns `Err` having written
+            // zero bytes, and the host only logs `recv: early eof`
+            // (#567). Best-effort
             // write — the host may have already torn the connection
             // down on its end (mirrors the token-mismatch path
             // above) — then return the original error so logging is
@@ -1890,8 +1888,7 @@ mod tests {
     /// must NOT try to spawn — that'd fail with EADDRINUSE and the
     /// host's proxy_shell would surface a bogus error. Instead we
     /// recognise the existing listener and return ShellReady with
-    /// spawned=false. Validates the fix for the prod failure mode I
-    /// observed 2026-05-20 (session accb3924).
+    /// spawned=false.
     #[tokio::test]
     async fn start_shell_recognises_a_preexisting_listener_without_spawning() {
         // Pick an unused port, then bind our own listener on it
@@ -2398,12 +2395,10 @@ mod tests {
 
     /// A guest's agentd is baked into its image at build time, so a live
     /// fleet routinely runs older agentd binaries than the host speaks.
-    /// Prod session 8174b7aa hit this: the guest's agentd predated
-    /// `WireRequest::StartBrowser`, so the request's variant index
-    /// decoded as unknown, `read_msg` failed, and `serve_connection`
-    /// returned `Err` having written zero bytes -- indistinguishable
-    /// from agentd crashing mid-call. The host only ever saw
-    /// `start_browser: recv: early eof`. This test pins that an
+    /// A variant the guest predates decodes as unknown, `read_msg`
+    /// fails, and `serve_connection` returns `Err` having written zero
+    /// bytes -- indistinguishable from agentd crashing mid-call. This
+    /// test pins that an
     /// undecodable-but-well-framed request instead gets a typed
     /// `WireResponse::Error` naming the skew, before the connection
     /// drops.

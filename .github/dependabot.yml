@@ -143,7 +143,7 @@ updates:
       #
       # #1034 moves `rand` 0.9 -> 0.10 alone, leaving `rand_chacha` at 0.9.
       # Its lockfile then carries rand_core 0.9.5 AND 0.10.1, so the DST
-      # schedulers (engram-dst, engram-dst-host, engram-dst-cosim) — which
+      # schedulers (engram-dst, engram-dst-cosim) — which
       # call `rand::Rng` methods on a `rand_chacha::ChaCha8Rng` — lose the
       # blanket impl: `Rng` 0.10 is implemented over rand_core 0.10's
       # `RngCore`, and ChaCha8Rng 0.9 implements rand_core 0.9's.

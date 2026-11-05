@@ -778,7 +778,7 @@ impl Runtime {
     /// (the checkpoint chain's accumulated diff — hundreds of 512 KiB
     /// chunks, all prestaged on local NVMe) faulted in one at a time
     /// through the single-threaded fault loop: the residual ~27 s
-    /// post-teleport guest crawl (prod canary 51d51740). Idempotent
+    /// post-teleport guest crawl. Idempotent
     /// against the fault loop via the `installed` bitmap; `wake=false`
     /// (no vCPU waits on a page it hasn't faulted).
     pub fn sweep_all(&self) -> Result<(), HandlerError> {

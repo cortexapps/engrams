@@ -119,7 +119,7 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     assert_eq!(completed_count, 3, "expected 3 ToolCallCompleted events");
 }
 
-/// ADR 0073 / #447 regression (the b9b28452 shape, end to end): a
+/// ADR 0073 / #447 regression, end to end: a
 /// host-agent restart rebuilds the hub with EMPTY memory, and the
 /// surviving in-guest harness re-dials. Pre-0067 that re-dial bounced
 /// "no sandbox bound to this session_id" until a coordinator rebind

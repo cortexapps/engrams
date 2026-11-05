@@ -171,7 +171,7 @@ impl Oracles {
     /// believes the session is Active, the world host reports its bound
     /// sandbox running, and no harness is attached. That is a legal
     /// TRANSIENT (the dial is in flight) but must never persist: past
-    /// the bound it is the 2026-07-31 zombie — a black-holed attach
+    /// the bound it is a zombie: a black-holed attach
     /// with every component convinced someone else owns the wait.
     /// Stateful: the window is measured from the first step that
     /// OBSERVES the disagreement, against the WORLD clock (skew-free).
@@ -514,7 +514,7 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
             let has_snapshot = db.snapshots.values().any(|snapshot| {
                 snapshot.session_id == Some(row.session.id) && snapshot.recoverable
             });
-            if !has_snapshot && row.session.live_disk_manifest.is_none() {
+            if !has_snapshot {
                 return Err(Violation {
                     invariant: "snapshot-safety",
                     detail: format!(
@@ -528,8 +528,7 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
     })
 }
 
-/// USER INPUT IS NEVER GUEST HISTORY (prod 2026-08-03, session
-/// aa0829b0): the rung-1 rewind's positive-provenance tombstone
+/// USER INPUT IS NEVER GUEST HISTORY: the rung-1 rewind's positive-provenance tombstone
 /// predicate must never touch a user-authored row — the receipt
 /// (`prompt_received`), the prompt echo (`agent_message` with role
 /// `user`), a deferred tool answer (`tool_result_submitted`), or an
@@ -635,20 +634,16 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
                     row.session.sandbox_id,
                     row.mem_budget_mib,
                     i64::from(row.cpu_budget_vcpus),
-                    row.nbd_slot_need,
                 )
             })
             .collect::<Vec<_>>()
     });
     let hosts = world.host_world.hosts.lock();
-    for (sid, status, host_id, sandbox_id, mem_budget_mib, cpu_budget_vcpus, nbd_slot_need) in
-        sessions
-    {
+    for (sid, status, host_id, sandbox_id, mem_budget_mib, cpu_budget_vcpus) in sessions {
         if status == SessionState::Queued {
-            if let Some(host) =
-                world
-                    .meta
-                    .oracle_pick_any_host(mem_budget_mib, cpu_budget_vcpus, nbd_slot_need)
+            if let Some(host) = world
+                .meta
+                .oracle_pick_any_host(mem_budget_mib, cpu_budget_vcpus)
             {
                 return Err(Violation {
                     invariant: "quiescence-queued-with-capacity",
@@ -690,7 +685,7 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
 
 /// ADR 0108 E: the TTFT liveness oracle. A session that is Active while
 /// a prompt outbox row for it sits unacked past [`TTFT_BOUND_SECS`] has
-/// a stalled delivery path — the exact 2026-07-31 symptom (prompt
+/// a stalled delivery path (prompt
 /// durable, session Active, `run_started` nowhere). The row is retired
 /// only by the confirming `run_started{prompt_id}` harness event, so
 /// this bounds the WHOLE chain: attach signal → deliver forward →

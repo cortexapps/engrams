@@ -35,8 +35,8 @@ impl PlanDecision {
 /// codex's revision turn.
 ///
 /// A verdict alone is not enough. "Plan rejected by the reviewer: <feedback>"
-/// got the model to re-propose a byte-identical plan (session 93869a67), and on
-/// codex the same shape ended the turn outright (fe3cd981, 98111e00). The
+/// makes the model re-propose a byte-identical plan, and on codex the same
+/// shape ends the turn outright. The
 /// imperative — revise, call the tool again, stay read-only — is load-bearing.
 pub fn changes_requested_message(decision: &PlanDecision) -> String {
     format!(

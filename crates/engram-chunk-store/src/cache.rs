@@ -12,7 +12,7 @@
 //!   mid-write don't leave the cache pointing at half-written chunks.
 //!   The temp name carries pid + a process-global counter for
 //!   IN-process concurrency: many tokio tasks (restore prefetch,
-//!   populate-server connections, disk-daemon flushes) populate
+//!   populate-server connections) populate
 //!   concurrently inside the ONE writer process. (ADR 0075 made this
 //!   single-writer; the pid component is vestigial-but-harmless
 //!   belt-and-braces from the multi-writer era, whose fixed-temp
@@ -549,8 +549,7 @@ type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
 /// the slot — holding the leader's own sender — lingers forever and
 /// every waiter (and every later `get` for this hash, which joins the
 /// orphaned slot) blocks on a broadcast that never comes. That poisons
-/// the host's chunk cache (prod incident: session 9f82064b wedged every
-/// resume retry). This guard removes the slot on drop, dropping its
+/// the host's chunk cache and wedges every resume retry. This guard removes the slot on drop, dropping its
 /// senders so waiters observe `RecvError` and retry as a fresh leader.
 /// The leader disarms it once it has removed the slot itself.
 struct LeaderGuard<'a> {
@@ -789,8 +788,7 @@ impl ChunkCache {
     }
 
     /// Does this chunk's content-addressed file exist on local NVMe right now?
-    /// The disk daemon reads this to label a read's tier (nvme vs blobstorage);
-    /// it also distinguishes "never warmed here" / "evicted" from "warmed but
+    /// Distinguishes "never warmed here" / "evicted" from "warmed but
     /// `get` still missed".
     pub fn contains_on_disk(&self, hash: ChunkHash) -> bool {
         self.path_for(hash).try_exists().unwrap_or(false)
@@ -936,9 +934,9 @@ impl ChunkCache {
         // (`get`'s fetch arm below, and `put`), so a file present at
         // `path_for(hash)` is known-good. We deliberately do NOT re-hash it
         // here. ADR 0021: a full sha256 of a 16 MiB chunk is ~80 ms on our
-        // no-SHA-NI (Cascade Lake) hosts, and the disk daemon re-reads hot
-        // ext4 chunks dozens of times per restore — re-verifying on every
-        // read was ~2.2 s of a 2.6 s substrate, the dominant cost. Verify on
+        // no-SHA-NI (Cascade Lake) hosts, and hot chunks are read many times
+        // per restore — re-verifying on every read would be the dominant
+        // cost. Verify on
         // populate; trust on read. (Atomic temp+rename means a present file is
         // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
@@ -966,9 +964,8 @@ impl ChunkCache {
             )
             .increment(1);
             // ADR 0019 0d: bytes served per tier. With the hit counter
-            // this gives page-in volume + the nvme/blob split — the
-            // aggregate view of chunked-NBD page-in during ext4 mount
-            // (per-read spans would flood the trace; this is the metric).
+            // this gives read volume + the nvme/blob split (per-read
+            // spans would flood the trace; this is the metric).
             metrics::counter!(
                 "engram_chunk_cache_bytes_total",
                 "tier" => "nvme",
@@ -1645,9 +1642,8 @@ impl ChunkCache {
     }
 
     /// Write bytes to the cache atomically. Used internally on
-    /// miss; also exposed so the disk daemon can populate the
-    /// cache directly from in-VM writes (the daemon already has
-    /// the bytes; no point round-tripping through BlobStorage).
+    /// miss; also exposed so a caller that already has the bytes
+    /// can populate the cache without a BlobStorage round trip.
     pub async fn put(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
         // Verify caller's hash claim — defensive; cheap.
         let actual = ChunkHash::of(bytes);
@@ -1791,8 +1787,8 @@ impl ChunkCache {
         // sweeper can't evict (today: the per-image base memfiles that File
         // restores read). The static ceiling was derived assuming the cache
         // owns its disk fraction outright, so an unbudgeted 40 GB co-tenant
-        // silently authorizes overshooting the kubelet eviction line (the
-        // 2026-07-14 w8wq DiskPressure incident). Subtract whatever the
+        // silently authorizes overshooting the kubelet eviction line.
+        // Subtract whatever the
         // co-tenants currently claim so the cache *aims* below it — the
         // statvfs floor stays the independent backstop.
         let reserved = self
@@ -2851,7 +2847,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_leader_does_not_poison_the_inflight_slot() {
-        // Regression for the single-flight poison (prod: session 9f82064b).
+        // Regression for the single-flight poison.
         // A leader cancelled mid-fetch (FC `load_snapshot` 60 s timeout tears
         // down the restore) must clean its slot so a later `get` for the same
         // hash leads a fresh fetch instead of wedging forever as a waiter.

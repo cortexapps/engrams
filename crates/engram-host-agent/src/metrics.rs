@@ -50,22 +50,20 @@ pub fn init(addr: SocketAddr) {
             .expect("install capture histogram buckets");
     }
 
-    // ADR 0116 C1: the starvation probes resolve SUB-millisecond — a
-    // healthy sched-delay tick and a page-cache pwrite both sit well
-    // under the default 5 ms floor, where every sample would land in
-    // the first bucket and the p99 excursion the probes exist to catch
-    // would be invisible until it crossed 5 ms.
+    // ADR 0116 C1: the starvation probe resolves SUB-millisecond — a
+    // healthy sched-delay tick sits well under the default 5 ms floor,
+    // where every sample would land in the first bucket and the p99
+    // excursion the probe exists to catch would be invisible until it
+    // crossed 5 ms.
     let probe_buckets = &[
         0.0002, 0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0, 5.0,
     ];
-    for name in [TOKIO_SCHED_DELAY_SECONDS, NBD_DIRTY_FILE_IO_SECONDS] {
-        builder = builder
-            .set_buckets_for_metric(
-                metrics_exporter_prometheus::Matcher::Full(name.to_string()),
-                probe_buckets,
-            )
-            .expect("install probe histogram buckets");
-    }
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(TOKIO_SCHED_DELAY_SECONDS.to_string()),
+            probe_buckets,
+        )
+        .expect("install probe histogram buckets");
 
     // ADR 0101 B: epoch age lives in the pacing clamp band
     // [ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS 30, ENGRAM_CHECKPOINT_INTERVAL_SECS
@@ -107,84 +105,6 @@ pub fn init(addr: SocketAddr) {
             epoch_bytes_buckets,
         )
         .expect("install epoch-bytes histogram buckets");
-    // ADR 0110: the write ack is the one latency the dirty file newly puts
-    // on the guest's critical path, and it lives three decimal places
-    // below everything else this exporter measures. A `pwrite` into page
-    // cache returns in tens of microseconds; the default `_seconds`
-    // buckets start at 5 ms, so every healthy sample would land in the
-    // first bucket and p99 would report "fast" no matter what happened.
-    // The top of the range covers the two known slow paths: a 16 MiB
-    // chunk materializing on first touch, and writeback throttling under
-    // memory pressure (ADR 0110 tradeoff 1).
-    let write_ack_buckets = &[
-        0.000_01, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05,
-        0.1, 0.25, 0.5, 1.0, 5.0,
-    ];
-    builder = builder
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(NBD_WRITE_ACK_SECONDS.to_string()),
-            write_ack_buckets,
-        )
-        .expect("install write-ack histogram buckets");
-    // One NBD request spans 4 KiB (NBD_BLOCK_SIZE) to 32 MiB
-    // (MAX_REQUEST_PAYLOAD_BYTES). Without explicit buckets a histogram
-    // renders as a Prometheus summary, whose per-host quantiles cannot be
-    // aggregated across the fleet — the same trap the epoch-bytes comment
-    // above records.
-    const KIB: f64 = 1024.0;
-    let write_bytes_buckets = &[
-        4.0 * KIB,
-        16.0 * KIB,
-        64.0 * KIB,
-        128.0 * KIB,
-        512.0 * KIB,
-        MIB,
-        4.0 * MIB,
-        16.0 * MIB,
-        32.0 * MIB,
-    ];
-    builder = builder
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(NBD_WRITE_BYTES.to_string()),
-            write_bytes_buckets,
-        )
-        .expect("install write-bytes histogram buckets");
-    // The read side reuses the write-ack bucket boundaries so the two
-    // distributions compare bucket-for-bucket. The measured landmarks all
-    // have a boundary near them: the ~90 µs serve floor (vCPU kept busy)
-    // sits in (50 µs, 100 µs], the ~195 µs typical qd=1 round trip in
-    // (100 µs, 250 µs], and the 8–9 ms first-touch whole-chunk
-    // materialization in (5 ms, 10 ms].
-    builder = builder
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(NBD_READ_SECONDS.to_string()),
-            write_ack_buckets,
-        )
-        .expect("install read histogram buckets");
-    builder = builder
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(NBD_READ_BYTES.to_string()),
-            write_bytes_buckets,
-        )
-        .expect("install read-bytes histogram buckets");
-    // Recovered bytes span one 16 MiB chunk to a whole unpublished
-    // divergence. The 0 bucket splits out clean-shutdown recoveries that
-    // had nothing left to save from the ones that rescued real writes.
-    let recovered_bytes_buckets = &[
-        0.0,
-        16.0 * MIB,
-        64.0 * MIB,
-        256.0 * MIB,
-        1024.0 * MIB,
-        4096.0 * MIB,
-        16384.0 * MIB,
-    ];
-    builder = builder
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(DIRTY_RECOVERED_BYTES.to_string()),
-            recovered_bytes_buckets,
-        )
-        .expect("install recovered-bytes histogram buckets");
 
     match builder.install() {
         Ok(()) => {
@@ -202,11 +122,6 @@ pub fn init(addr: SocketAddr) {
     // the alert must exist before the first firing, so the series must
     // too. (Same rationale as the coordinator's pre-registration.)
     ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
-    ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
-    // ADR 0110: a failed extent scan fails the reattach. Pre-register so
-    // the alert policy can exist before the first firing.
-    ::metrics::counter!(DIRTY_RECOVER_TOTAL, "outcome" => "scan_failed").absolute(0);
-    ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
     ::metrics::counter!(CAPTURE_SHUTDOWN_STRAGGLER_TOTAL).absolute(0);
     ::metrics::counter!(BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL).absolute(0);
 }
@@ -219,8 +134,8 @@ pub fn init(addr: SocketAddr) {
 ///   - `image_resolve` (`pooled_backend::create` — sum of
 ///     `ensure_image` + `ensure_harness_ext4`, both OCI/cache
 ///     lookups)
-///   - `materialize` (`pooled_backend::create` — `resolve_rootfs`
-///     spawns the NBD daemon or materializes the rootfs to file)
+///   - `materialize` (`pooled_backend::create` — provisioning the
+///     session volumes)
 ///   - `fc_boot` (`FirecrackerBackend::create` — FC API
 ///     PUT-boot-source / PUT-drive / PUT-vsock / InstanceStart)
 ///   - `create_total` (`pooled_backend::create` — rollup of the
@@ -364,9 +279,8 @@ pub const RECHUNK_BYTES_UPLOADED_TOTAL: &str = "engram_rechunk_bytes_uploaded_to
 pub const CAPTURE_LEG_SECONDS: &str = "engram_capture_leg_seconds";
 
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
-/// per-sandbox capture lock. The gridlock signal — the 5fadd364
-/// incident showed 52–151 s waits as captures queued behind a hung
-/// one. With B1 a periodic checkpoint skips rather than waits, so a
+/// per-sandbox capture lock. The gridlock signal: captures queued
+/// behind a hung one wait 52–151 s. With B1 a periodic checkpoint skips rather than waits, so a
 /// long tail here is an eviction/drain blocked on an in-flight capture.
 pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lock_wait_seconds";
 
@@ -375,11 +289,6 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// are expected under load (eviction + periodic contend); a flat zero
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
-
-/// ADR 0112 D5 (closing ADR 0110's open accounting gap): allocated
-/// bytes under the dirty root — the per-sandbox dirty files' real
-/// footprint on the shared mount, fed into the co-tenant reserve.
-pub const HOST_DIRTY_FILES_BYTES: &str = "engram_host_dirty_files_bytes";
 
 /// ADR 0101 B: dirty bytes one diff epoch carried (the adaptive
 /// controller aims this at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`) and the
@@ -493,12 +402,7 @@ pub const HEARTBEAT_DELIVERY_FAILURES_TOTAL: &str = "engram_host_heartbeat_deliv
 /// Counter (ADR 0091). External pause (the rung-2 park's host leg)
 /// refused or failed, labeled by bounded `reason`:
 /// `capture_in_flight` (typed retryable refusal — the park retries next
-/// nomination) / `vmm_pause` (the VMM itself failed the PATCH) /
-/// `data_plane_failed` (ADR 0116 C4: the sandbox's flush loop escalated
-/// a persistent device-class failure — the park is refused
-/// non-retryably, because it would freeze nothing durable, and the
-/// caller falls through to the quarantine-bounded full eviction).
-/// Sustained `vmm_pause` means parking is genuinely broken, not merely
+/// nomination) / `vmm_pause` (the VMM itself failed the PATCH). Sustained `vmm_pause` means parking is genuinely broken, not merely
 /// contended.
 pub const RUNG2_PARK_FAILED_TOTAL: &str = "engram_rung2_park_failed_total";
 
@@ -552,59 +456,6 @@ pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skippe
 /// writer. Labels: outcome = already_local | populated | error.
 pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";
 
-/// R6 (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): counter incremented
-/// each time the startup stale-binding sweep declined to DISCONNECT a
-/// dead-owner NBD device because a live process still holds the device node
-/// open (`sweep-blocked-live-holder`). The device is left RECONNECTABLE for a
-/// later re-serve pass. This should stay at/near zero in steady state; a
-/// non-zero value means a survivor's rehydrate was missed upstream (the
-/// gap-A recurrence counter) — the same signal as the `sweep-blocked-live-holder`
-/// soft-invariant, exported for alerting.
-pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live_holder_total";
-
-/// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): counter incremented each time
-/// the startup classification barrier reconciled the kernel-derived NBD
-/// inventory against the tracked records and found a CONNECTED device whose live
-/// (or unprovable) holder no record could account for — the #769 gap-A survivor,
-/// invisible to both the coord-list and the #739 local pass
-/// ([`engram_host_core::SlotClass::QuarantinedUnknown`]). The device is parked
-/// (left kernel-bound, RECONNECTABLE) and this fires alongside the
-/// `rehydrate-unknown-device` soft-invariant. Should stay at zero in steady
-/// state; a non-zero value means a survivor's records were lost upstream and an
-/// operator/runbook must reconcile it. Distinct from
-/// `sweep_blocked_live_holder`: THAT is the per-device sweep declining to sever;
-/// THIS is the reconcile finding a device it cannot account for at all.
-pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";
-
-/// Gauge: kernel-connected devices classified
-/// [`engram_host_core::SlotClass::ResidueAwaitingTombstone`] (engrams#1378) —
-/// attributed leftovers of an interrupted teardown, parked and reported on the
-/// heartbeat (`device_residue_sandboxes`) until the coordinator's tombstone
-/// orders the disconnect. Should return to zero within a heartbeat cycle or
-/// two of a roll; a persistently non-zero value means the tombstone flow is
-/// not settling the residue (check the coordinator's A5 entomb arm).
-pub const NBD_RESIDUE_DEVICES: &str = "engram_nbd_residue_devices";
-
-/// Counter: interrupted-predecessor NBD teardowns this generation completed
-/// under a coordinator tombstone (`destroy`'s residue arm, engrams#1378).
-pub const NBD_RESIDUE_TEARDOWN_TOTAL: &str = "engram_nbd_residue_teardown_total";
-
-/// Gauge, label `state` = `capacity` | `free` | `warm` | `in_use` |
-/// `parked`. This makes the NBD ceiling and its real high-water pressure
-/// visible before a deployment changes `nbds_max` again.
-pub const NBD_SLOTS: &str = "engram_nbd_slots";
-
-/// The rehydrate spool-adopt arm found a shutdown spool whose lineage disagrees
-/// with the reference disk manifest (fires alongside the
-/// `shutdown-spool-lineage-mismatch` soft-invariant). The spool is PRESERVED on
-/// disk but its acked writes are not served — the 2026-07-21 61a03b7e incident
-/// discarded such a spool because a wrong-kind reference (the MEMORY chain
-/// head) made a legitimate spool look foreign. Should stay at zero; non-zero
-/// means either a wrong-kind/wrong-lineage reference reached the attach path
-/// (a bug) or acked guest writes are sitting unserved (an operator must
-/// reconcile).
-pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
-
 /// ADR 0035 amendment D1: a startup pass that publishes the baked stamp's bundle
 /// generations to BlobStorage failed (it retries on a 60 s timer).
 /// Sustained increments mean stamp generations stay single-copy on
@@ -614,154 +465,10 @@ pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatc
 pub const BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL: &str =
     "engram_bundle_startup_publish_failures_total";
 
-/// A SIGTERM shutdown-ladder stage panicked and was unwind-isolated (the
-/// ladder continued to the abandon sweep + spool export). Should stay at
-/// zero; non-zero means a shutdown rung has a bug — the 2026-08-02
-/// durability rollback started as exactly such a panic, silent in prod
-/// for 11 days. Alert on any increase.
-pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_total";
-
-/// A quarantined survivor's disk was re-served by the rehydrate retry
-/// pass (2026-08-02 durability-rollback RCA) — the recovery that
-/// replaces the old destroy-on-exhaustion rollback. Informational;
-/// the paired failure signal is the coordinator's
-/// `engram_quarantine_stuck_total`.
-pub const QUARANTINE_REHYDRATE_RECOVERED_TOTAL: &str =
-    "engram_nbd_quarantine_rehydrate_recovered_total";
-
-/// Counter (ADR 0116 C4). A sandbox's continuous-flush loop hit the
-/// escalation threshold (4 consecutive device-class flush failures)
-/// and reported its data plane failed: the sandbox joins
-/// `quarantined_survivors` (reason `data_plane_failed`), the next
-/// heartbeat advertises it, and the coordinator's keyed quarantine
-/// evict owns the remediation. Label-free; one increment per failure
-/// episode, not per failed flush. Steady state zero — alert on any
-/// increase: the 2026-08-12 incident's 7-hour silent 30 s warn-loop
-/// becomes this counter.
-pub const NBD_FLUSH_ESCALATIONS_TOTAL: &str = "engram_nbd_flush_escalations_total";
-
-// ─── ADR 0110 rollout gates ───────────────────────────────────────
-//
-// The dirty file made the write path honest. These four metrics are how
-// the rollout is judged; `docs/adr/0110-…md` §Rollout names them. Two
-// of them answer "is the new path live", one answers "what did it save",
-// one answers "did the honesty cost latency".
-
-/// Counter. Which source seeded a survivor's dirty tier on reattach.
-/// Labels: `source` ∈
-/// - `dirty_file` — the ADR 0110 path. The file outlived the process and
-///   the extent scan rebuilt the dirty set.
-/// - `spool` — the pre-0110 fallback. A sandbox created before the
-///   upgrade has no dirty file, so the shutdown spool seeds it.
-/// - `none` — no dirty file and no adoptable spool. Correct for a
-///   sandbox with nothing unpublished; suspicious in a burst.
-///
-/// **This is the primary rollout gate.** Absence of errors cannot prove
-/// the new path runs, because the OLD path is also silent when it works.
-/// The first roll after the upgrade reports `spool` for every survivor
-/// (no file existed yet); the roll AFTER that is the first real exercise
-/// of `dirty_file`. Read as
-/// `sum by (source) (increase(engram_nbd_reattach_seed_total[1w]))` —
-/// `dirty_file` must climb and `spool` must fall to zero as pre-upgrade
-/// sandboxes age out. `spool` still rising after a week means dirty
-/// files are not surviving the roll, which is the whole premise failing.
-pub const REATTACH_SEED_TOTAL: &str = "engram_nbd_reattach_seed_total";
-
-/// Counter. Extent-scan recoveries, labelled `outcome` ∈ {`ok`,
-/// `scan_failed`}. Pairs with [`DIRTY_RECOVERED_BYTES`]: this counts how
-/// OFTEN the new recovery ran, that measures how MUCH it saved.
-/// `scan_failed` means `SEEK_DATA`/`SEEK_HOLE` errored — the reattach
-/// fails and the survivor rides the evict → resume ladder. Alert on any.
-pub const DIRTY_RECOVER_TOTAL: &str = "engram_nbd_dirty_recover_total";
-
-/// Histogram. Bytes of allocated extent one extent scan recovered —
-/// acked guest writes that a host-agent death would previously have
-/// destroyed. This is the ADR's central claim expressed as a number, so
-/// it is the evidence for the retirement PR: a week of non-zero samples
-/// is proof the write-through path did real work. The `0` bucket splits
-/// out the clean-shutdown recoveries that had nothing left to save.
-pub const DIRTY_RECOVERED_BYTES: &str = "engram_nbd_dirty_recovered_bytes";
-
-/// Histogram. Seconds one extent scan took. The scan is a synchronous
-/// `lseek` loop that runs on the reattach critical path, BEFORE
-/// RECONFIGURE releases guest I/O — so a slow scan delays a survivor's
-/// resume and is felt by the user. Default `_seconds` buckets are right
-/// here: a fast scan collapsing into the 5 ms bucket is fine, because
-/// the only question this answers is how bad the slow tail gets.
-pub const DIRTY_RECOVER_SECONDS: &str = "engram_nbd_dirty_recover_seconds";
-
-/// Histogram. Seconds from an NBD WRITE reaching the backend to the
-/// backend acking it, labelled `outcome` ∈ {`ok`, `eio`}.
-///
-/// ADR 0110 put a `pwrite` in front of every ack where the RAM map had
-/// none, and tradeoff 1 in the ADR is that under memory pressure the
-/// kernel can throttle that `pwrite` into writeback. This is the one
-/// latency the design newly places on the guest's critical path, and
-/// nothing measured it before.
-///
-/// It carries explicit microsecond-scale buckets (see `init`). The
-/// default `_seconds` buckets start at 5 ms, but a `pwrite` into page
-/// cache lands in tens of microseconds — every healthy sample would
-/// collapse into one bucket and p99 would read "fast" forever.
-///
-/// Read WITH [`NBD_WRITE_BYTES`]: a p99 rise means nothing on its own,
-/// because a workload shift to bigger writes moves it too. A 16 MiB
-/// chunk materializing on first touch is the expected slow tail.
-pub const NBD_WRITE_ACK_SECONDS: &str = "engram_nbd_write_ack_seconds";
-
-/// Histogram. Bytes per NBD WRITE request. The normalizer for
-/// [`NBD_WRITE_ACK_SECONDS`] — it separates "slower because larger"
-/// from "slower because the kernel throttled writeback".
-pub const NBD_WRITE_BYTES: &str = "engram_nbd_write_bytes";
-
-/// Histogram, label `outcome` (`ok`/`eio`). Wall time of one NBD READ,
-/// from dispatch to the backend's reply bytes — the guest-visible serve
-/// latency of the chunked rootfs, minus the virtio/kernel-NBD legs.
-///
-/// This is the north star for the cold-start read-path work (2026-08:
-/// a first `gradlew help` is ~47k dependency-chained reads at qd≈1, so
-/// wall time = this distribution × chain length). p50 tracks the serve
-/// floor; the p90+ tail tracks first-touch whole-chunk materialization.
-/// Recorded ONCE per NBD request — a read spanning several chunks must
-/// not observe per chunk, both for cost and to keep the distribution
-/// per-request.
-pub const NBD_READ_SECONDS: &str = "engram_nbd_read_seconds";
-
-/// Histogram. Bytes per NBD READ request. The normalizer for
-/// [`NBD_READ_SECONDS`] — guest readahead changes shift the request-size
-/// mix, which moves the latency histogram without the path itself
-/// changing speed.
-pub const NBD_READ_BYTES: &str = "engram_nbd_read_bytes";
-
-/// Counter (ADR 0116 C1). NBD serve-loop exits by cause, labeled
-/// `reason` (`eof` | `read_error` | `parse_error` | `disconnect` |
-/// `write_bound` | `payload_read_error` | `reply_write_error`) and
-/// `device` (`/dev/nbdN`; bounded by the device-slot pool, ADR 0049).
-/// An UNSOLICITED exit (anything but `disconnect` on teardown) leaves a
-/// netlink-configured device with no server: the kernel parks I/O for
-/// `dead_conn_timeout` (300 s) and then fails the device permanently —
-/// the 2026-08-12 nbd98 incident. C2's supervisor consumes this signal;
-/// C1 makes the death visible and countable per cause.
-pub const NBD_SERVE_EXITS_TOTAL: &str = "engram_nbd_serve_exits_total";
-
-/// Histogram (ADR 0116 C1). Latency of the disk daemon's local
-/// chunk-file I/O primitives (`read_exact_at` / `write_all_at` — the
-/// dirty-tier and local-cache pwrite/pread choke points), labeled
-/// `op` (`read` | `write`). These run as BLOCKING syscalls on the
-/// shared tokio runtime; a p99 excursion here during a capture-upload
-/// storm is the H1 (executor/IO saturation) signature, vs. a clean
-/// pwrite p99 with a spiking sched-delay probe pointing at H2
-/// (handler starvation) — the C3 QoS knobs are tuned by which fires.
-pub const NBD_DIRTY_FILE_IO_SECONDS: &str = "engram_nbd_dirty_file_io_seconds";
-
 /// Histogram (ADR 0116 C1). Observed-minus-expected delay of a 100 ms
 /// heartbeat tick on the host-agent's main tokio runtime — the
 /// executor-starvation probe. Steady-state ≈ 0; sustained excursions
-/// past ~10 ms mean runnable tasks (the NBD serve reader/writer among
-/// them) are waiting on workers, which is how a neighbor's upload storm
-/// turns into kernel NBD timeouts. Named generically: the probe moves
-/// to the dedicated serve runtime in C3 and the delta between the two
-/// runtimes becomes the isolation proof.
+/// past ~10 ms mean runnable tasks are waiting on workers.
 pub const TOKIO_SCHED_DELAY_SECONDS: &str = "engram_tokio_sched_delay_seconds";
 
 /// ADR 0116 C1: the executor-starvation probe task. A 100 ms tick that
@@ -787,18 +494,3 @@ pub fn spawn_sched_delay_probe() -> tokio::task::JoinHandle<()> {
         }
     })
 }
-
-/// Counter (ADR 0116 C2). Supervised serve-loop restarts: an unsolicited
-/// serve death repaired in place (fresh socketpair + RECONFIGURE against
-/// the same live backend). Label `device`. Steady state: zero — every
-/// increment is a serve loop that pre-C2 would have died silently and
-/// left the guest to a permanent EIO after `dead_conn_timeout`.
-pub const NBD_SERVE_RESTARTS_TOTAL: &str = "engram_nbd_serve_restarts_total";
-
-/// Counter (ADR 0116 C2). Supervised serve loops that exhausted the
-/// restart budget (5 per 10 min) and gave up — the device stays
-/// configured (guest I/O parks under `dead_conn_timeout`) and the
-/// sandbox's failing flushes escalate it (C4). Alert-worthy: this is a
-/// crash-looping data plane, not a transient.
-pub const NBD_SERVE_RESTART_BUDGET_EXHAUSTED_TOTAL: &str =
-    "engram_nbd_serve_restart_budget_exhausted_total";

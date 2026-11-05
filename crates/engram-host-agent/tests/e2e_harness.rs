@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -235,7 +236,18 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
 /// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
 /// (2026-07 core-ops fold: agentd installs the CA before spawning,
 /// one first-contact call instead of two).
-async fn bake_harness_rootfs(harness_bin: &Path, claude_bin: &Path, busybox: &Path) -> PathBuf {
+/// The baked rootfs file, the chunk store holding its manifest, and the
+/// manifest: a cold test boots the file, a warm test restores through
+/// session volumes staged from the manifest.
+async fn bake_harness_rootfs(
+    harness_bin: &Path,
+    claude_bin: &Path,
+    busybox: &Path,
+) -> (
+    PathBuf,
+    engram_chunk_store::ChunkStore,
+    engram_core::ManifestRef,
+) {
     let images = tempfile::tempdir().expect("images");
     let images_path = images.path().to_path_buf();
     std::mem::forget(images);
@@ -284,7 +296,7 @@ async fn bake_harness_rootfs(harness_bin: &Path, claude_bin: &Path, busybox: &Pa
     )
     .await;
 
-    outcome.rootfs_path
+    (outcome.rootfs_path, chunk_store, outcome.disk_manifest)
 }
 
 /// Spin up a real engram-egress-proxy + Registry + SystemResolver
@@ -705,7 +717,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (rootfs_path, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -739,7 +751,8 @@ async fn e2e_harness_cold_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
     let endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // Register the session in the proxy registry. For COLD path
@@ -787,7 +800,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (_, chunk_store, image) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -799,16 +812,22 @@ async fn e2e_harness_warm_via_pooled_backend() {
     cfg.egress_proxy_port = Some(proxy_port);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
-    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+    let pooled = Arc::new(
+        PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>)
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
+            .with_checkpoint_dir(work.path().join("checkpoints")),
+    );
+    pooled.set_self_ref(&pooled);
 
     let (sink, captured, cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
         image: "engram-e2e-harness-warm".into(),
-        rootfs_source: Some(rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, image).await),
         cpu: CpuLimit { vcpus: 2 },
         memory: MemoryLimit { max_mib: 512 },
         disk: DiskLimit { max_gib: 2 },
@@ -826,12 +845,17 @@ async fn e2e_harness_warm_via_pooled_backend() {
     // window that used to live here is now enforced inside
     // `PooledBackend::snapshot` via `inner.wait_agent_ready` — see the
     // comment there for the cold-boot race it guards against.
-    let cold_id = pooled.create(spec).await.expect("create");
+    let cold_id = SandboxId::new();
+    pooled.create(cold_id, spec).await.expect("create");
     let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     let metadata = pooled.snapshot(cold_id).await.expect("snapshot");
     pooled.destroy(cold_id).await.expect("destroy cold");
 
-    let warm_id = pooled.restore(metadata).await.expect("restore");
+    let warm_id = SandboxId::new();
+    pooled
+        .restore(warm_id, metadata, None)
+        .await
+        .expect("restore");
     let warm_endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
@@ -923,7 +947,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     // `/opt/engram/harness/harness`. If start_agent ignored the
     // empty argv and still tried to spawn, the test would surface that
     // as either a spawn failure or a sink event below.
-    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (rootfs_path, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -957,7 +981,8 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
     let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // The DevVm-mode AgentSpec: empty argv (resolve_harness → None),

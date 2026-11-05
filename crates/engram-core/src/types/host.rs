@@ -101,19 +101,55 @@ pub struct HostCapacity {
 }
 
 /// The host chunk-cache disk floor (bytes): free work_dir space below
-/// which the host is treated as disk-pressured. Issue #528 / the
-/// `engrams-fc-xngk` post-mortem: 20 GiB is the margin under which the
-/// host-agent's idle-evict stops pushing candidates. The SINGLE owner of
-/// this value — the host-agent's `DEFAULT_DISK_FLOOR_BYTES` aliases it,
-/// and ADR 0078's placement affinity vetoes a snapshot-host whose free
-/// disk is below it (placing a resume on a host about to disk-evict its
-/// cache is pointless). Do not mint a second threshold.
+/// which the host is treated as disk-pressured (issue #528). 20 GiB is the
+/// margin under which the host-agent's idle-evict stops pushing
+/// candidates. The SINGLE owner of this value: the host-agent's
+/// `DEFAULT_DISK_FLOOR_BYTES` aliases it, and ADR 0078's placement
+/// affinity vetoes a snapshot-host whose free disk is below it (placing
+/// a resume on a host about to disk-evict its cache is pointless). Do not
+/// mint a second threshold.
 pub const HOST_DISK_CACHE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// [`HOST_DISK_CACHE_FLOOR_BYTES`] in MiB, for comparison against
 /// [`HostUtilization`]'s MiB disk fields on the coordinator placement
 /// path.
 pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 * 1024);
+
+/// Placement stops choosing a host whose session-disk pool has less data
+/// space free than this. A full data pool queues guest I/O instead of
+/// failing it, so the floor keeps the resident sessions running.
+pub const HOST_POOL_DATA_FLOOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const HOST_POOL_DATA_FLOOR_MIB: u64 = HOST_POOL_DATA_FLOOR_BYTES / (1024 * 1024);
+
+/// The pool data floor in effect: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`,
+/// else [`HOST_POOL_DATA_FLOOR_BYTES`]. The coordinator places against
+/// it and a host reaps kept checkpoint volumes to stay above twice it.
+pub fn pool_data_floor_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        floor_bytes_from_env(
+            "ENGRAM_PLACEMENT_POOL_FLOOR_BYTES",
+            HOST_POOL_DATA_FLOOR_BYTES,
+        )
+    })
+}
+
+/// A byte count from `var`, or `default` when unset. A value that does
+/// not parse is a configuration error, not a default.
+pub fn floor_bytes_from_env(var: &str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|e| panic!("{var}={s:?} is not a byte count: {e}")),
+        Err(_) => default,
+    }
+}
+
+/// Placement stops choosing a host whose pool metadata has less space
+/// free than this. Metadata is sized so this never trips; the heartbeat
+/// reports it so an alert fires first.
+pub const HOST_POOL_METADATA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+pub const HOST_POOL_METADATA_FLOOR_MIB: u64 = HOST_POOL_METADATA_FLOOR_BYTES / (1024 * 1024);
 
 /// Observed host resource utilization, sampled fresh on every
 /// heartbeat. Distinct from [`HostCapacity`], which is the
@@ -128,16 +164,18 @@ pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 *
 /// UI renders an empty bar rather than failing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostUtilization {
-    /// NBD capacity. Zero means the host uses file-backed disks.
+    /// Free / total MiB of the session-disk pool's data device. A zero
+    /// total means the host has no pool (sparse-file volumes) or has not
+    /// reported one; placement treats it as unmeasured.
     #[serde(default)]
-    pub nbd_slots_total: u32,
-    /// Claimed slots, including quarantined devices.
+    pub pool_data_free_mib: u64,
     #[serde(default)]
-    pub nbd_slots_in_use: u32,
-    /// Attached device counts included in the slot sample, by sandbox.
-    /// Placement reserves the remaining need, including a partial attach.
+    pub pool_data_total_mib: u64,
+    /// Free / total MiB of the pool's metadata device.
     #[serde(default)]
-    pub nbd_sandboxes: std::collections::HashMap<super::ids::SandboxId, u32>,
+    pub pool_metadata_free_mib: u64,
+    #[serde(default)]
+    pub pool_metadata_total_mib: u64,
     /// Total / used bytes (MiB) of the host's work_dir filesystem —
     /// the mount that holds the chunk cache, jails, and FC memory
     /// dumps. `statvfs(2)`; available on Linux and macOS.
@@ -212,12 +250,12 @@ pub enum CapStatus {
     #[default]
     Unknown,
     /// The probe ran and passed. `detail` carries free-form context
-    /// (e.g. `nbds_max=128`) for operator display; never load-bearing.
+    /// (e.g. `session volumes`) for operator display; never load-bearing.
     Ok(Option<String>),
     /// The probe ran and failed. `detail` is the errno/message.
     Failed(String),
     /// This backend never has this capability (e.g. VZ has no
-    /// uffd/nbd/base_shm substrate) — distinct from `Failed` so the fleet
+    /// uffd/base_shm substrate) — distinct from `Failed` so the fleet
     /// view doesn't render a VZ host's substrate row as broken.
     NotApplicable,
 }
@@ -265,12 +303,10 @@ pub struct HostCapabilities {
     /// no guest involved). `NotApplicable` off the FC backend.
     #[serde(default)]
     pub uffd_minor_shmem: CapStatus,
-    /// The `nbd` kernel module is loaded (`/sys/module/nbd/parameters/nbds_max`
-    /// readable). `detail` carries `nbds_max=<n>`. `NotApplicable` off the
-    /// FC backend. Does NOT change `build_from_kernel`'s materialize-to-file
-    /// dev fallback — this only makes a prod misconfiguration visible.
+    /// The host owns a session-disk pool. `NotApplicable` off the FC
+    /// backend.
     #[serde(default)]
-    pub nbd: CapStatus,
+    pub session_disk: CapStatus,
     /// Idle-page bitmap access. Informational; never a placement requirement.
     #[serde(default)]
     pub page_idle: CapStatus,
@@ -296,7 +332,7 @@ impl HostCapabilities {
     /// the host has reported a real vector (`schema >= 1`), since an
     /// `Unknown` at `schema == 0` just means "hasn't reported yet,"
     /// not "probed and something's wrong." `NotApplicable` never
-    /// counts — it's the correct steady state for e.g. `nbd` on a VZ
+    /// counts — it's the correct steady state for e.g. `session_disk` on a VZ
     /// host, not a failure. Fixed field order (not alphabetical) for
     /// deterministic rendering.
     pub fn failing_capabilities(&self) -> Vec<&'static str> {
@@ -317,8 +353,8 @@ impl HostCapabilities {
         if is_failing(&self.uffd_minor_shmem) {
             out.push("uffd_minor_shmem");
         }
-        if is_failing(&self.nbd) {
-            out.push("nbd");
+        if is_failing(&self.session_disk) {
+            out.push("session_disk");
         }
         if matches!(self.page_idle, CapStatus::Failed(_)) {
             out.push("page_idle");
@@ -512,14 +548,12 @@ pub struct HostHeartbeat {
     pub lease_renew_until: Option<DateTime<Utc>>,
 }
 
-/// Per-host reserved memory, CPU, and NBD device budgets.
-/// Σ over the memory-reserving session states of `mem_budget_mib` and
-/// `cpu_budget_vcpus`. The read-side twin of `reserve_placement`'s
-/// in-transaction aggregate, for the resume/evac picker and the fleet view.
-/// NBD slots exclude devices already in the heartbeat count.
+/// Per-host reserved memory and CPU: Σ over the memory-reserving session
+/// states of `mem_budget_mib` and `cpu_budget_vcpus`. The read-side twin
+/// of `reserve_placement`'s in-transaction aggregate, for the resume/evac
+/// picker and the fleet view.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReservedBudget {
-    pub nbd_slots: i64,
     pub mem_mib: i64,
     pub vcpus: i64,
 }
@@ -741,7 +775,7 @@ mod tests {
         for cap in [
             CapStatus::Unknown,
             CapStatus::Ok(None),
-            CapStatus::Ok(Some("nbds_max=128".to_string())),
+            CapStatus::Ok(Some("session volumes".to_string())),
             CapStatus::Failed("ENOENT".to_string()),
             CapStatus::NotApplicable,
         ] {
@@ -777,7 +811,7 @@ mod tests {
             grpc_self_connect: CapStatus::Ok(None),
             base_shm_tmpfs: CapStatus::NotApplicable,
             uffd_minor_shmem: CapStatus::NotApplicable,
-            nbd: CapStatus::NotApplicable,
+            session_disk: CapStatus::NotApplicable,
             page_idle: CapStatus::NotApplicable,
             bundle_stamp: CapStatus::Failed("no stamp".to_string()),
             fc_snapshot_version: None,
@@ -802,7 +836,7 @@ mod tests {
             grpc_self_connect: CapStatus::Failed("x".into()),
             base_shm_tmpfs: CapStatus::Failed("x".into()),
             uffd_minor_shmem: CapStatus::Ok(None),
-            nbd: CapStatus::Unknown,
+            session_disk: CapStatus::Unknown,
             page_idle: CapStatus::Unknown,
             bundle_stamp: CapStatus::Ok(None),
             fc_snapshot_version: None,
@@ -810,7 +844,7 @@ mod tests {
         };
         assert_eq!(
             broken.failing_capabilities(),
-            vec!["grpc_self_connect", "base_shm_tmpfs", "nbd"]
+            vec!["grpc_self_connect", "base_shm_tmpfs", "session_disk"]
         );
     }
 }

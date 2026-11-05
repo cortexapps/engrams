@@ -23,8 +23,8 @@ const processes = [
     num: "03",
     kicker: "Every host",
     title: "The host agent",
-    body: "One per machine that runs VMs. It dials the coordinator, registers its capacity, and runs the VMs; it owns the chunk cache on local NVMe, the NBD daemon that serves chunked disks, the page-fault handler that pages VM memory in lazily, and the egress proxy every VM's traffic goes through. Hosts never need an inbound port.",
-    foot: "chunk cache · nbd · paging · egress",
+    body: "One per machine that runs VMs. It dials the coordinator, registers its capacity, and runs the VMs; it owns the chunk cache on local NVMe, the thin pool that holds image and session volumes, the page-fault handler that pages VM memory in lazily, and the egress proxy every VM's traffic goes through. Hosts never need an inbound port.",
+    foot: "chunk cache · thin pool · paging · egress",
   },
   {
     num: "04",
@@ -104,7 +104,7 @@ const processes = [
               <div class="arch-node host" style={`left:${40 + i * 320}px;top:340px;width:300px;height:150px`}>
                 <div class="kind"><span>process · per machine</span><span>kvm · nvme</span></div>
                 <div class="name">host agent</div>
-                <div class="meta">chunk cache · nbd · lazy paging · egress proxy</div>
+                <div class="meta">chunk cache · thin pool · lazy paging · egress proxy</div>
                 <div class="vms">
                   <div class="vm"><b>microVM</b><span>harness · daemon</span></div>
                   <div class="vm"><b>microVM</b><span>harness · daemon</span></div>
@@ -163,10 +163,11 @@ const processes = [
             kilobytes.
           </p>
           <p>
-            A VM reads its disk through an NBD device served from its manifest and pages memory in
-            lazily from chunks, with the chunks a session touched in its first seconds prefaulted
-            before the CPUs start. A snapshot writes only the delta and destroys the VM. Restoring on
-            a different host fetches the delta.
+            A VM's disk is a kernel-owned thin volume, a snapshot of the image staged on its host, and
+            it pages memory in lazily from chunks, with the chunks a session touched in its first
+            seconds prefaulted before the CPUs start. A checkpoint pauses the VM for tens of
+            milliseconds, uploads only the blocks that changed, and destroys the VM. Restoring on a different host
+            fetches the delta.
           </p>
         </div>
       </div>

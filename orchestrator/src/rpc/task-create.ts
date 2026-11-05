@@ -422,8 +422,8 @@ export async function compileSessionCreateInput(
   // carries the owner's per-user token; a service-account-created task carries
   // the org secret. They are mutually exclusive — never both. The PRINCIPAL
   // decides, never the task type/surface: a Slack mention email-matched to a
-  // real user is that user (the old `type === "chat"` gate booted Slack
-  // sessions credential-less — "Not logged in", session e721311e), while an
+  // real user is that user (a gate on the task type would boot Slack sessions
+  // credential-less — "Not logged in"), while an
   // API-key creator is programmatic even for a "chat" task.
   const isHuman = isHumanPrincipal(opts);
 

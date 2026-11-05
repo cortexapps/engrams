@@ -1,53 +1,19 @@
 //! The coordinator control-plane seam (ADR 0098 Phase 2).
 //!
-//! The host-agent's lifecycle flows make exactly three decision-feeding
-//! calls into the coordinator: `publish_live_manifest` (Flow A / D — tell
-//! coord a survivor's disk moved), `sandbox_ownership` (Flow E — the
-//! export-TTL ownership check), and `sandbox_owner` (Flow C — the
-//! unknown-binding reconcile lookup). Those three sit behind
-//! [`CoordControlPlane`]; the concrete reqwest client
+//! The host-agent's lifecycle flows make two decision-feeding calls into
+//! the coordinator: `sandbox_ownership` (the export-TTL ownership check)
+//! and `sandbox_owner` (the unknown-binding reconcile lookup). Both sit
+//! behind [`CoordControlPlane`]; the concrete reqwest client
 //! (`HttpCoordClient`, in `engram-host-agent`) implements it, and the
-//! host-internal simulator supplies a deliberately adversarial scripted
-//! stub (ownership flips mid-export, lost publish acks, a vanishing
-//! coordinator).
+//! boundary simulator answers it from the real coordinator handler cores.
 //!
-//! The remaining ~15 host→coord HTTP routes (register/heartbeat/forge/
-//! upload/…) are NOT part of this seam — they are cooperative data/control
-//! traffic the simulator never scripts, so they stay on the concrete
+//! The other host→coord HTTP routes (register/heartbeat/forge/upload/…)
+//! are NOT part of this seam — they are cooperative data/control traffic
+//! the simulator never scripts, so they stay on the concrete
 //! `HttpCoordClient` inherent surface.
 
 use async_trait::async_trait;
 use engram_core::{HostId, SandboxId, SessionId};
-use serde::{Deserialize, Serialize};
-
-// ---- ADR 0016 Phase B: live disk manifest publish ----
-//
-// Moved here from `engram-host-agent::coord_client` so the portable
-// simulator and the trait live in one crate. `HttpCoordClient` re-uses
-// these types directly.
-
-#[derive(Serialize, Deserialize)]
-pub struct LiveManifestPublishRequest {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    pub manifest_id: uuid::Uuid,
-    pub manifest_version: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct LiveManifestPublishResponse {
-    /// `applied` → the UPDATE matched the row and chunk_generation
-    /// ticked. `stale` → `sessions.sandbox_id != publish.sandbox_id`
-    /// (destroyed or rebound); host should NOT retry.
-    pub outcome: LiveManifestPublishOutcome,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveManifestPublishOutcome {
-    Applied,
-    Stale,
-}
 
 /// Portable mirror of the host-agent's former `CoordClientError`. The
 /// reqwest-specific `Transport(reqwest::Error)` variant is flattened to a
@@ -84,18 +50,11 @@ impl std::fmt::Display for CoordError {
 
 impl std::error::Error for CoordError {}
 
-/// The three decision-feeding coordinator calls the host-agent's
-/// lifecycle flows make. See the module doc for why this is a focused
-/// three-method trait and not the whole HTTP surface.
+/// The two decision-feeding coordinator calls the host-agent's lifecycle
+/// flows make. See the module doc for why this is a focused trait and not
+/// the whole HTTP surface.
 #[async_trait]
 pub trait CoordControlPlane: Send + Sync {
-    /// POST /api/v1/hosts/:id/live-manifest — Flow A/D survivor publish.
-    async fn publish_live_manifest(
-        &self,
-        host_id: HostId,
-        req: &LiveManifestPublishRequest,
-    ) -> Result<LiveManifestPublishResponse, CoordError>;
-
     /// GET ownership — Flow E export-TTL check. `Ok(true)` = coord still
     /// binds this sandbox to the session (abort the export, un-pause);
     /// `Ok(false)` = ownership moved on; `Err` = coord unreachable.

@@ -7,6 +7,7 @@ members = [
     "crates/engram-coordinator",
     "crates/engram-host-agent",
     "crates/engram-host-core",
+    "crates/engram-disk-thin",
     "crates/engram-host-operator",
     "crates/engram-chunk-store",
     "crates/engram-rootfs-materializer",
@@ -37,7 +38,6 @@ members = [
     "crates/engram-git-github",
     "crates/engram-postgres",
     "crates/engram-dst",
-    "crates/engram-dst-host",
     "crates/engram-dst-cosim",
     "crates/engram-sim",
     "crates/engram-testkit",
@@ -116,7 +116,6 @@ engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-coordinator = { path = "crates/engram-coordinator" }
 engram-dst = { path = "crates/engram-dst" }
-engram-dst-host = { path = "crates/engram-dst-host" }
 engram-dst-cosim = { path = "crates/engram-dst-cosim" }
 engram-sim = { path = "crates/engram-sim" }
 engram-testkit = { path = "crates/engram-testkit" }
@@ -134,6 +133,7 @@ engram-substrate-proto = { path = "crates/engram-substrate-proto" }
 engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
 engram-host-core = { path = "crates/engram-host-core" }
+engram-disk-thin = { path = "crates/engram-disk-thin" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-session-bundles = { path = "crates/engram-session-bundles" }
 engram-mount-manifest = { path = "crates/engram-mount-manifest" }

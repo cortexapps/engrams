@@ -834,8 +834,8 @@ async fn drive_attached<R, W>(
     // the durable event log coordinator-side (idle_detector.rs), which
     // inherits the seed-at-attach lesson structurally: a session's
     // clock starts at its created_at/last event, never at attach
-    // (prod 43fe13b4: seed-at-attach soft-TTL'd fresh sessions whose
-    // harness needed >30s to emit its first event).
+    // (seed-at-attach soft-TTLs a fresh session whose harness needs
+    // >30s to emit its first event).
 
     let mut writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
 

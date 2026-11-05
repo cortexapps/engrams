@@ -8,8 +8,8 @@
 //! ADR 0021 P1.4: the harness binary lives in the rootfs at the
 //! manifest-declared `[harness] exec` path (built-in templates plant
 //! it at `/opt/engram/harness/harness`; custom templates wherever the
-//! author COPY'd it). There's no drive mount, no NBD page-in on the
-//! spawn hot path; the supervisor just exec's argv. The egress-proxy
+//! author COPY'd it). There's no drive mount on the spawn hot path;
+//! the supervisor just exec's argv. The egress-proxy
 //! CA reaches the child via env vars pointing at the canonical
 //! [`crate::cacerts`] install paths — 2026-07 core-ops fold: the
 //! handler installs the CA (carried on this same `SpawnHarness`
@@ -37,9 +37,8 @@ use crate::proto::SpawnHarnessRequest;
 /// with fds 0/1/2 on `/dev/console`, and after an FC snapshot restore
 /// nothing drains the emulated serial port — once the TTY output buffer
 /// fills, the next `write(2)` to the console blocks *forever*. A harness
-/// whose `tracing` output went to the console deadlocked mid-log-line in
-/// prod (session 5665bdd3, 2026-06-03): the prompt was never processed
-/// and the session sat "thinking" indefinitely. File writes can't block
+/// whose `tracing` output goes to the console deadlocks mid-log-line, and
+/// the session never processes its prompt. File writes can't block
 /// that way, and the log stays readable in-guest via `/exec`.
 const HARNESS_LOG_PATH: &str = "/var/log/engram/harness.log";
 
@@ -209,8 +208,8 @@ impl HarnessSupervisor {
 
         // ADR 0021 P1.4: the harness binary is baked into the rootfs
         // at /opt/engram/harness/ (per the [harness] block in the
-        // image manifest). No drive mount, no NBD page-in on the
-        // spawn path; just exec the argv the host computed from the
+        // image manifest). No drive mount on the spawn path; just
+        // exec the argv the host computed from the
         // manifest's resolved `exec` + `args`.
         let mut cmd = Command::new(&argv0);
         cmd.args(&req.argv[1..]);

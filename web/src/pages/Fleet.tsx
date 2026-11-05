@@ -1,7 +1,6 @@
 import { toast } from "sonner";
 
 import { useHosts } from "../hooks/useHosts";
-import { useStorageSummary } from "../hooks/useStorageSummary";
 import { useDrainHost, useUndrainHost } from "../hooks/useDrainHost";
 import { useNow } from "../hooks/useNow";
 import {
@@ -12,7 +11,7 @@ import {
 } from "../operator-health";
 import { PageHeading } from "../components/page-heading";
 import { EmptyState } from "@/components/empty-state";
-import { localityTone, Meter } from "@/components/meter";
+import { Meter } from "@/components/meter";
 import { ReadoutCell, ReadoutStrip } from "@/components/readout-strip";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { StatusDot, type StatusTone } from "@/components/status-dot";
@@ -43,13 +42,12 @@ import type { HostStatus, HostView } from "../lib/types";
 
 // Settings › Fleet: the one page for whoever runs the hosts. The health strip
 // answers "is the fleet healthy?" in one read — a verdict with a sentence, the
-// two continuous numbers (capacity, base locality), the resident sandbox count
-// from the hosts' own heartbeats, and a telltale per fault, each with a count.
+// capacity figure, the resident sandbox count from the hosts' own heartbeats,
+// and a telltale per fault, each with a count.
 // Below it, one row per host with the figures an operator scans for and the
 // one action they take here (drain / undrain).
 //
-// Every number comes from host truth (`listHosts`, `getStorageSummary`), never
-// from the task list: that list is paged and scoped to the caller, so a count
+// Every number comes from host truth (`listHosts`), never from the task list: that list is paged and scoped to the caller, so a count
 // derived from it was a lower bound of one page of one person's tasks.
 
 const STATUS_TONE: Record<HostStatus, StatusTone> = {
@@ -88,10 +86,6 @@ function explain(issue: HealthIssue, hosts: HostView[]): string {
     }
     case "capacity":
       return "New sandboxes queue until a host frees memory.";
-    case "locality":
-      return "Base chunks are coming from the cold tier, so boots run slower.";
-    case "flush_window":
-      return "Dirty chunks older than the flush window are at risk if their host is lost.";
     case "caps":
       return "Placement skips a host that fails a capability check, so free hosts may not take work.";
   }
@@ -115,7 +109,7 @@ export function fleetVerdict(hosts: HostView[], m: HealthMetrics): FleetVerdict 
     return {
       tone: "nominal",
       headline: "All nominal",
-      sentence: "Every host heartbeats and every sandbox flushed inside the window.",
+      sentence: "Every host heartbeats and passes its capability checks.",
     };
   }
   return {
@@ -134,10 +128,9 @@ const gib = (mib: number, digits = 0) => (mib / 1024).toFixed(digits);
 
 export function Fleet() {
   const hostsQuery = useHosts();
-  const { data: storage } = useStorageSummary();
   const now = useNow(1_000);
   const hosts = hostsQuery.data ?? [];
-  const m = deriveHealthMetrics(hosts, storage);
+  const m = deriveHealthMetrics(hosts);
   const verdict = fleetVerdict(hosts, m);
   const capUsed = hosts.reduce((a, h) => a + h.capacity_used_mib, 0);
   const capTotal = hosts.reduce((a, h) => a + h.capacity_total_mib, 0);
@@ -148,7 +141,6 @@ export function Fleet() {
   const telltales: { label: string; tone: StatusTone; count: number }[] = [
     { label: "Draining", tone: "caution", count: m.draining },
     { label: "Offline", tone: "critical", count: m.dead },
-    { label: "Past flush window", tone: "caution", count: m.rpoStale },
     { label: "Caps failing", tone: "caution", count: m.capsFailing },
   ];
 
@@ -166,7 +158,7 @@ export function Fleet() {
         }
       />
 
-      <ReadoutStrip columns="minmax(0, 1.3fr) repeat(4, minmax(0, 1fr))">
+      <ReadoutStrip columns="minmax(0, 1.3fr) repeat(3, minmax(0, 1fr))">
         <ReadoutCell
           label={
             <span className="inline-flex items-center gap-2 text-sm text-foreground">
@@ -194,17 +186,6 @@ export function Fleet() {
           value={residentSandboxes(hosts)}
           sub={`across ${hosts.length} host${hosts.length === 1 ? "" : "s"}`}
         />
-        <ReadoutCell
-          label="Base locality"
-          value={m.locality === null ? "—" : `${m.locality}%`}
-          sub={storage ? `${storage.tracked_sandboxes} tracked` : undefined}
-        >
-          <Meter
-            value={m.locality}
-            tone={m.locality === null ? undefined : localityTone(m.locality)}
-            label="base locality"
-          />
-        </ReadoutCell>
         <ReadoutCell label="Telltales">
           <ul className="flex flex-col gap-1.5">
             {telltales.map((t) => (

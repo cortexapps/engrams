@@ -57,7 +57,7 @@ export function DurabilityTimeline({ sessionId }: { sessionId: string }) {
   if (checkpoints.length === 0) {
     return (
       <EmptyState inline className="px-0">
-        No checkpoints yet — recovery falls back to the latest disk flush.
+        No checkpoints yet — the first periodic checkpoint is the first recovery point.
       </EmptyState>
     );
   }

@@ -33,7 +33,7 @@ pub use integration::{
 pub use metadata::{
     CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,
     GcCandidateBacklog, GcCandidateRow, MetadataStore, PlacementNoFit, SessionCreateWriteSet,
-    SnapshotTotals, UpdateOutcome, GC_CANDIDATE_EXACT_CAP,
+    SnapshotTotals, GC_CANDIDATE_EXACT_CAP,
 };
 pub use sandbox::{
     AgentRefresh, BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink,

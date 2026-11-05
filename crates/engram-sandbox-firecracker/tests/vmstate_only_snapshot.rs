@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::client::FirecrackerClient;
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
@@ -81,8 +82,9 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
             .expect("clone rootfs");
 
         let backend = FirecrackerBackend::new(work.path(), make_cfg(&env, env.fork_bin.clone()));
-        let vm = backend
-            .create(spec("vmstate-only-fork", local_rootfs))
+        let vm = SandboxId::new();
+        backend
+            .create(vm, spec("vmstate-only-fork", local_rootfs))
             .await
             .expect("create (fork)");
         // Poll the serial console (firecracker.log) for the kernel banner rather
@@ -126,8 +128,9 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
             .expect("clone rootfs");
 
         let backend = FirecrackerBackend::new(work.path(), make_cfg(&env, env.stock_bin.clone()));
-        let vm = backend
-            .create(spec("vmstate-only-stock", local_rootfs))
+        let vm = SandboxId::new();
+        backend
+            .create(vm, spec("vmstate-only-stock", local_rootfs))
             .await
             .expect("create (stock)");
         // Poll the serial console (firecracker.log) for the kernel banner rather

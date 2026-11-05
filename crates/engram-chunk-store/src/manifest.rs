@@ -10,6 +10,7 @@
 //! versions stay forever (until GC sweeps them) so consumers can
 //! pin to a specific version.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -40,8 +41,8 @@ pub const DEFAULT_MEMORY_CHUNK_SIZE: u64 = 512 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ManifestKind {
-    /// A virtual block device. Consumed by NBD daemon (Linux+FC) or
-    /// materialize-to-file (macOS+VZ).
+    /// A virtual block device. Staged into a session-disk volume
+    /// (thin volume on Linux+FC, sparse file on macOS+VZ).
     Disk,
     /// A virtual memory image. Consumed by the UFFD handler
     /// (Linux+FC). Combined with a canonical-base manifest for the
@@ -200,6 +201,15 @@ impl<'de> Deserialize<'de> for ChunkHash {
 pub struct ChunkRef {
     pub offset: u64,
     pub hash: ChunkHash,
+}
+
+/// What separates two versions of one disk: see [`Manifest::delta_from`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestDelta {
+    /// Chunks whose hash differs from the base at that offset.
+    pub write: Vec<ChunkRef>,
+    /// Offsets the base lists and the target does not.
+    pub zero: Vec<u64>,
 }
 
 // `ManifestRef` lives in `engram-core::types::manifest` so the trait-
@@ -368,6 +378,56 @@ impl Manifest {
         Ok(())
     }
 
+    /// What must be written and zeroed to turn a disk holding `base`
+    /// into one holding `self`. Both must have the same shape.
+    pub fn delta_from(&self, base: &Manifest) -> Result<ManifestDelta> {
+        if self.chunk_size != base.chunk_size || self.total_bytes != base.total_bytes {
+            return Err(ChunkStoreError::MalformedManifest(format!(
+                "delta_from: shapes differ (chunk_size {} / {} bytes vs {} / {} bytes)",
+                self.chunk_size.as_u64(),
+                self.total_bytes,
+                base.chunk_size.as_u64(),
+                base.total_bytes
+            )));
+        }
+        let base_at: HashMap<u64, ChunkHash> =
+            base.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+        let mine: HashSet<u64> = self.chunks.iter().map(|c| c.offset).collect();
+        let write = self
+            .chunks
+            .iter()
+            .filter(|c| base_at.get(&c.offset) != Some(&c.hash))
+            .cloned()
+            .collect();
+        let zero = base
+            .chunks
+            .iter()
+            .map(|c| c.offset)
+            .filter(|offset| !mine.contains(offset))
+            .collect();
+        Ok(ManifestDelta { write, zero })
+    }
+
+    /// The inverse of [`Self::delta_from`]: `base.apply(&next.delta_from(&base))`
+    /// has `next`'s chunk list.
+    pub fn apply(&self, delta: &ManifestDelta) -> Manifest {
+        let mut by_offset: BTreeMap<u64, ChunkHash> =
+            self.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+        for offset in &delta.zero {
+            by_offset.remove(offset);
+        }
+        for c in &delta.write {
+            by_offset.insert(c.offset, c.hash);
+        }
+        Manifest {
+            chunks: by_offset
+                .into_iter()
+                .map(|(offset, hash)| ChunkRef { offset, hash })
+                .collect(),
+            ..self.clone()
+        }
+    }
+
     /// Find the chunk at a given offset (must be exactly aligned
     /// to `chunk_size`). Returns `None` if no chunk is listed for
     /// that offset — treat as zero-filled.
@@ -375,9 +435,8 @@ impl Manifest {
         // ADR 0099 H6 (site 2): the contract is "offset must be exactly
         // aligned to chunk_size" — a misaligned query silently returns
         // None (reads as zero-fill), masking a caller's index arithmetic
-        // bug as a hole in the image. debug_assert-tier: this is on the
-        // hot NBD fault path, so it fires under tests + the simulator and
-        // compiles out in prod. `validate()` guards the manifest's own
+        // bug as a hole in the image. debug_assert-tier: fires under
+        // tests + the simulator and compiles out in prod. `validate()` guards the manifest's own
         // entries, not the query offset, so this is not redundant.
         let sz = self.chunk_size.as_u64();
         debug_assert!(
@@ -395,6 +454,41 @@ impl Manifest {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn chunk(offset: u64, byte: u8) -> ChunkRef {
+        ChunkRef {
+            offset,
+            hash: ChunkHash::of(&[byte]),
+        }
+    }
+
+    fn manifest(chunks: Vec<ChunkRef>) -> Manifest {
+        Manifest {
+            chunks,
+            ..Manifest::empty(ManifestKind::Disk, DEFAULT_DISK_CHUNK_SIZE * 8)
+        }
+    }
+
+    #[test]
+    fn delta_lists_changed_and_new_chunks_to_write_and_vanished_ones_to_zero() {
+        let c = DEFAULT_DISK_CHUNK_SIZE;
+        let base = manifest(vec![chunk(0, 1), chunk(c, 2), chunk(2 * c, 3)]);
+        // 0 unchanged, c rewritten, 2c vanished, 3c new.
+        let next = manifest(vec![chunk(0, 1), chunk(c, 9), chunk(3 * c, 4)]);
+        let delta = next.delta_from(&base).unwrap();
+        assert_eq!(delta.write, vec![chunk(c, 9), chunk(3 * c, 4)]);
+        assert_eq!(delta.zero, vec![2 * c]);
+        assert_eq!(base.apply(&delta).chunks, next.chunks);
+        assert!(next.delta_from(&next).unwrap() == ManifestDelta::default());
+    }
+
+    #[test]
+    fn delta_refuses_manifests_of_different_shape() {
+        let base = manifest(vec![]);
+        let mut other = manifest(vec![]);
+        other.total_bytes += 1;
+        assert!(other.delta_from(&base).is_err());
+    }
 
     #[test]
     fn chunk_hash_round_trips_through_hex() {

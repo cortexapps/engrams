@@ -88,9 +88,8 @@ pub(crate) async fn resolve_explicit_secret_ref(
 ) -> Result<Option<String>, engram_core::SecretError> {
     // An empty ref is persistent config state ("not configured"), not
     // a lookup to attempt: the GCP backend would render it as
-    // `projects/<p>/secrets//versions/latest` and 400 on every call
-    // (prod 2026-08-03, session 51fc6af7 — 77 such entries made a
-    // deterministic defect look transient).
+    // `projects/<p>/secrets//versions/latest` and 400 on every call,
+    // which makes a deterministic defect look transient.
     if secret_ref.trim().is_empty() {
         return Ok(None);
     }
@@ -640,7 +639,6 @@ async fn boot_prepared(
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
-        nbd_slot_need,
         inputs,
         memory_mib,
         cpu_budget_vcpus,
@@ -667,7 +665,6 @@ async fn boot_prepared(
     // a capacity miss does. A straggler host that hasn't staged yet simply
     // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
-        nbd_slot_need,
         repo: &image_repo,
         image_version: &image_tag,
         // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
@@ -746,7 +743,6 @@ async fn boot_prepared(
     };
 
     let write_set = engram_core::traits::SessionCreateWriteSet {
-        nbd_slot_need,
         session_id,
         spec: inputs.spec.clone(),
         mem_budget_mib: memory_mib as i64,
@@ -1497,7 +1493,6 @@ async fn prepare_inner(
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
     Ok(crate::session_boot::PreparedBoot {
-        nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
@@ -1795,11 +1790,9 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
 /// (universal — the `engram-share` skill is baked into every image).
 ///
 /// This is THE injector for both harness-spawn paths — session
-/// create and resume's harness rebuild. They diverged once (resume
-/// missed the upload env, so `engram-share` broke after every
-/// idle→resume hop until the next cold create — prod session
-/// 5cfb90b8); a single shared entry point makes that class of skew
-/// impossible. If you add an env here, both paths get it.
+/// create and resume's harness rebuild. One shared entry point keeps
+/// the two from drifting apart (a resume that misses the upload env
+/// breaks `engram-share` until the next cold create). If you add an env here, both paths get it.
 pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
@@ -2196,10 +2189,10 @@ mod tests {
         }
     }
 
-    /// Prod 2026-08-03 (session 51fc6af7): an empty `secret_ref`
-    /// reached the GCP backend as `projects/<p>/secrets//versions/latest`
-    /// and 400'd on every call — a persistent config defect that read
-    /// as a transient failure. An empty ref is "not configured": it
+    /// An empty `secret_ref` sent to the GCP backend becomes
+    /// `projects/<p>/secrets//versions/latest` and 400s on every call —
+    /// a persistent config defect that reads as a transient failure.
+    /// An empty ref is "not configured": it
     /// resolves to `None` with ZERO store calls.
     #[tokio::test]
     async fn empty_secret_ref_is_not_configured_never_a_store_call() {

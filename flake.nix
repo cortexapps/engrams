@@ -160,22 +160,23 @@
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$X86_CC"
               export CC_aarch64_unknown_linux_musl="$ARM64_CC"
               export CC_x86_64_unknown_linux_musl="$X86_CC"
-              # The nix cross stdenvs above export a GENERIC `CC`/`CXX`
-              # (one of the musl gccs). cc-rs falls back to that generic
-              # CC for HOST (apple-darwin) build-dependency C — e.g. ring's
-              # curve25519.c built for a proc-macro — and pairs it with
-              # macOS flags (`-arch arm64 -mmacosx-version-min`), so a musl
-              # gcc gets `-arch arm64` and the build dies. Pin the host
-              # target's compiler back to the nix clang wrapper so host C
-              # builds use clang while only the *-linux-musl targets use the
-              # cross gccs. Without this, `cargo {check,clippy} --target
-              # aarch64-unknown-linux-musl` (the local Linux cross-check)
-              # fails on ring; `just bake-demo` happened to dodge it by not
-              # pulling a host-built ring.
-              export CC_aarch64_apple_darwin="$(command -v cc)"
-              export CXX_aarch64_apple_darwin="$(command -v c++)"
-              export CC_x86_64_apple_darwin="$(command -v cc)"
-              export CXX_x86_64_apple_darwin="$(command -v c++)"
+              export AR_aarch64_unknown_linux_musl="${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-ar"
+              export AR_x86_64_unknown_linux_musl="${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-ar"
+              # The cross stdenvs also export GENERIC `CC`, `CXX`, `AR`,
+              # `RANLIB` and `LD` naming musl tools, and cc-rs falls back
+              # to those for host (apple-darwin) C: ring's asm for a
+              # proc-macro, onig_sys's static archive for the TUI. Pin the
+              # host target and the generics to the nix clang wrapper; the
+              # per-target variables above keep the musl targets on the
+              # cross tools.
+              for host in aarch64_apple_darwin x86_64_apple_darwin; do
+                export "CC_$host=$(command -v cc)"
+                export "CXX_$host=$(command -v c++)"
+                export "AR_$host=$(command -v ar)"
+                export "RANLIB_$host=$(command -v ranlib)"
+              done
+              export CC="$(command -v cc)" CXX="$(command -v c++)" AR="$(command -v ar)"
+              export RANLIB="$(command -v ranlib)" LD="$(command -v ld)"
               # The musl cross sysroots ship libc but NOT the Linux kernel
               # UAPI headers, so a kernel-header bindgen crate (userfaultfd-sys,
               # and the C `cc` step) can't find <linux/userfaultfd.h> when you

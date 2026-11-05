@@ -59,7 +59,7 @@ service HostService {
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
   // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
   // pause vCPUs without snapshotting, destroying, or changing session
-  // state. An admin affordance to exercise + observe the pause/flush
+  // state. An admin affordance to exercise + observe the pause/resume
   // path; maps to SandboxBackend::pause / ::resume.
   rpc PauseSandbox(FencedSandboxRequest) returns (Empty);
   rpc ResumeSandbox(FencedSandboxRequest) returns (Empty);
@@ -138,34 +138,6 @@ service HostService {
   rpc StartIde(SandboxIdMessage) returns (IdePortResponse);
   rpc StopIde(SandboxIdMessage) returns (Empty);
 
-  // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
-  rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
-
-  // ---- ADR 0016 Phase A: COW observability ----
-  //
-  // Per-sandbox diagnostic: dirty/synced chunk counts, current disk
-  // manifest version, last flush timestamp, and the snapshot-bounded
-  // memory-tier RPO signal. Read-only; coord fans these out to power
-  // `GET /api/{hosts,sessions}/:id/cow-state`. Caller caches the
-  // response for ~1s to keep the host load low under web-app polling.
-  rpc CowState(SandboxIdMessage) returns (CowStateResponse);
-  rpc CowStateAll(Empty) returns (CowStateAllResponse);
-
-  // ---- ADR 0016 Phase B: admin flush trigger ----
-  //
-  // Force an immediate ChunkedDiskBackend::flush() on `id`. Pairs
-  // the FlushScheduler's implicit 30s tick with an explicit admin
-  // trigger per `[explicit_admin_triggers_for_testability]`. E2E
-  // tests drive this to verify the publish-to-PG round-trip without
-  // sleeping a full cadence; operators use it to flush a stuck
-  // sandbox's pending dirty bytes on demand.
-  //
-  // Response carries an optional manifest_ref: empty bytes encode
-  // `None` (sandbox not chunk-tracked, or zero dirty chunks), a
-  // full bincode blob encodes the new `ManifestRef` that the coord
-  // immediately funnels into `update_live_disk_manifest`.
-  rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
-
   // ADR 0113: bounded-memory session file transfer.
   rpc WriteFile(stream HostWriteFileRequest) returns (HostWriteFileResponse);
   rpc ReadFile(HostReadFileRequest) returns (stream HostReadFileResponse);
@@ -231,8 +203,8 @@ service HostService {
   // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
   // for `reconcile::flip_missing` to check BEFORE flipping a session to
   // `host_lost` on nothing but absence from the host's self-reported
-  // `running_sandboxes` list (the fbd3794c incident shape — the host
-  // was reachable and the VM was alive the whole time). A proto
+  // `running_sandboxes` list (the host can be reachable and the VM
+  // alive while the list omits it). A proto
   // ADDITION is protobuf-compatible: an old host-agent mid-roll answers
   // `Unimplemented`, which the caller treats as "no probe available ⇒
   // proceed with the flip" — no WIRE_VERSION bump needed for this RPC
@@ -357,9 +329,10 @@ message PostCopyCaptureResponse {
   uint64 pause_ms = 8;
   uint64 disk_drain_ms = 9;
   uint64 vmstate_ms = 10;
-  // Disk post-copy: how many disk chunks were sealed (dirty +
-  // pending tiers) for P2P demand-fetch.
-  uint64 sealed_disk_chunks = 11;
+  // Disk blocks sealed under the pause, and the blocks the presetup's
+  // snapshot carried while the guest ran.
+  uint64 sealed_disk_blocks = 11;
+  uint64 precopy_disk_blocks = 12;
 }
 
 message DrainOutcomeResponse {
@@ -389,19 +362,22 @@ enum DiskRole {
 
 message MigrationItem {
   enum Kind {
-    reserved 2, 3;
-    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST";
+    reserved 2, 3, 5;
+    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST", "DISK_CHUNK_AT";
     KIND_UNSPECIFIED = 0;
     STATE_BIN = 1;
     DISK_SEAL_INFO = 4;
-    DISK_CHUNK_AT = 5;
     HOT_HINT = 6;
+    // One 64 KiB disk block by index.
+    DISK_BLOCK_AT = 7;
+    // The blocks the presetup's snapshot carries, before the pause.
+    DISK_PRECOPY_INFO = 8;
   }
-  reserved 2;
-  reserved "hash";
+  reserved 2, 3;
+  reserved "hash", "chunk_idx";
   Kind kind = 1;
-  uint64 chunk_idx = 3;
   DiskRole role = 4;
+  uint64 index = 5;
 }
 
 message MigrationFrame {
@@ -640,22 +616,6 @@ message StartAgentRequest {
   uint64 fencing_epoch = 5;  // 0 = unfenced interim caller
 }
 
-// --- ReapMaterializeDir ---
-
-message ReapMaterializeDirRequest {
-  uint64 min_age_secs = 1;
-  // Each entry is a 16-byte UUID. Coord ships this snapshot of
-  // `list_live_disk_manifest_ids` inline; hosts have no DB access.
-  // 1M IDs = 16 MiB — bump the per-method max_decoding_message_size
-  // on the host server.
-  repeated bytes live_disk_manifest_ids = 2;
-}
-
-message ReapMaterializeDirResponse {
-  // bincode-encoded `engram_protocol::wire::WireReapStats`.
-  bytes stats_bincode = 1;
-}
-
 message HostWriteFileMetadata {
   bytes sandbox_id = 1; // 16-byte UUID
   string path = 2;
@@ -737,17 +697,12 @@ message CancelExecRequest {
 //
 // Wire shape: the coord opens the stream by sending exactly one
 // `ProxyShellOpen` carrying `sandbox_id`; subsequent messages from
-// either side are pure shell-frame variants. The earlier shape
-// (single `ProxyShellFrame` with a `bytes sandbox_id` populated only
-// on the first frame and a `ProxyShellKind` field that picked which
-// of `data`/`close_code`/`close_reason` were meaningful) was a flat
-// field-bag — the host receiver tried to "defensively forward" the
-// sentinel's empty payload as if it were a WS Binary frame, which
-// ttyd 1.7.8 treats as a protocol violation and TCP-RSTs (prod
-// session 8725648d on 2026-05-23). The oneof here makes every
+// either side are pure shell-frame variants. The oneof makes every
 // variant carry only its own meaningful fields, and makes Open a
-// distinct enum arm from any data variant so the bug class is
-// structurally impossible to express on either side.
+// distinct arm from any data variant. A receiver therefore cannot
+// forward an open sentinel's empty payload as a WS Binary frame,
+// which ttyd treats as a protocol violation (it resets the TCP
+// connection).
 
 message ProxyShellMessage {
   oneof body {
@@ -831,38 +786,3 @@ message ProxyPortData {
 // side say "I'm done writing" explicitly when it has no trailing data.
 message ProxyPortClose {}
 
-// --- ADR 0016 Phase A: CowState / CowStateAll ---
-
-// `Some(CowState)` if the host hosts a chunk-tracked view of this
-// sandbox; `None` (state_bincode empty) otherwise. Wire shape uses
-// bincode for the payload (same pattern as `SnapshotResponse`), so
-// schema evolution stays in Rust-land and proto is just envelope.
-message CowStateResponse {
-  // bincode-encoded `engram_core::types::cow_state::CowState`.
-  // Empty bytes encode the `None` case — distinguished from a
-  // present-but-empty payload because `CowState` always carries a
-  // populated `disk_manifest`.
-  bytes state_bincode = 1;
-}
-
-message CowStateAllResponse {
-  // bincode-encoded `Vec<engram_core::types::cow_state::CowStateRecord>`.
-  // Empty vec is encoded as a non-empty bincode blob (the length
-  // prefix is 0); the proto field is non-optional.
-  bytes records_bincode = 1;
-}
-
-// --- ADR 0016 Phase B commit 4a: FlushSandbox response ---
-
-// Outcome of `HostService.FlushSandbox`. `manifest_ref_bincode`
-// carries `Some(ManifestRef)` (bincode-encoded `Option<ManifestRef>`)
-// when chunks were drained, `None` otherwise. The wire shape mirrors
-// `CowStateResponse`'s empty-means-None convention: empty bytes
-// distinguish "sandbox not chunk-tracked OR zero dirty chunks" from
-// "drained N chunks, here's the new manifest version."
-message FlushSandboxResponse {
-  // bincode-encoded `Option<engram_core::types::manifest::ManifestRef>`.
-  // Empty bytes encode `None` (no chunk tracking / no dirty bytes);
-  // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
-  bytes manifest_ref_bincode = 1;
-}

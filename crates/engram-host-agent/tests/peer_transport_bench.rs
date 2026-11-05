@@ -193,7 +193,6 @@ async fn bench_tuned_grpc_pull() {
         tokio::spawn(engram_host_agent::grpc_server::boot(
             a,
             host,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             Some(peer),
         ));

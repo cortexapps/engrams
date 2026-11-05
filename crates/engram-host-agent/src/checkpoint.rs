@@ -15,7 +15,7 @@
 //!
 //! ## Cost model (why diff-first)
 //!
-//! `pause → drain NBD flush → FC Diff capture → resume` keeps the
+//! `pause → take disk checkpoint → FC Diff capture → resume` keeps the
 //! guest-visible pause at O(dirty set) — 38 ms measured on a 256 MiB
 //! guest vs 2,090 ms for a Full capture (`tests/diff_snapshot.rs`).
 //! Everything slow (overlay, incremental re-chunk, upload, record)
@@ -153,12 +153,7 @@ pub struct ChainHeadRecord {
     pub sandbox_id: SandboxId,
     /// The durably-published chain head at persist time.
     pub manifest_ref: ManifestRef,
-    /// Bound session, when known. Load-bearing since the local
-    /// survivor-rehydrate pass (session 731df805, 2026-07-17):
-    /// `PooledBackend::rehydrate_local_survivors` re-serves a live
-    /// survivor's NBD device under this session when the coordinator's
-    /// register-time list misses it. `None` (a record persisted before
-    /// the binding was known) exempts the sandbox from the local pass.
+    /// Bound session at persist time, when known. Diagnostic only.
     pub session_id: Option<SessionId>,
     pub updated_at: DateTime<Utc>,
 }
@@ -453,26 +448,17 @@ pub fn next_epoch_after(
 }
 
 impl CheckpointConfig {
-    /// ADR 0043 P2a relaxed the default cadence from the old aggressive 60 s
-    /// to 10 minutes. The periodic checkpoint is only the *in-RAM* backstop
-    /// for an unplanned crash of an ACTIVE session: the guest DISK is durable
-    /// on a continuous ~30 s flush ([`crate::disk_daemon::flush_scheduler`], no
-    /// guest pause) PLUS a final SIGTERM disk-flush pass (issue #225,
-    /// [`crate::pooled_backend::PooledBackend::flush_nbd_data_planes_for_shutdown`])
-    /// so a routine pod roll loses no acked writes; and the FC memory state is
-    /// captured on every event that *quiesces* a session — idle-eviction and
-    /// the operator `POST /sessions/:id/snapshot`. NOTE: a SIGTERM pod roll
-    /// intentionally does NOT capture FC memory — surviving VMs are detached
-    /// and reattached by the successor generation (ADR 0044 K2,
-    /// [`crate::lib`]: "no SIGTERM-checkpoint pipeline"); only the disk is
-    /// flushed, new captures are refused (the quiesce gate in
-    /// `capture_phase`), and an in-flight capture is drained bounded (the
-    /// CaptureDrain ladder stage) so its consumed dirty bitmap never dies
-    /// with the process. So the timer bounds how much in-RAM progress an active session
-    /// can lose to an *unplanned host crash* (its disk + harness transcript
-    /// survive; a planned roll keeps the running VM). 10 min
-    /// is "infrequent but sane", with far less per-session pause / capture-lock
-    /// contention / GCS churn than every 60 s. Override (or disable, `=0`) via
+    /// The periodic checkpoint is the backstop for an unplanned loss of the
+    /// host under an ACTIVE session: each one publishes the guest disk and
+    /// memory together, so the session resumes elsewhere at the last
+    /// checkpoint, and the timer bounds the progress such a loss can take.
+    /// Idle eviction and the operator `POST /sessions/:id/snapshot` also
+    /// checkpoint. A planned pod roll loses nothing and captures nothing:
+    /// session volumes are kernel-owned and outlive the process, the running
+    /// VMs are detached and reattached by the successor generation (ADR 0044
+    /// K2), new captures are refused (the quiesce gate in `capture_phase`),
+    /// and an in-flight capture is drained bounded so its consumed dirty
+    /// bitmap never dies with the process. Override (or disable, `=0`) via
     /// `ENGRAM_CHECKPOINT_INTERVAL_SECS`.
     pub fn from_env() -> Self {
         let secs = std::env::var("ENGRAM_CHECKPOINT_INTERVAL_SECS")

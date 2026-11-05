@@ -88,20 +88,11 @@ from pathlib import Path
 # Binaries that bake into each artifact.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"}
 
-# ADR 0098 P9: the host-internal simulation lane. Gated on the release
-# closure of the sim binary's own crate — engram-dst-host pulls
-# engram-host-agent + engram-host-core + engram-sim + the chunk/storage
-# crates as NORMAL deps, so any change that can alter host-sim behavior
-# trips the lane, and nothing else does (disjoint from engram-dst's
-# coordinator closure by construction — the two sims share no sim crate
-# dep direction).
-HOST_SIM_BINS = {"engram-dst-host"}
-
-# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator. Unlike
-# the two disjoint sims above, engram-dst-cosim deliberately spans BOTH
-# closures — it pulls engram-coordinator AND engram-host-agent/-core +
-# engram-dst-host + engram-sim as normal deps — so any change that can alter
-# either side's boundary behavior trips this lane. Its own release closure
+# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator.
+# engram-dst-cosim deliberately spans BOTH closures — it pulls
+# engram-coordinator AND engram-host-agent/-core + engram-sim as normal deps
+# — so any change that can alter either side's boundary behavior trips this
+# lane. Its own release closure
 # is therefore the union that gates `test-cosim`.
 COSIM_BINS = {"engram-dst-cosim"}
 # engram-host-operator (ADR 0044 K3) bakes into its own container image; add
@@ -442,7 +433,6 @@ def main():
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
-    host_sim_closure = release_closure(meta, HOST_SIM_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
     cli = release_closure(meta, CLI_BINS)
 
@@ -585,8 +575,6 @@ def main():
     test_deploy = ci_self or tf_or_helm
     # The site lane: leak lint + astro build, build-only (no deploy on PRs).
     test_site = ci_self or any_path(changed, SITE_PATHS)
-    # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
-    test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
     # release closure.
     test_cosim = ci_self or bool(cc & cosim_closure)
@@ -666,7 +654,7 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
+          f"test_cosim={test_cosim} "
           f"test_integrations_cli={test_integrations_cli} "
           f"test_deploy={test_deploy} test_site={test_site}",
           file=sys.stderr)
@@ -700,7 +688,6 @@ def main():
             f.write(f"test_web={b(test_web)}\n")
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
-            f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             f.write(f"test_deploy={b(test_deploy)}\n")

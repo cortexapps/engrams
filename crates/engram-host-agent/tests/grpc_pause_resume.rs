@@ -128,7 +128,6 @@ async fn boot_grpc_server(host: Arc<FakeHost>) -> std::net::SocketAddr {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             host_dyn,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             None,
         )

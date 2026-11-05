@@ -275,7 +275,7 @@ async fn fenced_write_zero_rows_after_reclaim() {
 /// while `sessions.current_epoch` still equals the op's claimed epoch. A
 /// reclaimed-out predecessor (epoch behind the successor's) writes NOTHING
 /// and gets `Ok(false)` — so it can never land a phantom `recoverable` row
-/// a resume would pick (the 89f7984d durability-lie class), and it never
+/// a resume would pick (a durability lie), and it never
 /// reaches the `commit_snapshot` that follows in the eviction pipeline.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
@@ -683,7 +683,7 @@ async fn cancel_by_id_is_row_scoped() {
 /// is ILLEGAL must get `Ok(None)` (silent fenced stop), NOT a bare
 /// `Conflict` — the latter would slip past callers matching
 /// `starts_with("fenced:")` and fire the compensation a fenced executor
-/// must never run (the 89f7984d brick class).
+/// must never run (it would brick the session).
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn fenced_transition_checks_fence_before_legality() {

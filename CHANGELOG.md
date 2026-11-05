@@ -10,6 +10,47 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Firecracker hosts need a session-disk pool.** The host agent no longer serves disks
+  over NBD, and it refuses to start the Firecracker backend without a pool. Node-prep in
+  the `engram-host-fleet` chart builds a device-mapper thin pool from two files on the
+  host's working filesystem, and the host agent opens it through `ENGRAM_THIN_POOL`; with
+  node-prep disabled, the node image must provide the pool. The node needs the
+  `dm_thin_pool` module and `thin-provisioning-tools`. The `nbd` chart values, the node-prep
+  NBD step, and `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` are gone.
+- **Sessions move across the upgrade through their checkpoints.** A session that is idle
+  with a recoverable snapshot resumes on a new host from its manifest. A session whose only
+  recoverable state was the host's live disk manifest is marked dead by migration 0126
+  before the column is dropped. Roll the host fleet after the coordinator so every running
+  session gets a checkpoint first.
+- **Three database migrations (0126, 0127, 0128).** They drop the live disk manifest, cancel
+  queued evictions of the retired quarantine flavour, and replace the NBD slot columns with
+  the pool capacity columns. Roll the coordinator before the hosts: an older host agent
+  still heartbeats to the new coordinator, but it takes no new sessions because it does not
+  report the `session_disk` capability.
+- **Removed metrics and knobs.** `engram_quarantine_stuck_total`,
+  `engram_durability_rollback_total`, and `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` no longer
+  exist; delete alert policies that read them. The capability vector reports `session_disk`
+  where it reported `nbd`. `engrams admin flush` is gone: a checkpoint is the only way disk
+  state leaves a host.
+- **Fleet API.** `HostView` loses `nbd_slots_total` and `nbd_slots_in_use` and gains
+  `pool_data_free_mib`, `pool_data_total_mib`, `pool_metadata_free_mib`, and
+  `pool_metadata_total_mib`. `FlushSession` is gone.
+
+### Changed
+
+- **The kernel owns the session disk.** A VM's disk is a thin volume in a device-mapper pool;
+  no host process is in the data path, and a host agent restart does not touch a running
+  VM's disk. A base image is staged into the pool once per host and every session's volume
+  is a snapshot of it, so a create writes nothing. A checkpoint pauses the VM for tens of
+  milliseconds however much it wrote and uploads only the blocks that changed. The disk daemon, the
+  copy-on-write view, the flush pipeline, the durability-rollback path, and the
+  quarantined-survivor eviction are gone with it.
+- Placement refuses a host whose pool is below a floor: `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES`
+  (16 GiB by default) of data space, and 64 MiB of metadata space. There is no per-session
+  disk reservation.
+
 ## [0.12.0] - 2026-10-26
 
 ### Upgrade notes

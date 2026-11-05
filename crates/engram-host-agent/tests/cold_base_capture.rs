@@ -50,6 +50,7 @@ use engram_chunk_store::ChunkStore;
 use engram_core::traits::sandbox::{BuildBaseSnapshotRequest, SandboxBackend};
 use engram_core::traits::{BlobStorage, ByteStream};
 use engram_core::types::capture_job::ColdBasePlan;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -134,7 +135,7 @@ async fn cold_base_hit_skips_the_second_cold_boot_and_dedupes_the_overlay() {
     let result1 = pooled
         .build_base_snapshot(
             BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm.clone()),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -175,7 +176,7 @@ async fn cold_base_hit_skips_the_second_cold_boot_and_dedupes_the_overlay() {
     let result2 = pooled
         .build_base_snapshot(
             BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -335,7 +336,7 @@ async fn seed_upload_overlaps_the_warm_hook() {
     pooled
         .build_base_snapshot(
             BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -401,7 +402,7 @@ async fn hook_failure_still_joins_the_deferred_seed() {
     let err = pooled
         .build_base_snapshot(
             BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -552,7 +553,8 @@ impl TestEnv {
         cache_cfg.budget_bytes = 1024 * 1024 * 1024;
         Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(store, self.work.path().join("materialize"))
+                .with_chunk_store(store.clone())
+                .with_session_volumes(common::session_volumes(self.work.path(), &store))
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
                 .with_checkpoint_dir(self.work.path().join("checkpoints")),
         )
@@ -579,13 +581,15 @@ impl TestEnv {
         cache_cfg.budget_bytes = 1024 * 1024 * 1024;
         Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(store, self.work.path().join("materialize-uffd"))
+                .with_chunk_store(store.clone())
+                .with_session_volumes(common::session_volumes(self.work.path(), &store))
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
                 .with_checkpoint_dir(self.work.path().join("checkpoints-uffd")),
         )
     }
 
-    async fn bake(&self, name: &str) -> std::path::PathBuf {
+    /// The sandbox's own lineage of a freshly baked rootfs.
+    async fn bake(&self, name: &str) -> engram_core::types::manifest::ManifestRef {
         let outcome = common::bake_fixture_ext4(
             &self.images.path().join(format!("{name}.ext4")),
             &self.chunk_store,
@@ -598,15 +602,15 @@ impl TestEnv {
             |_tree| Ok(()),
         )
         .await;
-        outcome.rootfs_path
+        common::fork_lineage(&self.chunk_store, outcome.disk_manifest).await
     }
 
-    fn spec(&self, rootfs: &Path) -> SandboxSpec {
+    fn spec(&self, rootfs: engram_core::types::manifest::ManifestRef) -> SandboxSpec {
         SandboxSpec {
             image: "engram-cold-base-test".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
+            rootfs_source: None,
             image_uri: None,
-            rootfs_manifest: None,
+            rootfs_manifest: Some(rootfs),
             cpu: CpuLimit { vcpus: 1 },
             // 256 MiB guest RAM: big enough that the marker (32 KiB) is
             // a small fraction of the image (the diff-vs-full asymmetry
@@ -696,7 +700,7 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
     let result = pooled
         .build_base_snapshot(
             BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -714,8 +718,9 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
         "Miss + warm must have minted the pre-hook seed (the diff-shape precondition)",
     );
 
-    let restored = pooled
-        .restore_fresh(result.snapshot, Vec::new())
+    let restored = SandboxId::new();
+    pooled
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("UFFD restore from the warm base snapshot");
 

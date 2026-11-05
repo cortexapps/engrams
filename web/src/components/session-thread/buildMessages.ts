@@ -151,10 +151,9 @@ export type SystemMarker =
       cause: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
     }
-  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
-  // eviction exhausted its budget; the coordinator destroyed the crippled VM
-  // and the next resume rewinds to the last published disk manifest, dropping
-  // guest writes acked-but-never-uploaded past it. A prominent warning marker.
+  // A recorded durability rollback (historical rows only): the coordinator
+  // destroyed a VM whose acked guest writes were never uploaded, so the next
+  // resume rewinds past them. A prominent warning marker.
   | {
       kind: "durability_rollback";
       manifest: string | null;
@@ -606,7 +605,7 @@ export function buildMessages(
   // runs its own pre-scan (it needs completions to resolve guest-assigned
   // task ids), so this is one call, not per-event work.
   const taskDisplaysByToolCallId = taskCallDisplays(events);
-  // prod session 68c70a65: a `prompt_id` user echo is HELD and rendered at its
+  // A `prompt_id` user echo is HELD and rendered at its
   // consuming `run_started{prompt_id}` (below). That relies on the echo being
   // seen BEFORE its run_started — true when the coordinator appends the echo
   // ahead of the forward, but a `SendPrompt` forwarded before the echo lands
@@ -619,7 +618,8 @@ export function buildMessages(
   // ADR 0108 (held-echo UX): prompt_ids consumed ANYWHERE in the stream
   // (run_started or prompt_steered), pre-scanned so the trailing pending
   // render below cannot double-emit a bubble for an echo that lands AFTER its
-  // run_started (the 68c70a65 inversion — the loop re-holds that echo).
+  // run_started (the forward-before-echo inversion — the loop re-holds that
+  // echo).
   const consumedPromptIds = new Set<string>();
   // The idx that ASKED for each deferred decision. A decision is ANSWERED by a
   // `tool_result_submitted`, which is not a spine kind, so below the window
@@ -712,7 +712,7 @@ export function buildMessages(
           // it's right where it was sent. Text from the held echo (full text),
           // falling back to the queue summary.
           const held = heldUserText.get(ev.prompt_id);
-          // Fall back to the pre-scanned echo (prod 68c70a65): when the echo was
+          // Fall back to the pre-scanned echo: when the echo was
           // appended AFTER this run_started, `heldUserText` is empty here but the
           // pre-scan still has the text, so the user turn renders instead of
           // vanishing.
@@ -803,7 +803,7 @@ export function buildMessages(
         // While plan mode is OFF that is the out-of-mode rejection (the
         // harness answered it in place) and a hint reads better than a failed
         // tool row. While plan mode is ON it is the CLI re-calling a tool
-        // whose first call is already parked (session 4a70374e) — the card
+        // whose first call is already parked — the card
         // covers it, and telling the user to "turn on the plan chip" when it
         // is already on is nonsense. Drop the row either way.
         if (
@@ -1028,8 +1028,8 @@ export function buildMessages(
         // ADR 0107: a plan decision ENDS the read-only turn by design — the
         // codex adapter interrupts it and starts the revision/build turn from
         // the queue. That is a handoff, not a cancellation, and rendering it
-        // as red "interrupted" told the reviewer their approval broke
-        // something (session 3728924b). The plan receipt already narrates the
+        // as red "interrupted" tells the reviewer their approval broke
+        // something. The plan receipt already narrates the
         // transition; the run just closes normally.
         const interrupted = ev.type === "run_interrupted" && !planHandoff;
         const ok = interrupted ? false : ev.type === "run_interrupted" || ev.ok;
@@ -1049,9 +1049,8 @@ export function buildMessages(
         // EVERY bubble this run produced has to leave "running" — not just the
         // one carrying the receipt. A system marker mid-run (a plan card, a
         // question) nulls `active`, so the next part opens a NEW bubble and the
-        // earlier ones would keep spinning their tool rows forever after the
-        // run ended: session 4a70374e showed "Waiting for tool: ToolSearch"
-        // beside a finished turn.
+        // earlier ones would keep spinning their tool rows ("Waiting for
+        // tool: …") forever after the run ended.
         const settled: ThreadMessageLike["status"] = ok
           ? { type: "complete", reason: "stop" }
           : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
@@ -1167,8 +1166,8 @@ export function buildMessages(
         harnessIdle = true;
         break;
 
-      // ADR 0090: the durability-rollback warning boundary. The next resume
-      // rewound the disk to `manifest`, dropping acked-but-unuploaded writes.
+      // The durability-rollback warning boundary (historical rows only): the
+      // next resume rewound the disk to `manifest`, dropping acked writes.
       case "durability_rollback":
         pushSystem(`dr:${idx}`, "guest disk was rolled back", {
           kind: "durability_rollback",
@@ -1241,10 +1240,9 @@ export function buildMessages(
         // `run_started{prompt_id}` ever arrives for it, so the held echo
         // must be released HERE, at its consumption position (mid-turn,
         // after whatever the agent produced before the steer landed).
-        // Pre-fix the echo stayed held forever: the trailing pending
-        // render skips consumed ids, so the user's own message vanished
-        // from the thread (prod 963df54e; the same swallow on every codex
-        // steer). Same fallbacks as the run_started arm, same id, so a
+        // Without this the echo stays held forever: the trailing pending
+        // render skips consumed ids, so the user's own message vanishes
+        // from the thread. Same fallbacks as the run_started arm, same id, so a
         // pending/type-ahead bubble transitions in place.
         const text =
           heldUserText.get(ev.prompt_id)?.text ??
@@ -1343,9 +1341,9 @@ export function buildMessages(
 
   // A deferred call awaiting a HUMAN is the opposite of working: the agent is
   // blocked on the reviewer, not thinking. Codex keeps its app-server turn open
-  // across the park, so `runOpen` stays true and the composer showed "working…"
-  // (plus a live Stop button) under a plan card asking for a decision — session
-  // 676b367f. `harness_parked` never reaches the client, so derive it from the
+  // across the park, so `runOpen` stays true and the composer would show
+  // "working…" (plus a live Stop button) under a plan card asking for a
+  // decision. `harness_parked` never reaches the client, so derive it from the
   // ledger the cards already read.
   // Only a decision whose ANSWER would have been loaded can count as pending.
   const decisionKnown = (id: string) =>

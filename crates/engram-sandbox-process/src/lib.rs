@@ -373,8 +373,7 @@ impl SandboxBackend for ProcessBackend {
         engram_core::traits::HarnessDial::HostTcp
     }
 
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        let id = SandboxId::new();
+    async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         let cwd = self.cwd_for(id);
         tokio::fs::create_dir_all(&cwd).await?;
         if let Some(src) = spec.rootfs_source.as_deref() {
@@ -389,7 +388,7 @@ impl SandboxBackend for ProcessBackend {
         // way the FC guest does.
         stage_aux_bundles(&cwd, &spec.aux_ro_drives).await;
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
-        Ok(id)
+        Ok(())
     }
 
     async fn merge_session_env(
@@ -879,6 +878,7 @@ impl SandboxBackend for ProcessBackend {
             // guest RAM to capture.
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             // ADR 0014: ProcessBackend is dev/test only; no portable
             // BlobStorage upload.
@@ -910,7 +910,12 @@ impl SandboxBackend for ProcessBackend {
     ///   - `rootfs_source` is irrelevant after restore — the cwd is
     ///     materialized from the snapshot's tarball, not from a source
     ///     image directory.
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = match tokio::fs::read(src.join("manifest.json")).await {
@@ -924,7 +929,6 @@ impl SandboxBackend for ProcessBackend {
             // has none to materialize). A *corrupted* manifest still
             // errors below — only a genuinely-absent one takes this path.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let id = SandboxId::new();
                 let cwd = self.cwd_for(id);
                 tokio::fs::create_dir_all(&cwd).await?;
                 let spec = SandboxSpec {
@@ -945,7 +949,7 @@ impl SandboxBackend for ProcessBackend {
                     swap_manifest: None,
                 };
                 self.sandboxes.insert(id, SandboxState::new(spec, cwd));
-                return Ok(id);
+                return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
@@ -954,7 +958,6 @@ impl SandboxBackend for ProcessBackend {
 
         // Restore into a *fresh* sandbox id rather than reusing
         // manifest.sandbox_id — different sandbox, same on-disk state.
-        let id = SandboxId::new();
         let cwd = self.cwd_for(id);
         tokio::fs::create_dir_all(&cwd).await?;
 
@@ -998,21 +1001,21 @@ impl SandboxBackend for ProcessBackend {
             swap_manifest: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
-        Ok(id)
+        Ok(())
     }
 
     async fn restore_base_for_session(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         session_env: HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // Process mode has no captured guest memory or chunked root disk. It
         // emulates the common base-restore contract by copying the configured
         // local image directory into a fresh per-session root. This keeps the
         // app and coordinator on their normal image/profile/session path while
         // the dev-only backend uses a different substrate underneath.
-        let id = SandboxId::new();
         let cwd = self.cwd_for(id);
         tokio::fs::create_dir_all(&cwd).await?;
         if let Some(image) = process_image(&metadata.image_version)? {
@@ -1039,7 +1042,7 @@ impl SandboxBackend for ProcessBackend {
             swap_manifest: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
-        Ok(id)
+        Ok(())
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -1895,7 +1898,8 @@ mod tests {
         use futures::{stream, StreamExt};
 
         let (backend, dir) = backend();
-        let sandbox_id = backend.create(spec()).await.unwrap();
+        let sandbox_id = SandboxId::new();
+        backend.create(sandbox_id, spec()).await.unwrap();
         let upload_id = uuid::Uuid::new_v4();
         let root = PathBuf::from(format!("/tmp/uploads/{upload_id}"));
         let path = root.join("process.bin");
@@ -2045,7 +2049,8 @@ mod tests {
         use futures::StreamExt;
 
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = durable_exec(
             "mid-run-ticket",
             &[
@@ -2090,7 +2095,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_attach_after_exit_replays_output_and_exact_exit() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = durable_exec(
             "completed-ticket",
             &[
@@ -2119,7 +2125,8 @@ mod tests {
     #[tokio::test]
     async fn completed_records_beyond_retention_evict_oldest_first() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         for i in 0..(EXEC_COMPLETED_RETENTION + 2) {
             let req = durable_exec(&format!("retained-{i}"), &["sh", "-c", "printf done"]);
             let (out, _, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
@@ -2148,7 +2155,8 @@ mod tests {
     #[tokio::test]
     async fn attaching_oldest_completed_record_exempts_it_from_pruning() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let oldest_command = "printf 'spawn\\n' >> marker; printf oldest";
 
         for i in 0..=EXEC_COMPLETED_RETENTION {
@@ -2187,7 +2195,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_command_mismatch_refuses_without_second_spawn() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let first = durable_exec(
             "mismatch-ticket",
             &["sh", "-c", "printf 'first\\n' >> marker"],
@@ -2211,7 +2220,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_unknown_ticket_with_offsets_refuses_without_spawn() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let mut req = durable_exec(
             "missing-ticket",
             &["sh", "-c", "printf spawned > must-not-exist"],
@@ -2226,7 +2236,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_cancel_kills_the_process_group() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let stream = b
             .exec_stream(
                 id,
@@ -2283,7 +2294,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_dropped_consumer_does_not_kill_command() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = durable_exec(
             "drop-ticket",
             &[
@@ -2312,7 +2324,8 @@ mod tests {
     #[tokio::test]
     async fn durable_exec_offset_beyond_retained_output_refuses_gap() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = durable_exec("gap-ticket", &["sh", "-c", "printf abc"]);
         let _ = collect_exec_stream(b.exec_stream(id, req.clone()).await.unwrap()).await;
 
@@ -2327,7 +2340,8 @@ mod tests {
     #[tokio::test]
     async fn create_then_exec_captures_stdout() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let h = b.exec(id, exec(&["sh", "-c", "echo hi"])).await.unwrap();
         assert_eq!(h.exit_status, Some(0));
         assert_eq!(String::from_utf8(h.stdout).unwrap(), "hi\n");
@@ -2337,7 +2351,8 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_propagates() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let h = b.exec(id, exec(&["sh", "-c", "exit 7"])).await.unwrap();
         assert_eq!(h.exit_status, Some(7));
     }
@@ -2345,7 +2360,8 @@ mod tests {
     #[tokio::test]
     async fn stderr_is_separated_from_stdout() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let h = b
             .exec(id, exec(&["sh", "-c", "echo out; echo err 1>&2"]))
             .await
@@ -2362,7 +2378,8 @@ mod tests {
         // 124" from "your command timed out" only by also having
         // requested a timeout. Either way the process is dead.
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = ExecRequest {
             command: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             stdin: None,
@@ -2386,7 +2403,8 @@ mod tests {
     #[tokio::test]
     async fn stdin_is_forwarded_to_command() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = ExecRequest {
             command: vec!["sh".into(), "-c".into(), "cat".into()],
             stdin: Some(b"piped-payload\n".to_vec()),
@@ -2406,8 +2424,10 @@ mod tests {
     #[tokio::test]
     async fn exec_uses_per_sandbox_cwd() {
         let (b, _d) = backend();
-        let id1 = b.create(spec()).await.unwrap();
-        let id2 = b.create(spec()).await.unwrap();
+        let id1 = SandboxId::new();
+        b.create(id1, spec()).await.unwrap();
+        let id2 = SandboxId::new();
+        b.create(id2, spec()).await.unwrap();
         b.exec(id1, exec(&["sh", "-c", "echo s1 > marker"]))
             .await
             .unwrap();
@@ -2425,7 +2445,8 @@ mod tests {
         let (b, _d) = backend();
         let mut s = spec();
         s.env.insert("GREETING".into(), "from-spec".into());
-        let id = b.create(s).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, s).await.unwrap();
         let mut req_env = HashMap::new();
         req_env.insert("GREETING".into(), "from-request".into());
         let req = ExecRequest {
@@ -2453,7 +2474,8 @@ mod tests {
     #[tokio::test]
     async fn exec_with_empty_argv_is_invalid_spec() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let req = ExecRequest {
             command: vec![],
             stdin: None,
@@ -2472,7 +2494,8 @@ mod tests {
     #[tokio::test]
     async fn destroy_removes_cwd_and_state() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         b.exec(id, exec(&["sh", "-c", "echo x > f"])).await.unwrap();
         let cwd = b.cwd_for(id);
         assert!(cwd.exists());
@@ -2491,7 +2514,8 @@ mod tests {
         // process is still alive after destroy.
         let (b, _d) = backend();
         let pid_file = "agent.pid";
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         // Agent argv is supplied at start_agent time, not on the
         // SandboxSpec — see the trait docs for why.
         let agent = AgentSpec {
@@ -2566,7 +2590,8 @@ mod tests {
         let backend = ProcessBackend::new(relative);
         assert!(backend.work_dir.is_absolute());
 
-        let id = backend.create(spec()).await.expect("create sandbox");
+        let id = SandboxId::new();
+        backend.create(id, spec()).await.expect("create sandbox");
         let harness = backend.cwd_for(id).join("opt/engram/dyn/0/harness");
         fs::create_dir_all(harness.parent().expect("harness parent"))
             .expect("create harness directory");
@@ -2612,8 +2637,10 @@ mod tests {
     async fn list_reflects_active_sandboxes() {
         let (b, _d) = backend();
         assert!(b.list().await.unwrap().is_empty());
-        let a = b.create(spec()).await.unwrap();
-        let z = b.create(spec()).await.unwrap();
+        let a = SandboxId::new();
+        b.create(a, spec()).await.unwrap();
+        let z = SandboxId::new();
+        b.create(z, spec()).await.unwrap();
         let mut listed = b.list().await.unwrap();
         listed.sort();
         let mut expected = vec![a, z];
@@ -2627,7 +2654,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_then_restore_round_trips_workspace() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         b.exec(
             id,
             exec(&[
@@ -2653,7 +2681,8 @@ mod tests {
         // not from leftover state.
         b.destroy(id).await.unwrap();
 
-        let restored = b.restore(meta).await.unwrap();
+        let restored = SandboxId::new();
+        b.restore(restored, meta, None).await.unwrap();
         let h_top = b.exec(restored, exec(&["cat", "greeting"])).await.unwrap();
         assert_eq!(String::from_utf8(h_top.stdout).unwrap(), "hello\n");
         let h_nested = b.exec(restored, exec(&["cat", "sub/file"])).await.unwrap();
@@ -2689,6 +2718,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -2698,7 +2728,7 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        let res = b.restore(meta).await;
+        let res = b.restore(SandboxId::new(), meta, None).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));
     }
 
@@ -2712,7 +2742,8 @@ mod tests {
         use futures::StreamExt;
 
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let stream = b
             .exec_stream(
                 id,
@@ -2777,7 +2808,8 @@ mod tests {
         let (b, _d) = backend();
         let mut s = spec();
         s.rootfs_source = Some(img.path().to_path_buf());
-        let id = b.create(s).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, s).await.unwrap();
 
         // Verify visibility from inside the sandbox via exec.
         let h = b
@@ -2796,7 +2828,8 @@ mod tests {
         // sandbox cwd is just an empty directory. Older callers /
         // tests don't have to know about images.
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         let h = b
             .exec(id, exec(&["sh", "-c", "ls -A | wc -l"]))
             .await
@@ -2814,7 +2847,7 @@ mod tests {
         let (b, _d) = backend();
         let mut s = spec();
         s.rootfs_source = Some("/no/such/starter/dir".into());
-        match b.create(s).await {
+        match b.create(SandboxId::new(), s).await {
             Err(SandboxError::Vm(e)) => {
                 assert!(e.to_string().contains("materialize"));
             }
@@ -2825,7 +2858,8 @@ mod tests {
     #[tokio::test]
     async fn workdir_is_resolved_relative_to_sandbox_cwd() {
         let (b, _d) = backend();
-        let id = b.create(spec()).await.unwrap();
+        let id = SandboxId::new();
+        b.create(id, spec()).await.unwrap();
         b.exec(id, exec(&["mkdir", "-p", "deep/nested"]))
             .await
             .unwrap();

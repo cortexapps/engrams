@@ -748,13 +748,12 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // (RAII abort) before `op_finish` so the beat never re-stamps a
     // just-finished row.
     let heartbeat = spawn_op_heartbeat(state, op.id, epoch);
-    // ADR 0079 backstop / the 2026-07-17 resume-stall incident (session
-    // 03e6535e): the within-step liveness heartbeat above PROVES the
+    // ADR 0079 backstop: the within-step liveness heartbeat above PROVES the
     // executor is alive independently of step progress — by design, so a
     // long-but-healthy host RPC is never reclaimed. Its failure mode is an
     // executor that is alive but WEDGED: a verb `await` that never returns
-    // (there, `host.start_agent` on a resume `finish` step hung on a dead
-    // rootfs device) keeps the row heartbeating forever, so the 180s
+    // (for example, `host.start_agent` on a resume `finish` step hung on
+    // a dead rootfs device) keeps the row heartbeating forever, so the 180s
     // stale-op reclaim can never fire and the op is pinned until a deploy
     // rolls the pod (34 minutes, in the incident). The per-RPC
     // `grpc-timeout`s (restore/start_agent, 240s) are the first line; this
@@ -778,8 +777,8 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // concurrently with the successor op (a retry's fresh capture, or a
     // Deliver/Resume against the same guest), corrupting snapshot
     // quiescence. So `op_deadline` returns `None` for those verbs (they keep
-    // their own bounds — the ADR-0090 quarantine capture timeout, and the
-    // 180s reclaim on genuine executor death); Resume/CreateBoot leave only
+    // their own bound, the 180s reclaim on genuine executor death);
+    // Resume/CreateBoot leave only
     // an orphan-reaped half-restore or a reattach-idempotent half-spawn, and
     // Deliver/Destroy have no shared-sandbox cleanup, so those are bounded.
     // Stamp the attempt start on the injected clock: the requeue arms
@@ -817,8 +816,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         // the bare delay. DST finding (ADR 0108 swarm, seed 33043259):
         // an attempt whose dispatch burns LONGER than its requeue delay
         // — a hung host RPC resolved only by `op_deadline` (Deliver
-        // 120s) or by an in-verb bound (evict's capture timeout) —
-        // re-arms every SIBLING op on the session whose ≤60s-capped
+        // 120s) — re-arms every SIBLING op on the session whose ≤60s-capped
         // backoff it just outlasted. Two such ops mutually re-arm:
         // each one's burn makes the other due again, `drive_session`'s
         // claim loop never runs dry, and the lane churns hung RPCs
@@ -994,8 +992,7 @@ fn backoff(attempts: i32) -> Duration {
 /// (Teleport), where dropping the host RPC spawns unfenced CaptureUnwind /
 /// abort cleanup on the shared sandbox that would race a successor op (see
 /// the cancellation-safety note in [`drive_one`]). Those verbs keep their
-/// existing bounds: the ADR-0090 quarantine capture timeout and the 180s
-/// reclaim on genuine executor death.
+/// existing bound: the 180s reclaim on genuine executor death.
 fn op_deadline(kind: OpKind) -> Option<Duration> {
     let deadline = match kind {
         // The worst legitimate case: restore (≤240s grpc) in the `restore`
@@ -1012,8 +1009,7 @@ fn op_deadline(kind: OpKind) -> Option<Duration> {
     };
     // Operators can pin a single global backstop (and tests set a short one)
     // via `ENGRAM_OP_DEADLINE_SECS` — applied only to deadline-eligible
-    // verbs, never to force one onto a cancel-unsafe verb. Mirrors the
-    // `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` knob.
+    // verbs, never to force one onto a cancel-unsafe verb.
     let deadline = std::env::var("ENGRAM_OP_DEADLINE_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

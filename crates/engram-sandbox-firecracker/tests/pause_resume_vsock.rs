@@ -27,6 +27,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
@@ -124,7 +125,8 @@ async fn vsock_delivers_after_plain_pause_resume() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    backend.create(sandbox_id, spec).await.expect("create");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     // ---- 3. Baseline: exec over vsock works before the pause ----

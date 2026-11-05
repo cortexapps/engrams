@@ -588,3 +588,11 @@ pub async fn bake_fixture_ext4(
         runtime_defaults: OciRuntimeDefaults::default(),
     }
 }
+
+/// The disk paths a restore attaches: the source VM's ext4, no swap.
+pub fn disks(root: &Path) -> Option<engram_core::types::sandbox::SessionDisks> {
+    Some(engram_core::types::sandbox::SessionDisks {
+        root: root.to_path_buf(),
+        swap: None,
+    })
+}

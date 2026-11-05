@@ -8,14 +8,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
 use crate::types::capture_job::{CaptureJobResult, ColdBasePlan};
-use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::endpoints::GuestEndpoints;
 use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    SessionFileMetadata, SessionFileSpec, SessionFileStream,
+    SessionDisks, SessionFileMetadata, SessionFileSpec, SessionFileStream,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -167,7 +166,10 @@ pub enum AgentRefresh {
 
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
-    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
+    /// Boot a sandbox under `id`, which the caller mints. Every host
+    /// resource the sandbox owns (volumes, jail, sockets) is named by
+    /// `id` before the backend sees it.
+    async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError>;
 
     /// Start the long-running agent process for this sandbox (the
     /// harness adapter — Claude Code, the dev noop). Idempotent:
@@ -398,9 +400,10 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C2: the blackout half. Pause → NBD fsync + dirty-tail
-    /// drain → vmstate-only snapshot (fork v3) → pagemap scan → seal
-    /// the page server's export (the parked dest handler unblocks).
+    /// ADR 0045 C2: the blackout half. Pause → disk seal (a volume
+    /// checkpoint and the chunks changed since presetup) → vmstate-only
+    /// snapshot (fork v3) → pagemap scan → seal the page server's export
+    /// (the parked dest handler unblocks).
     /// The guest stays paused serving pages until commit (post-drain)
     /// or abort; `state.bin` becomes fetchable via `migration_fetch`.
     async fn migration_capture_postcopy(
@@ -521,17 +524,24 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
-    /// Restore a sandbox from a previously-taken snapshot. ADR 0007
-    /// Phase 6: takes the metadata directly (carrying the manifest
-    /// refs + snapshot id) rather than a host-local path — the
-    /// backend looks up its own staging dir for `metadata.id` and
-    /// rehydrates from chunks if local files are missing.
+    /// Restore a sandbox from a snapshot. The backend looks up its own
+    /// staging dir for `metadata.id` and rehydrates from chunks when
+    /// local files are missing.
     ///
-    /// ADR 0035: this is the *resume* flavor — aux RO bundles stay on
-    /// the generation the snapshot pinned (live guest processes may
-    /// hold fds into them). Fresh session creates go through
+    /// `disks` are the session's disks, provisioned and named by the
+    /// caller. `None` asks the layer that owns the disks to provision
+    /// them; a backend that attaches disks and owns none refuses it.
+    ///
+    /// This is the *resume* flavor: aux RO bundles stay on the
+    /// generation the snapshot pinned (live guest processes may hold
+    /// fds into them). Fresh session creates go through
     /// [`Self::restore_fresh`].
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
+    ) -> Result<(), SandboxError>;
 
     /// ADR 0035/0055: restore for a *fresh* session (the base-snapshot path) —
     /// identical to [`Self::restore`] except, while the VM is load-paused,
@@ -542,10 +552,12 @@ pub trait SandboxBackend: Send + Sync {
     /// `selected_mounts` is ignored by the default.
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
+        disks: Option<SessionDisks>,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
-        self.restore(metadata).await
+    ) -> Result<(), SandboxError> {
+        self.restore(id, metadata, disks).await
     }
 
     /// ADR 0020 P1: block until the guest's agentd has dialled its
@@ -792,18 +804,15 @@ pub trait SandboxBackend: Send + Sync {
         Ok(AgentRefresh::UpToDate)
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a session and
-    /// ADR 0020 P1: restore the image's shared base snapshot for a
-    /// new session and inject the per-session env. ADR 0021 P1.5
-    /// retired the option-D substrate-swap stage that used to ride
-    /// here — the harness lives in the rootfs now and arrives with
-    /// the snapshot itself. Implemented on `PooledBackend`.
+    /// Restore the image's shared base snapshot for a new session and
+    /// inject the per-session env. Implemented on `PooledBackend`.
     async fn restore_base_for_session(
         &self,
+        _id: SandboxId,
         _metadata: SnapshotMetadata,
         _session_env: std::collections::HashMap<String, String>,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `restore_base_for_session` (needs the pooled chunk-store wrapper)".into(),
         ))
@@ -858,14 +867,9 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// ADR 0044 K2 survivor rehydrate: the host block device this
-    /// sandbox's rootfs drive reads (e.g. `/dev/nbd4` for a
-    /// chunked-NBD rootfs). After a host-agent restart the new
-    /// generation must re-serve EXACTLY this device — the surviving
-    /// FC holds an open fd to it, so attaching a fresh slot would
-    /// serve a device nobody reads. `None` for sandboxes whose
-    /// rootfs isn't a block device (file-backed, or backend doesn't
-    /// track it).
+    /// The host block device this sandbox's rootfs drive reads. `None`
+    /// for sandboxes whose rootfs isn't a block device (file-backed, or
+    /// backend doesn't track it).
     fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }
@@ -1049,28 +1053,6 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
-    /// `None` for backends without an NBD-chunked disk view
-    /// (Process, VZ-without-NBD, FC before its NBD attach lands) —
-    /// the diagnostic surface treats absence as "this sandbox isn't
-    /// chunk-tracked" rather than "this sandbox has zero dirty
-    /// bytes." Only `PooledBackend` overrides today; the FC + VZ
-    /// inner backends inherit the default. See [`CowState`] for
-    /// what the fields mean and ADR 0016 for the design.
-    async fn cow_state(&self, _id: SandboxId) -> Option<CowState> {
-        None
-    }
-
-    /// Bulk variant: one record per sandbox this backend hosts that
-    /// *has* a COW view. Skips sandboxes whose individual
-    /// `cow_state()` would return `None`. Default empty; only
-    /// `PooledBackend` overrides. Lets the host-side gRPC server
-    /// answer `CowStateAll` with one map-iteration rather than
-    /// `list() + N × cow_state()`.
-    async fn cow_state_all(&self) -> Vec<CowStateRecord> {
-        Vec::new()
-    }
-
     /// ADR 0035 amendment D2: the aux bundle generations attached to each
     /// running sandbox, from the backend's live view (post any
     /// create-time stamp swap, and rebuilt from the persisted manifest
@@ -1082,28 +1064,6 @@ pub trait SandboxBackend: Send + Sync {
     /// bundle GC's grace period tolerates.
     async fn aux_bundles_all(&self) -> Vec<crate::types::sandbox::SandboxAuxBundles> {
         Vec::new()
-    }
-
-    /// ADR 0016 Phase B commit 4a — explicit admin trigger for the
-    /// FlushScheduler's primitive. Forces an immediate
-    /// `ChunkedDiskBackend::flush()` on `id` and, if any chunks were
-    /// drained, returns the freshly-published `ManifestRef`. Returns
-    /// `Ok(None)` when this backend has no chunk-tracked view of
-    /// the sandbox (mirrors `cow_state` semantics) or when there
-    /// were no dirty chunks.
-    ///
-    /// Paired with the 30s tick + threshold-notify in
-    /// `FlushScheduler` per `[explicit_admin_triggers_for_testability]`:
-    /// the scheduler is the implicit trigger; this is the explicit
-    /// one. E2E tests use this to drive the publish-to-PG round-trip
-    /// without sleeping a full cadence. Operators use it to flush a
-    /// stuck sandbox's pending dirty bytes on demand. Default
-    /// `Ok(None)` so non-chunked backends compile unchanged.
-    async fn flush_sandbox(
-        &self,
-        _id: SandboxId,
-    ) -> Result<Option<crate::types::manifest::ManifestRef>, SandboxError> {
-        Ok(None)
     }
 }
 

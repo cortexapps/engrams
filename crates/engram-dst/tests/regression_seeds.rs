@@ -110,7 +110,7 @@ fn seed_96_host_lost_straggler_settles_via_sweep() {
     run(96, Profile::Chaos, 1500);
 }
 
-/// ADR 0098 coverage-gap G1 (PR #743, session 03e6535e): a resume-class op
+/// ADR 0098 coverage-gap G1 (PR #743): a resume-class op
 /// wedged forever inside its host RPC while the within-step heartbeat kept
 /// the op row fresh — stale-op reclaim never fired and the op pinned for
 /// 40 minutes until a pod roll. The fix (`op_deadline`, deliberately on the
@@ -334,8 +334,7 @@ fn issue_787_dead_host_false_evict_double_boot() {
 /// row is recorded, so the flag is `true`; only the sim was unfaithful.
 /// The fix makes the sim world faithful (world.rs): the snapshot verb now
 /// writes those blobs to the SAME shared store the coordinator reads and
-/// returns the refs, mirroring engram-dst-host's ledger discipline (model
-/// the artifact, never fake the flag). NOTE the idle_evictor has no
+/// returns the refs (model the artifact, never fake the flag). NOTE the idle_evictor has no
 /// explicit `recoverable`-before-`Idle` guard — it relies on captures always
 /// producing manifests, which prod does; a transiently-unrecoverable
 /// capture would land Idle-but-unrecoverable and only fail at resume

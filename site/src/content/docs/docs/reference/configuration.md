@@ -24,6 +24,7 @@ where, for anyone reading a manifest or running a component outside the charts.
 | `ENGRAM_SECRETS_BACKEND` | `gcp`, `aws`, or `env` for development. |
 | `ENGRAM_GCP_PROJECT_ID` | With `gcp`: the Secret Manager project. |
 | `ENGRAM_CHUNK_GC_INTERVAL_SECS`, `ENGRAM_CHUNK_GC_RETAIN_SECS` | How often chunk garbage collection runs, and how long an unreferenced chunk is kept before deletion. |
+| `ENGRAM_PLACEMENT_POOL_FLOOR_BYTES` | Free space a node's session-disk pool must keep for the scheduler to place a new session on it; default 16 GiB. A node deletes the checkpoint volumes of evicted sessions it kept for a fast resume when its free space falls under twice this value, so set it on the host agents too. |
 
 Cloud credentials are ambient: Workload Identity on GKE, IRSA on EKS, bound to the
 coordinator's ServiceAccount. There are no key files.
@@ -37,7 +38,7 @@ coordinator's ServiceAccount. There are no key files.
 | `ENGRAM_SANDBOX_BACKEND` | `firecracker` in production. |
 | `ENGRAM_KERNEL_IMAGE_PATH` | The guest kernel staged on the node. |
 | `ENGRAM_BLOB_BACKEND` and the bucket variables | Must match the coordinator's. |
-| `ENGRAM_NBD_MAX_SLOTS`, `ENGRAM_NBD_WARM_SLOTS` | The NBD device pool. The node-prep step loads the module with `nbds_max` to match. |
+| `ENGRAM_THIN_POOL` | The name of the node's session-disk pool, as node-prep built it. Required for the Firecracker backend; unset, the macOS and process backends keep volumes as sparse files under the working directory. |
 | `ENGRAM_FC_UFFD_BASE_DIR` | The tmpfs that holds each image's canonical memory. |
 | `ENGRAM_FC_VM_CGROUP_PARENT` | A node-level cgroup the VMs move into, so a host-agent pod restart does not kill them. |
 | `ENGRAM_EGRESS_PROXY_PORT`, `ENGRAM_EGRESS_DNS_PORT`, `ENGRAM_GUEST_GATEWAY_PORT` | The proxy's listeners. Mandatory and non-zero; guest traffic is redirected to them. |

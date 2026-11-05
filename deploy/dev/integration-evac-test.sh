@@ -18,8 +18,7 @@
 #      drives the full evacuate_to → finish_resume_to_active path.
 #   4. Verify the session ended at Active on a DIFFERENT host_id.
 #   5. Read /var/evac-canary.bin on the new host, compare md5.
-#      Match = disk preserved across the relocate. Mismatch = the
-#      live_disk_manifest pipeline regressed somewhere.
+#      Match = disk preserved across the relocate.
 #
 # This is the gold-standard test for "M4 actually works." Run on
 # dev-vm after every change to the evac primitives or
@@ -96,9 +95,6 @@ EXEC_RESP=$(engrams session exec "$SESSION_ID" "$EXEC_PAYLOAD")
 MD5_BEFORE=$(echo "$EXEC_RESP" | grep -o '[0-9a-f]\{32\}' | head -1)
 [ -n "$MD5_BEFORE" ] || die "couldn't parse md5 from exec output: $EXEC_RESP"
 ok "canary md5 before: $MD5_BEFORE"
-
-note "forcing flush so live_disk_manifest is published before evac"
-engrams admin flush "$SESSION_ID" >/dev/null || die "admin flush failed"
 
 # --- step 4: evacuate (async shape, ADR 0018 commit 12) -------------
 note "evacuating session $SESSION_ID"

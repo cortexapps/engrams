@@ -556,7 +556,6 @@ async fn cross_replica_scheduling_pins_and_tokens() {
     registry_b.register(h2, backend.clone());
 
     let ctx = ScheduleContext {
-        nbd_slot_need: 1,
         repo: "r",
         image_version: "v",
         snapshot_host: None,
@@ -708,7 +707,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
 /// `create_session_created` committed the row — so the insert silently
 /// FK-failed (`get_or_mint_broker_token` swallows the error to `None`) and the
 /// guest got no `ENGRAM_FORGE_TOKEN`: git failed with "could not read
-/// Username" (prod session a8395112). The in-memory mock store in
+/// Username". The in-memory mock store in
 /// `grpc_app.rs` enforces no FK and so can't catch this — it's pinned here
 /// against real Postgres. The fix defers `inject_harness_env` to
 /// `boot_on_reserved_host`, after the row materializes.

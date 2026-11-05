@@ -11,13 +11,11 @@
 //! variant is gone.
 
 use chrono::Utc;
-use engram_core::types::SessionState;
 use engram_core::SessionId;
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
 
-use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
@@ -76,54 +74,6 @@ pub(crate) async fn get_log_core(
             "unknown kind `{other}` — only `conversation` is supported"
         ))),
     }
-}
-
-/// gRPC `GetCowState` core. `None` when the session has no live sandbox
-/// (Idle / HostLost / terminal / Pending) or the host doesn't know it.
-pub(crate) async fn cow_state_core(
-    state: &SharedState,
-    id: SessionId,
-) -> Result<Option<CowStateView>, ApiError> {
-    let session = state.services.meta.get_session(id).await?;
-    let (host_id, sandbox_id) = match (session.host_id, session.sandbox_id, session.status) {
-        (Some(h), Some(sb), SessionState::Active | SessionState::Created) => (h, sb),
-        _ => {
-            // No live sandbox for this session (Idle, HostLost,
-            // terminal, or still Pending). ADR 0101 C: `Parked` also
-            // lands here DELIBERATELY — the VM is alive but paused, so
-            // live COW telemetry would be a frozen reading; the UI's
-            // parked copy explains the tier without it, and telemetry
-            // resumes on wake. (Same treatment `Evicting` always got.)
-            return Ok(None);
-        }
-    };
-    let backend = state.host_registry.backend_of(host_id).ok_or_else(|| {
-        ApiError::HostLost(format!(
-            "session {id} bound to host {host_id} which is no longer registered"
-        ))
-    })?;
-    let records = fetch_for_host(&state.cow_state_cache, host_id, backend)
-        .await
-        .map_err(ApiError::from)?;
-    let Some(record) = records.into_iter().find(|r| r.sandbox_id == sandbox_id) else {
-        // Host doesn't know this sandbox (transient mid-create, or
-        // it's a non-chunk-tracked backend on this host).
-        return Ok(None);
-    };
-    // Memory-tier enrichment from the session's latest snapshot
-    // row. Same shape as the per-host handler.
-    let (memory_manifest, last_snapshot_at) =
-        match state.services.meta.latest_snapshot_for_session(id).await {
-            Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
-            Ok(None) => (None, None),
-            Err(_) => (None, None),
-        };
-    Ok(Some(CowStateView::from_record(
-        &record,
-        Some(id),
-        memory_manifest,
-        last_snapshot_at,
-    )))
 }
 
 /// ADR 0028 A.log: one checkpoint in a session's chain — the data
@@ -240,7 +190,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

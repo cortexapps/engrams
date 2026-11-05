@@ -128,7 +128,7 @@ impl BaseShm {
     /// host the kernel's extent map is cold and a DENSE (pre-warmed)
     /// file makes each `SEEK_HOLE` walk every extent from `offset` to
     /// the next hole — thousands of first-touch faults compounded into
-    /// a ~46 s post-restore guest crawl (prod canary 1f64052e), gone on
+    /// a ~46 s post-restore guest crawl, gone on
     /// the second restore once the extent cache warmed.
     ///
     /// Staleness is one-sided and safe: a SIBLING handler populating a
