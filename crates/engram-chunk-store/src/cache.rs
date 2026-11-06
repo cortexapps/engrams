@@ -96,7 +96,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::fs;
 use tokio::sync::oneshot;
 
 use crate::admission::{Admission, Class, Permit};
@@ -624,7 +623,14 @@ struct CacheInner {
     /// Chunk writes to the cache's disk in flight, granted in class
     /// order (see [`ChunkCache::write_slot`]).
     writes: Arc<Admission>,
+    /// Held across a chunk file's change and its index update, by hash
+    /// ([`ChunkCache::file_lock`]). The index gains an entry only after
+    /// its file is in place and loses it before the file goes, so an
+    /// index hit always has a file.
+    file_locks: [Mutex<()>; FILE_LOCKS],
 }
+
+const FILE_LOCKS: usize = 64;
 
 /// Chunk writes to local disk in flight for classes other than `Demand`,
 /// and the extra slots `Demand` may use. Enough to keep an NVMe busy with
@@ -688,6 +694,10 @@ struct IndexEntry {
 impl ChunkCache {
     pub fn new(config: ChunkCacheConfig) -> Self {
         let free_floor_pct = resolve_free_floor_pct(&config.root);
+        Self::with_floor(config, free_floor_pct)
+    }
+
+    fn with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
         Self {
             inner: Arc::new(CacheInner {
                 config,
@@ -701,6 +711,7 @@ impl ChunkCache {
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
                 writes: Admission::fixed("disk_write", WRITE_SLOTS, WRITE_DEMAND_RESERVE),
+                file_locks: std::array::from_fn(|_| Mutex::new(())),
             }),
         }
     }
@@ -719,21 +730,7 @@ impl ChunkCache {
     /// (e.g. `file.rs`) can pin it too. Not part of the public surface.
     #[cfg(test)]
     pub(crate) fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
-        Self {
-            inner: Arc::new(CacheInner {
-                config,
-                free_floor_pct,
-                inflight: Mutex::new(HashMap::new()),
-                pinned: Mutex::new(HashMap::new()),
-                evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
-                last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
-                co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
-                co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
-                index: Mutex::new(IndexState::Pending(Vec::new())),
-                sweep_gate: tokio::sync::Mutex::new(()),
-                writes: Admission::fixed("disk_write", WRITE_SLOTS, WRITE_DEMAND_RESERVE),
-            }),
-        }
+        Self::with_floor(config, free_floor_pct)
     }
 
     /// ADR 0092 / ADR 0112: record how many allocated bytes one NAMED
@@ -897,8 +894,9 @@ impl ChunkCache {
     /// recovery paths without driving real disk pressure.
     #[doc(hidden)]
     pub fn evict_on_disk_for_test(&self, hash: ChunkHash) {
-        let _ = std::fs::remove_file(self.path_for(hash));
+        let _lock = self.file_lock(hash).lock();
         self.index_remove(hash);
+        let _ = std::fs::remove_file(self.path_for(hash));
     }
 
     /// [`Self::get_with_source`] with a cold-tier fetcher, writing at
@@ -1398,20 +1396,34 @@ impl ChunkCache {
 
     /// Place the chunk file and index it, under a write slot at `class`.
     /// A chunk the cache already holds is not written again. The
-    /// directory, the write and the rename run in one blocking task, on
-    /// `bytes` without a copy.
+    /// directory, the write, the rename and the index insert run in one
+    /// blocking task, on `bytes` without a copy. That task holds the slot
+    /// and runs to its end when the caller is dropped, so the index
+    /// learns every file the cache places.
     async fn store_file(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
         if self.contains(hash) {
             return Ok(());
         }
-        let _slot = self.write_slot(class).await;
-        let target = self.path_for(hash);
-        let len = bytes.len() as u64;
-        tokio::task::spawn_blocking(move || write_atomic(&target, &bytes))
-            .await
-            .map_err(|e| ChunkStoreError::Internal(format!("cache write task: {e}")))??;
-        self.index_insert(hash, len);
-        Ok(())
+        let slot = self.write_slot(class).await;
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let _lock = cache.file_lock(hash).lock();
+            if cache.contains(hash) {
+                return Ok(());
+            }
+            write_atomic(&cache.path_for(hash), &bytes)?;
+            cache.index_insert(hash, bytes.len() as u64);
+            Ok(())
+        })
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("cache write task: {e}")))?
+    }
+
+    /// The lock for `hash`'s file and index entry (see
+    /// [`CacheInner::file_locks`]). Held only in blocking code.
+    fn file_lock(&self, hash: ChunkHash) -> &Mutex<()> {
+        &self.inner.file_locks[hash.as_bytes()[0] as usize % FILE_LOCKS]
     }
     /// #1003: the budget sweep, driven by the in-memory index. Totals
     /// come from [`CacheIndex`], not a directory walk; eviction unlinks
@@ -1522,7 +1534,7 @@ impl ChunkCache {
             );
         }
 
-        let mut over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
+        let over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
         if over > 0 {
             // Oldest populate time first; skip pinned (any refcount > 0).
             // Snapshot (populated_ms, hash, size) triples under the lock,
@@ -1540,49 +1552,57 @@ impl ChunkCache {
                     .collect()
             };
             candidates.sort_unstable_by_key(|(ms, _, _)| *ms);
-            for (_, hash, size) in candidates {
-                if over == 0 {
-                    break;
-                }
-                // Re-check the LIVE pin map at unlink time. The `pinned`
-                // snapshot above was taken at sweep start, and the unlink
-                // loop awaits — a chunk pinned AFTER the snapshot but
-                // BEFORE its unlink (the ADR 0075 Hello pin-around-open
-                // sequence racing an in-flight sweep) was a candidate the
-                // stale snapshot could not see, and this sweep would evict
-                // a pinned chunk. Same delete-time re-verify shape as the
-                // chunk/bundle/snapshot-blob GC promote passes. Surfaced
-                // by `pinned_chunks_survive_populate_pressure` flaking
-                // under host disk pressure (the statvfs floor made a
-                // pre-pin sweep want to evict everything; its delayed
-                // unlink then removed the just-pinned chunk).
-                if self.inner.pinned.lock().contains_key(&hash) {
-                    continue;
-                }
-                let _ = fs::remove_file(self.path_for(hash)).await;
-                self.index_remove(hash);
-                over = over.saturating_sub(size);
-                // ADR 0039 #16: track what we evicted so a later remote miss
-                // for it can be counted as refetch-after-evict thrash.
-                self.inner.evicted_ring.lock().insert(hash);
-                // ADR 0014 M1.15: per-chunk LRU eviction counter.
-                // Operators watch the rate to know if the budget is
-                // too small for the working set.
-                metrics::counter!(
-                    "engram_chunk_cache_evictions_total",
-                    "reason" => "lru",
-                )
-                .increment(1);
-                tracing::trace!(
-                    hash = %hash,
-                    bytes = size,
-                    "evicted from chunk cache",
-                );
-            }
+            let cache = self.clone();
+            tokio::task::spawn_blocking(move || cache.evict_oldest(candidates, over))
+                .await
+                .map_err(|e| ChunkStoreError::Internal(format!("cache evict task: {e}")))?;
         }
         metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "index")
             .record(sweep_started.elapsed().as_secs_f64());
         Ok(())
+    }
+
+    /// Unlink `candidates` (oldest first) until `over` bytes are freed.
+    /// Blocking. Each unlink holds the chunk's file lock, and skips a
+    /// chunk pinned or written again since the candidates were taken.
+    fn evict_oldest(&self, candidates: Vec<(i64, ChunkHash, u64)>, mut over: u64) {
+        for (populated_ms, hash, size) in candidates {
+            if over == 0 {
+                break;
+            }
+            // Re-check the LIVE pin map at unlink time. The candidates
+            // were taken at sweep start; a chunk pinned since then (the
+            // ADR 0075 Hello pin-around-open sequence racing a sweep)
+            // must not be evicted. Same delete-time re-verify shape as
+            // the chunk/bundle/snapshot-blob GC promote passes.
+            if self.inner.pinned.lock().contains_key(&hash) {
+                continue;
+            }
+            {
+                let _lock = self.file_lock(hash).lock();
+                if !self.index_remove_if_populated_at(hash, populated_ms) {
+                    continue;
+                }
+                let _ = std::fs::remove_file(self.path_for(hash));
+            }
+            over = over.saturating_sub(size);
+            // ADR 0039 #16: track what we evicted so a later remote miss
+            // for it can be counted as refetch-after-evict thrash.
+            self.inner.evicted_ring.lock().insert(hash);
+            // ADR 0014 M1.15: per-chunk LRU eviction counter.
+            // Operators watch the rate to know if the budget is
+            // too small for the working set.
+            metrics::counter!(
+                "engram_chunk_cache_evictions_total",
+                "reason" => "lru",
+            )
+            .increment(1);
+            tracing::trace!(
+                hash = %hash,
+                bytes = size,
+                "evicted from chunk cache",
+            );
+        }
     }
 
     /// Build the index from one directory walk, OFF the write path, for
@@ -1653,9 +1673,25 @@ impl ChunkCache {
         }
     }
 
-    /// Record an in-process unlink (eviction, unverified-landing
-    /// discard, test helper) in the index; buffered while the first walk is in
-    /// flight, same as inserts.
+    /// Remove `hash` from a built index when its entry is the one
+    /// populated at `populated_ms`; whether it did.
+    fn index_remove_if_populated_at(&self, hash: ChunkHash, populated_ms: i64) -> bool {
+        match &mut *self.inner.index.lock() {
+            IndexState::Ready(idx)
+                if idx
+                    .entries
+                    .get(&hash)
+                    .is_some_and(|e| e.populated_ms == populated_ms) =>
+            {
+                idx.apply(PendingOp::Remove(hash));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record an in-process unlink (the test helper) in the index;
+    /// buffered while the first walk is in flight, same as inserts.
     fn index_remove(&self, hash: ChunkHash) {
         match &mut *self.inner.index.lock() {
             IndexState::Pending(ops) => ops.push(PendingOp::Remove(hash)),
@@ -2439,7 +2475,9 @@ mod tests {
         let h = store.put_chunk(body).await.unwrap();
         let _ = cache_get_from(&cache, &store, h).await.unwrap(); // warm
         let path = cache.path_for(h);
-        fs::write(&path, b"divergent on-disk bytes").await.unwrap();
+        tokio::fs::write(&path, b"divergent on-disk bytes")
+            .await
+            .unwrap();
         let got = cache
             .get(h, || async {
                 panic!("must not refetch when the file is present")
@@ -2631,6 +2669,30 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// A cache write whose caller is dropped once the write has started
+    /// still places the file and indexes it.
+    #[tokio::test]
+    async fn a_dropped_write_still_indexes_its_file() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from_static(b"written after the caller left");
+        let h = ChunkHash::of(&body);
+        let mut write = Box::pin(cache.put_trusted(h, body, Class::Background));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(write.as_mut(), &mut cx).is_pending(),
+            "the write waits on its blocking task"
+        );
+        drop(write);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cache.contains(h) {
+            assert!(tokio::time::Instant::now() < deadline, "never indexed");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(cache.contains_on_disk(h));
     }
 
     #[tokio::test]
