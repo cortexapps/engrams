@@ -237,10 +237,38 @@ export function fixedPolicyPlan(
   };
 }
 export function expectedPlanApproval(harness: "claude" | "codex") {
-  const text = '{"decision":"approve"}';
   return harness === "claude"
-    ? { content: [{ type: "text", text }] }
-    : { success: true, contentItems: [{ type: "inputText", text }] };
+    ? {
+        content: [
+          {
+            type: "text",
+            text: "Your plan was approved. Implement it now, following the plan you presented.",
+          },
+        ],
+      }
+    : {
+        success: true,
+        contentItems: [
+          {
+            type: "inputText",
+            text: "Plan approved. A fresh build turn starts next.",
+          },
+        ],
+      };
+}
+export function assertPlanApprovalCompletion(
+  harness: "claude" | "codex",
+  completed: {
+    proof: { resultReceived?: boolean; resultSha256?: string };
+  }[],
+) {
+  requireThat(
+    completed.length === 1 &&
+      completed[0]!.proof.resultReceived &&
+      completed[0]!.proof.resultSha256 ===
+        `sha256:${sha256(canonicalJson(expectedPlanApproval(harness)))}`,
+    "actual_generic_plan_completion",
+  );
 }
 export function policyObservation(
   source: DriverObservation["source"],
@@ -388,13 +416,7 @@ export const unattendedGrantDriver: CaseDriver = async (input) => {
           tool: "exit_plan_mode",
           planSha256: scenario.planSha256,
         });
-        requireThat(
-          completed.length === 1 &&
-            completed[0]!.proof.resultReceived &&
-            completed[0]!.proof.resultSha256 ===
-              `sha256:${sha256(canonicalJson(expectedPlanApproval(harness)))}`,
-          "actual_generic_plan_completion",
-        );
+        assertPlanApprovalCompletion(harness, completed);
         const afterPlan = await principals.admin.sessions.getMcpWritePolicy({
           sessionId: scenario.sessionId,
         });

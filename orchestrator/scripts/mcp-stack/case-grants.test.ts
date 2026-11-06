@@ -5,12 +5,14 @@ import {
   assertNoDispatch,
   grantUpdateRequest,
   fixedPolicyPlan,
-  expectedPlanApproval,
+  assertPlanApprovalCompletion,
   assertAbsentToolDenial,
   assertNoProjectedAuthority,
   assertDeltaOneConstraints,
 } from "./case-grants.ts";
 import { create } from "@bufbuild/protobuf";
+import { sha256 } from "./context.ts";
+import { canonicalJson } from "./guest.ts";
 import {
   ProfileSchema,
   UpdateProfileRequestSchema,
@@ -94,15 +96,67 @@ describe("policy case evidence", () => {
   });
 });
 
-test("ordinary plan approval has exact native JSON result bytes", () => {
-  expect(expectedPlanApproval("claude")).toEqual({
-    content: [{ type: "text", text: '{"decision":"approve"}' }],
-  });
-  expect(expectedPlanApproval("codex")).toEqual({
+const nativePlanApprovals = {
+  claude: {
+    content: [
+      {
+        type: "text",
+        text: "Your plan was approved. Implement it now, following the plan you presented.",
+      },
+    ],
+  },
+  codex: {
     success: true,
-    contentItems: [{ type: "inputText", text: '{"decision":"approve"}' }],
+    contentItems: [
+      {
+        type: "inputText",
+        text: "Plan approved. A fresh build turn starts next.",
+      },
+    ],
+  },
+};
+for (const harness of ["claude", "codex"] as const) {
+  test(`${harness} plan completion requires one received native approval result`, () => {
+    const resultHash = (value: unknown) =>
+      `sha256:${sha256(canonicalJson(value))}`;
+    const proof = {
+      resultReceived: true,
+      resultSha256: resultHash(nativePlanApprovals[harness]),
+    };
+    expect(() =>
+      assertPlanApprovalCompletion(harness, [{ proof }]),
+    ).not.toThrow();
+    const rawDecision = '{"decision":"approve"}';
+    const rawResult =
+      harness === "claude"
+        ? { content: [{ type: "text", text: rawDecision }] }
+        : {
+            success: true,
+            contentItems: [{ type: "inputText", text: rawDecision }],
+          };
+    for (const completed of [
+      [],
+      [{ proof }, { proof }],
+      [{ proof: { resultSha256: proof.resultSha256 } }],
+      [{ proof: { ...proof, resultReceived: false } }],
+      [{ proof: { ...proof, resultSha256: resultHash(rawResult) } }],
+      [
+        {
+          proof: {
+            ...proof,
+            resultSha256: resultHash(
+              nativePlanApprovals[harness === "claude" ? "codex" : "claude"],
+            ),
+          },
+        },
+      ],
+    ]) {
+      expect(() => assertPlanApprovalCompletion(harness, completed)).toThrow(
+        "actual_generic_plan_completion",
+      );
+    }
   });
-});
+}
 
 test("absent-tool proof requires the actual native unknown-tool refusal", () => {
   const proof = {
