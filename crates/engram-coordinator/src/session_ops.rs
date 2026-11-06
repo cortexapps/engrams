@@ -22,8 +22,10 @@ use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp}
 use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::SessionId;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
 
+use crate::error::ApiError;
 use crate::state::SharedState;
 
 /// Fallback rescan cadence — crash-recovery/missed-notify bound only.
@@ -176,7 +178,7 @@ pub async fn enqueue_claim(
 /// executor loop picks it up (NOTIFY-hot).
 ///
 /// Returns the enqueue outcome so wire handlers can bounded-observe the
-/// row (`op_get` on the returned id) for API compatibility.
+/// row with [`observe_op`] for API compatibility.
 pub async fn enqueue(
     state: &SharedState,
     session_id: SessionId,
@@ -197,6 +199,67 @@ pub async fn enqueue(
         });
     }
     Ok(outcome)
+}
+
+/// How often [`observe_op`] re-reads the op row when no op-finished id
+/// arrives: an id lost to a listener reconnect, or an op ended by a build
+/// that does not send one.
+pub(crate) const OP_OBSERVE_FALLBACK_POLL: Duration = Duration::from_secs(2);
+
+/// Reads the `op_id` row and gives it to `settle` until `settle` returns
+/// a result, or returns the retryable `in_flight` conflict after
+/// `timeout`. `settle` gets `None` when there is no row to read. Between
+/// reads it waits for the op's id on [`AppState::op_finished`] (sent when
+/// the op ends on any replica), and re-reads every
+/// [`OP_OBSERVE_FALLBACK_POLL`] without one.
+///
+/// [`AppState::op_finished`]: crate::state::AppState::op_finished
+pub(crate) async fn observe_op<T, F, Fut>(
+    state: &SharedState,
+    op_id: Option<i64>,
+    timeout: Duration,
+    in_flight: &str,
+    mut settle: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut(Option<SessionOp>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, ApiError>>,
+{
+    let deadline = state.services.clock.now_mono() + timeout;
+    // Subscribed before the first read, so an end after that read is seen.
+    let mut ended = state.op_finished.subscribe();
+    loop {
+        let op = match op_id {
+            Some(op_id) => state.services.meta.op_get(op_id).await.ok().flatten(),
+            None => None,
+        };
+        if let Some(settled) = settle(op).await? {
+            return Ok(settled);
+        }
+        let remaining = deadline.saturating_sub(state.services.clock.now_mono());
+        if remaining.is_zero() {
+            return Err(ApiError::Conflict(in_flight.to_string()));
+        }
+        let mut fallback = state
+            .services
+            .clock
+            .sleep(remaining.min(OP_OBSERVE_FALLBACK_POLL));
+        loop {
+            tokio::select! {
+                () = &mut fallback => break,
+                msg = ended.recv() => match msg {
+                    Ok(id) if Some(id) == op_id => break,
+                    Ok(_) => {}
+                    // Our id may be among the dropped ones.
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => {
+                        fallback.await;
+                        break;
+                    }
+                },
+            }
+        }
+    }
 }
 
 /// Apply a session state transition under `fence`. Epoch 0 (a caller
@@ -432,6 +495,7 @@ impl OpClaim {
             .meta
             .op_finish(self.op.id, self.epoch, outcome, error)
             .await;
+        publish_op_finished(&self.state, self.op.id);
         // Completion re-drive: a queued op behind this inline claim must
         // not wait for the fallback poll.
         let state = self.state.clone();
@@ -466,9 +530,17 @@ impl Drop for OpClaim {
                     Some("inline claim dropped without an explicit finish"),
                 )
                 .await;
+            publish_op_finished(&state, op_id);
             drive_session(&state, session_id).await;
         });
     }
+}
+
+/// Wakes this replica's waiters for `op_id` without the NOTIFY round
+/// trip that wakes the other replicas.
+fn publish_op_finished(state: &SharedState, op_id: i64) {
+    // No receivers is the normal case: no RPC is waiting.
+    let _ = state.op_finished.send(op_id);
 }
 
 /// RAII handle for an inline claim's heartbeat task.
@@ -859,6 +931,9 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             requeued
         }
     };
+    if terminal {
+        publish_op_finished(state, op.id);
+    }
     // An attach event can arrive after the step's last read but before
     // requeue. Its queued-only wake then misses the running op. Recheck
     // after requeue so that this race cannot retain the full pacing delay.

@@ -198,6 +198,7 @@ pub async fn run_with_registry_and_local(
         queue_wake.clone(),
         state.outbox_wake.clone(),
         state.session_ops_wake.clone(),
+        state.op_finished.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Fully trait-driven

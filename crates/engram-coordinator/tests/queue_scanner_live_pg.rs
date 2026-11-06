@@ -1183,6 +1183,7 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
         wake,
         std::sync::Arc::new(tokio::sync::Notify::new()),
         std::sync::Arc::new(tokio::sync::Notify::new()),
+        state.op_finished.clone(),
     );
     // Let both tasks reach their first `select!` / `LISTEN` before we
     // fire the freeing event.
