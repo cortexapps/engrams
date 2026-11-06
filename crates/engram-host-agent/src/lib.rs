@@ -306,15 +306,13 @@ impl HostAgent {
                 if let Some(egress) = self.egress.clone() {
                     p = p.with_egress(egress);
                 }
-                if let Some(cs) = self.chunk_store.clone() {
+                if let Some(fill) = self.fill.clone() {
                     if let Some(disk) = self.session_disk.clone() {
                         p = p.with_session_volumes(Arc::new(
-                            engram_host_core::SessionVolumes::new(disk, cs.clone()),
+                            engram_host_core::SessionVolumes::new(disk, fill.clone()),
                         ));
                     }
-                    if let Some(fill) = self.fill.clone() {
-                        p = p.with_fill(fill);
-                    }
+                    p = p.with_fill(fill);
                     // ADR 0080 §C: the MaterializeImage scratch root —
                     // gated on the chunk store because a materialize
                     // without one has nowhere durable to land. Same
@@ -1074,8 +1072,7 @@ impl HostAgent {
             // track whether the supervisor spawn below actually happens —
             // derive both from the same pure gate rather than letting
             // `enabled_images_tx.is_some()` implicitly stand in for it.
-            let stages_images =
-                stages_images_gate(self.fill.is_some(), self.chunk_cache.is_some());
+            let stages_images = stages_images_gate(self.fill.is_some(), self.chunk_cache.is_some());
             let enabled_images_tx = match (self.fill.clone(), self.chunk_cache.clone()) {
                 (Some(fill), Some(chunk_cache)) => {
                     // ADR 0022 Option A / ADR 0092: a fresh create always
@@ -1101,7 +1098,7 @@ impl HostAgent {
                         self.base_shm_protected.clone(),
                     );
                     if let Some(disk) = self.session_disk.clone() {
-                        image_volumes::spawn(disk, fill.store().clone(), tx.subscribe());
+                        image_volumes::spawn(disk, fill.clone(), tx.subscribe());
                     }
                     Some(tx)
                 }

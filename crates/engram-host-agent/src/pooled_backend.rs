@@ -12,7 +12,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_chunk_store::{ChunkCache, ChunkStore};
-use engram_fill::{Class, FillEngine};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::endpoints::GuestEndpoints;
@@ -23,6 +22,7 @@ use engram_core::types::sandbox::{
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
+use engram_fill::{Class, FillEngine};
 use tokio::fs;
 use tracing::Instrument as _;
 
@@ -3222,11 +3222,10 @@ impl PooledBackend {
         let Some(mref) = metadata.memory_manifest else {
             return Ok(engram_fill::FillStats::default());
         };
-        let manifest = fill
-            .store()
-            .get_manifest(mref)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}")))?;
+        let manifest =
+            fill.store().get_manifest(mref).await.map_err(|e| {
+                SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
+            })?;
         let stats = fill
             .fill(manifest.chunks.iter().map(|c| c.hash).collect(), class)
             .await
@@ -8876,7 +8875,10 @@ mod tests {
             engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
                 .unwrap(),
         );
-        let volumes = Arc::new(SessionVolumes::new(disk, ChunkStore::new(blob)));
+        let volumes = Arc::new(SessionVolumes::new(
+            disk,
+            engram_fill::FillEngine::new(ChunkStore::new(blob), engram_fill::Config::default()),
+        ));
         volumes
             .provision(
                 id,
@@ -10105,7 +10107,10 @@ mod tests {
         let pooled = PooledBackend::new(inner)
             .with_image_cache(cache)
             .with_chunk_store(cs.clone())
-            .with_session_volumes(Arc::new(SessionVolumes::new(disk, cs.clone())));
+            .with_session_volumes(Arc::new(SessionVolumes::new(
+                disk,
+                engram_fill::FillEngine::new(cs.clone(), engram_fill::Config::default()),
+            )));
 
         // 6. Drive a session-create with image_uri set.
         let mut spec = SandboxSpec {

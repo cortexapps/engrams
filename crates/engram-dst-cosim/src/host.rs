@@ -451,7 +451,10 @@ impl CosimHost {
         // I/O never feeds a decision — see the swarm's I/O-audit verdict.
         let store = ChunkStore::new(blob.clone());
         let disk = FileDisk::new(root.path().join("volumes"), CHUNK_SIZE).expect("file disk");
-        let volumes = Arc::new(SessionVolumes::new(Arc::new(disk), store.clone()));
+        let volumes = Arc::new(SessionVolumes::new(
+            Arc::new(disk),
+            engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
+        ));
         Self {
             host_id,
             clock,

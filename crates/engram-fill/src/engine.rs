@@ -118,6 +118,21 @@ impl FillEngine {
         self.fetch_admitted(hash, class, permit).await
     }
 
+    /// The chunk's bytes for a caller that keeps them itself (a volume
+    /// write): a cache hit is served, a miss is fetched and verified but
+    /// not stored in the cache, so the bytes are written to disk once.
+    pub async fn read(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
+        let store = self.store();
+        if let Some(cache) = store.chunk_cache() {
+            if let Some(bytes) = cache.read_resident(hash).await? {
+                return Ok(bytes);
+            }
+        }
+        let _permit = self.inner.admission.acquire(class).await;
+        metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
+        store.resolver().fetch_chunk(hash).await
+    }
+
     /// Make every chunk in `hashes` resident in the cache at `class`, each
     /// fetch on its own task. Fetches start in the given order. Returns after
     /// every fetch ends; the first error is returned, and the other fetches

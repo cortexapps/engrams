@@ -224,9 +224,17 @@ async fn a_checkpoint_over_the_pool_reproduces_through_stage() {
         vec![CHUNK, 6 * CHUNK]
     );
 
-    let copy = stage(&disk, &store, &staged, &manifest, None)
-        .await
-        .unwrap();
+    let fill = engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default());
+    let copy = stage(
+        &disk,
+        &fill,
+        engram_fill::Class::Demand,
+        &staged,
+        &manifest,
+        None,
+    )
+    .await
+    .unwrap();
     for i in 0..CHUNKS {
         assert_eq!(
             copy.read_chunk(ChunkIndex(i)).await.unwrap(),

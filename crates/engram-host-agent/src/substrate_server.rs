@@ -259,9 +259,9 @@ fn dir_is_tmpfs(_dir: &Path) -> bool {
 mod tests {
     use super::*;
     use engram_chunk_store::ChunkStore;
-    use std::sync::Arc;
     use engram_core::traits::BlobStorage;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     /// Counting blob store: serves fixed bytes, counts fetches — the
     /// cross-process-singleflight assertion's witness.

@@ -43,8 +43,8 @@ use std::sync::Arc;
 
 use engram_chunk_store::manifest::ChunkHash;
 use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
-use engram_fill::{Class, FillEngine};
 use engram_core::types::SnapshotId;
+use engram_fill::{Class, FillEngine};
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;

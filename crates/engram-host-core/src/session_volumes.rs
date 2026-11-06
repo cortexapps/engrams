@@ -24,10 +24,11 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
+use engram_chunk_store::{ChunkSize, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
+use engram_fill::{Class, FillEngine};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
@@ -225,7 +226,7 @@ pub struct Report {
 /// The owner of every `sb-` volume on a host.
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
-    store: ChunkStore,
+    fill: FillEngine,
     /// Released sandboxes whose checkpoint volumes stay, oldest release
     /// first. A sandbox `reconcile` finds with no live volume joins at
     /// the front: its age is unknown, so it goes first.
@@ -233,10 +234,10 @@ pub struct SessionVolumes {
 }
 
 impl SessionVolumes {
-    pub fn new(disk: Arc<dyn SessionDisk>, store: ChunkStore) -> Self {
+    pub fn new(disk: Arc<dyn SessionDisk>, fill: FillEngine) -> Self {
         Self {
             disk,
-            store,
+            fill,
             kept: Mutex::new(VecDeque::new()),
         }
     }
@@ -304,7 +305,8 @@ impl SessionVolumes {
         let (checkpoint, lineage) = match source {
             Source::Fork { manifest, base } => {
                 let wanted = self
-                    .store
+                    .fill
+                    .store()
                     .get_manifest(manifest)
                     .instrument(tracing::info_span!("disk.manifest_get"))
                     .await
@@ -318,7 +320,8 @@ impl SessionVolumes {
                     }
                 };
                 let lineage = ManifestRef::new();
-                self.store
+                self.fill
+                    .store()
                     .put_manifest(lineage, &wanted)
                     .instrument(tracing::info_span!("disk.manifest_put"))
                     .await
@@ -333,7 +336,8 @@ impl SessionVolumes {
                     ),
                     kept => {
                         let wanted = self
-                            .store
+                            .fill
+                            .store()
                             .get_manifest(manifest)
                             .instrument(tracing::info_span!("disk.manifest_get"))
                             .await
@@ -344,7 +348,8 @@ impl SessionVolumes {
                             {
                                 stage(
                                     self.disk.as_ref(),
-                                    &self.store,
+                                    &self.fill,
+                                    Class::Demand,
                                     &tmp,
                                     &wanted,
                                     Some((&volume, &held_manifest)),
@@ -369,7 +374,8 @@ impl SessionVolumes {
                     chunk_size: ChunkSize::bytes(volume.chunk_size),
                     ..Manifest::empty(ManifestKind::Disk, size_bytes)
                 };
-                self.store
+                self.fill
+                    .store()
                     .put_manifest(lineage, &manifest)
                     .instrument(tracing::info_span!("disk.manifest_put"))
                     .await
@@ -453,7 +459,7 @@ impl SessionVolumes {
             return Ok(None);
         };
         let volume = self.disk.open(&checkpoint_name(owner, role, held)).await?;
-        Ok(match self.store.get_manifest(held).await {
+        Ok(match self.fill.store().get_manifest(held).await {
             Ok(manifest) => Some((owner, volume, manifest, held)),
             Err(_) => None,
         })
@@ -493,7 +499,8 @@ impl SessionVolumes {
         };
         stage(
             self.disk.as_ref(),
-            &self.store,
+            &self.fill,
+            Class::Demand,
             name,
             wanted,
             base.as_ref().map(|(v, m)| (v, m)),
@@ -506,7 +513,7 @@ impl SessionVolumes {
     async fn staged(&self, image: ManifestRef) -> Option<(Volume, Manifest)> {
         match (
             self.disk.open(&image_volumes::volume_name(image)).await,
-            self.store.get_manifest(image).await,
+            self.fill.store().get_manifest(image).await,
         ) {
             (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
             _ => None,
@@ -634,10 +641,15 @@ impl SessionVolumes {
         } = pending;
         let previous_name = checkpoint_name(sandbox, role, previous);
         let previous_volume = self.disk.open(&previous_name).await?;
-        let previous_manifest = self.store.get_manifest(previous).await.map_err(store_err)?;
+        let previous_manifest = self
+            .fill
+            .store()
+            .get_manifest(previous)
+            .await
+            .map_err(store_err)?;
         let manifest = checkpoint_split::upload(
             self.disk.as_ref(),
-            &self.store,
+            &self.fill.store(),
             &snapshot,
             Some((&previous_volume, &previous_manifest)),
         )
@@ -647,7 +659,8 @@ impl SessionVolumes {
         // crash after `put_manifest` and before the rename leaves a
         // version the name never reached.
         let latest = self
-            .store
+            .fill
+            .store()
             .latest_manifest_version(previous.manifest_id)
             .await
             .map_err(store_err)?
@@ -656,7 +669,8 @@ impl SessionVolumes {
             manifest_id: previous.manifest_id,
             version: latest.max(previous.version) + 1,
         };
-        self.store
+        self.fill
+            .store()
             .put_manifest(next, &manifest)
             .await
             .map_err(store_err)?;
@@ -850,6 +864,7 @@ impl SessionVolumes {
 
 #[cfg(test)]
 mod tests {
+    use engram_chunk_store::ChunkStore;
     use engram_storage_local::LocalBlobStorage;
 
     use super::*;
@@ -889,7 +904,10 @@ mod tests {
         )));
         let store = ChunkStore::new(blob.clone());
         Rig {
-            volumes: SessionVolumes::new(disk.clone(), store.clone()),
+            volumes: SessionVolumes::new(
+                disk.clone(),
+                engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
+            ),
             disk,
             store,
             blob,
@@ -964,9 +982,13 @@ mod tests {
         r.store.put_manifest(image, &manifest).await.unwrap();
         r.disk.delete(&scratch).await.unwrap();
         r.disk.delete(&snap).await.unwrap();
-        image_volumes::reconcile_once(r.disk.as_ref(), &r.store, &[image])
-            .await
-            .unwrap();
+        image_volumes::reconcile_once(
+            r.disk.as_ref(),
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[image],
+        )
+        .await
+        .unwrap();
         image
     }
 
@@ -1912,7 +1934,10 @@ mod tests {
         let dead = SandboxId::new();
         r.volumes.provision(dead, fork(image), None).await.unwrap();
 
-        let restarted = SessionVolumes::new(r.disk.clone(), r.store.clone());
+        let restarted = SessionVolumes::new(
+            r.disk.clone(),
+            engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+        );
         let report = restarted.reconcile(&[]).await.unwrap();
         assert_eq!(report.kept, vec![dead]);
         assert_eq!(checkpoints_of(&r, dead, DiskRole::Root).await.len(), 1);

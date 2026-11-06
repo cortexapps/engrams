@@ -756,7 +756,10 @@ mod tests {
         let store = ChunkStore::new(blob);
         let disk: Arc<dyn engram_host_core::SessionDisk> =
             Arc::new(engram_host_core::FileDisk::new(tmp.join("volumes"), 64 * 1024).unwrap());
-        let volumes = Arc::new(engram_host_core::SessionVolumes::new(disk, store.clone()));
+        let volumes = Arc::new(engram_host_core::SessionVolumes::new(
+            disk,
+            engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
+        ));
         volumes
             .provision(
                 sandbox,

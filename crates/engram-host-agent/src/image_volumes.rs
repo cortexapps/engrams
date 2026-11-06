@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use engram_chunk_store::ChunkStore;
 use engram_core::types::manifest::ManifestRef;
 use engram_host_core::image_volumes::{reconcile_once, staged};
 use engram_host_core::SessionDisk;
@@ -13,7 +12,7 @@ use tokio::sync::watch;
 
 pub fn spawn(
     disk: Arc<dyn SessionDisk>,
-    store: ChunkStore,
+    fill: engram_fill::FillEngine,
     mut enabled: watch::Receiver<Vec<EnabledImageRef>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -26,7 +25,7 @@ pub fn spawn(
                 .iter()
                 .map(|image| image.base_snapshot_disk_manifest)
                 .collect();
-            match reconcile_once(disk.as_ref(), &store, &desired).await {
+            match reconcile_once(disk.as_ref(), &fill, &desired).await {
                 Ok(report) => {
                     for (name, error) in &report.failed {
                         tracing::warn!(volume = %name, %error, "image volume operation failed");
@@ -75,6 +74,7 @@ pub async fn ready_on_disk(
 
 #[cfg(test)]
 mod tests {
+    use engram_chunk_store::ChunkStore;
     use engram_core::types::SnapshotId;
     use engram_host_core::disk::FileDisk;
     use engram_host_core::image_volumes::volume_name;
@@ -120,7 +120,9 @@ mod tests {
 
         // A fresh process: the channel holds its empty initial value.
         let (tx, rx) = watch::channel(Vec::<EnabledImageRef>::new());
-        let task = spawn(disk.clone(), ChunkStore::new(blob), rx);
+        let fill =
+            engram_fill::FillEngine::new(ChunkStore::new(blob), engram_fill::Config::default());
+        let task = spawn(disk.clone(), fill, rx);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             volume_exists(&disk, &staged_name).await,

@@ -174,3 +174,22 @@ async fn fill_returns_the_first_error_after_the_other_fetches_finish() {
     assert!(err.is_err());
     assert!(f.cache.contains_on_disk(good));
 }
+
+#[tokio::test]
+async fn read_verifies_and_leaves_the_cache_alone() {
+    let f = fixture();
+    let good = put(&f, b"volume bytes").await;
+    let bad = ChunkHash::of(b"expected");
+    f.blob
+        .put(&bad.storage_key(), Bytes::from_static(b"tampered"))
+        .await
+        .unwrap();
+    let engine = engine_over(&f, counting(&f, None), Config::default());
+
+    assert_eq!(
+        &engine.read(good, Class::Demand).await.unwrap()[..],
+        b"volume bytes"
+    );
+    assert!(!f.cache.contains_on_disk(good));
+    assert!(engine.read(bad, Class::Demand).await.is_err());
+}

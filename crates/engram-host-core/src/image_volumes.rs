@@ -9,6 +9,7 @@ use std::io;
 
 use engram_chunk_store::{ChunkStore, Manifest};
 use engram_core::types::manifest::ManifestRef;
+use engram_fill::{Class, FillEngine};
 use uuid::Uuid;
 
 use crate::disk::{SessionDisk, Volume, VolumeName};
@@ -66,7 +67,7 @@ pub struct Report {
 /// only when the disk cannot be listed.
 pub async fn reconcile_once(
     disk: &dyn SessionDisk,
-    store: &ChunkStore,
+    fill: &FillEngine,
     desired: &[ManifestRef],
 ) -> io::Result<Report> {
     let mut report = Report::default();
@@ -91,7 +92,7 @@ pub async fn reconcile_once(
         .collect();
     to_stage.sort_by_key(|image| (image.manifest_id, image.version));
     for image in to_stage {
-        match stage_one(disk, store, image, &present).await {
+        match stage_one(disk, fill, image, &present).await {
             Ok(()) => present.push(image),
             Err(e) => report.failed.push((volume_name(image), e)),
         }
@@ -121,16 +122,18 @@ pub async fn reconcile_once(
 
 async fn stage_one(
     disk: &dyn SessionDisk,
-    store: &ChunkStore,
+    fill: &FillEngine,
     image: ManifestRef,
     present: &[ManifestRef],
 ) -> io::Result<()> {
+    let store = fill.store();
     let manifest = store.get_manifest(image).await.map_err(io::Error::other)?;
     let base = closest(disk, store, &manifest, present).await;
     let staging = staging_name(image);
     let staged = stage(
         disk,
-        store,
+        fill,
+        Class::Background,
         &staging,
         &manifest,
         base.as_ref().map(|(v, m)| (v, m)),
@@ -277,14 +280,26 @@ mod tests {
         let image = ManifestRef::new();
         publish(&r, image, &[1, 0, 3]).await;
 
-        let report = reconcile_once(&r.disk, &r.store, &[image]).await.unwrap();
+        let report = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[image],
+        )
+        .await
+        .unwrap();
         assert_eq!(report.staged, vec![image]);
         assert!(report.failed.is_empty());
         assert_eq!(names(&r.disk).await, vec![volume_name(image).as_str()]);
         let v = r.disk.open(&volume_name(image)).await.unwrap();
         assert_eq!(bytes_of(&v).await, vec![1, 0, 3]);
 
-        let again = reconcile_once(&r.disk, &r.store, &[image]).await.unwrap();
+        let again = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[image],
+        )
+        .await
+        .unwrap();
         assert_eq!(again.staged, vec![image]);
         assert!(again.deleted.is_empty() && again.failed.is_empty());
     }
@@ -297,8 +312,20 @@ mod tests {
         publish(&r, v1, &[1, 2, 3]).await;
         publish(&r, v2, &[1, 0, 9]).await;
 
-        reconcile_once(&r.disk, &r.store, &[v1]).await.unwrap();
-        let report = reconcile_once(&r.disk, &r.store, &[v1, v2]).await.unwrap();
+        reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[v1],
+        )
+        .await
+        .unwrap();
+        let report = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[v1, v2],
+        )
+        .await
+        .unwrap();
         assert_eq!(report.staged, vec![v1, v2]);
         let one = r.disk.open(&volume_name(v1)).await.unwrap();
         let two = r.disk.open(&volume_name(v2)).await.unwrap();
@@ -318,14 +345,22 @@ mod tests {
         publish(&r, old, &[1, 2, 3, 4]).await;
         publish(&r, other, &[1, 0, 0, 0]).await;
         publish(&r, rebaked, &[1, 2, 3, 9]).await;
-        reconcile_once(&r.disk, &r.store, &[old, other])
-            .await
-            .unwrap();
+        reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[old, other],
+        )
+        .await
+        .unwrap();
 
         let gets = r.blob.gets();
-        let report = reconcile_once(&r.disk, &r.store, &[other, rebaked])
-            .await
-            .unwrap();
+        let report = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[other, rebaked],
+        )
+        .await
+        .unwrap();
         assert_eq!(r.blob.gets(), gets + 1, "only the changed chunk is fetched");
         assert_eq!(report.deleted, vec![volume_name(old)]);
         let v = r.disk.open(&volume_name(rebaked)).await.unwrap();
@@ -339,12 +374,24 @@ mod tests {
         let wanted = ManifestRef::new();
         publish(&r, old, &[1]).await;
         publish(&r, wanted, &[2]).await;
-        reconcile_once(&r.disk, &r.store, &[old]).await.unwrap();
+        reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[old],
+        )
+        .await
+        .unwrap();
         r.disk.create(&staging_name(wanted), CHUNK).await.unwrap();
         let session = VolumeName::new("sb-abc-root").unwrap();
         r.disk.create(&session, CHUNK).await.unwrap();
 
-        let report = reconcile_once(&r.disk, &r.store, &[wanted]).await.unwrap();
+        let report = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[wanted],
+        )
+        .await
+        .unwrap();
         assert_eq!(report.staged, vec![wanted]);
         let mut deleted: Vec<&str> = report.deleted.iter().map(VolumeName::as_str).collect();
         deleted.sort();
@@ -367,9 +414,13 @@ mod tests {
         let missing = ManifestRef::new();
         publish(&r, good, &[5]).await;
 
-        let report = reconcile_once(&r.disk, &r.store, &[missing, good])
-            .await
-            .unwrap();
+        let report = reconcile_once(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            &[missing, good],
+        )
+        .await
+        .unwrap();
         assert_eq!(report.staged, vec![good]);
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, volume_name(missing));

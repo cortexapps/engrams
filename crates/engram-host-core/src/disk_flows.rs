@@ -3,13 +3,20 @@
 
 use std::io;
 
+use std::sync::Arc;
+
 use engram_chunk_store::{ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind};
+use engram_fill::{Class, FillEngine};
 use futures::stream::{self, TryStreamExt};
 
 use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
 
 /// Store calls in flight; peak buffered memory is this many chunks.
 const CONCURRENCY: usize = 64;
+
+/// Chunks fetched but not yet written while a volume stages. The disk
+/// writes more slowly than the store delivers, so this bounds memory.
+const STAGE_BUFFERED: usize = 64;
 
 fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
@@ -34,18 +41,36 @@ fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
-async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta) -> io::Result<()> {
+async fn apply_delta(
+    volume: &Volume,
+    fill: &FillEngine,
+    class: Class,
+    delta: &ManifestDelta,
+) -> io::Result<()> {
     let chunk_size = volume.chunk_size;
-    stream::iter(delta.write.iter().map(Ok))
-        .try_for_each_concurrent(CONCURRENCY, |c| async move {
-            // The volume keeps these bytes, so a miss is not stored in the
-            // chunk cache: that would double the disk writes.
-            let bytes = store.read_chunk(c.hash).await.map_err(store_err)?;
-            volume
-                .write_chunk(ChunkIndex(c.offset / chunk_size), bytes)
-                .await
-        })
-        .await?;
+    let buffered = Arc::new(tokio::sync::Semaphore::new(STAGE_BUFFERED));
+    let mut tasks = tokio::task::JoinSet::new();
+    for c in &delta.write {
+        let slot = Arc::clone(&buffered)
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        let (fill, volume) = (fill.clone(), volume.clone());
+        let (hash, index) = (c.hash, ChunkIndex(c.offset / chunk_size));
+        // One task per chunk, so fetch, hash and write use every core.
+        // `read` keeps a miss out of the chunk cache: the volume holds it.
+        tasks.spawn(async move {
+            let _slot = slot;
+            let bytes = fill.read(hash, class).await.map_err(store_err)?;
+            volume.write_chunk(index, bytes).await
+        });
+        while let Some(done) = tasks.try_join_next() {
+            done.map_err(io::Error::other)??;
+        }
+    }
+    while let Some(done) = tasks.join_next().await {
+        done.map_err(io::Error::other)??;
+    }
     for offset in &delta.zero {
         volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
     }
@@ -55,9 +80,11 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
 /// A new volume holding `manifest`. With `base` (a volume and the
 /// manifest it holds) the result is a snapshot of it with only the delta
 /// written; without, a fresh volume with every listed chunk written.
+/// Missing chunks are fetched at `class`.
 pub async fn stage(
     disk: &dyn SessionDisk,
-    store: &ChunkStore,
+    fill: &FillEngine,
+    class: Class,
     name: &VolumeName,
     manifest: &Manifest,
     base: Option<(&Volume, &Manifest)>,
@@ -79,7 +106,7 @@ pub async fn stage(
         }
     };
     shape_matches(&volume, manifest)?;
-    apply_delta(&volume, store, &delta).await?;
+    apply_delta(&volume, fill, class, &delta).await?;
     volume.sync().await?;
     Ok(volume)
 }
@@ -227,9 +254,16 @@ mod tests {
         );
         assert_eq!(manifest.chunks[0].hash, ChunkHash::of(&fill(1)));
 
-        let staged = stage(&r.disk, &r.store, &name("staged"), &manifest, None)
-            .await
-            .unwrap();
+        let staged = stage(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            Class::Demand,
+            &name("staged"),
+            &manifest,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes_of(&staged).await, bytes_of(&snap).await);
     }
 
@@ -259,15 +293,36 @@ mod tests {
         assert_eq!(delta.zero, vec![0]);
 
         // Staging m2 fresh, or over a staged m1, both reproduce the snapshot.
-        let fresh = stage(&r.disk, &r.store, &name("fresh"), &m2, None)
-            .await
-            .unwrap();
-        let base = stage(&r.disk, &r.store, &name("base"), &m1, None)
-            .await
-            .unwrap();
-        let over = stage(&r.disk, &r.store, &name("over"), &m2, Some((&base, &m1)))
-            .await
-            .unwrap();
+        let fresh = stage(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            Class::Demand,
+            &name("fresh"),
+            &m2,
+            None,
+        )
+        .await
+        .unwrap();
+        let base = stage(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            Class::Demand,
+            &name("base"),
+            &m1,
+            None,
+        )
+        .await
+        .unwrap();
+        let over = stage(
+            &r.disk,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            Class::Demand,
+            &name("over"),
+            &m2,
+            Some((&base, &m1)),
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes_of(&fresh).await, bytes_of(&c2).await);
         assert_eq!(bytes_of(&over).await, bytes_of(&c2).await);
     }
@@ -286,7 +341,8 @@ mod tests {
         };
         let err = stage(
             &r.disk,
-            &r.store,
+            &engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+            Class::Demand,
             &name("x"),
             &m_bigger,
             Some((&base, &m_base)),
