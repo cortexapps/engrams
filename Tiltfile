@@ -1071,6 +1071,8 @@ orchestrator_env = {
     # ADR 0089: register the dev-only smoke tools (dev_echo / dev_echo_deferred)
     # so live scenario A/C verification works against the local stack.
     'ENGRAM_DEV_TOOLS': '1',
+    # Human-readable log lines; without it the orchestrator logs JSON.
+    'ENGRAM_LOG_FORMAT': 'pretty',
 }
 admin_emails = env_or('ORCHESTRATOR_ADMIN_EMAILS', '')
 if admin_emails:

@@ -275,11 +275,16 @@ export const auth = betterAuth({
       startingCharactersConfig: { shouldStore: true, charactersLength: 11 },
       // Per-key rate limiting is ON by default (~10 req/day) — that would
       // break programmatic callers, and the orchestrator has no per-key QoS
-      // requirement. (lastRequest is still stamped for the "Last used" UI.)
+      // requirement. (lastRequest is still stamped for the "Last used" UI,
+      // on each request that misses the session cache in session.ts.)
       rateLimit: { enabled: false },
       // Days. Floor is the plugin's own minimum (1 day); revoke covers
       // "kill it now". 3650 ≈ effectively non-expiring for named CI keys.
       keyExpiration: { minExpiresIn: 1, maxExpiresIn: 3650 },
+      // The lastRequest stamp and the expired-key deletes run after the
+      // response instead of before it. Without advanced.backgroundTasks,
+      // better-auth runs them as unawaited promises; the plugin logs failures.
+      deferUpdates: true,
     }),
   ],
 });
