@@ -1,4 +1,4 @@
-# ADR 0126: The lazy session disk — a restore boots before its disk is complete
+# ADR 0127: The lazy session disk — a restore boots before its disk is complete
 
 - Status: Proposed
 - Date: 2026-11-06
@@ -113,8 +113,30 @@ KiB. Every sample includes about 4–5 ms of tool overhead.
 | destination equals source plus every write | pass | pass |
 
 `ublk_drv` loads on the same kernel from the distribution's extra
-modules. The production node image is still to be checked for `dm_clone`
-and `ublk_drv` (Rollout step 0).
+modules. The production node image (Container-Optimized OS, kernel
+6.12) builds dm-clone into the kernel (`CONFIG_DM_CLONE=y`) and ships
+`ublk_drv` as a signed module (`CONFIG_BLK_DEV_UBLK=m`) that is not
+loaded until something loads it.
+
+A first source on the same dev VM (`engram-disk-source`, libublk)
+served a manifest's exact bytes and survived a `SIGKILL` mid-read: a
+new process attached with user recovery, the kernel reissued the
+queued reads, and no read failed. The same work found a kernel rule
+the design must respect: stopping or deleting a ublk device that has
+a request in flight and no live server to finish it blocks in the
+kernel until the node reboots.
+
+### Where the fetch time goes
+
+A host-agent profile of a cold resume on the development cluster found
+that the chunk fetch paths drive every fetch from one task: TLS,
+response parsing, the hash check and the copies for every chunk run on
+one core. Raising the number of requests in flight did not raise the
+throughput; it raised the latency of each request. A production host
+in the failure above pulled 100–220 MB/s with its CPU, network and disk
+far below their limits, which is the same single-core bound. A fetch
+path that spreads this work across cores is a precondition for any
+estimate in Decision 1.
 
 ## Decision
 
@@ -123,9 +145,11 @@ and `ublk_drv` (Rollout step 0).
    manifests (`Manifest::delta_from` against the staged base when one
    exists) and splits them into local bytes (a staged volume or the
    chunk cache holds them) and remote bytes. The estimate is
-   `local / local_rate + remote / remote_rate` with conservative
-   per-host rates. At or under the eager budget (2 s), the restore is
-   eager. Over it, the restore is lazy. An eager restore that passes
+   `local / local_rate + remote / remote_rate`, with rates the host
+   measures from its own recent stages and a conservative floor; no
+   rate is a constant. At or under the eager budget, the restore is
+   eager. The budget starts at 2 s and is set from measurement once
+   the fetch path uses every core. Over it, the restore is lazy. An eager restore that passes
    its budget continues as a lazy restore over the partly written
    volume: the eager path writes exactly the manifest's bytes, so
    hydration rewrites those regions with identical data and the result
@@ -141,7 +165,10 @@ and `ublk_drv` (Rollout step 0).
    For each read it uses the first tier that holds the chunk: a staged
    volume whose chunk has the same hash, the chunk cache, a peer, then
    a ranged read from the chunk store followed by a fill of the whole
-   chunk. Guest reads go before hydration reads. The source holds no
+   chunk. Guest reads go before hydration reads. The fetch, the hash
+   check and the copies of each chunk run in their own task, so the
+   source uses every core and one slow fetch holds up only the reads
+   that need its chunk. The source holds no
    writes; every byte it can serve is in the chunk store. Its state is
    a function of the manifest id.
 4. **One source process per copying sandbox, outside the host-agent.**
@@ -157,6 +184,21 @@ and `ublk_drv` (Rollout step 0).
    attaches and the kernel reissues what was in flight. The host-agent
    restarts a dead source from `sandbox.json`. No code path kills,
    evicts or rewinds a VM because its source failed.
+
+   A read the source cannot serve is retried with backoff while the
+   failure is transient (the store is unreachable, slow or throttled).
+   A definitive failure, a chunk the store reports as absent or whose
+   bytes fail the hash check again after a fresh fetch, is data loss:
+   the source returns an I/O error for that read and logs an error
+   with a fixed message that alerting matches. Waiting cannot repair
+   it, and a panic would only make recovery reissue the same read.
+
+   A source is stopped only while it can finish every request it
+   holds: the host-agent recovers a dead source before it stops it,
+   and a stopping source first fails any read it cannot serve. The
+   kernel waits for requests in flight when a ublk device stops; a
+   request that nothing will finish blocks that stop, and every later
+   device operation on the node, until the node reboots.
 6. **Hydration belongs to the sandbox.** It is a host-owned job tied to
    the sandbox's lifetime: destroyed with the sandbox, resumed after a
    host-agent restart from the bitmap (which the kernel owns), never
@@ -257,6 +299,10 @@ manifest's non-zero bytes against the floor for a lazy restore.
   before the restore, and the fallback makes a wrong decision safe. A
   later change can unify them if seeding the bitmap from the base proves
   sound.
+- **A ublk device can block a node.** A device stopped with a request
+  that nothing will finish blocks in the kernel until reboot (Decision
+  5 states the rule that prevents it). The rule is enforced in the
+  source and in the host-agent, and tested.
 - **dm-clone is less used than dm-thin.** It has been in mainline Linux
   since 5.4. The tests below cut every step, and the production node
   image is checked before any code depends on it.
@@ -271,7 +317,10 @@ manifest's non-zero bytes against the floor for a lazy restore.
   a handle open, and destination equals source plus every write. Cut at
   every step of the lazy restore and the cutover, then converge on the
   next pass to the same bytes. Kill the source mid-hydration; the reads
-  stall and complete after recovery with no error.
+  stall and complete after recovery with no error. Stop a source that
+  holds a read it cannot serve; the read fails and the stop completes.
+  A chunk the store reports absent fails its read with an I/O error; a
+  store that is only slow does not.
 - **Firecracker integration (KVM runners, `ci.yml`):** resume from a
   manifest with no staged base: the guest runs in seconds and its disk
   is correct; a checkpoint during hydration reproduces through `stage`;
@@ -290,10 +339,13 @@ manifest's non-zero bytes against the floor for a lazy restore.
 
 Each step is one PR and retires what it replaces.
 
-0. **Gate.** Check the production node image for `dm_clone` and
-   `ublk_drv` with user recovery. If either is missing, this ADR is
-   revised before any further step. Turn on host-agent tracing in
-   production so restores can be measured.
+0. **Gate.** The production node image has dm-clone built in and
+   `ublk_drv` as a module (checked 2026-11-05). Node-prep loads
+   `ublk_drv` once per boot beside `dm_thin_pool`, so no source process
+   loads modules. Turn on host-agent tracing in production so restores
+   can be measured. Make the chunk fetch paths spread their work across
+   cores (Context: where the fetch time goes) and measure the eager
+   rates Decision 1 uses.
 1. **The source.** The `engram-disk-source` crate and binary: the ublk
    server over a manifest, with its tests.
 2. **dm-clone in `engram-disk-thin`.** `SessionDisk` gains the clone,
