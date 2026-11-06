@@ -23,7 +23,9 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use tokio::fs;
+use tracing::Instrument as _;
 
+use crate::capture_lock::{CaptureGate, CaptureUser};
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageCache};
 
@@ -120,29 +122,6 @@ struct PendingPresetup {
     sidecar_json: Vec<u8>,
     idle_marked: bool,
     hot_chunks: Vec<[u8; 32]>,
-}
-
-/// The per-sandbox capture locks. Take `serial` before `quiesce`.
-#[derive(Default)]
-struct CaptureGate {
-    /// The capture lock: serializes captures, held through the post phase.
-    serial: Arc<tokio::sync::Mutex<()>>,
-    /// Held by a capture from before its pause until its guest resumes,
-    /// and by `start_agent` (ADR 0123 D4: a `SpawnHarness`, which arms
-    /// swap, never straddles a pause). The post phase reads only what the
-    /// pause froze — the disk snapshots, the FC staging files, the chain
-    /// head cloned under `serial` — so it runs without this lock.
-    quiesce: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl CaptureGate {
-    async fn serialize(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.serial.clone().lock_owned().await
-    }
-
-    async fn quiesce(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.quiesce.clone().lock_owned().await
-    }
 }
 
 /// The unwind guard for a capture's window between the guest `pause`
@@ -1723,8 +1702,7 @@ impl PooledBackend {
     /// sandbox's gate. Callers that must not queue behind either (the
     /// periodic driver, the external pause) skip on `true`.
     pub fn capture_in_flight(&self, id: SandboxId) -> bool {
-        let gate = self.capture_gate(id);
-        gate.serial.try_lock().is_err() || gate.quiesce.try_lock().is_err()
+        self.capture_gate(id).in_flight()
     }
 
     /// 2026-08-03 `chain_poisoned` alert: refuse to START any new capture
@@ -1767,7 +1745,9 @@ impl PooledBackend {
         let mut stragglers = 0usize;
         for (id, gate) in gates {
             let remaining = deadline.saturating_sub(start.elapsed());
-            match tokio::time::timeout(remaining, gate.serialize()).await {
+            match tokio::time::timeout(remaining, gate.serialize(id, CaptureUser::ShutdownDrain))
+                .await
+            {
                 // Acquiring proves no capture holds the lock; release
                 // immediately (the quiesce flag keeps it that way).
                 Ok(_guard) => {}
@@ -1850,7 +1830,9 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<DeferredSnapshot, SandboxError> {
-        let (capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (capture_guard, cap) = self
+            .capture_phase(id, CaptureUser::DeferredSnapshot)
+            .await?;
         self.spawn_trace_publish(id);
         // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
         // canonical background bulk producer — nested-capped so it can
@@ -1963,7 +1945,9 @@ impl PooledBackend {
             let gate = self.capture_gate(record.sandbox_id);
             let f = finalizer.clone();
             tokio::spawn(async move {
-                let guard = gate.serialize().await;
+                let guard = gate
+                    .serialize(record.sandbox_id, CaptureUser::FinalizeRedrive)
+                    .await;
                 crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
             });
         }
@@ -2038,18 +2022,30 @@ impl PooledBackend {
 
     /// ADR 0045 D5: pause + drain + FC capture. Returns the capture lock,
     /// which the post phase must hold wherever it runs, and the artifacts
-    /// the post phase consumes. The quiesce guard ends on return.
+    /// the post phase consumes. The quiesce guard ends on return. A
+    /// [`CaptureUser::HeldCapture`] leaves the guest paused.
+    #[tracing::instrument(
+        name = "host.capture_phase",
+        skip_all,
+        fields(
+            sandbox_id = %id,
+            user = user.as_str(),
+            snap_type = tracing::field::Empty,
+            paused_ms = tracing::field::Empty,
+        )
+    )]
     async fn capture_phase(
         &self,
         id: SandboxId,
-        hold: bool,
+        user: CaptureUser,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
+        let hold = user == CaptureUser::HeldCapture;
         let gate = self.capture_gate(id);
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
         // B1 periodic checkpoints skip rather than queue, so a long tail
         // here is an eviction/drain blocked on an in-flight capture.
         let lock_wait = crate::time_source::metrics_now();
-        let capture_guard = gate.serialize().await;
+        let capture_guard = gate.serialize(id, user).await;
         if self.held_snapshots.contains_key(&id)
             || self.migration_role(id) == Some(crate::migration::MigrationRole::HeldSource)
         {
@@ -2154,13 +2150,18 @@ impl PooledBackend {
         // with the per-sandbox agent_ready watch; non-FC backends
         // (Process, future) return `InvalidSpec` from the default trait
         // impl, which we treat as "no readiness concept here, proceed."
-        match self.inner.wait_agent_ready(id).await {
+        match self
+            .inner
+            .wait_agent_ready(id)
+            .instrument(tracing::info_span!("capture.agent_ready"))
+            .await
+        {
             Ok(()) => {}
             Err(SandboxError::InvalidSpec(_)) => {}
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
 
-        let _quiesce = gate.quiesce().await;
+        let _quiesce = gate.quiesce(id, user).await;
         // The pause instant is the coherence cut for memory, disk, and
         // the event log: the coordinator resolves the session_events
         // cursor against it.
@@ -2173,8 +2174,10 @@ impl PooledBackend {
                 .await?;
         }
         let paused_at = self.clock.now_utc();
+        let pause_started = crate::time_source::metrics_now();
         self.inner
             .pause(id)
+            .instrument(tracing::info_span!("capture.pause"))
             .await
             .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
 
@@ -2195,6 +2198,7 @@ impl PooledBackend {
                 }
                 let pending = volumes
                     .take(id, role)
+                    .instrument(tracing::info_span!("capture.disk_take", %role))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("{role} disk checkpoint: {e}")))?;
                 unwind.pending.push(pending);
@@ -2213,6 +2217,7 @@ impl PooledBackend {
         // cold Full seed. After B2, `type="full"` should vanish on the
         // resume path (chain seeded → diff).
         let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
+        tracing::Span::current().record("snap_type", snap_type);
         let create_start = crate::time_source::metrics_now();
         let create_res = if hold {
             self.inner.snapshot_hold(id, chain_prev.is_some()).await
@@ -2221,6 +2226,11 @@ impl PooledBackend {
         } else {
             self.inner.snapshot(id).await
         };
+        if !hold {
+            // The inner create resumed the guest before it returned.
+            tracing::Span::current()
+                .record("paused_ms", pause_started.elapsed().as_millis() as u64);
+        }
         metrics::histogram!(
             crate::metrics::SNAPSHOT_CREATE_SECONDS,
             "type" => snap_type,
@@ -2458,6 +2468,7 @@ impl PooledBackend {
         live: Vec<(DiskRole, Volume)>,
     ) -> tokio::task::JoinHandle<()> {
         use engram_core::types::snapshot::MigrationItem;
+        let parent = tracing::Span::current();
         tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(240);
             let started = crate::time_source::metrics_now();
@@ -2475,9 +2486,27 @@ impl PooledBackend {
                 StateBin,
                 Seal,
             }
+            impl Stage {
+                /// The span stays open until the source serves the stage,
+                /// so it includes the wait for the source.
+                fn span(self, parent: &tracing::Span) -> tracing::Span {
+                    let blocks = tracing::field::Empty;
+                    match self {
+                        Stage::Precopy => {
+                            tracing::info_span!(parent: parent, "move.dest_precopy", blocks)
+                        }
+                        Stage::StateBin => {
+                            tracing::info_span!(parent: parent, "move.dest_state_bin")
+                        }
+                        Stage::Seal => {
+                            tracing::info_span!(parent: parent, "move.dest_seal", blocks)
+                        }
+                    }
+                }
+            }
             let mut stage = Stage::Precopy;
-            let mut stage_started = crate::time_source::metrics_now();
-            let (mut precopy_ms, mut precopy_blocks, mut sealed_blocks) = (0, 0, 0);
+            let mut stage_span = stage.span(&parent);
+            let (mut precopy_blocks, mut sealed_blocks) = (0, 0);
             loop {
                 if started.elapsed() > budget {
                     tracing::error!(
@@ -2505,10 +2534,11 @@ impl PooledBackend {
                         &live,
                         MigrationItem::DiskPrecopyInfo,
                     )
+                    .instrument(stage_span.clone())
                     .await
                     .map(|blocks| {
                         precopy_blocks = blocks;
-                        precopy_ms = stage_started.elapsed().as_millis() as u64;
+                        stage_span.record("blocks", blocks);
                         Some(Stage::StateBin)
                     }),
                     Stage::StateBin => Self::fetch_postcopy_artifacts(
@@ -2517,6 +2547,7 @@ impl PooledBackend {
                         &tmp,
                         &[MigrationItem::StateBin],
                     )
+                    .instrument(stage_span.clone())
                     .await
                     .map(|()| Some(Stage::Seal)),
                     Stage::Seal => Self::pull_disk_tier(
@@ -2525,9 +2556,11 @@ impl PooledBackend {
                         &live,
                         MigrationItem::DiskSealInfo,
                     )
+                    .instrument(stage_span.clone())
                     .await
                     .map(|blocks| {
                         sealed_blocks = blocks;
+                        stage_span.record("blocks", blocks);
                         None
                     }),
                 };
@@ -2535,7 +2568,7 @@ impl PooledBackend {
                     Ok(None) => break,
                     Ok(Some(reached)) => {
                         stage = reached;
-                        stage_started = crate::time_source::metrics_now();
+                        stage_span = stage.span(&parent);
                     }
                     // Not served yet: the export is not open or the
                     // capture has not run.
@@ -2550,7 +2583,7 @@ impl PooledBackend {
                     }
                 }
             }
-            let seal_ms = stage_started.elapsed().as_millis() as u64;
+            drop(stage_span);
             let Some(client) = source.as_ref() else {
                 return;
             };
@@ -2561,10 +2594,7 @@ impl PooledBackend {
             }
             tracing::info!(
                 export_id = %pending.export_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                precopy_ms,
                 precopy_blocks,
-                seal_ms,
                 sealed_blocks,
                 "post-copy restore inputs staged (state.bin landed)",
             );
@@ -2906,7 +2936,10 @@ impl PooledBackend {
             // invalidates + creates (bitmap reset) → seed stale head"
             // would rebuild exactly the corrupt diff this protocol
             // exists to prevent.
-            let _guard = self.capture_gate(id).serialize().await;
+            let _guard = self
+                .capture_gate(id)
+                .serialize(id, CaptureUser::ChainRehydrate)
+                .await;
             if self.checkpoint_chains.contains_key(&id) {
                 continue;
             }
@@ -3008,6 +3041,12 @@ impl PooledBackend {
             .collect()
     }
 
+    /// Whether a capture on this host has stamped this sandbox's
+    /// last-checkpoint time.
+    pub(crate) fn has_checkpoint_stamp(&self, id: SandboxId) -> bool {
+        self.last_snapshot_unix_ms.contains_key(&id)
+    }
+
     /// ADR 0028 Fix A: one periodic checkpoint — the same capture
     /// `snapshot()` runs for evictions (diff-flavored once the chain
     /// is seeded), self-committed because the durable record +
@@ -3025,6 +3064,7 @@ impl PooledBackend {
                 // producer — background class, so foreground uploads go
                 // first.
                 engram_chunk_store::UploadClass::Background,
+                CaptureUser::PeriodicCheckpoint,
             )
             .await?;
         let _ = self.commit_snapshot(id).await;
@@ -3036,8 +3076,9 @@ impl PooledBackend {
         &self,
         id: SandboxId,
         class: engram_chunk_store::UploadClass,
+        user: CaptureUser,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let (_capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (_capture_guard, cap) = self.capture_phase(id, user).await?;
         // Lift the per-jail working-set trace into the blob store under the
         // session-canonical key so the next resume prefaults it (#517 keyed
         // the replay; the handler can't publish it itself — SIGKILLed on
@@ -3652,8 +3693,8 @@ impl SnapshotFinisher {
     /// ADR 0045 D5 + issue #147: the post phase — disk upload, memory
     /// re-chunk (parallel, `buffer_unordered(32)` inside the chunk
     /// store), portable-blob upload, bundle publish, then chain
-    /// bookkeeping / cleanup. Instrumented end-to-end (the re-chunk used
-    /// to be invisible in traces).
+    /// bookkeeping / cleanup. Each leg has its own `finish.*` span.
+    #[tracing::instrument(name = "host.snapshot_finish", skip_all, fields(sandbox_id = %id))]
     pub(crate) async fn finish(
         &self,
         id: SandboxId,
@@ -3701,7 +3742,11 @@ impl SnapshotFinisher {
             while let Some(checkpoint) = pending.next() {
                 let role = checkpoint.role();
                 let volumes = self.volumes.as_ref().expect("a pending checkpoint implies volumes");
-                let published = match volumes.publish(checkpoint).await {
+                let published = match volumes
+                    .publish(checkpoint)
+                    .instrument(tracing::info_span!("finish.disk_publish", %role))
+                    .await
+                {
                     Ok(published) => published,
                     Err(error) => {
                         for rest in pending {
@@ -3744,14 +3789,21 @@ impl SnapshotFinisher {
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
                 // ADR 0101 B: the diff's dirty extent sum is the epoch's
                 // rate signal for the adaptive checkpoint controller.
-                epoch_dirty_bytes = Some(ranges.iter().map(|(_, len)| *len).sum());
+                let dirty_bytes: u64 = ranges.iter().map(|(_, len)| *len).sum();
+                epoch_dirty_bytes = Some(dirty_bytes);
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                    .instrument(tracing::info_span!(
+                        "finish.memory_rechunk",
+                        dirty_bytes,
+                        dirty_ranges = ranges.len()
+                    ))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
                 let next_ref = prev_ref.next_version();
                 chunk_store
                     .put_manifest(next_ref, &next)
+                    .instrument(tracing::info_span!("finish.manifest_put"))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
                 // The sparse diff did its job; drop it so the local
@@ -3776,6 +3828,7 @@ impl SnapshotFinisher {
                     self.chunk_cache.as_ref(),
                     "snapshot_finish",
                 )
+                .instrument(tracing::info_span!("finish.memory_chunk"))
                 .await?;
                 // ADR 0039: the dump is now durable in the chunk store and
                 // the chain seeds from the manifest (not this file) — drop
@@ -3822,20 +3875,24 @@ impl SnapshotFinisher {
             {
                 let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
                 let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &sidecar_key,
-                    &sidecar_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+                async {
+                    engram_chunk_store::snapshot_blob::upload_file(
+                        blob.as_ref(),
+                        &state_key,
+                        &state_path,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+                    engram_chunk_store::snapshot_blob::upload_file(
+                        blob.as_ref(),
+                        &sidecar_key,
+                        &sidecar_path,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))
+                }
+                .instrument(tracing::info_span!("finish.blob_upload"))
+                .await?;
                 metadata.state_blob_key = Some(state_key);
                 metadata.sidecar_blob_key = Some(sidecar_key);
                 metadata.source_sandbox_id = Some(id);
@@ -3857,6 +3914,7 @@ impl SnapshotFinisher {
                     self.bundle_file_ext,
                 )
                 .publish(&metadata.aux_bundles)
+                .instrument(tracing::info_span!("finish.bundle_publish"))
                 .await?;
             }
             Ok::<_, SandboxError>(metadata)
@@ -3904,6 +3962,7 @@ impl SnapshotFinisher {
                 // PG (if the caller's pipeline survives) knows this
                 // checkpoint. Both safe, both logged inside.
                 self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
+                    .instrument(tracing::info_span!("finish.record"))
                     .await;
                 Ok(m)
             }
@@ -4695,7 +4754,7 @@ impl SandboxBackend for PooledBackend {
         if let Some(metadata) = self.held_snapshots.get(&id) {
             return Ok(metadata.clone());
         }
-        let (_guard, cap) = self.capture_phase(id, true).await?;
+        let (_guard, cap) = self.capture_phase(id, CaptureUser::HeldCapture).await?;
         let metadata = self
             .finisher_with_class(engram_chunk_store::UploadClass::Foreground)
             .finish(id, cap)
@@ -4706,8 +4765,12 @@ impl SandboxBackend for PooledBackend {
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // Foreground captures serve a waiting session.
-        self.snapshot_with_class(id, engram_chunk_store::UploadClass::Foreground)
-            .await
+        self.snapshot_with_class(
+            id,
+            engram_chunk_store::UploadClass::Foreground,
+            CaptureUser::SnapshotRpc,
+        )
+        .await
     }
 
     /// The eviction flavor: capture, re-pause the guest (it is being
@@ -4743,7 +4806,7 @@ impl SandboxBackend for PooledBackend {
             ));
         };
 
-        let (capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (capture_guard, cap) = self.capture_phase(id, CaptureUser::EvictionCapture).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
         self.spawn_trace_publish(id);
@@ -5058,8 +5121,8 @@ impl SandboxBackend for PooledBackend {
 
             // Checkpoint fence: held for the export's lifetime.
             let gate = self.capture_gate(id);
-            let capture_guard = gate.serialize().await;
-            let _quiesce = gate.quiesce().await;
+            let capture_guard = gate.serialize(id, CaptureUser::PostCopyCapture).await;
+            let _quiesce = gate.quiesce(id, CaptureUser::PostCopyCapture).await;
 
             // Blackout leg 1: pause. (PR 10 decomposition.)
             let t_pause = crate::time_source::metrics_now();
@@ -5259,10 +5322,6 @@ impl SandboxBackend for PooledBackend {
                 total_chunks,
                 sealed_disk_blocks,
                 precopy_disk_blocks,
-                pause_ms,
-                disk_drain_ms,
-                vmstate_ms,
-                scan_ms,
                 "post-copy capture sealed; guest frozen as page server",
             );
             Ok(PostCopyCaptureOut {
@@ -5880,7 +5939,10 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
-        let _quiesce = self.capture_gate(id).quiesce().await;
+        let _quiesce = self
+            .capture_gate(id)
+            .quiesce(id, CaptureUser::StartAgent)
+            .await;
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
         // before the backend sees it. Each backend rides it into the
@@ -6732,7 +6794,7 @@ mod tests {
             .unwrap();
 
         pooled.quiesce_captures_for_shutdown();
-        let err = match pooled.capture_phase(id, false).await {
+        let err = match pooled.capture_phase(id, CaptureUser::EvictionCapture).await {
             Ok(_) => panic!("a quiesced capture must refuse"),
             Err(e) => e,
         };
@@ -6764,7 +6826,10 @@ mod tests {
         let id = SandboxId::new();
 
         // A capture in flight that outlives the deadline is a straggler.
-        let guard = pooled.capture_gate(id).serialize().await;
+        let guard = pooled
+            .capture_gate(id)
+            .serialize(id, CaptureUser::PeriodicCheckpoint)
+            .await;
         let stragglers = pooled
             .drain_captures_for_shutdown(std::time::Duration::from_millis(50))
             .await;
@@ -8621,7 +8686,10 @@ mod tests {
         std::fs::write(export_dir.join("state.bin"), b"state").unwrap();
         let id = SandboxId::new();
         let volumes = volumes_with_a_root(tmp.path(), id).await;
-        let guard = pooled.capture_gate(id).serialize().await;
+        let guard = pooled
+            .capture_gate(id)
+            .serialize(id, CaptureUser::PeriodicCheckpoint)
+            .await;
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: "hot-export".into(),
             sandbox_id: id,
@@ -11346,13 +11414,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
         let pooled = PooledBackend::new(inner.clone());
-        let spawn = pooled.capture_gate(inner.id).quiesce().await;
+        let spawn = pooled
+            .capture_gate(inner.id)
+            .quiesce(inner.id, CaptureUser::StartAgent)
+            .await;
         assert!(
             pooled.capture_in_flight(inner.id),
             "a harness spawn defers the periodic checkpoint"
         );
         drop(spawn);
-        let mut capture = Box::pin(pooled.capture_phase(inner.id, false));
+        let mut capture = Box::pin(pooled.capture_phase(inner.id, CaptureUser::PeriodicCheckpoint));
         assert!(futures::poll!(&mut capture).is_pending());
         let agent = AgentSpec {
             argv: vec![],
@@ -11390,7 +11461,10 @@ mod tests {
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
-            capture_guard: pooled.capture_gate(id).serialize().await,
+            capture_guard: pooled
+                .capture_gate(id)
+                .serialize(id, CaptureUser::PeriodicCheckpoint)
+                .await,
         }));
         export_id
     }

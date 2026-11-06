@@ -66,6 +66,7 @@ pub mod bindings;
 pub mod bundles;
 pub mod capabilities;
 pub mod capture_job;
+pub(crate) mod capture_lock;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;

@@ -568,7 +568,15 @@ pub async fn run_checkpoint_pass(
             );
             continue;
         }
-        match backend.checkpoint_sandbox(sandbox_id).await {
+        // A root span: the driver runs on its own timer, not for a request.
+        let span = tracing::info_span!(
+            parent: None,
+            "checkpoint.periodic",
+            %sandbox_id,
+            %session_id,
+            stamped = backend.has_checkpoint_stamp(sandbox_id),
+        );
+        match tracing::Instrument::instrument(backend.checkpoint_sandbox(sandbox_id), span).await {
             Ok(metadata) => {
                 // A successful capture proves the control plane
                 // answers — clear any unreachable suspicion.
