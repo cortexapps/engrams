@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,19 +114,29 @@ struct Inner {
     hedge_after: Option<Duration>,
     peer_race_after: Duration,
     /// Peers by session manifest id, for fetches that know only which
-    /// manifest they serve (a page fault).
-    peers: Mutex<HashMap<Uuid, Arc<dyn PeerSource>>>,
+    /// manifest they serve (a page fault), each with the id of the
+    /// registration that put it there.
+    peers: Mutex<HashMap<Uuid, (u64, Arc<dyn PeerSource>)>>,
+    next_registration: AtomicU64,
 }
 
-/// Keeps a peer registered; dropping it unregisters the peer.
+/// Keeps a peer registered; dropping it unregisters the peer, unless a
+/// later registration for the same manifest replaced it.
 pub struct PeerRegistration {
     inner: Arc<Inner>,
     manifest: Uuid,
+    id: u64,
 }
 
 impl Drop for PeerRegistration {
     fn drop(&mut self) {
-        self.inner.peers.lock().remove(&self.manifest);
+        let mut peers = self.inner.peers.lock();
+        if peers
+            .get(&self.manifest)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            peers.remove(&self.manifest);
+        }
     }
 }
 
@@ -148,6 +159,7 @@ impl FillEngine {
                 hedge_after: cfg.hedge_after,
                 peer_race_after: cfg.peer_race_after,
                 peers: Mutex::new(HashMap::new()),
+                next_registration: AtomicU64::new(0),
             }),
             peer: None,
         }
@@ -163,18 +175,26 @@ impl FillEngine {
     }
 
     /// Make `peer` the source for fetches of session `manifest`
-    /// ([`Self::for_manifest`]) while the registration lives.
+    /// ([`Self::for_manifest`]) while the registration lives. A later
+    /// registration for the same manifest replaces this one.
     pub fn register_peer(&self, manifest: Uuid, peer: Arc<dyn PeerSource>) -> PeerRegistration {
-        self.inner.peers.lock().insert(manifest, peer);
+        let id = self.inner.next_registration.fetch_add(1, Ordering::Relaxed);
+        self.inner.peers.lock().insert(manifest, (id, peer));
         PeerRegistration {
             inner: Arc::clone(&self.inner),
             manifest,
+            id,
         }
     }
 
     /// This engine with the peer registered for `manifest`, if any.
     pub fn for_manifest(&self, manifest: Uuid) -> Self {
-        let peer = self.inner.peers.lock().get(&manifest).cloned();
+        let peer = self
+            .inner
+            .peers
+            .lock()
+            .get(&manifest)
+            .map(|(_, peer)| Arc::clone(peer));
         Self {
             inner: Arc::clone(&self.inner),
             peer,

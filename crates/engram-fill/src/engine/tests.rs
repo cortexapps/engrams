@@ -317,6 +317,36 @@ async fn a_registered_peer_serves_its_manifest_until_the_registration_drops() {
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn dropping_a_replaced_registration_keeps_the_newer_peer() {
+    let f = fixture();
+    let hash = put(&f, b"re-registered").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+    let manifest = uuid::Uuid::from_u128(9);
+    let older = engine.register_peer(
+        manifest,
+        peer(Some(b"re-registered"), Duration::from_millis(1)),
+    );
+    let _newer = engine.register_peer(
+        manifest,
+        peer(Some(b"re-registered"), Duration::from_millis(1)),
+    );
+
+    drop(older);
+    engine
+        .for_manifest(manifest)
+        .get(hash, Class::Demand)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        0,
+        "the newer peer served it"
+    );
+}
+
 #[tokio::test]
 async fn an_upload_through_the_engine_store_takes_an_engine_slot() {
     let f = fixture();
