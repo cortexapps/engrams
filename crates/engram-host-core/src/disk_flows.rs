@@ -40,10 +40,22 @@ fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
+/// The class a stage fetches at. It is read again for each chunk, so a
+/// caller that starts to wait for a stage in flight can raise it.
+pub trait StageClass: Send + Sync {
+    fn class(&self) -> Class;
+}
+
+impl StageClass for Class {
+    fn class(&self) -> Class {
+        *self
+    }
+}
+
 async fn apply_delta(
     volume: &Volume,
     fill: &FillEngine,
-    class: Class,
+    class: &dyn StageClass,
     delta: &ManifestDelta,
 ) -> io::Result<()> {
     let chunk_size = volume.chunk_size;
@@ -54,6 +66,7 @@ async fn apply_delta(
             .acquire_owned()
             .await
             .expect("never closed");
+        let class = class.class();
         let (fill, volume) = (fill.clone(), volume.clone());
         let (hash, index) = (c.hash, ChunkIndex(c.offset / chunk_size));
         // One task per chunk, so fetch, hash and write use every core.
@@ -87,6 +100,18 @@ pub async fn stage(
     disk: &dyn SessionDisk,
     fill: &FillEngine,
     class: Class,
+    name: &VolumeName,
+    manifest: &Manifest,
+    base: Option<(&Volume, &Manifest)>,
+) -> io::Result<Volume> {
+    stage_at(disk, fill, &class, name, manifest, base).await
+}
+
+/// [`stage`] at a class that can change while it runs.
+pub async fn stage_at(
+    disk: &dyn SessionDisk,
+    fill: &FillEngine,
+    class: &dyn StageClass,
     name: &VolumeName,
     manifest: &Manifest,
     base: Option<(&Volume, &Manifest)>,

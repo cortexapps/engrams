@@ -7,10 +7,14 @@
 //! A sandbox created from an image forks the image's volume, staging it
 //! first when the host has none. One lock per image makes that stage
 //! and a pass's stage of the same image one stage, and keeps a pass
-//! from deleting a volume while a fork snapshots it.
+//! from deleting a volume while a fork or a stage reads it: a stage or a
+//! delete holds it exclusive, a fork of a present volume and a stage's
+//! base hold it shared. A fork that waits for a stage in flight raises
+//! that stage to its own class.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use engram_chunk_store::{ChunkStore, Manifest};
@@ -19,7 +23,7 @@ use engram_fill::{Class, FillEngine};
 use uuid::Uuid;
 
 use crate::disk::{SessionDisk, Volume, VolumeName};
-use crate::disk_flows::stage;
+use crate::disk_flows::{stage_at, StageClass};
 
 const IMAGE_PREFIX: &str = "img-";
 const STAGING_PREFIX: &str = "tmp-img-";
@@ -72,7 +76,47 @@ pub struct Report {
 pub struct ImageVolumes {
     disk: Arc<dyn SessionDisk>,
     fill: FillEngine,
-    locks: Mutex<HashMap<ManifestRef, Arc<tokio::sync::Mutex<()>>>>,
+    locks: Mutex<HashMap<ManifestRef, Arc<ImageLock>>>,
+}
+
+#[derive(Default)]
+struct ImageLock {
+    volume: Arc<tokio::sync::RwLock<()>>,
+    /// Forks that wait for this image. While one waits, a stage of the
+    /// image fetches at `Demand`.
+    demand_waiters: AtomicUsize,
+}
+
+/// A stage's class: its own, or `Demand` while a fork waits for it.
+struct Staging<'a> {
+    lock: &'a ImageLock,
+    own: Class,
+}
+
+impl StageClass for Staging<'_> {
+    fn class(&self) -> Class {
+        if self.lock.demand_waiters.load(Ordering::Relaxed) > 0 {
+            Class::Demand
+        } else {
+            self.own
+        }
+    }
+}
+
+/// Counts a fork as a waiter of an image until it drops.
+struct DemandWaiter(Arc<ImageLock>);
+
+impl DemandWaiter {
+    fn new(lock: Arc<ImageLock>) -> Self {
+        lock.demand_waiters.fetch_add(1, Ordering::Relaxed);
+        Self(lock)
+    }
+}
+
+impl Drop for DemandWaiter {
+    fn drop(&mut self) {
+        self.0.demand_waiters.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ImageVolumes {
@@ -84,7 +128,7 @@ impl ImageVolumes {
         }
     }
 
-    fn lock_of(&self, image: ManifestRef) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_of(&self, image: ManifestRef) -> Arc<ImageLock> {
         self.locks.lock().unwrap().entry(image).or_default().clone()
     }
 
@@ -102,7 +146,7 @@ impl ImageVolumes {
             if let Some(rest) = name.as_str().strip_prefix(STAGING_PREFIX) {
                 // A stage in flight holds its image's lock.
                 let lock = parse_image(rest).map(|image| self.lock_of(image));
-                let Ok(_held) = lock.as_ref().map(|l| l.try_lock()).transpose() else {
+                let Ok(_held) = lock.as_ref().map(|l| l.volume.try_write()).transpose() else {
                     continue;
                 };
                 match disk.delete(&name).await {
@@ -124,11 +168,12 @@ impl ImageVolumes {
         to_stage.sort_by_key(|image| (image.manifest_id, image.version));
         for image in to_stage {
             let lock = self.lock_of(image);
-            let _held = lock.lock().await;
+            let _held = lock.volume.write().await;
             let result = match disk.open(&volume_name(image)).await {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    stage_one(disk, &self.fill, Class::Background, image, &present).await
+                    self.stage_one(&lock, Class::Background, image, &present)
+                        .await
                 }
                 Err(e) => Err(e),
             };
@@ -144,7 +189,7 @@ impl ImageVolumes {
             }
             let name = volume_name(image);
             let lock = self.lock_of(image);
-            let _held = lock.lock().await;
+            let _held = lock.volume.write().await;
             match disk.delete(&name).await {
                 Ok(()) => {
                     present.retain(|p| *p != image);
@@ -173,91 +218,129 @@ impl ImageVolumes {
     pub async fn fork(&self, image: ManifestRef, dest: &VolumeName) -> io::Result<Volume> {
         let disk = self.disk.as_ref();
         let lock = self.lock_of(image);
-        let _held = lock.lock().await;
+        let _waiter = DemandWaiter::new(lock.clone());
+        {
+            let _shared = lock.volume.read().await;
+            match disk.open(&volume_name(image)).await {
+                Ok(origin) => return disk.snapshot(&origin, dest).await,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let _held = lock.volume.write().await;
         let origin = match disk.open(&volume_name(image)).await {
             Ok(origin) => origin,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let present = staged(&disk.list().await?);
-                stage_one(disk, &self.fill, Class::Demand, image, &present).await?;
+                self.stage_one(&lock, Class::Demand, image, &present)
+                    .await?;
                 disk.open(&volume_name(image)).await?
             }
             Err(e) => return Err(e),
         };
         disk.snapshot(&origin, dest).await
     }
+
+    /// Stage `image` under its staging name and rename it. The caller
+    /// holds `lock`, the image's lock, exclusive, so a staging volume
+    /// already on the disk is the remains of a stage that did not finish.
+    async fn stage_one(
+        &self,
+        lock: &ImageLock,
+        class: Class,
+        image: ManifestRef,
+        present: &[ManifestRef],
+    ) -> io::Result<()> {
+        let disk = self.disk.as_ref();
+        let store = self.fill.store();
+        let manifest = store.get_manifest(image).await.map_err(io::Error::other)?;
+        let base = self.closest(store, &manifest, present).await;
+        let staging = staging_name(image);
+        match disk.delete(&staging).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let staged = stage_at(
+            disk,
+            &self.fill,
+            &Staging { lock, own: class },
+            &staging,
+            &manifest,
+            base.as_ref().map(|b| (&b.volume, &b.manifest)),
+        )
+        .await;
+        drop(base);
+        if let Err(e) = staged {
+            let _ = disk.delete(&staging).await;
+            return Err(e);
+        }
+        drop(staged);
+        disk.rename(&staging, &volume_name(image)).await
+    }
+
+    /// The present volume whose manifest holds the most of `wanted`'s
+    /// chunks at the same offsets, when one holds any, with its lock
+    /// held shared so no pass deletes it while it is the stage's base. A
+    /// volume whose manifest the store no longer has, whose shape
+    /// differs, or whose lock is held exclusive (a delete or a stage) is
+    /// not a candidate: waiting for it while this image's lock is held
+    /// could wait in a cycle.
+    async fn closest(
+        &self,
+        store: &ChunkStore,
+        wanted: &Manifest,
+        present: &[ManifestRef],
+    ) -> Option<Base> {
+        let wanted_chunks: HashSet<(u64, _)> =
+            wanted.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+        let mut candidates = Vec::new();
+        for candidate in present {
+            let Ok(manifest) = store.get_manifest(*candidate).await else {
+                continue;
+            };
+            if manifest.chunk_size != wanted.chunk_size
+                || manifest.total_bytes != wanted.total_bytes
+            {
+                continue;
+            }
+            let shared = manifest
+                .chunks
+                .iter()
+                .filter(|c| wanted_chunks.contains(&(c.offset, c.hash)))
+                .count();
+            if shared > 0 {
+                candidates.push((shared, *candidate, manifest));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, candidate, manifest) in candidates {
+            let lock = self.lock_of(candidate);
+            let Ok(guard) = Arc::clone(&lock.volume).try_read_owned() else {
+                continue;
+            };
+            let Ok(volume) = self.disk.open(&volume_name(candidate)).await else {
+                continue;
+            };
+            return Some(Base {
+                volume,
+                manifest,
+                _guard: guard,
+                _lock: lock,
+            });
+        }
+        None
+    }
 }
 
-/// Stage `image` under its staging name and rename it. The caller holds
-/// the image's lock, so a staging volume already on the disk is the
-/// remains of a stage that did not finish.
-async fn stage_one(
-    disk: &dyn SessionDisk,
-    fill: &FillEngine,
-    class: Class,
-    image: ManifestRef,
-    present: &[ManifestRef],
-) -> io::Result<()> {
-    let store = fill.store();
-    let manifest = store.get_manifest(image).await.map_err(io::Error::other)?;
-    let base = closest(disk, store, &manifest, present).await;
-    let staging = staging_name(image);
-    match disk.delete(&staging).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let staged = stage(
-        disk,
-        fill,
-        class,
-        &staging,
-        &manifest,
-        base.as_ref().map(|(v, m)| (v, m)),
-    )
-    .await;
-    drop(base);
-    if let Err(e) = staged {
-        let _ = disk.delete(&staging).await;
-        return Err(e);
-    }
-    drop(staged);
-    disk.rename(&staging, &volume_name(image)).await
-}
-
-/// The present volume whose manifest holds the most of `wanted`'s
-/// chunks at the same offsets, when one holds any. A volume whose
-/// manifest the store no longer has, or whose shape differs, is not a
-/// candidate.
-async fn closest(
-    disk: &dyn SessionDisk,
-    store: &ChunkStore,
-    wanted: &Manifest,
-    present: &[ManifestRef],
-) -> Option<(Volume, Manifest)> {
-    let wanted_chunks: HashSet<(u64, _)> =
-        wanted.chunks.iter().map(|c| (c.offset, c.hash)).collect();
-    let mut best: Option<(usize, Volume, Manifest)> = None;
-    for candidate in present {
-        let Ok(manifest) = store.get_manifest(*candidate).await else {
-            continue;
-        };
-        if manifest.chunk_size != wanted.chunk_size || manifest.total_bytes != wanted.total_bytes {
-            continue;
-        }
-        let shared = manifest
-            .chunks
-            .iter()
-            .filter(|c| wanted_chunks.contains(&(c.offset, c.hash)))
-            .count();
-        if shared == 0 || best.as_ref().is_some_and(|(most, _, _)| *most >= shared) {
-            continue;
-        }
-        let Ok(volume) = disk.open(&volume_name(*candidate)).await else {
-            continue;
-        };
-        best = Some((shared, volume, manifest));
-    }
-    best.map(|(_, volume, manifest)| (volume, manifest))
+/// A stage's base volume, held shared for as long as the stage reads it.
+/// It keeps the lock's entry in the map, so a pass cannot drop the entry
+/// and give the next delete a fresh lock.
+struct Base {
+    volume: Volume,
+    manifest: Manifest,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _lock: Arc<ImageLock>,
 }
 
 #[cfg(test)]
@@ -505,6 +588,49 @@ mod tests {
         assert_eq!(bytes_of(&v).await, vec![1, 2, 3, 7]);
     }
 
+    /// A stage fetches at `Demand` while a fork waits for its image.
+    #[test]
+    fn a_waiting_fork_raises_the_stage_in_flight_to_demand() {
+        let lock = Arc::new(ImageLock::default());
+        let staging = Staging {
+            lock: &lock,
+            own: Class::Background,
+        };
+        assert_eq!(staging.class(), Class::Background);
+        let waiter = DemandWaiter::new(lock.clone());
+        assert_eq!(staging.class(), Class::Demand);
+        drop(waiter);
+        assert_eq!(staging.class(), Class::Background);
+    }
+
+    /// A pass does not delete a volume while a stage reads it as its base.
+    #[tokio::test]
+    async fn a_pass_keeps_a_base_a_stage_reads() {
+        let r = rig();
+        let old = ManifestRef::new();
+        let rebaked = ManifestRef::new();
+        publish(&r, old, &[1, 2]).await;
+        let wanted = publish(&r, rebaked, &[1, 3]).await;
+        let images = Arc::new(images(&r));
+        images.reconcile(&[old]).await.unwrap();
+
+        let base = images
+            .closest(&r.store, &wanted, &[old])
+            .await
+            .expect("the old volume shares a chunk");
+        let pass = tokio::spawn({
+            let images = images.clone();
+            async move { images.reconcile(&[]).await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!pass.is_finished(), "the delete waits for the base");
+        assert!(r.disk.open(&volume_name(old)).await.is_ok());
+
+        drop(base);
+        let report = pass.await.unwrap();
+        assert_eq!(report.deleted, vec![volume_name(old)]);
+    }
+
     /// A pass leaves the staging volume of a stage in flight.
     #[tokio::test]
     async fn a_pass_keeps_a_stage_in_flight() {
@@ -514,7 +640,7 @@ mod tests {
         r.disk.create(&staging_name(image), CHUNK).await.unwrap();
 
         let lock = images.lock_of(image);
-        let held = lock.lock().await;
+        let held = lock.volume.write().await;
         let report = images.reconcile(&[]).await.unwrap();
         assert!(report.deleted.is_empty());
         assert_eq!(names(&r.disk).await, vec![staging_name(image).as_str()]);
