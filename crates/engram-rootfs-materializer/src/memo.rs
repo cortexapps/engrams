@@ -31,9 +31,11 @@ struct Record {
 }
 
 impl MemoKey {
-    /// SHA-256 over the layout version, the platform, the ordered layer
-    /// digests and media types, the init shim and the size floor.
+    /// SHA-256 over the layout version, the chunk size of the disk
+    /// manifest, the platform, the ordered layer digests and media types,
+    /// the init shim and the size floor.
     pub fn new(
+        chunk_size: u64,
         platform: Platform,
         layers: &[LayerPlan],
         shim: &(String, u16, Vec<u8>),
@@ -45,6 +47,7 @@ impl MemoKey {
             h.update(bytes);
         };
         field(&LAYOUT_VERSION.to_le_bytes());
+        field(&chunk_size.to_le_bytes());
         field(platform.to_string().as_bytes());
         for layer in layers {
             field(layer.blob.digest.as_bytes());
@@ -128,18 +131,20 @@ mod tests {
     #[test]
     fn every_input_changes_the_key() {
         let layers = [layer(0, "sha256:a"), layer(1, "sha256:b")];
-        let base = MemoKey::new(Platform::LinuxAmd64, &layers, &shim("x"), 0);
+        const CHUNK: u64 = 16 << 20;
+        let base = MemoKey::new(CHUNK, Platform::LinuxAmd64, &layers, &shim("x"), 0);
         assert_eq!(
             base,
-            MemoKey::new(Platform::LinuxAmd64, &layers, &shim("x"), 0)
+            MemoKey::new(CHUNK, Platform::LinuxAmd64, &layers, &shim("x"), 0)
         );
         let swapped = [layer(0, "sha256:b"), layer(1, "sha256:a")];
         for other in [
-            MemoKey::new(Platform::LinuxArm64, &layers, &shim("x"), 0),
-            MemoKey::new(Platform::LinuxAmd64, &swapped, &shim("x"), 0),
-            MemoKey::new(Platform::LinuxAmd64, &layers[..1], &shim("x"), 0),
-            MemoKey::new(Platform::LinuxAmd64, &layers, &shim("y"), 0),
-            MemoKey::new(Platform::LinuxAmd64, &layers, &shim("x"), 1),
+            MemoKey::new(CHUNK / 2, Platform::LinuxAmd64, &layers, &shim("x"), 0),
+            MemoKey::new(CHUNK, Platform::LinuxArm64, &layers, &shim("x"), 0),
+            MemoKey::new(CHUNK, Platform::LinuxAmd64, &swapped, &shim("x"), 0),
+            MemoKey::new(CHUNK, Platform::LinuxAmd64, &layers[..1], &shim("x"), 0),
+            MemoKey::new(CHUNK, Platform::LinuxAmd64, &layers, &shim("y"), 0),
+            MemoKey::new(CHUNK, Platform::LinuxAmd64, &layers, &shim("x"), 1),
         ] {
             assert_ne!(base, other);
         }

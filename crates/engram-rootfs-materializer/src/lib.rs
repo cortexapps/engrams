@@ -246,7 +246,13 @@ impl Materializer {
         let pipeline_started = std::time::Instant::now();
         let resolved = pull::resolve_image(&self.oci, image_uri, platform).await?;
         let shim = inject::rendered_init_shim(&self.init).await?;
-        let memo_key = memo::MemoKey::new(platform, &resolved.layers, &shim, min_fs_size_bytes);
+        let memo_key = memo::MemoKey::new(
+            ManifestKind::Disk.default_chunk_size(),
+            platform,
+            &resolved.layers,
+            &shim,
+            min_fs_size_bytes,
+        );
         if let Some((disk_manifest, manifest)) = memo::lookup(chunk_store, &memo_key).await {
             let chunks = manifest.chunks.len() as u64;
             if let Some(tx) = &progress {
