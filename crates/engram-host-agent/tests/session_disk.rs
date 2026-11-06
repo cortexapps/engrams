@@ -24,7 +24,7 @@ use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::DiskRole;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
+use engram_host_core::disk::{Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName};
 use engram_host_core::SessionVolumes;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
@@ -313,6 +313,62 @@ impl SessionDisk for CountingDisk {
         block_bytes: u64,
     ) -> std::io::Result<Vec<u64>> {
         self.inner.dirty_blocks(before, after, block_bytes).await
+    }
+    async fn clone_drive(
+        &self,
+        drive: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        source: &Path,
+        hydration: Hydration,
+    ) -> std::io::Result<Volume> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .clone_drive(drive, dest, bitmap, source, hydration)
+            .await
+    }
+    async fn open_clone(&self, drive: &VolumeName) -> std::io::Result<Volume> {
+        self.inner.open_clone(drive).await
+    }
+    async fn clone_state(&self, drive: &VolumeName) -> std::io::Result<CloneState> {
+        self.inner.clone_state(drive).await
+    }
+    async fn enable_hydration(&self, drive: &VolumeName) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.enable_hydration(drive).await
+    }
+    async fn cut_over(&self, drive: &VolumeName) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.cut_over(drive).await
+    }
+    async fn snapshot_clone(
+        &self,
+        drive: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        dest_snapshot: &VolumeName,
+        bitmap_snapshot: &VolumeName,
+    ) -> std::io::Result<(Volume, Volume)> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .snapshot_clone(drive, dest, bitmap, dest_snapshot, bitmap_snapshot)
+            .await
+    }
+    async fn clone_view(
+        &self,
+        view: &VolumeName,
+        dest_snapshot: &Volume,
+        bitmap_snapshot: &Volume,
+        source: &Path,
+    ) -> std::io::Result<Volume> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .clone_view(view, dest_snapshot, bitmap_snapshot, source)
+            .await
+    }
+    async fn remove_clone(&self, drive: &VolumeName) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.remove_clone(drive).await
     }
 }
 

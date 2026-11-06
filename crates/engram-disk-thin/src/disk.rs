@@ -7,11 +7,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dm;
-use crate::parse::{self, DevNo, ThinParams, METADATA_BLOCK_BYTES};
+use crate::parse::{self, CloneTable, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
-use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
+use engram_host_core::disk::{
+    Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
+};
 
 const SECTOR_BYTES: u64 = 512;
+const REGION_SECTORS: u64 = CLONE_REGION_BYTES / SECTOR_BYTES;
+/// A view copies nothing, so its tuning is never used.
+const VIEW: Hydration = Hydration {
+    enabled: false,
+    threshold_regions: 1,
+    batch_regions: 1,
+};
 /// dm-thin device ids are 24 bits wide.
 const ID_MASK: u32 = 0x00FF_FFFF;
 /// A `delete` waits this long in all for the last holder of a device
@@ -218,6 +227,47 @@ impl ThinPoolDisk {
         }
     }
 
+    async fn drive_target(&self, drive: &VolumeName) -> io::Result<dm::Target> {
+        let targets = self.dm.table(&self.device_name(drive)).await?;
+        match targets.as_slice() {
+            [target] if is_drive(target) => Ok(target.clone()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{drive} is not a cloned drive: {targets:?}"),
+            )),
+        }
+    }
+
+    /// The clone table of a drive that has not been cut over.
+    async fn copying_drive(&self, drive: &VolumeName) -> io::Result<CloneTable> {
+        let target = self.drive_target(drive).await?;
+        if target.kind != "clone" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{drive} is cut over"),
+            ));
+        }
+        parse::clone_table(&target.params)
+    }
+
+    /// A clone table over two thins of this pool and `source`.
+    async fn clone_table(
+        &self,
+        dest: &Volume,
+        bitmap: &Volume,
+        source: &Path,
+    ) -> io::Result<(CloneTable, u64)> {
+        let (_, sectors) = self.thin_of(&dest.name).await?;
+        self.thin_of(&bitmap.name).await?;
+        let table = CloneTable {
+            metadata_dev: self.dm.devno(&self.device_name(&bitmap.name)).await?,
+            dest_dev: self.dm.devno(&self.device_name(&dest.name)).await?,
+            source_dev: dm::block_devno(source)?,
+            region_sectors: REGION_SECTORS,
+        };
+        Ok((table, sectors))
+    }
+
     /// Run `read` over a reserved metadata snapshot. The reserve is
     /// released when the guard drops, so a cancelled read releases it
     /// too. A reserve another holder left behind (a process that died,
@@ -255,6 +305,40 @@ struct Thin {
     params: ThinParams,
 }
 
+/// A suspended device; resumed on drop if [`Self::resume`] did not run.
+struct Suspended<'a> {
+    dm: &'a dm::Dm,
+    name: &'a str,
+    held: bool,
+}
+
+impl<'a> Suspended<'a> {
+    async fn suspend(dm: &'a dm::Dm, name: &'a str) -> io::Result<Self> {
+        dm.suspend(name).await?;
+        Ok(Self {
+            dm,
+            name,
+            held: true,
+        })
+    }
+
+    async fn resume(mut self) -> io::Result<()> {
+        let resumed = self.dm.resume(self.name).await;
+        self.held = false;
+        resumed
+    }
+}
+
+impl Drop for Suspended<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            if let Err(error) = self.dm.resume_blocking(self.name) {
+                tracing::error!(device = self.name, %error, "device left suspended");
+            }
+        }
+    }
+}
+
 /// A reserved metadata snapshot; released on drop.
 struct MetadataSnap<'a> {
     dm: &'a dm::Dm,
@@ -267,6 +351,12 @@ impl Drop for MetadataSnap<'_> {
             tracing::warn!(pool = self.pool, %error, "metadata snapshot not released");
         }
     }
+}
+
+/// A cloned drive's one target: `clone` while it copies, `linear` after
+/// the cutover.
+fn is_drive(target: &dm::Target) -> bool {
+    target.kind == "clone" || target.kind == "linear"
 }
 
 fn single_target(targets: &[dm::Target], kind: &str) -> io::Result<String> {
@@ -383,6 +473,170 @@ impl SessionDisk for ThinPoolDisk {
                 - status.metadata_used_blocks * METADATA_BLOCK_BYTES,
             metadata_total_bytes,
         })
+    }
+
+    /// A `clone` target over the two thins and `source`, region 64 KiB.
+    async fn clone_drive(
+        &self,
+        drive: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        source: &Path,
+        hydration: Hydration,
+    ) -> io::Result<Volume> {
+        let (table, sectors) = self.clone_table(dest, bitmap, source).await?;
+        self.dm
+            .create(
+                &self.device_name(drive),
+                sectors,
+                "clone",
+                &table.params(hydration),
+            )
+            .await?;
+        self.open_created(drive, |node| {
+            Volume::open(drive.clone(), node, sectors * SECTOR_BYTES, self.chunk_size)
+        })
+        .await
+    }
+
+    async fn open_clone(&self, drive: &VolumeName) -> io::Result<Volume> {
+        let target = self.drive_target(drive).await?;
+        self.volume(drive, target.length_sectors).await
+    }
+
+    async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
+        let status = self.dm.status(&self.device_name(drive)).await?;
+        match status.as_slice() {
+            [target] if target.kind == "linear" => Ok(CloneState::CutOver),
+            [target] if target.kind == "clone" => parse::clone_status(&target.params),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{drive} is not a cloned drive: {status:?}"),
+            )),
+        }
+    }
+
+    async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
+        self.copying_drive(drive).await?;
+        self.dm
+            .message(&self.device_name(drive), "enable_hydration")
+            .await
+    }
+
+    /// Suspend, load `linear` onto the destination, resume. A region the
+    /// clone has copied stays copied, so the check before the suspend
+    /// still holds at the swap.
+    async fn cut_over(&self, drive: &VolumeName) -> io::Result<()> {
+        let target = self.drive_target(drive).await?;
+        if target.kind == "linear" {
+            return Ok(());
+        }
+        let table = parse::clone_table(&target.params)?;
+        if !self.clone_state(drive).await?.is_hydrated() {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("{drive} is still hydrating"),
+            ));
+        }
+        let device = self.device_name(drive);
+        let suspended = Suspended::suspend(&self.dm, &device).await?;
+        self.dm
+            .load(
+                &device,
+                target.length_sectors,
+                "linear",
+                &format!("{} 0", table.dest_dev),
+            )
+            .await?;
+        suspended.resume().await
+    }
+
+    /// Both snapshots are taken while the drive is suspended: the suspend
+    /// stops the background copy and commits the bitmap.
+    async fn snapshot_clone(
+        &self,
+        drive: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        dest_snapshot: &VolumeName,
+        bitmap_snapshot: &VolumeName,
+    ) -> io::Result<(Volume, Volume)> {
+        let table = self.copying_drive(drive).await?;
+        let dest_dev = self.dm.devno(&self.device_name(&dest.name)).await?;
+        let bitmap_dev = self.dm.devno(&self.device_name(&bitmap.name)).await?;
+        if table.dest_dev != dest_dev || table.metadata_dev != bitmap_dev {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{drive} copies into {} with bitmap {}, not {} and {}",
+                    table.dest_dev, table.metadata_dev, dest.name, bitmap.name
+                ),
+            ));
+        }
+        let device = self.device_name(drive);
+        let suspended = Suspended::suspend(&self.dm, &device).await?;
+        let bitmap_snap = self.snapshot(bitmap, bitmap_snapshot).await?;
+        let taken = match self.snapshot(dest, dest_snapshot).await {
+            Ok(dest_snap) => suspended.resume().await.map(|()| dest_snap),
+            Err(e) => Err(e),
+        };
+        match taken {
+            Ok(dest_snap) => Ok((dest_snap, bitmap_snap)),
+            Err(e) => {
+                drop(bitmap_snap);
+                for name in [bitmap_snapshot, dest_snapshot] {
+                    match self.delete(name).await {
+                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                            tracing::warn!(volume = %name, %error, "snapshot left behind by a failed snapshot_clone");
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// A read-only `clone` target with hydration off.
+    async fn clone_view(
+        &self,
+        view: &VolumeName,
+        dest_snapshot: &Volume,
+        bitmap_snapshot: &Volume,
+        source: &Path,
+    ) -> io::Result<Volume> {
+        let (table, sectors) = self
+            .clone_table(dest_snapshot, bitmap_snapshot, source)
+            .await?;
+        self.dm
+            .create_read_only(
+                &self.device_name(view),
+                sectors,
+                "clone",
+                &table.params(VIEW),
+            )
+            .await?;
+        self.open_created(view, |node| {
+            Volume::open_read_only(view.clone(), node, sectors * SECTOR_BYTES, self.chunk_size)
+        })
+        .await
+    }
+
+    /// Also removes a drive left with no table by a crash inside
+    /// `clone_drive`.
+    async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()> {
+        let targets = self.dm.table(&self.device_name(drive)).await?;
+        match targets.as_slice() {
+            [] => {}
+            [target] if is_drive(target) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{drive} is not a cloned drive: {targets:?}"),
+                ))
+            }
+        }
+        self.remove_device(drive).await
     }
 
     /// Reads the pool's mapping tree instead of the volumes. A block is

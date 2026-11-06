@@ -21,7 +21,7 @@
 //!   rename / sync_dir / read / read_dir / remove_file) so a crash injector
 //!   can fail between each.
 //! - [`disk::SessionDisk`] — volumes the kernel owns (create, O(1)
-//!   snapshot, delete, dirty-chunk diff); [`disk_flows`] moves chunks
+//!   snapshot, delete, dirty-chunk diff, cloned drives); [`disk_flows`] moves chunks
 //!   between a volume and the chunk store; [`image_volumes`] keeps the
 //!   enabled images staged and [`session_volumes`] owns every session's
 //!   volumes.
@@ -40,7 +40,10 @@ mod test_support;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{CoordControlPlane, CoordError};
-pub use disk::{is_zero_chunk, Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName};
+pub use disk::{
+    is_zero_chunk, Capacity, ChunkIndex, CloneState, FileDisk, Hydration, SessionDisk, Volume,
+    VolumeName,
+};
 pub use disk_flows::{checkpoint, checkpoint_split, stage};
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};

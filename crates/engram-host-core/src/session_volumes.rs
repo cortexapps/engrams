@@ -812,10 +812,12 @@ impl SessionVolumes {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use engram_storage_local::LocalBlobStorage;
 
     use super::*;
-    use crate::disk::{ChunkIndex, FileDisk};
+    use crate::disk::{ChunkIndex, CloneState, FileDisk, Hydration};
     use crate::disk_flows::checkpoint;
     use crate::test_support::CountingBlob;
 
@@ -892,6 +894,56 @@ mod tests {
                 metadata_free_bytes: POOL_TOTAL,
                 metadata_total_bytes: POOL_TOTAL,
             })
+        }
+        async fn clone_drive(
+            &self,
+            drive: &VolumeName,
+            dest: &Volume,
+            bitmap: &Volume,
+            source: &Path,
+            hydration: Hydration,
+        ) -> io::Result<Volume> {
+            self.0
+                .clone_drive(drive, dest, bitmap, source, hydration)
+                .await
+        }
+        async fn open_clone(&self, drive: &VolumeName) -> io::Result<Volume> {
+            self.0.open_clone(drive).await
+        }
+        async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
+            self.0.clone_state(drive).await
+        }
+        async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
+            self.0.enable_hydration(drive).await
+        }
+        async fn cut_over(&self, drive: &VolumeName) -> io::Result<()> {
+            self.0.cut_over(drive).await
+        }
+        async fn snapshot_clone(
+            &self,
+            drive: &VolumeName,
+            dest: &Volume,
+            bitmap: &Volume,
+            dest_snapshot: &VolumeName,
+            bitmap_snapshot: &VolumeName,
+        ) -> io::Result<(Volume, Volume)> {
+            self.0
+                .snapshot_clone(drive, dest, bitmap, dest_snapshot, bitmap_snapshot)
+                .await
+        }
+        async fn clone_view(
+            &self,
+            view: &VolumeName,
+            dest_snapshot: &Volume,
+            bitmap_snapshot: &Volume,
+            source: &Path,
+        ) -> io::Result<Volume> {
+            self.0
+                .clone_view(view, dest_snapshot, bitmap_snapshot, source)
+                .await
+        }
+        async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()> {
+            self.0.remove_clone(drive).await
         }
     }
 
