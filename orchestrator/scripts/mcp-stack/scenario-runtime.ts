@@ -163,6 +163,7 @@ export async function startScenario(
   }
   await guestReady(ctx, client, task.sessionId);
   return {
+    ctx,
     ...task,
     ...profile,
     client,
@@ -613,8 +614,17 @@ async function pollSelectedProof(
   );
 }
 export async function closeScenario(
-  principals: Principals,
-  scenario: StartedScenario,
+  principals: {
+    automation: Pick<PublicClient, "automationRuns">;
+    admin: Pick<
+      PublicClient,
+      "sessions" | "automations" | "tasks" | "profiles"
+    >;
+  },
+  scenario: Pick<
+    StartedScenario,
+    "automation" | "sessionId" | "taskId" | "profileId"
+  > & { ctx: Pick<Context, "deadlines"> },
 ) {
   if (scenario.automation) {
     const run = await principals.automation.automationRuns.getRun({
@@ -635,6 +645,24 @@ export async function closeScenario(
         runId: scenario.automation.runId,
         reason: "Fixture cleanup",
       });
+  }
+  await principals.admin.sessions.deleteSession({
+    sessionId: scenario.sessionId,
+  });
+  await waitFor(
+    scenario.ctx,
+    "scenario_cleanup_session_terminal",
+    () =>
+      principals.admin.sessions.getSession({ sessionId: scenario.sessionId }),
+    (value) => {
+      requireThat(
+        value.session?.id === scenario.sessionId,
+        "scenario_cleanup_session_identity",
+      );
+      return ["completed", "failed", "dead"].includes(value.session.status);
+    },
+  );
+  if (scenario.automation) {
     await principals.admin.automations.archiveAutomation({
       id: scenario.automation.id,
     });

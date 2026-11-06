@@ -20,7 +20,7 @@ import type { Harness } from "./manifest.ts";
 import { encodeCallPlan, type CallPlan } from "./call-plan.ts";
 
 export async function waitFor<T>(
-  ctx: Context,
+  ctx: Pick<Context, "deadlines">,
   seam: string,
   read: () => Promise<T>,
   ready: (value: T) => boolean,
@@ -357,7 +357,8 @@ export async function createCatalog(
   });
   requireThat(
     enabled.connection?.id === created.connection.id &&
-      enabled.connection.configRevision === authorizedConnection.configRevision &&
+      enabled.connection.configRevision ===
+        authorizedConnection.configRevision &&
       enabled.connection.enabled,
     "enabled_connection",
   );
