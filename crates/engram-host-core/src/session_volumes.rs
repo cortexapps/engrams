@@ -21,9 +21,10 @@
 //!
 //! A lazy provision makes a cloned role over a source from
 //! [`DiskSources`]. A checkpoint of one reads through a view until the
-//! cutover; the first checkpoint after it is a `-ckpt-` volume, and from
-//! then on the role checkpoints as any other. A live move of a cloned
-//! role is refused.
+//! cutover ([`SessionVolumes::cut_over`]), which also deletes the bitmap
+//! and stops the source; the first checkpoint after it is a `-ckpt-`
+//! volume, and from then on the role checkpoints as any other. A live
+//! move of a cloned role is refused.
 //!
 //! A checkpoint volume is named after a manifest the chunk store holds,
 //! so the name is written last: a crash leaves a `tmp-` volume, never a
@@ -345,6 +346,12 @@ fn cloned_refused(sandbox: SandboxId, role: DiskRole, op: &str) -> io::Error {
     )
 }
 
+/// `e`, from the source of the role, with the role named.
+fn source_err(sandbox: SandboxId, role: DiskRole, e: io::Error) -> io::Error {
+    let what = format!("source of the {role} disk of sandbox {sandbox}: {e}");
+    io::Error::new(e.kind(), what)
+}
+
 /// Where a live volume's contents come from. A manifest is written in
 /// full before the sandbox starts; when `base` names an image staged on
 /// this host, that volume is the origin and only the difference is
@@ -422,6 +429,43 @@ enum Shape {
     /// A cloned drive's destination after the cutover, with no complete
     /// volume of `previous`: the upload hashes every chunk.
     CutOver,
+}
+
+/// The regions a cloned drive has copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copied {
+    pub hydrated_regions: u64,
+    pub total_regions: u64,
+}
+
+/// Where a cloned role is on its way to a finished cutover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hydrating {
+    /// Regions are still to copy.
+    Copying(Copied),
+    /// Every region is copied, or the drive is cut over and its bitmap
+    /// or source is left: [`SessionVolumes::cut_over`] finishes it.
+    Ready,
+}
+
+/// What [`SessionVolumes::cut_over`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cutover {
+    /// The drive maps its destination alone, and the bitmap and the
+    /// source are gone.
+    Done,
+    /// Nothing changed; the cutover can go ahead later.
+    Waiting(Waiting),
+}
+
+/// Why a cutover waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waiting {
+    /// Regions are still to copy.
+    Copying(Copied),
+    /// A checkpoint of the role is in flight, or a crash left one: its
+    /// publish reads through a view over the source.
+    Checkpoint,
 }
 
 /// Where a role's writes are.
@@ -1033,8 +1077,7 @@ impl SessionVolumes {
         if let Some(sources) = &self.sources {
             match sources.ensure_alive(sandbox, role).await {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                    let what = format!("source of the {role} disk of sandbox {sandbox}: {e}");
-                    return Err(io::Error::new(e.kind(), what));
+                    return Err(source_err(sandbox, role, e));
                 }
                 _ => {}
             }
@@ -1300,6 +1343,124 @@ impl SessionVolumes {
         }
     }
 
+    /// Where the role is on its way to a finished cutover; `None` when it
+    /// is not a cloned role or its cutover is finished. While the drive
+    /// copies, a source that died is started again first: the guest's
+    /// reads of uncopied regions wait on it.
+    pub async fn hydration(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<Option<Hydrating>> {
+        let names = self.disk.list().await?;
+        if !cloned_in(&names, sandbox, role) {
+            return Ok(None);
+        }
+        Ok(match self.clone_progress(sandbox, role).await? {
+            Some(copied) => {
+                self.sources(role)?
+                    .ensure_alive(sandbox, role)
+                    .await
+                    .map_err(|e| source_err(sandbox, role, e))?;
+                Some(if copied.hydrated_regions < copied.total_regions {
+                    Hydrating::Copying(copied)
+                } else {
+                    Hydrating::Ready
+                })
+            }
+            None => {
+                let sourced = match &self.sources {
+                    Some(sources) => sources.list().await?.contains(&(sandbox, role)),
+                    None => false,
+                };
+                (sourced || names.contains(&bitmap_name(sandbox, role))).then_some(Hydrating::Ready)
+            }
+        })
+    }
+
+    /// Cut a hydrated cloned role over to its destination, then delete
+    /// its bitmap and stop its source. The caller serializes this with
+    /// the role's checkpoints, from `take` to `publish`. A crash at any
+    /// step leaves a state the next call finishes. `InvalidInput` when
+    /// the role is not cloned.
+    pub async fn cut_over(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Cutover> {
+        let names = self.disk.list().await?;
+        if !cloned_in(&names, sandbox, role) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the {role} disk of sandbox {sandbox} is not a cloned drive"),
+            ));
+        }
+        let progress = self.clone_progress(sandbox, role).await?;
+        if let Some(copied) = progress.filter(|c| c.hydrated_regions < c.total_regions) {
+            return Ok(Cutover::Waiting(Waiting::Copying(copied)));
+        }
+        if self.checkpoint_in_flight(&names, sandbox, role).await? {
+            return Ok(Cutover::Waiting(Waiting::Checkpoint));
+        }
+        if progress.is_some() {
+            // A suspend waits for the source's reads in flight.
+            self.sources(role)?
+                .ensure_alive(sandbox, role)
+                .await
+                .map_err(|e| source_err(sandbox, role, e))?;
+            self.disk.cut_over(&live_name(sandbox, role)).await?;
+        }
+        self.delete_if_present(&bitmap_name(sandbox, role)).await?;
+        if let Some(sources) = &self.sources {
+            sources
+                .stop(sandbox, role)
+                .await
+                .map_err(|e| source_err(sandbox, role, e))?;
+        }
+        Ok(Cutover::Done)
+    }
+
+    /// The regions the role's drive has copied; `None` once it is cut
+    /// over.
+    async fn clone_progress(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<Option<Copied>> {
+        let drive = live_name(sandbox, role);
+        match self.disk.clone_state(&drive).await? {
+            CloneState::Copying {
+                hydrated_regions,
+                total_regions,
+                ..
+            } => Ok(Some(Copied {
+                hydrated_regions,
+                total_regions,
+            })),
+            CloneState::CutOver => Ok(None),
+            CloneState::Incomplete => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{drive} has no table"),
+            )),
+        }
+    }
+
+    /// A part of a checkpoint of the role exists: the snapshot pair, or
+    /// the view over it.
+    async fn checkpoint_in_flight(
+        &self,
+        names: &[VolumeName],
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<bool> {
+        if names.contains(&transient_name(sandbox, role))
+            || names.contains(&bitmap_snapshot_name(sandbox, role))
+        {
+            return Ok(true);
+        }
+        match self.disk.clone_state(&view_name(sandbox, role)).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Delete the sandbox's drives, its live and transient volumes and
     /// every checkpoint volume but the newest of each role. The kept
     /// checkpoint makes a resume on this host a snapshot instead of a
@@ -1501,10 +1662,10 @@ impl SessionVolumes {
             }
         }
         if let Some(sources) = &self.sources {
-            sources.stop(sandbox, role).await.map_err(|e| {
-                let what = format!("source of the {role} disk of sandbox {sandbox}: {e}");
-                (live_name(sandbox, role), io::Error::new(e.kind(), what))
-            })?;
+            sources
+                .stop(sandbox, role)
+                .await
+                .map_err(|e| (live_name(sandbox, role), source_err(sandbox, role, e)))?;
         }
         Ok(())
     }
@@ -3428,6 +3589,202 @@ mod tests {
             vec![2]
         );
         r.volumes.discard(precopy).await.unwrap();
+    }
+
+    async fn sourced(r: &Rig, sandbox: SandboxId) -> bool {
+        r.sources
+            .list()
+            .await
+            .unwrap()
+            .contains(&(sandbox, DiskRole::Root))
+    }
+
+    /// A checkpoint's publish reads through a view over the source, so a
+    /// cutover waits while its pair or view exists, and goes ahead once it
+    /// is published.
+    #[tokio::test]
+    async fn a_cutover_waits_for_a_checkpoint_in_flight() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 2, 5).await;
+        let drive = live_name(sandbox, DiskRole::Root);
+        let pending = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        let tmp = r.disk.open(&transient_name(sandbox, DiskRole::Root)).await;
+        let bm = r
+            .disk
+            .open(&bitmap_snapshot_name(sandbox, DiskRole::Root))
+            .await;
+        r.disk
+            .clone_view(
+                &view_name(sandbox, DiskRole::Root),
+                &tmp.unwrap(),
+                &bm.unwrap(),
+                Path::new("/dev/null"),
+            )
+            .await
+            .unwrap();
+        let before = names(&r).await;
+
+        for _ in 0..2 {
+            assert_eq!(
+                r.volumes.hydration(sandbox, DiskRole::Root).await.unwrap(),
+                Some(Hydrating::Ready)
+            );
+            assert_eq!(
+                r.volumes.cut_over(sandbox, DiskRole::Root).await.unwrap(),
+                Cutover::Waiting(Waiting::Checkpoint)
+            );
+            assert_eq!(names(&r).await, before);
+            assert!(sourced(&r, sandbox).await);
+            assert!(matches!(
+                r.disk.clone_state(&drive).await.unwrap(),
+                CloneState::Copying { .. }
+            ));
+            // A crash after the take leaves the pair alone.
+            r.volumes
+                .remove_clone_of(sandbox, DiskRole::Root, &view_name(sandbox, DiskRole::Root))
+                .await
+                .unwrap();
+        }
+        let published = r.volumes.publish(pending).await.unwrap();
+
+        assert_eq!(
+            r.volumes.cut_over(sandbox, DiskRole::Root).await.unwrap(),
+            Cutover::Done
+        );
+        assert_eq!(
+            r.disk.clone_state(&drive).await.unwrap(),
+            CloneState::CutOver
+        );
+        assert!(!sourced(&r, sandbox).await);
+        assert!(!names(&r)
+            .await
+            .contains(&bitmap_name(sandbox, DiskRole::Root).to_string()));
+        assert_eq!(
+            r.volumes.hydration(sandbox, DiskRole::Root).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            r.volumes.cut_over(sandbox, DiskRole::Root).await.unwrap(),
+            Cutover::Done
+        );
+        assert_eq!(bytes_at(&p.root).await, vec![1, 2, 5]);
+        assert_eq!(
+            staged_bytes(&r, published).await,
+            std::fs::read(&p.root).unwrap()
+        );
+
+        let plain = SandboxId::new();
+        r.volumes.provision(plain, fork(image), None).await.unwrap();
+        assert_eq!(
+            r.volumes.hydration(plain, DiskRole::Root).await.unwrap(),
+            None
+        );
+        let err = r.volumes.cut_over(plain, DiskRole::Root).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A crash after the drive is cut over leaves the bitmap and the
+    /// source, and one after the bitmap delete leaves the source. The
+    /// next call finishes either; until then the role checkpoints and
+    /// releases as a cut-over role.
+    #[tokio::test]
+    async fn a_cutover_cut_short_is_finished_by_the_next_call() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let (whole, unfinished) = (SandboxId::new(), SandboxId::new());
+        for sandbox in [whole, unfinished] {
+            r.volumes
+                .provision(sandbox, lazy_fork(image), None)
+                .await
+                .unwrap();
+            r.disk
+                .cut_over(&live_name(sandbox, DiskRole::Root))
+                .await
+                .unwrap();
+        }
+        r.disk
+            .delete(&bitmap_name(whole, DiskRole::Root))
+            .await
+            .unwrap();
+
+        for sandbox in [whole, unfinished] {
+            assert_eq!(
+                r.volumes.hydration(sandbox, DiskRole::Root).await.unwrap(),
+                Some(Hydrating::Ready)
+            );
+        }
+        assert_eq!(
+            r.volumes.cut_over(whole, DiskRole::Root).await.unwrap(),
+            Cutover::Done
+        );
+        assert!(!sourced(&r, whole).await);
+        assert_eq!(
+            r.volumes.hydration(whole, DiskRole::Root).await.unwrap(),
+            None
+        );
+
+        let first = r
+            .volumes
+            .checkpoint(unfinished, DiskRole::Root)
+            .await
+            .unwrap();
+        assert!(names(&r)
+            .await
+            .contains(&checkpoint_name(unfinished, DiskRole::Root, first).to_string()));
+        assert!(sourced(&r, unfinished).await);
+        for sandbox in [whole, unfinished] {
+            r.volumes.release(sandbox).await.unwrap();
+        }
+        assert!(r.sources.list().await.unwrap().is_empty());
+        assert_eq!(
+            names(&r).await,
+            vec![
+                image_volumes::volume_name(image).to_string(),
+                checkpoint_name(unfinished, DiskRole::Root, first).to_string(),
+            ]
+        );
+    }
+
+    /// After a cutover through the volumes the first checkpoint hashes
+    /// the disk into a checkpoint volume, and a release keeps it.
+    #[tokio::test]
+    async fn after_a_cutover_the_first_checkpoint_is_a_checkpoint_volume() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0, 3]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 5).await;
+        assert_eq!(
+            r.volumes.cut_over(sandbox, DiskRole::Root).await.unwrap(),
+            Cutover::Done
+        );
+
+        let first = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+
+        assert_eq!(first, next(p.root_manifest));
+        assert_eq!(
+            staged_bytes(&r, first).await,
+            std::fs::read(&p.root).unwrap()
+        );
+        r.volumes.release(sandbox).await.unwrap();
+        assert_eq!(
+            names(&r).await,
+            vec![
+                image_volumes::volume_name(image).to_string(),
+                checkpoint_name(sandbox, DiskRole::Root, first).to_string(),
+            ]
+        );
     }
 
     /// [`FileSources`] whose recovery always fails.

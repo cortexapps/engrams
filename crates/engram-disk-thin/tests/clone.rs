@@ -22,7 +22,7 @@ use engram_host_core::disk::{
 };
 use engram_host_core::disk_sources::Served;
 use engram_host_core::image_volumes;
-use engram_host_core::session_volumes::{live_name, Source};
+use engram_host_core::session_volumes::{live_name, Cutover, Source, Waiting};
 use engram_host_core::{checkpoint, stage, DiskSources, FileDisk, FileSources, SessionVolumes};
 use engram_storage_local::LocalBlobStorage;
 
@@ -1053,6 +1053,69 @@ async fn a_checkpoint_mid_hydration_stages_into_what_the_drive_read() {
     assert!(matches!(rig.root_state().await, CloneState::Copying { .. }));
     drop(drive);
     rig.release_clean().await;
+}
+
+/// Hydrated to the end, the role cuts over through the session volumes:
+/// a handle opened before reads the manifest and the guest's write, and
+/// the bitmap, the source and its loop device are gone. The first
+/// checkpoint after the cutover stages into what the drive reads.
+#[tokio::test]
+#[ignore]
+async fn a_hydrated_session_role_cuts_over_and_stops_its_source() {
+    let Some(rig) = SessionRig::new(None).await else {
+        return;
+    };
+    let drive = rig.lazy_root().await;
+    let mut expected = rig.bytes.clone();
+    write(&drive, &mut expected, 3 * REGION + 4096, vec![0x5A; 4096]).await;
+    let deadline = tokio::time::Instant::now() + HYDRATION_DEADLINE;
+    loop {
+        match rig
+            .volumes
+            .cut_over(rig.sandbox, DiskRole::Root)
+            .await
+            .unwrap()
+        {
+            Cutover::Done => break,
+            Cutover::Waiting(Waiting::Copying(_)) => {}
+            waiting => panic!("{waiting:?}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not hydrated in {HYDRATION_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(rig.root_state().await, CloneState::CutOver);
+    assert_eq!(first_difference(&whole(&drive).await, &expected), None);
+    assert_eq!(rig.sources.list().await.unwrap(), Vec::new());
+    assert_eq!(rig.sources.devices().len(), 0);
+    let bitmap = format!("{}-root-bitmap", rig.sandbox.as_uuid().simple());
+    let devices = devices_naming(rig.sandbox.as_uuid().simple());
+    assert!(!devices.iter().any(|d| d.ends_with(&bitmap)), "{devices:?}");
+    assert_eq!(
+        rig.volumes
+            .hydration(rig.sandbox, DiskRole::Root)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let published = rig
+        .volumes
+        .checkpoint(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
+    let staged = staged_bytes(&rig.files, &rig.store, "staged", published).await;
+    assert_eq!(first_difference(&staged, &expected), None);
+    drop(drive);
+    let report = rig.volumes.purge(rig.sandbox).await.unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(
+        devices_naming(rig.sandbox.as_uuid().simple()),
+        Vec::<String>::new()
+    );
 }
 
 /// Over a staged base the destination is a snapshot of the image
