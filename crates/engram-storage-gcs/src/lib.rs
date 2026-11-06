@@ -196,7 +196,7 @@ impl BlobStorage for GcsBlobStorage {
             .upload_object(&req, body, &upload_type)
             .await
             .map_err(map_http_err)?;
-        tracing::debug!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
+        tracing::trace!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
         Ok(len)
     }
 
@@ -234,7 +234,7 @@ impl BlobStorage for GcsBlobStorage {
             .await
             .map_err(map_http_err)?;
         let total = total.load(std::sync::atomic::Ordering::Relaxed);
-        tracing::debug!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
+        tracing::trace!(bucket = %self.bucket, key = %key, bytes = total, "gcs put");
         Ok(total)
     }
 
