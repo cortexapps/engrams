@@ -1603,6 +1603,65 @@ async fn ops_pipeline(ctx: &Ctx) {
         .unwrap());
 }
 
+/// The terminal op writes report whether they ended a row:
+/// `op_cancel_queued` ends every queued op of the kind and no running
+/// one; `op_cancel_by_id` ends only a queued row; `op_finish` ends only
+/// a running row at its epoch.
+async fn op_terminal_writes(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:op-terminal")).await.unwrap();
+    let EnqueueOutcome::Claimed(running) = meta
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("first op must be Claimed")
+    };
+    let mut queued = Vec::new();
+    for kind in [OpKind::Evict, OpKind::Evict, OpKind::Resume] {
+        match meta
+            .op_enqueue_and_claim(sid, kind, serde_json::json!({}), None, "pod-a")
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Queued(op) => queued.push(op),
+            other => panic!("ops behind a running op must queue, got {other:?}"),
+        }
+    }
+
+    assert!(meta.op_cancel_queued(sid, OpKind::Evict).await.unwrap());
+    assert!(
+        !meta.op_cancel_queued(sid, OpKind::Evict).await.unwrap(),
+        "nothing queued of the kind is left to cancel",
+    );
+    for op in &queued[..2] {
+        let row = meta.op_get(op.id).await.unwrap().unwrap();
+        assert_eq!(row.state, OpState::Cancelled);
+    }
+    let row = meta.op_get(running.id).await.unwrap().unwrap();
+    assert_eq!(row.state, OpState::Running, "a running op is not cancelled");
+
+    assert!(!meta.op_cancel_by_id(running.id).await.unwrap());
+    assert!(meta.op_cancel_by_id(queued[2].id).await.unwrap());
+    assert!(!meta.op_cancel_by_id(queued[2].id).await.unwrap());
+
+    let epoch = running.epoch.unwrap();
+    assert!(meta
+        .op_finish(running.id, epoch, OpState::Failed, Some("conf"))
+        .await
+        .unwrap());
+    assert!(
+        !meta
+            .op_finish(running.id, epoch, OpState::Done, None)
+            .await
+            .unwrap(),
+        "a finished op is not finished again",
+    );
+    let row = meta.op_get(running.id).await.unwrap().unwrap();
+    assert_eq!(row.state, OpState::Failed);
+    assert_eq!(row.error.as_deref(), Some("conf"));
+}
+
 /// Issue #1314: `op_resume_failure_streak` counts terminally-failed
 /// resume ops that recorded a side-effectful step (`restore`/`bind`/
 /// `finish`), newer than the latest successful resume. Every clause is
@@ -4009,6 +4068,7 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(t_op_terminal_writes, super::op_terminal_writes);
 conformance!(t_op_resume_failure_streak, super::op_resume_failure_streak);
 conformance!(
     t_op_wake_queued_kind_counts_due_ops,

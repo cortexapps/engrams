@@ -291,6 +291,21 @@ impl PostgresStore {
     }
 }
 
+/// The NOTIFY channel that carries the id of each op that reached a
+/// terminal state. Coordinator replicas LISTEN on it to wake the RPCs
+/// that wait for an op to end.
+pub const OP_FINISHED_CHANNEL: &str = "session_op_finished";
+
+/// Wraps a terminal `UPDATE session_ops … RETURNING id` so that the same
+/// statement sends one [`OP_FINISHED_CHANNEL`] NOTIFY per row it ended.
+/// Postgres delivers the NOTIFY only when the statement commits.
+fn notify_op_finished(update: &str) -> String {
+    format!(
+        "WITH ended AS ({update})
+         SELECT pg_notify('{OP_FINISHED_CHANNEL}', id::text) FROM ended"
+    )
+}
+
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
@@ -7849,19 +7864,20 @@ impl MetadataStore for PostgresStore {
         state: OpState,
         error: Option<&str>,
     ) -> Result<bool, MetaError> {
-        let res = sqlx::query(
+        let ended = sqlx::query(&notify_op_finished(
             "UPDATE session_ops SET state = $3, error = $4, finished_at = $5
-              WHERE id = $1 AND epoch = $2 AND state = 'running'",
-        )
+              WHERE id = $1 AND epoch = $2 AND state = 'running'
+             RETURNING id",
+        ))
         .bind(op_id)
         .bind(epoch)
         .bind(state.as_str())
         .bind(error)
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        Ok(!ended.is_empty())
     }
 
     async fn op_requeue_with_backoff(
@@ -7900,17 +7916,18 @@ impl MetadataStore for PostgresStore {
     ) -> Result<bool, MetaError> {
         // Every queued op of the kind — a cancelled verb has no business
         // running later from a duplicate row further down the queue.
-        let res = sqlx::query(
+        let ended = sqlx::query(&notify_op_finished(
             "UPDATE session_ops SET state = 'cancelled', finished_at = $3
-              WHERE session_id = $1 AND kind = $2 AND state = 'queued'",
-        )
+              WHERE session_id = $1 AND kind = $2 AND state = 'queued'
+             RETURNING id",
+        ))
         .bind(session_id.as_uuid())
         .bind(kind.as_str())
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        Ok(!ended.is_empty())
     }
 
     async fn op_wake_queued_kind(
@@ -8028,16 +8045,17 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
-        let res = sqlx::query(
+        let ended = sqlx::query(&notify_op_finished(
             "UPDATE session_ops SET state = 'cancelled', finished_at = $2
-              WHERE id = $1 AND state = 'queued'",
-        )
+              WHERE id = $1 AND state = 'queued'
+             RETURNING id",
+        ))
         .bind(op_id)
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        Ok(!ended.is_empty())
     }
 
     async fn op_pending_exists(
