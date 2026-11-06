@@ -484,8 +484,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         "the mid-run harness keeps RUNNING on the destination (heartbeat advances)"
     );
 
-    // Durability catch-up on B, then B checkpoints the moved VM (the
-    // lineage continues on the new host).
+    // B's first checkpoint is a diff on the lineage the finish seeded
+    // (the seed is v1), and the lineage continues on the new host.
     let row = host_b
         .pooled
         .checkpoint_sandbox(moved)
@@ -493,6 +493,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("durable checkpoint");
     let durable_ref = row.memory_manifest.expect("durable memory manifest");
     assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
+    assert_eq!(
+        durable_ref.version, 2,
+        "the first checkpoint after the move diffs against the seeded lineage"
+    );
     chunk_store
         .get_manifest(durable_ref)
         .await

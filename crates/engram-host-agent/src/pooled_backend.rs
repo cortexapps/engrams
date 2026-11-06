@@ -734,33 +734,32 @@ impl Drop for AbortTaskOnDrop {
 
 /// Observe the local handler independently of the coordinator's drain-wait RPC.
 /// ControlTx replays terminal reports to each subscriber, including late ones.
-fn monitor_hint_poller(poller: AbortTaskOnDrop, sock: Option<PathBuf>) -> AbortTaskOnDrop {
+/// Observe the destination's drain outcome locally, stop the optional
+/// hot-hint poller at that outcome, then run `then` (the post-copy
+/// finish). Destroy or a failed restore drops the returned task, which
+/// cancels the poller, the subscription, and `then`.
+fn observe_post_copy_drain<F, Fut>(
+    sock: PathBuf,
+    poller: Option<AbortTaskOnDrop>,
+    then: F,
+) -> AbortTaskOnDrop
+where
+    F: FnOnce(std::io::Result<engram_core::types::snapshot::DrainOutcome>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     AbortTaskOnDrop(tokio::spawn(async move {
-        let mut poller = poller;
-        let Some(sock) = sock else { return };
-        tokio::select! {
-            biased;
-            result = observe_memory_drain(&sock) => {
-                if let Err(error) = result {
-                    tracing::info!(%error, "post-copy hint observer failed; stop optional polling");
-                }
-            }
-            _ = &mut poller.0 => {}
-        }
-        // Drop also cancels an in-flight fetch. Destroy/restore failure cancels
-        // this owner and closes the local subscription without a blocking task.
+        let observe = crate::postcopy_finish::observe_drain(&sock);
+        tokio::pin!(observe);
+        let outcome = match poller {
+            Some(mut poller) => tokio::select! {
+                biased;
+                outcome = &mut observe => outcome,
+                _ = &mut poller.0 => observe.await,
+            },
+            None => observe.await,
+        };
+        then(outcome).await;
     }))
-}
-
-async fn observe_memory_drain(sock: &Path) -> std::io::Result<()> {
-    use engram_migrate_proto::HandlerControl;
-    let mut stream = tokio::net::UnixStream::connect(sock).await?;
-    loop {
-        match crate::migrate_peer::read_frame_async(&mut stream).await? {
-            HandlerControl::DrainDone { .. } | HandlerControl::PeerLost { .. } => return Ok(()),
-            HandlerControl::Sealed { .. } | HandlerControl::DrainProgress { .. } => {}
-        }
-    }
 }
 
 /// Retry only while the advisory budget remains. The owner cancels this future
@@ -1607,6 +1606,14 @@ impl PooledBackend {
             let inner = self.inner.clone();
             let migration_roles = self.migration_roles.clone();
             let hint_pollers = self.hint_pollers.clone();
+            let finish = post_copy_dest.then(|| crate::postcopy_finish::PostCopyFinish {
+                id: new_id,
+                inner: self.inner.clone(),
+                finisher: self.finisher(),
+                source_manifest: metadata.memory_manifest,
+                migration_roles: self.migration_roles.clone(),
+                drained_dests: self.drained_dests.clone(),
+            });
             let disks = disks.clone();
             tokio::spawn(async move {
                 if fresh {
@@ -1616,14 +1623,16 @@ impl PooledBackend {
                 } else {
                     inner.restore(new_id, metadata, disks).await?
                 };
-                if let Some(poller) = hint_poller {
-                    hint_pollers.insert(
-                        new_id,
-                        monitor_hint_poller(poller, inner.post_copy_control_sock(new_id)),
-                    );
-                }
                 if post_copy_dest {
                     migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
+                }
+                if let (Some(finish), Some(sock)) = (finish, inner.post_copy_control_sock(new_id)) {
+                    let observed = observe_post_copy_drain(
+                        sock.clone(),
+                        hint_poller,
+                        move |outcome| async move { finish.complete(outcome, &sock).await },
+                    );
+                    hint_pollers.insert(new_id, observed);
                 }
                 Ok(())
             })
@@ -2282,6 +2291,15 @@ impl PooledBackend {
         {
             return Err(SandboxError::Snapshot(
                 "snapshot hold already in progress; resume or destroy required".into(),
+            ));
+        }
+        // A post-copy destination's first capture must follow its chain
+        // seed: the seed relies on the dirty log that runs since load,
+        // and a capture consumes it. The post-copy finish clears the role.
+        if self.migration_role(id) == Some(crate::migration::MigrationRole::PostCopyDest) {
+            return Err(SandboxError::Snapshot(
+                "post-copy destination: captures wait for the memory drain and the chain seed"
+                    .into(),
             ));
         }
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
@@ -3172,6 +3190,11 @@ impl PooledBackend {
             .iter()
             .filter_map(|e| {
                 let id = *e.key();
+                // A sandbox in a move is never a candidate: its role fences
+                // captures.
+                if self.migration_role(id).is_some() {
+                    return None;
+                }
                 let last = self.last_snapshot_unix_ms.get(&id).map(|v| *v).unwrap_or(0);
                 let due_after = match self.checkpoint_pacing.get(&id).map(|v| *v) {
                     Some(s) => crate::checkpoint::next_epoch_after(
@@ -4106,6 +4129,55 @@ impl SnapshotFinisher {
         );
     }
 
+    /// A post-copy destination's seed: publish `source` (the source's
+    /// chain manifest) with the data ranges of `sealed` (the bytes the
+    /// peer supplied) written over it, under a fresh lineage. That is
+    /// the guest's memory at load, so the next capture diffs against it.
+    pub(crate) async fn seed_checkpoint_chain_post_copy(
+        &self,
+        id: SandboxId,
+        source: engram_core::types::manifest::ManifestRef,
+        sealed: &Path,
+    ) -> Result<engram_core::types::manifest::ManifestRef, String> {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return Err("no chunk store".into());
+        };
+        if self.checkpoint_dir.is_none() {
+            return Err("checkpoints are off".into());
+        }
+        if self.checkpoint_chains.contains_key(&id) {
+            return Err("a chain already exists".into());
+        }
+        let path = sealed.to_path_buf();
+        let ranges = tokio::task::spawn_blocking(move || crate::checkpoint::dirty_ranges(&path))
+            .await
+            .map_err(|e| format!("sealed ranges join: {e}"))?
+            .map_err(|e| format!("sealed ranges: {e}"))?;
+        let prev = chunk_store
+            .get_manifest(source)
+            .await
+            .map_err(|e| format!("source manifest {source}: {e}"))?;
+        let manifest = chunk_store
+            .update_for_dirty_ranges_sparse(&prev, sealed, &ranges)
+            .await
+            .map_err(|e| format!("re-chunk sealed chunks: {e}"))?;
+        let fork = engram_core::types::manifest::ManifestRef::new();
+        chunk_store
+            .put_manifest(fork, &manifest)
+            .await
+            .map_err(|e| format!("put manifest {fork}: {e}"))?;
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: fork,
+                manifest,
+            },
+        );
+        self.persist_chain_head(id, fork).await;
+        self.stamp_seeded(id);
+        Ok(fork)
+    }
+
     /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
     /// (no local rolling image — "sparse mode"). Two entry points: on
     /// RESUME from the source's memory manifest, and after a fresh Full
@@ -4683,15 +4755,6 @@ impl SandboxBackend for PooledBackend {
         Ok(snapshot_id)
     }
 
-    /// ADR 0045 C2: the pre-pause presetup. Mints the export identity
-    /// + packages the restore inputs derivable BEFORE the pause: the
-    /// sidecar (live composition — nothing in it changes across the
-    /// freeze), the inline CHAIN manifest (the session manifest ref is
-    /// the chain's CURRENT durable ref: post-copy never re-chunks at
-    /// capture, sealed chunks override via the peer at fault time, and
-    /// the dest's first checkpoint is a safe Full = the durability
-    /// catch-up), the live disk ref, and the hot set. NO pause, no
-    /// fence — the guest runs until `migration_capture_postcopy`.
     /// ADR 0045 C2: the inner backend's answer, unchanged — the pooled
     /// layer adds nothing to "what file is this guest's RAM mapped from".
     fn post_copy_source_view(
@@ -4701,6 +4764,15 @@ impl SandboxBackend for PooledBackend {
         self.inner.post_copy_source_view(id)
     }
 
+    /// ADR 0045 C2: the pre-pause presetup. Mints the export identity
+    /// + packages the restore inputs derivable BEFORE the pause: the
+    /// sidecar (live composition — nothing in it changes across the
+    /// freeze), the inline CHAIN manifest (the session manifest ref is
+    /// the chain's CURRENT durable ref: post-copy never re-chunks at
+    /// capture, sealed chunks override via the peer at fault time, and
+    /// the dest publishes them over this manifest after the drain), the
+    /// live disk ref, and the hot set. NO pause, no fence — the guest
+    /// runs until `migration_capture_postcopy`.
     async fn migration_presetup(
         &self,
         id: SandboxId,
@@ -5114,15 +5186,16 @@ impl SandboxBackend for PooledBackend {
     /// Await the memory drain's terminal outcome over the handler's
     /// control socket. The disk landed before `state.bin` did, so the
     /// source is released when memory no longer depends on it.
-    /// `PeerLost` pauses (poisons) the dest VM before returning.
+    /// `PeerLost` pauses (poisons) the dest VM before returning. The
+    /// destination role is the post-copy finish's to clear
+    /// (`postcopy_finish`). A caller may drop this future at any time;
+    /// the read thread then ends within one read timeout.
     async fn migration_drain_wait(
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
         use engram_core::types::snapshot::DrainOutcome;
         if let Some(done) = self.drained_dests.get(&id).map(|d| d.clone()) {
-            // The drain already finished; only the role clear is pending.
-            self.set_migration_role(id, None).await?;
             return Ok(done);
         }
         let Some(sock) = self.inner.post_copy_control_sock(id) else {
@@ -5130,17 +5203,44 @@ impl SandboxBackend for PooledBackend {
                 "no post-copy control socket for this sandbox".into(),
             ));
         };
-        let hint_pollers = self.hint_pollers.clone();
+        struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cancel = CancelOnDrop(cancelled.clone());
         let outcome = tokio::task::spawn_blocking(move || -> Result<DrainOutcome, String> {
+            const DRAIN_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
             let mut stream = std::os::unix::net::UnixStream::connect(&sock)
                 .map_err(|e| format!("dial control sock: {e}"))?;
             stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(600)))
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .map_err(|e| format!("control sock timeout: {e}"))?;
+            let started = crate::time_source::metrics_now();
             loop {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("drain wait cancelled".into());
+                }
+                if started.elapsed() > DRAIN_WAIT_BUDGET {
+                    return Err("drain wait timed out".into());
+                }
                 let msg: engram_migrate_proto::HandlerControl =
-                    engram_migrate_proto::read_frame(&mut stream)
-                        .map_err(|e| format!("control frame: {e}"))?;
+                    match engram_migrate_proto::read_frame(&mut stream) {
+                        Ok(msg) => msg,
+                        // A frame is written whole under the backlog lock,
+                        // so a timeout falls between frames.
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue
+                        }
+                        Err(e) => return Err(format!("control frame: {e}")),
+                    };
                 match msg {
                     engram_migrate_proto::HandlerControl::DrainDone {
                         pulled,
@@ -5152,7 +5252,6 @@ impl SandboxBackend for PooledBackend {
                         fault_max_us,
                         fault_around_chunks_installed,
                     } => {
-                        hint_pollers.remove(&id);
                         // Restore-tail attribution: the fault-path
                         // totals are the serial P2P cost inside the FC
                         // load + early guest execution (cross-ref with
@@ -5172,7 +5271,6 @@ impl SandboxBackend for PooledBackend {
                         });
                     }
                     engram_migrate_proto::HandlerControl::PeerLost { remaining, detail } => {
-                        hint_pollers.remove(&id);
                         return Ok(DrainOutcome::PeerLost { remaining, detail });
                     }
                     engram_migrate_proto::HandlerControl::Sealed { .. }
@@ -5195,11 +5293,7 @@ impl SandboxBackend for PooledBackend {
                 tracing::warn!(sandbox_id = %id, error = %e, "poison-pause failed");
             }
         } else {
-            // Both drains complete: the dest no longer depends on the
-            // source. Record that first, so a failed role persist is
-            // retried by the next call rather than reported as a lost drain.
             self.drained_dests.insert(id, outcome.clone());
-            self.set_migration_role(id, None).await?;
         }
         Ok(outcome)
     }
@@ -5585,9 +5679,8 @@ impl SandboxBackend for PooledBackend {
             Vec::new(),
         )
         .await?;
-        // Peer pages differ from the source chain. A post-copy destination
-        // starts with a full checkpoint after drain; only ordinary restores
-        // can seed a sparse checkpoint chain here.
+        // Peer pages differ from the source chain, so a post-copy
+        // destination seeds after its drain (`postcopy_finish`).
         if migration.is_none() {
             if let Some(memory_ref) = memory_ref {
                 self.seed_checkpoint_chain_sparse(id, memory_ref).await;
@@ -8404,6 +8497,7 @@ mod tests {
                 detail: "peer closed".into(),
             },
         ] {
+            let done = matches!(terminal, HandlerControl::DrainDone { .. });
             let tmp = tempfile::tempdir().unwrap();
             let sock = tmp.path().join("control.sock");
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
@@ -8433,7 +8527,10 @@ mod tests {
                 // Cancellation drops this sender instead of completing normally.
                 finished_tx.send(()).unwrap();
             }));
-            let mut observer = monitor_hint_poller(poller, Some(sock));
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let mut observer = observe_post_copy_drain(sock, Some(poller), |outcome| async move {
+                outcome_tx.send(outcome.unwrap()).unwrap();
+            });
             ready_rx.await.unwrap();
             start_tx.send(()).unwrap();
             request_rx.recv().await.unwrap();
@@ -8450,6 +8547,14 @@ mod tests {
             (&mut source.0).await.unwrap();
             (&mut observer.0).await.unwrap();
             assert!(finished_rx.await.is_err(), "poller must be cancelled");
+            let outcome = outcome_rx.await.unwrap();
+            assert_eq!(
+                matches!(
+                    outcome,
+                    engram_core::types::snapshot::DrainOutcome::Done { .. }
+                ),
+                done
+            );
             let expected = 1 + intervals.len();
             assert_eq!(requests.load(Ordering::SeqCst), expected);
             tokio::time::advance(Duration::from_millis(800)).await;
@@ -11303,11 +11408,11 @@ mod tests {
         assert_eq!(pooled.migration_role(id), None);
     }
 
-    /// A finished drain is remembered: when the role clear fails, the next
-    /// call retries only the clear and reports the same outcome, instead of
-    /// turning a complete drain into a lost peer.
+    /// A finished drain is remembered for later calls, and the
+    /// destination role is the post-copy finish's to clear: the drain
+    /// wait never writes it, and a capture is refused while it is set.
     #[tokio::test]
-    async fn migration_drain_wait_retries_the_role_clear_after_the_drain_finished() {
+    async fn migration_drain_wait_reports_a_finished_drain_and_leaves_the_role() {
         use engram_core::types::snapshot::DrainOutcome;
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
@@ -11322,13 +11427,6 @@ mod tests {
             ms: 30,
         };
         pooled.drained_dests.insert(id, done.clone());
-        inner
-            .fail_role_write
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        pooled.migration_drain_wait(id).await.unwrap_err();
-        inner
-            .fail_role_write
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         let again = pooled.migration_drain_wait(id).await.unwrap();
         assert!(matches!(
             again,
@@ -11338,12 +11436,138 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(*inner.calls.lock(), vec!["role", "role"]);
-        assert_eq!(pooled.migration_role(id), None);
+        assert!(inner.calls.lock().is_empty());
+        assert_eq!(
+            pooled.migration_role(id),
+            Some(crate::migration::MigrationRole::PostCopyDest)
+        );
+        let refused = pooled
+            .capture_phase(id, CaptureUser::PeriodicCheckpoint)
+            .await
+            .err()
+            .expect("a post-copy destination refuses captures");
+        assert!(refused.to_string().contains("post-copy destination"));
         // Destroy forgets both the role and the drain memo.
         pooled.destroy(id).await.unwrap();
         assert!(!pooled.drained_dests.contains_key(&id));
         assert!(!pooled.migration_roles.contains_key(&id));
+    }
+
+    /// The destination's seed is the source chain manifest with the
+    /// peer-supplied chunks written over it: the guest's memory at load.
+    /// Linux only: APFS can report a fresh sparse file's hole as data.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_copy_seed_publishes_the_peer_chunks_over_the_source_manifest() {
+        use engram_chunk_store::manifest::{
+            ChunkRef, ChunkSize, ManifestKind, MANIFEST_SCHEMA_VERSION,
+        };
+        use std::os::unix::fs::FileExt as _;
+        const CHUNK: u64 = 4096;
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let mut chunks = Vec::new();
+        for i in 0..4u8 {
+            let hash = cs.put_chunk(&vec![i + 1; CHUNK as usize]).await.unwrap();
+            chunks.push(ChunkRef {
+                offset: u64::from(i) * CHUNK,
+                hash,
+            });
+        }
+        let source_manifest = engram_chunk_store::Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(CHUNK),
+            total_bytes: 4 * CHUNK,
+            chunks,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let source = engram_core::types::manifest::ManifestRef::new();
+        cs.put_manifest(source, &source_manifest).await.unwrap();
+        // The peer supplied chunk 2 with the source's newer bytes.
+        let sealed = tmp.path().join("sealed.bin");
+        std::fs::File::create(&sealed)
+            .unwrap()
+            .write_all_at(&[0x5A; CHUNK as usize], 2 * CHUNK)
+            .unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        release.send(()).unwrap();
+        let id = inner.id;
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs.clone())
+            .with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let fork = pooled
+            .finisher()
+            .seed_checkpoint_chain_post_copy(id, source, &sealed)
+            .await
+            .unwrap();
+        assert_ne!(fork.manifest_id, source.manifest_id, "a fresh lineage");
+        assert_eq!(
+            pooled.checkpoint_chains.get(&id).unwrap().manifest_ref,
+            fork
+        );
+        assert!(pooled.has_checkpoint_stamp(id));
+        let recovered = tmp.path().join("recovered.bin");
+        cs.materialize_to_file(&cs.get_manifest(fork).await.unwrap(), &recovered)
+            .await
+            .unwrap();
+        let memory = std::fs::read(&recovered).unwrap();
+        for (i, want) in [1u8, 2, 0x5A, 4].into_iter().enumerate() {
+            let chunk = &memory[i * CHUNK as usize..(i + 1) * CHUNK as usize];
+            assert!(chunk.iter().all(|b| *b == want), "chunk {i}");
+        }
+    }
+
+    /// After a done drain the finish records the outcome and clears the
+    /// role, retrying a failed manifest write. Without a sealed output it
+    /// seeds no chain, so the first capture is Full.
+    #[tokio::test(start_paused = true)]
+    async fn post_copy_finish_clears_the_role_and_retries_a_failed_write() {
+        use engram_core::types::snapshot::DrainOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        release.send(()).unwrap();
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        pooled.note_migration_role(id, Some(crate::migration::MigrationRole::PostCopyDest));
+        inner
+            .fail_role_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let finish = crate::postcopy_finish::PostCopyFinish {
+            id,
+            inner: inner.clone(),
+            finisher: pooled.finisher(),
+            source_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+            migration_roles: pooled.migration_roles.clone(),
+            drained_dests: pooled.drained_dests.clone(),
+        };
+        let sock = tmp.path().join("uffd-control.sock");
+        let done = DrainOutcome::Done {
+            pulled: 1,
+            alt_sourced: 0,
+            zero_chunks: 0,
+            ms: 1,
+        };
+        let task = tokio::spawn(async move { finish.complete(Ok(done), &sock).await });
+        while !inner.calls.lock().contains(&"role") {
+            tokio::task::yield_now().await;
+        }
+        assert!(pooled.drained_dests.contains_key(&id));
+        assert_eq!(
+            pooled.migration_role(id),
+            Some(crate::migration::MigrationRole::PostCopyDest)
+        );
+        inner
+            .fail_role_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        task.await.unwrap();
+        assert_eq!(pooled.migration_role(id), None);
+        assert!(!pooled.checkpoint_chains.contains_key(&id));
     }
 
     /// A `SnapshotMetadata` carrying a recognizable id for assertions.

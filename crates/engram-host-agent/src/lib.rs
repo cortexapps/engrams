@@ -97,6 +97,7 @@ pub mod live_attach;
 pub mod materialize;
 pub mod metrics;
 pub mod pooled_backend;
+pub(crate) mod postcopy_finish;
 pub mod proxy_port;
 pub mod proxy_shell;
 pub mod proxyd_client;
