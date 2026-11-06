@@ -401,12 +401,6 @@ fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], second, 0, 0)
 }
 
-/// How long `destroy` waits for the guest to honour SendCtrlAltDel
-/// before escalating to SIGKILL. A healthy debian-slim/ubuntu rootfs
-/// halts within ~1s; 3s leaves room for the page-cache drain at
-/// snapshot time without making a single destroy feel slow.
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// ADR 0045 C2 (E2B fold): per-jail working-set trace dump filename —
 /// the uffd-handler's fault-order hot set, read best-effort by the
 /// migration capture for the `hot_chunks` rider.
@@ -6425,10 +6419,10 @@ impl SandboxBackend for FirecrackerBackend {
 /// a running microVM AND a retried destroy hit the idempotent
 /// early-return and falsely reported success.
 ///
-/// Sequence: graceful shutdown → SIGKILL of FC → SIGTERM/SIGKILL of the
-/// uffd handler → cgroup rmdir → TAP/netns teardown + allocator `free()`
-/// → canonical-entry + jail-dir removal. Each step is best-effort and
-/// logs rather than aborting the rest.
+/// Sequence: SIGKILL of FC → SIGTERM/SIGKILL of the uffd handler →
+/// cgroup rmdir → TAP/netns teardown + allocator `free()` →
+/// canonical-entry + jail-dir removal.
+/// Each step is best-effort and logs rather than aborting the rest.
 ///
 /// Belt-and-braces: FC and the uffd pid are armed with [`SpawnKillGuard`]s
 /// for the kill window, so even if THIS task is itself aborted mid-kill
@@ -6471,52 +6465,11 @@ async fn destroy_teardown(
         let _ = listener.await;
     }
 
-    // Try a graceful shutdown first: PUT /actions { SendCtrlAltDel }
-    // tells the guest kernel to halt cleanly via the keyboard
-    // controller's CAD signal, draining the page cache before we
-    // pull the plug. If the guest doesn't respond within
-    // `GRACEFUL_SHUTDOWN_TIMEOUT`, we fall through to SIGKILL.
-    let api = FirecrackerClient::new(&live.state.firecracker_socket);
-    // ADR 0009 §6: `child` is `None` for sandboxes pidfd-reattached
-    // on host-agent startup (we don't own a `Child` for those —
-    // the original process was spawned by a previous host-agent
-    // generation). For those, we fall back to libc::kill +
-    // poll-for-exit since there's no `Child::wait` to drive.
-    let graceful = async {
-        api.put_action(ActionType::SendCtrlAltDel).await?;
-        wait_for_fc_exit(&mut live.child, live.fc_pid)
-            .await
-            .map_err(SandboxError::from)
-    };
-    match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
-        Ok(Ok(_)) => {
-            tracing::debug!(sandbox_id = %id, "firecracker exited cleanly via SendCtrlAltDel");
-        }
-        Ok(Err(e)) => {
-            // SendCtrlAltDel rejected (FC API rejected the action,
-            // socket closed, etc.) — escalate to SIGKILL. This
-            // also covers the case where the API socket is gone
-            // but the child somehow survives.
-            tracing::debug!(
-                sandbox_id = %id,
-                error = %e,
-                "graceful shutdown failed; escalating to SIGKILL",
-            );
-            kill_fc(&mut live.child, live.fc_pid, id).await;
-            let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
-        }
-        Err(_) => {
-            // Timeout: guest didn't honour CAD within the grace
-            // window. Force-kill.
-            tracing::debug!(
-                sandbox_id = %id,
-                timeout = ?GRACEFUL_SHUTDOWN_TIMEOUT,
-                "firecracker didn't exit in time; SIGKILLing",
-            );
-            kill_fc(&mut live.child, live.fc_pid, id).await;
-            let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
-        }
-    }
+    // No clean guest shutdown: a path that keeps the session has a
+    // durable snapshot before it destroys, and the live disk goes with
+    // the VM, so nothing reads what the guest has not flushed.
+    kill_fc(&mut live.child, live.fc_pid, id).await;
+    let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
     // FC is confirmed gone — defuse its kill guard.
     if let Some(g) = fc_guard.as_mut() {
         g.disarm();
@@ -9406,67 +9359,48 @@ mod tests {
     /// FC process running forever AND a retried destroy hit the idempotent
     /// early-return, falsely reporting success.
     ///
-    /// We model the FC process with a real long-lived child (`sleep`,
-    /// `kill_on_drop(false)` to mirror ADR 0044 K2 — dropping the
-    /// `LiveSandbox` must NOT kill it), and force `destroy` to park in the
-    /// cancellable graceful-shutdown window with a UDS that accepts the
-    /// SendCtrlAltDel connection but never answers (so `put_action` blocks
-    /// for the full `GRACEFUL_SHUTDOWN_TIMEOUT`). We then cancel `destroy`
-    /// after 100ms — well inside that 3s window — and assert the spawned
-    /// teardown task still SIGKILLs the child, removes the jail dir + the
-    /// canonical entry, and that a retried destroy stays `Ok` with the
-    /// invariants holding (idempotency preserved, but no longer a lie).
+    /// We model the FC process and the uffd handler with real long-lived
+    /// children (`kill_on_drop(false)` to mirror ADR 0044 K2 — dropping the
+    /// `LiveSandbox` must NOT kill them). The handler stand-in ignores
+    /// SIGTERM, so `destroy` parks in the 2 s SIGTERM grace of the handler
+    /// teardown. We then cancel `destroy` after 100ms — well inside that
+    /// window — and assert the spawned teardown task still SIGKILLs both
+    /// children, removes the jail dir + the canonical entry, and that a
+    /// retried destroy stays `Ok` with the invariants holding (idempotency
+    /// preserved, but no longer a lie).
     ///
     /// Pre-fix this test fails: the cancelled future drops `live`, the
-    /// child survives, the jail dir lingers, and the retry no-ops.
+    /// children survive, the jail dir lingers, and the retry no-ops.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_is_cancel_safe_kills_fc_and_cleans_up() {
         use std::time::Duration;
-        use tokio::io::AsyncReadExt;
 
         // `_dir` keeps the backend's work_dir tempdir alive for the test.
         let (be, _dir) = backend();
         let id = SandboxId::new();
 
-        // A UDS at the FC API socket path that accepts but never replies,
-        // so `FirecrackerClient::put_action(SendCtrlAltDel)` blocks inside
-        // `tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, ..)` — i.e. the
-        // cancellable window the bug lives in. Rooted in the shared short
-        // socket dir because UDS paths are capped at SUN_LEN (~104B) and the
-        // per-test tempdir + sandbox-id filename overflow it.
-        let sock_dir = engram_core::socket::short_socket_dir();
-        std::fs::create_dir_all(&sock_dir).unwrap();
-        let socket = sock_dir.join("fc.sock");
-        let _ = std::fs::remove_file(&socket);
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fc api stub socket");
-        let _accept_task = tokio::spawn(async move {
-            while let Ok((mut conn, _)) = listener.accept().await {
-                // Hold the connection open and never write a response;
-                // just drain so the kernel doesn't RST. Dropped when the
-                // test ends.
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    while let Ok(n) = conn.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-
-        // Real, long-lived stand-in for the FC process. `kill_on_drop`
-        // OFF mirrors prod (ADR 0044 K2): dropping the `LiveSandbox`'s
-        // `Child` must NOT reap it — only an explicit kill does. That's
-        // exactly what makes the cancel orphan a VM pre-fix.
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("120").kill_on_drop(false);
         let child = cmd.spawn().expect("spawn sleep stand-in for firecracker");
         let fc_pid = child.id().expect("sleep child has a pid");
+        // An ignored signal stays ignored across `exec`. The line on stdout
+        // says the trap is in place.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; echo ready; exec sleep 120"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(false);
+        let mut handler = cmd.spawn().expect("spawn stand-in for the uffd handler");
+        let mut ready = tokio::io::BufReader::new(handler.stdout.take().unwrap());
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut ready, &mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        let handler_pid = handler.id().expect("handler child has a pid");
         assert!(
-            pid_alive(fc_pid),
-            "stand-in FC process is alive pre-destroy"
+            pid_alive(fc_pid) && pid_alive(handler_pid),
+            "stand-ins are alive pre-destroy"
         );
 
         // Materialize the jail dir + a canonical entry so we can assert
@@ -9487,7 +9421,7 @@ mod tests {
             LiveSandbox {
                 state: SandboxState {
                     spec: spec(),
-                    firecracker_socket: socket.clone(),
+                    firecracker_socket: jail_dir.join("firecracker.sock"),
                     rootfs_path: jail_dir.join("rootfs.ext4"),
                     vsock_cid: 3,
                     vsock_uds_path: jail_dir.join("vsock.sock"),
@@ -9497,8 +9431,8 @@ mod tests {
                 },
                 child: Some(child),
                 fc_pid: Some(fc_pid),
-                uffd_handler: None,
-                uffd_pid: None,
+                uffd_handler: Some(handler),
+                uffd_pid: Some(handler_pid),
                 net: None,
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
@@ -9510,11 +9444,11 @@ mod tests {
             },
         );
 
-        // Cancel destroy 100ms in — deep inside the 3s graceful window.
+        // Cancel destroy 100ms in — deep inside the handler's SIGTERM grace.
         let cancelled = tokio::time::timeout(Duration::from_millis(100), be.destroy(id)).await;
         assert!(
             cancelled.is_err(),
-            "destroy must still be parked in the graceful window when we cancel it"
+            "destroy must still be parked in the handler teardown when we cancel it"
         );
 
         assert_eq!(be.list().await.unwrap(), vec![id]);
@@ -9532,12 +9466,12 @@ mod tests {
         assert!(be.list().await.unwrap().is_empty());
 
         // THE invariant: despite the cancellation, the detached teardown
-        // task runs to completion. After the graceful window elapses it
-        // SIGKILLs the FC stand-in and removes the on-disk artifacts.
-        // Poll generously (graceful window is 3s; add slack).
+        // task runs to completion: it SIGKILLs both stand-ins and removes
+        // the on-disk artifacts.
+        let gone = || !pid_alive(fc_pid) && !pid_alive(handler_pid) && !jail_dir.exists();
         let mut killed = false;
         for _ in 0..120 {
-            if !pid_alive(fc_pid) && !jail_dir.exists() {
+            if gone() {
                 killed = true;
                 break;
             }
@@ -9545,9 +9479,10 @@ mod tests {
         }
         assert!(
             killed,
-            "cancelled destroy must STILL kill the FC process and remove the jail dir \
-             (pid_alive={}, jail_exists={})",
+            "cancelled destroy must STILL kill FC and the handler and remove the jail dir \
+             (fc_alive={}, handler_alive={}, jail_exists={})",
             pid_alive(fc_pid),
+            pid_alive(handler_pid),
             jail_dir.exists(),
         );
         for entry in &canonical {
@@ -9563,11 +9498,6 @@ mod tests {
         be.destroy(id).await.expect("retried destroy is Ok");
         assert!(!pid_alive(fc_pid), "FC process stays dead after retry");
         assert!(!be.sandboxes.contains_key(&id), "map entry stays absent");
-
-        // The FC stand-in's `Child` was moved into the `LiveSandbox` and
-        // reaped inside `kill_fc`'s `Child::kill().await`, so no zombie is
-        // left. Tidy up the stub socket dir.
-        let _ = std::fs::remove_dir_all(&sock_dir);
     }
 
     /// Issue #197: the `SpawnKillGuard` is now armed INSIDE the spawn
