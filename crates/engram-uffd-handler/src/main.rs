@@ -486,6 +486,23 @@ mod linux {
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
+        // The session's published first-touch prefix, read beside the
+        // startup work: the first-touch recorder carries it forward.
+        let previous_prefix = args.trace_key.map(|session| {
+            let blob = blob.clone();
+            tokio::spawn(async move {
+                let key = engram_chunk_store::FirstTouch::key(session);
+                match blob.get(&key).await {
+                    Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes),
+                    Err(engram_core::BlobError::NotFound) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "first-touch prefix unreadable");
+                        None
+                    }
+                }
+            })
+        });
+
         // ADR 0075: dial the single writer and run the readiness Hello
         // BEFORE any FC-facing surface exists (base-shm creation + the
         // UDS bind happen downstream of here). A HelloAck with
@@ -748,6 +765,7 @@ mod linux {
                         base_shm,
                         peer: peer_wiring,
                         sealed_output,
+                        previous_prefix,
                     },
                 )
             }

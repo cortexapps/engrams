@@ -149,13 +149,20 @@ pub struct PrefaultStats {
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
 
 /// Write `bytes` to `path` through a temp file and a rename, so a reader
-/// never sees a partial file. Best-effort: a failure is logged.
+/// never sees a partial file. Each call has its own temp file, so fault
+/// threads that write one path at once do not truncate each other's.
+/// Best-effort: a failure is logged.
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".{}.tmp",
+        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp);
     if let Err(e) = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
         tracing::warn!(error = %e, path = %path.display(), "write");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -169,23 +176,13 @@ pub fn prefault_stats_path(trace_output: &std::path::Path) -> Option<PathBuf> {
         .map(|dir| dir.join(PREFAULT_STATS_FILE))
 }
 
-/// Best-effort, atomic (temp+rename) write — same pattern as
-/// [`Runtime::dump_trace_output`]. Failures are logged, never
+/// Best-effort [`write_atomic`]. Failures are logged, never
 /// propagated: the stats file is a diagnostic surface, not load-bearing
 /// for the restore itself (a write failure here must never fail or
 /// slow down the guest's boot).
 pub fn write_prefault_stats(path: &std::path::Path, stats: &PrefaultStats) {
     match serde_json::to_vec(stats) {
-        Ok(bytes) => {
-            let tmp = path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp, &bytes) {
-                tracing::warn!(error = %e, path = %tmp.display(), "prefault_stats tmp write");
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                tracing::warn!(error = %e, path = %path.display(), "prefault_stats rename");
-            }
-        }
+        Ok(bytes) => write_atomic(path, &bytes),
         Err(e) => tracing::warn!(error = %e, "prefault_stats serialize"),
     }
 }
@@ -582,7 +579,7 @@ pub struct Runtime {
     /// A failed install rolls the chunk back to `Empty` so it is retried
     /// rather than permanently poisoned (issue #206).
     installed: Mutex<Vec<ChunkState>>,
-    /// The chunks faulted first, by position, for the next restore's prefix.
+    /// The chunks the guest needs first, by position, for the next restore's prefix.
     first_touch: crate::first_touch::FirstTouchRecorder,
     /// Notified whenever a chunk leaves `Installing` (→ `Installed` on
     /// success, → `Empty` on rollback). A fault that found the chunk
@@ -802,7 +799,12 @@ impl Runtime {
     /// fault loop snapshots the recorder into the path every N
     /// faults (and once after the recorder window closes) so the
     /// trace lands on disk even if the loop doesn't unwind cleanly.
+    /// The first-touch record goes to its sibling file as each entry is
+    /// recorded.
     pub fn set_trace_output(&mut self, path: PathBuf) {
+        if let Some(dir) = path.parent() {
+            self.first_touch.set_output(&dir.join(FirstTouch::FILE));
+        }
         self.trace_output = Some(path);
     }
 
@@ -845,9 +847,10 @@ impl Runtime {
     }
 
     /// Snapshot the current recorder state and write it to
-    /// `trace_output` if configured. Best-effort; failures are
-    /// logged but don't propagate (the path matters more than
-    /// our error reporting).
+    /// `trace_output` if configured. The recorder lock is held through
+    /// the write, so an older snapshot never replaces a newer one.
+    /// Best-effort; failures are logged but don't propagate (the path
+    /// matters more than our error reporting).
     fn dump_trace_output(&self) {
         let Some(path) = self.trace_output.as_ref() else {
             return;
@@ -859,17 +862,11 @@ impl Runtime {
             chrono::Utc::now(),
         );
         trace.chunks = r.chunks_snapshot();
-        drop(r);
         match serde_json::to_vec(&trace) {
             Ok(bytes) => write_atomic(path, &bytes),
             Err(e) => tracing::warn!(error = %e, "trace_output serialize"),
         }
-        if let Some(dir) = path.parent() {
-            write_atomic(
-                &dir.join(FirstTouch::FILE),
-                &self.first_touch.snapshot().encode(),
-            );
-        }
+        drop(r);
     }
 
     /// Pre-install every chunk listed in `trace` into the guest
@@ -885,6 +882,7 @@ impl Runtime {
         let started = std::time::Instant::now();
         let mut installed = 0usize;
         let mut skipped = 0usize;
+        let chunk_size = self.backend.chunk_size();
         // Run the body in a closure so a `?`-propagated error still falls
         // through to the stats write below (#526: a handler that dies
         // partway through must leave a stats file recording what it DID
@@ -922,6 +920,7 @@ impl Runtime {
                         if did {
                             installed += 1;
                         }
+                        self.first_touch.touch((byte_offset / chunk_size) as usize);
                     }
                     continue;
                 }
@@ -930,6 +929,7 @@ impl Runtime {
                     if self.install_chunk_at(byte_offset, bytes.clone(), false)? {
                         installed += 1;
                     }
+                    self.first_touch.touch((byte_offset / chunk_size) as usize);
                 }
             }
             Ok(())
@@ -2460,6 +2460,9 @@ pub struct RunListenerOpts {
     /// Peer mode: record every peer-supplied chunk here (see
     /// [`crate::peer::SealedOutput`]).
     pub sealed_output: Option<PathBuf>,
+    /// The session's published first-touch prefix, as it loads; the
+    /// first-touch recorder carries it forward.
+    pub previous_prefix: Option<tokio::task::JoinHandle<Option<Vec<u32>>>>,
 }
 
 pub fn run_listener(
@@ -2477,6 +2480,7 @@ pub fn run_listener(
         base_shm,
         peer,
         sealed_output,
+        previous_prefix,
     } = opts;
     let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
@@ -2524,6 +2528,14 @@ pub fn run_listener(
     // sound. Previously prefault ran to completion before `run()`, which put
     // the entire working-set fetch on the resume critical path.
     let rt = Arc::new(rt);
+    if let Some(prefix) = previous_prefix {
+        let rt = Arc::clone(&rt);
+        rt.handle.clone().spawn(async move {
+            if let Ok(Some(indices)) = prefix.await {
+                rt.first_touch.carry(&indices);
+            }
+        });
+    }
     {
         // Off the fault path: the composition stats every divergent chunk.
         let composition = Arc::clone(&rt);
