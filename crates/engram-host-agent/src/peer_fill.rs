@@ -431,7 +431,8 @@ async fn pull_shard(
                 return stats;
             };
             let len = current.len();
-            if let Err(e) = cache.put_trusted(hash, &current).await {
+            let body = bytes::Bytes::from(std::mem::take(&mut current));
+            if let Err(e) = cache.put_trusted(hash, body).await {
                 // Local landing failure (ENOSPC…) — not the peer's
                 // fault; skip this chunk (GCS pass covers it) and keep
                 // draining the stream.
@@ -442,7 +443,6 @@ async fn pull_shard(
                 metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
                 metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => "peer").increment(len as u64);
             }
-            current = Vec::new();
             current_idx = None;
         }
     }

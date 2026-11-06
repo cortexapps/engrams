@@ -175,7 +175,7 @@ impl ChunkStore {
                 // chunk is durable in the store regardless.
                 if let Some(cache) = &cache {
                     // `put_chunk` just hashed these bytes.
-                    if let Err(e) = cache.put_trusted(hash, &bytes).await {
+                    if let Err(e) = cache.put_trusted(hash, bytes).await {
                         tracing::warn!(
                             %hash,
                             error = %e,
@@ -466,7 +466,7 @@ impl ChunkStore {
                     // below, once.
                     Some(cache) => {
                         let hash = crate::manifest::ChunkHash::of(&slice);
-                        cache.put_no_evict(hash, &slice).await?;
+                        cache.put_no_evict(hash, Bytes::from(slice)).await?;
                         hash
                     }
                     None => {
@@ -1154,7 +1154,7 @@ mod tests {
         assert_eq!(fs::read(&dest).await.unwrap(), data);
         // Cache should hold every chunk now.
         for entry in &m.chunks {
-            assert!(cache.contains(entry.hash).await);
+            assert!(cache.contains(entry.hash));
         }
     }
 

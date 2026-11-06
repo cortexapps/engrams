@@ -176,7 +176,10 @@ async fn bench_tuned_grpc_pull() {
     let mut hashes = Vec::new();
     for b in &bodies {
         let h = ChunkHash::of(b);
-        serve_cache.put(h, b).await.unwrap();
+        serve_cache
+            .put(h, bytes::Bytes::copy_from_slice(b))
+            .await
+            .unwrap();
         hashes.push(h);
     }
     let total_bytes: usize = bodies.iter().map(Vec::len).sum();

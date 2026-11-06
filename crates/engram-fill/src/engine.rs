@@ -234,7 +234,7 @@ impl FillEngine {
                 stats.duplicate += 1;
                 continue;
             }
-            if cache.contains_on_disk(hash) {
+            if cache.contains(hash) {
                 stats.resident += 1;
                 continue;
             }

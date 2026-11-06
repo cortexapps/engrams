@@ -81,7 +81,10 @@ async fn fill_fetches_each_missing_chunk_once_and_skips_resident_ones() {
     let a = put(&f, b"chunk a").await;
     let b = put(&f, b"chunk b").await;
     let c = put(&f, b"chunk c").await;
-    f.cache.put(c, b"chunk c").await.unwrap();
+    f.cache
+        .put(c, Bytes::from_static(b"chunk c"))
+        .await
+        .unwrap();
     let resolver = counting(&f, None);
     let engine = engine_over(&f, resolver.clone(), Config::default());
 
@@ -122,7 +125,10 @@ async fn a_corrupt_store_object_is_neither_served_nor_stored() {
 async fn a_cache_hit_takes_no_slot() {
     let f = fixture();
     let hash = put(&f, b"resident").await;
-    f.cache.put(hash, b"resident").await.unwrap();
+    f.cache
+        .put(hash, Bytes::from_static(b"resident"))
+        .await
+        .unwrap();
     let engine = engine_over(&f, counting(&f, None), Config::default());
     let _all = engine.admission().acquire(Class::Demand).await;
 

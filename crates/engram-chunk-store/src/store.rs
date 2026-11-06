@@ -292,7 +292,7 @@ impl ChunkStore {
     /// a later fetch.
     async fn warm_local(&self, hash: ChunkHash, body: Bytes) {
         if let Some(cache) = &self.cache {
-            if let Err(e) = cache.write_local(hash, &body).await {
+            if let Err(e) = cache.write_local(hash, body).await {
                 tracing::debug!(
                     hash = %hash,
                     error = %e,

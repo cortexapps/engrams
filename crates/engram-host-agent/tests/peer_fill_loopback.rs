@@ -176,7 +176,10 @@ async fn seed_verified(cache: &ChunkCache, bodies: &[Vec<u8>]) -> Vec<ChunkHash>
     let mut hashes = Vec::new();
     for b in bodies {
         let h = ChunkHash::of(b);
-        cache.put(h, b).await.expect("seed put");
+        cache
+            .put(h, bytes::Bytes::copy_from_slice(b))
+            .await
+            .expect("seed put");
         hashes.push(h);
     }
     hashes
@@ -267,8 +270,8 @@ async fn missing_hash_is_an_honest_miss_not_a_fault() {
     assert_eq!(stats.landed, 1);
     assert_eq!(stats.missing, 1);
     assert!(!health.is_lost(&addr), "a miss must not mark the peer lost");
-    assert!(land_cache.contains(hashes[0]).await);
-    assert!(!land_cache.contains(absent).await);
+    assert!(land_cache.contains(hashes[0]));
+    assert!(!land_cache.contains(absent));
 }
 
 #[tokio::test]
@@ -299,7 +302,7 @@ async fn stale_base_image_scope_is_rejected() {
     .await;
     assert!(stats.failed, "stale scope must fail the window");
     assert_eq!(stats.landed, 0);
-    assert!(!land_cache.contains(hashes[0]).await);
+    assert!(!land_cache.contains(hashes[0]));
 }
 
 #[tokio::test]

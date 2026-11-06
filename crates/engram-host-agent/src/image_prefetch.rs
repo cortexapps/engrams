@@ -838,7 +838,7 @@ async fn peer_prepass(
         async move {
             let mut missing = Vec::new();
             for h in hashes {
-                if !cache.contains(h).await {
+                if !cache.contains(h) {
                     missing.push(h);
                 }
             }
