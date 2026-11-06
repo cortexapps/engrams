@@ -204,7 +204,9 @@ impl PopulateClient {
         &self,
         mut f: impl FnMut(&mut UnixStream) -> std::io::Result<T>,
     ) -> Result<T, PopulateError> {
+        let waited = std::time::Instant::now();
         let mut guard = self.conn.lock().expect("populate conn lock");
+        crate::fault_stats::STATS.record_lock_wait(waited.elapsed());
         let mut last_err = None;
         for attempt in 0..RECONNECT_ATTEMPTS {
             if guard.is_none() {
