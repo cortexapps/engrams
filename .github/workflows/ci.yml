@@ -1264,7 +1264,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_ublk == 'true'
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Load the ublk driver
@@ -1292,6 +1292,21 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-source \
             --test ublk_device \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+      # The host-agent runs each disk source as a process of its own.
+      - name: host-agent disk-source process tests (root)
+        env:
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          cargo build -p engram-disk-source --bin engram-disk-source
+          cargo nextest run -p engram-host-agent --test disk_source_ublk --no-run
+          sudo -E env "PATH=$PATH" \
+            "ENGRAM_DISK_SOURCE_BIN=$PWD/target/debug/engram-disk-source" \
+            cargo nextest run \
+            -p engram-host-agent \
+            --test disk_source_ublk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

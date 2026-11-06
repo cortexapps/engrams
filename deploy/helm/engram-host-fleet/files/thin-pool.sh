@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build or re-activate the node's dm-thin pool over two preallocated
-# files attached as loop devices. Idempotent: safe on every boot.
+# files attached as loop devices, and load the ublk driver. Idempotent:
+# safe on every boot.
 # Exits non-zero when thin_check fails, so a node never comes up with a
 # pool it cannot trust. Runs in the host mount namespace.
 #
@@ -30,6 +31,12 @@ META="$POOL_DIR/metadata.img"
 DATA="$POOL_DIR/data.img"
 
 log() { echo "[thin-pool] $*"; }
+
+# The disk sources of lazy restores are ublk devices. Loaded before the
+# pool check, so a node whose pool is already active loads it too. A
+# kernel without the driver keeps the node: the host-agent then refuses
+# to start a source and logs why.
+modprobe ublk_drv 2>/dev/null || log "WARNING: no ublk driver; lazy restore cannot run here"
 
 if dmsetup info "$POOL_NAME" >/dev/null 2>&1; then
     log "$POOL_NAME is active"

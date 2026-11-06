@@ -62,6 +62,13 @@ struct Cli {
     #[arg(long, env = "ENGRAM_THIN_POOL")]
     thin_pool: Option<String>,
 
+    /// When a restore boots before its disk is complete: `off`, `force`
+    /// or `auto`. Any mode but `off` runs a disk source process per
+    /// restoring disk, which needs the ublk driver on a host with a thin
+    /// pool.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE", default_value = "off")]
+    lazy_restore: engram_host_agent::config::LazyRestore,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -321,6 +328,7 @@ async fn main() -> Result<(), HostAgentError> {
             BackendChoice::Firecracker => "firecracker".to_string(),
             BackendChoice::Vz => "vz".to_string(),
         },
+        lazy_restore: cli.lazy_restore,
         ..HostAgentConfig::default()
     };
 
@@ -686,6 +694,7 @@ async fn main() -> Result<(), HostAgentError> {
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let observe_token = cfg.coordinator_token.clone();
 
+    let disk_sources = disk_sources(&cli, &chunk_store)?;
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store)
         .with_chunk_cache(chunk_cache)
@@ -695,6 +704,9 @@ async fn main() -> Result<(), HostAgentError> {
         .with_base_shm_protected(base_shm_protected);
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
+    }
+    if let Some(sources) = disk_sources {
+        agent = agent.with_disk_sources(sources);
     }
     // The egress proxy is mandatory (issue #240) and, since ADR 0121,
     // lives in `engram-egress-proxyd` — a node-local daemon that
@@ -753,6 +765,46 @@ async fn main() -> Result<(), HostAgentError> {
         }
     }
     agent.run().await
+}
+
+/// The sources lazy restores read from (ADR 0127): a process per source
+/// over a thin pool, a staged file per source over sparse files. `None`
+/// when lazy restore is off.
+fn disk_sources(
+    cli: &Cli,
+    chunk_store: &engram_chunk_store::ChunkStore,
+) -> Result<Option<Arc<dyn engram_host_core::DiskSources>>, HostAgentError> {
+    use engram_host_agent::config::LazyRestore;
+    use engram_host_agent::disk_source::{ProcessSources, ProcessSourcesConfig};
+    if cli.lazy_restore == LazyRestore::Off {
+        return Ok(None);
+    }
+    if cli.thin_pool.is_none() {
+        let files = engram_host_core::FileSources::new(
+            cli.work_dir.join("file-sources"),
+            chunk_store.clone(),
+        )
+        .map_err(HostAgentError::Io)?;
+        return Ok(Some(Arc::new(files)));
+    }
+    let bin = std::env::var_os("ENGRAM_DISK_SOURCE_BIN")
+        .map_or_else(|| PathBuf::from("engram-disk-source"), PathBuf::from);
+    let mut cfg = ProcessSourcesConfig::new(bin, cli.work_dir.clone());
+    // The VMs' node cgroup (ADR 0044 K2): a source outlives the pod too.
+    cfg.cgroup_parent = std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    cfg.cache_root = Some(cli.work_dir.join("chunk-cache"));
+    let sources = ProcessSources::new(cfg);
+    if let Err(error) = sources.check_driver() {
+        tracing::error!(
+            %error,
+            mode = ?cli.lazy_restore,
+            "lazy restore is on, but this host cannot start a disk source",
+        );
+    }
+    Ok(Some(Arc::new(sources)))
 }
 
 /// Load the egress CA material for the daemon (ADR 0121): the daemon

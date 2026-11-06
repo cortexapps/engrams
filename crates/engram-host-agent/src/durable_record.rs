@@ -1,14 +1,17 @@
 //! One-file-per-record durable JSON persistence — the shared engine
-//! under `checkpoint::CheckpointRecord` (ADR 0028 Fix A) and
-//! `capture_job::CaptureJobRecord` (ADR 0084 §A).
+//! under `checkpoint::CheckpointRecord` (ADR 0028 Fix A),
+//! `capture_job::CaptureJobRecord` (ADR 0084 §A) and
+//! `disk_source::SourceRecord` (ADR 0127).
 //!
-//! The contract both rely on:
+//! The contract they rely on:
 //!   - **persist** = write to a `.json.partial` temp, fsync, rename, then
 //!     fsync the parent dir — the rename publishes complete bytes or
 //!     nothing, and the dir fsync makes the rename itself crash-durable;
 //!   - **load_all** = torn-write-tolerant: unreadable/unparseable files
 //!     are skipped with a warn, never an error — a torn write must not
 //!     wedge the heartbeat loop that re-advertises these records;
+//!   - **load** = one record by id; a torn or corrupt file is an
+//!     `InvalidData` error, because the caller asked for that record;
 //!   - **delete** = idempotent (NotFound is fine): the coordinator acked,
 //!     the PG row owns the reference now.
 //!
@@ -32,6 +35,8 @@ use std::path::{Path, PathBuf};
 
 use engram_host_core::HostFs;
 use serde::de::DeserializeOwned;
+
+use crate::durable_envelope::OpenError;
 use serde::Serialize;
 
 pub fn record_path(dir: &Path, id: impl Display) -> PathBuf {
@@ -83,37 +88,83 @@ pub async fn load_all<T: DeserializeOwned>(fs: &dyn HostFs, dir: &Path, what: &s
         // The record's expected identity is its filename stem — bind the
         // envelope's sealed id to it so a misdirected read is rejected.
         let expected_id = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        match fs.read(&p).await {
-            Ok(bytes) => match crate::durable_envelope::open(&bytes, expected_id) {
-                Ok(body) => match serde_json::from_slice::<T>(&body) {
-                    Ok(r) => out.push(r),
-                    Err(e) => {
-                        tracing::warn!(path = %p.display(), error = %e,
-                            "unparseable {what} body; skipping");
-                    }
-                },
-                // R5: DISTINCT logs — a checksum/identity failure is
-                // corruption (a real finding), not a torn write.
-                Err(e @ crate::durable_envelope::OpenError::ChecksumMismatch { .. }) => {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "corrupt {what} (checksum); skipping");
-                }
-                Err(e @ crate::durable_envelope::OpenError::IdMismatch { .. }) => {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "misdirected {what} (identity); skipping");
-                }
-                Err(e @ crate::durable_envelope::OpenError::Malformed(_)) => {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "malformed {what} envelope; skipping");
-                }
-            },
+        let bytes = match fs.read(&p).await {
+            Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(path = %p.display(), error = %e,
                     "unreadable {what}; skipping");
+                continue;
+            }
+        };
+        match decode(&bytes, expected_id) {
+            Ok(r) => out.push(r),
+            Err(Unusable::Body(e)) => {
+                tracing::warn!(path = %p.display(), error = %e,
+                    "unparseable {what} body; skipping");
+            }
+            // R5: DISTINCT logs — a checksum/identity failure is
+            // corruption (a real finding), not a torn write.
+            Err(Unusable::Envelope(e @ OpenError::ChecksumMismatch { .. })) => {
+                tracing::warn!(path = %p.display(), error = %e,
+                    "corrupt {what} (checksum); skipping");
+            }
+            Err(Unusable::Envelope(e @ OpenError::IdMismatch { .. })) => {
+                tracing::warn!(path = %p.display(), error = %e,
+                    "misdirected {what} (identity); skipping");
+            }
+            Err(Unusable::Envelope(e @ OpenError::Malformed(_))) => {
+                tracing::warn!(path = %p.display(), error = %e,
+                    "malformed {what} envelope; skipping");
             }
         }
     }
     out
+}
+
+/// The record `<dir>/<id>.json`: `None` when there is none, `InvalidData`
+/// when its file is torn or corrupt.
+pub async fn load<T: DeserializeOwned>(
+    fs: &dyn HostFs,
+    dir: &Path,
+    id: impl Display,
+    what: &str,
+) -> std::io::Result<Option<T>> {
+    let id = id.to_string();
+    let path = record_path(dir, &id);
+    let bytes = match fs.read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    decode(&bytes, &id).map(Some).map_err(|e| {
+        let e = match e {
+            Unusable::Envelope(e) => e.to_string(),
+            Unusable::Body(e) => e.to_string(),
+        };
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} {}: {e}", path.display()),
+        )
+    })
+}
+
+enum Unusable {
+    Envelope(OpenError),
+    Body(serde_json::Error),
+}
+
+/// Open the envelope of `bytes` for the record id `id` and parse its body.
+fn decode<T: DeserializeOwned>(bytes: &[u8], id: &str) -> Result<T, Unusable> {
+    let body = crate::durable_envelope::open(bytes, id).map_err(Unusable::Envelope)?;
+    serde_json::from_slice(&body).map_err(Unusable::Body)
+}
+
+/// Delete the record `<dir>/<id>.json`; NotFound is fine (already gone).
+pub async fn delete(fs: &dyn HostFs, dir: &Path, id: impl Display) -> std::io::Result<()> {
+    match fs.remove_file(&record_path(dir, id)).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Delete the acked records' files; NotFound is fine (already gone).
@@ -124,12 +175,10 @@ pub async fn delete_acked(
     what: &str,
 ) {
     for id in acked {
-        let p = record_path(dir, id);
-        if let Err(e) = fs.remove_file(&p).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %p.display(), error = %e,
-                    "failed to delete acked {what}");
-            }
+        let id = id.to_string();
+        if let Err(e) = delete(fs, dir, &id).await {
+            tracing::warn!(path = %record_path(dir, &id).display(), error = %e,
+                "failed to delete acked {what}");
         }
     }
 }

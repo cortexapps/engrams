@@ -50,6 +50,37 @@ pub struct HostAgentConfig {
     /// the mode=all / in-process test-harness backend, which never
     /// constructs a `HostAgentConfig` through `main.rs`'s match anyway.
     pub backend_name: String,
+    /// When a restore boots before its disk is complete (ADR 0127).
+    pub lazy_restore: LazyRestore,
+}
+
+/// When a restore boots over a source before its disk is complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LazyRestore {
+    /// Every restore writes the whole disk before it boots. The host
+    /// starts no disk source.
+    #[default]
+    Off,
+    /// Every restore boots over a source.
+    Force,
+    /// A restore boots over a source when it cannot finish its writes
+    /// within the eager budget.
+    Auto,
+}
+
+impl std::str::FromStr for LazyRestore {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(Self::Off),
+            "force" => Ok(Self::Force),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!(
+                "invalid lazy restore mode `{other}`: expected `off`, `force` or `auto`"
+            )),
+        }
+    }
 }
 
 impl Default for HostAgentConfig {
@@ -67,6 +98,7 @@ impl Default for HostAgentConfig {
             grpc_advertise_addr: None,
             migrate_peer_listen_addr: None,
             backend_name: "process".to_string(),
+            lazy_restore: LazyRestore::Off,
         }
     }
 }

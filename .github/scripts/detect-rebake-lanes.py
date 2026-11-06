@@ -86,7 +86,8 @@ import sys
 from pathlib import Path
 
 # Binaries that bake into each artifact.
-FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"}
+FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd",
+           "engram-disk-source"}
 
 # ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator.
 # engram-dst-cosim deliberately spans BOTH closures — it pulls
@@ -111,12 +112,16 @@ COSIM_BINS = {"engram-dst-cosim"}
 # copies it to /usr/local/bin) and is spawned by path, not a cargo
 # dependency, so it must be listed here or a daemon-only change
 # deploys nowhere.
+#
+# engram-disk-source (ADR 0127): the same shape again — the host-agent
+# container carries it and spawns it by path.
 CONTAINER_BINS = {
     "engram-coordinator",
     "engram-host-agent",
     "engram-host-operator",
     "engram-uffd-handler",
     "engram-egress-proxyd",
+    "engram-disk-source",
 }
 # The built-in claude harness binary. ADR 0062: it is NOT baked into any
 # image — it rides the fleet `current_bundles` stamp (the
@@ -160,7 +165,8 @@ E2E_BINS = {
 
 # Crates whose root tests need the kernel's ublk driver (ADR 0127). They
 # run on their own lane: the Firecracker runners' kernel has no ublk.
-UBLK_TEST_CRATES = {"engram-disk-source"}
+# engram-host-agent runs its disk sources as engram-disk-source processes.
+UBLK_TEST_CRATES = {"engram-disk-source", "engram-host-agent"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -613,8 +619,7 @@ def main():
         if baselines else ({}, {})
 
     coord_closure = release_closure(meta, {"engram-coordinator"})
-    ha_closure = release_closure(
-        meta, {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"})
+    ha_closure = release_closure(meta, FC_BINS)
     hop_closure = release_closure(meta, {"engram-host-operator"})
     dirs = crate_dirs(meta, repo_root)
 

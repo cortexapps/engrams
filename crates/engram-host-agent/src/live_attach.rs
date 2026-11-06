@@ -751,6 +751,12 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("chunk-cache")).unwrap();
         std::fs::create_dir_all(tmp.path().join("bindings")).unwrap();
         std::fs::write(tmp.path().join("bindings/keep.json"), b"{}").unwrap();
+        // A disk source outlives its sandbox's VM (ADR 0127): its record
+        // and log stay, even for a dead sandbox id.
+        let source = tmp.path().join("disk-sources");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(format!("{dead_dir_id}-root.json")), b"{}").unwrap();
+        std::fs::write(source.join(format!("{dead_dir_id}-root.log")), b"").unwrap();
         // ADR 0112: leaked swap backings. Design is unlink-after-attach,
         // so ANY .img at startup is a leak — a dead sandbox's (aborted
         // create) and a LIVE one's (failed unlink; FC holds the fd, so
@@ -794,6 +800,11 @@ mod tests {
             tmp.path().join("chunk-cache").exists()
                 && tmp.path().join("bindings/keep.json").exists(),
             "non-uuid residents untouched"
+        );
+        assert!(
+            source.join(format!("{dead_dir_id}-root.json")).exists()
+                && source.join(format!("{dead_dir_id}-root.log")).exists(),
+            "disk source records and logs untouched"
         );
         assert!(
             kept_dir.exists() && tmp.path().join(format!("{kept_id}.vsock")).exists(),
