@@ -967,6 +967,9 @@ pub struct AppState {
     /// receiver-less `watch::Sender` is kept alive here; handlers call
     /// `subscribe_shutdown()` for a fresh receiver.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// The fleet-wide heartbeat-ack reads, shared by the heartbeats this
+    /// replica takes within a short window.
+    pub heartbeat_fleet: crate::api::host_http::FleetReadCache,
 }
 
 impl AppState {
@@ -1048,6 +1051,7 @@ impl AppState {
             preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            heartbeat_fleet: Default::default(),
         }
     }
 

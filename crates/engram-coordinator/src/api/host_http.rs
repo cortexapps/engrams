@@ -664,85 +664,43 @@ pub async fn heartbeat(
         let _ = crate::harness_desync::run_once(&state, host_id, &running, &attached).await;
     }
 
-    // ADR 0015 M5: ship the coord's authoritative enabled-images
-    // set so the host's prefetch loop drives from heartbeat alone.
-    // Best-effort: a PG hiccup degrades to no-images for this tick.
-    let mut enabled_images = match state.services.meta.list_enabled_images().await {
-        Ok(rows) => enabled_image_refs_from_rows(rows),
-        Err(e) => {
-            tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
-            Vec::new()
-        }
-    };
-
-    // ADR 0036 amendment (issue #538): ship the base-snapshot refs of
-    // every enable job currently `prestaging`, so eligible hosts warm them
-    // BEFORE the scanner's `enabled_images` upsert makes the digest
-    // visible to session-create. Best-effort, same posture as
-    // `enabled_images` above — a PG hiccup degrades to no prestage work
-    // for this tick; the scanner's poll loop just sees one more empty
-    // heartbeat and keeps waiting. A row that fails to deserialize (wire
-    // skew mid-roll) is skipped + logged rather than failing the whole ack.
-    let mut prestage_images: Vec<EnabledImageRef> =
-        match state.services.meta.list_prestaging_refs().await {
-            Ok(raw) => raw
-                .into_iter()
-                .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
-                        None
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
-                Vec::new()
-            }
-        };
-
-    // ADR 0095: stamp peer-fill seeds onto every image entry — fleet
-    // siblings whose `ready_images` already carry the digest, so the
-    // recipient's prefetch supervisor pulls the base chunk set over the
-    // LAN instead of N-hosts × GCS. Freshly assembled every ack (never
-    // persisted; seeds change as hosts warm/die). Best-effort, same
-    // posture as the lists themselves: a PG hiccup ⇒ no seeds ⇒ pure
-    // GCS, byte-identical to pre-0095. The capturing host of a fresh
-    // enable flips ready within one reconcile tick of the snapshot row
-    // landing (its prefetch is an all-local stat walk), so it becomes
-    // the prestage seed automatically, and hosts that finish warming
-    // join the seed set — a natural fan-out tree.
-    if !(enabled_images.is_empty() && prestage_images.is_empty()) {
-        match state.services.meta.list_active_hosts().await {
-            Ok(hosts) => {
-                let now = state.services.clock.now_utc();
-                attach_warm_peers(&mut enabled_images, &hosts, host_id, now);
-                attach_warm_peers(&mut prestage_images, &hosts, host_id, now);
-            }
-            Err(e) => {
-                tracing::debug!(host_id = %host_id, error = %e, "list_active_hosts failed; no warm peers this tick");
-            }
-        }
-    }
-
-    // ADR 0035 §5: the bundle pin set. NOT best-effort — an empty set
-    // is an instruction to sweep, so a PG failure here must fail the
-    // heartbeat (the host retries next tick) rather than degrade to
-    // "nothing is pinned".
+    // The enabled and prestaging images and the fleet's host
+    // rows: the same for every host, so read once per replica per
+    // FLEET_READS_TTL. NOT best-effort: the host keeps exactly these
+    // images' volumes, so an empty set read from a PG failure would make
+    // it delete them.
     //
-    // ADR 0035 amendment D2 ordering invariant: this read runs strictly AFTER
-    // `touch_host_heartbeat` persisted THIS tick's `sandbox_bundles`
-    // (early-return on failure above), so a freshly rolled host's
-    // FIRST ack already pins its own reattached sandboxes'
-    // attachments — the ack drives the host's sweep, and this exact
-    // window (roll → reattach → first sweep before any pin existed)
-    // is what destroyed a running VM's only bundle copy on
-    // 2026-08-10. Do not move this read above the persist.
-    let live_bundles = state.services.meta.bundle_pin_set().await.map_err(|e| {
+    // ADR 0035 §5: the bundle pin set. NOT best-effort either — an empty
+    // set is an instruction to sweep. ADR 0035 amendment D2 ordering
+    // invariant: this read runs strictly AFTER `touch_host_heartbeat`
+    // persisted THIS tick's `sandbox_bundles` (early-return on failure
+    // above), so a freshly rolled host's FIRST ack already pins its own
+    // reattached sandboxes' attachments. Do not move it above the persist,
+    // and do not cache it.
+    let (fleet, live_bundles) = tokio::join!(
+        state.heartbeat_fleet.get(&state),
+        state.services.meta.bundle_pin_set()
+    );
+    let fleet = fleet.map_err(|e| {
+        ApiError::Internal(format!(
+            "fleet image reads failed; heartbeat ack withheld: {e}"
+        ))
+    })?;
+    let live_bundles = live_bundles.map_err(|e| {
         ApiError::Internal(format!(
             "bundle_pin_set failed; heartbeat ack withheld: {e}"
         ))
     })?;
+    let mut enabled_images = fleet.enabled_images.clone();
+    let mut prestage_images = fleet.prestage_images.clone();
+    // ADR 0095: peer-fill seeds per image — fleet siblings whose
+    // `ready_images` carry the digest. Chosen per recipient, never
+    // persisted. No host rows ⇒ no seeds ⇒ pure GCS.
+    if let Some(hosts) = &fleet.active_hosts {
+        let now = state.services.clock.now_utc();
+        attach_warm_peers(&mut enabled_images, hosts, host_id, now);
+        attach_warm_peers(&mut prestage_images, hosts, host_id, now);
+    }
 
     // ADR 0028 Fix A: reconcile the host's un-acked durable checkpoint
     // records into PG. `record_snapshot` is idempotent on snapshot_id
@@ -1092,6 +1050,85 @@ pub async fn heartbeat(
         acked_capture_jobs,
         tombstoned_sandboxes,
     }))
+}
+
+/// How long one replica answers heartbeats from one set of fleet-wide
+/// reads. Each host heartbeats every 5 s, so one read serves every
+/// heartbeat the replica takes in this window; a change to the image sets
+/// reaches a host at most this much later.
+const FLEET_READS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The heartbeat-ack inputs that are the same for every host.
+pub struct FleetReads {
+    enabled_images: Vec<EnabledImageRef>,
+    prestage_images: Vec<EnabledImageRef>,
+    /// `None` when there is no image to seed or the read failed: the acks
+    /// then carry no warm peers.
+    active_hosts: Option<Vec<HostRecord>>,
+}
+
+impl FleetReads {
+    async fn load(
+        meta: &dyn engram_core::traits::MetadataStore,
+    ) -> Result<Self, engram_core::error::MetaError> {
+        let (enabled, prestaging) =
+            futures::try_join!(meta.list_enabled_images(), meta.list_prestaging_refs())?;
+        let enabled_images = enabled_image_refs_from_rows(enabled);
+        // A row that fails to deserialize (wire skew mid-roll) is skipped
+        // rather than failing every ack.
+        let prestage_images: Vec<EnabledImageRef> = prestaging
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, "prestage_ref failed to deserialize; skipping");
+                    None
+                }
+            })
+            .collect();
+        let active_hosts = if enabled_images.is_empty() && prestage_images.is_empty() {
+            None
+        } else {
+            match meta.list_active_hosts().await {
+                Ok(hosts) => Some(hosts),
+                Err(e) => {
+                    tracing::debug!(error = %e, "list_active_hosts failed; no warm peers this tick");
+                    None
+                }
+            }
+        };
+        Ok(Self {
+            enabled_images,
+            prestage_images,
+            active_hosts,
+        })
+    }
+}
+
+/// One replica's [`FleetReads`], kept for [`FLEET_READS_TTL`] on the
+/// injected monotonic clock. Heartbeats that arrive during a read wait
+/// for it instead of reading again. A failed read is returned, not kept.
+#[derive(Default)]
+pub struct FleetReadCache {
+    slot: tokio::sync::Mutex<Option<(std::time::Duration, std::sync::Arc<FleetReads>)>>,
+}
+
+impl FleetReadCache {
+    async fn get(
+        &self,
+        state: &crate::state::AppState,
+    ) -> Result<std::sync::Arc<FleetReads>, engram_core::error::MetaError> {
+        let mut slot = self.slot.lock().await;
+        let now = state.services.clock.now_mono();
+        if let Some((read_at, reads)) = slot.as_ref() {
+            if now.saturating_sub(*read_at) < FLEET_READS_TTL {
+                return Ok(reads.clone());
+            }
+        }
+        let reads = std::sync::Arc::new(FleetReads::load(state.services.meta.as_ref()).await?);
+        *slot = Some((now, reads.clone()));
+        Ok(reads)
+    }
 }
 
 /// ADR 0084 P1b: map a `CaptureJobStage` to the `CapturePhase` the
@@ -1764,6 +1801,63 @@ mod tests {
     use crate::state::AppState;
     use crate::Services;
     use engram_core::traits::SandboxBackend;
+
+    fn sim_state(
+        meta: Arc<engram_sim::SimMetadataStore>,
+        clock: Arc<engram_sim::ManualClock>,
+    ) -> SharedState {
+        let blob = Arc::new(engram_sim::MemBlobStorage::new());
+        let services = Services {
+            meta: meta.clone(),
+            host: Arc::new(HostRegistry::new(meta)),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: blob.clone(),
+            chunk_store: engram_chunk_store::ChunkStore::new(blob),
+            materialize_dir: None,
+            clock,
+            entropy: Arc::new(engram_sim::SimEntropy::seeded(0xF1EE7)),
+        };
+        Arc::new(AppState::new(CoordinatorConfig::default(), services))
+    }
+
+    /// Heartbeats within one window share a read; the next window reads
+    /// again, and a failed read is not kept.
+    #[tokio::test]
+    async fn fleet_reads_are_shared_within_the_window_and_a_failure_is_not_kept() {
+        let clock = engram_sim::ManualClock::new();
+        let meta = engram_sim::SimMetadataStore::new(
+            clock.clone(),
+            Arc::new(engram_sim::SimEntropy::seeded(7)),
+        );
+        let state = sim_state(meta.clone(), clock.clone());
+        state.heartbeat_fleet.get(&state).await.expect("first read");
+
+        meta.set_outage(true);
+        state
+            .heartbeat_fleet
+            .get(&state)
+            .await
+            .expect("a heartbeat inside the window reads nothing");
+        clock.advance(FLEET_READS_TTL);
+        assert!(
+            state.heartbeat_fleet.get(&state).await.is_err(),
+            "the next window reads again"
+        );
+        meta.set_outage(false);
+        state
+            .heartbeat_fleet
+            .get(&state)
+            .await
+            .expect("the failed read was not kept");
+    }
 
     /// ADR 0116 A-D2 wire pin: the coordinator's `HandoffMarker` mirror
     /// must decode exactly what `engram_host_core::shutdown::HandoffMarker`
