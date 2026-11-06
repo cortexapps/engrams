@@ -649,7 +649,7 @@ impl SessionVolumes {
             .map_err(store_err)?;
         let manifest = checkpoint_split::upload(
             self.disk.as_ref(),
-            &self.fill.store(),
+            self.fill.store(),
             &snapshot,
             Some((&previous_volume, &previous_manifest)),
         )
