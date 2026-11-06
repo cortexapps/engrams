@@ -40,10 +40,11 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 #
 # The snapshot server throttles busy clients: a request can stall with no
 # data or fail with a 5xx. apt gives up on a request that sends nothing for
-# 30 s and tries it again, so a stall costs seconds, not the job's limit.
+# 30 s and tries it again, backing off up to 30 s between tries, so an
+# outage of a few minutes costs minutes, not the job's limit.
 ARG SNAPSHOT_TS=20260630T000000Z
 RUN set -eux; \
-    printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' \
+    printf '%s\n' 'Acquire::Retries "10";' 'Acquire::http::Timeout "30";' \
         'Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-retries; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
