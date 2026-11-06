@@ -313,7 +313,7 @@ impl ImageVolumes {
                 candidates.push((shared, *candidate, manifest));
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by_key(|(shared, _, _)| std::cmp::Reverse(*shared));
         for (_, candidate, manifest) in candidates {
             let lock = self.lock_of(candidate);
             let Ok(guard) = Arc::clone(&lock.volume).try_read_owned() else {
