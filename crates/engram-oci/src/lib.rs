@@ -92,6 +92,7 @@ pub struct OciClient {
     /// [`OciClient::pull_docker_blob_to_file`]). Production default;
     /// tests dial the backoff down via [`OciClient::with_blob_retry`].
     blob_retry: BlobRetryConfig,
+    ranged_pull: RangedPullConfig,
 }
 
 /// Transient-retry policy for streaming ONE (potentially multi-GB) blob
@@ -121,6 +122,29 @@ impl Default for BlobRetryConfig {
             max_attempts: 5,
             base_backoff: Duration::from_secs(1),
             rate_limit_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+/// How [`OciClient::pull_docker_blob_to_file`] splits a large blob into
+/// concurrent `Range` requests. One stream from a registry runs at tens
+/// of MB/s, so a multi-GB layer on one stream bounds the whole pull.
+#[derive(Clone, Copy, Debug)]
+pub struct RangedPullConfig {
+    /// Blobs smaller than this download on one stream.
+    pub min_blob_bytes: u64,
+    /// Bytes per range request.
+    pub part_bytes: u64,
+    /// Range requests in flight for one blob.
+    pub parts_in_flight: usize,
+}
+
+impl Default for RangedPullConfig {
+    fn default() -> Self {
+        Self {
+            min_blob_bytes: 256 << 20,
+            part_bytes: 64 << 20,
+            parts_in_flight: 8,
         }
     }
 }
@@ -169,6 +193,7 @@ impl OciClient {
             head_tokens: Arc::new(Mutex::new(HashMap::new())),
             auth,
             blob_retry: BlobRetryConfig::default(),
+            ranged_pull: RangedPullConfig::default(),
         }
     }
 
@@ -184,6 +209,13 @@ impl OciClient {
     /// The active per-blob retry policy (used by `docker_image.rs`).
     pub(crate) fn blob_retry(&self) -> BlobRetryConfig {
         self.blob_retry
+    }
+
+    /// Override how large blobs split into range requests. Production
+    /// runs on the default; tests use small parts.
+    pub fn with_ranged_pull(mut self, cfg: RangedPullConfig) -> Self {
+        self.ranged_pull = cfg;
+        self
     }
 
     /// The cached client whose protocol matches `reference`'s registry
