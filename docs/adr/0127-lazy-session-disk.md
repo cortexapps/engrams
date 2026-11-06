@@ -22,8 +22,8 @@
   a read-only source device. Reads of a region it has not copied go to
   the source; writes go to the destination; a background task copies
   the remaining regions. A **region** is its unit of copy (64 KiB here,
-  the pool's block size). Its **bitmap** records the copied regions, on
-  a metadata device.
+  the default block size of a production pool). Its **bitmap** records
+  the copied regions, on a metadata device.
 - **Hydration**: the background copy, from the source into the
   destination, until every region is copied.
 - **Cutover**: replacing the dm-clone table with a `linear` table onto
@@ -213,10 +213,14 @@ estimate in Decision 1.
 8. **A checkpoint during hydration is correct without waiting.** Under
    the pause the checkpoint syncs the drive, which commits the bitmap
    with every region the guest wrote. It then suspends the drive, which
-   stops the background copy, snapshots the bitmap volume and the
+   stops the background copy, snapshots the bitmap volume and then the
    destination, and resumes the drive. The copy does not stop for the
-   guest pause, so without the suspend the bitmap snapshot could record
-   a region that the destination snapshot does not hold. A destination
+   guest pause. With the bitmap snapshot taken first and the drive
+   synced, the pair is consistent: the kernel records a region in the
+   bitmap only after its copy is in the destination, so the later
+   destination snapshot holds every region the bitmap snapshot records.
+   The suspend makes the pair consistent in either order, and costs
+   milliseconds inside the pause that already exists. A destination
    snapshot reads zeros in regions not yet
    copied, so the upload never reads it directly. It reads through a
    view: a second dm-clone table over the two snapshots and the same
@@ -262,6 +266,18 @@ the simulator) has no dm-clone. It hydrates eagerly: `clone_drive`
 copies the source into the destination before it returns, so a drive
 is hydrated from the start and `cut_over` only records the state.
 
+A drive takes a bitmap that no drive has used (its first 4 KiB, where
+the kernel writes the dm-clone superblock, reads as zeros), and refuses
+a destination or bitmap that another drive or view uses. Operations on
+one drive are serialized, and a suspend runs to its resume in a task
+that a cancelled caller cannot stop.
+
+The region size is part of the on-disk format. The bitmap's superblock
+records it, and the kernel refuses a table over that bitmap with any
+other size, so a change of `CLONE_REGION_BYTES` is a format change. A
+view reads the region size from the superblock of its bitmap snapshot,
+so it composes with whatever size the drive used.
+
 ### Lifecycles
 
 **Lazy restore.** Create the destination and bitmap volumes. Start the
@@ -274,9 +290,13 @@ batch sized from the measured source rate). Record everything in
 counters from `dmsetup status` on each heartbeat and starts the cutover
 when they are complete.
 
-**Host-agent restart.** Read `sandbox.json`. For a hydrating sandbox,
-confirm the dm-clone device and the source process. Restart the source
-if it is gone (Decision 5). Nothing is copied again.
+**Host-agent restart.** Opening the pool resumes every device of the
+pool that a death between a suspend and its resume left suspended:
+thins first, then the drives and views on them. Read `sandbox.json`.
+For a hydrating sandbox, confirm the dm-clone device and the source
+process. Restart the source if it is gone (Decision 5). A drive with no
+live table is a `clone_drive` that did not finish: remove it and make
+it again on a new bitmap. Nothing is copied again.
 
 **Checkpoint, evict, destroy.** As ADR 0125, with Decision 8 for the
 upload. Destroy also stops the source and deletes the bitmap.
@@ -331,7 +351,10 @@ manifest's non-zero bytes against the floor for a lazy restore.
   test: reads, partial and whole-region writes, hydration, cutover with
   a handle open, and destination equals source plus every write. Cut at
   every step of the lazy restore and the cutover, then converge on the
-  next pass to the same bytes. Kill the source mid-hydration; the reads
+  next pass to the same bytes, keeping every write of the earlier pass;
+  a drive left with no table is removed and made again. A drive left
+  suspended resumes when the pool is opened again and copies on to the
+  cutover. Kill the source mid-hydration; the reads
   stall and complete after recovery with no error. Stop a source that
   holds a read it cannot serve; the read fails and the stop completes.
   A chunk the store reports absent fails its read with an I/O error; a
