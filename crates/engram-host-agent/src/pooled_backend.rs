@@ -5783,6 +5783,8 @@ impl SandboxBackend for PooledBackend {
                 let volumes = self.volumes.clone();
                 let pending_finalizes = self.pending_finalizes.clone();
                 let pending_presetups = self.pending_presetups.clone();
+                let migrations = self.migrations.clone();
+                let migrate_peer = self.migrate_peer.get().cloned();
                 Box::pin(async move {
                     // Unregister from the egress proxy first, so a still-alive
                     // guest's traffic stops being rewritten. The binding goes
@@ -5791,6 +5793,12 @@ impl SandboxBackend for PooledBackend {
                     unreachable_guests.remove(&id);
                     migration_roles.remove(&id);
                     drained_dests.remove(&id);
+                    // An open export's page-server entry reads the VM's
+                    // process, so it goes before the VM.
+                    let export = migrations.remove(id);
+                    if let (Some(export), Some(peer)) = (export.as_ref(), migrate_peer.as_ref()) {
+                        peer.remove(&export.export_id);
+                    }
                     if let Some(egress) = egress.as_ref() {
                         if let Some(session_id) = removed_session {
                             egress.unregister_session(session_id);
@@ -5799,8 +5807,18 @@ impl SandboxBackend for PooledBackend {
                     let result = inner.destroy(id).await;
                     // The disks go after the VM has closed them. A pending
                     // eviction finalize still publishes from them; it runs
-                    // this destroy again at its terminal step. A move that
-                    // never reached its capture holds a precopy of them.
+                    // this destroy again at its terminal step. A move holds
+                    // snapshots of them that the release cannot remove while
+                    // they are open: an export's seals and precopy, or the
+                    // precopy of a presetup that never reached its capture.
+                    if let Some(export) = export {
+                        let _ = fs::remove_dir_all(&export.snapshot_dir).await;
+                        if let Some(volumes) = volumes.as_ref() {
+                            for (_, seal) in export.disk_seal.into_iter().chain(export.precopy) {
+                                discard_seal(volumes, seal).await;
+                            }
+                        }
+                    }
                     if let Some(volumes) = volumes.as_ref() {
                         if let Some((_, presetup)) = pending_presetups.remove(&id) {
                             for (_, seal) in presetup.precopy {
@@ -9002,6 +9020,36 @@ mod tests {
             seal.upgrade().is_none(),
             "nothing holds the precopy snapshot after destroy"
         );
+    }
+
+    /// A destroy consumes an open export first, so its seal does not hold
+    /// a snapshot open when the session disks are released.
+    #[tokio::test]
+    async fn destroy_consumes_an_open_export_and_its_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        let sealed = seal_root(&volumes, id).await;
+        let seal = Arc::downgrade(&sealed);
+        export.disk_seal.insert(DiskRole::Root, sealed);
+        assert!(pooled.migrations.insert(export));
+
+        pooled.destroy(id).await.unwrap();
+        assert!(pooled.migrations.export_id_of(id).is_none());
+        assert!(
+            seal.upgrade().is_none(),
+            "nothing holds the seal after destroy"
+        );
+        assert!(!dir.exists(), "the export dir goes with the destroy");
+        assert!(volumes.roles(id).await.unwrap().is_empty());
     }
 
     /// Aborting an export discards its seal, removes the export dir and
