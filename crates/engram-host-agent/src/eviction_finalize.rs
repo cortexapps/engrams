@@ -176,6 +176,8 @@ pub struct EvictionFinalizer {
     pub(crate) bundle_file_ext: &'static str,
     /// `<work_dir>/checkpoints`: `records/` and `finalize/` live under it.
     pub(crate) checkpoint_dir: PathBuf,
+    /// Signalled after the terminal checkpoint record lands in `records/`.
+    pub(crate) checkpoint_recorded: Arc<tokio::sync::Notify>,
     pub(crate) pending_finalizes: Arc<DashMap<SandboxId, SnapshotId>>,
     pub(crate) destroyer: Arc<dyn EvictionSandbox>,
     pub(crate) fs: Arc<dyn HostFs>,
@@ -191,6 +193,7 @@ impl EvictionFinalizer {
         bundle_dir: PathBuf,
         bundle_file_ext: &'static str,
         checkpoint_dir: PathBuf,
+        checkpoint_recorded: Arc<tokio::sync::Notify>,
         pending_finalizes: Arc<DashMap<SandboxId, SnapshotId>>,
         destroyer: Arc<dyn EvictionSandbox>,
         fs: Arc<dyn HostFs>,
@@ -203,6 +206,7 @@ impl EvictionFinalizer {
             bundle_dir,
             bundle_file_ext,
             checkpoint_dir,
+            checkpoint_recorded,
             pending_finalizes,
             destroyer,
             fs,
@@ -491,6 +495,7 @@ async fn run_terminal(
         .persist(f.fs.as_ref(), &f.records_dir())
         .await
         .map_err(|e| SandboxError::Snapshot(format!("persist eviction-final checkpoint: {e}")))?;
+    f.checkpoint_recorded.notify_one();
 
     EvictionFinalizeRecord::delete(f.fs.as_ref(), &f.finalize_dir(), record.snapshot_id).await;
     f.pending_finalizes.remove(&record.sandbox_id);
@@ -769,6 +774,7 @@ mod tests {
             tmp.join("bundles"),
             "bundle",
             tmp.join("checkpoints"),
+            Arc::new(tokio::sync::Notify::new()),
             Arc::new(DashMap::new()),
             Arc::new(NoDestroy),
             Arc::new(engram_host_core::TokioFs),
