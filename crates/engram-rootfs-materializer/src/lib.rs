@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 
-pub use ext4::{inode_count_for, recommended_size, DETERMINISTIC_EPOCH_SECS};
+pub use ext4::{recommended_inodes, recommended_size, DETERMINISTIC_EPOCH_SECS};
 pub use inject::{inject_init, rendered_init_shim, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
     download_layer, layer_compression, pull_image, resolve_image, LayerCompression, LayerPlan,

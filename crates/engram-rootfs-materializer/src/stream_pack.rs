@@ -29,8 +29,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
+use engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE;
 use mkext4::build::Timespec;
-use mkext4::{FsBuilder, InodeCount, InodeHandle, Layout, Meta, Options, SpecialKind, ROOT};
+use mkext4::{
+    FsBuilder, InodeCount, InodeHandle, Layout, LayoutPolicy, Meta, Options, SpecialKind,
+    StableLayout, ROOT,
+};
 
 // Relocated from the retired flatten engine (ADR 0093): the error
 // vocabulary, the skipped-xattr record, and the decompressor thread.
@@ -924,10 +928,15 @@ impl NamespaceBuilder {
     /// zero chunks are elided from manifests, so a 16 GiB fs holding
     /// 3 GiB of content still stores ~3 GiB of chunks. Determinism is
     /// unaffected: the size is a pure function of (content, config).
+    ///
+    /// The image uses mkext4's stable layout with the disk chunk size as
+    /// its window, so an edit between two bakes rewrites only the chunks
+    /// near it.
     pub fn seal(self, min_fs_size_bytes: u64) -> Result<SealedImage, FlattenError> {
         let (entry_count, tree_bytes) = self.sizing();
-        let size_bytes = crate::ext4::recommended_size(tree_bytes).max(min_fs_size_bytes);
-        let inode_count = crate::ext4::inode_count_for(entry_count, size_bytes);
+        let size_bytes =
+            crate::ext4::recommended_size(tree_bytes, entry_count).max(min_fs_size_bytes);
+        let inode_count = crate::ext4::recommended_inodes(entry_count);
 
         let mut opts = Options::new(
             size_bytes,
@@ -938,6 +947,7 @@ impl NamespaceBuilder {
         );
         opts.hash_seed = hash_seed_words();
         opts.inodes = InodeCount::Exact(inode_count.min(u32::MAX as u64) as u32);
+        opts.layout = LayoutPolicy::Stable(StableLayout::new(DEFAULT_DISK_CHUNK_SIZE));
         let mut b = FsBuilder::new(opts).map_err(mk_err)?;
 
         // Names in global declaration order (parents precede children
@@ -1297,7 +1307,80 @@ fn sanitize(path: &std::path::Path) -> Result<Option<String>, FlattenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mkext4::reader::Fs;
+    use mkext4::reader::{Fs, ReadAt};
+    use mkext4::sink::RegionSink;
+
+    const BLOCK: u64 = 4096;
+
+    /// A packed image held as its non-zero 4 KiB blocks. Every image is
+    /// at least 1 GiB and almost all zero windows, so a test holds only
+    /// the bytes the layout wrote.
+    #[derive(Default, PartialEq, Eq)]
+    struct SparseImage(BTreeMap<u64, Box<[u8]>>);
+
+    impl std::fmt::Debug for SparseImage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SparseImage({} non-zero blocks)", self.0.len())
+        }
+    }
+
+    impl SparseImage {
+        /// Apply `f(block, range in block, range in input)` to each block
+        /// that `offset..offset + len` covers.
+        fn spans(
+            offset: u64,
+            len: u64,
+            mut f: impl FnMut(u64, std::ops::Range<usize>, std::ops::Range<usize>),
+        ) {
+            let mut at = offset;
+            while at < offset + len {
+                let block = at / BLOCK;
+                let from = (at % BLOCK) as usize;
+                let n = (BLOCK as usize - from).min((offset + len - at) as usize);
+                let done = (at - offset) as usize;
+                f(block, from..from + n, done..done + n);
+                at += n as u64;
+            }
+        }
+
+        fn drop_zero_blocks(&mut self) {
+            self.0.retain(|_, b| b.iter().any(|&x| x != 0));
+        }
+    }
+
+    impl RegionSink for SparseImage {
+        fn data(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+            Self::spans(offset, bytes.len() as u64, |block, dst, src| {
+                let b = self
+                    .0
+                    .entry(block)
+                    .or_insert_with(|| vec![0; BLOCK as usize].into());
+                b[dst].copy_from_slice(&bytes[src]);
+            });
+            Ok(())
+        }
+
+        fn zeros(&mut self, offset: u64, len: u64) -> std::io::Result<()> {
+            Self::spans(offset, len, |block, dst, _| {
+                if let Some(b) = self.0.get_mut(&block) {
+                    b[dst].fill(0);
+                }
+            });
+            Ok(())
+        }
+    }
+
+    impl ReadAt for SparseImage {
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            Self::spans(offset, buf.len() as u64, |block, from, to| {
+                match self.0.get(&block) {
+                    Some(b) => buf[to].copy_from_slice(&b[from]),
+                    None => buf[to].fill(0),
+                }
+            });
+            Ok(())
+        }
+    }
 
     struct LayerBuilder {
         tar: tar::Builder<Vec<u8>>,
@@ -1378,28 +1461,32 @@ mod tests {
 
     /// Declare + seal + fill + finish; every image is checksum-verified
     /// by the mkext4 reader before any assertion runs.
-    fn build_image(layers: &[Vec<u8>]) -> Vec<u8> {
+    fn build_image(layers: &[Vec<u8>]) -> SparseImage {
         build_image_with(layers, |_| {})
     }
 
-    fn build_image_with(layers: &[Vec<u8>], tweak: impl FnOnce(&mut NamespaceBuilder)) -> Vec<u8> {
+    fn build_image_with(
+        layers: &[Vec<u8>],
+        tweak: impl FnOnce(&mut NamespaceBuilder),
+    ) -> SparseImage {
         let mut ns = NamespaceBuilder::new();
         for l in layers {
             ns.declare_layer(&l[..]).unwrap();
         }
         tweak(&mut ns);
         let sealed = ns.seal(0).unwrap();
-        let mut sink = mkext4::sink::VecSink::default();
-        let mut w = sealed.layout.writer(&mut sink).unwrap();
+        let mut image = SparseImage::default();
+        let mut w = sealed.layout.writer(&mut image).unwrap();
         for (i, l) in layers.iter().enumerate() {
             sealed.fill_layer(&mut w, i, &l[..]).unwrap();
         }
         sealed.fill_synthetic(&mut w).unwrap();
         w.finish().unwrap();
-        sink.buf
+        image.drop_zero_blocks();
+        image
     }
 
-    fn open(image: &[u8]) -> Fs<&[u8]> {
+    fn open(image: &SparseImage) -> Fs<&SparseImage> {
         let fs = Fs::open(image).unwrap();
         let issues = fs.verify().unwrap();
         assert!(issues.is_empty(), "image must verify clean: {issues:?}");
@@ -1695,6 +1782,39 @@ mod tests {
         assert_ne!(build_image(&mk(b"aaaa")), build_image(&mk(b"aaab")));
     }
 
+    /// The image uses the stable layout with the disk chunk size as its
+    /// window: inode numbers start at the second inode-table window and
+    /// file data starts on a chunk boundary.
+    #[test]
+    fn images_use_the_chunk_aligned_stable_layout() {
+        let image = build_image(&[LayerBuilder::new().file("f", 0o644, b"hello").build()]);
+        let fs = open(&image);
+        let ino = fs.resolve("/f").unwrap();
+        let inodes_per_window = DEFAULT_DISK_CHUNK_SIZE / 256;
+        assert!(
+            u64::from(ino) > inodes_per_window,
+            "sparse stable numbering: {ino}"
+        );
+        let extents = fs.extents(ino, &fs.inode(ino).unwrap()).unwrap();
+        assert_eq!(extents[0].physical * 4096 % DEFAULT_DISK_CHUNK_SIZE, 0);
+    }
+
+    /// A tree of empty files has no data bytes, so its entries size the
+    /// image: 170,000 of them need more inode numbers than eight block
+    /// groups hold under the stable layout.
+    #[test]
+    fn a_tree_of_empty_files_seals() {
+        let mut layer = LayerBuilder::new();
+        for d in 0..170 {
+            for f in 0..1000 {
+                layer = layer.file(&format!("d{d}/f{f}"), 0o644, b"");
+            }
+        }
+        let image = build_image(&[layer.build()]);
+        let fs = open(&image);
+        assert!(fs.resolve("/d169/f999").is_ok());
+    }
+
     /// ADR 0093 addendum: `seal(min_fs_size_bytes)` floors the ext4 size
     /// so `suggested_disk_gib` grants real working room; a floor at or
     /// below `recommended_size` is a no-op (content sizing wins).
@@ -1707,14 +1827,17 @@ mod tests {
             ns.seal(0).unwrap().image_len()
         };
 
-        const GIB: u64 = 1 << 30;
+        const FLOOR: u64 = 2 << 30;
         let floored = {
             let mut ns = NamespaceBuilder::new();
             ns.declare_layer(&layers[0][..]).unwrap();
-            ns.seal(GIB).unwrap().image_len()
+            ns.seal(FLOOR).unwrap().image_len()
         };
-        assert!(content_sized < GIB, "fixture must be tiny: {content_sized}");
-        assert_eq!(floored, GIB);
+        assert!(
+            content_sized < FLOOR,
+            "fixture must be tiny: {content_sized}"
+        );
+        assert_eq!(floored, FLOOR);
 
         // A floor below the content-derived size changes nothing.
         let noop = {
