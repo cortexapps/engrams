@@ -579,6 +579,12 @@ pub fn block_devno(path: &Path) -> io::Result<DevNo> {
     })
 }
 
+/// The number of devices stacked on `devno`: a device-mapper table that
+/// uses it, a partition, a RAID member.
+pub fn holders(devno: DevNo) -> io::Result<usize> {
+    Ok(std::fs::read_dir(format!("{}/holders", devno.sysfs_path()))?.count())
+}
+
 /// Create a block device node, replacing one that points elsewhere.
 #[allow(unsafe_code)]
 pub fn make_node(path: &Path, devno: DevNo) -> io::Result<()> {

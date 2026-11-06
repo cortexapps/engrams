@@ -189,6 +189,27 @@ pub fn clone_status(status: &str) -> io::Result<CloneState> {
     })
 }
 
+const CLONE_MAGIC: u64 = 0x8af2_7f64;
+const CLONE_MAGIC_AT: usize = 32;
+const CLONE_REGION_AT: usize = 172;
+
+/// The region size, in sectors, that a dm-clone superblock records
+/// (`struct superblock_disk` in `drivers/md/dm-clone-metadata.c`: the
+/// magic at byte 32 and the region size at byte 172, little-endian).
+/// The kernel refuses a table whose region size differs.
+pub fn clone_superblock_region_sectors(superblock: &[u8]) -> io::Result<u64> {
+    let le64 = |at: usize| {
+        superblock
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| invalid("dm-clone superblock is short"))
+    };
+    if le64(CLONE_MAGIC_AT)? != CLONE_MAGIC {
+        return Err(invalid("no dm-clone superblock"));
+    }
+    le64(CLONE_REGION_AT)
+}
+
 /// The `DEVNAME=` line of a sysfs `uevent` file.
 pub fn devname(uevent: &str) -> io::Result<String> {
     uevent
@@ -430,6 +451,21 @@ mod tests {
                 hydration_enabled: true
             }
         );
+    }
+
+    #[test]
+    fn the_region_size_comes_from_a_clone_superblock() {
+        // The first bytes of a bitmap after one `clone` table load with
+        // region 128 and 16384 sectors, kernel 6.8.
+        let mut superblock = vec![0u8; 4096];
+        superblock[..4].copy_from_slice(&[0x4a, 0x96, 0x31, 0xd2]);
+        superblock[32..36].copy_from_slice(&[0x64, 0x7f, 0xf2, 0x8a]);
+        superblock[40] = 1;
+        superblock[172] = 0x80;
+        superblock[181] = 0x40;
+        assert_eq!(clone_superblock_region_sectors(&superblock).unwrap(), 128);
+        assert!(clone_superblock_region_sectors(&vec![0u8; 4096]).is_err());
+        assert!(clone_superblock_region_sectors(&superblock[..100]).is_err());
     }
 
     #[test]

@@ -198,6 +198,12 @@ async fn whole(volume: &Volume) -> Vec<u8> {
     volume.read_range(0, volume.size_bytes).await.unwrap()
 }
 
+/// `major:minor` of a volume's device node.
+fn devno(volume: &Volume) -> String {
+    let rdev = std::fs::metadata(&volume.path).unwrap().rdev();
+    format!("{}:{}", libc::major(rdev), libc::minor(rdev))
+}
+
 /// The first region at which two images differ, for a short message.
 fn first_difference(got: &[u8], want: &[u8]) -> Option<u64> {
     got.iter()
@@ -367,6 +373,27 @@ async fn a_view_over_snapshots_reads_what_the_guest_saw_mid_hydration() {
         CloneState::Copying { hydrated_regions, .. } if hydrated_regions == at_snapshot
     ));
     assert!(view.write_range(0, vec![0xFF; 4096]).await.is_err());
+    let reopened = rig.disk.open_clone(&rig.name("view")).await.unwrap();
+    assert!(reopened.write_range(0, vec![0xFF; 4096]).await.is_err());
+    let refused = [
+        rig.disk.cut_over(&rig.name("view")).await,
+        rig.disk.enable_hydration(&rig.name("view")).await,
+        rig.disk.rename(&rig.name("view"), &rig.name("moved")).await,
+        rig.disk
+            .snapshot_clone(
+                &rig.name("view"),
+                &dest_snap,
+                &bitmap_snap,
+                &rig.name("s1"),
+                &rig.name("s2"),
+            )
+            .await
+            .map(drop),
+    ];
+    for result in refused {
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+    drop(reopened);
 
     // The drive copies on and cuts over with the guest's every write.
     rig.hydrated(REGIONS).await;
@@ -397,6 +424,8 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
     let bitmap = rig.volume("bitmap", BITMAP).await;
     let big = rig.volume("big", 2 * SIZE).await;
     let other = rig.volume("other", BITMAP).await;
+    let dest2 = rig.volume("dest2", SIZE).await;
+    let small = rig.volume("small", 512).await;
     let taken = rig.volume("taken", BITMAP).await;
 
     // The source is smaller than the destination: the kernel refuses the
@@ -411,6 +440,13 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         "{err}"
     );
 
+    let err = rig
+        .disk
+        .clone_drive(&rig.name("drive"), &dest, &small, &rig.source, off(1, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+
     let drive = rig.clone_drive(&dest, &bitmap, off(1, 1)).await;
     let err = rig
         .disk
@@ -418,18 +454,28 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         .await
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::AlreadyExists);
-    let err = rig
-        .disk
-        .snapshot_clone(
-            &rig.name("drive"),
-            &dest,
-            &other,
-            &rig.name("dest-snap"),
-            &rig.name("bitmap-snap"),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // A second drive over the first one's destination or bitmap.
+    for (d, b) in [(&dest, &other), (&dest2, &bitmap)] {
+        let err = rig
+            .disk
+            .clone_drive(&rig.name("second"), d, b, &rig.source, off(1, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ResourceBusy, "{err}");
+    }
+    assert_eq!(
+        rig.disk.delete(&rig.name("dest")).await.unwrap_err().kind(),
+        ErrorKind::ResourceBusy
+    );
+    assert_eq!(
+        rig.disk
+            .rename(&rig.name("drive"), &rig.name("moved"))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+
     // A snapshot name that is taken: the call fails, deletes nothing it
     // did not make, and leaves the drive running.
     let err = rig
@@ -497,6 +543,13 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
             .kind(),
         ErrorKind::InvalidInput
     );
+    // The cutover frees the bitmap, which still holds the drive's header.
+    let err = rig
+        .disk
+        .clone_drive(&rig.name("second"), &dest2, &bitmap, &rig.source, off(1, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
     rig.disk.remove_clone(&rig.name("drive")).await.unwrap();
     assert_eq!(
         rig.disk
@@ -507,8 +560,8 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         ErrorKind::NotFound
     );
 
-    drop((dest, bitmap, big, other, taken));
-    for role in ["dest", "bitmap", "big", "other", "taken"] {
+    drop((dest, bitmap, big, other, dest2, small, taken));
+    for role in ["dest", "bitmap", "big", "other", "dest2", "small", "taken"] {
         rig.disk.delete(&rig.name(role)).await.unwrap();
     }
     assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
@@ -567,5 +620,70 @@ async fn a_drive_left_suspended_resumes_when_the_pool_is_opened_again() {
     assert_eq!(first_difference(&whole(&dest).await, &expected), None);
     drop(dest);
     rig.disk.delete(&rig.name("dest")).await.unwrap();
+    assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
+}
+
+/// A `clone_drive` cut after the device was made leaves it with no live
+/// table, and with its table loaded inactive the kernel has already
+/// written the bitmap's header. The restore removes the drive, makes the
+/// bitmap again, and converges.
+#[tokio::test]
+#[ignore]
+async fn a_half_made_drive_is_removed_and_made_again() {
+    let Some(rig) = Rig::new("half", None).await else {
+        return;
+    };
+    for loaded in [false, true] {
+        let dest = rig.volume("dest", SIZE).await;
+        let bitmap = rig.volume("bitmap", BITMAP).await;
+        let device = rig.device(&rig.name("drive"));
+        run("dmsetup", &["create", "--noudevsync", "--notable", &device]);
+        if loaded {
+            let table = format!(
+                "0 {} clone {} {} {} 128 1 no_hydration",
+                SIZE / 512,
+                devno(&bitmap),
+                devno(&dest),
+                rig.source.display()
+            );
+            run("dmsetup", &["load", &device, "--table", &table]);
+        }
+        assert_eq!(rig.state("drive").await, CloneState::Incomplete);
+        assert_eq!(
+            rig.disk
+                .open_clone(&rig.name("drive"))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        rig.disk.remove_clone(&rig.name("drive")).await.unwrap();
+        if loaded {
+            let err = rig
+                .disk
+                .clone_drive(&rig.name("drive"), &dest, &bitmap, &rig.source, off(1, 1))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+        }
+        drop(bitmap);
+        rig.disk.delete(&rig.name("bitmap")).await.unwrap();
+        let bitmap = rig.volume("bitmap", BITMAP).await;
+        let drive = rig.clone_drive(&dest, &bitmap, off(4, 4)).await;
+        let mut expected = rig.bytes.clone();
+        write(&drive, &mut expected, REGION + 512, vec![0xC3; 4096]).await;
+        rig.disk.enable_hydration(&rig.name("drive")).await.unwrap();
+        rig.hydrated(REGIONS).await;
+        rig.disk.cut_over(&rig.name("drive")).await.unwrap();
+        assert_eq!(first_difference(&whole(&drive).await, &expected), None);
+
+        drop((drive, bitmap));
+        rig.disk.remove_clone(&rig.name("drive")).await.unwrap();
+        rig.disk.delete(&rig.name("bitmap")).await.unwrap();
+        assert_eq!(first_difference(&whole(&dest).await, &expected), None);
+        drop(dest);
+        rig.disk.delete(&rig.name("dest")).await.unwrap();
+    }
     assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
 }

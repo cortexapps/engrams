@@ -12,12 +12,14 @@ use crate::dm;
 use crate::parse::{self, CloneTable, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
 use engram_host_core::disk::{
-    Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
+    check_fresh_bitmap, Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName,
+    CLONE_HEADER_BYTES, CLONE_REGION_BYTES,
 };
 
 const SECTOR_BYTES: u64 = 512;
 const REGION_SECTORS: u64 = CLONE_REGION_BYTES / SECTOR_BYTES;
-/// A view copies nothing, so its tuning is never used.
+/// A view is loaded with hydration off and never turned on, so its copy
+/// tuning has no effect.
 const VIEW: Hydration = Hydration {
     enabled: false,
     threshold_regions: 1,
@@ -280,27 +282,45 @@ impl ThinPoolDisk {
         }
     }
 
-    async fn drive_target(&self, drive: &VolumeName) -> io::Result<dm::Target> {
-        let targets = self.dm.table(&self.device_name(drive)).await?;
-        match targets.as_slice() {
-            [target] if is_drive(target) => Ok(target.clone()),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{drive} is not a cloned drive: {targets:?}"),
-            )),
-        }
+    /// What `name` is to the drive operations; `None` when it exists and
+    /// is not a drive or a view.
+    async fn drive_kind(&self, name: &VolumeName) -> io::Result<Option<Drive>> {
+        let device = self.device_name(name);
+        let targets = self.dm.table(&device).await?;
+        Ok(match targets.as_slice() {
+            [] => Some(Drive::Incomplete),
+            [target] if target.kind == "linear" => Some(Drive::CutOver {
+                sectors: target.length_sectors,
+            }),
+            [target] if target.kind == "clone" => {
+                let table = parse::clone_table(&target.params)?;
+                let sectors = target.length_sectors;
+                Some(if self.dm.info(&device).await?.read_only {
+                    Drive::View { sectors }
+                } else {
+                    Drive::Copying { table, sectors }
+                })
+            }
+            _ => None,
+        })
     }
 
-    /// The clone table of a drive that has not been cut over.
-    async fn copying_drive(&self, drive: &VolumeName) -> io::Result<CloneTable> {
-        let target = self.drive_target(drive).await?;
-        if target.kind != "clone" {
-            return Err(io::Error::new(
+    async fn drive(&self, name: &VolumeName) -> io::Result<Drive> {
+        self.drive_kind(name).await?.ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{drive} is cut over"),
-            ));
+                format!("{name} is not a cloned drive or a view"),
+            )
+        })
+    }
+
+    /// The clone table of a drive that copies; `InvalidInput` for any
+    /// other drive or view.
+    async fn copying_drive(&self, drive: &VolumeName) -> io::Result<(CloneTable, u64)> {
+        match self.drive(drive).await? {
+            Drive::Copying { table, sectors } => Ok((table, sectors)),
+            other => Err(other.refused(drive)),
         }
-        parse::clone_table(&target.params)
     }
 
     /// A clone table over two thins of this pool and `source`.
@@ -309,6 +329,7 @@ impl ThinPoolDisk {
         dest: &Volume,
         bitmap: &Volume,
         source: &Path,
+        region_sectors: u64,
     ) -> io::Result<(CloneTable, u64)> {
         let (_, sectors) = self.thin_of(&dest.name).await?;
         self.thin_of(&bitmap.name).await?;
@@ -316,18 +337,36 @@ impl ThinPoolDisk {
             metadata_dev: self.dm.devno(&self.device_name(&bitmap.name)).await?,
             dest_dev: self.dm.devno(&self.device_name(&dest.name)).await?,
             source_dev: dm::block_devno(source)?,
-            region_sectors: REGION_SECTORS,
+            region_sectors,
         };
         Ok((table, sectors))
     }
 
-    async fn cut_over_locked(&self, drive: &VolumeName) -> io::Result<()> {
-        let target = self.drive_target(drive).await?;
-        if target.kind == "linear" {
-            return Ok(());
+    /// The region counts of a `clone` target.
+    async fn clone_status(&self, drive: &VolumeName) -> io::Result<CloneState> {
+        let status = self.dm.status(&self.device_name(drive)).await?;
+        parse::clone_status(&single_target(&status, "clone")?)
+    }
+
+    /// `ResourceBusy` while a device is stacked on `volume`.
+    async fn check_unused(&self, volume: &VolumeName) -> io::Result<()> {
+        let devno = self.dm.devno(&self.device_name(volume)).await?;
+        if dm::holders(devno)? > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("{volume} is used by a drive or a view"),
+            ));
         }
-        let table = parse::clone_table(&target.params)?;
-        if !self.clone_state(drive).await?.is_hydrated() {
+        Ok(())
+    }
+
+    async fn cut_over_locked(&self, drive: &VolumeName) -> io::Result<()> {
+        let (table, sectors) = match self.drive(drive).await? {
+            Drive::CutOver { .. } => return Ok(()),
+            Drive::Copying { table, sectors } => (table, sectors),
+            other => return Err(other.refused(drive)),
+        };
+        if !self.clone_status(drive).await?.is_hydrated() {
             return Err(io::Error::new(
                 io::ErrorKind::ResourceBusy,
                 format!("{drive} is still hydrating"),
@@ -337,12 +376,7 @@ impl ThinPoolDisk {
         let suspended = Suspended::suspend(&self.dm, &device).await?;
         let loaded = self
             .dm
-            .load(
-                &device,
-                target.length_sectors,
-                "linear",
-                &format!("{} 0", table.dest_dev),
-            )
+            .load(&device, sectors, "linear", &format!("{} 0", table.dest_dev))
             .await;
         let resumed = suspended.resume().await;
         loaded.and(resumed)
@@ -356,7 +390,7 @@ impl ThinPoolDisk {
         dest_snapshot: &VolumeName,
         bitmap_snapshot: &VolumeName,
     ) -> io::Result<(Volume, Volume)> {
-        let table = self.copying_drive(drive).await?;
+        let (table, _) = self.copying_drive(drive).await?;
         let dest_dev = self.dm.devno(&self.device_name(&dest.name)).await?;
         let bitmap_dev = self.dm.devno(&self.device_name(&bitmap.name)).await?;
         if table.dest_dev != dest_dev || table.metadata_dev != bitmap_dev {
@@ -430,6 +464,30 @@ struct Thin {
     params: ThinParams,
 }
 
+/// What a name is to the drive operations.
+enum Drive {
+    /// A read-write `clone` target: copying into its destination.
+    Copying { table: CloneTable, sectors: u64 },
+    /// A `linear` target onto the destination.
+    CutOver { sectors: u64 },
+    /// A read-only `clone` target: a checkpoint's view.
+    View { sectors: u64 },
+    /// No live table: a `clone_drive` that did not finish.
+    Incomplete,
+}
+
+impl Drive {
+    fn refused(&self, name: &VolumeName) -> io::Error {
+        let what = match self {
+            Self::Copying { .. } => "is copying",
+            Self::CutOver { .. } => "is cut over",
+            Self::View { .. } => "is a view",
+            Self::Incomplete => "has no table",
+        };
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name} {what}"))
+    }
+}
+
 /// A suspended device. Until a resume succeeds it stays armed: a drop
 /// resumes it, so a task aborted between the two still resumes it.
 struct Suspended {
@@ -495,12 +553,6 @@ impl Drop for MetadataSnap<'_> {
             tracing::warn!(pool = self.pool, %error, "metadata snapshot not released");
         }
     }
-}
-
-/// A cloned drive's one target: `clone` while it copies, `linear` after
-/// the cutover.
-fn is_drive(target: &dm::Target) -> bool {
-    target.kind == "clone" || target.kind == "linear"
 }
 
 fn single_target(targets: &[dm::Target], kind: &str) -> io::Result<String> {
@@ -593,6 +645,12 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
+        if self.drive_kind(from).await?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{from} is a drive or a view, which is not renamed"),
+            ));
+        }
         self.dm
             .rename(&self.device_name(from), &self.device_name(to))
             .await?;
@@ -615,7 +673,8 @@ impl SessionDisk for ThinPoolDisk {
         })
     }
 
-    /// A `clone` target over the two thins and `source`, region 64 KiB.
+    /// A `clone` target over the two thins and `source`, with region
+    /// [`CLONE_REGION_BYTES`].
     async fn clone_drive(
         &self,
         drive: &VolumeName,
@@ -625,14 +684,25 @@ impl SessionDisk for ThinPoolDisk {
         hydration: Hydration,
     ) -> io::Result<Volume> {
         let _held = self.lock_drive(drive).await;
-        let (table, sectors) = self.clone_table(dest, bitmap, source).await?;
+        let device = self.device_name(drive);
+        match self.dm.info(&device).await {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{drive} already exists"),
+                ))
+            }
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
+        }
+        let (table, sectors) = self
+            .clone_table(dest, bitmap, source, REGION_SECTORS)
+            .await?;
+        self.check_unused(&dest.name).await?;
+        self.check_unused(&bitmap.name).await?;
+        check_fresh_bitmap(bitmap).await?;
         self.dm
-            .create(
-                &self.device_name(drive),
-                sectors,
-                "clone",
-                &table.params(hydration),
-            )
+            .create(&device, sectors, "clone", &table.params(hydration))
             .await?;
         self.open_created(drive, |node| {
             Volume::open(drive.clone(), node, sectors * SECTOR_BYTES, self.chunk_size)
@@ -641,19 +711,30 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn open_clone(&self, drive: &VolumeName) -> io::Result<Volume> {
-        let target = self.drive_target(drive).await?;
-        self.volume(drive, target.length_sectors).await
+        let (sectors, open): (u64, fn(_, &Path, _, _) -> _) = match self.drive(drive).await? {
+            Drive::Copying { sectors, .. } | Drive::CutOver { sectors } => (sectors, Volume::open),
+            Drive::View { sectors } => (sectors, Volume::open_read_only),
+            Drive::Incomplete => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{drive} has no table; remove it and make it again"),
+                ))
+            }
+        };
+        let node = self.node(drive).await?;
+        open(
+            drive.clone(),
+            &node,
+            sectors * SECTOR_BYTES,
+            self.chunk_size,
+        )
     }
 
     async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
-        let status = self.dm.status(&self.device_name(drive)).await?;
-        match status.as_slice() {
-            [target] if target.kind == "linear" => Ok(CloneState::CutOver),
-            [target] if target.kind == "clone" => parse::clone_status(&target.params),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{drive} is not a cloned drive: {status:?}"),
-            )),
+        match self.drive(drive).await? {
+            Drive::Incomplete => Ok(CloneState::Incomplete),
+            Drive::CutOver { .. } => Ok(CloneState::CutOver),
+            Drive::Copying { .. } | Drive::View { .. } => self.clone_status(drive).await,
         }
     }
 
@@ -699,7 +780,8 @@ impl SessionDisk for ThinPoolDisk {
         .await
     }
 
-    /// A read-only `clone` target with hydration off.
+    /// A read-only `clone` target with hydration off, with the region size
+    /// the bitmap snapshot's superblock records.
     async fn clone_view(
         &self,
         view: &VolumeName,
@@ -708,8 +790,10 @@ impl SessionDisk for ThinPoolDisk {
         source: &Path,
     ) -> io::Result<Volume> {
         let _held = self.lock_drive(view).await;
+        let superblock = bitmap_snapshot.read_direct(0, CLONE_HEADER_BYTES).await?;
+        let region_sectors = parse::clone_superblock_region_sectors(&superblock)?;
         let (table, sectors) = self
-            .clone_table(dest_snapshot, bitmap_snapshot, source)
+            .clone_table(dest_snapshot, bitmap_snapshot, source, region_sectors)
             .await?;
         self.dm
             .create_read_only(
@@ -729,17 +813,7 @@ impl SessionDisk for ThinPoolDisk {
     /// `clone_drive`.
     async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()> {
         let _held = self.lock_drive(drive).await;
-        let targets = self.dm.table(&self.device_name(drive)).await?;
-        match targets.as_slice() {
-            [] => {}
-            [target] if is_drive(target) => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{drive} is not a cloned drive: {targets:?}"),
-                ))
-            }
-        }
+        self.drive(drive).await?;
         self.remove_device(drive).await
     }
 
