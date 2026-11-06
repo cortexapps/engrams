@@ -1109,7 +1109,7 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
 /// not "the harness is gone". Sized above the observed attach lag
 /// (50–200 ms) with a wide margin; past the window, the destructive
 /// reattach is the correct remedy again.
-const ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// ADR 0108 A5: fixed cadence for deferrals whose cause is KNOWN and
 /// short-lived (a boot in progress, the attach grace). Never

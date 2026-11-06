@@ -12,6 +12,12 @@
 //! Deliver op directly, so recovery is bounded by the heartbeat
 //! cadence, not by the ack timeout.
 //!
+//! With no waiting rows the repair re-attaches the harness at once, so
+//! the next prompt does not pay for it. Every memory capture resets the
+//! vsock device: the hub drops the harness link, while the idle harness,
+//! which writes nothing, keeps its end half open and does not re-dial
+//! until agentd signals it.
+//!
 //! The decision logic lives here — NOT in the HTTP handler — so the
 //! DST swarm can drive `run_once` from the sim world without the wire
 //! layer (ADR 0098: keep the `spawn()`/`run_once()` split).
@@ -25,8 +31,8 @@ use crate::state::SharedState;
 /// One repair pass over one host's heartbeat view. Returns the number
 /// of sessions re-driven (rows recalled + Deliver op enqueued).
 ///
-/// Pure over its inputs plus the metadata store: no clock, no entropy,
-/// no wire types.
+/// Pure over its inputs plus the metadata store and the injected clock:
+/// no entropy, no wire types.
 pub async fn run_once(
     state: &SharedState,
     host_id: engram_core::HostId,
@@ -65,8 +71,9 @@ pub async fn run_once(
         // repeated disagreement never inflates the retry backoff.
         match state.services.meta.outbox_make_due(session_id).await {
             Ok(0) => {
-                tracing::debug!(host_id = %host_id, %session_id, %sandbox_id,
-                    "harness desync: running sandbox with no attached harness; no waiting outbox rows");
+                if reattach_idle_harness(state, session_id, sandbox_id).await {
+                    redriven += 1;
+                }
             }
             Ok(moved) => {
                 ::metrics::counter!(crate::metrics::HARNESS_DESYNC_REDRIVEN_TOTAL).increment(1);
@@ -82,6 +89,93 @@ pub async fn run_once(
         }
     }
     redriven
+}
+
+/// Start a re-attach of the harness of an Active session with nothing to
+/// deliver, detached from the heartbeat: `start_agent` waits for the
+/// guest. Skipped while an attach is in flight (the attach grace) and for
+/// a session with no harness. Returns whether a re-attach started.
+async fn reattach_idle_harness(
+    state: &SharedState,
+    session_id: engram_core::SessionId,
+    sandbox_id: SandboxId,
+) -> bool {
+    let now = state.services.clock.now_utc();
+    if let Some(stamp) = state.attach_grace.get(&session_id).map(|e| *e.value()) {
+        let grace = chrono::Duration::from_std(crate::session_verbs::ATTACH_GRACE)
+            .expect("ATTACH_GRACE fits chrono::Duration");
+        if now.signed_duration_since(stamp) < grace {
+            return false;
+        }
+    }
+    match state.services.meta.get_session(session_id).await {
+        Ok(session)
+            if !session.mode.is_dev_vm()
+                && session.status == engram_core::types::SessionState::Active
+                && session.sandbox_id == Some(sandbox_id) => {}
+        _ => return false,
+    }
+    let state = state.clone();
+    tokio::spawn(async move { reattach_under_claim(&state, session_id, sandbox_id, now).await });
+    true
+}
+
+/// The re-attach under an inline op claim: the session's op lane orders
+/// it against a delivery, an eviction or a move. A busy lane skips it.
+async fn reattach_under_claim(
+    state: &SharedState,
+    session_id: engram_core::SessionId,
+    sandbox_id: SandboxId,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let claim = match crate::session_ops::OpClaim::try_acquire(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Deliver,
+        serde_json::json!({ "reason": "harness_reattach" }),
+    )
+    .await
+    {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!(%session_id, error = %e, "harness desync: op claim failed; next heartbeat retries");
+            return;
+        }
+    };
+    let result = crate::api::snapshot::reattach_harness_in_place(
+        state,
+        session_id,
+        sandbox_id,
+        claim.fence(),
+    )
+    .await;
+    if matches!(result, Ok(true)) {
+        // The attach is in flight: a prompt in the next moments defers
+        // to it instead of signalling the harness again.
+        state.attach_grace.insert(session_id, now);
+        ::metrics::counter!(crate::metrics::HARNESS_DESYNC_REDRIVEN_TOTAL).increment(1);
+        tracing::info!(%session_id, %sandbox_id,
+            "harness desync repair: re-attached an idle harness");
+    }
+    match result {
+        Ok(_) => {
+            claim
+                .finish(engram_core::types::session_op::OpState::Done, None)
+                .await
+        }
+        Err(e) => {
+            let error = e.to_string();
+            tracing::debug!(%session_id, %sandbox_id, %error,
+                "harness desync: idle re-attach failed; next heartbeat retries");
+            claim
+                .finish(
+                    engram_core::types::session_op::OpState::Failed,
+                    Some(&error),
+                )
+                .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +288,57 @@ mod tests {
             "row still waiting",
         );
         assert!(mini.ops.all().is_empty(), "no deliver op enqueued");
+    }
+
+    /// With nothing waiting, the repair re-attaches the idle harness under
+    /// an op claim, so the next prompt finds it attached.
+    #[tokio::test]
+    async fn an_idle_unattached_harness_is_reattached_under_an_op_claim() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, mini, _local) =
+            build_state_for_session(session(SessionState::Active, host_id, sandbox_id));
+        let session_id = mini.session.lock().id;
+
+        let running: BTreeSet<_> = [sandbox_id].into();
+        let attached = BTreeSet::new();
+        assert_eq!(run_once(&state, host_id, &running, &attached).await, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let claimed = mini.ops.all().iter().any(|o| {
+                o.session_id == session_id
+                    && o.kind == OpKind::Deliver
+                    && o.state != engram_core::types::session_op::OpState::Running
+            });
+            if claimed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the re-attach never ran under a finished op claim"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An attach in flight (a boot, a resume, an earlier repair) and a
+    /// session with no harness are left alone.
+    #[tokio::test]
+    async fn an_attach_in_flight_or_a_dev_vm_is_not_reattached() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, mini, _local) =
+            build_state_for_session(session(SessionState::Active, host_id, sandbox_id));
+        let session_id = mini.session.lock().id;
+        let running: BTreeSet<_> = [sandbox_id].into();
+        let attached = BTreeSet::new();
+
+        state.attach_grace.insert(session_id, chrono::Utc::now());
+        assert_eq!(run_once(&state, host_id, &running, &attached).await, 0);
+
+        state.attach_grace.remove(&session_id);
+        mini.session.lock().mode = engram_core::types::session::SessionMode::DevVm;
+        assert_eq!(run_once(&state, host_id, &running, &attached).await, 0);
+        assert!(mini.ops.all().is_empty(), "no op claimed");
     }
 }
