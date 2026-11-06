@@ -182,18 +182,26 @@ network rates, and the estimate counts the bytes of both streams.
    writes; every byte it can serve is in the chunk store. Its state is
    a function of the manifest id.
 4. **One source process per copying sandbox, outside the host-agent.**
-   The host-agent starts it, moves it to the node's cgroup as it does
-   the Firecracker processes (ADR 0044 K2), and
-   records it in `sandbox.json`. It exits after the cutover. A
-   host-agent restart does not touch it. A new build of the source
-   applies to new copies only, so the source is never upgraded in
-   place.
+   The host-agent starts it, moves it to a leaf of the node's cgroup of
+   its own (ADR 0044 K2; not the Firecracker leaf, which goes with the
+   VM while the source can outlive it), and records it in a durable
+   record of its own. The record is not `sandbox.json`: that file
+   belongs to the Firecracker backend, and the orphan reap deletes it
+   with the jail. The source exits after the cutover. A host-agent
+   restart does not touch it. A recovery runs the build the host has
+   then, so the serve arguments and the device geometry are a contract
+   across one release.
 5. **A source failure stalls reads; it never ends a session.** The ublk
    device uses user recovery with reissue: when the process dies the
    kernel keeps the device and queues its I/O, and a new process
    attaches and the kernel reissues what was in flight. The host-agent
-   restarts a dead source from `sandbox.json`. No code path kills,
+   restarts a dead source from its record. No code path kills,
    evicts or rewinds a VM because its source failed.
+
+   A suspend of a drive waits for the requests in flight, so a dead
+   source blocks it. Every suspend (a checkpoint, the cutover) first
+   makes sure the source is alive, and a recovery never waits on a
+   lock that a suspend holds.
 
    A read the source cannot serve is retried with backoff while the
    failure is transient (the store is unreachable, slow or throttled).
@@ -216,10 +224,16 @@ network rates, and the estimate counts the bytes of both streams.
    when hydration ends. Memory prefetch is tied to the sandbox the same
    way.
 7. **Cutover is the only exit.** When the bitmap shows every region
-   copied, the host-agent suspends the device, loads a `linear` table
-   onto the destination, resumes it, stops the source process, and
-   deletes the bitmap volume. The session is then an ADR 0125 session
-   in every respect.
+   copied and no checkpoint of the drive is still uploading, the
+   host-agent suspends the device, loads a `linear` table onto the
+   destination, resumes it, and deletes the bitmap volume. It stops the
+   source process when the last view over it is gone: an eviction's
+   upload reads through a view after the VM has stopped. The session is
+   then an ADR 0125 session in every respect.
+
+   While a sandbox hydrates, a live move of it is refused and the
+   coordinator moves it by snapshot. A release during hydration keeps
+   no checkpoint volume, because no volume of the role is complete.
 8. **A checkpoint during hydration is correct without waiting.** Under
    the pause the checkpoint syncs the drive, which commits the bitmap
    with every region the guest wrote. It then suspends the drive, which
@@ -238,9 +252,14 @@ network rates, and the estimate counts the bytes of both streams.
    composes exactly as the guest saw it. The dm-thin root lane proves
    this on kernel 6.8 with the copy running and guest writes before and
    after the snapshots. The upload hashes every 16 MiB window in which the
-   destination snapshot maps any block, and publishes the windows whose
-   hash differs from the source manifest; every other window is the
-   source manifest's chunk. Copied windows hash equal to the source, so
+   destination snapshot differs from its origin (the staged base when
+   the destination is a snapshot of it, otherwise an empty volume), and
+   publishes the windows whose hash differs from the source manifest;
+   every other window is the source manifest's chunk. With no staged
+   base, every copied window differs from the origin, so such a
+   checkpoint reads and hashes the whole disk, outside the pause. The
+   rule holds while the guest cannot discard: dm-clone records a
+   discarded region as copied without writing it. Copied windows hash equal to the source, so
    they cost a read and a hash, not an upload. The view and both
    snapshots are deleted once the manifest is durable.
 9. **The heartbeat carries a fact, not an event.** Per sandbox: whether
@@ -258,12 +277,12 @@ network rates, and the estimate counts the bytes of both streams.
 ### Objects on a node
 
 ```text
-/dev/engram/engram-pool.sb-<sandbox>-root          the guest's drive: dm-clone while hydrating, then linear
-/dev/engram/engram-pool.sb-<sandbox>-root-dest     the destination thin volume
-/dev/engram/engram-pool.sb-<sandbox>-root-bitmap   the dm-clone metadata thin volume
-/dev/engram/engram-pool.<view>                     a checkpoint's read-only view, while it uploads
-/dev/ublkbN                                        the source, one per hydrating role
-<work_dir>/<sandbox>/sandbox.json                  the volume names, the source manifest, the source process
+/dev/engram/engram-pool.sb-<s>-root                   the guest's drive: dm-clone while hydrating, then linear
+/dev/engram/engram-pool.sb-<s>-root-dest-<m>-v<N>     the destination thin; names the lineage's newest manifest
+/dev/engram/engram-pool.sb-<s>-root-bitmap            the dm-clone metadata thin volume
+/dev/engram/engram-pool.tmp-sb-<s>-root{,-bm,-view}   a checkpoint's pair and its read-only view, while it uploads
+/dev/ublkbN                                           the source, one per hydrating role
+<work_dir>/disk-sources/<s>-root.json                 the source process, its device and its serve arguments
 ```
 
 Swap follows root: a role whose manifest is not local restores lazily
@@ -282,6 +301,12 @@ a destination or bitmap that another drive or view uses. Operations on
 one drive are serialized, and a suspend runs to its resume in a task
 that a cancelled caller cannot stop.
 
+The names stay the only record, as in ADR 0125. A checkpoint published
+during hydration renames the destination to the new manifest version.
+After the cutover, the first checkpoint publishes a `-ckpt-` volume, a
+complete snapshot of the destination, which is newer than the
+destination's name; from then on the role has the ADR 0125 names.
+
 The region size is part of the on-disk format. The bitmap's superblock
 records it, and the kernel refuses a table over that bitmap with any
 other size, so a change of `CLONE_REGION_BYTES` is a format change. A
@@ -293,8 +318,8 @@ so it composes with whatever size the drive used.
 **Lazy restore.** Create the destination and bitmap volumes. Start the
 source process for the manifest and wait for its ublk device. Load the
 dm-clone table (region 128 sectors, hydration enabled, threshold and
-batch sized from the measured source rate). Record everything in
-`sandbox.json`. Start Firecracker on the dm-clone device.
+batch sized from the measured source rate). Record the source. Start
+Firecracker on the dm-clone device.
 
 **Hydration.** The kernel copies. The host-agent reads the bitmap
 counters from `dmsetup status` on each heartbeat and starts the cutover
@@ -302,9 +327,9 @@ when they are complete.
 
 **Host-agent restart.** Opening the pool resumes every device of the
 pool that a death between a suspend and its resume left suspended:
-thins first, then the drives and views on them. Read `sandbox.json`.
-For a hydrating sandbox, confirm the dm-clone device and the source
-process. Restart the source if it is gone (Decision 5). A drive with no
+thins first, then the drives and views on them. Read the source
+records, before the volume reconcile, which removes drives. For a
+hydrating sandbox, confirm the dm-clone device and the source process. Restart the source if it is gone (Decision 5). A drive with no
 live table is a `clone_drive` that did not finish: remove it and make
 it again on a new bitmap. Nothing is copied again.
 
@@ -402,6 +427,10 @@ Each step is one PR and retires what it replaces.
 3. **Lazy restore.** Decision 1 and the lazy path in
    `provision_for_restore`; hydration and cutover owned by the sandbox;
    the restore RPC returns at boot; memory prefetch tied to the sandbox.
+   A host-agent flag (`off`, `force`, `auto`; off by default) turns it
+   on. The build that first understands the lazy volume names ships
+   before the flag is on anywhere, so a rollback never meets a lazy
+   sandbox that it cannot see.
 4. **Placement and teleport.** Decision 10, the pool accounting for
    lazy restores, and the teleport target.
 5. **Accept.** Write the facts into the DESIGN.md "Session disk" page
