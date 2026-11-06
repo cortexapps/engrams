@@ -7007,30 +7007,24 @@ impl FirecrackerBackend {
         // client; a failure mid-sequence still tries to resume the
         // VM rather than leaving it stuck Paused.
         // Snapshot duration scales with guest memory (every dirty page is
-        // flushed to memory.bin synchronously), so the timeout scales with
-        // the VM's RAM — a flat 60s tripped on large warm images (dev-brain's
-        // 32 GiB capture). See `snapshot_create_timeout`.
+        // written to the memory file inside the call), so the timeout scales
+        // with the VM's RAM — a flat 60s tripped on large warm images
+        // (dev-brain's 32 GiB capture). See `snapshot_create_timeout`.
         let api = FirecrackerClient::new(&socket)
             .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
+        let state_path = dest.join("state.bin");
+        let mem_path = dest.join(match snapshot_type {
+            client::SnapshotType::Full => "memory.bin",
+            client::SnapshotType::Diff => "memory.diff",
+        });
         let create_result = if hold {
-            let name = match snapshot_type {
-                client::SnapshotType::Full => "memory.bin",
-                client::SnapshotType::Diff => "memory.diff",
-            };
-            api.create_snapshot_held(dest.join("state.bin"), dest.join(name), snapshot_type)
+            api.create_snapshot_held(state_path, mem_path, snapshot_type)
                 .await
         } else {
-            match snapshot_type {
-                client::SnapshotType::Full => api.create_snapshot(&dest).await,
-                client::SnapshotType::Diff => {
-                    api.create_snapshot_at(
-                        dest.join("state.bin"),
-                        dest.join("memory.diff"),
-                        client::SnapshotType::Diff,
-                    )
-                    .await
-                }
-            }
+            // The guest resumes before the files reach the disk; the
+            // caller syncs them (`SandboxBackend::snapshot`'s contract).
+            api.create_snapshot_at(state_path, mem_path, snapshot_type, true)
+                .await
         };
         // The create ran `prepare_save`, which queued a vsock
         // `TRANSPORT_RESET`: every connection open across this point is

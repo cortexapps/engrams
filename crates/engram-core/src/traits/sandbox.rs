@@ -355,6 +355,10 @@ pub trait SandboxBackend: Send + Sync {
     /// in BlobStorage are the cross-host durability primitive and
     /// the local files are just a cache. Returns the metadata the
     /// coord persists to the `snapshots` row.
+    ///
+    /// The staging files can still be in the page cache when this
+    /// returns: a caller that relies on them across a host crash syncs
+    /// them first. The same holds for [`Self::snapshot_diff`].
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
     /// Capture without resuming. `diff` requests the same sparse format as snapshot_diff.
@@ -479,10 +483,9 @@ pub trait SandboxBackend: Send + Sync {
     /// artifact is `memory.diff` — a sparse file holding ONLY the
     /// pages dirtied since the last capture (KVM dirty bitmap, which
     /// resets on capture, so successive calls chain). The checkpoint
-    /// pipeline overlays it onto a rolling full memory image and
-    /// re-chunks incrementally; the returned metadata's
-    /// `memory_manifest` is patched by that pipeline, exactly like
-    /// `snapshot()`'s.
+    /// pipeline re-chunks only the chunks the diff touches; the returned
+    /// metadata's `memory_manifest` is patched by that pipeline, exactly
+    /// like `snapshot()`'s.
     ///
     /// Requires dirty tracking armed (`track_dirty_pages` at boot /
     /// `enable_diff_snapshots` at load). Default impl returns

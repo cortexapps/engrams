@@ -160,10 +160,14 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     let api1 = FirecrackerClient::new(&st1.firecracker_socket);
     let diff1_dir = tempfile::tempdir().expect("diff1 dir");
     let t = Instant::now();
+    // `defer_sync`: the fork skips the fsync; a binary without the field
+    // rejects it and the client retries without it. Either way the diff
+    // must restore.
     api1.create_snapshot_at(
         diff1_dir.path().join("state.bin"),
         diff1_dir.path().join("memory.diff"),
         SnapshotType::Diff,
+        true,
     )
     .await
     .expect("diff snapshot (cold-boot dirty tracking)");
@@ -237,6 +241,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         diff2_dir.path().join("state.bin"),
         diff2_dir.path().join("memory.diff"),
         SnapshotType::Diff,
+        false,
     )
     .await
     .expect("diff snapshot after restore (enable_diff_snapshots path)");
