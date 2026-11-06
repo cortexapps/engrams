@@ -131,13 +131,19 @@ impl ChunkStore {
         self
     }
 
-    /// Cloneable handle to the BlobStorage backing this `ChunkStore`.
-    /// Used by callers (ADR 0008 Phase 5+) that need to construct
-    /// a `TieredChunkResolver` write-back to the same BlobStorage
-    /// the store reads from. The handle is just an `Arc`-clone;
-    /// PUT/GET semantics are unchanged.
+    /// The BlobStorage backing this store.
     pub fn blob_storage(&self) -> Arc<dyn BlobStorage> {
         Arc::clone(&self.inner)
+    }
+
+    /// The local cache tier, when one is wired.
+    pub fn chunk_cache(&self) -> Option<&crate::cache::ChunkCache> {
+        self.cache.as_ref()
+    }
+
+    /// The read path behind the cache.
+    pub fn resolver(&self) -> &Arc<dyn ChunkResolver> {
+        &self.resolver
     }
 
     // ---------- chunks ----------
@@ -310,14 +316,19 @@ impl ChunkStore {
     }
 
     /// A chunk's bytes: from the local cache when one is wired and
-    /// holds it, else from the resolver, which verifies the content
-    /// hashes to `hash`. A cache miss stores the fetched bytes.
+    /// holds it, else from the resolver. Either way the bytes hash to
+    /// `hash`: the cache verifies once before it stores a fetched chunk,
+    /// and without a cache the resolver verifies.
     ///
     /// Never wrap this call in `ChunkCache::get` on the same cache:
     /// the cache's singleflight would wait on itself.
     pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
         match &self.cache {
-            Some(cache) => cache.get(hash, || self.resolver.fetch_chunk(hash)).await,
+            Some(cache) => {
+                cache
+                    .get(hash, || self.resolver.fetch_chunk_unverified(hash))
+                    .await
+            }
             None => self.resolver.fetch_chunk(hash).await,
         }
     }
@@ -340,7 +351,7 @@ impl ChunkStore {
         match &self.cache {
             Some(cache) => {
                 cache
-                    .prefetch(hash, || self.resolver.fetch_chunk(hash))
+                    .prefetch(hash, || self.resolver.fetch_chunk_unverified(hash))
                     .await
             }
             None => Ok(()),
@@ -357,7 +368,7 @@ impl ChunkStore {
         cache
             .prefetch_chunks_parallel(hashes, concurrency, move |hash| {
                 let resolver = resolver.clone();
-                async move { resolver.fetch_chunk(hash).await }
+                async move { resolver.fetch_chunk_unverified(hash).await }
             })
             .await
     }

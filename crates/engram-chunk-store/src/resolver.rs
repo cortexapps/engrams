@@ -53,6 +53,13 @@ pub trait ChunkResolver: Send + Sync {
     /// Fetch a chunk's bytes by hash.
     async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes>;
 
+    /// [`Self::fetch_chunk`] for a caller that verifies the bytes
+    /// itself before it uses or stores them (the cache populate path),
+    /// so a resolver that hashes can skip its own check.
+    async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
+        self.fetch_chunk(hash).await
+    }
+
     /// Whether the chunk is reachable through this resolver.
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool>;
 }
@@ -76,8 +83,7 @@ impl BlobStorageResolver {
 #[async_trait]
 impl ChunkResolver for BlobStorageResolver {
     async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        let key = hash.storage_key();
-        let bytes = self.blob.get(&key).await?;
+        let bytes = self.fetch_chunk_unverified(hash).await?;
         let actual = ChunkHash::of(&bytes);
         if actual != hash {
             return Err(ChunkStoreError::HashMismatch {
@@ -86,6 +92,10 @@ impl ChunkResolver for BlobStorageResolver {
             });
         }
         Ok(bytes)
+    }
+
+    async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
+        Ok(self.blob.get(&hash.storage_key()).await?)
     }
 
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
