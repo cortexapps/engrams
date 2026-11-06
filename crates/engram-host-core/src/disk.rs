@@ -446,6 +446,12 @@ pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
 }
 
 /// The platform's volume store.
+///
+/// Operations on one drive are serialized. An operation that suspends a
+/// drive or a volume resumes it before it returns, even when its caller
+/// is dropped; a process death between the two leaves the device
+/// suspended, and the platform's disk resumes it when it is opened again
+/// (`ThinPoolDisk::open`).
 #[async_trait]
 pub trait SessionDisk: Send + Sync {
     /// A new volume of `size_bytes` that reads as zeros.
@@ -506,8 +512,8 @@ pub trait SessionDisk: Send + Sync {
     /// agree with each other: no region is copied between the two. The
     /// guest must be paused and the drive synced first, so the bitmap
     /// records every region the guest wrote. Returns `(dest, bitmap)`.
-    /// `InvalidInput` after the cutover, when the destination alone is
-    /// the drive.
+    /// On failure neither copy is left. `InvalidInput` after the cutover,
+    /// when the destination alone is the drive.
     async fn snapshot_clone(
         &self,
         drive: &VolumeName,
@@ -803,9 +809,20 @@ impl SessionDisk for FileDisk {
         bitmap_snapshot: &VolumeName,
     ) -> io::Result<(Volume, Volume)> {
         self.copying(drive)?;
-        let bitmap = self.snapshot(bitmap, bitmap_snapshot).await?;
-        let dest = self.snapshot(dest, dest_snapshot).await?;
-        Ok((dest, bitmap))
+        let bitmap_snap = self.snapshot(bitmap, bitmap_snapshot).await?;
+        match self.snapshot(dest, dest_snapshot).await {
+            Ok(dest_snap) => Ok((dest_snap, bitmap_snap)),
+            Err(e) => {
+                drop(bitmap_snap);
+                match self.delete(bitmap_snapshot).await {
+                    Ok(()) => Err(e),
+                    Err(left) => Err(io::Error::new(
+                        e.kind(),
+                        format!("{e}; snapshot {bitmap_snapshot} is left behind: {left}"),
+                    )),
+                }
+            }
+        }
     }
 
     async fn clone_view(

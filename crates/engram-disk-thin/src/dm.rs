@@ -56,6 +56,15 @@ const fn request(cmd: u32) -> libc::Ioctl {
     (3 << 30 | (HEADER_LEN as u32) << 16 | DM_IOCTL << 8 | cmd) as libc::Ioctl
 }
 
+/// A device's number and state, from its status reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Info {
+    pub dev: DevNo,
+    pub suspended: bool,
+    /// The live table was loaded read-only.
+    pub read_only: bool,
+}
+
 /// One target line of a table or status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -492,6 +501,10 @@ impl Dm {
     }
 
     pub async fn devno(&self, name: &str) -> io::Result<DevNo> {
+        Ok(self.info(name).await?.dev)
+    }
+
+    pub async fn info(&self, name: &str) -> io::Result<Info> {
         let reply = self
             .call(
                 "status",
@@ -501,7 +514,12 @@ impl Dm {
                 io::ErrorKind::ResourceBusy,
             )
             .await?;
-        Ok(reply.dev())
+        let flags = reply.flags();
+        Ok(Info {
+            dev: reply.dev(),
+            suspended: flags & DM_SUSPEND_FLAG != 0,
+            read_only: flags & DM_READONLY_FLAG != 0,
+        })
     }
 
     /// The active table's target lines.

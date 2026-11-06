@@ -142,12 +142,14 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         // A drive or view holds its thins, and every device holds the
-        // source, so remove in passes until nothing is left.
+        // source, so remove in passes until nothing is left. A device a
+        // failed test left suspended is resumed first, so no I/O waits on
+        // it.
         for _ in 0..4 {
             for device in self.leftovers() {
-                let _ = Command::new("dmsetup")
-                    .args(["remove", "--noudevsync", &device])
-                    .output();
+                for args in [vec!["resume"], vec!["remove", "--noudevsync"]] {
+                    let _ = Command::new("dmsetup").args(args).arg(&device).output();
+                }
                 let _ = std::fs::remove_file(Path::new(NODES).join(&device));
             }
         }
@@ -395,6 +397,7 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
     let bitmap = rig.volume("bitmap", BITMAP).await;
     let big = rig.volume("big", 2 * SIZE).await;
     let other = rig.volume("other", BITMAP).await;
+    let taken = rig.volume("taken", BITMAP).await;
 
     // The source is smaller than the destination: the kernel refuses the
     // table and no device is left.
@@ -415,6 +418,44 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         .await
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    let err = rig
+        .disk
+        .snapshot_clone(
+            &rig.name("drive"),
+            &dest,
+            &other,
+            &rig.name("dest-snap"),
+            &rig.name("bitmap-snap"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // A snapshot name that is taken: the call fails, deletes nothing it
+    // did not make, and leaves the drive running.
+    let err = rig
+        .disk
+        .snapshot_clone(
+            &rig.name("drive"),
+            &dest,
+            &bitmap,
+            &rig.name("taken"),
+            &rig.name("bitmap-snap"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+    rig.disk.open(&rig.name("taken")).await.unwrap();
+    assert_eq!(
+        rig.disk
+            .open(&rig.name("bitmap-snap"))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    let mut expected = rig.bytes.clone();
+    write(&drive, &mut expected, 4096, vec![0x77; 4096]).await;
+    assert_eq!(first_difference(&whole(&drive).await, &expected), None);
     let err = rig
         .disk
         .snapshot_clone(
@@ -466,9 +507,65 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         ErrorKind::NotFound
     );
 
-    drop((dest, bitmap, big, other));
-    for role in ["dest", "bitmap", "big", "other"] {
+    drop((dest, bitmap, big, other, taken));
+    for role in ["dest", "bitmap", "big", "other", "taken"] {
         rig.disk.delete(&rig.name(role)).await.unwrap();
     }
+    assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
+}
+
+/// A process death between a suspend and its resume leaves the drive and
+/// its destination suspended. Opening the pool again resumes both: the
+/// guest's write that waited completes, and the copy runs to the cutover.
+#[tokio::test]
+#[ignore]
+async fn a_drive_left_suspended_resumes_when_the_pool_is_opened_again() {
+    let Some(rig) = Rig::new("resume", Some(30)).await else {
+        return;
+    };
+    let dest = rig.volume("dest", SIZE).await;
+    let bitmap = rig.volume("bitmap", BITMAP).await;
+    let drive = rig.clone_drive(&dest, &bitmap, off(1, 1)).await;
+    rig.disk.enable_hydration(&rig.name("drive")).await.unwrap();
+    rig.hydrated(2).await;
+
+    for role in ["drive", "dest"] {
+        run("dmsetup", &["suspend", &rig.device(&rig.name(role))]);
+    }
+    let mut expected = rig.bytes.clone();
+    let write = pattern(8192, 3);
+    expected[(7 * REGION) as usize..(7 * REGION) as usize + 8192].copy_from_slice(&write);
+    let path = drive.path.clone();
+    let writer = std::thread::spawn(move || {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.write_all_at(&write, 7 * REGION).unwrap();
+        file.sync_all().unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!writer.is_finished(), "a write to a suspended drive waits");
+
+    let pool = std::env::var("ENGRAM_TEST_THIN_POOL").unwrap();
+    let disk = ThinPoolDisk::open(&pool, CHUNK, Path::new(NODES))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !writer.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write still waits after the pool was opened again"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    writer.join().unwrap();
+    rig.hydrated(REGIONS).await;
+    disk.cut_over(&rig.name("drive")).await.unwrap();
+    assert_eq!(first_difference(&whole(&drive).await, &expected), None);
+
+    drop((drive, bitmap));
+    rig.disk.delete(&rig.name("bitmap")).await.unwrap();
+    rig.disk.remove_clone(&rig.name("drive")).await.unwrap();
+    assert_eq!(first_difference(&whole(&dest).await, &expected), None);
+    drop(dest);
+    rig.disk.delete(&rig.name("dest")).await.unwrap();
     assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
 }

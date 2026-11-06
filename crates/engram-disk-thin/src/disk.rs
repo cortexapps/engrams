@@ -1,9 +1,11 @@
 //! The disk over the ioctl layer; Linux only.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::dm;
@@ -27,7 +29,14 @@ const ID_MASK: u32 = 0x00FF_FFFF;
 /// to close it.
 const REMOVE_ATTEMPTS: u32 = 10;
 const REMOVE_RETRY: Duration = Duration::from_millis(100);
+/// A resume that fails is retried this many times in all before the
+/// device is reported left suspended.
+const RESUME_ATTEMPTS: u32 = 5;
+const RESUME_RETRY: Duration = Duration::from_millis(50);
 
+/// Copies share the pool's id counter, metadata-snapshot lock and drive
+/// locks, so an operation can run in a task of its own.
+#[derive(Clone)]
 pub struct ThinPoolDisk {
     dm: dm::Dm,
     pool: String,
@@ -41,14 +50,17 @@ pub struct ThinPoolDisk {
     /// is safe.
     next_id: Arc<AtomicU32>,
     /// The pool holds one reserved metadata snapshot at a time.
-    metadata_snap: tokio::sync::Mutex<()>,
+    metadata_snap: Arc<tokio::sync::Mutex<()>>,
+    /// One lock per drive or view name, held across each operation on it.
+    drive_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ThinPoolDisk {
     /// Attach to an active pool whose block size divides `chunk_size`,
-    /// delete thins that have no device (a crash between `delete` and
-    /// the pool message), and seed the id counter. Device nodes are made
-    /// under `nodes_dir`.
+    /// resume its devices that a process death left suspended, delete
+    /// thins that have no device (a crash between `delete` and the pool
+    /// message), and seed the id counter. Device nodes are made under
+    /// `nodes_dir`. No other process may operate on the pool meanwhile.
     pub async fn open(pool: &str, chunk_size: u64, nodes_dir: &Path) -> io::Result<Self> {
         let dm = dm::Dm::open()?;
         let params = parse::pool_params(&single_target(&dm.table(pool).await?, "thin-pool")?)?;
@@ -71,8 +83,10 @@ impl ThinPoolDisk {
             chunk_size,
             block_bytes,
             next_id: Arc::new(AtomicU32::new(1)),
-            metadata_snap: tokio::sync::Mutex::new(()),
+            metadata_snap: Arc::new(tokio::sync::Mutex::new(())),
+            drive_locks: Arc::new(Mutex::new(HashMap::new())),
         };
+        disk.resume_suspended().await?;
         let in_pool = disk.thin_ids().await?;
         let active = disk.active_ids().await?;
         for id in in_pool.iter().filter(|id| !active.contains(id)) {
@@ -86,6 +100,45 @@ impl ThinPoolDisk {
 
     pub fn pool(&self) -> &str {
         &self.pool
+    }
+
+    /// Resume every device of this pool that is suspended: thins first,
+    /// then the drives and views stacked on them.
+    async fn resume_suspended(&self) -> io::Result<()> {
+        let prefix = format!("{}.", self.pool);
+        let mut suspended = Vec::new();
+        for (name, _) in self.dm.list().await? {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            match self.dm.info(&name).await {
+                Ok(info) if info.suspended => {}
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => continue,
+            }
+            let thin = match self.dm.table(&name).await {
+                Ok(targets) => targets.iter().any(|t| t.kind == "thin"),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            suspended.push((!thin, name));
+        }
+        suspended.sort();
+        for (_, name) in suspended {
+            tracing::warn!(device = %name, "resuming a device a process death left suspended");
+            self.dm.resume(&name).await?;
+        }
+        Ok(())
+    }
+
+    /// The lock of drive or view `name`.
+    async fn lock_drive(&self, name: &VolumeName) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.drive_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(name.as_str().to_string()).or_default())
+        };
+        lock.lock_owned().await
     }
 
     /// Every thin id the pool holds, with or without a device.
@@ -268,13 +321,85 @@ impl ThinPoolDisk {
         Ok((table, sectors))
     }
 
+    async fn cut_over_locked(&self, drive: &VolumeName) -> io::Result<()> {
+        let target = self.drive_target(drive).await?;
+        if target.kind == "linear" {
+            return Ok(());
+        }
+        let table = parse::clone_table(&target.params)?;
+        if !self.clone_state(drive).await?.is_hydrated() {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!("{drive} is still hydrating"),
+            ));
+        }
+        let device = self.device_name(drive);
+        let suspended = Suspended::suspend(&self.dm, &device).await?;
+        let loaded = self
+            .dm
+            .load(
+                &device,
+                target.length_sectors,
+                "linear",
+                &format!("{} 0", table.dest_dev),
+            )
+            .await;
+        let resumed = suspended.resume().await;
+        loaded.and(resumed)
+    }
+
+    async fn snapshot_clone_locked(
+        &self,
+        drive: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        dest_snapshot: &VolumeName,
+        bitmap_snapshot: &VolumeName,
+    ) -> io::Result<(Volume, Volume)> {
+        let table = self.copying_drive(drive).await?;
+        let dest_dev = self.dm.devno(&self.device_name(&dest.name)).await?;
+        let bitmap_dev = self.dm.devno(&self.device_name(&bitmap.name)).await?;
+        if table.dest_dev != dest_dev || table.metadata_dev != bitmap_dev {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{drive} copies into {} with bitmap {}, not {} and {}",
+                    table.dest_dev, table.metadata_dev, dest.name, bitmap.name
+                ),
+            ));
+        }
+        let suspended = Suspended::suspend(&self.dm, &self.device_name(drive)).await?;
+        let mut made = Vec::with_capacity(2);
+        let taken = async {
+            for (origin, name) in [(bitmap, bitmap_snapshot), (dest, dest_snapshot)] {
+                made.push(self.snapshot(origin, name).await?);
+            }
+            Ok(())
+        }
+        .await;
+        let resumed = suspended.resume().await;
+        if let Err(e) = taken.and(resumed) {
+            for snap in made {
+                let name = snap.name.clone();
+                drop(snap);
+                if let Err(error) = self.delete(&name).await {
+                    tracing::warn!(volume = %name, %error, "snapshot left behind by a failed snapshot_clone");
+                }
+            }
+            return Err(e);
+        }
+        let dest_snap = made.pop().expect("two snapshots taken");
+        let bitmap_snap = made.pop().expect("two snapshots taken");
+        Ok((dest_snap, bitmap_snap))
+    }
+
     /// Run `read` over a reserved metadata snapshot. The reserve is
     /// released when the guard drops, so a cancelled read releases it
     /// too. A reserve another holder left behind (a process that died,
     /// a read cancelled before this guard existed) is released first.
     async fn with_metadata_snap<T>(
         &self,
-        read: impl std::future::Future<Output = io::Result<T>>,
+        read: impl Future<Output = io::Result<T>>,
     ) -> io::Result<T> {
         let _held = self.metadata_snap.lock().await;
         if let Err(error) = self.dm.message(&self.pool, "reserve_metadata_snap").await {
@@ -305,38 +430,57 @@ struct Thin {
     params: ThinParams,
 }
 
-/// A suspended device; resumed on drop if [`Self::resume`] did not run.
-struct Suspended<'a> {
-    dm: &'a dm::Dm,
-    name: &'a str,
-    held: bool,
+/// A suspended device. Until a resume succeeds it stays armed: a drop
+/// resumes it, so a task aborted between the two still resumes it.
+struct Suspended {
+    device: Option<(dm::Dm, String)>,
 }
 
-impl<'a> Suspended<'a> {
-    async fn suspend(dm: &'a dm::Dm, name: &'a str) -> io::Result<Self> {
+impl Suspended {
+    async fn suspend(dm: &dm::Dm, name: &str) -> io::Result<Self> {
         dm.suspend(name).await?;
         Ok(Self {
-            dm,
-            name,
-            held: true,
+            device: Some((dm.clone(), name.to_string())),
         })
     }
 
+    /// Resume, retrying a bounded number of times. On failure the drop
+    /// tries once more and logs the device as left suspended.
     async fn resume(mut self) -> io::Result<()> {
-        let resumed = self.dm.resume(self.name).await;
-        self.held = false;
-        resumed
+        let (dm, name) = self.device.as_ref().expect("armed until resumed");
+        let mut attempt = 1;
+        loop {
+            match dm.resume(name).await {
+                Ok(()) => break,
+                Err(error) if attempt < RESUME_ATTEMPTS => {
+                    tracing::warn!(device = %name, attempt, %error, "resume failed; retrying");
+                    attempt += 1;
+                    tokio::time::sleep(RESUME_RETRY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.device = None;
+        Ok(())
     }
 }
 
-impl Drop for Suspended<'_> {
+impl Drop for Suspended {
     fn drop(&mut self) {
-        if self.held {
-            if let Err(error) = self.dm.resume_blocking(self.name) {
-                tracing::error!(device = self.name, %error, "device left suspended");
+        if let Some((dm, name)) = self.device.take() {
+            if let Err(error) = dm.resume_blocking(&name) {
+                tracing::error!(device = %name, %error, "device left suspended");
             }
         }
     }
+}
+
+/// Run `op` in a task of its own, so a caller that is dropped cannot stop
+/// it between a suspend and the resume.
+async fn detached<T: Send + 'static>(
+    op: impl Future<Output = io::Result<T>> + Send + 'static,
+) -> io::Result<T> {
+    tokio::spawn(op).await.map_err(io::Error::other)?
 }
 
 /// A reserved metadata snapshot; released on drop.
@@ -393,11 +537,8 @@ impl SessionDisk for ThinPoolDisk {
         let pool = self.pool.clone();
         let next_id = self.next_id.clone();
         let origin_name = self.device_name(&origin.name);
-        // The origin holds all I/O while it is suspended, so the resume
-        // must run whatever happens to the caller: the calls are one owned
-        // task.
-        let id = tokio::spawn(async move {
-            dm.suspend(&origin_name).await?;
+        let id = detached(async move {
+            let suspended = Suspended::suspend(&dm, &origin_name).await?;
             let created = loop {
                 let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
                 match dm
@@ -408,7 +549,7 @@ impl SessionDisk for ThinPoolDisk {
                     created => break created.map(|()| id),
                 }
             };
-            let resumed = dm.resume(&origin_name).await;
+            let resumed = suspended.resume().await;
             match (created, resumed) {
                 (Ok(id), Ok(())) => Ok(id),
                 (Ok(id), Err(e)) => {
@@ -421,8 +562,7 @@ impl SessionDisk for ThinPoolDisk {
                 (Err(e), _) => Err(e),
             }
         })
-        .await
-        .map_err(io::Error::other)??;
+        .await?;
         self.activate(name, id, sectors).await
     }
 
@@ -484,6 +624,7 @@ impl SessionDisk for ThinPoolDisk {
         source: &Path,
         hydration: Hydration,
     ) -> io::Result<Volume> {
+        let _held = self.lock_drive(drive).await;
         let (table, sectors) = self.clone_table(dest, bitmap, source).await?;
         self.dm
             .create(
@@ -517,6 +658,7 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
+        let _held = self.lock_drive(drive).await;
         self.copying_drive(drive).await?;
         self.dm
             .message(&self.device_name(drive), "enable_hydration")
@@ -527,32 +669,17 @@ impl SessionDisk for ThinPoolDisk {
     /// clone has copied stays copied, so the check before the suspend
     /// still holds at the swap.
     async fn cut_over(&self, drive: &VolumeName) -> io::Result<()> {
-        let target = self.drive_target(drive).await?;
-        if target.kind == "linear" {
-            return Ok(());
-        }
-        let table = parse::clone_table(&target.params)?;
-        if !self.clone_state(drive).await?.is_hydrated() {
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!("{drive} is still hydrating"),
-            ));
-        }
-        let device = self.device_name(drive);
-        let suspended = Suspended::suspend(&self.dm, &device).await?;
-        self.dm
-            .load(
-                &device,
-                target.length_sectors,
-                "linear",
-                &format!("{} 0", table.dest_dev),
-            )
-            .await?;
-        suspended.resume().await
+        let (disk, drive) = (self.clone(), drive.clone());
+        detached(async move {
+            let _held = disk.lock_drive(&drive).await;
+            disk.cut_over_locked(&drive).await
+        })
+        .await
     }
 
-    /// Both snapshots are taken while the drive is suspended: the suspend
-    /// stops the background copy and commits the bitmap.
+    /// Both snapshots, the bitmap first, are taken while the drive is
+    /// suspended: the suspend stops the background copy and commits the
+    /// bitmap.
     async fn snapshot_clone(
         &self,
         drive: &VolumeName,
@@ -561,40 +688,15 @@ impl SessionDisk for ThinPoolDisk {
         dest_snapshot: &VolumeName,
         bitmap_snapshot: &VolumeName,
     ) -> io::Result<(Volume, Volume)> {
-        let table = self.copying_drive(drive).await?;
-        let dest_dev = self.dm.devno(&self.device_name(&dest.name)).await?;
-        let bitmap_dev = self.dm.devno(&self.device_name(&bitmap.name)).await?;
-        if table.dest_dev != dest_dev || table.metadata_dev != bitmap_dev {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{drive} copies into {} with bitmap {}, not {} and {}",
-                    table.dest_dev, table.metadata_dev, dest.name, bitmap.name
-                ),
-            ));
-        }
-        let device = self.device_name(drive);
-        let suspended = Suspended::suspend(&self.dm, &device).await?;
-        let bitmap_snap = self.snapshot(bitmap, bitmap_snapshot).await?;
-        let taken = match self.snapshot(dest, dest_snapshot).await {
-            Ok(dest_snap) => suspended.resume().await.map(|()| dest_snap),
-            Err(e) => Err(e),
-        };
-        match taken {
-            Ok(dest_snap) => Ok((dest_snap, bitmap_snap)),
-            Err(e) => {
-                drop(bitmap_snap);
-                for name in [bitmap_snapshot, dest_snapshot] {
-                    match self.delete(name).await {
-                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                            tracing::warn!(volume = %name, %error, "snapshot left behind by a failed snapshot_clone");
-                        }
-                        _ => {}
-                    }
-                }
-                Err(e)
-            }
-        }
+        let disk = self.clone();
+        let (drive, dest, bitmap) = (drive.clone(), dest.clone(), bitmap.clone());
+        let (dest_snapshot, bitmap_snapshot) = (dest_snapshot.clone(), bitmap_snapshot.clone());
+        detached(async move {
+            let _held = disk.lock_drive(&drive).await;
+            disk.snapshot_clone_locked(&drive, &dest, &bitmap, &dest_snapshot, &bitmap_snapshot)
+                .await
+        })
+        .await
     }
 
     /// A read-only `clone` target with hydration off.
@@ -605,6 +707,7 @@ impl SessionDisk for ThinPoolDisk {
         bitmap_snapshot: &Volume,
         source: &Path,
     ) -> io::Result<Volume> {
+        let _held = self.lock_drive(view).await;
         let (table, sectors) = self
             .clone_table(dest_snapshot, bitmap_snapshot, source)
             .await?;
@@ -625,6 +728,7 @@ impl SessionDisk for ThinPoolDisk {
     /// Also removes a drive left with no table by a crash inside
     /// `clone_drive`.
     async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()> {
+        let _held = self.lock_drive(drive).await;
         let targets = self.dm.table(&self.device_name(drive)).await?;
         match targets.as_slice() {
             [] => {}
