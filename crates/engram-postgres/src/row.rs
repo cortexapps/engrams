@@ -39,22 +39,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
             )));
         }
     };
-    // ADR 0016 Phase B: live_disk_manifest_* columns added in
-    // migration 0034. The both-or-neither CHECK constraint
-    // guarantees these two columns are either both NULL or both
-    // populated, so we collapse them into Option<ManifestRef>.
-    // Older SELECT statements that don't project these columns
-    // get `try_get` errors → fall back to None.
-    let live_disk_manifest_id: Option<Uuid> = row.try_get("live_disk_manifest_id").ok().flatten();
-    let live_disk_manifest_version: Option<i64> =
-        row.try_get("live_disk_manifest_version").ok().flatten();
-    let live_disk_manifest = match (live_disk_manifest_id, live_disk_manifest_version) {
-        (Some(mid), Some(ver)) => Some(engram_core::types::manifest::ManifestRef {
-            manifest_id: mid,
-            version: ver as u64,
-        }),
-        _ => None,
-    };
     // Issue #535 (b): migration 0082's TEXT[] NOT NULL DEFAULT '{}' column.
     // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
     // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
@@ -83,7 +67,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         last_event_at,
-        live_disk_manifest,
         park_rung,
         parked_at,
         suggested_title,
@@ -102,7 +85,6 @@ pub(crate) fn queued_session_from_row(
     let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
     let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
     Ok(engram_core::types::session::QueuedSession {
-        nbd_slot_need: row.try_get::<i64, _>("nbd_slot_need").map_err(col_err)? as u32,
         session,
         origin,
         mem_budget_mib,
@@ -181,16 +163,22 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             running_sandboxes: running_sandboxes.max(0) as u32,
         },
         utilization: HostUtilization {
-            nbd_slots_total: row
-                .try_get::<i64, _>("nbd_slots_total")
+            pool_data_free_mib: row
+                .try_get::<i64, _>("pool_data_free_mib")
                 .map_err(col_err)?
-                .max(0) as u32,
-            nbd_slots_in_use: row
-                .try_get::<i64, _>("nbd_slots_in_use")
+                .max(0) as u64,
+            pool_data_total_mib: row
+                .try_get::<i64, _>("pool_data_total_mib")
                 .map_err(col_err)?
-                .max(0) as u32,
-            nbd_sandboxes: serde_json::from_value(row.try_get("nbd_sandboxes").map_err(col_err)?)
-                .map_err(|e| MetaError::Serialization(e.to_string()))?,
+                .max(0) as u64,
+            pool_metadata_free_mib: row
+                .try_get::<i64, _>("pool_metadata_free_mib")
+                .map_err(col_err)?
+                .max(0) as u64,
+            pool_metadata_total_mib: row
+                .try_get::<i64, _>("pool_metadata_total_mib")
+                .map_err(col_err)?
+                .max(0) as u64,
             disk_total_mib: util_disk_total_mib.max(0) as u64,
             disk_used_mib: util_disk_used_mib.max(0) as u64,
             mem_total_mib: util_mem_total_mib.max(0) as u64,

@@ -12,8 +12,8 @@
 //!   K2: a host-agent restart *detaches* its VMs (leaves them running
 //!   under hostPID) and the successor re-adopts them here.
 //! - Orphan-reap: when the FC process is truly gone (or identity
-//!   fails), delete the manifest and let `orphan_reap.rs` reap the
-//!   jail_dir. Reconcile then transitions the owning session, which
+//!   fails), delete the manifest and let the teardown reconcile reap
+//!   the jail_dir. Reconcile then transitions the owning session, which
 //!   warm-recovers elsewhere from its last periodic checkpoint.
 //!
 //! There is deliberately no "restore from a SIGTERM checkpoint" path:

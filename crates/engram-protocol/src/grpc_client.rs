@@ -14,7 +14,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::traits::{HostClient, SessionFence};
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
@@ -93,21 +92,6 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
-/// Deadline applied (via the gRPC `grpc-timeout` header) to the
-/// snapshot-restore RPCs — `restore` (resume),
-/// `restore_base_for_session` (cold-create-via-restore), and
-/// `start_agent` (the harness (re)attach leg of the same resume
-/// pipeline, which shares the wedge modes). Without it a
-/// host that wedges mid-restore leaves the coord caller hung
-/// indefinitely (observed as a ~6-minute dead-host stall); the
-/// keepalive pings only catch a *silent* connection, not a peer that
-/// ACKs but never completes the call. Set generously above the
-/// slowest legitimate restore (cold boot ~15-30s, rechunk-heavy
-/// resumes up to a couple of minutes) so it never aborts a real
-/// restore, while still bounding the pathological hang. Because it
-/// rides the gRPC deadline header, the *host* side observes it too and
-/// can abort its own work. Override via
-/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
 /// ADR 0079: build the shared fenced request for the
 /// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
 /// encodes epoch 0 (interim "verb not yet migrated" — the host allows
@@ -120,7 +104,9 @@ fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
     }
 }
 
-/// Shared budget for restore and managed lifecycle calls.
+/// Deadline for restore, harness start and managed lifecycle calls.
+/// The host receives the same deadline through the gRPC timeout header.
+/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS` overrides the 240-second default.
 pub fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
@@ -148,17 +134,14 @@ impl GrpcHostClient {
     /// Build a client over an existing tonic `Channel`. The channel
     /// is HTTP/2-multiplexing — many concurrent RPCs share one
     /// TCP+H2 connection — so we want exactly one instance per
-    /// host. Callers go through `GrpcHostPool::dispatch` which
+    /// host. Callers go through `GrpcHostPool::get_or_warm` which
     /// hands out a clone of the pool's entry.
     ///
     /// Every RPC carries the caller's `traceparent` via
     /// [`TraceparentInjector`] (ADR 0019 distributed tracing).
     ///
-    /// The inbound decode cap is 32 MiB on every client (was an opt-in
-    /// for `ReapMaterializeDir`'s 16 MiB reply; ADR 0095's
-    /// `PeerChunkGet` frames — 4 MiB data + overhead — need past
-    /// tonic's 4 MiB default too, and the cap is just a limit check,
-    /// no allocation change).
+    /// The 32 MiB decode cap permits peer chunk frames with 4 MiB of data
+    /// plus framing overhead. It does not allocate memory before a reply.
     pub fn new(channel: Channel) -> Self {
         Self {
             inner: HostServiceClient::with_interceptor(channel, TraceparentInjector)
@@ -363,7 +346,8 @@ impl GrpcHostClient {
             disk_drain_ms: resp.disk_drain_ms,
             vmstate_ms: resp.vmstate_ms,
             scan_ms: resp.scan_ms,
-            sealed_disk_chunks: resp.sealed_disk_chunks,
+            sealed_disk_blocks: resp.sealed_disk_blocks,
+            precopy_disk_blocks: resp.precopy_disk_blocks,
             paused_at_unix_ms: resp.paused_at_unix_ms,
         })
     }
@@ -445,44 +429,25 @@ impl GrpcHostClient {
         SandboxError,
     > {
         use crate::grpc::migration_item::Kind;
+        use engram_core::types::snapshot::MigrationItem as Item;
+        let wire_role = |role: engram_core::types::snapshot::DiskRole| match role {
+            engram_core::types::snapshot::DiskRole::Root => crate::grpc::DiskRole::Root as i32,
+            engram_core::types::snapshot::DiskRole::Swap => crate::grpc::DiskRole::Swap as i32,
+        };
         let wire_items = items
             .into_iter()
-            .map(|item| match item {
-                engram_core::types::snapshot::MigrationItem::HotHint => MigrationItem {
-                    kind: Kind::HotHint as i32,
-                    chunk_idx: 0,
-                    role: crate::grpc::DiskRole::Root as i32,
-                },
-                engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
-                    kind: Kind::StateBin as i32,
-                    chunk_idx: 0,
-                    role: crate::grpc::DiskRole::Root as i32,
-                },
-                engram_core::types::snapshot::MigrationItem::DiskSealInfo(role) => MigrationItem {
-                    kind: Kind::DiskSealInfo as i32,
-                    chunk_idx: 0,
-                    role: match role {
-                        engram_core::types::snapshot::DiskRole::Root => {
-                            crate::grpc::DiskRole::Root as i32
-                        }
-                        engram_core::types::snapshot::DiskRole::Swap => {
-                            crate::grpc::DiskRole::Swap as i32
-                        }
-                    },
-                },
-                engram_core::types::snapshot::MigrationItem::DiskChunkAt(role, idx) => {
-                    MigrationItem {
-                        kind: Kind::DiskChunkAt as i32,
-                        chunk_idx: idx,
-                        role: match role {
-                            engram_core::types::snapshot::DiskRole::Root => {
-                                crate::grpc::DiskRole::Root as i32
-                            }
-                            engram_core::types::snapshot::DiskRole::Swap => {
-                                crate::grpc::DiskRole::Swap as i32
-                            }
-                        },
-                    }
+            .map(|item| {
+                let (kind, role, index) = match item {
+                    Item::HotHint => (Kind::HotHint, None, 0),
+                    Item::StateBin => (Kind::StateBin, None, 0),
+                    Item::DiskSealInfo(role) => (Kind::DiskSealInfo, Some(role), 0),
+                    Item::DiskPrecopyInfo(role) => (Kind::DiskPrecopyInfo, Some(role), 0),
+                    Item::DiskBlockAt(role, index) => (Kind::DiskBlockAt, Some(role), index),
+                };
+                MigrationItem {
+                    kind: kind as i32,
+                    role: role.map_or(crate::grpc::DiskRole::Root as i32, wire_role),
+                    index,
                 }
             })
             .collect();
@@ -549,6 +514,26 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
+    }
+
+    pub async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        let resp = self
+            .inner
+            .clone()
+            .migration_abort_unserved(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(resp.into_inner().aborted)
     }
 
     pub async fn commit_snapshot(
@@ -899,8 +884,7 @@ impl GrpcHostClient {
         // the host-side SpawnHarness round-trip can wedge (guest page-in
         // starvation, a dead rootfs device that never answers agentd), and
         // without a `grpc-timeout` header the coordinator's resume `finish`
-        // step inherits the hang unbounded (prod 2026-07-17 session
-        // 03e6535e: a 34-minute stall ended only by a pod roll). The host
+        // step inherits the hang unbounded. The host
         // reattach is idempotent, so a timed-out attempt that the op
         // executor retries reconciles cleanly rather than double-spawning.
         req.set_timeout(restore_rpc_timeout());
@@ -968,68 +952,6 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
-    }
-
-    /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
-    /// `state_bincode` on the wire encodes `None` (host has no
-    /// chunk-tracked view of this sandbox) so coord can distinguish
-    /// "not chunk-tracked" from "really nothing dirty".
-    pub async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .cow_state(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.state_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(&resp.state_bincode, "CowState")?))
-    }
-
-    /// ADR 0016 Phase A: bulk COW fetch for one host. Returns one
-    /// record per chunk-tracked sandbox; ordering not guaranteed.
-    pub async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        let resp = self
-            .inner
-            .clone()
-            .cow_state_all(Empty {})
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        decode_bincode(&resp.records_bincode, "Vec<CowStateRecord>")
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin flush trigger. Coord's
-    /// `POST /api/admin/sessions/:id/flush-now` calls this. Empty
-    /// `manifest_ref_bincode` on the wire encodes `None` (no chunk
-    /// tracking / no dirty chunks); non-empty decodes to the new
-    /// `Some(ManifestRef)`.
-    pub async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .flush_sandbox(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        if resp.manifest_ref_bincode.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_bincode(
-            &resp.manifest_ref_bincode,
-            "ManifestRef",
-        )?))
     }
 
     /// Server-streaming exec. The first frame is `started` (carries
@@ -1463,13 +1385,7 @@ fn proxy_body_to_shell_frame(
     })
 }
 
-// ---- helpers ----
-//
-// Use `bincode::serialize` / `bincode::deserialize` with default
-// config to match the existing WS codec (`src/codec.rs:49,71`) so
-// a SandboxSpec encoded on the gRPC wire decodes identically to one
-// on the WS wire. Both transports use the same Rust types during
-// the ADR 0013 transition.
+// Bincode uses its default configuration on both sides of the host boundary.
 
 fn encode_bincode<T: serde::Serialize>(
     value: &T,
@@ -1640,6 +1556,15 @@ impl HostClient for GrpcHostClient {
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
         Self::migration_abort(self, id, export_id, fence).await
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        Self::migration_abort_unserved(self, id, export_id, fence).await
     }
 
     async fn commit_snapshot(
@@ -1954,27 +1879,9 @@ impl HostClient for GrpcHostClient {
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC
     // doesn't carry static capability or in-proc sink wiring.
-
-    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        Self::cow_state(self, id).await
-    }
-
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Self::cow_state_all(self).await
-    }
-
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        Self::flush_sandbox(self, id).await
-    }
 }
 
-/// Map a tonic Status into the same `SandboxError` shape today's WS
-/// path produces. The bincode wire used `RemoteError::into_sandbox`;
-/// tonic gives us a status code + message, so we do the equivalent
-/// mapping per code.
+/// Map gRPC status codes and exact refusal markers to typed sandbox errors.
 fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
     use tonic::Code;
     match status.code() {

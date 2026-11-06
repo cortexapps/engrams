@@ -63,15 +63,10 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
-    /// ADR 0028 Fix B: chunked-manifest override for the root disk.
-    /// When set, the host serves the rootfs from THIS manifest's
-    /// chunks (NBD-attached, continuous-flush continues the same
-    /// lineage) instead of resolving it from `image_uri` — the
-    /// disk-only cold-boot recovery shape: a fresh kernel boot
-    /// mounting a session's evolved `live_disk_manifest`. Wire note:
-    /// `SandboxSpec` is bincode-framed coord→host, so a mixed-version
-    /// fleet mid-deploy can't decode creates — acceptable per the
-    /// clean-break norm (coord + host MIG roll together on push).
+    /// Chunked-manifest override for the root disk. When set, the host
+    /// continues this manifest's lineage instead of forking the image's
+    /// base: the disk-only cold boot, a fresh kernel on a session's
+    /// evolved disk.
     #[serde(default)]
     pub rootfs_manifest: Option<super::manifest::ManifestRef>,
     // ADR 0021 P1.5b retired `harness_pack_uri` + `harness_substrate`.
@@ -112,16 +107,24 @@ pub struct SandboxSpec {
     /// stay in lockstep (an empty `Vec` still encodes as length 0).
     #[serde(default)]
     pub aux_ro_drives: Vec<AuxRoDrive>,
-    /// Guest swap capacity in MiB. The host serves this disk through NBD.
+    /// Guest swap capacity in MiB. The host backs this disk with a volume.
     /// The snapshot carries its contents together with guest memory.
     #[serde(default)]
     pub swap_mib: Option<u32>,
     /// Host block device that serves the swap disk.
     #[serde(default)]
     pub swap_source: Option<PathBuf>,
-    /// Private swap lineage used to recover the host disk server.
+    /// Start the swap from this lineage instead of blank.
     #[serde(default)]
     pub swap_manifest: Option<super::manifest::ManifestRef>,
+}
+
+/// The device paths of a session's disks, provisioned by the layer
+/// that owns them and handed to the backend that attaches them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDisks {
+    pub root: PathBuf,
+    pub swap: Option<PathBuf>,
 }
 
 /// A read-only mount the host attaches to the guest as an additional

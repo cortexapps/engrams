@@ -7,9 +7,9 @@
 //! bincode blobs inside proto `bytes` fields
 //! (`engram-protocol/src/grpc_client.rs::{encode,decode}_bincode`):
 //! `SandboxSpec`, `AgentSpec`, `SnapshotMetadata`, `ManifestRef`,
-//! `SessionEgressPolicy`, `CowState`/`CowStateRecord`. These are the
-//! AUTHORITATIVE in-process engram-core types — they cross the wire
-//! as-is, with no proto mirror per nested struct.
+//! `SessionEgressPolicy`. These are the AUTHORITATIVE in-process
+//! engram-core types — they cross the wire as-is, with no proto mirror
+//! per nested struct.
 //!
 //! `bincode` (1.x) is positional: enums encode by `u32` variant *index*,
 //! structs by field *order*. Neither is self-describing. The existing
@@ -24,9 +24,8 @@
 //! or adding a non-trailing field fails here with a message naming the
 //! evolution rule, turning a silent wire desync into a CI failure.
 //!
-//! Also covered: the `wire.rs` mirrors (`WireExecRequest`,
-//! `WireReapStats`) — the pattern ADR 0013 says SHOULD eventually wrap
-//! every cross-boundary shape.
+//! Also covered: the `wire.rs` mirror `WireExecRequest` — the pattern
+//! ADR 0013 says SHOULD eventually wrap every cross-boundary shape.
 //!
 //! ## Regenerating the corpus (only when you INTENTIONALLY evolve a type)
 //!
@@ -50,7 +49,6 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use chrono::DateTime;
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::{
     EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
 };
@@ -63,7 +61,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{WarmStageOutcome, WarmStageRecord};
 use engram_core::{SandboxId, SessionId, SnapshotId};
-use engram_protocol::wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
+use engram_protocol::wire::{WireExecRequest, WIRE_VERSION};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -204,6 +202,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
         disk_manifest: Some(fixed_manifest_ref(0x21, 1)),
         memory_manifest: Some(fixed_manifest_ref(0x22, 1)),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: Some(SandboxId::from(fixed_uuid(0x23))),
         state_blob_key: Some("snapshots/x/state.bin".into()),
@@ -252,7 +251,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
     }
 }
 
-/// The engrams-review outage (2026-08-01): every field of the inject/observe
+/// A populated minted policy: every field of the inject/observe
 /// ENTRY types populated — most importantly `mint_source: Some(..)`, which the
 /// empty-`injects` golden above can never exercise. `CredentialMintSource` was
 /// internally tagged (#931); bincode ENCODED that as a map but could never
@@ -407,19 +406,6 @@ fn session_egress_policy_oauth_user() -> SessionEgressPolicy {
     }
 }
 
-fn cow_state() -> CowState {
-    CowState {
-        disk_manifest: fixed_manifest_ref(0x40, 7),
-        dirty_chunks: 3,
-        dirty_bytes: 48 * 1024 * 1024,
-        last_flush_unix_ms: 1_770_000_000_000,
-        base_chunks: 256,
-        base_chunks_local: 240,
-        memory_manifest: Some(fixed_manifest_ref(0x41, 2)),
-        last_snapshot_unix_ms: 1_769_000_000_000,
-    }
-}
-
 /// Issue #539 (historical): `Vec<WarmStageRecord>` used to cross the
 /// coord<->host wire as the `CaptureProgress.warm_stages_bincode`
 /// payload; ADR 0084 P1b deleted that RPC (and P4 deleted the
@@ -458,18 +444,20 @@ fn migration_item_indices_stay_fixed() {
     for (item, index) in [
         (MigrationItem::StateBin, 0),
         (MigrationItem::DiskSealInfo(DiskRole::Root), 1),
-        (MigrationItem::DiskChunkAt(DiskRole::Root, 9), 2),
+        (MigrationItem::DiskBlockAt(DiskRole::Root, 9), 2),
         (MigrationItem::HotHint, 3),
+        (MigrationItem::DiskPrecopyInfo(DiskRole::Root), 4),
     ] {
         // Exhaustive guard: every new kind needs an explicit wire pin.
         let kind = match item {
             MigrationItem::StateBin => Kind::StateBin,
             MigrationItem::DiskSealInfo(_) => Kind::DiskSealInfo,
-            MigrationItem::DiskChunkAt(_, _) => Kind::DiskChunkAt,
+            MigrationItem::DiskBlockAt(_, _) => Kind::DiskBlockAt,
             MigrationItem::HotHint => Kind::HotHint,
+            MigrationItem::DiskPrecopyInfo(_) => Kind::DiskPrecopyInfo,
         };
         assert_variant_index(&item, index, "MigrationItem");
-        assert_eq!(kind as i32, [1, 4, 5, 6][index as usize]);
+        assert_eq!(kind as i32, [1, 4, 7, 6, 8][index as usize]);
         let bytes = bincode::serialize(&item).unwrap();
         assert_eq!(bincode::deserialize::<MigrationItem>(&bytes).unwrap(), item);
     }
@@ -499,8 +487,7 @@ fn struct_payloads_golden() {
             sha256: "d".repeat(64),
         },
     );
-    // SessionEgressPolicy / CowState / CowStateRecord don't derive
-    // `PartialEq`; pin their encoded bytes (field-order regression catch).
+    // Pin the policy field order, including the optional managed deny.
     assert_golden_no_eq("session_egress_policy", &session_egress_policy());
     assert_golden_no_eq(
         "session_egress_policy_minted",
@@ -518,16 +505,7 @@ fn struct_payloads_golden() {
         "session_egress_policy_oauth_user",
         &session_egress_policy_oauth_user(),
     );
-    assert_golden_no_eq("cow_state", &cow_state());
-    assert_golden_no_eq(
-        "cow_state_record",
-        &CowStateRecord {
-            sandbox_id: SandboxId::from(fixed_uuid(0x60)),
-            state: cow_state(),
-        },
-    );
-    // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
-    // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
+    // Pin the persisted warm-stage shape.
     assert_golden("warm_stages", &warm_stages());
 
     // ADR 0080 phase 3b (wire v14) — the MaterializeImage payloads.
@@ -606,8 +584,7 @@ fn nested_enum_variant_indices() {
 
 #[test]
 fn wire_mirrors_golden() {
-    // The wire.rs mirror shapes (ADR 0013 — the pattern the rest should
-    // eventually adopt). WireExecRequest isn't `PartialEq`; pin bytes.
+    // Pin the exec request field order.
     assert_golden_no_eq(
         "wire_exec_request",
         &WireExecRequest {
@@ -620,16 +597,6 @@ fn wire_mirrors_golden() {
             stdout_offset: Some(7),
             stderr_offset: Some(9),
             wake: Some(true),
-        },
-    );
-    assert_golden_no_eq(
-        "wire_reap_stats",
-        &WireReapStats {
-            files_scanned: 12,
-            files_deleted: 5,
-            bytes_freed: 1024,
-            files_skipped_unparseable: 1,
-            files_skipped_too_young: 2,
         },
     );
 }
@@ -684,8 +651,8 @@ fn wire_version_pinned() {
     // bincode field. The session-egress-policy golden was regenerated.
     // 21 -> 22: `CredentialMintSource` becomes externally tagged — the
     // internally-tagged form (#931) could never bincode-DECODE, so every
-    // minted-inject policy failed host-side at boot (the engrams-review
-    // outage, 2026-08-01). No existing golden changes bytes (the broken
+    // minted-inject policy failed host-side at boot (the minted-policy
+    // decode failure). No existing golden changes bytes (the broken
     // `Some` shape never had one); the minted-policy golden is ADDED.
     // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` became
     // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
@@ -734,11 +701,12 @@ fn wire_version_pinned() {
     // MigrationItem appends HotHint (bincode 3, protobuf 6). Existing item
     // indices stay fixed; the optional hint is separate from immutable disk seals.
     // Existing goldens embed neither payload and keep their bytes.
-    // 37 -> 38: SessionEgressPolicy appends the managed deny envelope.
-    // 38 -> 39: per-call harness cancellation; 39 -> 40: creation authority RPCs.
-    // The latter adds protobuf messages without changing existing bincode bytes.
+    // 37 -> 38: MigrationItem::DiskBlockAt replaces DiskChunkAt at bincode
+    // index 2 (protobuf 7) and DiskPrecopyInfo is appended (bincode 4,
+    // protobuf 8); the capture reports block counts. No golden embeds either.
+    // 38 -> 43 combines managed policy, cancellation, boot and deferred identity.
     assert_eq!(
-        WIRE_VERSION, 42,
+        WIRE_VERSION, 43,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -792,14 +760,6 @@ fn regen_golden() {
         "session_egress_policy_oauth_user",
         &session_egress_policy_oauth_user(),
     );
-    write("cow_state", &cow_state());
-    write(
-        "cow_state_record",
-        &CowStateRecord {
-            sandbox_id: SandboxId::from(fixed_uuid(0x60)),
-            state: cow_state(),
-        },
-    );
     write("warm_stages", &warm_stages());
     // ADR 0080 phase 3b — MaterializeImage payloads (see
     // struct_payloads_golden for the shapes' rationale).
@@ -840,19 +800,9 @@ fn regen_golden() {
             wake: Some(true),
         },
     );
-    write(
-        "wire_reap_stats",
-        &WireReapStats {
-            files_scanned: 12,
-            files_deleted: 5,
-            bytes_freed: 1024,
-            files_skipped_unparseable: 1,
-            files_skipped_too_young: 2,
-        },
-    );
 }
 
-/// The engrams-review outage (2026-08-01): the internally-tagged
+/// A populated minted policy: the internally-tagged
 /// `CredentialMintSource` (#931) bincode-ENCODED fine but could never DECODE
 /// (`deserialize_any`), so the encode-only golden pin above was green while
 /// every minted-inject policy failed host-side. This test pins the DECODE leg:
@@ -875,7 +825,7 @@ fn minted_inject_policy_bincode_round_trips() {
     );
 }
 
-/// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds
+/// ADR 0080 capture contract: `WarmConfig.env` holds
 /// `CaptureEnvValue`, an internally-tagged serde enum — bincode cannot
 /// DECODE that representation (`deserialize_any`), so a non-empty
 /// `[[warm.env]]` crossing the wire fails host-side at capture. The

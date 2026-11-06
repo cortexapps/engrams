@@ -127,7 +127,6 @@ fn bare_write_set(
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
-        nbd_slot_need: 1,
         session_id,
         spec: spec(),
         mem_budget_mib,
@@ -242,7 +241,7 @@ async fn placement_no_fit_details_classifies_against_real_pg() {
     let placed = reserve(&meta, sid, 16384, 2, &[host], 0).await;
     assert_eq!(placed, Some(host), "the 16 GiB session reserves the host");
     let details = meta
-        .placement_no_fit_details(&[host], 4096, 2, 1)
+        .placement_no_fit_details(&[host], 4096, 2)
         .await
         .expect("placement_no_fit_details SQL runs");
     assert_eq!(details.len(), 1);
@@ -275,7 +274,6 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
-        nbd_slot_need: 1,
         session_id,
         spec: spec(),
         mem_budget_mib: 2048,

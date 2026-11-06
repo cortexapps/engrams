@@ -10,11 +10,8 @@ pub struct SnapshotMetadata {
     pub created_at: DateTime<Utc>,
     /// Image version the source sandbox was launched from.
     pub image_version: String,
-    /// ADR 0007: content-addressed manifest pointing at the disk's
-    /// chunks in `BlobStorage`, captured at snapshot time. `None`
-    /// for backends that haven't wired chunk-store snapshot yet
-    /// (FC; lights up with Phase 4's NBD work). `Some` for VZ on
-    /// macOS once a `ChunkStore` is attached to its config.
+    /// The root disk's chunk-store manifest, captured at snapshot
+    /// time. `None` only for a backend with no chunk store.
     #[serde(default)]
     pub disk_manifest: Option<super::manifest::ManifestRef>,
     /// ADR 0007: content-addressed manifest pointing at the
@@ -120,6 +117,12 @@ pub struct SnapshotMetadata {
     /// Chunked swap device captured with this snapshot.
     #[serde(default)]
     pub swap_manifest: Option<super::manifest::ManifestRef>,
+    /// The disk manifest of the image this session started from. A
+    /// host that has the image staged writes only the difference
+    /// between it and `disk_manifest` when it restores. `None` stages
+    /// the whole disk.
+    #[serde(default)]
+    pub base_disk_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -264,9 +267,9 @@ pub struct MigrationPresetupOut {
     /// chunks override via the peer at fault/drain time).
     pub memory_manifest_json: Vec<u8>,
     pub memory_manifest_ref: super::manifest::ManifestRef,
-    /// The disk manifest the dest NBD-attaches at prepare (the live
-    /// published view; the post-pause drain's final manifest arrives
-    /// with the capture and the dest REBASES before FC load).
+    /// The disk lineage the dest stages at prepare. The capture seals
+    /// the chunks changed since it; the dest writes them into its
+    /// volume before it loads the VM state.
     pub disk_manifest_ref: Option<super::manifest::ManifestRef>,
     /// Swap base lineage; sealed changes arrive before the VM state.
     pub swap_manifest_ref: Option<super::manifest::ManifestRef>,
@@ -277,8 +280,9 @@ pub struct MigrationPresetupOut {
 /// ADR 0045 C2: what `migration_capture_postcopy` returns — the
 /// post-pause half. NOTHING bulky moves at capture (that is the
 /// point): the memory dirty map seals on the page server, the disk
-/// dirty/pending tiers seal on the export (raw bytes, never hashed),
-/// and `state.bin` becomes fetchable. The dest demand-faults both.
+/// blocks changed since the presetup's snapshot seal on the export
+/// (raw bytes, never hashed), and `state.bin` becomes fetchable. The
+/// dest demand-faults memory and pulls the sealed blocks.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PostCopyCaptureOut {
     /// Sealed (peer-authoritative) memory chunk count — observability.
@@ -297,8 +301,11 @@ pub struct PostCopyCaptureOut {
     pub vmstate_ms: u64,
     /// Pagemap scan wall time (blackout attribution, R6).
     pub scan_ms: u64,
-    /// Sealed disk chunk count (dirty + pending tiers) — observability.
-    pub sealed_disk_chunks: u64,
+    /// Disk blocks sealed under the pause: what the dest pulls before
+    /// it loads the VM state.
+    pub sealed_disk_blocks: u64,
+    /// Disk blocks the presetup's snapshot carried while the guest ran.
+    pub precopy_disk_blocks: u64,
     pub paused_at_unix_ms: i64,
 }
 
@@ -339,33 +346,69 @@ impl DiskRole {
         *self == Self::Root
     }
 
+    /// The lowercase name, the same one serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Swap => "swap",
+        }
+    }
+
     pub fn dirty_file_name(self, id: crate::SandboxId) -> String {
         match self {
             Self::Root => format!("{id}.cache"),
             Self::Swap => format!("{id}.swap.cache"),
         }
     }
+}
 
-    pub fn seal_file_name(self) -> &'static str {
-        match self {
-            Self::Root => "disk-seal.json",
-            Self::Swap => "disk-seal.swap.json",
+impl std::fmt::Display for DiskRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DiskRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "root" => Ok(Self::Root),
+            "swap" => Ok(Self::Swap),
+            other => Err(format!("unknown disk role {other:?}")),
         }
     }
 }
+
+/// The unit a live move carries disk changes in. A pool block, so a
+/// small guest write moves a small block and not its whole chunk.
+pub const MIGRATION_DISK_BLOCK_BYTES: u64 = 64 * 1024;
 
 /// One artifact the destination pulls from a migration export.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MigrationItem {
     StateBin,
-    /// The disk seal descriptor and published base manifest.
+    /// The blocks the disk seal carries: those that changed between the
+    /// presetup's snapshot and the one under the pause. Answers once
+    /// the capture has run.
     DiskSealInfo(DiskRole),
-    /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
-    /// by chunk index — demand-fetched (and drained) by the dest's
-    /// NBD backend straight out of the frozen source's RAM.
-    DiskChunkAt(DiskRole, u64),
+    /// One disk block's raw bytes, by index of
+    /// [`MIGRATION_DISK_BLOCK_BYTES`]; from the seal under the pause
+    /// when it lists the block, else from the presetup's snapshot. The
+    /// dest writes it into its volume before it loads the VM state.
+    DiskBlockAt(DiskRole, u64),
     /// Optional advisory hot-set hint, fetched after the required VM state.
     HotHint,
+    /// The blocks the presetup's snapshot changed since the advertised
+    /// checkpoint. Answers while the guest still runs, so the dest
+    /// pulls them before the pause.
+    DiskPrecopyInfo(DiskRole),
+}
+
+/// The body of a `DiskSealInfo` or `DiskPrecopyInfo` item.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskSealInfo {
+    pub block_indices: Vec<u64>,
 }
 
 /// A frame of `migration_fetch`'s stream.

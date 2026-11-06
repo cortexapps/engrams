@@ -75,11 +75,17 @@ class McpLanes(unittest.TestCase):
 
     def test_closed_namespace_gate_is_required_and_unconditional(self):
         workflow = (SCRIPT.parents[1] / 'workflows/ci.yml').read_text()
-        lane = workflow.split('  test-fc-nbd-net:', 1)[1].split('  test-fc-e2e:', 1)[0]
+        lane = workflow.split('  test-fc-root:', 1)[1].split('  test-fc-e2e:', 1)[0]
         step = lane.split('      - name: CLOSED namespace installed-state test (root)', 1)[1].split('      - name:', 1)[0]
         self.assertIn('run: bash .github/scripts/mcp-acceptance-fc-closed.sh', step)
         self.assertNotIn('        if:', step)
-        self.assertIn('      - test-fc-nbd-net', workflow.split('  ci-gate:', 1)[1])
+        self.assertIn('      - test-fc-root', workflow.split('  ci-gate:', 1)[1])
+
+    def test_pool_paths_select_firecracker_lane(self):
+        for path in ['deploy/helm/engram-host-fleet/files/thin-pool.sh',
+                     'scripts/thin-pool-states-test.sh']:
+            with self.subTest(path=path):
+                self.assertEqual(detect(path)['test_fc'], 'true')
 
     def test_helper_runs_native_gate(self):
         result = detect('sandbox-netstack/go.sum')

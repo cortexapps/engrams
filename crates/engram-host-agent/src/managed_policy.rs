@@ -568,7 +568,7 @@ mod live_tests {
     }
     #[async_trait::async_trait]
     impl SandboxBackend for EndpointFixture {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(invalid("unused fixture"))
         }
         async fn exec_stream(
@@ -584,7 +584,12 @@ mod live_tests {
         fn snapshot_path_for(&self, _: SnapshotId) -> std::path::PathBuf {
             std::path::PathBuf::new()
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(invalid("unused fixture"))
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {

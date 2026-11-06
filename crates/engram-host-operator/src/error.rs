@@ -28,6 +28,9 @@ pub enum OperatorError {
     Invalid(String),
     /// A cloud node-pool actuator (e.g. the GKE scaler) call failed.
     Cloud(engram_core::BackendError),
+    /// The upgrade roll could not finish, or the drain ran out of time
+    /// (ADR 0126).
+    Upgrade(String),
 }
 
 impl fmt::Display for OperatorError {
@@ -41,6 +44,7 @@ impl fmt::Display for OperatorError {
             ),
             Self::Invalid(msg) => write!(f, "invalid host-fleet state: {msg}"),
             Self::Cloud(e) => write!(f, "cloud scaler error: {e}"),
+            Self::Upgrade(msg) => write!(f, "upgrade: {msg}"),
         }
     }
 }
@@ -65,5 +69,15 @@ impl From<kube::Error> for OperatorError {
 impl From<engram_core::BackendError> for OperatorError {
     fn from(e: engram_core::BackendError) -> Self {
         Self::Cloud(e)
+    }
+}
+
+impl From<engram_upgrade_drain::DrainError> for OperatorError {
+    fn from(e: engram_upgrade_drain::DrainError) -> Self {
+        match e {
+            engram_upgrade_drain::DrainError::Rpc { op, status } => Self::Rpc { op, status },
+            engram_upgrade_drain::DrainError::Invalid(msg) => Self::Invalid(msg),
+            engram_upgrade_drain::DrainError::Timeout(msg) => Self::Upgrade(msg),
+        }
     }
 }

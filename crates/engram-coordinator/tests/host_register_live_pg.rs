@@ -1,5 +1,4 @@
-//! Live-Postgres regression for idempotent host registration (the
-//! prod jpjdb incident): host identity is the STABLE `id` (persisted
+//! Live-Postgres regression for idempotent host registration: host identity is the STABLE `id` (persisted
 //! work_dir / node-name-derived — ADR 0044 K2), while `hostname` is
 //! the K8s POD name and changes on every fleet roll. The legacy upsert
 //! conflicted on `hostname`, so a successor pod re-registering the

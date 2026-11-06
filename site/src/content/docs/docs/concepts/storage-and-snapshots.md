@@ -41,27 +41,28 @@ every chunk with its parent until one of them writes.
 
 ## How a VM reads its disk and memory
 
-On Firecracker, a VM's disk is an NBD device on the host, served by the host agent from the
-session's manifest. Reads that miss the local cache stream from the blob store. Writes go to
-per-chunk buffers and are flushed to new chunks when the session snapshots.
+On Firecracker, a VM's disk is a thin volume in a device-mapper pool on the host. The kernel
+owns it: no host process is in the data path, and a host agent restart does not touch a running
+VM's disk. A base image is staged into the pool once per host, and every session's volume is a
+snapshot of that image, so creating a session writes nothing. Guest writes land in the pool.
 
 Memory is paged in lazily. The host agent owns a `userfaultfd` for the VM's memory region,
 and on a page fault it resolves the address to a chunk, fetches it if needed, and copies the
 page in. To hide that latency on resume, hosts record which chunks a session touched in its
 first seconds and prefault those chunks before the VM's CPUs start.
 
-On the macOS backend the picture is simpler: chunks are assembled into a disk file before the
-VM starts, and the filesystem's clone operation gives each sandbox its own copy-on-write view.
-Memory chunking is Firecracker-only.
+On the macOS backend the volume is a sparse file under the host's working directory, and the
+same staging and checkpoint code runs over it. Memory chunking is Firecracker-only.
 
 ## What a snapshot is
 
 A snapshot is two manifest versions, one for disk and one for memory, plus a row in Postgres
-that points at them. Taking one pauses the VM, flushes dirty disk buffers to chunks, writes
-the memory that differs from the canonical map as chunks, records the manifests, and destroys
-the VM. Restoring is the reverse, on whichever host the coordinator picks. A host that still
-has the chunks in its cache restores in well under 100 ms; any other host fetches the delta
-and restores in one to two seconds.
+that points at them. Taking one pauses the VM for the page-cache sync and a volume snapshot,
+tens of milliseconds however much the session has written, then uploads the blocks that changed since
+the previous checkpoint as chunks, writes the memory that differs from the canonical map as
+chunks, records the manifests, and destroys the VM. Restoring is the reverse, on whichever
+host the coordinator picks: the host stages the manifest into a fresh volume, fetching only
+the chunks it does not already hold.
 
 ## Garbage collection
 

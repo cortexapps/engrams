@@ -5,9 +5,8 @@
 //! `bytes` fields — bincode round-trips Rust types without needing
 //! a proto mirror for every nested struct (SandboxSpec,
 //! SnapshotMetadata, SessionEgressPolicy, AgentSpec, etc. stay
-//! authoritative). Coord + host deploy together (OSS image tag →
-//! engrams-internal Helm pin) so bincode skew can't happen across
-//! versions.
+//! authoritative). The wire-version gate rejects incompatible peers before
+//! it decodes these positional payloads.
 //!
 //! Pre-0013 this file held the full `Frame`/`RequestKind`/`ResponseKind`/
 //! `NotifyKind` enum surface for the bincode-over-WS protocol. ADR 0013
@@ -117,7 +116,7 @@ use serde::{Deserialize, Serialize};
 // v21 (ADR 0109): `SessionEgressPolicy.google_adc` tells the host whether
 // to expose the session-local Google metadata endpoint. Trailing bincode
 // field addition. Lockstep coordinator and host roll.
-// v22 (issue: engrams-review outage 2026-08-01): `CredentialMintSource`
+// v22: `CredentialMintSource`
 // becomes externally tagged. The internally-tagged form (#931) bincode-
 // ENCODED as a map but could never DECODE (`deserialize_any`), so every
 // `SessionEgressPolicy` carrying a minted inject failed host-side at
@@ -171,12 +170,21 @@ use serde::{Deserialize, Serialize};
 // the Dead budget instead of recovering from disk.
 // v36 gates page-channel v6 fault windows for a lockstep host roll.
 // v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
-// v39 appends the harness per-call cancellation signal. Older fleets cannot decode it.
-// v40 adds immutable managed creation reservation and native-manifest reads.
-// v41: exact managed prepare/read/finalize/start authority. No ordinary fallback.
-// v42 appends exact deferred-call association to harness turn completion.
-// Coordinator, host and baked harness artifacts must roll together.
-pub const WIRE_VERSION: u32 = 42;
+// v38 moves disk changes in 64 KiB blocks and carries the presetup's
+// snapshot before the pause: MigrationItem::DiskBlockAt replaces
+// DiskChunkAt at the same index, DiskPrecopyInfo is appended, and the
+// capture reports sealed and precopy block counts.
+// v43 combines the block migration layout with managed deny policies,
+// per-call cancellation, managed boot authority, and deferred-turn identity.
+pub const WIRE_VERSION: u32 = 43;
+
+/// Whether a host-agent build can adopt the microVMs the previous build left
+/// running (ADR 0126). Two builds with the same number can reattach each
+/// other's VMs; raise it in any change that stops a new build from adopting
+/// the previous build's VMs, and an upgrade across it drains every host
+/// first. 1: the session disk is a kernel-owned thin volume (ADR 0125); a
+/// build that reports nothing counts as 0.
+pub const REATTACH_GENERATION: u32 = 1;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
@@ -327,18 +335,6 @@ impl WireExecRequest {
     }
 }
 
-/// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
-/// Defined here so `engram-protocol` doesn't drag a dep on the
-/// host-agent crate.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WireReapStats {
-    pub files_scanned: u64,
-    pub files_deleted: u64,
-    pub bytes_freed: u64,
-    pub files_skipped_unparseable: u64,
-    pub files_skipped_too_young: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,21 +454,5 @@ mod tests {
             parse_wire_skew_message(&harness_spawn_message("NotFound", "x")),
             None
         );
-    }
-
-    #[test]
-    fn wire_reap_stats_round_trips() {
-        let stats = WireReapStats {
-            files_scanned: 12,
-            files_deleted: 5,
-            bytes_freed: 1024,
-            files_skipped_unparseable: 1,
-            files_skipped_too_young: 2,
-        };
-        let bytes = bincode::serialize(&stats).unwrap();
-        let back: WireReapStats = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(back.files_scanned, stats.files_scanned);
-        assert_eq!(back.files_deleted, stats.files_deleted);
-        assert_eq!(back.bytes_freed, stats.bytes_freed);
     }
 }

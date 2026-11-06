@@ -1263,8 +1263,8 @@ const PLAN_APPROVED_MESSAGE: &str =
 /// ADR 0107: a rejection is delivered the same way an approval is — as a
 /// fresh user turn, not as a tool result. Answering the parked call is not
 /// sufficient: codex reads a failed dynamic-tool result as "the tool did not
-/// work", narrates a summary, and ends the turn (session 98111e00 did exactly
-/// that with `success: false` plus the reviewer's words in `contentItems`).
+/// work", narrates a summary, and ends the turn, even with `success: false`
+/// plus the reviewer's words in `contentItems`.
 /// The stamp stays `plan`, so the revision turn is still read-only. The text
 /// itself is shared with the claude adapter's deny + fallback paths.
 use engram_harness_sdk::plan::changes_requested_message as plan_changes_requested_message;
@@ -1590,10 +1590,10 @@ async fn route_tool_result(
         .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
         .flatten();
     // ADR 0107: a REJECT ends the plan turn and starts a new one carrying the
-    // reviewer's words — the only channel codex reliably acts on. Two earlier
-    // shapes both failed: `success: true` with the raw decision JSON (session
-    // fe3cd981) and `success: false` with the feedback in `contentItems`
-    // (session 98111e00) each made the model narrate "plan submitted" and stop.
+    // reviewer's words — the only channel codex reliably acts on. A tool
+    // result alone, `success: true` with the raw decision JSON or
+    // `success: false` with the feedback in `contentItems`, makes the model
+    // narrate "plan submitted" and stop.
     if let Some(decision) = plan_decision.as_ref().filter(|d| !d.approved()) {
         let text = plan_changes_requested_message(decision);
         if call.request_generation == server.generation && !call.request_id.is_null() {
@@ -3359,7 +3359,7 @@ done
         engine.abort();
     }
 
-    /// ADR 0107 (session fe3cd981 regression): a REJECT decision must land
+    /// ADR 0107: a REJECT decision must land
     /// as a FAILED call carrying the reviewer's feedback — a success-shaped
     /// response made the model narrate "plan submitted" and end the turn.
     /// PR #927 review: three interrupt sites recorded the pending request but
@@ -3473,7 +3473,7 @@ done
 
         // ...and the feedback must come back as a fresh read-only turn. The
         // tool result alone is not a steer: codex reads a failed dynamic call
-        // as "the tool did not work" and ends the turn (session 98111e00).
+        // as "the tool did not work" and ends the turn.
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let requests = recorded_requests(&record).await;

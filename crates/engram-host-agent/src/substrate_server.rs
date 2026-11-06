@@ -172,12 +172,7 @@ impl SubstrateServer {
     fn populate(&self, stream: &mut UnixStream, hash: ChunkHash) -> std::io::Result<()> {
         self.cache.pin(hash);
         let already = self.cache.contains_on_disk(hash);
-        let fetched = self.rt.block_on(async {
-            let store = self.store.clone();
-            self.cache
-                .get(hash, || async move { store.get_chunk(hash).await })
-                .await
-        });
+        let fetched = self.rt.block_on(self.store.get_chunk(hash));
         let outcome = match fetched {
             Ok(_bytes) => {
                 let path = self.cache.on_disk_path(hash);

@@ -290,7 +290,6 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                     },
                 }),
                 mcp_policy: Some(policy.clone()),
-                nbd_slot_need: 1,
                 session_id: native_sid,
                 spec: engram_core::types::SessionSpec {
                     image: "test.invalid/native:latest".into(),
@@ -514,7 +513,6 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                         parent_session_id: None,
                         eligibility: WriteEligibility::ReadOnly,
                     }),
-                    nbd_slot_need: 1,
                     session_id: policy_sid,
                     spec: engram_core::types::SessionSpec {
                         image: "test.invalid/policy:latest".into(),

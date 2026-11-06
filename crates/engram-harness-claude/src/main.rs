@@ -185,8 +185,8 @@ mod adapter {
         // The CLI carries a NATIVE tool also named "Artifact" that is
         // disabled in headless mode, so a bare-name call fails with
         // "exists but is not enabled in this context" — worse than
-        // unknown, because the model keeps retrying the built-in name
-        // (session 2769b9df). Redirect to the injected spelling.
+        // unknown, because the model keeps retrying the built-in name.
+        // Redirect to the injected spelling.
         if injected_tools(manifest).any(|tool| tool.name == "Artifact") {
             lines.push(
                 "The built-in Artifact tool is not available here. To publish, update, \
@@ -466,10 +466,9 @@ mod adapter {
             event_rx,
             reattach,
         } = engram_harness_sdk::Channels::new();
-        // Issue #535 (d): no more env-seeded initial prompt — every prompt,
-        // first or follow-up, arrives as a `HarnessCommand::Prompt` frame
-        // over the same connection this loop dials. The engine starts with
-        // an empty pending queue and waits.
+        // The engine reads the create-time initial prompt from its spawn
+        // environment once. Later prompts arrive as `HarnessCommand::Prompt`
+        // frames; prompt-id deduplication also covers initial-prompt replays.
 
         let engine = tokio::spawn(run_engine(
             cli.clone(),
@@ -1608,10 +1607,9 @@ mod adapter {
         ///
         /// The exact `tool_use_id` is the normal key. But a respawned CLI
         /// mints a NEW id for the same intent, so an id-keyed lookup misses
-        /// and the call parks a second time — session 5661c75f ended up
-        /// with two unresolvable `exit_plan_mode` rows: a duplicate review
-        /// card, an inflated revision count, and `awaiting_review` that can
-        /// never clear.
+        /// and the call parks a second time. That leaves two unresolvable
+        /// `exit_plan_mode` rows: a duplicate review card, an inflated
+        /// revision count, and `awaiting_review` that can never clear.
         ///
         /// So `exit_plan_mode` also matches by TOOL: at most one plan is
         /// ever under review per session, and a plan drafted before the
@@ -2051,7 +2049,7 @@ mod adapter {
         // by the built-in name) is exactly the discovery the model gets
         // wrong: haiku searched `select:ask_user_question` (the bare name,
         // not `mcp__engrams__ask_user_question`), missed, and gave up asking
-        // in plain text (session 03efe4f2). Always-loading restores the
+        // in plain text. Always-loading restores the
         // native binding's always-present property. The injected set is
         // small, so the resident-schema cost is negligible; if it grows,
         // switch to per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's
@@ -2424,8 +2422,8 @@ mod adapter {
 
     /// The single in-flight turn, owned by the session loop. `run_id` is
     /// minted on prompt-accept — BEFORE any claude output — so no event
-    /// can be emitted without a valid `run_id`. The bare-event desync
-    /// that wedged `bf3dbbcb` is therefore impossible by construction.
+    /// can be emitted without a valid `run_id`, and a bare-event desync
+    /// is impossible by construction.
     struct TurnState {
         run_id: String,
         tool_calls: u32,
@@ -2480,12 +2478,10 @@ mod adapter {
     /// these in memory and writes one to claude's stdin only at the
     /// consumption boundary (the running turn's `result`). `prompt_id`
     /// carries the client/coord-minted id used to correlate the queue
-    /// events and the eventual `RunStarted{prompt_id}` — issue #535 (d):
-    /// every prompt, first or follow-up, now arrives via `HarnessCommand::
-    /// Prompt`, so this is always `Some` in practice (the historical `None`
-    /// case was the env-seeded initial prompt, deleted). Kept `Option`
-    /// rather than force-unwrapping at each read site — a defensive `None`
-    /// costs nothing here and this isn't a wire type.
+    /// events and the eventual `RunStarted{prompt_id}`. Both the create-time
+    /// prompt read from the spawn environment and host-delivered prompts
+    /// carry an id. The optional form allows callers to handle an absent id
+    /// without force-unwrapping it.
     struct QueuedPrompt {
         prompt_id: Option<String>,
         text: String,
@@ -2531,8 +2527,7 @@ mod adapter {
         }
     }
 
-    /// The condemned-process contract (prod 2026-08-03, session
-    /// aa0829b0): any child we SIGNAL never receives another turn. A
+    /// The condemned-process contract: any child we SIGNAL never receives another turn. A
     /// SIGINT'd claude may abort the turn, emit the abort `result`, and
     /// exit much later on its own schedule — a turn dispatched into that
     /// window dies mid-flight with exit code 0 and reads as a harness
@@ -3351,7 +3346,7 @@ mod adapter {
                                 // abort in flight (or a condemned child)
                                 // must never receive another message — the
                                 // write would land in a dying process and be
-                                // lost (the 2026-08-03 aa0829b0 contract:
+                                // lost (the condemned-process contract:
                                 // the queue survives to the fresh
                                 // generation); and no stdin means no wire to
                                 // write.
@@ -3551,12 +3546,10 @@ mod adapter {
                                 // and STAYS ALIVE — no SIGINT, no respawn — so
                                 // conversation context is preserved and the
                                 // next queued prompt runs on the SAME warm
-                                // process. (This is the root-cause fix for the
-                                // SIGINT-kills-the-persistent-process bug:
-                                // session ba3ae8d5, where interrupt + a queued
-                                // message respawned `--resume` into a fragile,
-                                // context-less process that the harness then
-                                // misread as a crash.) Mark the run so the
+                                // process. A SIGINT here kills the persistent
+                                // process, and interrupt + a queued message
+                                // then respawns `--resume` into a context-less
+                                // process that reads as a crash. Mark the run so the
                                 // `result` handler reports RunInterrupted, and
                                 // arm a grace deadline: a build that ignores the
                                 // control frame is escalated to SIGINT (the
@@ -3638,9 +3631,8 @@ mod adapter {
                         // anything. claude 2.1.212 can abort the turn, emit
                         // the abort `result`, and exit much later — and the
                         // result handler then dispatched the next queued
-                        // prompt into the dying process (prod 2026-08-03,
-                        // session aa0829b0: "claude exited abnormally
-                        // mid-turn ... code 0"). Break straight to the reap:
+                        // prompt into the dying process ("claude exited
+                        // abnormally mid-turn ... code 0"). Break straight to the reap:
                         // `interrupted_run` is set, so the turn closes as
                         // RunInterrupted and the engine respawns `--resume`
                         // with zero backoff; the queued prompt lands in the
@@ -5002,7 +4994,7 @@ mod adapter {
                             "args": ["mcp-bridge"],
                             // Always-loaded so an injected built-in replacement
                             // (ask_user_question/exit_plan_mode) is resident and
-                            // needs no ToolSearch discovery (session 03efe4f2).
+                            // needs no ToolSearch discovery.
                             "alwaysLoad": true
                         }
                     }
@@ -5126,7 +5118,7 @@ mod adapter {
 
         #[tokio::test]
         async fn mcp_tools_call_round_trips_through_main_process_socket() {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-mcp-bridge-test-{}.sock",
                     uuid::Uuid::new_v4()
@@ -5176,7 +5168,7 @@ mod adapter {
         #[tokio::test]
         async fn external_mcp_bridge_preserves_text_structure_and_upstream_error() {
             let dir =
-                std::env::temp_dir().join(format!("engram-mcp-result-{}", uuid::Uuid::new_v4()));
+                test_socket_root().join(format!("engram-mcp-result-{}", uuid::Uuid::new_v4()));
             tokio::fs::create_dir_all(&dir).await.unwrap();
             let sock = dir.join("bridge.sock");
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
@@ -5232,7 +5224,7 @@ mod adapter {
             mpsc::Receiver<HarnessEvent>,
             hook_server::DeferredCalls,
         ) {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-mcp-main-test-{}.sock",
                     uuid::Uuid::new_v4()
@@ -5486,8 +5478,7 @@ mod adapter {
             let _ = tokio::fs::remove_file(sock).await;
         }
 
-        /// The by-tool retarget on the injected path (session 5661c75f's
-        /// class): a respawned CLI minted a NEW id for the same plan, so the
+        /// The by-tool retarget on the injected path: a respawned CLI minted a NEW id for the same plan, so the
         /// exact-id lookup misses. The serve must consume the old stash, ack
         /// the OLD call id (its outbox row would redeliver forever), and not
         /// park a duplicate.
@@ -6208,9 +6199,16 @@ mod adapter {
             let _ = engine.await;
         }
 
+        // macOS TMPDIR can leave too little room for UUID-named socket paths.
+        fn test_socket_root() -> PathBuf {
+            let root = engram_core::socket::short_socket_dir();
+            std::fs::create_dir_all(&root).expect("test socket root");
+            root
+        }
+
         fn test_cli(claude_bin: String) -> Cli {
             let state_dir =
-                std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
+                test_socket_root().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&state_dir).expect("test state dir");
             // The token is agentd's file, not a per-session state file:
             // it lives beside the state dir, never inside it.
@@ -6682,7 +6680,7 @@ mod adapter {
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
 
-        /// The incident fake (prod 2026-08-03, session aa0829b0): a claude
+        /// A fake claude
         /// that IGNORES the `control_request` (forcing the grace escalation
         /// to SIGINT), and on SIGINT emits the abort `result` but does NOT
         /// exit — the abort-then-exit-later shape of claude 2.1.212. Every
@@ -6721,8 +6719,7 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        /// The condemned-process contract, end to end (prod 2026-08-03,
-        /// session aa0829b0): an interrupt whose `control_request` is not
+        /// The condemned-process contract, end to end: an interrupt whose `control_request` is not
         /// honored escalates to SIGINT — and from that signal on, the
         /// child NEVER receives another turn, even though it emits an
         /// abort `result` and lingers. The run closes as RunInterrupted
@@ -6853,8 +6850,7 @@ mod adapter {
             }
         }
 
-        // Phase 3 regression for session ba3ae8d5, write-through era (ADR
-        // 0052 2026-08-20 revision): a mid-turn prompt is WRITTEN THROUGH
+        // Write-through (ADR 0052): a mid-turn prompt is WRITTEN THROUGH
         // (PromptSteered — the fake consumes it inside the running turn),
         // and a subsequent operator Interrupt aborts the turn cleanly on
         // the SAME warm process — RunInterrupted then Idle, no respawn,
@@ -7441,7 +7437,7 @@ mod adapter {
             hook_server::DuplicateDeferredIds,
             hook_server::CurrentRunId,
         ) {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-hook-manifest-{}.sock",
                     uuid::Uuid::new_v4()
@@ -8342,8 +8338,7 @@ mod adapter {
             assert_eq!(apply_prompt_mode(&cli, Some("default")), "default");
         }
 
-        /// ADR 0107 approve, injected `exit_plan_mode` (PR #981 regression,
-        /// session f9222d41): an idle `plan`-directive prompt respawns into
+        /// ADR 0107 approve, injected `exit_plan_mode`: an idle `plan`-directive prompt respawns into
         /// `--permission-mode plan`; the injected `exit_plan_mode` defers and
         /// parks; the approve result flips the stamp to build and STASHES the
         /// result. On the id-stable re-fire the hook must ALLOW (not defer a
@@ -8526,8 +8521,8 @@ mod adapter {
             assert_eq!(prompt_id, None);
             // A respawned CLI mints a NEW tool_use_id for the re-fire — the
             // production case, because a parked plan gets idle-evicted while
-            // the human reads it. Session 5661c75f parked this a SECOND time
-            // and left an unresolvable row behind. The hook must ALLOW the
+            // the human reads it. Without the retarget the re-fire parks a
+            // second time and leaves an unresolvable row. The hook must ALLOW the
             // re-fire (the by-tool retarget finds the stashed reject), and the
             // bridge serves the REVISE instruction.
             assert!(
@@ -8550,9 +8545,9 @@ mod adapter {
                 served.contains("also add tests"),
                 "feedback rides: {served}"
             );
-            // A verdict alone is not enough: session 93869a67 got "Plan
-            // rejected by the reviewer: …" and re-proposed the byte-identical
-            // plan. The ask has to be explicit.
+            // A verdict alone is not enough: on "Plan rejected by the
+            // reviewer: …" the model re-proposes the byte-identical plan.
+            // The ask has to be explicit.
             assert!(
                 served.contains("call exit_plan_mode again"),
                 "the revision ask rides: {served}"
@@ -9942,22 +9937,22 @@ mod tests {
 
     /// Pins the OBSERVED `background_tasks_changed` wire shape (probed
     /// 2026-08-06 against the harness argv; the event is undocumented).
-    /// The lines are verbatim probe captures. If a future CLI changes the
-    /// shape, this fails loudly instead of the harness silently reverting
+    /// Synthetic fixtures preserve the observed shape. If a future CLI changes
+    /// the shape, this fails loudly instead of the harness silently reverting
     /// to announce-idle-immediately.
     #[test]
     fn background_agent_inventory_counts_local_agents_only() {
-        let agent = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a9e33c94e91b3d1b5","task_type":"local_agent","description":"Sleep then output done"}],"uuid":"d3ae041e-47fd-4d0f-add6-0f13a50f6b2f","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        let agent = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-fixture","task_type":"local_agent","description":"Sleep then output done"}],"uuid":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010"}"#;
         assert_eq!(detect_background_agents(agent), Some(1));
-        let drained = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"9b1482bc-3149-4371-8318-6f56b4397b81","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        let drained = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000010"}"#;
         assert_eq!(detect_background_agents(drained), Some(0));
         // A background SHELL never counts: it can be a never-exiting dev
         // server, and holding the idle announcement on it would pin the
         // session resident until the hard TTL.
-        let bash = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bw9ttimtt","task_type":"local_bash","description":"Sleep 20 seconds in background"}],"uuid":"eb30b242-265e-4fec-8928-cf7368376864","session_id":"816f8b56-7307-4175-b4a5-89c453bbc577"}"#;
+        let bash = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bash-fixture","task_type":"local_bash","description":"Sleep 20 seconds in background"}],"uuid":"00000000-0000-4000-8000-000000000003","session_id":"00000000-0000-4000-8000-000000000020"}"#;
         assert_eq!(detect_background_agents(bash), Some(0));
         // Lifecycle lines are NOT inventory lines.
-        let started = r#"{"type":"system","subtype":"task_started","task_id":"a9e33c94e91b3d1b5","task_type":"local_agent"}"#;
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"agent-fixture","task_type":"local_agent"}"#;
         assert_eq!(detect_background_agents(started), None);
         assert_eq!(detect_background_agents(r#"{"type":"assistant"}"#), None);
     }
@@ -9974,9 +9969,9 @@ mod tests {
         assert!(is_main_loop_message(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]},"parent_tool_use_id":null}"#
         ));
-        // Verbatim-shaped subagent line from the probe: tagged → never.
+        // Synthetic subagent line preserves the observed shape: tagged → never.
         assert!(!is_main_loop_message(
-            r#"{"type":"assistant","message":{"id":"m2","content":[]},"parent_tool_use_id":"toolu_01TUxcDgGE8cPe7wZ2B1sKbm"}"#
+            r#"{"type":"assistant","message":{"id":"m2","content":[]},"parent_tool_use_id":"toolu_fixture_parent"}"#
         ));
         assert!(!is_main_loop_message(
             r#"{"type":"system","subtype":"init"}"#
@@ -10121,7 +10116,7 @@ mod tests {
         assert!(!ok(""));
     }
 
-    /// ADR 0107 / session 28216894: a natively-bound deferred tool arrives as
+    /// ADR 0107: a natively-bound deferred tool arrives as
     /// `ExitPlanMode`, NOT `mcp__engrams__exit_plan_mode`, and
     /// `injected_tools` excludes natively-bound tools by design. The parked
     /// call therefore never marked itself deferred, so the model's "the

@@ -15,6 +15,7 @@ use engram_core::types::teleport::*;
 use engram_core::types::{BindingDisposition, SessionState};
 use engram_core::{HostId, SandboxError, SessionId};
 use std::time::Duration;
+use tracing::Instrument as _;
 
 #[derive(Clone, Debug)]
 pub struct TeleportConfig {
@@ -31,8 +32,7 @@ impl Default for TeleportConfig {
 }
 pub fn spawn(cfg: TeleportConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(cfg.poll_interval);
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timer = engram_core::periodic(cfg.poll_interval);
         loop {
             timer.tick().await;
             if let Err(e) = run_once(&cfg, &state).await {
@@ -297,17 +297,34 @@ async fn drive_inner(ctx: &OpCtx<'_>) -> Result<OpOutcome, ApiError> {
                 .await?;
             return Ok(OpOutcome::Done);
         }
-        let outcome = match row.phase {
-            TeleportPhase::Admitted => steps::capture(ctx, &row).await?,
-            TeleportPhase::Captured => steps::restore(ctx, &row).await?,
-            TeleportPhase::Restored => steps::commit(ctx, &row).await?,
-            TeleportPhase::Committed => steps::attach(ctx, &row).await?,
-            TeleportPhase::Attached => steps::release(ctx, &row).await?,
-            TeleportPhase::RollingBack => steps::rollback(ctx, &row).await?,
-            TeleportPhase::Done | TeleportPhase::Aborted | TeleportPhase::Failed => {
-                return Ok(OpOutcome::Done)
+        let span = tracing::info_span!(
+            "coord.teleport_step",
+            teleport_id = %row.id,
+            session_id = %row.session_id,
+            phase = row.phase.as_str(),
+            kind = ?row.kind,
+            pause_ms = tracing::field::Empty,
+            disk_drain_ms = tracing::field::Empty,
+            vmstate_ms = tracing::field::Empty,
+            scan_ms = tracing::field::Empty,
+            sealed_chunks = tracing::field::Empty,
+            sealed_disk_blocks = tracing::field::Empty,
+            blackout_ms = tracing::field::Empty,
+        );
+        let step = async {
+            match row.phase {
+                TeleportPhase::Admitted => steps::capture(ctx, &row).await,
+                TeleportPhase::Captured => steps::restore(ctx, &row).await,
+                TeleportPhase::Restored => steps::commit(ctx, &row).await,
+                TeleportPhase::Committed => steps::attach(ctx, &row).await,
+                TeleportPhase::Attached => steps::release(ctx, &row).await,
+                TeleportPhase::RollingBack => steps::rollback(ctx, &row).await,
+                TeleportPhase::Done | TeleportPhase::Aborted | TeleportPhase::Failed => {
+                    Ok(Some(OpOutcome::Done))
+                }
             }
         };
+        let outcome = step.instrument(span).await?;
         if let Some(outcome) = outcome {
             return Ok(outcome);
         }
@@ -415,6 +432,7 @@ mod steps {
                 .trim_start_matches("https://");
             let hostname = hostpart.rsplit_once(':').map_or(hostpart, |(h, _)| h);
             let peer_addr = format!("{hostname}:{}", presetup.peer_port);
+            let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
             let metadata = SnapshotMetadata {
                 id: engram_core::SnapshotId::from(state.services.entropy.uuid()),
                 size_bytes: durable.as_ref().map_or(0, |s| s.size_bytes),
@@ -425,11 +443,8 @@ mod steps {
                 swap_manifest: presetup.swap_manifest_ref,
                 disk_manifest: presetup.disk_manifest_ref,
                 memory_manifest: Some(presetup.memory_manifest_ref),
-                base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                    state,
-                    &session.image,
-                )
-                .await,
+                base_memory_manifest: base.memory,
+                base_disk_manifest: base.disk,
                 migration_source: Some(engram_core::types::snapshot::MigrationSourceInfo {
                     export_id: presetup.export_id.clone(),
                     source_addr,
@@ -477,17 +492,27 @@ mod steps {
                 ctx.fence(),
             )
             .await;
-        if let Err(e) = captured {
-            task.abort_all();
-            let error = if matches!(e, SandboxError::NotFound | SandboxError::AlreadyExists)
-                || e.to_string().contains("presetup")
-            {
-                "live_export_lost".into()
-            } else {
-                e.to_string()
-            };
-            return rollback_begin(ctx, row, error).await;
-        }
+        let captured = match captured {
+            Ok(out) => out,
+            Err(e) => {
+                task.abort_all();
+                let error = if matches!(e, SandboxError::NotFound | SandboxError::AlreadyExists)
+                    || e.to_string().contains("presetup")
+                {
+                    "live_export_lost".into()
+                } else {
+                    e.to_string()
+                };
+                return rollback_begin(ctx, row, error).await;
+            }
+        };
+        let span = tracing::Span::current();
+        span.record("pause_ms", captured.pause_ms);
+        span.record("disk_drain_ms", captured.disk_drain_ms);
+        span.record("vmstate_ms", captured.vmstate_ms);
+        span.record("scan_ms", captured.scan_ms);
+        span.record("sealed_chunks", captured.sealed_chunks);
+        span.record("sealed_disk_blocks", captured.sealed_disk_blocks);
         if let Some(out) =
             advance(ctx, row, TeleportPhase::Captured, TeleportPatch::default()).await?
         {
@@ -501,6 +526,14 @@ mod steps {
             .await
             .expect("restore task")
             .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+        if restored.is_ok() {
+            // The source host's pause stamp to the coordinator's receipt of
+            // the restore: an upper bound across two clocks.
+            span.record(
+                "blackout_ms",
+                state.services.clock.now_utc().timestamp_millis() - captured.paused_at_unix_ms,
+            );
+        }
         finish_live_restore(ctx, &captured_row, restored).await
     }
     async fn finish_live_restore(
@@ -547,9 +580,34 @@ mod steps {
                     .await?;
                 rollback_begin(ctx, row, e.to_string()).await
             }
-            Err(e) if ctx.op.attempts <= 3 => Ok(Some(OpOutcome::Retry(e.to_string()))),
-            Err(e) => fail_move(ctx, row, &format!("dest_lost_after_blackout: {e}"), false).await,
+            Err(e) => match abort_unserved(ctx, row).await {
+                Ok(true) => rollback_begin(ctx, row, e.to_string()).await,
+                // The state was served, so the destination can run it, or
+                // the source cannot say. A missing export is no answer: the
+                // export registry does not survive a host-agent restart.
+                // Resuming the source could fork the guest.
+                Ok(false) | Err(_) if ctx.op.attempts <= 3 => {
+                    Ok(Some(OpOutcome::Retry(e.to_string())))
+                }
+                Ok(false) | Err(_) => {
+                    fail_move(ctx, row, &format!("dest_lost_after_blackout: {e}"), false).await
+                }
+            },
         }
+    }
+    /// Abort the export on the source if no destination fetched its
+    /// state. A host without the RPC answers an error, never `Ok(true)`.
+    async fn abort_unserved(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<bool, SandboxError> {
+        ctx.state
+            .host_registry
+            .backend_for(row.source_host_id)
+            .await?
+            .migration_abort_unserved(
+                row.source_sandbox_id,
+                row.export_id.as_deref().expect("live export"),
+                ctx.fence(),
+            )
+            .await
     }
     async fn destination_gone(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<bool, ApiError> {
         Ok(ctx
@@ -623,8 +681,8 @@ mod steps {
         Ok(Some(OpOutcome::Done))
     }
     /// Where a session rests when its move fails: the dead-host predicate
-    /// (`recovery_target`: Idle with a recoverable memory snapshot or a live
-    /// disk manifest, Dead otherwise), except that a session parked at
+    /// (`recovery_target`: Idle with a recoverable snapshot, Dead
+    /// otherwise), except that a session parked at
     /// Created by a deterministic spawn failure has no Dead edge and rests
     /// at Failed. `allow_snapshot = false` discards the snapshot evidence
     /// (the move itself produced it and it is not trusted).
@@ -642,10 +700,7 @@ mod steps {
                 .latest_snapshot_for_session(row.session_id)
                 .await?
                 .is_some_and(|s| s.recoverable);
-        let target = crate::dead_host::recovery_target(
-            has_recoverable_snapshot,
-            session.live_disk_manifest.is_some(),
-        );
+        let target = crate::dead_host::recovery_target(has_recoverable_snapshot);
         Ok(match (session.status, target) {
             (SessionState::Created, SessionState::Dead) => SessionState::Failed,
             (_, t) => t,
@@ -684,7 +739,6 @@ mod steps {
         };
         let candidates_for = |caps: crate::placement::CapabilityRequirements| {
             let context = crate::placement::ScheduleContext {
-                nbd_slot_need: 1,
                 repo: &session.image,
                 image_version: "",
                 snapshot_host: None,
@@ -720,10 +774,15 @@ mod steps {
             let kind = if crate::placement::host_meets_capabilities(&host, &caps_for(true)).is_ok()
             {
                 TeleportKind::Live
-            } else if crate::placement::host_meets_capabilities(&host, &caps_for(false)).is_ok() {
-                TeleportKind::Snapshot
             } else {
-                return Err(ApiError::Conflict("target_lacks_capability".into()));
+                match crate::placement::host_meets_capabilities(&host, &caps_for(false)) {
+                    Ok(()) => TeleportKind::Snapshot,
+                    Err(missing) => {
+                        return Err(ApiError::Conflict(format!(
+                            "target_lacks_capability: {missing}"
+                        )));
+                    }
+                }
             };
             let candidates = candidates_for(caps_for(kind == TeleportKind::Live)).await?;
             if !candidates.contains(&target) {
@@ -874,6 +933,7 @@ mod steps {
             })
             .into_iter()
             .collect();
+        let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
         let metadata = SnapshotMetadata {
             id: snapshot.id,
             size_bytes: snapshot.size_bytes,
@@ -882,11 +942,8 @@ mod steps {
             swap_manifest: snapshot.swap_manifest,
             disk_manifest: snapshot.disk_manifest,
             memory_manifest: snapshot.memory_manifest,
-            base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
-                state,
-                &session.image,
-            )
-            .await,
+            base_memory_manifest: base.memory,
+            base_disk_manifest: base.disk,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
@@ -1165,8 +1222,7 @@ mod steps {
     /// The source is gone during a rollback (dead or retired host, or a
     /// destroyed sandbox): entomb it and settle the session the way a lost
     /// host settles it (`dead_host::recovery_target`): Idle with a
-    /// recoverable memory snapshot or a live disk manifest (the disk-only
-    /// cold boot), Dead with nothing recoverable.
+    /// recoverable snapshot, Dead with nothing recoverable.
     async fn settle_lost_source(
         ctx: &OpCtx<'_>,
         row: &TeleportRow,

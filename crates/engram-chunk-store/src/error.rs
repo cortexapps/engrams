@@ -56,11 +56,7 @@ pub enum ChunkStoreError {
     Internal(String),
 
     /// A chunk fetch (blob/origin GET) exceeded its bounded deadline.
-    /// Surfaced so a caller on a latency-critical path — the disk daemon
-    /// serving NBD — can fail the request fast (→ guest EIO) instead of
-    /// letting a stuck GET hang the guest's virtio-blk I/O indefinitely
-    /// (which also blocks FC from pausing the VM). The string carries the
-    /// chunk hash + the deadline that elapsed.
+    /// The string carries the chunk hash + the deadline that elapsed.
     FetchTimeout(String),
 }
 

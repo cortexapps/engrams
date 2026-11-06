@@ -64,7 +64,6 @@ service SessionService {
   // stand-in for "the session went idle" WITHOUT waiting out (or lowering)
   // the idle TTL. Synchronous: the session is Idle by the time this returns.
   rpc EvictIdle(EvictIdleRequest) returns (EvictIdleResponse);
-  rpc GetCowState(GetCowStateRequest) returns (GetCowStateResponse);
   rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
   // STREAMING: artifacts run to 512 MiB (MAX_ARTIFACT_BYTES); a unary
   // response would blow the 4 MiB message cap. First message = metadata.
@@ -650,45 +649,6 @@ message EvictIdleRequest {
 message EvictIdleResponse {
   string session_id = 1;
   string status = 2;
-}
-
-message GetCowStateRequest {
-  string session_id = 1;
-}
-
-message GetCowStateResponse {
-  string session_id = 1;
-  // Unset when the session has no live sandbox (Idle, HostLost, Pending,
-  // terminal) — the disk-tier numbers don't exist.
-  optional CowStateView state = 2;
-}
-
-// Mirrors engram_coordinator::cow_state::CowStateView. One row per
-// chunk-tracked sandbox.
-message CowStateView {
-  string sandbox_id = 1;
-  optional string session_id = 2;
-  // Current disk manifest version. Ticks on every flush().
-  string disk_manifest_id = 3;
-  uint64 disk_manifest_version = 4;
-  // Dirty chunks resident in host RAM (not yet flushed to BlobStorage).
-  uint32 dirty_chunks = 5;
-  uint64 dirty_bytes = 6;
-  // ISO-8601 timestamp of the last successful flush(). Unset = never
-  // flushed since the backend was constructed.
-  optional string last_flush_at = 7;
-  // Total chunks the disk manifest references.
-  uint32 base_chunks = 8;
-  // Of base_chunks, how many are resident on this host's local NVMe
-  // cache vs. fetched on-demand from BlobStorage.
-  uint32 base_chunks_local = 9;
-  // Most recent memory manifest captured in a snapshot. Unset if the
-  // session has never been snapshotted.
-  optional string memory_manifest_id = 10;
-  optional uint64 memory_manifest_version = 11;
-  // ISO-8601 timestamp of the last successful snapshot. Unset = never
-  // snapshotted.
-  optional string last_snapshot_at = 12;
 }
 
 message ListCheckpointsRequest {

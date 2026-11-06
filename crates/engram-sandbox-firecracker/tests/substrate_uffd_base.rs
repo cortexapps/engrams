@@ -43,6 +43,7 @@ use std::time::Duration;
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::traits::BlobStorage;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
@@ -109,7 +110,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
 
     let spec = SandboxSpec {
         image: "fc-substrate-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -125,7 +126,8 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         swap_manifest: None,
     };
 
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
     // Fixed settle before snapshot. The substrate tests re-capture VMs restored
     // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
     // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
@@ -181,6 +183,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,
+        base_disk_manifest: None,
         migration_source: None,
         source_sandbox_id: metadata.source_sandbox_id,
         state_blob_key: metadata.state_blob_key.clone(),
@@ -208,8 +211,16 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         panic!("{what}: {e}");
     };
 
-    let restored_id = match backend.restore(restore_metadata.clone()).await {
-        Ok(id) => id,
+    let restored_id = SandboxId::new();
+    match backend
+        .restore(
+            restored_id,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
+        .await
+    {
+        Ok(()) => {}
         Err(e) => dump_logs_and_panic("restore #1", format!("{e:?}"), work.path()),
     };
 
@@ -260,8 +271,16 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
 
     // Sibling restore from the same snapshot: exercises the
     // already-populated base (SEEK_HOLE fast path + shared CONTINUE).
-    let sibling_id = match backend.restore(restore_metadata.clone()).await {
-        Ok(id) => id,
+    let sibling_id = SandboxId::new();
+    match backend
+        .restore(
+            sibling_id,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
+        .await
+    {
+        Ok(()) => {}
         Err(e) => dump_logs_and_panic("restore #2 (sibling)", format!("{e:?}"), work.path()),
     };
     // Poll list() until both siblings appear rather than sleeping a fixed window;
@@ -300,8 +319,16 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         .expect("put mismatched base manifest");
     let mut mismatched_metadata = restore_metadata;
     mismatched_metadata.base_memory_manifest = Some(mismatched_base);
-    let fallback_id = match backend.restore(mismatched_metadata).await {
-        Ok(id) => id,
+    let fallback_id = SandboxId::new();
+    match backend
+        .restore(
+            fallback_id,
+            mismatched_metadata,
+            common::disks(&local_rootfs),
+        )
+        .await
+    {
+        Ok(()) => {}
         Err(e) => dump_logs_and_panic(
             "restore #3 (mismatched base)",
             format!("{e:?}"),
@@ -395,7 +422,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     let spec = SandboxSpec {
         image: "fc-substrate-capture-test".into(),
-        rootfs_source: Some(local_rootfs),
+        rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -412,7 +439,8 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     };
 
     // Source VM -> snapshot -> chunked manifest (the substrate's source).
-    let original_id = backend.create(spec).await.expect("create");
+    let original_id = SandboxId::new();
+    backend.create(original_id, spec).await.expect("create");
     // Fixed settle before snapshot. The substrate tests re-capture VMs restored
     // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
     // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
@@ -458,8 +486,13 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     restore_metadata.memory_manifest = Some(manifest_ref);
 
     // Restore #1 onto the substrate; let the guest run + COW-dirty pages.
-    let substrate_vm = backend
-        .restore(restore_metadata.clone())
+    let substrate_vm = SandboxId::new();
+    backend
+        .restore(
+            substrate_vm,
+            restore_metadata.clone(),
+            common::disks(&local_rootfs),
+        )
         .await
         .expect("restore #1 onto the substrate");
     // Irreducible open-loop churn window (NOT a readiness wait): let the guest
@@ -537,8 +570,9 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
     // per-image base file instead of minting a session-keyed one.
     meta2.base_memory_manifest = Some(manifest_ref);
 
-    let revived = backend
-        .restore(meta2)
+    let revived = SandboxId::new();
+    backend
+        .restore(revived, meta2, common::disks(&local_rootfs))
         .await
         .expect("restore FROM the capture-of-substrate snapshot");
     // Poll list() until both VMs appear rather than sleeping a fixed window; the

@@ -703,22 +703,6 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
-    async fn get_cow_state(
-        &self,
-        req: Request<app::GetCowStateRequest>,
-    ) -> Result<Response<app::GetCowStateResponse>, Status> {
-        self.auth.check(&req)?;
-        let id = parse_session_id(&req.get_ref().session_id)?;
-        let maybe_view = crate::api::sessions_inspect::cow_state_core(&self.state, id)
-            .await
-            .map_err(into_status)?;
-        let proto_state = maybe_view.map(|v| super::convert::cow_state_to_proto(&v));
-        Ok(Response::new(app::GetCowStateResponse {
-            session_id: id.to_string(),
-            state: proto_state,
-        }))
-    }
-
     async fn list_checkpoints(
         &self,
         req: Request<app::ListCheckpointsRequest>,

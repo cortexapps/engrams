@@ -171,7 +171,6 @@ async fn managed_host_requires_pinned_mutual_tls() {
     let server = tokio::spawn(engram_host_agent::grpc_server::boot_with_managed_tls(
         addr,
         local.clone(),
-        None,
         engram_host_agent::session_epochs::SessionEpochStore::open(dir.join("epochs")).unwrap(),
         None,
         Some(engram_host_agent::managed_tls::ManagedHostTls {
@@ -616,8 +615,9 @@ impl engram_core::traits::SandboxBackend for EndpointFixture {
     }
     async fn create(
         &self,
+        _: engram_core::SandboxId,
         _: engram_core::types::sandbox::SandboxSpec,
-    ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+    ) -> Result<(), engram_core::SandboxError> {
         unimplemented!("fixture does not create guests")
     }
     async fn exec_stream(
@@ -638,19 +638,22 @@ impl engram_core::traits::SandboxBackend for EndpointFixture {
     }
     async fn restore(
         &self,
+        _: engram_core::SandboxId,
         _: engram_core::types::snapshot::SnapshotMetadata,
-    ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+        _: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), engram_core::SandboxError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(engram_core::SandboxId::new())
+        Ok(())
     }
     async fn restore_base_for_session(
         &self,
+        _: engram_core::SandboxId,
         _: engram_core::types::snapshot::SnapshotMetadata,
         _: std::collections::HashMap<String, String>,
         _: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+    ) -> Result<(), engram_core::SandboxError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(engram_core::SandboxId::new())
+        Ok(())
     }
     async fn resume(&self, _: engram_core::SandboxId) -> Result<(), engram_core::SandboxError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -54,8 +54,7 @@ impl Default for CheckpointRetentionConfig {
 /// Spawn the sweeper. Mirrors [`crate::teleport::spawn`].
 pub fn spawn(cfg: CheckpointRetentionConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(cfg.poll_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(cfg.poll_interval);
         tick.tick().await;
         loop {
             tick.tick().await;

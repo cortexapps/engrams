@@ -1454,27 +1454,58 @@ impl ManagedBootHost {
             if target.session_id != fence.session_id || fence.epoch == 0 {
                 return Err(invalid("destroy target"));
             }
-            if entry.owner.is_none()
-                && matches!(
-                    entry.record.state,
-                    ManagedBootHostState::Retired { .. } | ManagedBootHostState::Captured { .. }
-                )
-            {
-                // The physical source is already gone. Preserve its durable proof.
-                return this.close_resources(&mut entry).await;
-            }
-            entry.attach_owner = None;
-            entry.record.state = ManagedBootHostState::Failed {
-                key: entry.record.request.key.clone(),
-            };
-            this.persist(&entry.record)?;
-            entry.agent = None;
-            this.unbind_owned(&entry.record.request.key);
-            this.close_resources(&mut entry).await?;
-            Ok(())
+            this.destroy_entry(&mut entry).await
         })
         .await
         .map_err(invalid)?
+    }
+    /// Heartbeat tombstones name the sandbox, independently of a session fence.
+    pub(crate) async fn destroy_tombstoned(
+        self: &Arc<Self>,
+        id: SandboxId,
+    ) -> Result<(), SandboxError> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let entry = this
+                .entries
+                .get(&id)
+                .map(|e| e.clone())
+                .ok_or_else(|| invalid("tombstone owner absent"))?;
+            let mut entry = entry.lock().await;
+            let key = &entry.record.request.key;
+            this.check_key(&entry, key)?;
+            if key.context.target.host_id != this.host_id
+                || key.context.target.sandbox_id != id
+                || entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !owner.owns(&entry.record.request.cold))
+            {
+                return Err(invalid("tombstone owner identity"));
+            }
+            this.destroy_entry(&mut entry).await
+        })
+        .await
+        .map_err(invalid)?
+    }
+    async fn destroy_entry(&self, entry: &mut Entry) -> Result<(), SandboxError> {
+        if entry.owner.is_none()
+            && matches!(
+                entry.record.state,
+                ManagedBootHostState::Retired { .. } | ManagedBootHostState::Captured { .. }
+            )
+        {
+            // The physical source is already gone. Preserve its durable proof.
+            return self.close_resources(entry).await;
+        }
+        entry.attach_owner = None;
+        entry.record.state = ManagedBootHostState::Failed {
+            key: entry.record.request.key.clone(),
+        };
+        self.persist(&entry.record)?;
+        entry.agent = None;
+        self.unbind_owned(&entry.record.request.key);
+        self.close_resources(entry).await
     }
     pub fn ordinary_spec(
         &self,
@@ -1708,7 +1739,18 @@ impl ManagedBootHost {
         let mut residents = Vec::new();
         for (id, entry) in entries {
             let entry = entry.try_lock().map_err(|_| invalid("inventory busy"))?;
+            let network_reserved = entry.record.allocation.as_ref().is_some_and(|allocation| {
+                allocation.host_incarnation == self.incarnation
+                    && entry.record.incarnation == self.incarnation
+                    && self
+                        .networks
+                        .lock()
+                        .expect("network slots")
+                        .contains(allocation.attachment_generation)
+            });
             if entry.owner.is_some()
+                || entry.close_failed
+                || network_reserved
                 || matches!(
                     entry.record.state,
                     ManagedBootHostState::Prepared { .. }
@@ -2121,7 +2163,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FileBackendCalls(std::sync::atomic::AtomicUsize);
+    struct FileBackendCalls(std::sync::atomic::AtomicUsize, Vec<SandboxId>);
     #[async_trait::async_trait]
     impl SandboxBackend for FileBackendCalls {
         async fn exec_stream(
@@ -2136,8 +2178,9 @@ mod tests {
         }
         async fn create(
             &self,
+            _: SandboxId,
             _: engram_core::types::sandbox::SandboxSpec,
-        ) -> Result<SandboxId, SandboxError> {
+        ) -> Result<(), SandboxError> {
             panic!("unexpected ordinary create")
         }
         async fn snapshot(
@@ -2148,15 +2191,17 @@ mod tests {
         }
         async fn restore(
             &self,
+            _: SandboxId,
             _: engram_core::types::snapshot::SnapshotMetadata,
-        ) -> Result<SandboxId, SandboxError> {
+            _: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             panic!("unexpected ordinary restore")
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
             panic!("unexpected ordinary destroy")
         }
         async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-            Ok(Vec::new())
+            Ok(self.1.clone())
         }
         async fn read_file(
             &self,
@@ -2195,6 +2240,131 @@ mod tests {
     ) -> crate::host_client::LocalHostClient {
         crate::host_client::LocalHostClient::new(ordinary.clone(), host.hub.clone())
             .with_managed_boot(host.clone())
+    }
+    #[tokio::test]
+    async fn inventory_propagates_unknown_managed_binding_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let managed = request.key.context.target.sandbox_id;
+        install_exec_owner(&host, &request);
+        let ordinary = SandboxId::new();
+        let backend = Arc::new(FileBackendCalls(
+            Default::default(),
+            vec![ordinary, managed],
+        ));
+        let local = file_client(&host, &backend);
+        // The managed ID comes from its live owner, once, after ordinary IDs.
+        assert_eq!(local.list().await.unwrap(), vec![ordinary, managed]);
+        let corrupt = host.bindings.directory().join("invalid.managed-required");
+        std::fs::write(&corrupt, b"1").unwrap();
+        assert!(matches!(
+            local.list().await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        std::fs::remove_file(corrupt).unwrap();
+        assert_eq!(local.list().await.unwrap(), vec![ordinary, managed]);
+    }
+    #[tokio::test]
+    async fn tombstone_retries_proxy_cleanup_before_inventory_ack() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.cold.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        let generation = reserve_test_network(&host, &mut *entry.lock().await);
+        let local = file_client(&host, &Arc::new(FileBackendCalls::default()));
+        let retained = host.directory.join(format!("{id}.retired"));
+        durable_write(&retained, b"retained disk").unwrap();
+        let replacement = SandboxId::new();
+        host.hub
+            .bind_session(request.cold.session_id, replacement, 2)
+            .unwrap();
+        let (server, mut removals, _) = cleanup_proxy(temp.path());
+        for succeeds in [false, true] {
+            let cleanup = local.destroy_tombstoned(id);
+            let ack = async {
+                let reply = removals.recv().await.unwrap();
+                assert!(host.networks.lock().unwrap().contains(generation));
+                reply
+                    .send(if succeeds {
+                        engram_egress_proto::FromProxyd::Ok
+                    } else {
+                        engram_egress_proto::FromProxyd::Err("still draining".into())
+                    })
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(cleanup, ack);
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(local.list().await.unwrap().contains(&id), !succeeds);
+            assert_eq!(
+                host.networks.lock().unwrap().contains(generation),
+                !succeeds
+            );
+            let entry = entry.lock().await;
+            assert!(entry.owner.is_none());
+            assert!(entry.attach_owner.is_none());
+            assert!(matches!(
+                entry.record.state,
+                ManagedBootHostState::Failed { .. }
+            ));
+        }
+        local.destroy_tombstoned(id).await.unwrap();
+        assert_eq!(
+            host.hub.bound_sandbox(request.cold.session_id),
+            Some(replacement)
+        );
+        assert_eq!(std::fs::read(retained).unwrap(), b"retained disk");
+        assert!(host.bindings.managed_sandbox_required(id).unwrap());
+        assert!(host.read_record(id).unwrap().is_some());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn tombstone_uncertain_native_close_remains_in_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.cold.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
+            owner.close_fails = true;
+        }
+        let local = file_client(&host, &Arc::new(FileBackendCalls::default()));
+        // Generic callers still need a session fence, even with a live owner.
+        assert!(local
+            .destroy(id, engram_core::traits::SessionFence::unfenced())
+            .await
+            .is_err());
+        assert!(entry.lock().await.owner.is_some());
+        for _ in 0..2 {
+            assert!(local.destroy_tombstoned(id).await.is_err());
+            assert_eq!(local.list().await.unwrap(), vec![id]);
+            assert!(entry.lock().await.close_failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_rejects_unknown_or_changed_managed_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let id = request.cold.sandbox_id;
+        let entry = install_exec_owner(&host, &request);
+        let local = file_client(&host, &Arc::new(FileBackendCalls::default()));
+        entry.lock().await.record.incarnation = "previous-host".into();
+        assert!(local.destroy_tombstoned(id).await.is_err());
+        assert!(entry.lock().await.owner.is_some());
+        entry.lock().await.record.incarnation = host.incarnation.clone();
+        if let Some(Owner::ExecTest(owner)) = &mut entry.lock().await.owner {
+            owner.request.boot_attempt = "different-owner".into();
+        }
+        assert!(local.destroy_tombstoned(id).await.is_err());
+        assert!(entry.lock().await.owner.is_some());
+        host.entries.remove(&id);
+        assert!(local.destroy_tombstoned(id).await.is_err());
+        assert!(host.bindings.managed_sandbox_required(id).unwrap());
+        let corrupt = host.bindings.directory().join("invalid.managed-required");
+        std::fs::write(&corrupt, b"1").unwrap();
+        assert!(local.destroy_tombstoned(SandboxId::new()).await.is_err());
+        assert_eq!(std::fs::read(corrupt).unwrap(), b"1");
     }
     #[tokio::test]
     async fn managed_file_io_uses_current_owner() {
@@ -3581,6 +3751,16 @@ mod tests {
             .await
             .is_err());
         assert!(local.interrupt(id).await.is_err());
+        let error = local
+            .migration_abort_unserved(
+                id,
+                "unserved-export",
+                engram_core::traits::SessionFence::new(key.creation.session_id, 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SandboxError::InvalidSpec(message)
+            if message == "managed session requires its current boot owner"));
         assert!(local.list().await.unwrap().is_empty());
         let mut wrong = key;
         wrong.boot_attempt = "other".into();
@@ -3911,6 +4091,7 @@ mod tests {
         )
         .await
         .unwrap();
+        host.destroy_tombstoned(id).await.unwrap();
         assert_eq!(host.read(key).await.unwrap(), expected);
     }
 

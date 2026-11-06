@@ -171,8 +171,7 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
 /// must land in iptables-save with the conntrack module loaded,
 /// matching the pool source, and ordered before the engram-host-input
 /// DROP. Without ordering, host-initiated TCP flows (proxy_shell ↔
-/// ttyd) lose their return SYN+ACK to the blanket DROP and time out
-/// — exactly the prod failure observed on session 379abfec.
+/// ttyd) lose their return SYN+ACK to the blanket DROP and time out.
 ///
 /// This is the live-iptables counterpart to the
 /// `host_startup_accepts_established_input_before_drop` unit test in

@@ -43,7 +43,6 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
-    devices: Vec<PathBuf>,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("drainwave-{label}-"))
@@ -67,11 +66,8 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
-        .with_nbd_pool(
-            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
-                .expect("nbd slot pool"),
-        )
-        .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+        .with_chunk_store(chunk_store.clone())
+        .with_session_volumes(common::session_volumes(work.path(), chunk_store))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
     (Arc::new(pooled), work)
@@ -91,7 +87,6 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             inner,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             None,
         )
@@ -134,7 +129,7 @@ fn heartbeat_argv() -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + four NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn drain_wave_teleports_every_session_off_host_a() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -143,9 +138,9 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2 * SESSIONS) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -189,7 +184,6 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        devices.iter().step_by(2).cloned().collect(),
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -198,7 +192,6 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        devices.iter().skip(1).step_by(2).cloned().collect(),
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -220,13 +213,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         image: "engram-drain-wave".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

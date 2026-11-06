@@ -40,3 +40,17 @@ npm run build --prefix mcp-worker
 The rollout/CI task must wire these commands into the path detector and required
 `CI Gate` dependency graph before the feature ships. The fixture foundation does
 not modify the workflow or enable any production dispatch path.
+
+## Unreleased migration numbering
+
+Upstream uses migrations 0126–0128 for session-disk storage. The unreleased MCP
+migrations use 0129–0138, in their original order with unchanged SQL checksums.
+The migration-version test rejects duplicate numbers after later merges.
+
+An earlier development build applied the MCP migrations as 0126–0135. A database
+with those versions is not compatible with the merged build. Keep it unchanged;
+do not edit its migration ledger or bypass checksum validation. Use a fresh
+isolated PostgreSQL cluster for acceptance. A new database on the old cluster is
+insufficient because testkit cleanup can remove older test databases and templates.
+This development reset is not a data-preserving upgrade path for a deployed MCP
+installation. Such an installation requires a separate migration plan.

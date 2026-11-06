@@ -38,21 +38,21 @@ function host(id: string, status: HostView["status"], over: Partial<HostView> = 
 
 describe("fleetVerdict", () => {
   it("names the empty fleet as a fact, not a fault", () => {
-    const v = fleetVerdict([], deriveHealthMetrics([], undefined));
+    const v = fleetVerdict([], deriveHealthMetrics([]));
     expect(v.tone).toBe("muted");
     expect(v.headline).toBe("No hosts registered");
   });
 
   it("is nominal with a full sentence when nothing is wrong", () => {
     const hosts = [host("host-01", "ready")];
-    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts, undefined));
+    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts));
     expect(v.tone).toBe("nominal");
     expect(v.headline).toBe("All nominal");
   });
 
   it("explains a draining host by name", () => {
     const hosts = [host("host-01", "ready"), host("host-04", "draining")];
-    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts, undefined));
+    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts));
     expect(v.tone).toBe("caution");
     expect(v.headline).toBe("Caution · 1 host draining");
     expect(v.sentence).toBe("Sandboxes on host-04 finish in place; nothing new lands there.");
@@ -60,7 +60,7 @@ describe("fleetVerdict", () => {
 
   it("lets a critical issue outrank a caution one", () => {
     const hosts = [host("host-02", "dead"), host("host-04", "draining")];
-    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts, undefined));
+    const v = fleetVerdict(hosts, deriveHealthMetrics(hosts));
     expect(v.tone).toBe("critical");
     expect(v.headline).toBe("Critical · 1 host offline");
     expect(v.sentence).toContain("host-02 stopped heartbeating");
@@ -118,16 +118,6 @@ describe("Fleet page", () => {
               capabilitiesSchema: 1,
             }),
           ],
-        }),
-        getStorageSummary: () => ({
-          snapshots: 0n,
-          snapshotBytes: 0n,
-          gcPending: 0n,
-          trackedSandboxes: 0n,
-          dirtyChunks: 0n,
-          unflushedBytes: 0n,
-          avgLocalityPct: 0,
-          rows: [],
         }),
         uncordonHost: uncordon,
       });

@@ -13,9 +13,10 @@ node's network, the node's PID namespace, `/dev/kvm`, and the cgroup tree.
 
 ## The pieces
 
-**node-prep** runs once per node before the host agent: it loads the NBD module with
-`nbd.nbdsMax` devices, sets `vm.unprivileged_userfaultfd` and `net.ipv4.ip_forward`, and
-mounts the tmpfs that holds each image's canonical memory.
+**node-prep** runs once per node before the host agent: it builds the session-disk pool
+(`thinPool`), sets `vm.unprivileged_userfaultfd` and `net.ipv4.ip_forward`, and mounts the
+tmpfs that holds each image's canonical memory. On a later boot it checks the pool's metadata
+and re-activates it; a node whose pool fails the check does not come up.
 
 **node-assets** is an init container on the host-agent pod. It stages Firecracker, the guest
 kernel, and the read-only session bundles (the in-guest daemon, the harnesses, the skills)
@@ -43,12 +44,13 @@ by hand and drain each host first.
 | `firecracker` | Restore modes, the canonical-memory tmpfs and its size, the density knobs, and `vmCgroupParent`, the node-level cgroup VMs move into so a pod restart does not kill them. |
 | `egress` | The proxy's ports and `caSource`, which is `env` on GKE and `aws-secrets-manager` on EKS. The [configuration reference](../configuration/) explains why. |
 | `storage` | The host's working directory on the node, the chunk cache budget, and any dedicated devices. The working directory must be a host path so it survives pod restarts. |
-| `nbd` | `nbdsMax`, the number of NBD devices node-prep creates, and `warmSlots`, how many the host agent keeps ready. One device serves one running VM. |
+| `thinPool` | The session-disk pool every host needs: its `name` and `dir`, `dataSize` (absolute, or a percentage of the filesystem that holds `dir`), `metadataSize`, `blockSizeSectors`, and `lowWaterMarkBlocks`. Every image and session volume on the node lives in it. |
 | `nodePrep` | The node-prep image and the sysctls it sets. |
 | `hostAgent` | Ports, resource requests and limits, and `extraEnv` for any `ENGRAM_*` variable not exposed as a value. |
 | `otel`, `metrics` | Traces and Prometheus metrics from the host agent. |
 | `updateStrategy` | `OnDelete`. Leave it. |
 | `operator` | Whether the operator runs, its image, its own ServiceAccount, and `scaler`: `noop`, `gke`, or `asg`. |
+| `upgradeDrain` | The jobs that run around an upgrade whose host agents cannot adopt the VMs running now: whether they run, the time budget, and the coordinator's RPC address (by default `operator.coordinatorUrl`, else the host of `coordinator.endpoint`). See [Upgrade engrams](../../guides/upgrade/#when-a-release-changes-how-hosts-run-vms). |
 
 ## The custom resource
 

@@ -32,16 +32,14 @@ pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 /// org-secret backend layered ahead of the deployment one). A `literal` secret
 /// is placed in the guest env; a `broker` secret installs a per-session
 /// placeholder in the env + an egress entry the proxy substitutes on the
-/// secret's `allow_hosts` (the guest never holds the value). A ref that doesn't
-/// resolve is skipped + warn-logged — the session still boots, that one secret
-/// is just absent (mirrors `resolve_inject_entries`).
+/// secret's `allow_hosts` (the guest never holds the value). Missing refs and
+/// secret-store errors block launch and resume.
 ///
 /// Issue #535 (c): the per-secret `SecretStore` round trips are independent
 /// (no secret's resolution depends on another's), so they run concurrently
 /// via `join_all` instead of one-at-a-time — the result folds back into the
 /// SAME order-insensitive (env map + entries vec) shape a serial loop would
 /// have produced.
-/// Missing secrets and store errors block launch and resume.
 pub(crate) async fn resolve_policy_secrets(
     state: &SharedState,
     policy: Option<&engram_core::types::IntegrationPolicy>,
@@ -88,9 +86,8 @@ pub(crate) async fn resolve_explicit_secret_ref(
 ) -> Result<Option<String>, engram_core::SecretError> {
     // An empty ref is persistent config state ("not configured"), not
     // a lookup to attempt: the GCP backend would render it as
-    // `projects/<p>/secrets//versions/latest` and 400 on every call
-    // (prod 2026-08-03, session 51fc6af7 — 77 such entries made a
-    // deterministic defect look transient).
+    // `projects/<p>/secrets//versions/latest` and 400 on every call,
+    // which makes a deterministic defect look transient.
     if secret_ref.trim().is_empty() {
         return Ok(None);
     }
@@ -305,11 +302,10 @@ fn stamp_committer_env(cfg: &crate::config::CoordinatorConfig, env: &mut HashMap
 ///
 /// Async only because of `host.guest_ip`. Pure assembly delegated to
 /// [`assemble_resume_egress_policy`] for testability.
-/// Build the egress policy for a resume. Lossy by design: a
-/// resolution failure degrades to a reduced policy (the session must
-/// come up; the user is present to retry, and the mint refresh seam
-/// re-mints stale entries on first use). `None` = no guest IP for
-/// this sandbox (yet). ADR 0111 removed the strict survivor face:
+/// Policy reads, policy parsing, and required secret resolution fail closed.
+/// Individual inject failures omit those entries. `None` = no guest IP for
+/// an ordinary session (yet). Managed policies require a guest IP.
+/// ADR 0111 removed the strict survivor face:
 /// the host persists every APPLIED policy beside its binding record
 /// and rebuilds its registry locally, so no post-restart rebuild
 /// happens on the coordinator at all.
@@ -679,7 +675,6 @@ async fn boot_prepared(
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         managed_selection,
-        nbd_slot_need,
         inputs,
         memory_mib,
         cpu_budget_vcpus,
@@ -706,7 +701,6 @@ async fn boot_prepared(
     // a capacity miss does. A straggler host that hasn't staged yet simply
     // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
-        nbd_slot_need,
         repo: &image_repo,
         image_version: &image_tag,
         // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
@@ -826,7 +820,6 @@ async fn boot_prepared(
         },
         managed_creation: managed_creation.clone(),
         mcp_policy: mcp_creation,
-        nbd_slot_need,
         session_id,
         spec: inputs.spec.clone(),
         mem_budget_mib: memory_mib as i64,
@@ -1110,13 +1103,7 @@ pub(crate) async fn prepare_from_row(
     state: &SharedState,
     session: &Session,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    let overrides = load_session_secrets(state, session.id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(session_id = %session.id, error = %e,
-            "prepare_from_row: secret overrides unavailable; continuing without them");
-            None
-        });
+    let overrides = load_session_secrets(state, session.id).await?;
     // Issue #535 (a): the queued path stays tolerant of a soft-deleted image
     // (the lineage is still pinned) — the cache's `_any` fill is exactly this.
     // Propagate the cache's own error verbatim (missing row / bad manifest /
@@ -1128,25 +1115,8 @@ pub(crate) async fn prepare_from_row(
     // ADR 0056 (B′): re-read the persisted integration policy so the queued
     // boot re-injects (`resolve_inject_entries` resolves its refs again on the
     // new host, via `boot_on_reserved_host`'s overlapped env/egress leg).
-    // A malformed/absent blob → None (no injection).
-    let integration_policy = match state
-        .services
-        .meta
-        .get_session_integration_policy(session.id)
-        .await
-    {
-        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
-            tracing::warn!(session_id = %session.id, error = %e,
-                    "persisted integration policy failed to parse; booting without injection");
-            None
-        }),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(session_id = %session.id, error = %e,
-                "integration policy lookup failed; booting without injection");
-            None
-        }
-    };
+    // Read and parse errors block boot; a missing policy is valid absence.
+    let integration_policy = load_session_policy(state, session.id).await?;
     // ADR 0077 phase 3: read the persisted RuntimeSpec so the queued /
     // resumed boot re-resolves the session's dynamic skill NAMES against
     // the current fleet stamp — fixing the ADR 0055 TODO(P1-D) where the
@@ -1616,7 +1586,6 @@ async fn prepare_inner(
             });
     Ok(crate::session_boot::PreparedBoot {
         managed_selection,
-        nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
@@ -1735,52 +1704,51 @@ pub(crate) async fn delete_session_core(
     )
     .await
     .map_err(|e| ApiError::Internal(format!("destroy enqueue failed: {e}")))?;
-    // `Duplicate` = a prior DELETE already enqueued/ran the destroy (the
-    // burned idempotency key) — observe the session row alone.
+    // `Duplicate` = a prior DELETE's destroy op is still queued or running
+    // (the keyed row) — observe that op.
     let op_id = match outcome {
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
-        EnqueueOutcome::Duplicate => None,
+        EnqueueOutcome::Duplicate => state
+            .services
+            .meta
+            .op_latest_for_kind(id, OpKind::Destroy)
+            .await
+            .ok()
+            .flatten()
+            .map(|op| op.id),
     };
 
-    let deadline = state.services.clock.now_mono() + DESTROY_OBSERVE_TIMEOUT;
-    loop {
-        // The terminal flip is the user-visible outcome; it lands before
-        // the (best-effort, can-take-seconds) sandbox destroy finishes.
-        match state.services.meta.get_session(id).await {
-            Ok(s) if s.status.is_terminal() => return Ok(()),
-            Ok(_) => {}
-            // Row hard-deleted (FK cascade) — idempotent 204.
-            Err(engram_core::MetaError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        if let Some(op_id) = op_id {
-            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
-                match op.state {
-                    OpState::Done => return Ok(()),
-                    OpState::Failed => {
-                        return Err(ApiError::Internal(format!(
-                            "session teardown failed: {}",
-                            op.error.as_deref().unwrap_or("destroy op failed")
-                        )));
-                    }
-                    OpState::Cancelled => {
-                        return Err(ApiError::Conflict(
-                            "session teardown was cancelled; retry the delete".into(),
-                        ));
-                    }
-                    OpState::Queued | OpState::Running => {}
-                }
+    crate::session_ops::observe_op(
+        state,
+        op_id,
+        DESTROY_OBSERVE_TIMEOUT,
+        "session teardown in flight (destroy op enqueued behind an in-flight op); retry \
+         shortly",
+        |op| async move {
+            // The terminal flip is the user-visible outcome; it lands before
+            // the (best-effort, can-take-seconds) sandbox destroy finishes.
+            match state.services.meta.get_session(id).await {
+                Ok(s) if s.status.is_terminal() => return Ok(Some(())),
+                Ok(_) => {}
+                // Row hard-deleted (FK cascade) — idempotent 204.
+                Err(engram_core::MetaError::NotFound) => return Ok(Some(())),
+                Err(e) => return Err(e.into()),
             }
-        }
-        if state.services.clock.now_mono() >= deadline {
-            return Err(ApiError::Conflict(
-                "session teardown in flight (destroy op enqueued behind an in-flight \
-                 op); retry shortly"
-                    .into(),
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+            let Some(op) = op else { return Ok(None) };
+            match op.state {
+                OpState::Done => Ok(Some(())),
+                OpState::Failed => Err(ApiError::Internal(format!(
+                    "session teardown failed: {}",
+                    op.error.as_deref().unwrap_or("destroy op failed")
+                ))),
+                OpState::Cancelled => Err(ApiError::Conflict(
+                    "session teardown was cancelled; retry the delete".into(),
+                )),
+                OpState::Queued | OpState::Running => Ok(None),
+            }
+        },
+    )
+    .await
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,
@@ -1914,11 +1882,9 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
 /// (universal — the `engram-share` skill is baked into every image).
 ///
 /// This is THE injector for both harness-spawn paths — session
-/// create and resume's harness rebuild. They diverged once (resume
-/// missed the upload env, so `engram-share` broke after every
-/// idle→resume hop until the next cold create — prod session
-/// 5cfb90b8); a single shared entry point makes that class of skew
-/// impossible. If you add an env here, both paths get it.
+/// create and resume's harness rebuild. One shared entry point keeps
+/// the two from drifting apart (a resume that misses the upload env
+/// breaks `engram-share` until the next cold create). If you add an env here, both paths get it.
 pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
@@ -2294,6 +2260,159 @@ mod tests {
     use super::*;
     use engram_core::SandboxId;
 
+    fn seed_boot_image(meta: &engram_sim::SimMetadataStore, session: &Session) {
+        let id = engram_core::SnapshotId::from(uuid::Uuid::from_u128(72));
+        let now = session.created_at;
+        meta.with_db_mut(|db| {
+            db.enabled_images.insert(
+                session.image.clone(),
+                (
+                    engram_core::types::EnabledImage {
+                        id: uuid::Uuid::from_u128(73),
+                        image_uri: session.image.clone(),
+                        image_config: Default::default(),
+                        oci_defaults: Default::default(),
+                        manifest_digest: "sha256:test".into(),
+                        disk_manifest: None,
+                        base_snapshot_id: Some(id),
+                        base_snapshot_disk_manifest: None,
+                        base_snapshot_memory_manifest: None,
+                        last_refreshed_at: now,
+                        created_at: now,
+                        updated_at: None,
+                        soft_deleted_at: None,
+                    },
+                    None,
+                ),
+            );
+            db.snapshots.insert(
+                id,
+                engram_core::types::SnapshotRecord {
+                    id,
+                    session_id: None,
+                    host_id: None,
+                    image_version: "test".into(),
+                    size_bytes: 0,
+                    created_at: now,
+                    last_accessed_at: now,
+                    swap_manifest: None,
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    recoverable: true,
+                    aux_bundles: Vec::new(),
+                    events_cursor: None,
+                    fc_snapshot_version: None,
+                },
+            );
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_propagates_secret_lookup_failure() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        meta.set_outage(true);
+        let expected = load_session_secrets(&state, session.id)
+            .await
+            .unwrap_err()
+            .to_string();
+        let error = prepare_from_row(&state, &session)
+            .await
+            .err()
+            .expect("must reject failed secret read");
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "do not proceed to image lookup after a failed secret read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_rejects_unreadable_sealed_secrets() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+        // A valid envelope containing the wrong JSON shape exercises decoding;
+        // corrupting its ciphertext exercises authentication/decryption.
+        let sealed = cipher.seal(b"[]").await.unwrap();
+        let mut row = engram_core::types::SessionSecrets {
+            session_id: session.id,
+            wrapped_dek: sealed.wrapped_dek,
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext,
+            key_id: sealed.key_id,
+            created_at: session.created_at,
+        };
+        for failure in [
+            "deserialize session secrets",
+            "open session secrets",
+            "nonce wrong length",
+        ] {
+            meta.with_db_mut(|db| {
+                db.session_secrets.insert(session.id, row.clone());
+            });
+            let error = prepare_from_row(&state, &session)
+                .await
+                .err()
+                .expect("must reject unreadable secrets");
+            assert!(error.to_string().contains(failure), "{error}");
+            row.ciphertext[0] ^= 1;
+            if failure == "open session secrets" {
+                row.nonce.clear();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_boot_rejects_malformed_policy_and_preserves_absence() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        seed_boot_image(&meta, &session);
+        meta.with_db_mut(|db| {
+            db.session_integration_policy.insert(session.id, "{".into());
+        });
+        let error = prepare_from_row(&state, &session)
+            .await
+            .err()
+            .expect("must reject malformed policy");
+        assert!(error.to_string().contains("session policy:"), "{error}");
+        meta.with_db_mut(|db| {
+            db.session_integration_policy.remove(&session.id);
+        });
+        let prepared = prepare_from_row(&state, &session)
+            .await
+            .expect("absent secrets and policy are valid");
+        assert!(prepared.inputs.integration_policy.is_none());
+        assert!(prepared.inputs.deferred_session_secrets.is_none());
+
+        let overrides = HashMap::from([("API_TOKEN".into(), "session-token".into())]);
+        let sealed = seal_session_secrets(&state, session.id, &overrides)
+            .await
+            .unwrap();
+        meta.with_db_mut(|db| {
+            db.session_secrets.insert(session.id, sealed);
+            db.session_integration_policy
+                .insert(session.id, "{}".into());
+        });
+        let prepared = prepare_from_row(&state, &session)
+            .await
+            .expect("valid credentials and policy still prepare");
+        assert_eq!(
+            prepared.inputs.session_env.get("API_TOKEN"),
+            overrides.get("API_TOKEN")
+        );
+        assert_eq!(prepared.inputs.deferred_session_secrets, Some(overrides));
+        assert!(prepared.inputs.integration_policy.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_policy_lookup_failure_is_not_absence() {
+        let (state, meta, session, _dir) = crate::session_boot::credential_tests::fixture();
+        assert!(load_session_policy(&state, session.id)
+            .await
+            .unwrap()
+            .is_none());
+        meta.set_outage(true);
+        assert!(load_session_policy(&state, session.id).await.is_err());
+    }
+
     struct ExplicitRefStore;
 
     #[async_trait::async_trait]
@@ -2342,10 +2461,10 @@ mod tests {
         }
     }
 
-    /// Prod 2026-08-03 (session 51fc6af7): an empty `secret_ref`
-    /// reached the GCP backend as `projects/<p>/secrets//versions/latest`
-    /// and 400'd on every call — a persistent config defect that read
-    /// as a transient failure. An empty ref is "not configured": it
+    /// An empty `secret_ref` sent to the GCP backend becomes
+    /// `projects/<p>/secrets//versions/latest` and 400s on every call —
+    /// a persistent config defect that reads as a transient failure.
+    /// An empty ref is "not configured": it
     /// resolves to `None` with ZERO store calls.
     #[tokio::test]
     async fn empty_secret_ref_is_not_configured_never_a_store_call() {

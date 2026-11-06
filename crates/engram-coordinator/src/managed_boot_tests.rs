@@ -310,7 +310,6 @@ async fn fixture() -> (
         managed_creation: Some(creation.clone()),
         managed_initial_prompt: None,
         mcp_policy: Some(policy),
-        nbd_slot_need: 1,
         session_id: sid,
         spec: engram_core::types::SessionSpec {
             image: "test.invalid/managed:latest".into(),
@@ -922,7 +921,6 @@ async fn managed_boot_interruption_publishes_through_pg_listener() {
             },
             mem_budget_mib: 128,
             cpu_budget_vcpus: 1,
-            nbd_slot_need: 1,
             sealed_secrets: None,
             capabilities: vec![],
             integration_policy_json: None,
@@ -990,6 +988,7 @@ async fn managed_boot_interruption_publishes_through_pg_listener() {
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
+        state.op_finished.clone(),
     );
     // No local publish: receiving this marker proves LISTEN is established.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1266,11 +1265,11 @@ async fn managed_bridge_real_driver_claims_once_and_reconciles_prepared_reply() 
 }
 
 #[tokio::test]
-async fn managed_bridge_driver_uses_held_two_slot_requirement() {
+async fn managed_bridge_driver_rechecks_pool_capacity() {
     managed_bridge_driver(true).await;
 }
 
-async fn managed_bridge_driver(two_slots: bool) {
+async fn managed_bridge_driver(pool_capacity: bool) {
     use engram_core::types::{host::*, managed_bridge::*};
     let (mut state, meta, host, row) = fixture().await;
     let sid = row.request.key.creation.session_id;
@@ -1304,9 +1303,6 @@ async fn managed_bridge_driver(two_slots: bool) {
         s.session.host_id = None;
         s.session.sandbox_id = None;
         s.binding_epoch = 0;
-        if two_slots {
-            s.nbd_slot_need = 2;
-        }
         db.managed_boot_selections.insert(sid, selection.clone());
     });
     *host.state.lock().unwrap() = Some(ManagedBootHostState::Missing {
@@ -1378,16 +1374,10 @@ async fn managed_bridge_driver(two_slots: bool) {
                 status: HostStatus::Ready,
                 capacity: second.capacity.clone(),
                 utilization: HostUtilization {
-                    allocatable_mib: if two_slots { 1024 } else { capacity },
-                    nbd_slots_total: if two_slots {
-                        if id == host_id {
-                            1
-                        } else {
-                            2
-                        }
-                    } else {
-                        0
-                    },
+                    allocatable_mib: if pool_capacity { 1024 } else { capacity },
+                    pool_data_total_mib: if pool_capacity { 200_000 } else { 0 },
+                    pool_data_free_mib: if id == host_id { 0 } else { 100_000 },
+                    pool_metadata_free_mib: 1_000,
                     ..Default::default()
                 },
                 ready_images: vec![selection.image_digest.clone()],
@@ -1518,8 +1508,8 @@ async fn managed_bridge_driver(two_slots: bool) {
             meta.with_db_mut(|db| {
                 let host = db.hosts.get_mut(&host_id).unwrap();
                 host.utilization.allocatable_mib = 1024;
-                if two_slots {
-                    host.utilization.nbd_slots_total = 2;
+                if pool_capacity {
+                    host.utilization.pool_data_free_mib = 100_000;
                 }
             });
         }
@@ -1619,7 +1609,7 @@ async fn managed_bridge_driver(two_slots: bool) {
             .ciphertext,
         sealed.ciphertext
     );
-    if two_slots {
+    if pool_capacity {
         meta.set_host_cordon(free_host, None, None).await.unwrap();
     }
     let input = ManagedRecoveryInput {
@@ -1647,7 +1637,7 @@ async fn managed_bridge_driver(two_slots: bool) {
     );
     assert_eq!(host.captures.load(Ordering::SeqCst), 1);
     assert!(meta
-        .list_live_session_disk_manifest_ids()
+        .list_managed_disk_manifests()
         .await
         .unwrap()
         .contains(&recovery.disk_manifest));

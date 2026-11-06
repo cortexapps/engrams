@@ -4,19 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Portable host-agent core (ADR 0098 Phase 2): the HostEffects trait seams (CoordControlPlane, HostFs, DeviceSync, NbdKernel) plus their prod-portable impls — the macOS-runnable surface the host-internal simulator drives."
+description = "Portable host-agent core: the side-effect seams (CoordControlPlane, HostFs, SessionDisk) and the session-volume owner — the macOS-runnable surface the boundary simulator drives."
 
-[lints]
-workspace = true
+# The workspace `forbid` cannot be relaxed per function; `deny` can.
+# Only `disk::punch_hole` and `disk::filesystem_space` carry an allow.
+[lints.rust]
+unsafe_code = "deny"
+
+# Copied from the root Cargo.toml: `workspace = true` cannot coexist
+# with a crate-local lint.
+[lints.clippy]
+disallowed_methods = "deny"
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+engram-chunk-store.workspace = true
 engram-core.workspace = true
+futures.workspace = true
+libc = "0.2"
 serde.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+engram-storage-local.workspace = true
 serde_json.workspace = true
+tempfile = "3"

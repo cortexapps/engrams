@@ -172,67 +172,6 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         }))
     }
 
-    async fn get_host_cow_state(
-        &self,
-        req: Request<app::GetHostCowStateRequest>,
-    ) -> Result<Response<app::GetHostCowStateResponse>, Status> {
-        self.auth.check(&req)?;
-        let host_id: engram_core::HostId = req
-            .get_ref()
-            .host_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // Delegates to the same helpers as api/hosts.rs::cow_state.
-        // enrichment_for_session is pub(crate) — reused here instead of
-        // re-inlining. No DRIFT WARNING needed: there is no copy left.
-        let backend = self
-            .state
-            .host_registry
-            .backend_of(host_id)
-            .ok_or_else(|| {
-                into_status(crate::error::ApiError::NotFound(
-                    "host not registered".into(),
-                ))
-            })?;
-        let records =
-            crate::cow_state::fetch_for_host(&self.state.cow_state_cache, host_id, backend)
-                .await
-                .map_err(|e| {
-                    into_status(crate::error::ApiError::Internal(format!("cow_state: {e}")))
-                })?;
-        let assignments = self
-            .state
-            .services
-            .meta
-            .list_resident_sandbox_assignments_on_host(host_id)
-            .await
-            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
-        let session_for: std::collections::HashMap<engram_core::SandboxId, engram_core::SessionId> =
-            assignments
-                .into_iter()
-                .map(|(sid, sb, _)| (sb, sid))
-                .collect();
-        let mut sessions = Vec::with_capacity(records.len());
-        for record in records {
-            let session_id = session_for.get(&record.sandbox_id).copied();
-            let (memory_manifest, last_snapshot_at) = match session_id {
-                Some(sid) => crate::api::hosts::enrichment_for_session(&self.state, sid).await,
-                None => (None, None),
-            };
-            let view = crate::cow_state::CowStateView::from_record(
-                &record,
-                session_id,
-                memory_manifest,
-                last_snapshot_at,
-            );
-            sessions.push(convert::cow_state_to_proto(&view));
-        }
-        Ok(Response::new(app::GetHostCowStateResponse {
-            host_id: host_id.to_string(),
-            sessions,
-        }))
-    }
-
     async fn drain_host(
         &self,
         req: Request<app::DrainHostRequest>,
@@ -397,18 +336,6 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .await
             .map_err(into_status)?;
         Ok(Response::new(convert::storage_summary_to_proto(resp)))
-    }
-
-    async fn flush_session(
-        &self,
-        req: Request<app::FlushSessionRequest>,
-    ) -> Result<Response<app::FlushSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        let id = parse_session_id(&req.get_ref().session_id)?;
-        let result = crate::api::admin::flush_now_core(&self.state, id)
-            .await
-            .map_err(into_status)?;
-        Ok(Response::new(convert::flush_now_result_to_proto(result)))
     }
 
     async fn teleport_session(

@@ -21,7 +21,7 @@ import { parseOrchestratorFrame, type IndexedEvent, type SessionEvent } from "./
 import { SESSION_EVENT_KINDS } from "./sse";
 
 // ---------------------------------------------------------------------------
-// LIVE fixtures — captured from the orchestrator, session 0c0929d3
+// LIVE fixtures — captured from the orchestrator
 // ---------------------------------------------------------------------------
 
 /** LIVE: status_changed pending→created (idx 0, first event in the log) */

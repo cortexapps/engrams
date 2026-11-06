@@ -5,7 +5,6 @@
 //! the pieces around `PooledBackend::checkpoint_sandbox` (which owns
 //! the capture pipeline itself):
 //!
-//! - the sparse-file utility the diff path rides (`dirty_ranges`),
 //! - the per-sandbox checkpoint chain state ([`CheckpointChain`]),
 //! - the durable, self-describing per-checkpoint record
 //!   ([`CheckpointRecord`] — written the moment the upload finishes,
@@ -15,7 +14,7 @@
 //!
 //! ## Cost model (why diff-first)
 //!
-//! `pause → drain NBD flush → FC Diff capture → resume` keeps the
+//! `pause → take disk checkpoint → FC Diff capture → resume` keeps the
 //! guest-visible pause at O(dirty set) — 38 ms measured on a 256 MiB
 //! guest vs 2,090 ms for a Full capture (`tests/diff_snapshot.rs`).
 //! Everything slow (overlay, incremental re-chunk, upload, record)
@@ -153,12 +152,7 @@ pub struct ChainHeadRecord {
     pub sandbox_id: SandboxId,
     /// The durably-published chain head at persist time.
     pub manifest_ref: ManifestRef,
-    /// Bound session, when known. Load-bearing since the local
-    /// survivor-rehydrate pass (session 731df805, 2026-07-17):
-    /// `PooledBackend::rehydrate_local_survivors` re-serves a live
-    /// survivor's NBD device under this session when the coordinator's
-    /// register-time list misses it. `None` (a record persisted before
-    /// the binding was known) exempts the sandbox from the local pass.
+    /// Bound session at persist time, when known. Diagnostic only.
     pub session_id: Option<SessionId>,
     pub updated_at: DateTime<Utc>,
 }
@@ -365,37 +359,6 @@ impl ChainHeadStore {
     }
 }
 
-/// Walk `diff`'s data extents (`SEEK_DATA`/`SEEK_HOLE`) and return
-/// them as `(offset, len)` ranges. FC's Diff snapshot writes dirty
-/// pages at their guest-physical offsets into an otherwise-sparse
-/// file, so the extents ARE the dirty set (page-granular, possibly
-/// coalesced by the filesystem — coalescing only ever widens, which
-/// is safe for the incremental re-chunk).
-pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    use std::os::unix::io::AsRawFd;
-
-    let src = std::fs::File::open(diff)?;
-    let len = src.metadata()?.len() as i64;
-    let fd = src.as_raw_fd();
-    let mut ranges = Vec::new();
-    let mut off: i64 = 0;
-    while off < len {
-        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
-        if data < 0 {
-            let errno = std::io::Error::last_os_error();
-            if errno.raw_os_error() == Some(libc::ENXIO) {
-                break; // no more data extents
-            }
-            return Err(errno);
-        }
-        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        let hole = if hole < 0 { len } else { hole };
-        ranges.push((data as u64, (hole - data) as u64));
-        off = hole;
-    }
-    Ok(ranges)
-}
-
 /// Config for the periodic driver.
 #[derive(Clone, Debug)]
 pub struct CheckpointConfig {
@@ -453,26 +416,17 @@ pub fn next_epoch_after(
 }
 
 impl CheckpointConfig {
-    /// ADR 0043 P2a relaxed the default cadence from the old aggressive 60 s
-    /// to 10 minutes. The periodic checkpoint is only the *in-RAM* backstop
-    /// for an unplanned crash of an ACTIVE session: the guest DISK is durable
-    /// on a continuous ~30 s flush ([`crate::disk_daemon::flush_scheduler`], no
-    /// guest pause) PLUS a final SIGTERM disk-flush pass (issue #225,
-    /// [`crate::pooled_backend::PooledBackend::flush_nbd_data_planes_for_shutdown`])
-    /// so a routine pod roll loses no acked writes; and the FC memory state is
-    /// captured on every event that *quiesces* a session — idle-eviction and
-    /// the operator `POST /sessions/:id/snapshot`. NOTE: a SIGTERM pod roll
-    /// intentionally does NOT capture FC memory — surviving VMs are detached
-    /// and reattached by the successor generation (ADR 0044 K2,
-    /// [`crate::lib`]: "no SIGTERM-checkpoint pipeline"); only the disk is
-    /// flushed, new captures are refused (the quiesce gate in
-    /// `capture_phase`), and an in-flight capture is drained bounded (the
-    /// CaptureDrain ladder stage) so its consumed dirty bitmap never dies
-    /// with the process. So the timer bounds how much in-RAM progress an active session
-    /// can lose to an *unplanned host crash* (its disk + harness transcript
-    /// survive; a planned roll keeps the running VM). 10 min
-    /// is "infrequent but sane", with far less per-session pause / capture-lock
-    /// contention / GCS churn than every 60 s. Override (or disable, `=0`) via
+    /// The periodic checkpoint is the backstop for an unplanned loss of the
+    /// host under an ACTIVE session: each one publishes the guest disk and
+    /// memory together, so the session resumes elsewhere at the last
+    /// checkpoint, and the timer bounds the progress such a loss can take.
+    /// Idle eviction and the operator `POST /sessions/:id/snapshot` also
+    /// checkpoint. A planned pod roll loses nothing and captures nothing:
+    /// session volumes are kernel-owned and outlive the process, the running
+    /// VMs are detached and reattached by the successor generation (ADR 0044
+    /// K2), new captures are refused (the quiesce gate in `capture_phase`),
+    /// and an in-flight capture is drained bounded so its consumed dirty
+    /// bitmap never dies with the process. Override (or disable, `=0`) via
     /// `ENGRAM_CHECKPOINT_INTERVAL_SECS`.
     pub fn from_env() -> Self {
         let secs = std::env::var("ENGRAM_CHECKPOINT_INTERVAL_SECS")
@@ -534,8 +488,7 @@ pub fn spawn_checkpoint_driver(
         // backstop); the fast quantum exists so a busy sandbox's short
         // epoch is honored. The candidate scan is a pure in-RAM map
         // walk — waking it every `min_interval` costs nothing.
-        let mut tick = tokio::time::interval(cfg.min_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(cfg.min_interval);
         // Skip the immediate first tick: freshly-created sandboxes get
         // their seed checkpoint later, by which point agentd is up (and
         // the capture path's wait_agent_ready gate covers stragglers).
@@ -571,20 +524,26 @@ pub async fn run_checkpoint_pass(
     }
     let due = backend.checkpoint_candidates_adaptive(cfg);
     for (sandbox_id, session_id) in due {
-        // ADR 0038 B1: skip if a capture is already in flight —
-        // queuing this best-effort checkpoint behind another
-        // capture is what let one slow/hung capture gridlock the
-        // fleet. The next tick retries.
+        // ADR 0038 B1: a best-effort checkpoint never queues behind a
+        // capture or a harness spawn. The next tick retries.
         if backend.capture_in_flight(sandbox_id) {
             metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
             tracing::debug!(
                 %sandbox_id,
                 %session_id,
-                "skipping periodic checkpoint; a capture is already in flight",
+                "skipping periodic checkpoint; a capture or harness spawn is in flight",
             );
             continue;
         }
-        match backend.checkpoint_sandbox(sandbox_id).await {
+        // A root span: the driver runs on its own timer, not for a request.
+        let span = tracing::info_span!(
+            parent: None,
+            "checkpoint.periodic",
+            %sandbox_id,
+            %session_id,
+            stamped = backend.has_checkpoint_stamp(sandbox_id),
+        );
+        match tracing::Instrument::instrument(backend.checkpoint_sandbox(sandbox_id), span).await {
             Ok(metadata) => {
                 // A successful capture proves the control plane
                 // answers — clear any unreachable suspicion.

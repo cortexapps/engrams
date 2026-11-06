@@ -1,8 +1,9 @@
 //! The eviction-finalize DECISIONS (ADR 0098 Phase 2, Flow D).
 //!
 //! `snapshot_begin` moves a paused sandbox's durability boundary from
-//! "upload complete" to "record persisted": the drained disk chunks, the FC
-//! memory snapshot, and the aux-bundle pins are staged locally and a
+//! "upload complete" to "record persisted": the disk checkpoints taken
+//! under the pause, the FC memory snapshot, and the aux-bundle pins are
+//! held locally and a
 //! durable `EvictionFinalizeRecord` is written; a background job then walks
 //! the legs (disk manifest publish → memory chunking → blob upload →
 //! terminal checkpoint record + destroy), persisting the stage bump after
@@ -10,10 +11,9 @@
 //! at the persisted stage.
 //!
 //! This module holds the **pure decisions** of that flow, extracted out of
-//! the host-agent driver so the host-internal simulator (`engram-dst-host`)
+//! the host-agent driver so the boundary simulator (`engram-dst-cosim`)
 //! drives the real leg bodies on macOS and asserts stage monotonicity +
-//! convergence. Only `std` types — the portable crate is the honest home
-//! (the same test as Flow A's `shutdown` module).
+//! convergence. Only `std` types — the portable crate is the honest home.
 //!
 //! **What stays in the driver:** the effectful leg bodies (chunk-store
 //! puts, blob uploads, fs), the redrive loop's `sleep`, and the sandbox
@@ -38,8 +38,7 @@ pub enum FinalizeStage {
     /// The staging dir + record are durable; no leg has run.
     #[default]
     Captured,
-    /// The disk manifest (drained NBD chunks layered onto the capture-time
-    /// base) is published to the chunk store.
+    /// Each pending disk checkpoint is published to the chunk store.
     DiskUploaded,
     /// The memory snapshot is chunked + its manifest published.
     MemoryChunked,

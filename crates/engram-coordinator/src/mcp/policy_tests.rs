@@ -430,7 +430,6 @@ async fn managed_retry_denies_requeued_nonzero_epoch() {
         managed_initial_prompt: None,
         managed_creation: Some(frozen.clone()),
         mcp_policy: Some(policy),
-        nbd_slot_need: 1,
         session_id: id,
         spec: SessionSpec {
             image: "test.invalid/managed:latest".into(),

@@ -220,8 +220,7 @@ pub async fn run(
         let outer = progress.clone();
         tokio::spawn(async move {
             let mut last: Option<MaterializeProgress> = None;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(std::time::Duration::from_secs(20));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tokio::select! {

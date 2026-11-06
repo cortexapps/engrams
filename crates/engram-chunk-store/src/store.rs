@@ -55,11 +55,9 @@ pub struct ChunkStore {
     /// over `inner`; production may swap in a tiered resolver
     /// (see ADR 0008 Phase 2 — `TieredChunkResolver`).
     resolver: Arc<dyn ChunkResolver>,
-    /// Optional local write-through cache. When set (host-agent), a
-    /// `put_chunk` that durably writes a *new* chunk also populates this
-    /// cache, so the producing host reads it back locally instead of
-    /// re-fetching from `inner`. `None` on the coordinator (no local
-    /// resume-serving cache) — there `put_chunk` is blob-only, unchanged.
+    /// The local tier. When set (host-agent), `get_chunk` reads it
+    /// before the resolver and a miss or a `put_chunk` populates it.
+    /// `None` on the coordinator, where every read goes to `inner`.
     cache: Option<crate::cache::ChunkCache>,
     /// Optional host-global upload budget (ADR 0088 addendum): every
     /// chunk PUT body acquires one permit, so concurrent bulk-upload
@@ -113,12 +111,11 @@ impl ChunkStore {
         self
     }
 
-    /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as a
-    /// write-through tier: `put_chunk` will populate it after the durable
-    /// blob write, so the producing host serves the chunk locally on the
-    /// next read/resume. The host-agent passes the same cache its UFFD
-    /// handler + disk daemon read from; the coordinator omits it. Cheap
-    /// clone (the cache is `Arc`-backed).
+    /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as the
+    /// tier every read checks first. A `get_chunk` miss and a
+    /// `put_chunk` both populate it, so a chunk this host fetched or
+    /// produced is served locally from then on. Cheap clone (the cache
+    /// is `Arc`-backed).
     pub fn with_chunk_cache(mut self, cache: crate::cache::ChunkCache) -> Self {
         self.cache = Some(cache);
         self
@@ -200,8 +197,8 @@ impl ChunkStore {
 
     /// PUT a chunk WITHOUT the `exists()` dedup HEAD (ADR 0078 move 5).
     ///
-    /// For the flush paths — the NBD disk flush and the teleport memory
-    /// catch-up — whose input is freshly re-chunked dirty data that is
+    /// For the sparse dirty-range re-chunk, whose input is freshly
+    /// re-chunked dirty data that is
     /// **new by construction** (a content boundary shifted, so the hash
     /// changed). The HEAD there is pure waste: O(dirty) GCS round-trips
     /// per flush that always miss. Content-addressed PUTs are idempotent,
@@ -312,14 +309,57 @@ impl ChunkStore {
         }
     }
 
-    /// GET a chunk's bytes. The resolver verifies the returned
-    /// content hashes to the requested value — callers don't
-    /// re-hash. With the default `BlobStorageResolver` this is a
-    /// direct `BlobStorage` GET; with `TieredChunkResolver`
-    /// (ADR 0008 Phase 2) it falls through `BlobStorage → OCI`
-    /// with opportunistic write-through fill on miss.
+    /// A chunk's bytes: from the local cache when one is wired and
+    /// holds it, else from the resolver, which verifies the content
+    /// hashes to `hash`. A cache miss stores the fetched bytes.
+    ///
+    /// Never wrap this call in `ChunkCache::get` on the same cache:
+    /// the cache's singleflight would wait on itself.
     pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+        match &self.cache {
+            Some(cache) => cache.get(hash, || self.resolver.fetch_chunk(hash)).await,
+            None => self.resolver.fetch_chunk(hash).await,
+        }
+    }
+
+    /// [`Self::get_chunk`] for a reader that keeps the bytes itself: a
+    /// cache hit is served, a miss goes to the resolver and is not
+    /// stored.
+    pub async fn read_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.read_resident(hash).await? {
+                return Ok(bytes);
+            }
+        }
         self.resolver.fetch_chunk(hash).await
+    }
+
+    /// Make `hash` resident in the local cache; nothing to do without
+    /// one.
+    pub async fn prefetch_chunk(&self, hash: ChunkHash) -> Result<()> {
+        match &self.cache {
+            Some(cache) => {
+                cache
+                    .prefetch(hash, || self.resolver.fetch_chunk(hash))
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::prefetch_chunk`] for a whole set, at most `concurrency`
+    /// fetches at a time.
+    pub async fn prefetch_chunks(&self, hashes: Vec<ChunkHash>, concurrency: usize) -> Result<()> {
+        let Some(cache) = &self.cache else {
+            return Ok(());
+        };
+        let resolver = self.resolver.clone();
+        cache
+            .prefetch_chunks_parallel(hashes, concurrency, move |hash| {
+                let resolver = resolver.clone();
+                async move { resolver.fetch_chunk(hash).await }
+            })
+            .await
     }
 
     /// Existence check for a chunk. Routed through the resolver,
@@ -762,6 +802,64 @@ mod tests {
         );
         let store = ChunkStore::new(counting.clone()).with_chunk_cache(cache.clone());
         (store, counting, cache, dir)
+    }
+
+    /// A chunk the cache holds is served without a blob call; the
+    /// first miss fetches once and leaves it resident.
+    #[tokio::test]
+    async fn get_chunk_reads_the_local_cache_before_blob_storage() {
+        let (s, counting, cache, _d) = counting_store_with_cache().await;
+        let body = b"served locally after the first miss";
+        let h = ChunkHash::of(body);
+        counting
+            .put(&h.storage_key(), Bytes::copy_from_slice(body))
+            .await
+            .unwrap();
+        assert!(!cache.contains_on_disk(h));
+
+        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
+        assert!(cache.contains_on_disk(h), "a miss populates the cache");
+        assert_eq!(counting.get_count(), 1, "the miss reaches blob storage");
+
+        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
+        assert_eq!(counting.get_count(), 1, "a hit makes no blob GET");
+    }
+
+    /// `read_chunk` serves a resident chunk without a blob call, and a
+    /// miss reaches blob storage without filling the cache.
+    #[tokio::test]
+    async fn read_chunk_serves_hits_and_does_not_store_misses() {
+        let (s, counting, cache, _d) = counting_store_with_cache().await;
+        let body = b"kept by the reader, not by the cache";
+        let h = ChunkHash::of(body);
+        counting
+            .put(&h.storage_key(), Bytes::copy_from_slice(body))
+            .await
+            .unwrap();
+
+        assert_eq!(&s.read_chunk(h).await.unwrap()[..], body);
+        assert_eq!(counting.get_count(), 1, "the miss reaches blob storage");
+        assert!(!cache.contains_on_disk(h), "a miss is not stored");
+
+        s.get_chunk(h).await.unwrap();
+        assert_eq!(counting.get_count(), 2);
+        assert_eq!(&s.read_chunk(h).await.unwrap()[..], body);
+        assert_eq!(counting.get_count(), 2, "a hit makes no blob GET");
+    }
+
+    /// A miss through `read_chunk` still checks the content hash.
+    #[tokio::test]
+    async fn read_chunk_rejects_bytes_that_do_not_match_the_hash() {
+        let (s, counting, _cache, _d) = counting_store_with_cache().await;
+        let h = ChunkHash::of(b"the bytes the manifest names");
+        counting
+            .put(&h.storage_key(), Bytes::from_static(b"other bytes"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.read_chunk(h).await,
+            Err(ChunkStoreError::HashMismatch { .. })
+        ));
     }
 
     /// ADR 0078 move 4: the `exists()` dedup short-circuit must STILL

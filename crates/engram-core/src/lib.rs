@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod invariant;
+mod periodic;
 pub mod socket;
 pub mod traits;
 pub mod types;
@@ -15,6 +16,7 @@ pub use error::{
     harness_spawn_kind_is_deterministic, BackendError, BlobError, MetaError, SandboxError,
     SecretError,
 };
+pub use periodic::periodic;
 pub use traits::{
     BlobObjectMeta, BlobStorage, ByteStream, CloudBackend, DisableEnabledImageOutcome,
     MetadataStore, SandboxBackend, SecretStore,

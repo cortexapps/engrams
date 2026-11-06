@@ -14,6 +14,7 @@ mod metrics;
 mod reconcile;
 mod scaler;
 mod time_source;
+mod upgrade;
 mod wave;
 
 use std::sync::Arc;
@@ -66,6 +67,13 @@ async fn main() -> Result<(), OperatorError> {
         )
         .init();
 
+    // ADR 0126: the Helm hooks of an upgrade.
+    match std::env::args().nth(1).as_deref() {
+        Some("upgrade-drain") => return upgrade_drain().await,
+        Some("upgrade-roll") => return upgrade_roll().await,
+        _ => {}
+    }
+
     let scaler_kind = parse_scaler_kind(std::env::var("ENGRAM_NODE_POOL_SCALER").ok().as_deref())?;
     tracing::info!(?scaler_kind, "node-pool actuator selection");
     let client = Client::try_default().await?;
@@ -104,6 +112,45 @@ async fn main() -> Result<(), OperatorError> {
             }
         })
         .await;
+    Ok(())
+}
+
+fn required_env(name: &str) -> Result<String, OperatorError> {
+    std::env::var(name).map_err(|_| OperatorError::Invalid(format!("{name} must be set")))
+}
+
+/// The host-fleet `pre-upgrade` hook: the drain, then, with
+/// `ENGRAM_UPGRADE_MARKER` set, a record that it drained.
+async fn upgrade_drain() -> Result<(), OperatorError> {
+    let outcome = engram_upgrade_drain::run_from_env().await?;
+    if let (engram_upgrade_drain::DrainOutcome::Drained { .. }, Ok(marker)) =
+        (outcome, std::env::var("ENGRAM_UPGRADE_MARKER"))
+    {
+        let namespace = required_env("POD_NAMESPACE")?;
+        upgrade::write_marker(Client::try_default().await?, &namespace, &marker).await?;
+    }
+    Ok(())
+}
+
+/// The host-fleet `post-upgrade` hook: after a drain, roll the host-agent
+/// pods onto the new build.
+async fn upgrade_roll() -> Result<(), OperatorError> {
+    let (url, token) = engram_upgrade_drain::coordinator_from_env()?;
+    let coord = engram_upgrade_drain::Coordinator::new(&url, token, Duration::from_secs(10));
+    let namespace = required_env("POD_NAMESPACE")?;
+    let daemon_set = required_env("ENGRAM_HOST_AGENT_DAEMONSET")?;
+    let marker = required_env("ENGRAM_UPGRADE_MARKER")?;
+    let operator_rolls = std::env::var("ENGRAM_OPERATOR_ENABLED").as_deref() == Ok("true");
+    let outcome = upgrade::roll(
+        Client::try_default().await?,
+        &coord,
+        &namespace,
+        &daemon_set,
+        &marker,
+        operator_rolls,
+    )
+    .await?;
+    tracing::info!(?outcome, operator_rolls, "upgrade roll");
     Ok(())
 }
 

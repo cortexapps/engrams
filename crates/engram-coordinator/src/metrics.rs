@@ -174,8 +174,6 @@ pub fn init(addr: SocketAddr) {
     // Monitoring refuses to CREATE an alert policy on a metric it has
     // never seen. The alert must exist before the first firing, so the
     // series must too.
-    ::metrics::counter!(DURABILITY_ROLLBACK_TOTAL).absolute(0);
-    ::metrics::counter!(QUARANTINE_STUCK_TOTAL).absolute(0);
     ::metrics::counter!(OUTBOX_RESCAN_CLAIMED_TOTAL).absolute(0);
     ::metrics::counter!(SESSION_OP_RESCAN_CLAIMED_TOTAL).absolute(0);
     ::metrics::counter!(INITIAL_PROMPT_ENV_STAMPED_TOTAL).absolute(0);
@@ -444,7 +442,7 @@ pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disag
 /// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
 /// re-drove: waiting outbox rows recalled to due + a Deliver op
 /// enqueued, for an Active session whose sandbox the host reports
-/// RUNNING with no attached harness (prod 7eddce62).
+/// RUNNING with no attached harness.
 pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
@@ -492,50 +490,21 @@ pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
-/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A resume
-/// was forced past acked-but-unpublished guest writes — real, user-visible
-/// data loss. Pairs with the durable `durability_rollback` session_events
-/// row.
-///
-/// **EMITTER-LESS since the 2026-08-02 RCA** (PR #972): the quarantine
-/// evict ladder — the only emitter — no longer destroys (it parks; see
-/// [`QUARANTINE_STUCK_TOTAL`]), so nothing increments this today and the
-/// series exports a constant 0. It is retained deliberately, NOT armed:
-/// the `SessionEvent::DurabilityRollback` variant must keep decoding (the
-/// web timeline renders the historical incident rows), and this name is
-/// the canonical counter any FUTURE durability-promise-break path must
-/// emit — re-adding an emitter re-arms the "must be ~0" alert with its
-/// original meaning. Expected host-death rewinds are NOT this counter's
-/// domain; they are counted by `session_rewound_events_total` with
-/// `cause=host_failure_recovery`.
-pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
-
-/// Counter (2026-08-02 durability-rollback RCA). A quarantined survivor's
-/// eviction exhausted its fast-retry budget and the op PARKED on the slow
-/// retry lane — the VM and its acked writes are preserved, but the
-/// session is stalled until the host's rehydrate retry re-serves the disk
-/// or an operator intervenes. Alert on any increase: recovery is expected
-/// to be automatic within minutes; a session stuck longer needs a human
-/// (the runbook alternative used to be automatic VM destruction, i.e.
-/// data loss).
-pub const QUARANTINE_STUCK_TOTAL: &str = "engram_quarantine_stuck_total";
-
 /// Counter of session_events ROWS rolled back by rung-1 recovery rewinds
 /// (`apply_rung1_rewind`), labeled `cause` ∈ {planned_relocation,
 /// host_failure_recovery, checkpoint_lag}. Each increment batch is a
 /// user-visible transcript rewind — the "resumed from an earlier
 /// checkpoint" boundary. Small, rare `host_failure_recovery` blips are
 /// the designed blast radius of real host death; `checkpoint_lag` (the
-/// checkpoint lagged live activity with NO host failure — 2026-07-21
-/// 61a03b7e: 93 events on a healthy host) and any large burst deserve an
-/// alert.
+/// checkpoint lagged live activity with NO host failure) and any large
+/// burst deserve an alert.
 pub const SESSION_REWOUND_EVENTS_TOTAL: &str = "engram_session_rewound_events_total";
 
 /// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
 /// guard fired: an idle-evict capture produced manifests but
 /// `verify_snapshot_recoverable`'s BlobStorage HEAD failed
-/// (`recoverable = false`) with no live disk manifest, so the pipeline
-/// refused to land `Idle` and returned a retryable error. A transient
+/// (`recoverable = false`), so the pipeline refused to land `Idle` and
+/// returned a retryable error. A transient
 /// blip clears on the op redrive; a persistently-high value means the
 /// snapshot pipeline (or the BlobStorage HEAD path) is genuinely failing
 /// and sessions are riding the budget out to the HostLost/Dead honest
@@ -673,8 +642,8 @@ pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_ho
 /// Labels:
 /// - `reason` = the bounded `placement::exclusion_summary` vocabulary
 ///   (`excluded` / `not_ready` / `cordoned` / `wire_skew` / `stale` /
-///   `cap:<name>` — one of the ~6 named capabilities, so still bounded
-///   / `digest_not_ready` / `no_fit`) PLUS the reserve-path fit
+///   `pool_full` / `cap:<name>` — one of the ~6 named capabilities, so
+///   still bounded / `digest_not_ready` / `no_fit`) PLUS the reserve-path fit
 ///   vocabulary from `PlacementNoFit` (`ram_full` / `cpu_full` /
 ///   `unmeasured` / `not_lockable` / `fits_now`).
 /// - `origin` = which call site: `create` (fresh session,
@@ -712,8 +681,8 @@ pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_straggler
 
 /// Counter (issue #777, ADR 0098 Phase 3 honest-Dead). A HostLost
 /// stage-2 transition routed a session to `Dead` while a snapshot row
-/// DID exist — the snapshot was un-recoverable (its BlobStorage HEAD
-/// failed at take-time) and there was no live disk manifest either.
+/// DID exist: the snapshot was un-recoverable (its BlobStorage HEAD
+/// failed at take-time).
 /// Distinct from "no snapshot at all" so a bad-capture pipeline stays
 /// visible instead of hiding behind a generic Dead. Fired from every
 /// stage-2 site (`reconcile::flip_missing`, `dead_host::evict_host`,

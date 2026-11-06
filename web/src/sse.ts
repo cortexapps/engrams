@@ -62,7 +62,7 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "integration_asset",
   "file_shared",
   "recovered_from_checkpoint",
-  // ADR 0090: the durability-rollback warning marker.
+  // Historical rows only: the durability-rollback warning marker.
   "durability_rollback",
   // A resume booted a fresh kernel on the disk; running processes were lost.
   "resumed_from_disk",

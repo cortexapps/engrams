@@ -104,11 +104,6 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
-  "SessionService.GetCowState": {
-    action: "read",
-    subject: "Session",
-    sessionIdField: "sessionId",
-  },
   "SessionService.ListCheckpoints": {
     action: "read",
     subject: "Session",
@@ -188,7 +183,6 @@ export const POLICY: Record<string, PolicyEntry> = {
   // ------------------------------------------------------------------
   "FleetService.ListHosts": { action: "manage", subject: "all" },
   "FleetService.GetHost": { action: "manage", subject: "all" },
-  "FleetService.GetHostCowState": { action: "manage", subject: "all" },
   "FleetService.DrainHost": { action: "manage", subject: "all" },
   "FleetService.AdminDrainHost": { action: "manage", subject: "all" },
   "FleetService.RetireHost": { action: "manage", subject: "all" },
@@ -202,7 +196,6 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.UncordonHost": { action: "manage", subject: "all" },
   "FleetService.DeleteHost": { action: "manage", subject: "all" },
   "FleetService.GetStorageSummary": { action: "manage", subject: "all" },
-  "FleetService.FlushSession": { action: "manage", subject: "all" },
   "FleetService.TeleportSession": { action: "manage", subject: "all" },
   "FleetService.ChunkGc": { action: "manage", subject: "all" },
   "FleetService.BundleGc": { action: "manage", subject: "all" },

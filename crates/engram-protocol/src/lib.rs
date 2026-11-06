@@ -14,7 +14,6 @@
 //! frame protocol; that's been retired and only the shared
 //! payload shapes remain.
 
-pub mod admin;
 pub mod app;
 pub mod grpc;
 pub mod grpc_client;
@@ -22,9 +21,8 @@ pub mod grpc_pool;
 pub mod heartbeat;
 pub mod wire;
 
-pub use admin::HostAdminHandler;
 pub use heartbeat::*;
-pub use wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
+pub use wire::{WireExecRequest, REATTACH_GENERATION, WIRE_VERSION};
 
 pub mod mcp;
 

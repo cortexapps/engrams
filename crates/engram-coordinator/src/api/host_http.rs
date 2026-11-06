@@ -104,39 +104,19 @@ pub struct RegisterResponse {
     /// to just `prefetch_time`.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
-    /// ADR 0016 Phase B commit 7: rehydration source. One record
-    /// per Active session PG already has bound to this host with
-    /// a chunked-disk manifest. Host iterates this on startup,
-    /// rebuilds `ChunkedDiskBackend` from the effective manifest,
-    /// spawns the NBD daemon + FlushScheduler. Closes the
-    /// host-agent-restart-loses-COW-tracking gap the ADR's
-    /// commit-0 design called out.
-    ///
-    /// Empty when:
-    /// - The host's first registration (no Active sessions yet).
-    /// - The host's restart but no Active sessions in PG were
-    ///   bound (eviction sweep ran while the host was down).
-    /// - The coord lookup failed (we log + emit empty so the host
-    ///   continues; sandboxes recover via the M4 evac path).
+    /// Every VM-resident binding PG still holds for this host, which a
+    /// restarted host re-registers. Empty on a first registration, when
+    /// nothing survived, or when the lookup failed (logged; the host
+    /// runs blind for the survivors).
     #[serde(default)]
     pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
 }
 
-/// ADR 0016 Phase B commit 7: one entry in the rehydration list
-/// the host iterates at startup. Wire format mirrors the columns
-/// `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`
-/// returns; the host's startup hook rebuilds chunked-disk tracking
-/// from these.
+/// One VM-resident binding the host re-registers at startup.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RehydrateSandboxRef {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
-    /// The effective disk manifest the host should rebuild from
-    /// (newer of `sessions.live_disk_manifest_*` and the latest
-    /// recoverable `snapshots.disk_manifest`). `None` means there's
-    /// no chunked-disk lineage to rebuild — host skips this row.
-    pub disk_manifest_id: Option<uuid::Uuid>,
-    pub disk_manifest_version: Option<u64>,
 }
 
 pub async fn register(
@@ -185,6 +165,11 @@ pub async fn register(
             "host register adopts a declared handoff (roll succession)",
         );
     }
+    let stored = state.services.meta.get_host(req.host_id).await?;
+    let lifts_cordon = stored
+        .as_ref()
+        .is_some_and(|h| engram_core::types::host::register_lifts_cordon(h, &req.capabilities));
+    let reattach_generation = req.capabilities.reattach_generation;
     let record = HostRecord {
         id: req.host_id,
         hostname: req.hostname,
@@ -237,6 +222,18 @@ pub async fn register(
         lease_epoch: 0,
     };
     state.services.meta.upsert_host(record).await?;
+    if lifts_cordon {
+        state
+            .services
+            .meta
+            .set_host_cordon(req.host_id, None, None)
+            .await?;
+        tracing::info!(
+            host_id = %req.host_id,
+            reattach_generation,
+            "host registers a higher reattach generation; the upgrade drain's cordon is lifted",
+        );
+    }
 
     // ADR 0013: warm the gRPC pool entry + register the host's
     // GrpcHostClient with `HostRegistry` so subsequent
@@ -271,19 +268,13 @@ pub async fn register(
         }
     };
 
-    // ADR 0016 Phase B commit 7: rehydration list. PG already
-    // knows which VM-resident sessions are bound to this host (a
-    // host-agent restart drops `nbd_sandboxes` but PG persists the
-    // session→sandbox→host binding). "Resident" = every
-    // `reserves_host_memory` state with a sandbox bound, NOT just
-    // Active: a rung-parked Evicting session's paused VM survives
-    // the pod roll too, and omitting it orphans its NBD device
-    // (session 731df805, 2026-07-17). Hand the list back so the
-    // host can rebuild `ChunkedDiskBackend` + spawn the
-    // FlushScheduler for each, restoring continuous-flush
-    // coverage. Failure non-fatal: a host that doesn't get the
-    // list runs blind for the survivors (same shape as pre-Phase-
-    // B behaviour); operator can manually re-register or evac.
+    // Rehydration list: PG persists the session→sandbox→host binding
+    // across a host-agent restart, so the host re-registers every
+    // VM-resident survivor from it. "Resident" is every
+    // `reserves_host_memory` state with a sandbox bound, not just
+    // Active: a rung-parked Evicting session's paused VM survives the
+    // pod roll too. Failure is non-fatal: a host that does not get the
+    // list runs blind for the survivors.
     let rehydrate_sandboxes = match register_rehydrate_list_core(&state, req.host_id).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -299,8 +290,7 @@ pub async fn register(
     // ADR 0111: survivor egress recovery is host-local. The host
     // persists every applied policy beside its binding record and
     // rebuilds its proxy registry from those files at startup — the
-    // coordinator no longer re-pushes policies after a host restart
-    // (the 2026-07-13 dfa0face re-push watchdog is retired).
+    // coordinator does not re-push policies after a host restart.
 
     tracing::info!(
         host_id = %req.host_id,
@@ -420,29 +410,10 @@ pub struct HeartbeatRequest {
     /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot the host quarantined after a
-    /// failed rehydrate — the coordinator enqueues `evict_local` for
-    /// each still-owned one (the op layer dedups re-adverts).
-    #[serde(default)]
-    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: control-plane-dead guests (host's 3/3-probe verdict) —
     /// the handler flips each owning session Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
-    /// engrams#1378: sandboxes whose kernel NBD binding survives on the host
-    /// as attributed residue of an interrupted teardown. Counted as PRESENT
-    /// for tombstone ack-by-absence and the ADR 0116 A5 unbound-entomb arm —
-    /// a tombstone is only settled when the host affirms the VM AND its
-    /// kernel binding are gone. `#[serde(default)]` → empty from a pre-#1378
-    /// host-agent mid-roll.
-    #[serde(default)]
-    pub device_residue_sandboxes: Vec<SandboxId>,
-    /// engrams#1378: `false` while the host's startup classification barrier
-    /// has not yet run (residue unknown — the issue-#215 asymmetry). The
-    /// default is `true` so a pre-#1378 host-agent mid-roll keeps today's
-    /// ack behavior.
-    #[serde(default = "default_running_sandboxes_known")]
-    pub device_residue_known: bool,
 }
 
 #[derive(Serialize)]
@@ -530,30 +501,19 @@ pub struct HandoffResponse {
     pub accepted: bool,
 }
 
+#[tracing::instrument(name = "coord.heartbeat", skip_all, fields(host_id = %host_id))]
 pub async fn heartbeat(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,
     Json(hb): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
-    // ADR 0013 self-heal: ensure the host is in this pod's
-    // in-memory registry + the gRPC pool, even if we never saw
-    // the original `/api/hosts/register` POST (e.g. coord pod was
-    // just rolled by helm-deploy; the host already registered
-    // against the previous pod and won't re-register until its
-    // next agent restart). Heartbeat carries `host_addr` so we
-    // don't need a PG lookup; the warm + register are idempotent
-    // on the steady-state path.
+    // This replica dials the host at the address its heartbeat carries:
+    // (re)warm and register when the host is unknown here (this pod
+    // started after the host registered) or its address changed (a
+    // replaced node keeps its host id but not its IP). A host's heartbeats
+    // reach one replica; the others pick up a changed address from the
+    // `hosts` row once their entry passes the TTL (`HostRegistry::backend_for`).
     if let Some(host_addr) = hb.host_addr.as_deref() {
-        // (Re)warm + register when EITHER the host is unknown to this
-        // coord pod (it was rolled by helm-deploy — the original ADR 0013
-        // self-heal), OR its advertised addr changed since we last dialed
-        // it. The latter is ADR 0044 K2 (GAP 1): a DaemonSet pod restart
-        // keeps a STABLE HostId but gets a fresh POD_IP, so `contains` is
-        // still true — without the addr-change arm we'd keep dialing the
-        // dead old IP forever. `warm` is idempotent (a no-op when the addr
-        // is unchanged), and the `register` below re-points the dispatch
-        // backend; `update_state` later in this handler repopulates the
-        // reset HostState from this same heartbeat.
         let known = state.host_registry.contains(host_id);
         let addr_changed =
             state.services.host_pool.current_addr(host_id).as_deref() != Some(host_addr);
@@ -577,15 +537,13 @@ pub async fn heartbeat(
         }
     }
 
-    // ADR 0068: persist BEFORE reconcile (was the reverse — see the
-    // git history on this handler). A heartbeat the coordinator
+    // ADR 0068: persist BEFORE reconcile. A heartbeat the coordinator
     // refuses to ack (5xx on persist failure, issue #231) must not
     // have ALREADY driven session flips from its `running_sandboxes`
     // payload — "Postgres is the authority" means reconcile can only
-    // act on a heartbeat that's actually landed. This closes one of
-    // the two candidate producers of the fbd3794c incident shape (the
-    // other, the dead-host detector's own probe, already gates
-    // correctly — see `dead_host.rs`).
+    // act on a heartbeat that's actually landed. (The dead-host
+    // detector's probe, the other path that flips sessions from host
+    // state, gates the same way — see `dead_host.rs`.)
     //
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
@@ -693,8 +651,8 @@ pub async fn heartbeat(
     // REPAIR now, not just an alarm. An Active session whose sandbox
     // the host reports RUNNING but not hub-ATTACHED has a delivery
     // hole: a forward into that hub reaches a socket with no reader,
-    // and the outbox row waits out the full ACK_TIMEOUT (prod
-    // 7eddce62). `harness_desync::run_once` recalls the waiting rows
+    // and the outbox row waits out the full ACK_TIMEOUT.
+    // `harness_desync::run_once` recalls the waiting rows
     // and enqueues the Deliver op directly; the decision logic lives
     // there — not here — so the DST swarm drives it without this HTTP
     // handler. Best-effort and deliberately coarse: sessions
@@ -960,31 +918,6 @@ pub async fn heartbeat(
         );
     }
 
-    // ADR 0090: drive the documented remediation for quarantined
-    // survivors (NBD rehydrate failed after a roll — VM possibly live,
-    // disk unserved). Enqueue `evict_local` (full capture, no park) for
-    // each survivor the session still owns. Dedup keys ONLY on the
-    // idempotency key (ADR 0079 finding #4 — active-state-scoped), so the
-    // re-adverts every 5s heartbeat carries MUST pass one; a key-less
-    // enqueue inserts a fresh queued row per heartbeat (ADR 0093: 423
-    // rows piled up behind one wedged evict in the 2026-07-13 incident).
-    // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
-    // reconciler's orphan path SIGKILLed the VM.
-    //
-    // 2026-07-21 livelock incident: the active-state-scoped key is only
-    // safe because the enqueued op is guaranteed to CONVERGE. An op that
-    // settles Done as a fast no-op frees the key before the next
-    // heartbeat and turns this enqueue into a 5s-cadence infinite loop
-    // (session 8174b7aa: an ADR 0077 harness-failed park at `Created`
-    // skipped the evict guard in ~10ms, for 2.5 days / ~43k ops). The
-    // evict pipeline's quarantine arm (`quarantine_reap_unevictable`)
-    // now destroys the survivor — clearing the host's quarantine entry,
-    // i.e. this very advertise — whenever the session can't be evicted
-    // from its current state, so every enqueue here ends the loop it
-    // rides on. Keep that pairing in mind before adding states the
-    // pipeline may skip.
-    quarantined_survivor_advertise_core(&state, host_id, &hb.quarantined_survivors).await;
-
     // ADR 0091: flip sessions whose guest control plane is dead. The
     // host re-advertises until a successful capture or destroy clears
     // the entry, so this is idempotent (already-Unreachable sessions
@@ -1136,21 +1069,15 @@ pub async fn heartbeat(
         }
     };
 
-    // ADR 0116 A-D5: ack tombstones the host's PRESENCE set no longer
-    // contains, then advertise what is still outstanding. engrams#1378:
-    // presence = running VMs ∪ attributed NBD residue — a sandbox whose
-    // kernel binding survives an interrupted teardown keeps its tombstone
-    // alive (and advertised, so the host's destroy completes the
-    // disconnect) instead of being acked by a VM-only absence check, the
-    // exact mis-ack of the 2026-08-25 firing. Both `known` flags gate the
-    // ack/entomb arms (the issue-#215 "no information ≠ empty" asymmetry).
-    let mut present_sandboxes = hb.running_sandboxes.clone();
-    present_sandboxes.extend(hb.device_residue_sandboxes.iter().copied());
+    // ADR 0116 A-D5: ack tombstones the host's running set no longer
+    // contains, then advertise what is still outstanding. The `known`
+    // flag gates the ack/entomb arms (the issue-#215 "no information ≠
+    // empty" asymmetry).
     let tombstoned_sandboxes = crate::dead_host::process_sandbox_tombstones(
         &state.services.meta,
         host_id,
-        &present_sandboxes,
-        hb.running_sandboxes_known && hb.device_residue_known,
+        &hb.running_sandboxes,
+        hb.running_sandboxes_known,
     )
     .await;
 
@@ -1694,61 +1621,11 @@ pub async fn refresh_inject(
     }))
 }
 
-// ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
-
-#[derive(Deserialize)]
-pub struct LiveManifestPublishRequest {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    pub manifest_id: uuid::Uuid,
-    pub manifest_version: u64,
-}
-
-#[derive(Serialize)]
-pub struct LiveManifestPublishResponse {
-    pub outcome: LiveManifestPublishOutcome,
-}
-
-#[derive(Serialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveManifestPublishOutcome {
-    Applied,
-    Stale,
-}
-
-/// ADR 0016 Phase B: host's FlushScheduler tells us a fresh manifest
-/// version landed for `(session_id, sandbox_id)`. We UPDATE
-/// `sessions.live_disk_manifest_*` gated on `sandbox_id` match; on
-/// `Applied` we also bump `chunk_generation` (the Phase C mid-sweep
-/// barrier) in the same TX via `MetadataStore::update_live_disk_manifest`.
-///
-/// `Stale` (UPDATE matched zero rows) is logged as WARN — the host
-/// shouldn't retry; the staleness is structural (sandbox destroyed
-/// or rebound). Operators chasing repeated WARNs are likely seeing
-/// an issue with sandbox-binding bookkeeping, not Phase B.
-pub async fn live_manifest_publish(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-    Json(req): Json<LiveManifestPublishRequest>,
-) -> Result<Json<LiveManifestPublishResponse>, ApiError> {
-    let outcome = live_manifest_publish_core(&state, host_id, &req).await?;
-    Ok(Json(LiveManifestPublishResponse { outcome }))
-}
-
-/// The pure store-level core of [`live_manifest_publish`] (ADR 0098
-/// R-CoSim, the run_once pattern applied to handlers): the HTTP wrapper
-/// thins to extractor + JSON, this holds the real logic so the boundary
-/// simulator (`engram-dst-cosim`) can drive the exact coordinator code
-/// path the host-agent's `CoordControlPlane::publish_live_manifest` hits.
-/// Zero behavior change.
-/// The store-level core of the [`register`] handler's rehydration list (ADR
-/// 0098 R-CoSim, the run_once pattern applied to handlers). Returns the
-/// VM-resident sandboxes PG has bound to `host_id` — every
-/// `reserves_host_memory` state (Active AND rung-parked Evicting survivors,
-/// per session 731df805) — with the effective disk manifest the host rebuilds
-/// from. The boundary simulator's register-rehydrate leg drives THIS exact
-/// listing, so the co-simulated host re-serves precisely the devices the real
-/// coordinator would name.
+/// The store-level core of the [`register`] handler's rehydration list.
+/// Returns the VM-resident sandboxes PG has bound to `host_id`: every
+/// `reserves_host_memory` state, so rung-parked Evicting survivors count as
+/// well as Active ones. The boundary simulator's register-rehydrate leg
+/// drives this exact listing.
 pub async fn register_rehydrate_list_core(
     state: &SharedState,
     host_id: HostId,
@@ -1756,138 +1633,21 @@ pub async fn register_rehydrate_list_core(
     let rows = state
         .services
         .meta
-        .list_resident_sandboxes_on_host_with_disk_manifest(host_id)
+        .list_resident_sandbox_assignments_on_host(host_id)
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
+        .map(|(session_id, sandbox_id, _)| RehydrateSandboxRef {
             session_id,
             sandbox_id,
-            disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
-            disk_manifest_version: manifest.as_ref().map(|m| m.version),
         })
         .collect())
 }
 
-/// The ADR 0090 quarantined-survivor advertise arm of the heartbeat,
-/// extracted per the run_once pattern so the boundary co-simulator
-/// (`engram-dst-cosim`) drives the REAL reaction to a host's quarantine
-/// advertise — the seam the 2026-07-21 8174b7aa livelock lived in (the
-/// cosim previously wrote host liveness straight to the store, so the
-/// advertise → enqueue → skip loop was structurally invisible to it).
-/// For each survivor the session still owns, enqueue the keyed
-/// quarantine `evict_local`; the pipeline's convergence guarantee (see
-/// the heartbeat handler's comment) is what keeps this 5s-cadence
-/// enqueue loop-free.
-pub async fn quarantined_survivor_advertise_core(
-    state: &SharedState,
-    host_id: HostId,
-    survivors: &[engram_protocol::heartbeat::QuarantinedSurvivor],
-) {
-    for q in survivors {
-        match state.services.meta.get_session(q.session_id).await {
-            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
-                match crate::session_ops::enqueue(
-                    state,
-                    q.session_id,
-                    engram_core::types::session_op::OpKind::Evict,
-                    serde_json::json!({
-                        "target": "idle",
-                        "allow_park": false,
-                        "nominated": false,
-                        // Quarantine flavor: the survivor's disk is unserved, so
-                        // the evict verb bounds each capture attempt and, past
-                        // the fast-retry budget, parks the op on a slow retry
-                        // cadence until the host's rehydrate retry re-serves
-                        // the disk (2026-08-02 durability-rollback RCA — the
-                        // old exhaustion arm destroyed the VM and rewound past
-                        // acked writes).
-                        "quarantine": true,
-                        // Pin the op to the advertised sandbox: the slow lane
-                        // can outlive a relocation, and a stale wake-up must
-                        // no-op instead of evicting the session's NEW, healthy
-                        // sandbox.
-                        "sandbox_id": q.sandbox_id,
-                    }),
-                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
-                )
-                .await
-                {
-                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
-                    Ok(_) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            sandbox_id = %q.sandbox_id,
-                            reason = ?q.reason,
-                            "quarantined survivor advertised — enqueued evict_local \
-                             (capture + relocate; ADR 0090)",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            error = %e,
-                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
-                        );
-                    }
-                }
-            }
-            // Session moved on (relocated / terminal) or unknown — the
-            // host's quarantine entry clears when the sandbox is
-            // destroyed; nothing to drive here.
-            _ => {}
-        }
-    }
-}
-
-pub async fn live_manifest_publish_core(
-    state: &SharedState,
-    host_id: HostId,
-    req: &LiveManifestPublishRequest,
-) -> Result<LiveManifestPublishOutcome, ApiError> {
-    let manifest_ref = engram_core::types::manifest::ManifestRef {
-        manifest_id: req.manifest_id,
-        version: req.manifest_version,
-    };
-    let outcome = state
-        .services
-        .meta
-        .update_live_disk_manifest(req.session_id, req.sandbox_id, manifest_ref)
-        .await?;
-    match outcome {
-        engram_core::traits::UpdateOutcome::Applied => {
-            tracing::debug!(
-                %host_id,
-                session_id = %req.session_id,
-                sandbox_id = %req.sandbox_id,
-                manifest_id = %req.manifest_id,
-                manifest_version = req.manifest_version,
-                "live_disk_manifest applied",
-            );
-            Ok(LiveManifestPublishOutcome::Applied)
-        }
-        engram_core::traits::UpdateOutcome::DroppedStale => {
-            tracing::warn!(
-                %host_id,
-                session_id = %req.session_id,
-                sandbox_id = %req.sandbox_id,
-                manifest_id = %req.manifest_id,
-                manifest_version = req.manifest_version,
-                "live_disk_manifest dropped as stale (sandbox_id mismatch)",
-            );
-            Ok(LiveManifestPublishOutcome::Stale)
-        }
-    }
-}
-
-/// ADR 0034: fast control-plane nomination. The pre-0034 handler ran
-/// the full snapshot pipeline inline here; a fat session's eviction
-/// (60-90s+) outlived the host's POST timeout, the connection drop
-/// cancelled the handler future mid-pipeline, and the eviction died
-/// silently (prod session 0782bea5 sat Active for 8+ hours). Now the
-/// handler only flips `Active → Evicting` — a single PG UPDATE — and
+/// ADR 0034: fast control-plane nomination. The snapshot pipeline must
+/// not run inline here: a fat session's eviction (60-90s+) outlives the
+/// host's POST timeout, the connection drop cancels the handler future
+/// mid-pipeline, and the eviction dies silently. The handler only flips `Active → Evicting` — a single PG UPDATE — and
 /// the eviction scanner (`idle_evictor::spawn_eviction_scanner`)
 /// drives the pipeline outside any request lifetime.
 ///
@@ -1961,7 +1721,7 @@ pub struct SandboxOwnershipResponse {
 
 /// ADR 0090: the teardown reconciler's unknown-binding form — "does ANY
 /// session own sandbox Y on this host?" A fresh host-agent generation
-/// whose NBD rehydrate failed has no local binding for a pidfd-reattached
+/// whose binding rehydrate failed has no local binding for a pidfd-reattached
 /// survivor; before the reconciler may count an orphan strike it must ask
 /// here. Returns the owning session id (non-terminal states only, incl.
 /// `host_lost`) so the host can also repopulate its binding table.
@@ -2027,35 +1787,6 @@ mod tests {
         assert_eq!(m.resident_sandboxes, 0);
     }
 
-    /// engrams#1378 mixed-fleet pin: a heartbeat from a pre-#1378 host-agent
-    /// (no residue fields) must decode as known-empty residue — today's ack
-    /// behavior — while an unclassified new host's explicit `false` withholds
-    /// the ack (the issue-#215 asymmetry, applied to residue).
-    #[test]
-    fn heartbeat_residue_fields_default_for_pre_1378_hosts() {
-        let legacy = r#"{
-            "capacity": {
-                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
-            }
-        }"#;
-        let hb: HeartbeatRequest = serde_json::from_str(legacy).expect("decode legacy heartbeat");
-        assert!(hb.device_residue_sandboxes.is_empty());
-        assert!(hb.device_residue_known);
-        let sb = engram_core::SandboxId::new();
-        let unclassified = format!(
-            r#"{{
-            "capacity": {{
-                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
-            }},
-            "device_residue_sandboxes": ["{sb}"],
-            "device_residue_known": false
-        }}"#
-        );
-        let hb: HeartbeatRequest =
-            serde_json::from_str(&unclassified).expect("decode residue heartbeat");
-        assert_eq!(hb.device_residue_sandboxes, vec![sb]);
-        assert!(!hb.device_residue_known);
-    }
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
     use engram_core::types::SessionState;
@@ -2123,7 +1854,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
@@ -2279,104 +2009,6 @@ mod tests {
             assert_eq!(*meta.reconcile_probe_calls.lock(), 0);
             assert_eq!(meta.hosts.lock()[0].status, status);
         }
-    }
-
-    /// 2026-07-13 incident regression: the ADR 0090 quarantined-survivor
-    /// arm fires on EVERY 5s heartbeat, and `session_ops` dedup keys
-    /// ONLY on the idempotency key — a key-less enqueue inserts a fresh
-    /// queued row per heartbeat (423 piled up behind one wedged evict in
-    /// prod). Pin that re-adverts collapse to ONE keyed row. The seeded
-    /// running evict keeps the lane busy so the first advert's row stays
-    /// `queued` (never claimed/driven) and the second advert must dedup
-    /// against it.
-    #[tokio::test]
-    async fn quarantined_survivor_readverts_dedup_to_one_op() {
-        let host_id = HostId::new();
-        let sandbox_id = SandboxId::new();
-        let session_id = engram_core::SessionId::new();
-        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
-        session.host_id = Some(host_id);
-        let (state, meta, _local) = build_state_for_session(session);
-        meta.ops
-            .seed_running(session_id, engram_core::types::session_op::OpKind::Evict);
-
-        let hb_json = serde_json::json!({
-            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
-            "running_sandboxes": [sandbox_id],
-            "quarantined_survivors": [
-                { "sandbox_id": sandbox_id, "session_id": session_id },
-            ],
-        });
-        for tick in 0..2 {
-            let hb: HeartbeatRequest =
-                serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
-            let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
-            assert!(result.is_ok(), "heartbeat tick {tick}: {:?}", result.err());
-        }
-
-        let keyed: Vec<_> = meta
-            .ops
-            .all()
-            .into_iter()
-            .filter(|o| {
-                o.idempotency_key.as_deref()
-                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
-            })
-            .collect();
-        assert_eq!(
-            keyed.len(),
-            1,
-            "re-advertised quarantined survivor must dedup to one keyed evict op, got {keyed:#?}",
-        );
-    }
-
-    /// ADR 0116 C4: a survivor advertised with the additive
-    /// `reason: "data_plane_failed"` still produces the same keyed
-    /// quarantine evict — the reason changes the WARN log, never the
-    /// enqueue behavior (the keyed op is already convergence-safe).
-    /// The old-host shape (no `reason` key) is pinned by
-    /// `quarantined_survivor_readverts_dedup_to_one_op` above, whose
-    /// fixture omits the field.
-    #[tokio::test]
-    async fn quarantined_survivor_with_data_plane_reason_enqueues_keyed_evict() {
-        let host_id = HostId::new();
-        let sandbox_id = SandboxId::new();
-        let session_id = engram_core::SessionId::new();
-        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
-        session.host_id = Some(host_id);
-        let (state, meta, _local) = build_state_for_session(session);
-
-        let hb_json = serde_json::json!({
-            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
-            "running_sandboxes": [sandbox_id],
-            "quarantined_survivors": [
-                {
-                    "sandbox_id": sandbox_id,
-                    "session_id": session_id,
-                    "reason": "data_plane_failed",
-                },
-            ],
-        });
-        let hb: HeartbeatRequest =
-            serde_json::from_value(hb_json).expect("deserialize heartbeat with reason");
-        let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
-        assert!(result.is_ok(), "heartbeat failed: {:?}", result.err());
-
-        let keyed: Vec<_> = meta
-            .ops
-            .all()
-            .into_iter()
-            .filter(|o| {
-                o.idempotency_key.as_deref()
-                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
-            })
-            .collect();
-        assert_eq!(
-            keyed.len(),
-            1,
-            "a data-plane-failed survivor must drive the keyed quarantine evict, \
-             got {keyed:#?}",
-        );
     }
 
     /// ADR 0084 §A: the terminal-report ack rule. The two failure modes

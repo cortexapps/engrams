@@ -138,7 +138,7 @@ impl Bootstrap {
     /// `ManifestRef` from `bundle.json::disk_manifest` (or
     /// `canonical_memory_manifest` for memory bootstraps). After
     /// that, every consumer of `chunk_store.get_manifest` —
-    /// materialize, NBD daemon, UFFD handler — finds it in the
+    /// materialize, disk stage, UFFD handler — finds it in the
     /// local BlobStorage and works unchanged.
     pub fn to_manifest(&self) -> Manifest {
         Manifest {

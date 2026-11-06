@@ -101,7 +101,7 @@ def env_or(key, default):
 #
 # When set, the host-agent (+ its FC stack) runs INSIDE the named Colima
 # VM instead of as a Mac-local process — the only way to exercise the
-# FC-only surfaces (NBD, UFFD, netns egress, squashfs patch-drives) on
+# FC-only surfaces (dm-thin, UFFD, netns egress, squashfs patch-drives) on
 # Apple Silicon, where /dev/kvm only exists inside a nested-virt guest.
 # Coordinator/orchestrator/web/compose are untouched either way; only the
 # backend probe and the host-agent resource below change shape. `just
@@ -463,14 +463,23 @@ if sandbox_backend == 'process':
     if process_image_catalog:
         coord_env['ENGRAM_PROCESS_IMAGE_CATALOG'] = process_image_catalog
 
+# ADR 0125: a Firecracker host-agent needs a dm-thin pool for its session
+# disks (`thin-pool.sh` builds one; the fc-dev VM has a 20 GiB one called
+# engram-pool). A dev pool is far under the 16 GiB production floor, so
+# the placement floor drops with it; the host-agent reads the same
+# variable to decide when to reap kept checkpoint volumes.
+dev_thin_pool = env_or('ENGRAM_THIN_POOL', 'engram-pool' if sandbox_backend == 'firecracker' else '')
+dev_pool_floor = env_or('ENGRAM_PLACEMENT_POOL_FLOOR_BYTES', '3221225472')
+if dev_thin_pool:
+    coord_env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor
+
 if fc_colima_profile:
-    # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
-    # production 20 GiB disk-cache floor. Lower BOTH coordinator-side
-    # floors — placement (or the VM is never disk-eligible for a
-    # session) and the idle detector's — in lockstep with the VM-side
-    # host-agent idle-evict override below. The two are separate env
-    # vars on purpose: prod must be able to tune idle eviction without
-    # silently loosening placement's disk gate.
+    # The fc-dev VM has a ~19 GiB rootfs, under the production floors
+    # (20 GiB disk cache). Lower the placement floor (or the VM never
+    # takes a session) and the idle detector's disk floor, in lockstep
+    # with the VM-side host-agent idle-evict override below. Separate
+    # env vars on purpose: prod tunes idle eviction without loosening
+    # placement.
     coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
 
@@ -546,39 +555,12 @@ two_hosts = env_or('ENGRAM_INTEG_TWO_HOSTS', '') in ('1', 'true', 'yes')
 if two_hosts and fc_colima_profile:
     # ADR 0082 wires exactly one VM-hosted host-agent; a second one would
     # need its own gRPC/metrics ports forwarded out of the SAME VM plus a
-    # disjoint NBD/sandbox-dir split inside it, neither of which exists
-    # yet. Fail fast instead of silently only starting host-agent.
+    # sandbox-dir split inside it, neither of which exists yet. Fail fast
+    # instead of silently only starting host-agent.
     fail('ENGRAM_INTEG_TWO_HOSTS is not supported together with ' +
          'ENGRAM_FC_COLIMA_PROFILE yet.')
 
-def _nbd_device_count():
-    # FC serves the chunked disks over /dev/nbdN. The host-agent sizes its
-    # device pool from the kernel's `nbds_max` on its own, so one host-agent
-    # needs no NBD setting here.
-    listing = str(local("ls -1 /dev", echo_off=True, quiet=True)).strip()
-    return len([d for d in listing.split('\n')
-                if d.startswith('nbd') and d[3:].isdigit()])
-
-# Two host-agents on one machine MUST own disjoint /dev/nbdN ranges. Each
-# host-agent keeps devices that it validated as free ready to use, and it
-# cannot see a CONNECT by the other process. With a shared range, the second
-# host-agent can CONNECT a device that the first one now serves, and the
-# attach fails with EBUSY (a teleport onto host-agent-b aborted this way).
-# (ENGRAM_INTEG_TWO_HOSTS with ENGRAM_FC_COLIMA_PROFILE fails above, so the
-# devices are on this machine.)
-nbd_a = None
-nbd_b = None
-if two_hosts and sandbox_backend == 'firecracker':
-    _nbd_count = _nbd_device_count()
-    if _nbd_count < 2:
-        fail('engram dev: two host-agents need at least 2 /dev/nbdN devices to split, found %d; load nbd with nbds_max>=2' % _nbd_count)
-    _half = _nbd_count // 2
-    nbd_a = (0, _half)
-    nbd_b = (_half, _nbd_count - _half)
-    print('engram dev: %d NBD devices; host-agent range (first, count) = %r, host-agent-b = %r'
-          % (_nbd_count, nbd_a, nbd_b))
-
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_range, egress_proxy_port, egress_dns_port, guest_gateway_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_port, egress_dns_port, guest_gateway_port, thin_pool):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -658,10 +640,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_range, egre
     # would clobber the host-agent's PATH-lookup default.
     if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
-
-    if nbd_range:
-        env['ENGRAM_NBD_FIRST_SLOT'] = str(nbd_range[0])
-        env['ENGRAM_NBD_MAX_SLOTS'] = str(nbd_range[1])
+    # The session-disk pool and its floor, see `dev_thin_pool` above.
+    # Both must be in this map: the Linux host-agent runs under sudo
+    # --preserve-env=<these keys>. Each host-agent has its own pool.
+    if thin_pool:
+        env['ENGRAM_THIN_POOL'] = thin_pool
+        env['ENGRAM_PLACEMENT_POOL_FLOOR_BYTES'] = dev_pool_floor
 
     if fc_colima_profile:
         # ADR 0082: this resource's whole execution model moves into the
@@ -961,7 +945,7 @@ if _guest_gateway_base < 1 or _guest_gateway_base > 65535:
 if two_hosts and (_proxy_base == 65535 or _dns_base == 65535 or _guest_gateway_base == 65535):
     fail('two-host mode needs room for the second host egress ports (base must be <= 65534)')
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base), str(_guest_gateway_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', str(_proxy_base), str(_dns_base), str(_guest_gateway_base), dev_thin_pool)
     if fc_colima_profile:
         # ADR 0082: the coordinator dials the host-agent's advertised
         # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
@@ -1010,7 +994,7 @@ if dev_split:
         # netns), else host-agent-b fails closed on Address already in use
         # (ADR 0083).
         _proxy_b = str(_proxy_base + 1)
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1), str(_guest_gateway_base + 1))
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', _proxy_b, str(_dns_base + 1), str(_guest_gateway_base + 1), dev_thin_pool + '-b' if dev_thin_pool else '')
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.
@@ -1087,6 +1071,8 @@ orchestrator_env = {
     # ADR 0089: register the dev-only smoke tools (dev_echo / dev_echo_deferred)
     # so live scenario A/C verification works against the local stack.
     'ENGRAM_DEV_TOOLS': '1',
+    # Human-readable log lines; without it the orchestrator logs JSON.
+    'ENGRAM_LOG_FORMAT': 'pretty',
 }
 admin_emails = env_or('ORCHESTRATOR_ADMIN_EMAILS', '')
 if admin_emails:

@@ -8,7 +8,7 @@
 //! chunk is hashed and PUT the moment its byte range is fully covered.
 //! No image file exists anywhere: the producing host's local NVMe cache
 //! is seeded by `put_chunk`'s write-through (ADR 0078 move 4), which is
-//! what the co-located capture VM's NBD page-in reads.
+//! what staging the image volume on that host reads.
 //!
 //! All-zero chunks are elided from the manifest exactly as
 //! [`ChunkStore::chunk_file_into`] elides them (a manifest gap reads as

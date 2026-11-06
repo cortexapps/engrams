@@ -404,9 +404,8 @@ pub struct CachedImage {
     /// (no bundle present).
     pub rootfs_path: Option<PathBuf>,
     /// ADR 0007: parsed bundle.json content, when the image carries
-    /// one. Phase 4/5 wire this into FC's NBD disk + UFFD memory
-    /// adapters; today it's plumbed through so adopters can find
-    /// the chunk-store reference without re-reading the file.
+    /// one: the chunk-store manifests a session volume and the UFFD
+    /// memory adapter start from.
     pub bundle: Option<ImageBundle>,
     /// ADR 0008 Phase 3 / ADR 0036: path to the disk-side bootstrap
     /// layer when the artifact is chunked-OCI shaped. `Some` enables

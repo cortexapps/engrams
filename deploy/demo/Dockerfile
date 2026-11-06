@@ -37,8 +37,15 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 # raw and the upstream 401s. (Firecracker needs nothing here: its REDIRECT is
 # host-side in the netns.) The owned guest kernel carries the matching
 # CONFIG_IP_NF_NAT / CONFIG_NETFILTER_XT_NAT.
+#
+# The snapshot server throttles busy clients: a request can stall with no
+# data or fail with a 5xx. apt gives up on a request that sends nothing for
+# 30 s and tries it again, backing off up to 30 s between tries, so an
+# outage of a few minutes costs minutes, not the job's limit.
 ARG SNAPSHOT_TS=20260630T000000Z
 RUN set -eux; \
+    printf '%s\n' 'Acquire::Retries "10";' 'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-retries; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
     rm -f /etc/apt/sources.list.d/debian.sources; \

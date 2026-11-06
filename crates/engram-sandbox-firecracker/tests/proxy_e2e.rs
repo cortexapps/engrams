@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::integration::GuestService;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
@@ -414,7 +415,8 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = backend.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    backend.create(sandbox_id, spec).await.expect("create");
     // Poll for guest_endpoints — the in-VM agent takes a few seconds to
     // bind on vsock and answer the GuestIp RPC after kernel boot.
     let mut endpoints = None;

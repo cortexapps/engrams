@@ -619,7 +619,7 @@ async fn write_file_smoke() {
 }
 
 /// `Snapshot → EvictLocal → Resume` round-trip smoke. Also exercises
-/// `GetLog`, `GetCowState`, and `ListCheckpoints` in the same session.
+/// `GetLog` and `ListCheckpoints` in the same session.
 #[tokio::test]
 #[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
 async fn snapshot_evict_resume_smoke() {
@@ -683,20 +683,6 @@ async fn snapshot_evict_resume_smoke() {
     println!(
         "smoke(snapshot): GetLog returned {} events",
         log_resp.events.len()
-    );
-
-    let mut cow_req = tonic::Request::new(app::GetCowStateRequest {
-        session_id: session_id.clone(),
-    });
-    cow_req.set_timeout(rpc_timeout);
-    let cow_resp = client
-        .get_cow_state(cow_req)
-        .await
-        .expect("GetCowState must succeed")
-        .into_inner();
-    println!(
-        "smoke(snapshot): GetCowState state={:?}",
-        cow_resp.state.is_some()
     );
 
     let mut snap_req = tonic::Request::new(app::SnapshotRequest {

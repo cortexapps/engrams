@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -125,7 +126,8 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = Arc::new(
         PooledBackend::new(inner)
-            .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
             .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
             .with_checkpoint_dir(work.path().join("checkpoints")),
     );
@@ -133,9 +135,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     let spec = SandboxSpec {
         image: "engram-ckpt-chain-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -149,7 +151,8 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
-    let sandbox = pooled.create(spec).await.expect("create");
+    let sandbox = SandboxId::new();
+    pooled.create(sandbox, spec).await.expect("create");
     // The durable record only writes for session-bound sandboxes.
     let session_id = engram_core::SessionId::new();
     pooled.bind_session(session_id, sandbox);
@@ -169,6 +172,12 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     let m1 = ckpt1
         .memory_manifest
         .expect("seed must publish a memory manifest");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        pooled.checkpoint_recorded().notified(),
+    )
+    .await
+    .expect("a persisted checkpoint record signals the heartbeat");
 
     // ADR 0039: the Full capture chunked guest RAM into the store and
     // then removed the local memory.bin — committed snapshot dirs must
@@ -222,8 +231,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // vsock path for the restored sibling).
     pooled.destroy(sandbox).await.expect("destroy original");
     let t = Instant::now();
-    let restored = pooled
-        .restore(ckpt2.clone())
+    let restored = SandboxId::new();
+    pooled
+        .restore(restored, ckpt2.clone(), None)
         .await
         .expect("restore from diff checkpoint");
     eprintln!("CHAIN: restore(ckpt2) {} ms", t.elapsed().as_millis());
@@ -274,8 +284,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // fidelity proof for `update_for_dirty_ranges_sparse` against real
     // guest memory (fetch-prev-chunk + apply-diff == current).
     pooled.destroy(restored).await.expect("destroy restored");
-    let restored2 = pooled
-        .restore(ckpt3.clone())
+    let restored2 = SandboxId::new();
+    pooled
+        .restore(restored2, ckpt3.clone(), None)
         .await
         .expect("restore from sparse diff checkpoint");
     let out = exec(
@@ -303,8 +314,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // version conflict — the e2e-stack regression), each on a DISTINCT
     // fresh lineage at v2 (v2 = a diff of the v1 fork; a Full would
     // have minted yet another id at v1).
-    let fresh_a = pooled
-        .restore_fresh(ckpt3.clone(), Vec::new())
+    let fresh_a = SandboxId::new();
+    pooled
+        .restore_fresh(fresh_a, ckpt3.clone(), None, Vec::new())
         .await
         .expect("fresh restore A");
     // Marker planted BEFORE B exists: File-mode siblings restored from
@@ -315,8 +327,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // substrate, not File). Characterized while landing the lineage
     // fork — tracked separately, see issue #172.
     let sum4 = plant_marker(&pooled, fresh_a, 4).await;
-    let fresh_b = pooled
-        .restore_fresh(ckpt3.clone(), Vec::new())
+    let fresh_b = SandboxId::new();
+    pooled
+        .restore_fresh(fresh_b, ckpt3.clone(), None, Vec::new())
         .await
         .expect("fresh restore B");
     let t = Instant::now();
@@ -359,8 +372,9 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // including marker4, dirtied AFTER the fork seed.
     pooled.destroy(fresh_a).await.expect("destroy fresh_a");
     pooled.destroy(fresh_b).await.expect("destroy fresh_b");
-    let restored3 = pooled
-        .restore(ckpt_a)
+    let restored3 = SandboxId::new();
+    pooled
+        .restore(restored3, ckpt_a, None)
         .await
         .expect("restore from seed-at-create forked checkpoint");
     let out = exec(

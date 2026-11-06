@@ -338,6 +338,12 @@ async fn main() -> Result<(), CoordinatorError> {
     // spans on shutdown (ADR 0019).
     let _telemetry = init_tracing();
 
+    // The chart's pre-upgrade hook runs this image with `upgrade-drain`.
+    if std::env::args().nth(1).as_deref() == Some("upgrade-drain") {
+        engram_upgrade_drain::run_from_env().await?;
+        return Ok(());
+    }
+
     // ADR 0098 D1: time/entropy are injected world inputs. Built once
     // here so pre-`Services` boot code (host-row upsert, heartbeat
     // loop) reads the same clock the rest of the coordinator gets.
@@ -487,7 +493,7 @@ async fn main() -> Result<(), CoordinatorError> {
         let meta = meta_arc.clone();
         let clock = clock.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut tick = engram_core::periodic(std::time::Duration::from_secs(15));
             loop {
                 tick.tick().await;
                 // ADR 0047: counts from the hosts rows (replica-consistent).
@@ -660,8 +666,7 @@ async fn main() -> Result<(), CoordinatorError> {
         let pg_for_hb = pg.clone();
         let ready_images_for_hb = process_ready_images;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(std::time::Duration::from_secs(5));
             // Startup published a synchronous heartbeat. Wait one full
             // interval before the recurring heartbeat.
             tick.tick().await;

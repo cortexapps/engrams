@@ -1,6 +1,6 @@
 //! Two-host post-copy integration on real KVM. File-mode sources retain
 //! post-checkpoint RAM, a running harness, and held stdin across the move.
-//! NBD probes run after source destruction. A lost source must leave no VM.
+//! Disk probes run after source destruction. A lost source must leave no VM.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
@@ -56,7 +56,6 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
-    nbd_device: &Path,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("teleport-{label}-"))
@@ -80,15 +79,10 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
-        .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+        .with_chunk_store(chunk_store.clone())
+        .with_session_volumes(common::session_volumes(work.path(), chunk_store))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
-    let pooled = pooled.with_nbd_pool(
-        engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(
-            vec![nbd_device.to_path_buf()],
-        )
-        .expect("nbd slot pool"),
-    );
     (Arc::new(pooled), work)
 }
 
@@ -106,7 +100,6 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         let _ = engram_host_agent::grpc_server::boot(
             addr,
             inner,
-            None,
             engram_host_agent::session_epochs::ephemeral(),
             None,
         )
@@ -134,7 +127,7 @@ async fn dial(addr: std::net::SocketAddr) -> engram_protocol::grpc_client::GrpcH
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -143,9 +136,9 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -187,7 +180,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -196,7 +188,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -208,13 +199,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         image: "engram-two-host-teleport".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -615,7 +600,7 @@ int main(int argc, char **argv) {
 /// the in-flight turn) is unit-tested in engram-harness-claude's
 /// `connection_bounce_mid_turn_preserves_the_run`.
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_live_teleport_held_stdin_pipe_survives() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -624,9 +609,9 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -692,7 +677,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "pipe-b",
@@ -701,7 +685,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -712,13 +695,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         image: "engram-teleport-pipe".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -903,119 +880,159 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     host_b.peer.abort();
 }
 
-/// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
-/// sessions run on a CHUNKED-NBD rootfs, and both prod teleport
-/// canaries came out the other side with a corrupt disk — zeros /
-/// "Exec format error" on any UNCACHED read — while every memory-side
-/// probe passed. The sibling test above boots on a flat ext4 file
-/// (`rootfs_source`), so the migration's whole disk leg (pause-window
-/// drain, inline-manifest hand-off, dest NBD re-attach, drive
-/// re-point) had no real-VM coverage. Worse, on a single machine the
-/// frozen source's NBD device keeps serving correct bytes until
-/// commit, masking a wrong redirect — so this test COMMITS (source
-/// destroyed) BEFORE probing, then drops the guest page cache and
-/// re-reads through the destination's NBD. Byte-identical or bust.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
-async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
-    if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
-        .map(|v| v == "0")
-        .unwrap_or(false)
-    {
-        eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
-        return;
-    }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
-        return;
-    };
-    let Some((kernel, handler, agent, busybox)) = gate() else {
-        return;
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
+/// Two served hosts over one chunk store, for the disk-leg tests.
+struct DiskHosts {
+    _shared: tempfile::TempDir,
+    _images: tempfile::TempDir,
+    _work_a: tempfile::TempDir,
+    _work_b: tempfile::TempDir,
+    host_a: HostStack,
+    host_b: HostStack,
+    client_a: engram_protocol::grpc_client::GrpcHostClient,
+    client_b: engram_protocol::grpc_client::GrpcHostClient,
+    spec: SandboxSpec,
+}
+
+impl DiskHosts {
+    /// `None`, with a `SKIP:` line, when the host cannot run a two-host move.
+    async fn gate() -> Option<Self> {
+        if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
+            return None;
+        }
+        common::postcopy::fork_gate()?;
+        let (kernel, handler, agent, busybox) = gate()?;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
+            )
+            .with_test_writer()
+            .try_init();
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+
+        let shared = tempfile::tempdir().expect("shared dir");
+        let blob_root = shared.path().join("blob");
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
+        );
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+
+        // Docker-free (ADR 0080 §D).
+        let images = tempfile::tempdir().expect("images dir");
+        let outcome = common::bake_fixture_ext4(
+            &images.path().join("rootfs.ext4"),
+            &chunk_store,
+            &busybox,
+            Some(InitInjection {
+                vsock_port: ENGRAM_AGENTD_PORT,
+                transport: Transport::Vsock,
+                init_script: None,
+            }),
+            |_tree| Ok(()),
         )
-        .with_test_writer()
-        .try_init();
-    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+        .await;
+        let rootfs_manifest = common::fork_lineage(&chunk_store, outcome.disk_manifest).await;
 
-    let shared = tempfile::tempdir().expect("shared dir");
-    let blob_root = shared.path().join("blob");
-    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-        engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
-    );
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+        // ADR 0080: one staged agentd bundle dir shared by both hosts.
+        let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
+        let (pooled_a, work_a) = build_host(
+            "disk-a",
+            &kernel,
+            &handler,
+            &blob_root,
+            &staged.bundle_dir,
+            &chunk_store,
+        );
+        let (pooled_b, work_b) = build_host(
+            "disk-b",
+            &kernel,
+            &handler,
+            &blob_root,
+            &staged.bundle_dir,
+            &chunk_store,
+        );
+        let host_a = serve(pooled_a).await;
+        let host_b = serve(pooled_b).await;
+        let client_a = dial(host_a.addr).await;
+        let client_b = dial(host_b.addr).await;
+        let spec = SandboxSpec {
+            image: "engram-teleport-disk".into(),
+            rootfs_source: None,
+            image_uri: None,
+            rootfs_manifest: Some(rootfs_manifest),
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit { max_mib: 256 },
+            disk: DiskLimit { max_gib: 1 },
+            ttl: None,
+            env: HashMap::new(),
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: vec![staged.agentd_slot()],
+            swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
+        };
+        Some(Self {
+            _shared: shared,
+            _images: images,
+            _work_a: work_a,
+            _work_b: work_b,
+            host_a,
+            host_b,
+            client_a,
+            client_b,
+            spec,
+        })
+    }
 
-    // Docker-free (ADR 0080 §D).
-    let images = tempfile::tempdir().expect("images dir");
-    let outcome = common::bake_fixture_ext4(
-        &images.path().join("rootfs.ext4"),
-        &chunk_store,
-        &busybox,
-        Some(InitInjection {
-            vsock_port: ENGRAM_AGENTD_PORT,
-            transport: Transport::Vsock,
-            init_script: None,
-        }),
-        |_tree| Ok(()),
-    )
-    .await;
-    let rootfs_manifest = outcome
-        .disk_manifest
-        .expect("ext4 bake produces a chunked disk manifest");
+    /// A running guest on A with its seed checkpoint.
+    async fn guest(
+        &self,
+    ) -> (
+        engram_core::SandboxId,
+        engram_core::types::snapshot::SnapshotMetadata,
+    ) {
+        let base = common::postcopy::base(&self.host_a.pooled, self.spec.clone()).await;
+        let vm = common::postcopy::fresh(&self.host_a.pooled, base).await;
+        let _ = exec(&self.host_a.pooled, vm, "true").await;
+        let ckpt = self
+            .host_a
+            .pooled
+            .checkpoint_sandbox(vm)
+            .await
+            .expect("seed checkpoint on A");
+        (vm, ckpt)
+    }
 
-    // ADR 0080: one staged agentd bundle dir shared by both hosts.
-    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "nbd-a",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-        &devices[0],
-    );
-    let (pooled_b, _work_b) = build_host(
-        "nbd-b",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-        &devices[1],
-    );
-    let host_a = serve(pooled_a).await;
-    let host_b = serve(pooled_b).await;
-    let client_a = dial(host_a.addr).await;
-    let client_b = dial(host_b.addr).await;
+    fn stop(self) {
+        self.host_a.server.abort();
+        self.host_a.peer.abort();
+        self.host_b.server.abort();
+        self.host_b.peer.abort();
+    }
+}
 
-    // Create on A through the chunked-NBD rootfs path, exactly like a
-    // prod session (no flat ext4 file).
-    let spec = SandboxSpec {
-        image: "engram-teleport-nbd".into(),
-        rootfs_source: None,
-        image_uri: None,
-        rootfs_manifest: Some(rootfs_manifest),
-        cpu: CpuLimit { vcpus: 1 },
-        memory: MemoryLimit { max_mib: 256 },
-        disk: DiskLimit { max_gib: 1 },
-        ttl: None,
-        env: HashMap::new(),
-        workdir: None,
-        network: Default::default(),
-        aux_ro_drives: vec![staged.agentd_slot()],
-        swap_mib: None,
-        swap_source: None,
-        swap_manifest: None,
+/// The disk leg of a move: the destination's root volume holds the
+/// image bytes and the session's own writes after the source is gone.
+/// Commits (source destroyed) BEFORE probing, then drops the guest page
+/// cache so every read goes to the destination's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
+async fn two_host_teleport_rootfs_survives_source_destroy() {
+    let Some(hosts) = DiskHosts::gate().await else {
+        return;
     };
-    let base = common::postcopy::base(&host_a.pooled, spec).await;
-    let vm = common::postcopy::fresh(&host_a.pooled, base).await;
-    let _ = exec(&host_a.pooled, vm, "true").await;
-    let ckpt = host_a
-        .pooled
-        .checkpoint_sandbox(vm)
-        .await
-        .expect("seed checkpoint on A");
+    let DiskHosts {
+        host_a,
+        host_b,
+        client_a,
+        client_b,
+        ..
+    } = &hosts;
+    let (vm, ckpt) = hosts.guest().await;
 
     // Pre-move disk truth: an existing rootfs binary AND a freshly
     // written ROOTFS file (not /dev/shm — it must travel via the disk
@@ -1038,11 +1055,11 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 
     // ---- The move ----
     let (moved, cap) =
-        common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
+        common::postcopy::move_guest(client_a, client_b, vm, ckpt.clone(), host_a.addr).await;
     common::postcopy::drain(&host_b.pooled, moved).await;
     assert!(
         cap.disk_manifest_ref.is_some(),
-        "NBD source advertises its disk base"
+        "the source advertises its disk checkpoint"
     );
     let row = host_b
         .pooled
@@ -1052,9 +1069,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     let durable_ref = row.memory_manifest.expect("durable memory manifest");
     assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
 
-    // COMMIT FIRST: the frozen source — whose NBD device on a
-    // one-machine test would happily keep serving the right bytes —
-    // is destroyed before any probe runs.
+    // Commit first: the frozen source is destroyed before any probe runs.
     client_a
         .migration_commit(
             vm,
@@ -1065,8 +1080,8 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
 
-    // Post-move disk truth, THROUGH the destination's NBD: drop the
-    // guest page cache so nothing is served from the RAM that moved.
+    // Drop the guest page cache so nothing is served from the RAM that
+    // moved.
     let dropped = exec(
         &host_b.pooled,
         moved,
@@ -1094,18 +1109,168 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     assert_eq!(
         probe_hash_b, probe_hash_a,
         "the session-written rootfs file must survive the move \
-         (travels via the pause-window disk drain)"
+         (travels in the sealed disk checkpoint)"
     );
 
     host_b.pooled.destroy(moved).await.expect("destroy moved");
-    host_a.server.abort();
-    host_a.peer.abort();
-    host_b.server.abort();
-    host_b.peer.abort();
+    hosts.stop();
+}
+
+/// The disk leg under a guest that writes at a steady rate: the
+/// presetup's snapshot carries what the guest wrote before the move
+/// began while it still runs, so the seal under the pause holds only
+/// what it wrote while that precopy was in flight; and the destination
+/// holds every byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
+async fn two_host_teleport_seals_only_the_residual_under_steady_writes() {
+    use engram_core::types::snapshot::MIGRATION_DISK_BLOCK_BYTES as BLOCK;
+    const MIB: u64 = 1024 * 1024;
+    let Some(hosts) = DiskHosts::gate().await else {
+        return;
+    };
+    let DiskHosts {
+        host_a,
+        host_b,
+        client_a,
+        client_b,
+        ..
+    } = &hosts;
+    let (vm, ckpt) = hosts.guest().await;
+
+    // Two fsynced MiB every tenth of a second or slower, over 24 slots
+    // of a 48 MiB window, so distinct bytes pile up before the move and
+    // keep coming during it. The writer stops at a stop file and
+    // reports when its last write is in.
+    //
+    // The guest's busybox has no `nohup`, and its ash leaks per-job
+    // redirection fds into a backgrounded child, so the shell points its
+    // own stdio at /dev/null and then backgrounds the loop.
+    let free_kib: u64 = exec(&host_a.pooled, vm, "df -k /root | awk 'NR==2 {print $4}'")
+        .await
+        .trim()
+        .parse()
+        .expect("df prints the free KiB of /root");
+    assert!(
+        free_kib / 1024 >= 48 + 8,
+        "the guest root has {} MiB free; the writer needs 48 MiB",
+        free_kib / 1024
+    );
+    exec(
+        &host_a.pooled,
+        vm,
+        "exec </dev/null >/dev/null 2>&1; sh -c 'i=0; while [ ! -e /root/stop ]; do \
+           dd if=/dev/urandom of=/root/stream bs=1M count=2 seek=$((2 * (i % 24))) \
+              conv=notrunc,fsync 2>/dev/null; \
+           i=$((i+1)); echo $i > /root/rounds; sleep 0.1; done; \
+           echo done > /root/writer.done' &",
+    )
+    .await;
+    let pooled_a = host_a.pooled.clone();
+    let primed = common::poll_until_async(
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_millis(250),
+        || {
+            let pooled_a = pooled_a.clone();
+            async move {
+                exec(&pooled_a, vm, "cat /root/rounds 2>/dev/null || echo 0")
+                    .await
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+                    >= 40
+            }
+        },
+    )
+    .await;
+    assert!(primed, "the guest writes at a steady rate");
+
+    // ---- The move, with the guest writing throughout ----
+    let presetup = client_a
+        .migration_presetup(vm, engram_core::traits::SessionFence::unfenced())
+        .await
+        .expect("presetup");
+    let row = common::postcopy::metadata(ckpt, &presetup, host_a.addr);
+    let dest = client_b.clone();
+    let restore = tokio::spawn(async move {
+        dest.restore(row, engram_core::traits::SessionFence::unfenced())
+            .await
+    });
+    // The precopy travels while the guest keeps writing.
+    let window = std::time::Duration::from_secs(2);
+    tokio::time::sleep(window).await;
+    let cap = client_a
+        .migration_capture_postcopy(
+            vm,
+            &presetup.export_id,
+            engram_core::traits::SessionFence::unfenced(),
+        )
+        .await
+        .expect("post-copy capture");
+    let moved = restore
+        .await
+        .expect("restore task")
+        .expect("restore on destination");
+    common::postcopy::drain(&host_b.pooled, moved).await;
+
+    let precopy_mib = cap.precopy_disk_blocks * BLOCK / MIB;
+    let sealed_mib = cap.sealed_disk_blocks * BLOCK / MIB;
+    eprintln!(
+        "DISK: precopy {precopy_mib} MiB, sealed {sealed_mib} MiB, \
+         disk_drain_ms {}",
+        cap.disk_drain_ms
+    );
+    // Forty rounds of two distinct MiB went ahead of the pause.
+    assert!(
+        precopy_mib >= 32,
+        "the precopy carries the writes made before the move: {precopy_mib} MiB"
+    );
+    // At most 20 MiB/s over a two-second window, with room for the
+    // capture's own latency and the file system's metadata.
+    let residual_bound_mib = 2 * 20 * window.as_secs();
+    assert!(
+        sealed_mib <= residual_bound_mib,
+        "the seal holds only the residual: {sealed_mib} MiB over {residual_bound_mib} MiB"
+    );
+    assert!(
+        cap.sealed_disk_blocks < cap.precopy_disk_blocks,
+        "the pause carries less than the precopy did"
+    );
+
+    // Every byte landed: with the writer stopped, the stream file reads
+    // the same from the destination's disk as from the guest's own page
+    // cache, and the source is gone when it is read.
+    client_a
+        .migration_commit(
+            vm,
+            &presetup.export_id,
+            engram_core::traits::SessionFence::unfenced(),
+        )
+        .await
+        .expect("commit on A");
+    assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
+    let same = exec(
+        &host_b.pooled,
+        moved,
+        "touch /root/stop; while [ ! -e /root/writer.done ]; do sleep 0.1; done; sync; \
+         a=$(sha256sum /root/stream | cut -d' ' -f1); \
+         echo 3 > /proc/sys/vm/drop_caches; \
+         b=$(sha256sum /root/stream | cut -d' ' -f1); \
+         [ \"$a\" = \"$b\" ] && echo same",
+    )
+    .await;
+    assert_eq!(
+        same.trim(),
+        "same",
+        "the stream file on the destination's disk matches the guest's view"
+    );
+
+    host_b.pooled.destroy(moved).await.expect("destroy moved");
+    hosts.stop();
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN"]
 async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -1114,9 +1279,9 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    if common::postcopy::fork_gate().is_none() {
         return;
-    };
+    }
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -1154,7 +1319,6 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "kb",
@@ -1163,7 +1327,6 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -1174,13 +1337,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         image: "engram-kill-source-test".into(),
         rootfs_source: None,
         image_uri: None,
-        // The chunked disk manifest: an NBD-served root is what presetup
-        // requires (the disk half of post-copy is the NBD seal).
-        rootfs_manifest: Some(
-            outcome
-                .disk_manifest
-                .expect("ext4 bake produces a chunked disk manifest"),
-        ),
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, outcome.disk_manifest).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

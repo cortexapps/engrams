@@ -144,8 +144,8 @@ mod tests {
 
     // Real `gh` traffic: `gh` NAMES its single operation and sends no
     // `operationName`. async-graphql-parser models a *named* op as `Multiple` even
-    // when it's the only one, so these must be accepted (they were rejected as
-    // "unparseable" pre-fix — the prod regression on session 2f25d473).
+    // when it's the only one, so these must be accepted, not rejected as
+    // "unparseable".
     #[test]
     fn single_named_query_without_operation_name() {
         // The exact shape `gh repo view` sends.

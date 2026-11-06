@@ -48,7 +48,6 @@ async fn reserve_session(sim: &mut Sim) -> (engram_coordinator::state::SharedSta
         managed_initial_prompt: None,
         managed_creation: None,
         mcp_policy: None,
-        nbd_slot_need: 1,
         session_id,
         spec: SessionSpec {
             image: SIM_IMAGE.into(),

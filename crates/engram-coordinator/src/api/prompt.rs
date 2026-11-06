@@ -7,8 +7,8 @@
 //! (`crate::outbox_delivery`) resumes the session BEHIND the enqueue,
 //! forwards, self-heals the harness-unbound desync, and redelivers
 //! until the confirming harness event acks the row. A caller therefore
-//! never waits on a 12-89s resume, and a connection bounce can no
-//! longer eat the command (the e35ed1fa class): the row survives until
+//! never waits on a 12-89s resume, and a connection bounce cannot eat
+//! the command: the row survives until
 //! `run_started{prompt_id}` lands.
 //!
 //! Dead sessions return 410 Gone — the only affordance there is
@@ -134,8 +134,7 @@ pub(crate) async fn send_prompt_core(
     // transcript holds the echo until that arrives. The single
     // transaction makes the echo's idx precede its `run_started` BY
     // CONSTRUCTION — the outbox row and the echo become visible at
-    // the same commit, so delivery cannot begin first. (Pre-0067 this
-    // leaned on the synchronous forward; prod session 68c70a65.)
+    // the same commit, so delivery cannot begin first.
     let mut events = vec![
         SessionEvent::PromptReceived {
             prompt_id: prompt_id.clone(),
@@ -560,7 +559,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,
-            live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
             suggested_title: None,

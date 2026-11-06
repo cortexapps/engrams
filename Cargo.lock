@@ -2278,6 +2278,7 @@ dependencies = [
  "engram-telemetry",
  "engram-testkit",
  "engram-tls",
+ "engram-upgrade-drain",
  "flate2",
  "futures",
  "hex",
@@ -2352,6 +2353,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-disk-thin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "engram-chunk-store",
+ "engram-host-core",
+ "engram-storage-local",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-dst"
 version = "0.1.0"
 dependencies = [
@@ -2393,7 +2409,6 @@ dependencies = [
  "engram-coordinator",
  "engram-core",
  "engram-crypto",
- "engram-dst-host",
  "engram-host-agent",
  "engram-host-core",
  "engram-oci",
@@ -2414,30 +2429,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "uuid",
- "workspace-hack",
-]
-
-[[package]]
-name = "engram-dst-host"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "engram-chunk-store",
- "engram-core",
- "engram-host-agent",
- "engram-host-core",
- "engram-sim",
- "engram-storage-local",
- "parking_lot 0.13.0",
- "rand 0.10.2",
- "rand_chacha 0.10.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
  "uuid",
  "workspace-hack",
 ]
@@ -2655,6 +2646,7 @@ dependencies = [
  "engram-cloud-sql",
  "engram-cloud-static",
  "engram-core",
+ "engram-disk-thin",
  "engram-egress-proto",
  "engram-egress-proxy",
  "engram-egress-proxyd",
@@ -2713,10 +2705,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "engram-chunk-store",
  "engram-core",
+ "engram-storage-local",
+ "futures",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
  "uuid",
  "workspace-hack",
 ]
@@ -2730,6 +2728,7 @@ dependencies = [
  "engram-cloud-gcp",
  "engram-core",
  "engram-protocol",
+ "engram-upgrade-drain",
  "futures",
  "k8s-openapi",
  "kube",
@@ -2781,6 +2780,7 @@ dependencies = [
  "lz4_flex",
  "proptest",
  "serde",
+ "serde_bytes",
  "workspace-hack",
 ]
 
@@ -3018,11 +3018,9 @@ dependencies = [
  "dashmap",
  "dispatch2",
  "engram-agentd",
- "engram-chunk-store",
  "engram-core",
  "engram-egress-proto",
  "engram-harness-proto",
- "engram-storage-local",
  "futures",
  "hex",
  "libc",
@@ -3290,6 +3288,19 @@ dependencies = [
  "tracing-subscriber",
  "userfaultfd",
  "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-upgrade-drain"
+version = "0.1.0"
+dependencies = [
+ "engram-core",
+ "engram-protocol",
+ "futures",
+ "tokio",
+ "tonic",
+ "tracing",
  "workspace-hack",
 ]
 
@@ -5072,9 +5083,9 @@ dependencies = [
 
 [[package]]
 name = "mkext4"
-version = "0.0.3"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d9b87ba418ec2aace835f39128b6c7a90a9f7f8130da2db95a3e00f94d97be1"
+checksum = "907262285b1fd903bb1f1190b98bc785250752be4f72d440d9f6befcd81f3f15"
 dependencies = [
  "crc32c",
 ]
@@ -6973,6 +6984,16 @@ checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
 dependencies = [
  "ordered-float 2.10.1",
  "serde",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

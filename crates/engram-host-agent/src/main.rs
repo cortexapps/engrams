@@ -56,13 +56,11 @@ struct Cli {
     )]
     work_dir: PathBuf,
 
-    /// Root for per-sandbox sparse dirty files.
-    #[arg(
-        long,
-        env = "ENGRAM_DIRTY_ROOT",
-        default_value = "/var/lib/engram/dirty"
-    )]
-    dirty_root: PathBuf,
+    /// Name of the node's dm-thin pool that holds image and session
+    /// volumes. Unset, volumes are sparse files under the work dir
+    /// (development only).
+    #[arg(long, env = "ENGRAM_THIN_POOL")]
+    thin_pool: Option<String>,
 
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
@@ -284,8 +282,7 @@ async fn main() -> Result<(), HostAgentError> {
 
     // ADR 0116 C1: the executor-starvation probe — a 100 ms tick whose
     // observed lateness is the "runnable tasks are waiting on workers"
-    // signal (the NBD serve loops share this runtime until C3 isolates
-    // them). Held for the process lifetime.
+    // signal. Held for the process lifetime.
     let _sched_delay_probe = engram_host_agent::metrics::spawn_sched_delay_probe();
 
     // #1003: SIGUSR2 → symbolized pprof heap dump; allocator stats as
@@ -351,10 +348,8 @@ async fn main() -> Result<(), HostAgentError> {
     // sweep can never delete an enabled image's pre-warmed base file.
     let base_shm_protected = engram_host_agent::base_shm_gc::ProtectedPaths::new();
 
-    // ADR 0007: blob backend + chunk store. Created before the backend
-    // match so the inner VZ backend can be wired with its own chunk
-    // store (snapshots chunk the rootfs clone and report the manifest
-    // ref). Misconfiguration fails closed at startup — better than
+    // ADR 0007: blob backend for the pooled disk and snapshot owner.
+    // Misconfiguration fails closed at startup — better than
     // pretending to be ready and failing every session create. Shares
     // the same `BlobStorage` the coordinator's chunk store (the
     // enable-time materializer) writes to (a shared GCS bucket in
@@ -365,7 +360,7 @@ async fn main() -> Result<(), HostAgentError> {
 
     // ADR 0088 addendum: ONE host-global upload budget shared by every
     // ChunkStore this process builds — materialize chunking, capture
-    // memory-seed/diff chunking, and the NBD disk flush all acquire
+    // memory-seed/diff chunking, and the disk checkpoint upload all acquire
     // from the same FIFO pool, so concurrent bulk uploads share the
     // NIC instead of stacking on it (`ENGRAM_UPLOAD_BUDGET_PERMITS`).
     let upload_budget = engram_chunk_store::UploadBudget::from_env_or_default();
@@ -538,18 +533,9 @@ async fn main() -> Result<(), HostAgentError> {
                         cli.guest_gateway_port,
                     );
                 fc_for_reattach = None;
-                // ADR 0007: attach the chunk store so `snapshot()` chunks
-                // the rootfs clone and reports the manifest ref. Without
-                // this the base-snapshot capture produces a disk_manifest
-                // of None, and the coordinator's HEAD-verify rejects the
-                // enable ("chunked manifests failed HEAD-verify"). Shares
-                // the same `blob` Arc as the PooledBackend wrapper below.
-                let cs = engram_chunk_store::ChunkStore::new(blob.clone())
-                    .with_upload_budget(upload_budget.clone());
                 let vz = Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
-                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?
-                        .with_chunk_store(cs),
+                        .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?,
                 );
                 if cfg.managed_tls.is_some() {
                     let path = std::env::var_os("ENGRAM_MANAGED_NETSTACK_PATH")
@@ -584,6 +570,56 @@ async fn main() -> Result<(), HostAgentError> {
             }
         }
     };
+    let session_disk: Arc<dyn engram_host_core::SessionDisk> = match cli.thin_pool.as_deref() {
+        #[cfg(target_os = "linux")]
+        Some(pool) => {
+            let disk = engram_disk_thin::ThinPoolDisk::open(
+                pool,
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+                std::path::Path::new("/dev/engram"),
+            )
+            .await
+            .map_err(|e| HostAgentError::Config(format!("thin pool {pool}: {e}")))?;
+            let capacity = engram_host_core::SessionDisk::capacity(&disk)
+                .await
+                .map_err(|e| HostAgentError::Config(format!("thin pool {pool} capacity: {e}")))?;
+            tracing::info!(
+                pool,
+                data_free_bytes = capacity.data_free_bytes,
+                data_total_bytes = capacity.data_total_bytes,
+                metadata_free_bytes = capacity.metadata_free_bytes,
+                metadata_total_bytes = capacity.metadata_total_bytes,
+                "thin pool open"
+            );
+            Arc::new(disk)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Some(pool) => {
+            return Err(HostAgentError::Config(format!(
+                "--thin-pool {pool} needs Linux device-mapper"
+            )));
+        }
+        // A file-backed snapshot copies the volume's data while the guest
+        // is paused: fine for a macOS dev box (an APFS clone), a long
+        // freeze on a Firecracker host.
+        #[cfg(target_os = "linux")]
+        None if matches!(cli.sandbox_backend, BackendChoice::Firecracker) => {
+            return Err(HostAgentError::Config(
+                "the Firecracker backend needs a session-disk pool: set --thin-pool \
+                 (ENGRAM_THIN_POOL) to the pool node prep builds (the host-fleet chart's \
+                 thinPool.enabled, or deploy/helm/engram-host-fleet/files/thin-pool.sh)"
+                    .into(),
+            ));
+        }
+        None => {
+            let disk = engram_host_core::FileDisk::new(
+                cli.work_dir.join("volumes"),
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+            )
+            .map_err(HostAgentError::Io)?;
+            Arc::new(disk)
+        }
+    };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
     // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute
@@ -616,9 +652,8 @@ async fn main() -> Result<(), HostAgentError> {
     // (Spawned below once the chunk store exists; see substrate_spawn.)
 
     // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
-    // base-snapshot residency). `blob` was created above the backend
-    // match so the inner VZ backend could share it; reuse it here. Wire the
-    // SAME local cache the UFFD handler + disk daemon read from
+    // base-snapshot residency). Reuse the configured blob backend. Wire the
+    // SAME local cache the UFFD handler + disk stage read from
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
     // served locally on the next resume instead of re-fetched from GCS.
@@ -646,8 +681,6 @@ async fn main() -> Result<(), HostAgentError> {
         ),
         BackendChoice::Vz => None,
     };
-    let materialize_dir = cli.work_dir.join("chunked-rootfs");
-
     // OCI auth resolver. The standalone host-agent doesn't have
     // direct DB/KEK access, so it asks the coord to resolve
     // credentials over HTTP (ADR 0013).
@@ -686,9 +719,9 @@ async fn main() -> Result<(), HostAgentError> {
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_managed_ownership(managed_ownership)
-        .with_chunk_store(chunk_store, materialize_dir)
+        .with_chunk_store(chunk_store)
         .with_chunk_cache(chunk_cache)
-        .with_dirty_root(cli.dirty_root.clone())
+        .with_session_disk(session_disk)
         .with_image_cache(image_cache)
         .with_host_id(host_id)
         .with_base_shm_protected(base_shm_protected);
@@ -697,24 +730,6 @@ async fn main() -> Result<(), HostAgentError> {
     }
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
-    }
-    // ADR 0007 Phase 4 / ADR 0049: NBD daemon with a warm-pool slot
-    // allocator. The pool sizes itself from the kernel's `nbds_max`
-    // (the chart's `modprobe nbd nbds_max=<N>`), capped by
-    // `ENGRAM_NBD_MAX_SLOTS`, keeping `ENGRAM_NBD_WARM_SLOTS` slots
-    // pre-validated and ready for O(1) `acquire()`. Returns `None`
-    // (materialize-to-file fallback) when the nbd module isn't loaded
-    // or `ENGRAM_NBD_DISABLE` is set.
-    //
-    // ADR 0044 K2: stale-binding recovery does NOT run at construction.
-    // A device bound to the dead previous generation might be a
-    // SURVIVOR's live disk (its FC keeps reading it; rehydrate
-    // RECONFIGUREs it) — the old eager pass disconnected one in prod
-    // (2026-06-11, /dev/nbd4 → guest rootfs EIO). The sweep runs in
-    // `lib.rs` AFTER the registration-time survivor rehydrate, scoped
-    // to the slot pool's still-free paths.
-    if let Some(pool) = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel() {
-        agent = agent.with_nbd_pool(pool);
     }
     // The egress proxy is mandatory (issue #240) and, since ADR 0121,
     // lives in `engram-egress-proxyd` — a node-local daemon that

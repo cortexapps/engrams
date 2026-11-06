@@ -783,8 +783,8 @@ async fn reconcile(
     // cache (both under the work dir) and its sweeper can't evict them —
     // reserve their allocated bytes out of the cache's ceiling so the
     // cache yields the space instead of racing the memfiles to the
-    // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
-    // a warm at-budget cache + 40 GB of unbudgeted memfiles).
+    // kubelet eviction line (a warm at-budget cache + 40 GB of
+    // unbudgeted memfiles trips DiskPressure).
     chunk_cache.set_co_tenant_reserved("memfiles", memfile_bytes);
 }
 
@@ -989,9 +989,7 @@ async fn prefetch_one(
     // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
     // files written at template-boot (Bun / node_modules / claude). Warming
-    // these on NVMe keeps the resuming guest's rootfs page-in off GCS — the
-    // serial 16 MiB-chunk fetches during `resume` were the measured substrate
-    // cost.
+    // these on NVMe lets the image volume stage from local disk, not GCS.
     let disk_manifest: Manifest = chunk_store
         .get_manifest(image.base_snapshot_disk_manifest)
         .await
@@ -1000,8 +998,7 @@ async fn prefetch_one(
     // ADR 0095: LAN peer pre-pass, then the verifying loop completes
     // the remainder (and every chunk on a peer-less fleet) via GCS.
     peer_prepass(image, &disk_manifest, chunk_cache, peer_health).await;
-    let mut total =
-        prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
+    let mut total = prefetch_manifest_chunks(disk_manifest, chunk_store, semaphore).await?;
 
     // ADR 0045 addendum: the base shm file readiness will rest on, if any
     // (see `WarmedManifest::base_shm`).
@@ -1025,9 +1022,7 @@ async fn prefetch_one(
             .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
         record_hashes(&memory_manifest);
         peer_prepass(image, &memory_manifest, chunk_cache, peer_health).await;
-        total +=
-            prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
-                .await?;
+        total += prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, semaphore).await?;
 
         // ADR 0045 (the handshake-breakdown follow-up): pre-warm the
         // SUBSTRATE's per-image base shm file from the just-prefetched
@@ -1095,8 +1090,7 @@ async fn prefetch_one(
                         pending_bytes,
                     );
                     let prewarm_result =
-                        prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache)
-                            .await;
+                        prewarm_base_shm(&base_path, &memory_manifest, chunk_store).await;
                     ram_ledger.settle_pending(&memory_ref);
                     match prewarm_result {
                         Ok(written) => {
@@ -1132,7 +1126,7 @@ async fn prefetch_one(
         if let Some(dest) = base_memfile {
             if tokio::fs::metadata(&dest).await.is_err() {
                 chunk_store
-                    .materialize_to_file_cached(&memory_manifest, &dest, chunk_cache)
+                    .materialize_to_file(&memory_manifest, &dest)
                     .await
                     .map_err(|e| {
                         PrefetchError::MemfileMaterialize(format!("{}: {e}", dest.display()))
@@ -1183,7 +1177,6 @@ async fn prewarm_base_shm(
     path: &std::path::Path,
     manifest: &Manifest,
     chunk_store: &ChunkStore,
-    chunk_cache: &engram_chunk_store::ChunkCache,
 ) -> Result<usize, String> {
     use std::os::unix::fs::FileExt;
     if let Some(parent) = path.parent() {
@@ -1205,8 +1198,8 @@ async fn prewarm_base_shm(
     let file = std::sync::Arc::new(file);
     let mut written = 0usize;
     for chunk in &manifest.chunks {
-        let bytes = chunk_cache
-            .get(chunk.hash, || chunk_store.get_chunk(chunk.hash))
+        let bytes = chunk_store
+            .get_chunk(chunk.hash)
             .await
             .map_err(|e| format!("chunk {}: {e}", chunk.hash))?;
         let file = file.clone();
@@ -1227,7 +1220,6 @@ async fn prewarm_base_shm(
 async fn prefetch_manifest_chunks(
     manifest: Manifest,
     chunk_store: &ChunkStore,
-    chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
 ) -> Result<usize, PrefetchError> {
     let total = manifest.chunks.len();
@@ -1239,18 +1231,10 @@ async fn prefetch_manifest_chunks(
             .await
             .map_err(|_| PrefetchError::SemaphoreClosed)?;
         let chunk_store = chunk_store.clone();
-        let chunk_cache = chunk_cache.clone();
         let hash = chunk.hash;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            // Singleflight'd through ChunkCache::prefetch — concurrent
-            // calls for the same chunk dedup, and a successful fetch
-            // writes the bytes to the NVMe cache so the lazy-fault
-            // path on session boot hits tier 1 instead of paying a
-            // BlobStorage round-trip per page.
-            chunk_cache
-                .prefetch(hash, || async move { chunk_store.get_chunk(hash).await })
-                .await
+            chunk_store.prefetch_chunk(hash).await
         }));
     }
 
@@ -1430,13 +1414,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob: StdArc<dyn BlobStorage> =
             StdArc::new(LocalBlobStorage::new(dir.path().join("blob")));
-        let store = ChunkStore::new(blob);
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: dir.path().join("cache"),
             budget_bytes: 256 * 1024 * 1024,
             sweep_debounce_ms: 0,
             eviction_enabled: true,
         });
+        let store = ChunkStore::new(blob).with_chunk_cache(cache.clone());
         // Distinct disk + memory payloads so a mix-up would be caught.
         let disk_bytes = (0..37u8).cycle().take(2 * 1024 * 1024).collect::<Vec<_>>();
         let mem_bytes = (3..200u8).cycle().take(3 * 1024 * 1024).collect::<Vec<_>>();
@@ -2274,9 +2258,8 @@ mod tests {
         // ADR 0092: the memfiles share the chunk cache's filesystem and
         // its sweeper can't evict them — every reconcile tick publishes
         // their allocated bytes as the cache's co-tenant reserve so the
-        // cache stops aiming for disk the memfiles occupy (the 2026-07-14
-        // w8wq DiskPressure incident: at-budget warm cache + 40 GB of
-        // unbudgeted memfiles).
+        // cache stops aiming for disk the memfiles occupy (an at-budget
+        // warm cache + 40 GB of unbudgeted memfiles trips DiskPressure).
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
@@ -2416,9 +2399,6 @@ mod prewarm_tests {
             engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
         );
         let store = ChunkStore::new(blob);
-        let cache = engram_chunk_store::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
-        );
 
         // A sparse image: chunk at 0 (0xAA), HOLE at 4096, chunk at 8192 (0xBB).
         let img = tmp.path().join("img.bin");
@@ -2433,7 +2413,7 @@ mod prewarm_tests {
         assert_eq!(manifest.chunks.len(), 2, "the zero chunk is elided");
 
         let base = tmp.path().join("shm").join("base.base");
-        let written = prewarm_base_shm(&base, &manifest, &store, &cache)
+        let written = prewarm_base_shm(&base, &manifest, &store)
             .await
             .expect("prewarm");
         assert_eq!(written, 2);

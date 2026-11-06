@@ -83,8 +83,7 @@ runs:
     # test mounts (ADR 0064), and for the agentd-bundle staging in
     # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
     # materialize_boot guest's entire userland (ADR 0080 phase 3b).
-    # ADR 0093: ext4 packing is pure Rust — no e2fsprogs. (debugfs for
-    # the nbd_chunked_disk inspection comes with the runner's distro.)
+    # ADR 0093: ext4 packing is pure Rust — no e2fsprogs.
     - name: Install build deps (musl-tools, squashfs-tools, busybox-static)
       shell: bash
       run: |

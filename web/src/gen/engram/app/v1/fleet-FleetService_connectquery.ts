@@ -22,14 +22,6 @@ export const getHost = FleetService.method.getHost;
 export const retireHost = FleetService.method.retireHost;
 
 /**
- * ADR 0016 Phase A per-host COW diagnostic
- * (GET /api/hosts/:id/cow-state).
- *
- * @generated from rpc engram.app.v1.FleetService.GetHostCowState
- */
-export const getHostCowState = FleetService.method.getHostCowState;
-
-/**
  * Soft drain — the member-facing POST /hosts/:id/drain (status flip,
  * the one the web calls: web/src/api.ts drainHost). The scheduler
  * stops picking the host; in-flight sessions stay put.
@@ -81,14 +73,6 @@ export const deleteHost = FleetService.method.deleteHost;
  * @generated from rpc engram.app.v1.FleetService.GetStorageSummary
  */
 export const getStorageSummary = FleetService.method.getStorageSummary;
-
-/**
- * ADR 0016 Phase B explicit flush trigger
- * (POST /api/admin/sessions/:id/flush-now).
- *
- * @generated from rpc engram.app.v1.FleetService.FlushSession
- */
-export const flushSession = FleetService.method.flushSession;
 
 /**
  * ADR 0123 B: admit one teleport for a session (synchronous admission;

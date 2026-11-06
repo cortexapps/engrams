@@ -1,22 +1,11 @@
-//! `SandboxBackend` wrapper that adds host-side resource resolution
-//! (image cache, chunk store, materialize-to-file, optional NBD,
-//! optional egress proxy) on top of the inner backend (VZ or FC).
-//!
-//! Originally this also held a warm pool of pre-created sandboxes;
-//! that was deleted as part of the ADR 0008 follow-up — see commit
-//! history for context. Briefly: warm pools' value (~30 ms saved on
-//! cold start) didn't earn its complexity in the multi-tenant
-//! world we'd grown into (every session is a different
-//! SandboxSpec, so the per-key warm-slot hit rate trended to
-//! zero), and the FC production-target replacement
-//! (canonical-memory restore from ADR 0007 Phase 5) is strictly
-//! better. VZ dev now pays full cold-boot (~1 s) per session;
-//! that's the explicit tradeoff.
-
-#[cfg(target_os = "linux")]
-use crate::disk_daemon::SandboxDisks;
-use engram_core::types::snapshot::DiskRole;
-use std::collections::HashSet;
+//! `SandboxBackend` wrapper that owns the host-side resources of a
+//! sandbox: its session disks, the image cache, the chunk store, the
+//! checkpoint chain, and the optional egress proxy. The inner backend
+//! (VZ or FC) only attaches the devices this layer provisions.
+use engram_core::types::sandbox::SessionDisks;
+use engram_core::types::snapshot::{DiskRole, MIGRATION_DISK_BLOCK_BYTES};
+use engram_host_core::session_volumes::{PendingCheckpoint, Source};
+use engram_host_core::{SessionVolumes, Volume};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,114 +23,11 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use tokio::fs;
-use tokio::sync::Mutex;
+use tracing::Instrument as _;
 
+use crate::capture_lock::{CaptureGate, CaptureUser};
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageCache};
-
-/// Cross-platform optional NBD state slot. Linux carries the real
-/// state; non-Linux is `()` so the `resolve_rootfs` return signature
-/// is consistent and call sites cfg-gate the storage-stash branch.
-#[cfg(target_os = "linux")]
-type NbdStateSlot = Option<crate::disk_daemon::NbdSandboxState>;
-#[cfg(not(target_os = "linux"))]
-type NbdStateSlot = ();
-
-#[cfg(target_os = "linux")]
-fn nbd_state_none() -> NbdStateSlot {
-    None
-}
-#[cfg(not(target_os = "linux"))]
-fn nbd_state_none() -> NbdStateSlot {}
-
-fn should_reap_dirty_entry(name: &str, live: &HashSet<SandboxId>) -> bool {
-    if name.starts_with(".pending-") {
-        return true;
-    }
-    let stem = name
-        .strip_suffix(".ref.tmp")
-        .or_else(|| name.strip_suffix(".cache"))
-        .or_else(|| name.strip_suffix(".ref"));
-    let Some(id) = stem.and_then(|stem| {
-        stem.strip_suffix(".swap")
-            .unwrap_or(stem)
-            .parse::<SandboxId>()
-            .ok()
-    }) else {
-        return false;
-    };
-    !live.contains(&id)
-}
-
-/// ADR 0112 D5: allocated (on-disk) bytes of every regular file
-/// directly under `root` — `st_blocks × 512`, so sparse files (the
-/// ADR 0110 dirty files, hole-punched after publish) charge what they
-/// actually consume. Non-recursive by design: both consumers are flat
-/// directories. Missing dir / unreadable entries count 0 (telemetry
-/// must never fail the heartbeat).
-fn allocated_bytes_under(root: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::MetadataExt::blocks(&m) * 512
-            }
-            #[cfg(not(unix))]
-            {
-                m.len()
-            }
-        })
-        .sum()
-}
-
-fn sweep_dirty_root_at(root: &Path, live: &HashSet<SandboxId>) {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => {
-            tracing::warn!(
-                path = %root.display(),
-                %error,
-                "dirty-root sweep could not read the directory",
-            );
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(%error, "dirty-root sweep could not read an entry");
-                continue;
-            }
-        };
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !should_reap_dirty_entry(name, live) {
-            continue;
-        }
-        let path = entry.path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(
-                path = %path.display(),
-                "dirty-root sweep removed an unowned file",
-            ),
-            Err(error) => tracing::warn!(
-                path = %path.display(),
-                %error,
-                "dirty-root sweep could not remove a file",
-            ),
-        }
-    }
-}
 
 /// ADR 0039 item #19: bounded concurrency for the cold-restore memory
 /// chunk prefetch. Raised from 8 — single-stream GCS ~80 MB/s on the
@@ -151,10 +37,6 @@ fn sweep_dirty_root_at(root: &Path, live: &HashSet<SandboxId>) {
 /// GCS per-object rate limits. Mirrors the re-chunk/upload bound so the
 /// save and load paths use the same fleet-tuned fan-out.
 const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
-
-#[cfg(target_os = "linux")]
-static PENDING_DIRTY_FILE_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
@@ -176,9 +58,40 @@ fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
     })
 }
 
+fn disk_err(e: std::io::Error) -> SandboxError {
+    SandboxError::Vm(format!("session disk: {e}").into())
+}
+
+/// What the snapshot's sidecar says about swap.
+struct SidecarSwap {
+    swap_mib: u64,
+    /// The captured guest was a base capture: its swap was never a
+    /// session's state, so a fresh device is the right one.
+    base_capture: bool,
+}
+
+async fn read_sidecar_swap(src: &Path) -> Result<SidecarSwap, SandboxError> {
+    let bytes = fs::read(src.join("manifest.json"))
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("read snapshot sidecar: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| SandboxError::Snapshot(format!("parse snapshot sidecar: {e}")))?;
+    let spec = value
+        .get("spec")
+        .ok_or_else(|| SandboxError::Snapshot("sidecar spec is absent".into()))?;
+    Ok(SidecarSwap {
+        swap_mib: spec.get("swap_mib").and_then(|v| v.as_u64()).unwrap_or(0),
+        base_capture: spec
+            .get("env")
+            .and_then(|v| v.get("ENGRAM_BASE_CAPTURE"))
+            .and_then(|v| v.as_str())
+            == Some("1"),
+    })
+}
+
 /// ADR 0045 C2 (destination): a staged post-copy restore awaiting its
 /// fetch poller spawn (keyed by the restore metadata's snapshot id;
-/// consumed inside `restore_with` once the NBD handle exists). The
+/// consumed inside `restore_with` once the session volumes exist). The
 /// fields drive the Linux-only poller; non-Linux builds never
 /// construct one.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -189,161 +102,42 @@ struct PostCopyDestPending {
     export_id: String,
 }
 
-/// ADR 0045 C2 disk post-copy (destination): fetch sealed disk chunks
-/// from the frozen source over the migration gRPC channel. Dialed
-/// lazily and reused across fetches (the drain's bounded fan-out and
-/// the guest's demand faults share it; HTTP/2 multiplexes). A failed
-/// attempt resets the channel so the next one re-dials. `Err` after
-/// the bounded retries is TERMINAL — the overlay latches lost and the
-/// coordinator rewinds.
-#[cfg(target_os = "linux")]
-struct GrpcPostCopyDiskFetcher {
-    role: DiskRole,
-    source_addr: String,
-    export_id: String,
-    client: tokio::sync::Mutex<Option<engram_protocol::grpc_client::GrpcHostClient>>,
-}
-
-#[cfg(target_os = "linux")]
-impl GrpcPostCopyDiskFetcher {
-    fn new(source_addr: String, export_id: String, role: DiskRole) -> Self {
-        Self {
-            source_addr,
-            export_id,
-            client: tokio::sync::Mutex::new(None),
-            role,
-        }
-    }
-
-    async fn client(&self) -> Result<engram_protocol::grpc_client::GrpcHostClient, String> {
-        let mut guard = self.client.lock().await;
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = PooledBackend::dial_migration_source(&self.source_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-        *guard = Some(c.clone());
-        Ok(c)
-    }
-
-    async fn fetch_once(&self, chunk_idx: u64) -> Result<bytes::Bytes, String> {
-        let client = self.client().await?;
-        let mut stream = client
-            .migration_fetch(
-                &self.export_id,
-                vec![engram_core::types::snapshot::MigrationItem::DiskChunkAt(
-                    self.role, chunk_idx,
-                )],
-            )
-            .await
-            .map_err(|e| format!("migration fetch: {e}"))?;
-        use futures::StreamExt;
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(frame) = stream.next().await {
-            let frame = frame.map_err(|e| format!("fetch frame: {e}"))?;
-            buf.extend_from_slice(&frame.data);
-            if frame.last {
-                return Ok(bytes::Bytes::from(buf));
-            }
-        }
-        Err("stream ended before the last frame".into())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl crate::disk_daemon::PostCopyDiskFetcher for GrpcPostCopyDiskFetcher {
-    fn fetch(
-        &self,
-        chunk_idx: u64,
-    ) -> futures::future::BoxFuture<'_, Result<bytes::Bytes, String>> {
-        Box::pin(async move {
-            const ATTEMPTS: u32 = 4;
-            let mut last = String::new();
-            for attempt in 1..=ATTEMPTS {
-                match self.fetch_once(chunk_idx).await {
-                    Ok(b) => return Ok(b),
-                    Err(e) => {
-                        last = e;
-                        // Drop the cached channel; the next attempt
-                        // re-dials (covers a source pod hiccup without
-                        // declaring the peer dead on one RST).
-                        *self.client.lock().await = None;
-                        if attempt < ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                250 * attempt as u64,
-                            ))
-                            .await;
-                        }
-                    }
-                }
-            }
-            Err(format!(
-                "disk chunk {chunk_idx} after {ATTEMPTS} attempts: {last}"
-            ))
-        })
-    }
-}
-
-/// ADR 0045 C2: a minted-but-not-yet-captured post-copy export. The
-/// capture (Linux-only) consumes it.
+/// A minted-but-not-yet-captured post-copy export. The capture consumes it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone)]
 struct PendingPresetup {
     export_id: String,
     peer_token: String,
     /// The chain ref the presetup advertised as the session manifest
-    /// (the capture validates the chain hasn't moved underneath).
+    /// (the capture validates the chain has not moved underneath).
     chain_ref: engram_core::types::manifest::ManifestRef,
+    /// The disk checkpoints the presetup advertised; the capture's
+    /// pending checkpoints must be changes on exactly these.
+    disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
     swap_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
+    /// A snapshot of each disk, taken while the guest runs, and the
+    /// blocks it changed since the advertised checkpoint. The dest pulls
+    /// them before the pause; the capture seals only what changed since.
+    precopy: std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>,
     sidecar_json: Vec<u8>,
     idle_marked: bool,
     hot_chunks: Vec<[u8; 32]>,
 }
 
-/// Issue #202: the unwind guard for a migration / snapshot capture's
-/// "point of no return" window — between the guest `pause` and the
-/// moment the export (or the snapshot finisher) takes ownership of the
-/// drained state.
-///
-/// Inside that window the capture has frozen the guest, raised the
-/// disk `migration_fence` (so background `flush()` no-ops), and DRAINED
-/// the dirty disk buffer out into a local `PendingDiskFlush` (or a
-/// post-copy seal). If a fallible `?` await returns `Err`, OR tonic
-/// drops the handler future on a coordinator deadline / disconnect, no
-/// error arm runs — so without a Drop-based guard the guest stays
-/// paused forever, the fence stays raised (silent disk-RPO collapse),
-/// and the drained chunks are lost from every future published manifest
-/// (a silent disk rollback for the next restore). See the issue for the
-/// three independently-confirmed code paths.
-///
-/// `Drop` performs the SAME recovery `migration_abort` does
-/// (`requeue_pending` + `requeue_postcopy_seal` + `set_migration_fence
-/// (false)` + best-effort `resume`), plus it re-inserts the consumed
-/// post-copy presetup so a coordinator retry can succeed. Because the
-/// dirty re-queue + resume are async, `Drop` spawns a task. `defuse` is
-/// called once ownership transfers (export registered / capture handed
-/// to the finisher), making the success path a zero-behavior-change
-/// no-op.
+/// The unwind guard for a capture's window between the guest `pause`
+/// and the moment a finisher, a finalize record, or an export owns the
+/// captured state. A `?` return or a dropped handler future inside that
+/// window runs no error arm, so `Drop` does the recovery: discard the
+/// pending disk checkpoints, re-insert a consumed presetup so a
+/// coordinator retry finds it, and resume the guest when it was paused.
 struct CaptureUnwind {
     inner: Arc<dyn SandboxBackend>,
+    volumes: Option<Arc<SessionVolumes>>,
     id: SandboxId,
-    /// The disk backends to unfence and requeue. The disk types are
-    /// cross-platform (`disk_daemon::backend`), so these fields are too —
-    /// only the capture call sites that POPULATE them are Linux-gated.
-    /// Empty when the sandbox has no NBD disk (non-Linux, memory-only).
-    disk_backend: std::collections::BTreeMap<DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>>,
-    /// Whether the fence was raised by the capture (so Drop knows to
-    /// lower it). Tracked separately from `disk_backend` because the
-    /// ordinary-snapshot path drains WITHOUT fencing.
-    fenced: bool,
-    /// Drained-but-unowned dirty chunks to re-queue on unwind.
-    disk_pending: std::collections::BTreeMap<DiskRole, crate::disk_daemon::PendingDiskFlush>,
-    /// Post-copy seals to requeue on unwind (C2 only).
-    disk_seal: std::collections::BTreeMap<DiskRole, Arc<crate::disk_daemon::PostCopyDiskSeal>>,
-    /// The presetup consumed by `migration_capture_postcopy`, restored
-    /// on unwind so the coordinator's retry finds a matching presetup
-    /// instead of failing "no matching presetup" (C2 only).
+    /// Disk snapshots taken under the pause that nothing owns yet.
+    pending: Vec<PendingCheckpoint>,
+    /// Post-copy seals taken under the pause that no export owns yet.
+    disk_seal: Vec<Arc<DiskSeal>>,
     #[allow(clippy::type_complexity)]
     presetup_restore: Option<(
         SandboxId,
@@ -355,31 +149,26 @@ struct CaptureUnwind {
 }
 
 impl CaptureUnwind {
-    /// Arm a guard that, on unwind, resumes the guest. Disk fields are
-    /// attached separately so the caller can move drained state into the
-    /// guard as it produces it.
-    fn new(inner: Arc<dyn SandboxBackend>, id: SandboxId) -> Self {
+    fn new(backend: &PooledBackend, id: SandboxId) -> Self {
         Self {
-            inner,
+            inner: backend.inner.clone(),
+            volumes: backend.volumes.clone(),
             id,
-            disk_backend: Default::default(),
-            fenced: false,
-            disk_pending: Default::default(),
-            disk_seal: Default::default(),
+            pending: Vec::new(),
+            disk_seal: Vec::new(),
             presetup_restore: None,
             defused: true,
             resume_on_drop: true,
         }
     }
 
-    /// Mark the guard armed (the pause has happened; from here Drop must
-    /// run the unwind unless `defuse` is called).
+    /// The pause has happened; from here `Drop` recovers unless
+    /// `defuse` is called.
     fn arm(&mut self) {
         self.defused = false;
     }
 
-    /// Ownership transferred (export registered / capture handed to the
-    /// finisher). Drop becomes a no-op.
+    /// Something durable owns the captured state; `Drop` is a no-op.
     fn defuse(&mut self) {
         self.defused = true;
     }
@@ -391,506 +180,222 @@ impl Drop for CaptureUnwind {
             return;
         }
         let inner = self.inner.clone();
+        let volumes = self.volumes.clone();
         let resume_on_drop = self.resume_on_drop;
         let id = self.id;
-        let disk_backend = std::mem::take(&mut self.disk_backend);
-        let fenced = self.fenced;
-        let mut disk_pending = std::mem::take(&mut self.disk_pending);
-        let disk_seal = std::mem::take(&mut self.disk_seal);
+        let pending = std::mem::take(&mut self.pending);
+        let mut disk_seal = std::mem::take(&mut self.disk_seal);
         if let Some((pid, presetup, map)) = self.presetup_restore.take() {
-            // Restore the consumed presetup so a coordinator retry finds
-            // a match — unless a NEWER presetup already landed (last-
-            // write-wins, matching `migration_presetup`'s own policy).
-            map.entry(pid).or_insert(presetup);
+            // A newer presetup wins (the same policy as `migration_presetup`);
+            // the superseded one's precopy goes with it.
+            match map.entry(pid) {
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    slot.insert(presetup);
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    disk_seal.extend(presetup.precopy.into_values());
+                }
+            }
         }
         tracing::warn!(
             sandbox_id = %id,
-            "capture unwind: capture failed or was cancelled after pause+fence+drain; \
-             requeueing drained disk state, clearing the migration fence, resuming the guest",
+            resume = resume_on_drop,
+            "capture unwind: capture failed or was cancelled; \
+             discarding the pending disk checkpoints and restoring the presetup",
         );
-        // The dirty re-queue + resume are async; Drop can't await, so
-        // hand the SAME recovery `migration_abort` runs to a task. Drop
-        // can run outside a runtime (process shutdown, sync test); fall
-        // back to a synchronous fence clear so a fenced backend never
-        // stays wedged even then.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            for backend in disk_backend.values() {
-                if fenced {
-                    backend.set_migration_fence(false);
-                }
-            }
             tracing::warn!(
                 sandbox_id = %id,
-                "capture unwind: no tokio runtime in Drop; cleared fence synchronously, \
-                 could not requeue/resume (best-effort)",
+                "capture unwind: no tokio runtime in Drop; the next startup reconcile \
+                 removes the pending checkpoints",
             );
             return;
         };
         handle.spawn(async move {
-            for (role, backend) in disk_backend {
-                if let Some(pending) = disk_pending.remove(&role) {
-                    backend.requeue_pending(pending).await;
+            if let Some(volumes) = volumes.as_ref() {
+                for pending in pending {
+                    discard_pending(volumes, pending).await;
                 }
-                if let Some(sealed) = disk_seal.get(&role) {
-                    backend.requeue_postcopy_seal(sealed).await;
-                }
-                if fenced {
-                    backend.set_migration_fence(false);
+                for seal in disk_seal {
+                    discard_seal(volumes, seal).await;
                 }
             }
-            if !resume_on_drop { return; }
-            if let Err(e) = inner.resume(id).await {
-                tracing::warn!(
+            if !resume_on_drop {
+                return;
+            }
+            match inner.resume(id).await {
+                Ok(()) => tracing::info!(sandbox_id = %id, "capture unwind: guest resumed in place"),
+                Err(e) => tracing::warn!(
                     sandbox_id = %id,
                     error = %e,
                     "capture unwind: best-effort resume failed (guest may stay paused until destroy)",
-                );
-            } else {
-                tracing::info!(sandbox_id = %id, "capture unwind: guest resumed in place");
+                ),
             }
         });
     }
 }
 
-/// One quarantined survivor's record (2026-08-02 durability-rollback
-/// RCA): everything the rehydrate retry pass needs to re-attempt the
-/// failed re-serve, keyed by sandbox in `quarantined_survivors`. The
-/// retry-only fields are read by the Linux-gated retry pass; macOS
-/// builds see only the heartbeat accessor's `session_id` read.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[derive(Clone, Debug)]
-struct QuarantinedSurvivor {
-    session_id: SessionId,
-    /// The disk manifest ref the failed rehydrate attached from — the
-    /// coordinator's effective ref at register time. It cannot advance
-    /// while the disk is unserved (nothing publishes), so the retry
-    /// reuses it verbatim. `None` for an ADR 0116 C4 data-plane-failed
-    /// entry: the disk is still served (the flush loop is what failed),
-    /// so there is no failed-rehydrate manifest and nothing to
-    /// RECONFIGURE — the quarantine evict owns the remediation and the
-    /// rehydrate retry pass skips the entry.
-    disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    /// Retry attempts so far — log pacing only.
-    retry_attempts: u64,
-    /// Why the entry exists — advertised to the coordinator (additive
-    /// JSON field) and read by `pause()`'s ADR 0116 C4 park refusal.
-    reason: engram_protocol::heartbeat::QuarantineReason,
+/// A snapshot of one disk a live move serves blocks from: the
+/// presetup's, taken while the guest runs, or the capture's, taken
+/// under the pause. `sealed` lists the blocks of
+/// [`MIGRATION_DISK_BLOCK_BYTES`] that changed since the snapshot
+/// before it: the advertised checkpoint for a precopy, the precopy for
+/// a seal.
+pub struct DiskSeal {
+    pub(crate) pending: PendingCheckpoint,
+    pub(crate) sealed: std::collections::BTreeSet<u64>,
 }
 
-/// ADR 0116 C4: PooledBackend's [`crate::disk_daemon::DataPlaneHealth`]
-/// sink. Mirrors how `CoordLiveManifestPublisher`'s resolver closes
-/// over `session_bindings`: a small struct over the two shared maps,
-/// with no back-reference to the backend. On a report it resolves the
-/// session binding and inserts a `DataPlaneFailed` survivor entry, so
-/// the next heartbeat advertises it and the coordinator's keyed
-/// quarantine evict engages. `or_insert` only: an existing entry (a
-/// failed rehydrate already being retried) keeps its manifest, reason,
-/// and pacing counter — the advertise it drives is the same.
-struct QuarantineDataPlaneHealth {
-    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
-    session_bindings: Arc<DashMap<SandboxId, SessionId>>,
-}
+impl DiskSeal {
+    fn info(&self) -> engram_core::types::snapshot::DiskSealInfo {
+        engram_core::types::snapshot::DiskSealInfo {
+            block_indices: self.sealed.iter().copied().collect(),
+        }
+    }
 
-#[async_trait]
-impl crate::disk_daemon::DataPlaneHealth for QuarantineDataPlaneHealth {
-    async fn data_plane_failed(&self, sandbox_id: SandboxId) {
-        let Some(session_id) = self.session_bindings.get(&sandbox_id).map(|e| *e) else {
-            // Unbound (warm-pool / post-destroy race): there is no
-            // session to advertise; the destroy path owns cleanup.
-            tracing::warn!(
-                %sandbox_id,
-                "flush escalation on an unbound sandbox; no survivor entry to advertise",
-            );
-            return;
-        };
-        self.quarantined_survivors
-            .entry(sandbox_id)
-            .or_insert(QuarantinedSurvivor {
-                session_id,
-                disk_manifest: None,
-                retry_attempts: 0,
-                reason: engram_protocol::heartbeat::QuarantineReason::DataPlaneFailed,
-            });
+    /// Block `index` of the snapshot; short when it is the last one.
+    async fn read_block(&self, index: u64) -> std::io::Result<Vec<u8>> {
+        let volume = self.pending.snapshot();
+        let offset = index * MIGRATION_DISK_BLOCK_BYTES;
+        let len = MIGRATION_DISK_BLOCK_BYTES.min(volume.size_bytes.saturating_sub(offset));
+        volume.read_range(offset, len).await
     }
 }
 
-/// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
-/// resource resolution: image cache, chunk store, materialize-to-
-/// file, optional NBD daemon, optional egress proxy.
-///
-/// Pre-warm-pool-deletion this also held a `Pool` of pre-created
-/// sandboxes and a `pool_key`-based checkout dance. Both are gone;
-/// `create` just resolves resources and forwards to `inner`.
-/// Cold-create cost on each backend:
-///
-/// - **FC + canonical-memory-baked image**: ~100-500 ms via UFFD-
-///   from-chunks restore. The "warm" of post-warm-pool-world.
-/// - **FC, legacy bake**: ~500-700 ms full cold boot.
-/// - **VZ**: ~1 s full cold boot. No memory-snapshot primitive
-///   available on macOS arm64 Linux (Apple-side bug).
+async fn discard_pending(volumes: &SessionVolumes, pending: PendingCheckpoint) {
+    let (sandbox, role) = (pending.sandbox(), pending.role());
+    if let Err(error) = volumes.discard(pending).await {
+        tracing::warn!(%sandbox, %role, %error, "discard of a pending disk checkpoint failed");
+    }
+}
+
+/// The seal's snapshot is deleted when this holder is the last one; an
+/// export still serving from it keeps it until commit or abort.
+async fn discard_seal(volumes: &SessionVolumes, seal: Arc<DiskSeal>) {
+    match Arc::try_unwrap(seal) {
+        Ok(seal) => discard_pending(volumes, seal.pending).await,
+        // A fetch stream still reads the snapshot; the release of the
+        // sandbox's volumes removes it.
+        Err(seal) => tracing::debug!(
+            sandbox_id = %seal.pending.sandbox(),
+            role = %seal.pending.role(),
+            "disk seal still in use at discard; left for the sandbox's release",
+        ),
+    }
+}
+
+/// Wraps an inner [`SandboxBackend`] (FC or VZ) with the host-side
+/// resources of a sandbox. `create` provisions the session disks and
+/// resolves the image; captures checkpoint the disks and chunk the
+/// memory; `destroy` releases everything.
 pub struct PooledBackend {
     teardowns: engram_core::teardown::TeardownRegistry<SandboxId>,
     inner: Arc<dyn SandboxBackend>,
-    /// Phase 5+: if `Some`, `create()` resolves `spec.image_uri`
-    /// through this cache before delegating to `inner`. The cache
-    /// owns OCI pull + on-disk layout; `create` reads
-    /// `cached.bundle` to decide between rootfs paths (legacy
-    /// ext4, ADR 0007 chunked manifest, ADR 0008 chunked-OCI).
+    /// The session disks of every sandbox on this host. `None` on a
+    /// host without a session disk: the inner backend opens the image's
+    /// flat rootfs file and nothing checkpoints the disk.
+    volumes: Option<Arc<SessionVolumes>>,
+    /// Resolves `spec.image_uri` before `create` delegates to `inner`.
     image_cache: Option<ImageCache>,
-    /// ADR 0006: per-host egress proxy. When attached, incoming
-    /// `notify_session_policy` calls register against the local
-    /// proxy registry and `destroy` unregisters. `None` is the
-    /// "no egress filtering" path (dev or operator opt-out).
+    /// ADR 0006: the per-host egress proxy. `None` is the no-filtering
+    /// path (dev or operator opt-out).
     egress: Option<Arc<HostEgress>>,
-    /// `sandbox_id → session_id` index, the host-agent's
-    /// canonical binding map. Two consumers:
-    ///
-    /// - ADR 0006: `destroy(sandbox_id)` resolves to a `session_id`
-    ///   for `Registry::unregister(session_id)`.
-    /// - ADR 0016 Phase B: the `LiveManifestPublisher`'s drain task
-    ///   holds a clone for the sandbox→session lookup at publish
-    ///   time; warm-pool sandboxes (future) share the same scheduler
-    ///   API — the publisher returns "skip" for any sandbox not yet
-    ///   bound to a session.
-    ///
-    /// Renamed from `egress_sessions` in ADR 0017 Phase C: the map
-    /// is no longer an egress-only concern. `Arc` wrapping lets the
-    /// publisher drain task and the destroy path share ownership.
+    /// `sandbox_id → session_id`, the host-agent's canonical binding map.
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined
-    /// (rehydrate `RECONFIGURE` failed). Advertised in every heartbeat
-    /// until the sandbox is destroyed or the rehydrate retry pass
-    /// (2026-08-02 durability-rollback RCA) re-serves the disk; the
-    /// coordinator drives `evict_local → resume` off it. The record
-    /// carries what the retry needs: the manifest ref the failed
-    /// rehydrate used and an attempt counter for log pacing.
-    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
-    /// ADR 0091: guests whose control plane stopped answering (3/3
-    /// socket probes refused after a checkpoint failure). Advertised in
-    /// every heartbeat until cleared by a successful capture or destroy;
-    /// the coordinator flips the session Active → Unreachable off it.
+    /// Guests whose control plane stopped answering (ADR 0091).
+    /// Advertised in every heartbeat until a successful capture or
+    /// destroy clears them.
     unreachable_guests: Arc<DashMap<SandboxId, SessionId>>,
-    /// ADR 0091 probe gate (engrams review, #835): sandboxes with a
-    /// detached dead-guest confirmation probe currently in flight — at
-    /// most one probe per sandbox regardless of the driver's tick rate
-    /// (the ~6s probe outlives a sub-6s `min_interval` tick). Entry
-    /// removed when the probe finishes or the sandbox is destroyed.
+    /// Sandboxes with a dead-guest confirmation probe in flight: at
+    /// most one probe per sandbox regardless of the driver's tick rate.
     dead_probe_inflight: Arc<DashMap<SandboxId, ()>>,
-    /// ADR 0007: chunk-store-backed materialization. When set, the
-    /// `bundle.json` on a cached image is the source of truth for
-    /// the disk — chunks are fetched from `BlobStorage`, written to
-    /// a content-addressed file under `materialize_dir`, and that
-    /// path becomes `spec.rootfs_source`. When unset, we fall back
-    /// to the OCI-pulled `rootfs.ext4` (transitional path; retired
-    /// in Phase 6).
+    /// The chunk store that holds disk and memory manifests. `None`
+    /// disables chunked snapshots.
     chunk_store: Option<ChunkStore>,
-    /// ADR 0095: requester-side peer health for the resume peer-fill
-    /// arm — one per backend so a lost peer is skipped across every
-    /// resume on this host for the lost-window.
+    /// Peer health for the resume peer-fill arm (ADR 0095): a lost peer
+    /// is skipped across every resume on this host for the lost window.
     peer_health: std::sync::Arc<crate::peer_fill::PeerHealth>,
-    /// Per-host directory where chunked manifests are materialized.
-    /// `Some` iff `chunk_store` is. Files inside are named by
-    /// `manifest_id`-`version` so two sessions hitting the same
-    /// manifest share the materialized file (and VZ's per-sandbox
-    /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
-    materialize_dir: Option<PathBuf>,
-    /// ADR 0035/0062: staged-bundle dir (`<sha256>.squashfs` + the bake's
-    /// `current.json`). NOT set independently — `new()` copies it from
-    /// `inner.bundle_dir()`, so it always equals the dir the inner backend reads
-    /// generations from (the single source of truth; `ENGRAM_BUNDLE_DIR` or the
-    /// `SHARED_DIR` default).
+    /// The staged-bundle dir, copied from `inner.bundle_dir()` so this
+    /// layer materializes generations into the dir the backend reads.
     bundle_dir: PathBuf,
-    /// Optional NVMe-backed LRU cache fronting the chunk store.
-    /// When wired, chunk reads during materialization go through
-    /// the cache — chunks shared across manifests (canonical-base
-    /// images, fork lineage) stay local across rematerializes
-    /// rather than re-fetching from `BlobStorage` every time.
-    /// When unset, `materialize_chunked_rootfs` goes straight to
-    /// the store.
+    /// NVMe-backed LRU cache fronting the chunk store for memory chunks.
     chunk_cache: Option<ChunkCache>,
-    /// Root for stable `<sandbox_id>.cache` dirty files.
-    dirty_root: Option<PathBuf>,
-    /// Single-flight gate: stops two concurrent `create()` calls
-    /// from racing on the same manifest_id+version file. Held only
-    /// for the materialize critical section, not the whole call.
-    materialize_lock: Mutex<()>,
-    /// ADR 0080 §C: scratch root for image materialization
-    /// (`MaterializeImage` RPC) — per-run subdirs live under it and
-    /// are scrubbed by the materializer's guard + the startup
-    /// reconcile. `None` = this host can't materialize (no scratch
-    /// wired; dev/in-process compositions).
+    /// Scratch root for the `MaterializeImage` RPC (ADR 0080 §C).
+    /// `None` = this host cannot materialize images.
     materialize_scratch: Option<PathBuf>,
-    /// ADR 0080 §C: the ≤1-concurrent-materialize-per-host gate. A
-    /// `try_lock` miss returns the retryable `Busy` failure — the
-    /// coordinator re-picks a host instead of queueing image pulls
-    /// behind each other on one NVMe.
+    /// The one-materialize-per-host gate; a `try_lock` miss is the
+    /// retryable `Busy` failure.
     materialize_gate: Arc<tokio::sync::Mutex<()>>,
-    /// ADR 0008 Phase 5: OCI client used as the *origin tier* of the
-    /// tiered chunk-fault path. When `Some`, `resolve_rootfs` checks
-    /// `cached.is_disk_chunked_oci()` and builds a
-    /// `TieredChunkResolver` that consults BlobStorage first and
-    /// falls through to OCI Range GET on miss, opportunistically
-    /// write-filling BlobStorage with the fetched chunk (CDN-fill).
-    /// `None` keeps the legacy BlobStorage-only path.
+    /// The OCI client `materialize_image` pulls with.
     oci_client: Option<engram_oci::OciClient>,
-    /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
-    /// host-agent allocates from when serving chunked disks via
-    /// the NBD daemon. `None` = NBD disabled (the materialize-to-
-    /// file fallback runs instead — that's the macOS path and the
-    /// transitional Linux path before operators wire `nbds_max=N`).
-    /// Cross-platform because the allocator itself is target-
-    /// agnostic; the daemon that consumes a slot is Linux-only.
-    nbd_pool: Option<Arc<crate::disk_daemon::NbdSlotAllocator>>,
-    /// Live NBD daemon state, keyed by sandbox id. Each entry
-    /// owns the daemon's kernel-binding handle, the data-plane
-    /// backend (used for snapshot flush), and the slot lease
-    /// (Drop returns `/dev/nbdN` to the pool). Linux-only — on
-    /// macOS the materialize-to-file path is the only option for
-    /// chunked disks.
-    ///
-    /// INVARIANT: never hold a `DashMap` `Ref`/`RefMut` guard (the
-    /// value returned by `.get()` / `.iter()` / `.get_mut()`) across
-    /// an `.await`. A guard pins the shard's **synchronous**
-    /// `RwLock`; any contending writer (`destroy`'s `remove`,
-    /// `create`/`restore`/`rehydrate`'s `insert`) hashing to the same
-    /// shard then blocks its OS worker thread for the whole await,
-    /// and dashmap-6's writer-preference subsequently blocks every
-    /// new reader on that shard too. With ≥ worker_threads collisions
-    /// (a busy host capturing/destroying/creating concurrently) all
-    /// tokio workers park in sync lock waits, the guard-holding
-    /// future can never be polled to release it, and the runtime
-    /// deadlocks — heartbeats stop and the host is declared dead.
-    /// Instead, clone the `Arc<ChunkedDiskBackend>` (and copy
-    /// `device_path().to_path_buf()` etc.) out of the guard, drop the
-    /// guard, then `.await` on the owned `Arc`. See `flush_sandbox`
-    /// for the canonical pattern and `migration_fetch` for the rule
-    /// restated inline. TOCTOU note: a `None`-after-clone (entry
-    /// removed mid-op) is handled identically to "entry missing".
-    #[cfg(target_os = "linux")]
-    nbd_sandboxes: Arc<DashMap<SandboxId, SandboxDisks>>,
-    /// engrams#1378: the durable device→sandbox OWNER RECORDS
-    /// (`<work_dir>/nbd-owners`). Written at every attach's id-known point
-    /// and every rehydrate; read by the startup classification barrier to
-    /// attribute kernel-connected devices no live process accounts for.
-    /// `None` when the record dir could not be opened (attribution degrades
-    /// to the legacy record-reconcile path).
-    #[cfg(target_os = "linux")]
-    nbd_owners: Option<Arc<crate::disk_daemon::owners::NbdOwnerDir>>,
-    /// Owner records read before startup writers begin; retained for recovery retries.
-    #[cfg(target_os = "linux")]
-    recovery_owners: std::collections::HashMap<PathBuf, crate::disk_daemon::owners::DiskOwner>,
-    /// engrams#1378: attributed residue — kernel-connected devices whose
-    /// sandbox is known (owner record) but which no rehydrate record serves
-    /// and whose owner process is dead. Populated by the startup
-    /// classification barrier; reported on every heartbeat
-    /// (`device_residue_sandboxes`); drained by `destroy` when the
-    /// coordinator's tombstone orders the teardown.
-    #[cfg(target_os = "linux")]
-    nbd_residue: Arc<DashMap<SandboxId, Vec<std::path::PathBuf>>>,
-    /// engrams#1378: `false` until the startup classification barrier has
-    /// run once (or this host has no NBD pool, so there is nothing to
-    /// classify). Rides the heartbeat as `device_residue_known` — the
-    /// issue-#215 asymmetry: an unclassified generation's empty residue set
-    /// is "no information", and the coordinator withholds tombstone
-    /// ack-by-absence against it.
-    nbd_residue_known: Arc<std::sync::atomic::AtomicBool>,
-    /// ADR 0014 issue #1/#2: per-sandbox in-flight snapshot tracking.
-    /// `snapshot(sandbox_id)` records the produced snapshot_id here so
-    /// (a) a retry from the same sandbox first aborts the prior attempt
-    /// (overwrite-in-place semantics — prevents the 4-GiB-per-retry
-    /// leak the prod incident on `engrams-fc-xngk` exhibited) and
-    /// (b) the caller can `commit`/`abort` by sandbox_id without
-    /// passing the snapshot_id back. Cleared by `commit_snapshot` and
-    /// `abort_snapshot`; not persisted across host-agent restarts (a
-    /// restart between snapshot and commit/abort leaves an orphan dir
-    /// — small bounded leak we accept until a host-side janitor lands).
+    /// The snapshot each sandbox produced but has not committed or
+    /// aborted, so a retry overwrites in place instead of leaking a
+    /// snapshot dir per attempt.
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
     /// The metadata of the snapshot a held source produced, for the
     /// coordinator's durable finalize after the hold.
     held_snapshots: DashMap<SandboxId, SnapshotMetadata>,
-    /// Swap capacities (MiB) whose blank base manifest this process has
-    /// confirmed in the chunk store. The blank base is one deterministic
-    /// manifest per size, so a create after the first pays no store
-    /// round trip for it.
-    #[cfg(target_os = "linux")]
-    blank_swap_bases: DashMap<u32, ()>,
-    /// ADR 0016 Phase A: unix-ms timestamp of the last successful
-    /// `snapshot(sandbox_id)` per sandbox. Read by `cow_state` to
-    /// populate the memory-tier RPO field. `0`/absent = never
-    /// snapshotted; the diagnostic surface renders `0` as "never".
-    /// Stamped at the tail of the `snapshot()` post-processing
-    /// block, after BlobStorage uploads succeed but before the
-    /// `inflight_snapshots` insert (which gates commit/abort).
-    /// Cleared on `destroy(sandbox_id)` so the entry doesn't
-    /// outlive its sandbox.
+    /// Unix ms at which each sandbox's memory last matched a durable
+    /// manifest: its last successful capture, or the chain seed of its
+    /// restore. A sandbox without a stamp is due for a checkpoint.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
-    /// ADR 0101 B: per-sandbox pacing sample from the last completed
-    /// capture (diff dirty bytes + epoch length) — the adaptive
-    /// checkpoint controller's input. Written by the snapshot post
-    /// phase, cleared on destroy alongside `last_snapshot_unix_ms`.
+    /// The adaptive checkpoint controller's input: what the last
+    /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
-    /// ADR 0016 Phase B: continuous-flush scheduler config + the
-    /// publisher impl the scheduler hands its outcomes to. Cloned
-    /// into every cold-create / resume / restart-rehydration site
-    /// that spawns a scheduler. Defaults to the
-    /// [`crate::disk_daemon::NoOpLiveManifestPublisher`] in
-    /// commit 2; commit 4 wires the real coord-bound publisher via
-    /// [`Self::with_live_manifest_coord_publisher`].
-    // Read only by the linux NBD/flush-scheduler paths; macOS (VZ
-    // parity) builds construct but never read it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    flush_config: crate::disk_daemon::FlushSchedulerConfig,
-    live_manifest_publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
-    /// Owns the drain task spawned by the live-manifest publisher.
-    /// Dropping aborts the task; held here so it shares
-    /// PooledBackend's lifetime. `None` for the no-op publisher (no
-    /// task to abort).
-    live_manifest_publisher_handle: Option<crate::disk_daemon::LiveManifestPublisherHandle>,
-    /// ADR 0116 C4: the flush scheduler's escalation sink
-    /// ([`QuarantineDataPlaneHealth`] over `quarantined_survivors` +
-    /// `session_bindings`). Cloned into every scheduler install site
-    /// next to the publisher.
-    // Read only by the linux NBD/flush-scheduler paths; macOS (VZ
-    // parity) builds construct but never read it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    data_plane_health: Arc<dyn crate::disk_daemon::DataPlaneHealth>,
-    /// ADR 0028 Fix A: root for checkpoint state — `rolling/` (the
-    /// per-sandbox rolling memory images, diff-apply targets) and
-    /// `records/` (durable per-checkpoint records awaiting coord
-    /// ack). `None` disables checkpoint chains entirely: `snapshot()`
-    /// stays pure-Full and the periodic driver no-ops — the rollout
-    /// gate, and the natural state for non-FC backends.
+    /// Root for checkpoint state: `records/` (durable per-checkpoint
+    /// records awaiting coordinator ack) and `finalize/`. `None`
+    /// disables checkpoint chains: `snapshot()` stays pure-Full.
     checkpoint_dir: Option<PathBuf>,
-    /// Durable mirror of the chain heads (survivor rehydrate after a
-    /// pod roll) — every record mutation routes through this store so
-    /// a cancelled persist's detached tail can never resurrect a record
-    /// a later capture invalidated (see [`crate::checkpoint::ChainHeadStore`]).
-    /// `Some` ⟺ `checkpoint_dir` is `Some`.
+    /// Signalled after each checkpoint record lands in `records/`, so the
+    /// heartbeat advertises it at once instead of on the next period.
+    checkpoint_recorded: Arc<tokio::sync::Notify>,
+    /// Durable mirror of the chain heads for survivor rehydrate after a
+    /// pod roll. `Some` iff `checkpoint_dir` is `Some`.
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
-    /// ADR 0028 Fix A: per-sandbox rolling chain state. Present once
-    /// the first (Full, seeding) checkpoint completed; every
-    /// subsequent `snapshot()` on that sandbox — periodic checkpoint
-    /// OR eviction/drain/SIGTERM capture — rides the O(dirty) diff
-    /// path against it. Cleared on `destroy`.
+    /// Per-sandbox rolling chain state. Present once the first (Full)
+    /// checkpoint completed; every later capture is a diff against it.
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
-    /// ADR 0028 Fix A: serializes captures per sandbox — a periodic
-    /// checkpoint must never interleave with an eviction snapshot
-    /// (double-pause is idempotent but concurrent NBD flushes +
-    /// chain advances are not).
-    capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
-    /// Issue #529: `sandbox_id → snapshot_id` for an in-flight (durably
-    /// persisted, not-yet-terminal) eviction finalize job. Seeded from
-    /// disk at startup (`resume_pending_finalizes`) and on every fresh
-    /// `snapshot_begin`; cleared only when the job reaches its terminal
-    /// stage or is quarantined. Makes `snapshot_begin` idempotent under
-    /// an eviction-scanner retry storm: re-observe the pending
-    /// `snapshot_id` instead of re-capturing.
+    capture_gates: Arc<DashMap<SandboxId, Arc<CaptureGate>>>,
+    /// `sandbox_id → snapshot_id` of an in-flight, durably persisted
+    /// eviction finalize job (issue #529). Makes `snapshot_begin`
+    /// idempotent under an eviction-scanner retry storm, and keeps
+    /// `destroy` from releasing the disks the job still publishes.
     pending_finalizes: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
-    /// Issue #529: a weak self-reference, set once via `set_self_ref`
-    /// right after construction (see `lib.rs`, alongside
-    /// `Arc::new(p)`) — so a detached eviction finalize job, which only
-    /// has `EvictionFinalizer` (a bundle of Arc-cloned fields, built from
-    /// `&self`), can still reach the FULL `PooledBackend::destroy` (egress
-    /// unregister, NBD slot release, checkpoint-chain teardown — not just
-    /// the inner backend's VM teardown) at its terminal stage, without
-    /// threading an owned `Arc<PooledBackend>` through `snapshot_begin`'s
-    /// `&self` signature. `Weak` so holding a clone can never keep the
-    /// backend alive past its natural lifetime.
+    /// A weak self-reference, set once via `set_self_ref`, so a
+    /// detached finalize job reaches the full `destroy`.
     self_ref: Arc<std::sync::OnceLock<std::sync::Weak<PooledBackend>>>,
-    /// ADR 0045: open live-migration exports (frozen sandboxes
-    /// serving a move). See `crate::migration`.
+    /// Open live-migration exports (frozen sandboxes serving a move).
     migrations: Arc<crate::migration::MigrationRegistry>,
-    /// ADR 0045 C2 (source): the post-copy page server. Set once at
-    /// host-agent startup when the 9102 listener is configured; the C2
-    /// capture registers `PeerExport`s here after its pagemap scan.
+    /// The post-copy page server, when the host runs one.
     migrate_peer: Arc<std::sync::OnceLock<Arc<crate::migrate_peer::PeerServer>>>,
-    /// ADR 0045 C2: presetups awaiting their capture (export identity
-    /// minted pre-pause; `migration_capture_postcopy` consumes it).
+    /// Presetups awaiting their capture.
     pending_presetups: Arc<DashMap<SandboxId, PendingPresetup>>,
-    /// ADR 0045 C2 (destination): staged post-copy restores awaiting
-    /// their fetch-poller spawn inside `restore_with`.
+    /// Staged post-copy restores awaiting their fetch poller.
     postcopy_dests: Arc<DashMap<engram_core::types::SnapshotId, PostCopyDestPending>>,
-    /// ADR 0045 C2: sandboxes currently playing a post-copy role. Both
-    /// roles fence the normal lifecycle drivers (idle-evict nomination
-    /// skips them; checkpoints/flush are already fenced by the capture
-    /// guard + migration fence). Mirrored into the FC sandbox manifest
-    /// for reattach (ADR 0044 K2).
+    /// Sandboxes playing a post-copy role; both roles fence the normal
+    /// lifecycle drivers. Mirrored into the FC sandbox manifest for
+    /// reattach.
     migration_roles: Arc<DashMap<SandboxId, crate::migration::MigrationRole>>,
-    /// Destinations whose post-copy drain finished. `migration_drain_wait`
-    /// records the outcome here before it clears the persisted role, so a
-    /// failed manifest write is retried by the next call and never turns a
-    /// complete drain into a rewind.
+    /// Destinations whose post-copy drain finished, recorded before
+    /// the persisted role is cleared so a failed manifest write is
+    /// retried by the next call.
     drained_dests: Arc<DashMap<SandboxId, engram_core::types::snapshot::DrainOutcome>>,
     /// Optional hint polling stops as soon as the memory drain terminates.
     hint_pollers: Arc<DashMap<SandboxId, AbortTaskOnDrop>>,
-    /// ADR 0044 K2 (issue #224): terminal-mode flag for graceful
-    /// shutdown. `abandon_nbd_data_planes_for_shutdown` sets this
-    /// `true` (SeqCst) BEFORE draining `nbd_sandboxes`, turning
-    /// abandonment from a one-shot sweep of the map's current
-    /// contents into a sticky terminal mode. Every NBD insert site
-    /// (`create`, `restore_with`, `rehydrate_sandbox`) checks it
-    /// immediately before the `insert`: if set, the freshly-built
-    /// `NbdSandboxState` is `abandon_for_shutdown()`-ed (kernel
-    /// config left alive for the successor) rather than inserted —
-    /// so a still-running registration/rehydrate task or an
-    /// in-flight gRPC handler that finishes AFTER the sweep can no
-    /// longer leak a live data plane into the map only to have
-    /// `NbdHandle::Drop` netlink-disconnect a surviving FC's device
-    /// at process exit. `Arc` so the spawned create/restore insert
-    /// tasks (issue #223) can move a clone in. Linux-only — the
-    /// abandon contract exists only where NBD data planes do.
-    #[cfg(target_os = "linux")]
-    abandoning: Arc<std::sync::atomic::AtomicBool>,
-    /// 2026-08-03 `chain_poisoned` alert: SIGTERM capture quiesce. Raised
-    /// (SeqCst, never lowered) as the first act of the shutdown ladder.
-    /// `capture_phase` checks it under the capture lock, BEFORE the
-    /// write-ahead invalidate and the FC `PUT /snapshot/create` — i.e.
-    /// before anything is consumed — and refuses: a capture that starts
-    /// after SIGTERM walks straight into the runtime teardown, fails
-    /// mid-post-processing with the dirty bitmap already consumed, and
-    /// poisons its checkpoint chain (the surviving VM then pays a FULL
-    /// re-chunk under the successor). Captures already past the gate are
-    /// waited for by `drain_captures_for_shutdown`. Unlike `abandoning`
-    /// this is not Linux-gated — captures exist on every backend.
+    /// The SIGTERM capture quiesce: raised once, never lowered.
+    /// `capture_phase` refuses under the capture lock before anything is
+    /// consumed, so a capture never walks into the runtime teardown.
     captures_quiesced: Arc<std::sync::atomic::AtomicBool>,
-    /// Issue #225: the coord client + host id used to SYNCHRONOUSLY
-    /// publish a survivor's freshly-flushed `live_disk_manifest`
-    /// during the SIGTERM final-flush pass. The normal flush path
-    /// publishes through the async `live_manifest_publisher`'s
-    /// coalescing drain task — but that task is aborted on process
-    /// exit, so a manifest queued during shutdown would never reach
-    /// coord and the successor would rehydrate from the stale ref.
-    /// The shutdown pass therefore POSTs directly here, before the
-    /// process exits. Set by `with_live_manifest_coord_publisher`
-    /// (the same wiring that builds the async publisher); `None` for
-    /// the no-op / test publishers, in which case the shutdown flush
-    /// still drains chunks to GCS but skips the coord publish.
-    shutdown_manifest_publish: Option<(
-        Arc<dyn engram_host_core::CoordControlPlane>,
-        engram_core::HostId,
-    )>,
-    /// ADR 0098 D1: wall clock is an injected world input (record
-    /// timestamps, the pause mark, the migration TTL). P8 closed the
-    /// flow-extraction arc: every seam reaches its flow through its own
-    /// field (`clock`, `host_fs`, `shutdown_manifest_publish`,
-    /// `DeviceSync`/`NbdKernel` at their entry points) — the loose fields
-    /// ARE the end state; `HostEffects::production` remains the sim's
-    /// assembly point, not a prod indirection.
+    /// ADR 0098 D1: the wall clock is an injected world input.
     clock: Arc<dyn engram_core::traits::Clock>,
-    /// ADR 0098 P5: the durable-fs seam. Prod is [`TokioFs`]; Flow D's
-    /// durable records + the shutdown spool perform every fs op through
-    /// it (the host-internal simulator's `CrashFs` intercepts at op
-    /// boundaries). Remaining loose-field seams consolidate into the
-    /// full `HostEffects` bundle with the last flow-extraction PRs.
+    /// ADR 0098 P5: the durable-fs seam the records go through.
     host_fs: Arc<dyn engram_host_core::HostFs>,
 }
 
-/// ADR 0098 P5: the prod [`crate::eviction_finalize::EvictionSandbox`] —
-/// upgrades the weak `PooledBackend` ref at call time so the detached
-/// finalize job reaches the FULL `PooledBackend::destroy` (egress
-/// unregister, NBD slot release, checkpoint-chain teardown). A gone
-/// backend (process shutting down) is success: nothing left to destroy
-/// here, and `orphan_reap` backstops the sandbox itself.
+/// The finalize job's teardown seam: upgrades the weak `PooledBackend`
+/// ref at call time so the job reaches the full `destroy`. A gone
+/// backend (process shutting down) is success: the teardown reconcile
+/// backstops the sandbox itself.
 pub(crate) struct PooledDestroyer {
     pub(crate) self_ref: Arc<std::sync::OnceLock<std::sync::Weak<PooledBackend>>>,
 }
@@ -1066,7 +571,6 @@ async fn observe_memory_drain(sock: &Path) -> std::io::Result<()> {
 
 /// Retry only while the advisory budget remains. The owner cancels this future
 /// at the local memory drain outcome, including during a fetch or backoff sleep.
-#[cfg(any(target_os = "linux", test))]
 async fn poll_hot_hint<F, Fut>(budget: std::time::Duration, mut fetch: F)
 where
     F: FnMut() -> Fut,
@@ -1109,7 +613,7 @@ fn spawn_leg_keepalive(
 ) -> AbortTaskOnDrop {
     AbortTaskOnDrop(tokio::spawn(async move {
         let mut interval =
-            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+            engram_core::periodic(crate::warm_progress::capture_keepalive_secs_from_env());
         interval.tick().await; // consume the immediate first tick
         loop {
             interval.tick().await;
@@ -1130,7 +634,6 @@ fn publish_hot_hint(dir: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
 }
 
 /// Parse the optional hint independently of the required disk seal.
-#[cfg(any(target_os = "linux", test))]
 fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
     let result = (|| {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
@@ -1149,7 +652,6 @@ fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
 }
 
 /// Atomically stage an advisory hint after state.bin has opened the load gate.
-#[cfg(any(target_os = "linux", test))]
 fn stage_hot_trace(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
     let mut trace =
         engram_chunk_store::working_set::WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
@@ -1163,48 +665,36 @@ fn stage_hot_trace(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
 }
 
 impl PooledBackend {
-    /// Compose the pre-pause export from the current device lineages.
+    /// Compose the pre-pause export. The dest stages each disk from the
+    /// checkpoint the precopy is a change on.
     async fn prepare_migration_export(
         &self,
         id: SandboxId,
         chain_ref: engram_core::types::manifest::ManifestRef,
         chain_manifest: &engram_chunk_store::Manifest,
         peer_port: u16,
-        backends: Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)>,
+        precopy: std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let advertised = |role| precopy.get(&role).map(|seal| seal.pending.previous());
+        let (disk_manifest_ref, swap_manifest_ref) =
+            (advertised(DiskRole::Root), advertised(DiskRole::Swap));
         let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
         let memory_manifest_json = serde_json::to_vec(&chain_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
-
-        // The caller releases the device map guard before these awaits.
-        let (disk_manifest_ref, swap_manifest_ref) = {
-            let mut root_ref = None;
-            let mut swap_ref = None;
-            for (role, backend) in backends {
-                if let Err(error) = backend.sync_host_device().await {
-                    tracing::warn!(sandbox_id = %id, %error, "presetup NBD sync failed; capture will sync again");
-                }
-                match role {
-                    DiskRole::Root => root_ref = Some(backend.manifest_ref().await),
-                    DiskRole::Swap => swap_ref = Some(backend.manifest_ref().await),
-                }
-            }
-            (root_ref, swap_ref)
-        };
-
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
         let peer_token = crate::migration::MigrationRegistry::mint_export_id();
         let pending = PendingPresetup {
             export_id: export_id.clone(),
             peer_token: peer_token.clone(),
             chain_ref,
+            disk_manifest_ref,
             swap_manifest_ref,
+            precopy,
             sidecar_json: sidecar_json.clone(),
             idle_marked: false,
             hot_chunks: self.read_hot_chunks(id),
         };
         self.pending_presetups.insert(id, pending.clone());
-
         Ok(engram_core::types::snapshot::MigrationPresetupOut {
             export_id,
             peer_token,
@@ -1213,47 +703,41 @@ impl PooledBackend {
             memory_manifest_json,
             memory_manifest_ref: chain_ref,
             disk_manifest_ref,
-            swap_manifest_ref: pending.swap_manifest_ref,
+            swap_manifest_ref,
             hot_chunks: pending.hot_chunks,
         })
     }
 
-    /// Restore all sealed devices before the source resumes.
+    /// Discard the sealed disk checkpoints and resume the source in place.
     async fn abort_migration_export(
         &self,
         export: crate::migration::MigrationExport,
-        backends: Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)>,
     ) -> Result<(), SandboxError> {
-        // The export is consumed: from here the cleanup must run to the
-        // end even if this request is cancelled, or a retry would see
-        // NotFound with the fence still raised. A detached task owns it;
-        // the request only awaits the result.
+        // The export is consumed: from here the cleanup runs to the end
+        // even if this request is cancelled, or a retry would see
+        // NotFound with the guest still paused. A detached task owns it.
         let inner = self.inner.clone();
+        let volumes = self.volumes.clone();
         let migration_roles = self.migration_roles.clone();
         let id = export.sandbox_id;
         let export_id = export.export_id.clone();
         tokio::spawn(async move {
-            for (role, backend) in backends {
-                // Disk post-copy: the sealed bytes go back into `dirty`
-                // so the resumed guest's next flush captures them.
-                if let Some(sealed) = export.disk_seal.get(&role) {
-                    backend.requeue_postcopy_seal(sealed).await;
+            if let Some(volumes) = volumes.as_ref() {
+                for (_, seal) in export.disk_seal.into_iter().chain(export.precopy) {
+                    discard_seal(volumes, seal).await;
                 }
-                backend.set_migration_fence(false);
             }
-            let snapshot_dir = export.snapshot_dir.clone();
-            let _ = fs::remove_dir_all(&snapshot_dir).await;
+            let _ = fs::remove_dir_all(&export.snapshot_dir).await;
             drop(export.capture_guard);
             inner
                 .resume(id)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
-            // Last: the drained bytes are back, the fence is down, and the
-            // guest runs again whether or not this manifest write succeeds
-            // (`resume` retries the clear). In-memory first, then the manifest.
+            // The guest runs again whether or not this manifest write
+            // succeeds (`resume` retries the clear). In-memory first.
             migration_roles.remove(&id);
             inner.set_manifest_migration_role(id, None).await?;
-            tracing::info!(sandbox_id = %id, export_id, "migration aborted; guest resumed in place (ADR 0045)");
+            tracing::info!(sandbox_id = %id, export_id, "migration aborted; guest resumed in place");
             Ok(())
         })
         .await
@@ -1396,8 +880,8 @@ impl PooledBackend {
 
     /// Run `sync` in the guest — the base-capture quiesce (see the call
     /// site in `build_base_snapshot`). Bounded: sync of a warm image's
-    /// dirty set is seconds; 120 s covers a slow chunked-NBD writeback
-    /// without letting a wedged guest hang the capture forever.
+    /// dirty set is seconds; 120 s covers a slow writeback without letting
+    /// a wedged guest hang the capture forever.
     async fn sync_guest_fs(&self, id: SandboxId) -> Result<(), SandboxError> {
         use engram_core::types::sandbox::ExecEvent;
         use futures::StreamExt;
@@ -1555,7 +1039,7 @@ impl PooledBackend {
         let mut last_detail: Option<String> = None;
 
         let mut keepalive =
-            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+            engram_core::periodic(crate::warm_progress::capture_keepalive_secs_from_env());
         keepalive.tick().await; // consume the immediate first tick
 
         let send_progress =
@@ -1744,61 +1228,28 @@ impl PooledBackend {
         }
     }
 
-    /// Shared body of `restore` (resume flavor) and `restore_fresh`
-    /// (fresh-create flavor) — see ADR 0035 §3 for the split.
+    /// Stage the snapshot's inputs, provision its disks, then restore.
+    /// `fork_disk` starts a new disk lineage (a shared base's consumer);
+    /// `fresh` swaps aux bundles to the host's current generation.
     async fn restore_with(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         fresh: bool,
-        // ADR 0077 phase 2: fork the disk manifest identity at NBD attach.
-        // True whenever this restore attaches a SHARED disk manifest (a
-        // fresh create off a base snapshot, or a capture VM restoring a
-        // shared cold base) — each consumer's flush chain must own a
-        // private lineage, exactly like the cold-create path
-        // (`try_spawn_nbd` fork=true). False for resume/rehydrate/
-        // migration, which re-attach the session's OWN already-forked id
-        // and must tick it, not fork again. Distinct from `fresh`: a
-        // Hit-capture restore is fork=true but fresh=false (it keeps the
-        // snapshot's pinned mounts and resume memory semantics).
-        fork_disk_at_attach: bool,
-        // ADR 0055: per-session skills to patch into reserved slots (fresh only;
-        // ignored on resume, which keeps the snapshot's pinned mounts).
+        fork_disk: bool,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
+        let new_id = id;
         let post_copy_dest = self.postcopy_dests.contains_key(&metadata.id)
             || self
                 .inner
                 .snapshot_path_for(metadata.id)
                 .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
                 .exists();
-        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
-        // into local NVMe BEFORE we hand off to materialize +
-        // inner.restore. Without this, materialize_to_file_cached's
-        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
-        // a cold-cache host — a 512 MiB template's 32 chunks come
-        // out as ~10 s of serial fetch. Parallel prefetch with
-        // bounded concurrency reduces that to roughly ~2 s.
-        // Subsequent restores against the same template hit NVMe
-        // and the prefetch is a no-op.
-        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
-        // prefetch / state materialize / NBD attach) alongside the
-        // `fc.restore_in_jail` legs, so one trace shows where the whole
-        // `host.restore_base_for_session` window goes. Pure observability.
-        // ADR 0022 / ADR 0045: does this restore serve memory lazily (UFFD
-        // faults / peer), or does it need a contiguous `memory.bin`
-        // materialized for `load_snapshot` (File)? Lazy iff
-        // `restore_memory_is_lazy_for(fresh)` — a fresh base-create under the
-        // ADR-0045 substrate, or any UFFD resume — OR this is a staged
-        // migration restore, which `restore_in_jail` forces to UFFD regardless
-        // of `config.restore_mode`, keyed on the migration manifest's presence.
-        // Compute it ONCE so the prefetch-block gate here and the
-        // memory.bin-materialize gate below both mirror the actual load
-        // decision and can't drift from it — or from each other. (The old
-        // `if fresh` gate mis-BLOCKED a substrate base-create on a full
-        // memory-manifest prefetch even though UFFD serves it lazily; and a
-        // File-mode host picked as a migration dest mis-materialized a
-        // `memory.bin` that `inner.restore` never reads — both on the restore
-        // critical path.)
+        // Memory is served lazily (UFFD faults / peer) for a substrate
+        // base-create, a UFFD resume, and every staged migration restore;
+        // a File-mode restore needs a contiguous `memory.bin`. One
+        // decision drives both the prefetch gate and the materialize gate.
         let memory_is_lazy = self.inner.restore_memory_is_lazy_for(fresh)
             || self
                 .inner
@@ -1806,16 +1257,9 @@ impl PooledBackend {
                 .join("migration-session-manifest.json")
                 .exists();
 
-        // ADR 0043 P1: warm the memory-chunk cache before the handler faults
-        // from it. A NON-LAZY restore (File base-create / File resume) feeds the
-        // warmed cache to the serial `materialize_memory_if_missing` below, so
-        // the prefetch stays on the critical path (awaited). A LAZY restore
-        // consumes the chunks only via the handler's lazy faults AFTER
-        // `inner.restore`, so warming need not block: spawn it and let restore
-        // proceed immediately. The handler faults from the same cancel-safe
-        // single-flight cache, so a fault that races ahead of the background
-        // prefetch just fetches its one chunk itself. (Pairs with the
-        // handler-side background prefault — ADR 0043 P1 / ADR 0039 #19.)
+        // A non-lazy restore reads the warmed cache serially below, so
+        // the prefetch stays on the critical path; a lazy restore faults
+        // after `inner.restore`, so warming runs in the background.
         if !memory_is_lazy {
             let prefetched_chunks = tracing::Instrument::instrument(
                 self.prefetch_memory_chunks(&metadata),
@@ -1829,12 +1273,11 @@ impl PooledBackend {
                     "chunked restore memory chunk prefetch failed; falling back to serial fault path",
                 );
             }
-        } else if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
-        {
+        } else if let Some(cs) = self.chunk_store.clone() {
             let md = metadata.clone();
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &cache, &md).await {
+                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
                         tracing::warn!(
                             error = %e,
                             snapshot_id = %md.id,
@@ -1846,26 +1289,10 @@ impl PooledBackend {
             ));
         }
 
-        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
-        // The backend owns its staging dir layout (Phase 6); we ask
-        // it where this snapshot would live, then ensure the
-        // memory.bin file is present before delegating to inner —
-        // either because we're on the same host where it was
-        // written, or because we need to rebuild it from chunks
-        // (cross-host migration). With M1.13's prefetch above, the
-        // serial materialize loop now hits the NVMe-warm cache for
-        // every chunk.
         let src = self.inner.snapshot_path_for(metadata.id);
 
-        // ADR 0014: cross-host materialization is order-sensitive.
-        // `materialize_memory_if_missing` reads the local FC sidecar
-        // (`manifest.json`) to find the memory_manifest ref before
-        // it can rebuild memory.bin from chunks. On a cross-host
-        // restore that sidecar is in BlobStorage, not on disk, so
-        // the sidecar download (`materialize_state_if_missing`)
-        // MUST run first — otherwise memory.bin materialization
-        // silently no-ops and FC restore then errors with
-        // "snapshot memory.bin missing".
+        // The sidecar names the memory manifest `materialize_memory_if_missing`
+        // rebuilds from, so on a cross-host restore it is downloaded first.
         if let Some(chunk_store) = self.chunk_store.as_ref() {
             let blob = chunk_store.blob_storage();
             if let Err(e) = tracing::Instrument::instrument(
@@ -1887,507 +1314,196 @@ impl PooledBackend {
             }
         }
 
-        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
-        // for the resumed sandbox.
-        //
-        // Branching mirrors the cold-create path's `resolve_rootfs`:
-        //
-        // - Linux + nbd_pool + chunk_store + chunk_cache + a
-        //   chunked `disk_manifest` on the snapshot row → take the
-        //   NBD attach path. ChunkedDiskBackend is rebased on the
-        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
-        //   restore reads its rootfs through that block device. The
-        //   resumed sandbox enters `nbd_sandboxes` after
-        //   `inner.restore` returns the new sandbox_id; the
-        //   FlushScheduler spawns immediately. Closes ADR 0016 §
-        //   "Phase B failure mode to close" — both the COW-diagnostic-
-        //   silent symptom and the second-eviction-can't-snapshot
-        //   symptom.
-        //
-        // - Other configurations (macOS dev, hosts without NBD wired,
-        //   legacy snapshots whose `disk_manifest` is None) → fall
-        //   back to `materialize_disk_if_missing`, which writes the
-        //   bytes to a flat file and patches the sidecar. This path
-        //   doesn't enter `nbd_sandboxes` and doesn't get a
-        //   scheduler; it's the pre-Phase-B behaviour kept for
-        //   backwards compatibility on non-NBD configurations.
-        //
-        // The pending state is captured here (pre-restore) so the
-        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
-        // BEFORE `inner.restore` reads the sidecar to install the
-        // canonical-rootfs symlinks.
-        #[cfg(target_os = "linux")]
-        let pending_nbd_state = tracing::Instrument::instrument(
-            self.prepare_resume_nbd_attach(&metadata, &src, fork_disk_at_attach),
-            tracing::info_span!("restore.prepare_nbd"),
-        )
-        .await?;
-        #[cfg(target_os = "linux")]
-        let mut pending_swap_state = if pending_nbd_state.is_some() {
-            self.prepare_resume_swap_attach(&metadata, &src, fresh)
-                .await?
-        } else {
-            None
-        };
-        #[cfg(target_os = "linux")]
-        let swap_owner = if pending_swap_state.is_some() {
-            Some(
-                self.self_ref
-                    .get()
-                    .and_then(std::sync::Weak::upgrade)
-                    .ok_or_else(|| {
-                        SandboxError::InvalidSpec("swap attach requires backend ownership".into())
-                    })?,
-            )
-        } else {
-            None
-        };
-        // Non-Linux has no NBD data plane — the fork decision has no seam
-        // to apply to (the materialize-to-file fallback below has no
-        // manifest chain).
-        #[cfg(not(target_os = "linux"))]
-        let _ = fork_disk_at_attach;
-        // ADR 0045 C2: a staged post-copy destination arms its fetch
-        // poller HERE — the earliest point the NBD handle exists. The
-        // attach above used the presetup's published disk ref; the
-        // poller rebases to the capture-time base + arms the sealed-
-        // chunk peer overlay before landing state.bin (the FC load
-        // gate), and the publisher stays fenced until the disk drain
-        // makes the dest self-sufficient.
-        #[cfg(not(target_os = "linux"))]
-        let hint_poller: Option<AbortTaskOnDrop> = None;
-        #[cfg(target_os = "linux")]
-        let hint_poller = if let Some((_, pending)) = self.postcopy_dests.remove(&metadata.id) {
-            let nbd = [
-                (DiskRole::Root, pending_nbd_state.as_ref()),
-                (DiskRole::Swap, pending_swap_state.as_ref()),
-            ]
-            .into_iter()
-            .filter_map(|(role, state)| {
-                state.map(|state| {
-                    state.backend.set_migration_fence(true);
-                    (
-                        role,
-                        state.backend.clone(),
-                        state.device_path().to_path_buf(),
-                    )
-                })
-            })
-            .collect();
-            Some(AbortTaskOnDrop(self.spawn_postcopy_fetch_poller(
-                pending,
-                self.inner.snapshot_path_for(metadata.id),
-                nbd,
-            )))
-        } else {
-            None
-        };
-
-        #[cfg(target_os = "linux")]
-        if pending_swap_state.is_none()
-            && read_sidecar_swap_source(&src)
-                .await
-                .is_some_and(|path| path.starts_with("/dev/nbd"))
-        {
-            return Err(SandboxError::MemoryImageUnusable(
-                "swap restore would reopen a stale literal NBD device".into(),
-            ));
-        }
-
-        // Non-NBD fallback runs only when the NBD path didn't take.
-        // On macOS this is the only path; on Linux it covers hosts
-        // without nbd_pool/chunk_store/chunk_cache wired or
-        // snapshots with disk_manifest=None.
-        let took_nbd_path: bool;
-        #[cfg(target_os = "linux")]
-        {
-            took_nbd_path = pending_nbd_state.is_some();
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            took_nbd_path = false;
-        }
-        if !took_nbd_path {
-            // The 2026-07-17 corruption path (session 03e6535e): a chunked
-            // snapshot whose `disk_manifest` is None (manufactured by the D5
-            // silent-skip one hop upstream, or a torn checkpoint) takes NO
-            // NBD attach and NO sidecar patch — so FC restores against the
-            // capture-time LITERAL `/dev/nbdN` still named in the sidecar's
-            // `spec.rootfs_source`. On the receiving host that device is at
-            // best dead (every vda read → EIO → the guest SIGBUSes on its
-            // first mmap page-in) and at worst ANOTHER session's live disk
-            // (the cross-session hazard `prepare_resume_nbd_attach`'s
-            // migration arm already documents). On a host that runs the NBD
-            // data plane, refuse the restore rather than boot onto a
-            // stale/foreign literal device: the resume op requeues, and the
-            // poisoned lineage surfaces loudly for operator remediation
-            // instead of silently corrupting. (The materialize-to-file
-            // fallback below is only legitimate when the rootfs is NOT a
-            // block device — a flat-file rootfs, macOS/dev — which the
-            // sidecar reports as a non-`/dev/nbd` `rootfs_source`.) The
-            // verdict is the pure `plan_resume_attach` (ADR 0098 G2 — the
-            // survivor-invisibility family's resume leg, which the host
-            // simulator drives).
-            let sidecar_dev = read_sidecar_rootfs_source(&src).await;
-            let sidecar_is_nbd_literal = sidecar_dev
-                .as_deref()
-                .is_some_and(|d| d.starts_with("/dev/nbd"));
-            if matches!(
-                engram_host_core::plan_resume_attach(
-                    false,
-                    self.host_runs_nbd_data_plane(),
-                    sidecar_is_nbd_literal,
-                ),
-                engram_host_core::ResumeAttachPlan::RefuseStaleLiteral
-            ) {
-                let dev = sidecar_dev.expect("RefuseStaleLiteral implies a sidecar device");
-                return Err(SandboxError::Snapshot(format!(
-                    "resume of {} would reopen the capture-time literal rootfs device {dev} \
-                     (sidecar spec.rootfs_source) because no NBD attach happened \
-                     (disk_manifest={:?}) — that device is dead or owned by another \
-                     session on this host. Refusing to boot onto a stale/foreign \
-                     /dev/nbdN; the snapshot's disk lineage must be repaired.",
-                    metadata.id, metadata.disk_manifest,
-                )));
-            }
-            if let Some(chunk_store) = self.chunk_store.as_ref() {
-                if let Err(e) = materialize_disk_if_missing(
-                    chunk_store,
-                    self.chunk_cache.as_ref(),
-                    &src,
-                    metadata.disk_manifest,
-                    &self.materialize_lock,
+        let disks = match self.volumes.as_ref() {
+            Some(volumes) => Some(
+                tracing::Instrument::instrument(
+                    self.provision_for_restore(volumes, id, &metadata, &src, fresh, fork_disk),
+                    tracing::info_span!("restore.provision_disks"),
                 )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        src = %src.display(),
-                        "rootfs materialization failed; inner.restore will see whatever's there",
-                    );
+                .await?,
+            ),
+            None => None,
+        };
+        let restore = async {
+            // A staged post-copy destination arms its fetch poller as soon
+            // as its disks exist: the poller writes the source's sealed
+            // chunks into the live volumes, then lands `state.bin` (the FC
+            // load gate).
+            let hint_poller = match self.postcopy_dests.remove(&metadata.id) {
+                Some((_, pending)) => {
+                    let live = self.live_volumes(id).await?;
+                    Some(AbortTaskOnDrop(self.spawn_postcopy_fetch_poller(
+                        pending,
+                        src.clone(),
+                        live,
+                    )))
                 }
-            }
-        }
+                None => None,
+            };
 
-        // ADR 0020 Route B / ADR 0022 Option A: whether to rebuild the
-        // contiguous memory.bin is the SAME per-restore laziness decision the
-        // prefetch gate above used (`memory_is_lazy`). A lazy restore — every
-        // UFFD resume, a substrate base-create, and any staged migration
-        // restore — serves memory from chunks/peer; the handler faults straight
-        // from the cache the prefetch warmed, so materializing memory.bin would
-        // be pure overhead (and on a migration dest, a wasted rebuild of a file
-        // `inner.restore` never reads). A non-lazy File restore needs the
-        // memfile present for `load_snapshot`; `materialize_memory_if_missing`
-        // is an idempotent no-op once the residency prefetch (image_prefetch)
-        // wrote the *per-template* file at this same snapshot-id-keyed path —
-        // which keeps siblings sharing one inode rather than each rebuilding a
-        // divergent copy.
-        if memory_is_lazy {
-            tracing::debug!(
-                snapshot_id = %metadata.id,
-                "lazy memory restore (UFFD); skipping memory.bin materialization",
-            );
-        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
-            tracing::warn!(
-                error = %e,
-                src = %src.display(),
-                "memory.bin materialization failed; inner.restore will see whatever's there",
-            );
-        }
-
-        // ADR 0035 §4: every generation the snapshot pins must be staged
-        // before FC's `load_snapshot` opens the embedded path. Cross-host
-        // (post-roll) restores materialize from BlobStorage here; the
-        // common case is a no-op (baked or prefetched).
-        if !metadata.aux_bundles.is_empty() {
-            if let Some(cs) = self.chunk_store.as_ref() {
-                crate::bundles::BundleStore::new(
-                    cs.blob_storage().clone(),
-                    self.bundle_dir.clone(),
-                    self.bundle_file_ext(),
-                )
-                .materialize_if_missing(&metadata.aux_bundles)
-                .await?;
-            } else {
+            if memory_is_lazy {
                 tracing::debug!(
-                    "snapshot pins aux bundles but no chunk store is wired; \
-                     relying on locally staged generations"
+                    snapshot_id = %metadata.id,
+                    "lazy memory restore (UFFD); skipping memory.bin materialization",
+                );
+            } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
+                tracing::warn!(
+                    error = %e,
+                    src = %src.display(),
+                    "memory.bin materialization failed; inner.restore will see whatever's there",
                 );
             }
-        }
-        // ADR 0062: a fresh create's SELECTED mounts (the catalog harness on
-        // dyn_0, per-session skills) are pins too, but they are NOT in the
-        // snapshot's `aux_bundles`, so the block above doesn't cover them. The
-        // baked skills/sentinel are pre-staged on the host image, but a
-        // catalog-PUBLISHED generation (the harness, ADR 0062) has no local
-        // stage on a host that hasn't prefetched it yet — materialize it here
-        // too, or FC's `load_snapshot` opens a `dyn_*` path the host never
-        // staged ("selected skill <sha> … is not staged on this host (catalog
-        // materialize gap?)"). Symbolic mounts (`sha256 == None`) are resolved
-        // inside the backend, not staged from blob — skip them. Empty for
-        // resumes (they carry no fresh selections), so this is a no-op there.
-        let selected_refs: Vec<AuxBundleRef> = selected_mounts
-            .iter()
-            .filter_map(|m| {
+
+            // Every generation the snapshot pins, and every selected mount
+            // of a fresh create, is staged before FC opens the embedded path.
+            let mut pinned: Vec<AuxBundleRef> = metadata.aux_bundles.clone();
+            pinned.extend(selected_mounts.iter().filter_map(|m| {
                 m.sha256.as_ref().map(|sha| AuxBundleRef {
                     drive_id: m.drive_id.clone(),
                     sha256: sha.clone(),
                 })
-            })
-            .collect();
-        if !selected_refs.is_empty() {
-            if let Some(cs) = self.chunk_store.as_ref() {
-                crate::bundles::BundleStore::new(
-                    cs.blob_storage().clone(),
-                    self.bundle_dir.clone(),
-                    self.bundle_file_ext(),
-                )
-                .materialize_if_missing(&selected_refs)
-                .await?;
+            }));
+            if !pinned.is_empty() {
+                match self.chunk_store.as_ref() {
+                    Some(cs) => {
+                        crate::bundles::BundleStore::new(
+                            cs.blob_storage().clone(),
+                            self.bundle_dir.clone(),
+                            self.bundle_file_ext(),
+                        )
+                        .materialize_if_missing(&pinned)
+                        .await?
+                    }
+                    None => tracing::debug!(
+                        "snapshot pins aux bundles but no chunk store is wired; \
+                         relying on locally staged generations"
+                    ),
+                }
             }
-        }
-        // ADR 0035 §3: fresh creates swap aux bundles to the host's
-        // current generation inside the backend; resumes keep the pin.
-        //
-        // Issue #223 — CANCELLATION SAFETY. On the NBD-attach path the
-        // sidecar was already patched to `/dev/nbdN` (above, in
-        // `prepare_resume_nbd_attach`), so the FC `inner.restore`/`restore_fresh`
-        // below boots reading that device. The `NbdSandboxState` (daemon +
-        // slot lease) only enters `nbd_sandboxes` AFTER the restore returns.
-        // If the gRPC handler future is dropped (client deadline, coordinator
-        // pod restart) in the window between the restore and the insert, the
-        // local `pending_nbd_state` drops mid-flight UNDER THE LIVE FC:
-        // `NbdHandle::Drop` netlink-disconnects the device the just-restored
-        // guest is reading (guest parks under `dead_conn_timeout`, VM orphaned
-        // — its id never delivered to anyone), and `NbdSlot::Drop` returns the
-        // path to the pool. The disconnect clears the busy probe, so a
-        // different session's `create` can CONNECT its own backend onto the
-        // device the orphan FC still holds open → cross-session disk I/O
-        // (prod canaries 5fa742b7/4391e591). `orphan_reap` is eventual and can
-        // lose the race.
-        //
-        // Fix (mirrors the coordinator detach in #210 / the FC `ResumeOnDrop`
-        // family): run the restore + the map insert inside a `tokio::spawn`ed
-        // task that MOVES `pending_nbd_state` into itself, so the state always
-        // lands in `nbd_sandboxes` regardless of the request's fate — then
-        // normal `destroy()` teardown owns it (kill FC first, THEN disconnect).
-        // The handler awaits the JoinHandle only to observe the result for the
-        // connected client; a disconnect drops that await, not the work. The
-        // non-NBD path also detaches restore so the destination role is
-        // recorded if the caller stops waiting.
-        #[cfg(target_os = "linux")]
-        if let Some(mut state) = pending_nbd_state {
+
+            // The restore runs detached from the request: a handler future
+            // dropped mid-restore (client deadline, coordinator restart) must
+            // not leave a half-restored VM nobody owns. The handler awaits
+            // the join handle only to observe the result.
             let inner = self.inner.clone();
-            let nbd_sandboxes = self.nbd_sandboxes.clone();
-            let publisher = self.live_manifest_publisher.clone();
-            let health = self.data_plane_health.clone();
-            let flush_config = self.flush_config.clone();
-            let owners = self.nbd_owners.clone();
-            let abandoning = self.abandoning.clone();
-            let dirty_root = self
-                .resolved_dirty_root()
-                .expect("NBD state requires a dirty root");
             let migration_roles = self.migration_roles.clone();
             let hint_pollers = self.hint_pollers.clone();
-            let join = tokio::spawn(async move {
-                let new_id = if fresh {
-                    inner.restore_fresh(metadata, selected_mounts).await?
+            let disks = disks.clone();
+            tokio::spawn(async move {
+                if fresh {
+                    inner
+                        .restore_fresh(new_id, metadata, disks, selected_mounts)
+                        .await?
                 } else {
-                    inner.restore(metadata).await?
+                    inner.restore(new_id, metadata, disks).await?
                 };
-                // Subscribe as soon as the backend exposes the restored VM.
-                // Replay covers a drain that finished during restore.
-                let hint_poller = hint_poller.map(|poller| {
-                    monitor_hint_poller(poller, inner.post_copy_control_sock(new_id))
-                });
+                if let Some(poller) = hint_poller {
+                    hint_pollers.insert(
+                        new_id,
+                        monitor_hint_poller(poller, inner.post_copy_control_sock(new_id)),
+                    );
+                }
                 if post_copy_dest {
                     migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
                 }
-                if let Err(error) = state
-                    .backend
-                    .relocate_dirty_file(&dirty_root.join(format!("{new_id}.cache")))
-                    .await
-                {
-                    // The VM is live on a device this task is about to
-                    // drop. Tear the VM down FIRST so the device never
-                    // disconnects under a running Firecracker (the
-                    // cross-session I/O hazard this task exists to avoid).
-                    if let Err(e) = inner.destroy(new_id).await {
-                        tracing::warn!(sandbox_id = %new_id, error = %e,
-                            "destroy after a failed dirty-file relocation failed");
-                        state.abandon_for_shutdown();
-                        if let Some(swap) = pending_swap_state.take() {
-                            swap.abandon_for_shutdown();
-                        }
-                    }
-                    return Err(SandboxError::Vm(
-                        format!("move restored sandbox dirty file into place: {error}").into(),
-                    ));
-                }
-                // ADR 0016 Phase B commit 5: post-restore wiring. The new
-                // sandbox_id is only known here; install it into
-                // `nbd_sandboxes` together with the FlushScheduler so the
-                // resumed sandbox is first-class in the COW diagnostic and
-                // in the continuous-flush pipeline. Field-ordered Drop
-                // ensures scheduler-cancel → NBD-disconnect → slot-release
-                // on subsequent destroy.
-                state.install_flush_scheduler(
-                    new_id,
-                    DiskRole::Root,
-                    publisher,
-                    health,
-                    flush_config,
-                    owners,
-                );
-                // ADR 0019: open the resume operation window — restore-time disk
-                // reads (load_snapshot + the resumed guest's working set) attach
-                // `chunk.fetch` spans to this trace. Covers idle→resume AND
-                // evac-dest; the coord parent trace distinguishes them. Closed by
-                // `start_agent` (finish_resume_to_active calls it). Memory page-in
-                // is the UFFD side, on the spawn-TRACEPARENT path.
-                state.backend.operation_scope().begin("resume");
-                // Issue #224: terminal-mode check. This task outlives a
-                // dropped HANDLER future by design (issue #223), so it
-                // also outlives a SIGTERM that cancels the handler — and
-                // its `inner.restore` window is multi-second. If the
-                // abandon sweep ran while we were restoring, inserting
-                // here would leak a live data plane the sweep already
-                // passed; process exit would then `NbdHandle::Drop` →
-                // netlink-disconnect the just-restored guest's device.
-                // Abandon in-place instead (kernel config persists for
-                // the successor); the restore itself succeeded, so the
-                // sandbox_id is still returned to the caller.
-                if abandoning.load(std::sync::atomic::Ordering::SeqCst) {
-                    tracing::warn!(
-                        %new_id,
-                        "restore completed during SIGTERM abandon; abandoning the \
-                         NBD data plane in-place instead of inserting after the sweep",
-                    );
-                    state.abandon_for_shutdown();
-                    if let Some(swap) = pending_swap_state.take() {
-                        swap.abandon_for_shutdown();
-                    }
-                    return Ok::<SandboxId, SandboxError>(new_id);
-                }
-                nbd_sandboxes.insert(
-                    new_id,
-                    SandboxDisks {
-                        expected: std::iter::once(DiskRole::Root)
-                            .chain(pending_swap_state.as_ref().map(|_| DiskRole::Swap))
-                            .collect(),
-                        root: state,
-                        swap: None,
-                    },
-                );
-                if let (Some(owner), Some(swap)) = (swap_owner, pending_swap_state) {
-                    if let Err(error) = owner.attach_disk(new_id, DiskRole::Swap, swap).await {
-                        let _ = owner.destroy(new_id).await;
-                        return Err(error);
-                    }
-                }
-                if let Some(poller) = hint_poller {
-                    hint_pollers.insert(new_id, poller);
-                }
-                Ok::<SandboxId, SandboxError>(new_id)
-            });
-            // A JoinError here means the spawned task panicked; the FC restore
-            // either never completed or panicked mid-flight — surface it as a
-            // VM error (the task did NOT insert, so there is no orphan to own).
-            // A cancelled HANDLER future drops THIS await, not the task.
-            return join
-                .await
-                .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
         }
+        .await;
+        if restore.is_err() {
+            if let Some(volumes) = self.volumes.as_ref() {
+                if let Err(error) = volumes.release(id).await {
+                    tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
+                }
+            }
+        }
+        restore
+    }
 
-        let inner = self.inner.clone();
-        let migration_roles = self.migration_roles.clone();
-        let hint_pollers = self.hint_pollers.clone();
-        tokio::spawn(async move {
-            let new_id = if fresh {
-                inner.restore_fresh(metadata, selected_mounts).await?
-            } else {
-                inner.restore(metadata).await?
-            };
-            if let Some(poller) = hint_poller {
-                hint_pollers.insert(
-                    new_id,
-                    monitor_hint_poller(poller, inner.post_copy_control_sock(new_id)),
-                );
+    /// Provision a restored sandbox's disks from the snapshot's manifests.
+    async fn provision_for_restore(
+        &self,
+        volumes: &SessionVolumes,
+        id: SandboxId,
+        metadata: &SnapshotMetadata,
+        src: &Path,
+        fresh: bool,
+        fork_disk: bool,
+    ) -> Result<SessionDisks, SandboxError> {
+        let manifest = metadata.disk_manifest.ok_or_else(|| {
+            SandboxError::MemoryImageUnusable("snapshot has no disk manifest".into())
+        })?;
+        let base = metadata.base_disk_manifest;
+        let root = if fork_disk {
+            Source::Fork { manifest, base }
+        } else {
+            Source::Continue { manifest, base }
+        };
+        let sidecar = read_sidecar_swap(src).await?;
+        let swap = match (metadata.swap_manifest, sidecar.swap_mib) {
+            (Some(_), 0) => {
+                return Err(SandboxError::MemoryImageUnusable(
+                    "swap manifest has no device geometry".into(),
+                ));
             }
-            if post_copy_dest {
-                migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
+            (None, 0) => None,
+            (Some(_), _) if fresh => {
+                return Err(SandboxError::Snapshot(
+                    "base snapshot contains swap state".into(),
+                ));
             }
-            Ok(new_id)
+            (Some(manifest), _) => Some(Source::Continue {
+                manifest,
+                base: None,
+            }),
+            (None, _) if !fresh && !sidecar.base_capture => {
+                return Err(SandboxError::MemoryImageUnusable(
+                    "swap restore has no manifest; refusing a stale device".into(),
+                ));
+            }
+            (None, mib) => Some(Source::Empty {
+                size_bytes: mib << 20,
+            }),
+        };
+        let provisioned = volumes
+            .provision(id, root, swap)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("provision session disks: {e}").into()))?;
+        Ok(SessionDisks {
+            root: provisioned.root,
+            swap: provisioned.swap,
         })
-        .await
-        .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
     }
 
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
-        // ADR 0062: the bundle dir is the INNER backend's — never set
-        // independently. The PooledBackend materializes pinned generations into
-        // the exact dir the inner backend reads them from, so there's a single
-        // source of truth (the backend config, set once from ENGRAM_BUNDLE_DIR /
-        // the SHARED_DIR default) and no way to make them disagree.
         let bundle_dir = inner.bundle_dir().to_path_buf();
-        let session_bindings: Arc<DashMap<SandboxId, SessionId>> = Arc::new(DashMap::new());
-        let quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>> =
-            Arc::new(DashMap::new());
-        // ADR 0116 C4: the escalation sink shares the survivor map and
-        // the binding index with the backend itself.
-        let data_plane_health = Arc::new(QuarantineDataPlaneHealth {
-            quarantined_survivors: quarantined_survivors.clone(),
-            session_bindings: session_bindings.clone(),
-        });
         Self {
             inner,
             teardowns: Default::default(),
+            volumes: None,
             image_cache: None,
             egress: None,
-            session_bindings,
-            quarantined_survivors,
+            session_bindings: Arc::new(DashMap::new()),
             unreachable_guests: Arc::new(DashMap::new()),
             dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
             peer_health: crate::peer_fill::PeerHealth::new(),
-            materialize_dir: None,
             bundle_dir,
             chunk_cache: None,
-            dirty_root: None,
-            materialize_lock: Mutex::new(()),
             materialize_scratch: None,
             materialize_gate: Arc::new(tokio::sync::Mutex::new(())),
             oci_client: None,
-            nbd_pool: None,
-            #[cfg(target_os = "linux")]
-            nbd_sandboxes: Arc::new(DashMap::new()),
-            #[cfg(target_os = "linux")]
-            nbd_owners: None,
-            #[cfg(target_os = "linux")]
-            recovery_owners: std::collections::HashMap::new(),
-            #[cfg(target_os = "linux")]
-            nbd_residue: Arc::new(DashMap::new()),
-            // engrams#1378: flips false when an NBD pool is wired
-            // (`with_nbd_pool`) — a pool-less host has nothing to classify,
-            // so its residue report is vacuously known-empty.
-            nbd_residue_known: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             held_snapshots: DashMap::new(),
-            #[cfg(target_os = "linux")]
-            blank_swap_bases: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
-            // ADR 0016 Phase B: scheduler defaults come from env at
-            // host-agent startup; the builder method
-            // `with_flush_scheduler` can override.
-            flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
-            live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
-            live_manifest_publisher_handle: None,
-            data_plane_health,
             checkpoint_dir: None,
+            checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
             chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
-            capture_locks: Arc::new(DashMap::new()),
+            capture_gates: Arc::new(DashMap::new()),
             pending_finalizes: Arc::new(DashMap::new()),
             self_ref: Arc::new(std::sync::OnceLock::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
@@ -2397,25 +1513,90 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             drained_dests: Arc::new(DashMap::new()),
             hint_pollers: Arc::new(DashMap::new()),
-            #[cfg(target_os = "linux")]
-            abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
         }
     }
 
-    /// Whether this host runs the chunked-disk NBD data plane — the same
-    /// `(nbd_pool, chunk_store, chunk_cache)` triple `prepare_resume_nbd_attach`
-    /// gates the NBD attach path on. When true, a sandbox with a `/dev/nbd*`
-    /// rootfs is EXPECTED to have live NBD state (an `nbd_sandboxes` entry on
-    /// Linux); its absence is the post-roll-survivor corruption class the D4/D5
-    /// guards refuse to snapshot/resume through. When false (macOS/dev, or a
-    /// Linux host before `nbds_max` is wired) the materialize-to-file fallback
-    /// is the legitimate path and a missing entry is expected.
-    fn host_runs_nbd_data_plane(&self) -> bool {
-        self.nbd_pool.is_some() && self.chunk_store.is_some() && self.chunk_cache.is_some()
+    /// The session disks of this host's sandboxes.
+    pub fn with_session_volumes(mut self, volumes: Arc<SessionVolumes>) -> Self {
+        self.volumes = Some(volumes);
+        self
+    }
+
+    pub fn session_volumes(&self) -> Option<&Arc<SessionVolumes>> {
+        self.volumes.as_ref()
+    }
+
+    fn volumes(&self) -> Result<&Arc<SessionVolumes>, SandboxError> {
+        self.volumes
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("this host has no session disk".into()))
+    }
+
+    /// A snapshot of each of the sandbox's disks while the guest runs,
+    /// with the blocks it changed since the checkpoint. Nothing is left
+    /// behind when one role fails.
+    async fn take_precopy(
+        &self,
+        volumes: &SessionVolumes,
+        id: SandboxId,
+    ) -> Result<std::collections::BTreeMap<DiskRole, Arc<DiskSeal>>, SandboxError> {
+        let mut taken: Vec<(DiskRole, PendingCheckpoint)> = Vec::new();
+        let diffed = async {
+            let mut precopy = std::collections::BTreeMap::new();
+            for role in volumes.roles(id).await.map_err(disk_err)? {
+                let pending = volumes
+                    .take_precopy(id, role)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
+                taken.push((role, pending));
+                let pending = &taken.last().expect("just pushed").1;
+                let changed = volumes
+                    .changed_blocks(pending, MIGRATION_DISK_BLOCK_BYTES)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("{role} disk precopy diff: {e}"))
+                    })?;
+                precopy.insert(role, changed);
+            }
+            Ok::<_, SandboxError>(precopy)
+        }
+        .await;
+        match diffed {
+            Ok(mut changed) => Ok(taken
+                .into_iter()
+                .map(|(role, pending)| {
+                    let sealed = changed.remove(&role).expect("one diff per snapshot");
+                    (
+                        role,
+                        Arc::new(DiskSeal {
+                            pending,
+                            sealed: sealed.into_iter().collect(),
+                        }),
+                    )
+                })
+                .collect()),
+            Err(error) => {
+                for (_, pending) in taken {
+                    discard_pending(volumes, pending).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The live volumes of a sandbox, by role.
+    async fn live_volumes(&self, id: SandboxId) -> Result<Vec<(DiskRole, Volume)>, SandboxError> {
+        let Some(volumes) = self.volumes.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut live = Vec::new();
+        for role in volumes.roles(id).await.map_err(disk_err)? {
+            live.push((role, volumes.live(id, role).await.map_err(disk_err)?));
+        }
+        Ok(live)
     }
 
     /// ADR 0045 C2: install the page server handle (startup wiring; a
@@ -2477,6 +1658,28 @@ impl PooledBackend {
         self.migrations.state_served(id)
     }
 
+    /// Carry out the export TTL sweep's verdict. The abort re-checks
+    /// `state_served` in the same step that consumes the export, so a
+    /// fetch after the verdict leaves the source paused.
+    pub async fn run_export_ttl_verdict(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        verdict: crate::migration::TtlVerdict,
+    ) -> Result<(), SandboxError> {
+        use crate::migration::TtlVerdict;
+        match verdict {
+            TtlVerdict::AbortInPlace => {
+                if !self.migration_abort_unserved(id, export_id).await? {
+                    tracing::warn!(sandbox_id = %id, "export state served after the TTL verdict; stays paused");
+                }
+                Ok(())
+            }
+            TtlVerdict::Destroy => self.migration_commit(id, export_id).await,
+            TtlVerdict::StayPaused => Ok(()),
+        }
+    }
+
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
     /// (`rolling/` + `records/` subdirs are created lazily). Without
     /// this, `snapshot()` stays pure-Full and the periodic driver
@@ -2495,32 +1698,15 @@ impl PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
     }
 
-    /// The per-sandbox capture serialization lock (periodic
-    /// checkpoint vs eviction/drain/SIGTERM snapshot).
-    fn capture_lock(&self, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
-        self.capture_locks
-            .entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    fn capture_gate(&self, id: SandboxId) -> Arc<CaptureGate> {
+        self.capture_gates.entry(id).or_default().clone()
     }
 
-    /// ADR 0038 B1: is a capture (eviction / evac / drain / a prior
-    /// checkpoint) currently holding this sandbox's capture lock? The
-    /// periodic checkpoint driver probes this and SKIPS the tick when
-    /// it returns true — a best-effort checkpoint must never *queue*
-    /// behind another capture, which is how one slow/hung capture
-    /// gridlocked the fleet (the 52–151 s dark `host.snapshot` waits in
-    /// the 5fadd364 incident). `try_lock` is the probe: a held lock
-    /// means a capture is in flight.
-    ///
-    /// A benign sub-ms race remains — a capture can start between this
-    /// probe and `snapshot()`'s own blocking acquire, in which case the
-    /// periodic tick queues behind that *one* fresh capture rather than
-    /// skipping. That's harmless: the gridlock we're killing is queuing
-    /// behind a HUNG capture, which the probe catches (try_lock fails)
-    /// and skips outright; the next tick retries regardless.
+    /// ADR 0038 B1: whether a capture or a harness spawn holds this
+    /// sandbox's gate. Callers that must not queue behind either (the
+    /// periodic driver, the external pause) skip on `true`.
     pub fn capture_in_flight(&self, id: SandboxId) -> bool {
-        self.capture_lock(id).try_lock().is_err()
+        self.capture_gate(id).in_flight()
     }
 
     /// 2026-08-03 `chain_poisoned` alert: refuse to START any new capture
@@ -2555,15 +1741,17 @@ impl PooledBackend {
         // Snapshot the lock set; the quiesce flag guarantees no NEW
         // capture can begin, so entries added after this point are
         // uncontended.
-        let locks: Vec<(SandboxId, Arc<tokio::sync::Mutex<()>>)> = self
-            .capture_locks
+        let gates: Vec<(SandboxId, Arc<CaptureGate>)> = self
+            .capture_gates
             .iter()
             .map(|e| (*e.key(), Arc::clone(e.value())))
             .collect();
         let mut stragglers = 0usize;
-        for (id, lock) in locks {
+        for (id, gate) in gates {
             let remaining = deadline.saturating_sub(start.elapsed());
-            match tokio::time::timeout(remaining, lock.lock()).await {
+            match tokio::time::timeout(remaining, gate.serialize(id, CaptureUser::ShutdownDrain))
+                .await
+            {
                 // Acquiring proves no capture holds the lock; release
                 // immediately (the quiesce flag keeps it that way).
                 Ok(_guard) => {}
@@ -2592,8 +1780,7 @@ impl PooledBackend {
     /// clones of the PooledBackend's.
     pub(crate) fn finisher(&self) -> SnapshotFinisher {
         SnapshotFinisher {
-            #[cfg(target_os = "linux")]
-            nbd_sandboxes: self.nbd_sandboxes.clone(),
+            volumes: self.volumes.clone(),
             chunk_store: self.chunk_store.clone(),
             chunk_cache: self.chunk_cache.clone(),
             bundle_dir: self.bundle_dir.clone(),
@@ -2603,6 +1790,7 @@ impl PooledBackend {
             checkpoint_pacing: self.checkpoint_pacing.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
+            checkpoint_recorded: self.checkpoint_recorded.clone(),
             chain_heads: self.chain_heads.clone(),
             session_bindings: self.session_bindings.clone(),
             clock: self.clock.clone(),
@@ -2647,7 +1835,9 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<DeferredSnapshot, SandboxError> {
-        let (capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (capture_guard, cap) = self
+            .capture_phase(id, CaptureUser::DeferredSnapshot)
+            .await?;
         self.spawn_trace_publish(id);
         // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
         // canonical background bulk producer — nested-capped so it can
@@ -2667,7 +1857,7 @@ impl PooledBackend {
     /// `Arc::new(p)` — before that, `eviction_finalizer()` builds a bundle
     /// whose `self_ref` can never upgrade, and any finalize job it drives
     /// silently skips its own destroy call (logged, not fatal — the
-    /// teardown reconcile / orphan_reap backstop it, but it's a real gap).
+    /// teardown reconcile backstops it, but it's a real gap).
     /// A second call is a startup-order bug; logged and ignored rather
     /// than panicking (mirrors `set_migrate_peer_server`).
     pub fn set_self_ref(&self, arc: &Arc<PooledBackend>) {
@@ -2682,11 +1872,13 @@ impl PooledBackend {
     pub(crate) fn eviction_finalizer(&self) -> Option<crate::eviction_finalize::EvictionFinalizer> {
         let checkpoint_dir = self.checkpoint_dir.clone()?;
         Some(crate::eviction_finalize::EvictionFinalizer::new(
+            self.volumes.clone(),
             self.chunk_store.clone(),
             self.chunk_cache.clone(),
             self.bundle_dir.clone(),
             self.bundle_file_ext(),
             checkpoint_dir,
+            self.checkpoint_recorded.clone(),
             self.pending_finalizes.clone(),
             Arc::new(PooledDestroyer {
                 self_ref: self.self_ref.clone(),
@@ -2694,6 +1886,39 @@ impl PooledBackend {
             self.host_fs.clone(),
             crate::eviction_finalize::max_attempts(),
         ))
+    }
+
+    /// Delete the volumes of every sandbox that is neither alive nor
+    /// awaiting an eviction finalize. Runs once at startup, after the
+    /// reattach pass fixes the live set and before anything can
+    /// provision a sandbox.
+    pub async fn reconcile_volumes(&self) {
+        let Some(volumes) = &self.volumes else {
+            return;
+        };
+        let live = match self.inner.list().await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "volume reconcile skipped: cannot list sandboxes");
+                return;
+            }
+        };
+        let finalizer = self.eviction_finalizer();
+        match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
+            Ok(report) => {
+                if !report.deleted.is_empty() || !report.failed.is_empty() {
+                    tracing::info!(
+                        deleted = report.deleted.len(),
+                        failed = report.failed.len(),
+                        "startup volume reconcile",
+                    );
+                }
+                for (name, error) in &report.failed {
+                    tracing::warn!(volume = %name, %error, "volume reconcile: delete failed");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "startup volume reconcile failed"),
+        }
     }
 
     /// Issue #529: re-drive every un-acked eviction finalize record at
@@ -2723,13 +1948,13 @@ impl PooledBackend {
                 .pending_finalizes
                 .insert(record.sandbox_id, record.snapshot_id);
             metrics::counter!(crate::metrics::EVICTION_FINALIZE_REDRIVEN_TOTAL).increment(1);
-            let capture_lock = self.capture_lock(record.sandbox_id);
+            let gate = self.capture_gate(record.sandbox_id);
             let f = finalizer.clone();
             tokio::spawn(async move {
-                let guard = capture_lock.lock_owned().await;
-                // Startup redrive: a fresh process has no hot disk bytes
-                // by definition — the disk leg reads the journal.
-                crate::eviction_finalize::run_eviction_finalize(f, record, guard, None).await;
+                let guard = gate
+                    .serialize(record.sandbox_id, CaptureUser::FinalizeRedrive)
+                    .await;
+                crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
             });
         }
     }
@@ -2801,23 +2026,32 @@ impl PooledBackend {
         });
     }
 
-    /// ADR 0045 D5: pause + drain + FC capture. Returns the held capture
-    /// lock (the caller decides whether the post phase runs inline or in
-    /// a background task — the lock must span it either way, so a
-    /// concurrent periodic checkpoint's `capture_in_flight` try_lock
-    /// keeps skipping until the upload completes) and the capture
-    /// artifacts the post phase consumes.
+    /// ADR 0045 D5: pause + drain + FC capture. Returns the capture lock,
+    /// which the post phase must hold wherever it runs, and the artifacts
+    /// the post phase consumes. The quiesce guard ends on return. A
+    /// [`CaptureUser::HeldCapture`] leaves the guest paused.
+    #[tracing::instrument(
+        name = "host.capture_phase",
+        skip_all,
+        fields(
+            sandbox_id = %id,
+            user = user.as_str(),
+            snap_type = tracing::field::Empty,
+            paused_ms = tracing::field::Empty,
+        )
+    )]
     async fn capture_phase(
         &self,
         id: SandboxId,
-        hold: bool,
+        user: CaptureUser,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
-        let capture_lock = self.capture_lock(id);
+        let hold = user == CaptureUser::HeldCapture;
+        let gate = self.capture_gate(id);
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
         // B1 periodic checkpoints skip rather than queue, so a long tail
         // here is an eviction/drain blocked on an in-flight capture.
         let lock_wait = crate::time_source::metrics_now();
-        let capture_guard = capture_lock.lock_owned().await;
+        let capture_guard = gate.serialize(id, user).await;
         if self.held_snapshots.contains_key(&id)
             || self.migration_role(id) == Some(crate::migration::MigrationRole::HeldSource)
         {
@@ -2847,7 +2081,7 @@ impl PooledBackend {
         // chain seeds on the first (Full) capture below — so an
         // eviction on a long-running session is just the final diff
         // in its checkpoint chain, collapsing the multi-GiB-dump
-        // window the cf4d4afd incident sat in.
+        // window.
         let chain_prev = self
             .checkpoint_chains
             .get(&id)
@@ -2881,9 +2115,9 @@ impl PooledBackend {
         // and commit), tear down its artifacts BEFORE we mint a fresh
         // SnapshotId. This is the overwrite-in-place semantic that
         // keeps the host-side disk bounded under coord-side retry
-        // storms — the prod incident on `engrams-fc-xngk` leaked
-        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
-        // id and left the prior dir on disk.
+        // storms. Without it, each retry mints a fresh id and leaves
+        // the prior 4 GiB dir on disk; 25 retries fill a host in
+        // 13 min.
         if self.inflight_snapshots.contains_key(&id) {
             if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
                 tracing::warn!(
@@ -2922,37 +2156,21 @@ impl PooledBackend {
         // with the per-sandbox agent_ready watch; non-FC backends
         // (Process, future) return `InvalidSpec` from the default trait
         // impl, which we treat as "no readiness concept here, proceed."
-        match self.inner.wait_agent_ready(id).await {
+        match self
+            .inner
+            .wait_agent_ready(id)
+            .instrument(tracing::info_span!("capture.agent_ready"))
+            .await
+        {
             Ok(()) => {}
             Err(SandboxError::InvalidSpec(_)) => {}
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
 
-        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
-        //   pause → wait_idle → flush_local(drain) → inner.snapshot
-        //   → [resume] → flush_upload(GCS) (in the `post` block)
-        // where inner.snapshot's internal pause/capture/resume is a
-        // no-op pause (FC's PATCH /vm is idempotent) followed by the
-        // memory dump and a resume that brings the VM back running.
-        // This guarantees memory + disk are CAPTURED at the same point
-        // in time: the explicit pause stops vCPUs, wait_idle drains any
-        // in-flight virtio writes through the NBD daemon, flush_local
-        // drains the just-quiesced dirty set locally, and inner.snapshot
-        // then captures the page cache (which agrees with that disk
-        // state). The disk GCS upload is deferred to flush_upload AFTER
-        // resume — off the frozen-guest path — but the captured *content*
-        // is fixed at the drain, so coherence is unchanged.
-        //
-        // Pre-12m ordering was flush → inner.snapshot (FC's pause
-        // happened inside the inner call AFTER our flush). Writes
-        // queued between flush and pause landed in memory but not
-        // the drained disk set — the cross-host evac canary md5
-        // mismatch on dev-vm validation was exactly this race.
-        //
-        // ADR 0028 A.log: the pause instant is the coherence cut for
-        // the (memory, disk, event-log) triple — the coord resolves
-        // the session_events cursor as "last event at or before this"
-        // when it records the checkpoint.
+        let _quiesce = gate.quiesce(id, user).await;
+        // The pause instant is the coherence cut for memory, disk, and
+        // the event log: the coordinator resolves the session_events
+        // cursor against it.
         if hold {
             // Persisted BEFORE the pause: a host-agent that restarts while
             // the move is open re-adopts this VM as a frozen source (never
@@ -2962,115 +2180,36 @@ impl PooledBackend {
                 .await?;
         }
         let paused_at = self.clock.now_utc();
+        let pause_started = crate::time_source::metrics_now();
         self.inner
             .pause(id)
+            .instrument(tracing::info_span!("capture.pause"))
             .await
             .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
 
-        // Issue #202: arm the unwind guard the instant the guest is
-        // paused. Unlike the migration paths this path raises no fence,
-        // and `inner.snapshot` below resumes the guest on success — but
-        // if `inner.snapshot` returns `Err` (FC `PUT /snapshot/create`
-        // can hang 60 s then fail) or the handler future is cancelled
-        // here, the guest stays paused and the drained dirty buffer is
-        // lost. The guard owns the drained `PendingDiskFlush` and rides
-        // inside the returned `SnapshotCapture` until the finisher's
-        // `flush_upload` takes it over (covering the cancellation gap in
-        // `snapshot_begin` between this return and the finisher spawn).
-        let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+        // Armed the instant the guest is paused: a failure or a dropped
+        // handler future from here must resume it and discard what the
+        // capture took.
+        let mut unwind = CaptureUnwind::new(self, id);
         unwind.resume_on_drop = !hold;
         unwind.arm();
 
-        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
-        // (+ hash + stash in the backend's pending tier) — the
-        // multi-second GCS upload is deferred to `flush_upload` after
-        // the guest resumes (the `post` block below), so the
-        // guest-visible pause is O(local copy), not O(GCS). The drain
-        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
-        // memory capture below is paired with it.
-        #[cfg(target_os = "linux")]
-        {
-            // INVARIANT (see `nbd_sandboxes`): clone the Arc out of the
-            // guard, then drop it BEFORE any `.await` — a held guard
-            // across the drain/upload below parks contending
-            // `destroy`/`create` workers on the shard's sync RwLock and
-            // can deadlock the runtime.
-            if self.nbd_sandboxes.contains_key(&id) && !self.all_disks_served(id) {
-                return Err(SandboxError::Snapshot(
-                    "sandbox has an unserved owned NBD device".into(),
-                ));
-            }
-            let disk_backends = self.disk_backends(id);
-            if !disk_backends.is_empty() {
-                for (role, backend) in disk_backends {
-                    if role == DiskRole::Swap && self.inner.is_base_capture(id) {
-                        continue;
-                    }
-                    // Drain in-flight NBD requests so the drain sees a quiescent
-                    // dirty buffer. With FC paused above, no new virtio writes
-                    // are issued, and wait_idle returns once already-in-flight
-                    // requests have completed through backend.write().
-                    // `flush_local` then syncs the HOST page cache for
-                    // /dev/nbdN down first (the capture primitive owns that
-                    // sync — see `ChunkedDiskBackend::sync_host_device`), so
-                    // the drain captures the guest-acked bytes, not just what
-                    // background writeback (~30 s) happened to deliver.
-                    backend.wait_idle().await;
-                    let pending = backend
-                        .flush_local()
-                        .await
-                        .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-                    // Issue #202: the dirty buffer now lives only in
-                    // `pending` — move it into the guard so any error/cancel
-                    // before the finisher takes over re-queues it (and
-                    // resumes the guest). `fenced` stays false: this path
-                    // never raises the migration fence.
-                    unwind.disk_backend.insert(role, backend);
-                    unwind.disk_pending.insert(role, pending);
+        // Under the pause, only snapshot the disks: the upload runs in the
+        // finisher after the guest resumes, so the pause is O(snapshot).
+        // The content is fixed here, paired with the memory capture below.
+        if let Some(volumes) = self.volumes.as_ref() {
+            for role in volumes.roles(id).await.map_err(disk_err)? {
+                if role == DiskRole::Swap && self.inner.is_base_capture(id) {
+                    continue;
                 }
-            } else {
-                // The 2026-07-17 corruption path (session 03e6535e): a
-                // sandbox with an NBD-backed rootfs but NO `nbd_sandboxes`
-                // entry is a post-pod-roll survivor whose in-pod NBD server
-                // died with the old host-agent and was never rehydrated
-                // (the #739 family). Silently skipping the drain here
-                // records a snapshot with `disk_manifest=None` +
-                // `recoverable=true` — dropping EVERY acked disk write of
-                // the session and poisoning its lineage (the next resume
-                // then boots onto a literal /dev/nbdN — see
-                // `prepare_resume_nbd_attach`'s D4 guard). The verdict is
-                // the pure `plan_capture_disk_drain` (ADR 0098 G2 — the
-                // survivor-invisibility family's capture leg, which the
-                // host simulator drives): refuse rather than skip; the
-                // error requeues the eviction op (redrive-safe). The skip
-                // stays correct for a legitimately non-NBD rootfs
-                // (macOS/dev/flat-file), which `rootfs_device` reports as
-                // `None`.
-                let rootfs_dev = self.inner.rootfs_device(id);
-                let rootfs_is_nbd = rootfs_dev
-                    .as_ref()
-                    .is_some_and(|d| d.to_string_lossy().starts_with("/dev/nbd"));
-                if matches!(
-                    engram_host_core::plan_capture_disk_drain(
-                        false,
-                        self.host_runs_nbd_data_plane(),
-                        rootfs_is_nbd,
-                    ),
-                    engram_host_core::CaptureDrainPlan::RefuseUntracked
-                ) {
-                    let dev = rootfs_dev.expect("RefuseUntracked implies an nbd rootfs device");
-                    return Err(SandboxError::Snapshot(format!(
-                        "sandbox {id} has an NBD-backed rootfs ({}) but no nbd_sandboxes \
-                         entry — a post-roll survivor whose disk server is gone. Refusing to \
-                         snapshot with disk_manifest=None (would drop the session's acked \
-                         disk writes and poison its lineage); the session must be rehydrated \
-                         or evicted-locally first.",
-                        dev.display(),
-                    )));
-                }
+                let pending = volumes
+                    .take(id, role)
+                    .instrument(tracing::info_span!("capture.disk_take", %role))
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk checkpoint: {e}")))?;
+                unwind.pending.push(pending);
             }
         }
-
         // ADR 0007 Phase 6: backend owns its staging dir; we look
         // it up via snapshot_path_for after the inner call so we
         // can read/patch the on-disk artifacts the inner backend
@@ -3084,6 +2223,7 @@ impl PooledBackend {
         // cold Full seed. After B2, `type="full"` should vanish on the
         // resume path (chain seeded → diff).
         let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
+        tracing::Span::current().record("snap_type", snap_type);
         let create_start = crate::time_source::metrics_now();
         let create_res = if hold {
             self.inner.snapshot_hold(id, chain_prev.is_some()).await
@@ -3092,6 +2232,11 @@ impl PooledBackend {
         } else {
             self.inner.snapshot(id).await
         };
+        if !hold {
+            // The inner create resumed the guest before it returned.
+            tracing::Span::current()
+                .record("paused_ms", pause_started.elapsed().as_millis() as u64);
+        }
         metrics::histogram!(
             crate::metrics::SNAPSHOT_CREATE_SECONDS,
             "type" => snap_type,
@@ -3256,7 +2401,7 @@ impl PooledBackend {
     /// ADR 0045 C2 (destination): stage the presetup's restore package
     /// — the sidecar, the inline session manifest, and the peer spec —
     /// then arm the fetch poller (spawned inside `restore_with` once
-    /// the NBD handle exists). No export artifacts exist yet: the
+    /// the session volumes exist). No export artifacts exist yet: the
     /// source hasn't paused.
     async fn postcopy_stage(
         &self,
@@ -3314,48 +2459,65 @@ impl PooledBackend {
         Ok(())
     }
 
-    /// ADR 0045 C2 (destination): the fetch poller. Once the source's
-    /// capture lands (the export starts answering), pull the disk
-    /// SEAL descriptor, rebase the NBD attach to the source's
-    /// published base manifest + arm the peer overlay (sealed chunks
-    /// demand-fault from the frozen source's RAM), spawn the
-    /// background drain, then write `state.bin` LAST — its appearance
-    /// is the FC load gate. No chunk staging, no uploads: the drain
-    /// unfences the publisher when the disk is self-sufficient, and
-    /// durability rides the dest's normal flush cadence from there.
-    #[cfg(target_os = "linux")]
+    /// The destination's fetch poller. While the source guest still
+    /// runs, pull the presetup's precopy tier into the live volumes.
+    /// Once the capture lands (the seal answers), pull `state.bin` and
+    /// the seal tier, then write `state.bin` last: its appearance is the
+    /// FC load gate, so the guest never runs on a disk that could be
+    /// stale. Every error arm returns without landing `state.bin`; the
+    /// load gate times out and the coordinator aborts to the source
+    /// with zero loss.
     fn spawn_postcopy_fetch_poller(
         &self,
         pending: PostCopyDestPending,
         dest_dir: std::path::PathBuf,
-        nbd: Vec<(
-            DiskRole,
-            Arc<crate::disk_daemon::ChunkedDiskBackend>,
-            std::path::PathBuf,
-        )>,
+        live: Vec<(DiskRole, Volume)>,
     ) -> tokio::task::JoinHandle<()> {
+        use engram_core::types::snapshot::MigrationItem;
+        let parent = tracing::Span::current();
         tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(240);
             let started = crate::time_source::metrics_now();
             let tmp = dest_dir.join("postcopy-tmp");
             let _ = fs::create_dir_all(&tmp).await;
 
-            // 1. Poll until the export serves (capture done). Dial
-            //    ONCE and poll tight over the live channel — the old
-            //    250 ms sleep (plus a fresh TCP+HTTP/2 handshake per
-            //    attempt) was a pure blackout tax whenever the
-            //    pre-stage finished before the capture; a failed
-            //    attempt is a sub-ms NotFound on the pod network.
+            // Dial once and poll tight over the live channel; a failed
+            // attempt is a sub-ms NotFound on the pod network.
             let mut source: Option<engram_protocol::grpc_client::GrpcHostClient> = None;
-            // These are destination roles; a source without one fails the fetch loudly.
-            let mut roles: Vec<_> = nbd.iter().map(|(role, _, _)| *role).collect();
-            if roles.is_empty() {
-                roles.push(DiskRole::Root);
+            // The tiers in order; each one is polled until the source
+            // serves it.
+            #[derive(Clone, Copy, Debug)]
+            enum Stage {
+                Precopy,
+                StateBin,
+                Seal,
             }
-            let (state_tmp, fetch_ms) = loop {
+            impl Stage {
+                /// The span stays open until the source serves the stage,
+                /// so it includes the wait for the source.
+                fn span(self, parent: &tracing::Span) -> tracing::Span {
+                    let blocks = tracing::field::Empty;
+                    match self {
+                        Stage::Precopy => {
+                            tracing::info_span!(parent: parent, "move.dest_precopy", blocks)
+                        }
+                        Stage::StateBin => {
+                            tracing::info_span!(parent: parent, "move.dest_state_bin")
+                        }
+                        Stage::Seal => {
+                            tracing::info_span!(parent: parent, "move.dest_seal", blocks)
+                        }
+                    }
+                }
+            }
+            let mut stage = Stage::Precopy;
+            let mut stage_span = stage.span(&parent);
+            let (mut precopy_blocks, mut sealed_blocks) = (0, 0);
+            loop {
                 if started.elapsed() > budget {
                     tracing::error!(
                         export_id = %pending.export_id,
+                        ?stage,
                         "post-copy fetch poller timed out; the FC load gate will tear the restore down",
                     );
                     return;
@@ -3371,161 +2533,80 @@ impl PooledBackend {
                         }
                     },
                 };
-                let t_fetch = crate::time_source::metrics_now();
-                match Self::fetch_postcopy_artifacts(
-                    client,
-                    &pending.export_id,
-                    &tmp,
-                    &roles
-                        .iter()
-                        .copied()
-                        .map(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
-                        .chain(std::iter::once(
-                            engram_core::types::snapshot::MigrationItem::StateBin,
-                        ))
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                {
-                    Ok(()) => break (tmp.join("state.bin"), t_fetch.elapsed().as_millis() as u64),
+                let next = match stage {
+                    Stage::Precopy => Self::pull_disk_tier(
+                        client,
+                        &pending.export_id,
+                        &live,
+                        MigrationItem::DiskPrecopyInfo,
+                    )
+                    .instrument(stage_span.clone())
+                    .await
+                    .map(|blocks| {
+                        precopy_blocks = blocks;
+                        stage_span.record("blocks", blocks);
+                        Some(Stage::StateBin)
+                    }),
+                    Stage::StateBin => Self::fetch_postcopy_artifacts(
+                        client,
+                        &pending.export_id,
+                        &tmp,
+                        &[MigrationItem::StateBin],
+                    )
+                    .instrument(stage_span.clone())
+                    .await
+                    .map(|()| Some(Stage::Seal)),
+                    Stage::Seal => Self::pull_disk_tier(
+                        client,
+                        &pending.export_id,
+                        &live,
+                        MigrationItem::DiskSealInfo,
+                    )
+                    .instrument(stage_span.clone())
+                    .await
+                    .map(|blocks| {
+                        sealed_blocks = blocks;
+                        stage_span.record("blocks", blocks);
+                        None
+                    }),
+                };
+                match next {
+                    Ok(None) => break,
+                    Ok(Some(reached)) => {
+                        stage = reached;
+                        stage_span = stage.span(&parent);
+                    }
+                    // Not served yet: the export is not open or the
+                    // capture has not run.
+                    Err(SandboxError::NotFound) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    }
+                    // A transport failure poisons the cached channel.
                     Err(e) => {
-                        // A transport-level failure poisons the cached
-                        // channel; NotFound (export not open yet) does
-                        // not.
-                        if !matches!(e, SandboxError::NotFound) {
-                            tracing::debug!(error = %e, "post-copy fetch not ready; retrying");
-                            source = None;
-                        }
+                        tracing::debug!(error = %e, ?stage, "post-copy fetch not ready; retrying");
+                        source = None;
                         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                     }
                 }
+            }
+            drop(stage_span);
+            let Some(client) = source.as_ref() else {
+                return;
             };
 
-            // 2. Parse the seal; rebase NBD to the source's published
-            //    base + arm the overlay; spawn the drain. Every error
-            //    arm here returns WITHOUT landing state.bin — the FC
-            //    load gate times out → NeverLoaded → the coordinator
-            //    aborts to the source, zero loss. Never resume on a
-            //    disk that could be stale.
-            #[derive(serde::Deserialize)]
-            struct SealInfo {
-                sealed_chunk_indices: Vec<u64>,
-                manifest: Option<engram_chunk_store::Manifest>,
-                disk_ref_bincode: Option<Vec<u8>>,
-            }
-            for role in roles {
-                let device_state = nbd
-                    .iter()
-                    .find(|(r, _, _)| *r == role)
-                    .map(|(_, backend, path)| (backend, path));
-                let info: SealInfo = match fs::read(tmp.join(role.seal_file_name())).await {
-                    Ok(bytes) => match serde_json::from_slice(&bytes) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            tracing::error!(error = %e,
-                            "post-copy disk seal parse failed; NOT landing state.bin");
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!(error = %e,
-                        "post-copy disk seal read failed; NOT landing state.bin");
-                        return;
-                    }
-                };
-                match (device_state, info.manifest) {
-                    (Some((nbd, device)), Some(manifest)) => {
-                        let Some(rref) = info
-                            .disk_ref_bincode
-                            .as_deref()
-                            .and_then(|b| bincode::deserialize(b).ok())
-                        else {
-                            tracing::error!(
-                                "post-copy disk seal missing/invalid ref; NOT landing state.bin"
-                            );
-                            return;
-                        };
-                        let fetcher = Arc::new(GrpcPostCopyDiskFetcher::new(
-                            pending.source_addr.clone(),
-                            pending.export_id.clone(),
-                            role,
-                        ));
-                        match nbd
-                            .install_postcopy_overlay(
-                                &manifest,
-                                rref,
-                                &info.sealed_chunk_indices,
-                                fetcher,
-                            )
-                            .await
-                        {
-                            Ok(_subscription) => {
-                                tracing::info!(
-                                    export_id = %pending.export_id,
-                                    sealed = info.sealed_chunk_indices.len(),
-                                    "post-copy disk overlay armed (sealed chunks demand-fault P2P)",
-                                );
-                                nbd.clone().spawn_postcopy_drain();
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e,
-                                "post-copy disk overlay install failed; NOT landing state.bin");
-                                return;
-                            }
-                        }
-                        // Drop the device's host page cache (BLKFLSBUF):
-                        // the kernel's udev/partition probe read the first
-                        // blocks at CONNECT time — before the overlay — so
-                        // the page cache may hold PRE-divergence bytes for
-                        // sealed chunks (the ext4 superblock region is
-                        // near-always sealed on a live session). FC reads
-                        // /dev/nbdN through that cache; a stale superblock
-                        // served to the resumed guest is the corruption
-                        // class this line exists for.
-                        if let Err(e) = crate::disk_daemon::flush_block_device_cache(device) {
-                            tracing::error!(error = %e, device = %device.display(),
-                            "BLKFLSBUF failed; NOT landing state.bin (stale-probe risk)");
-                            return;
-                        }
-                    }
-                    (None, Some(_)) if !info.sealed_chunk_indices.is_empty() => {
-                        // The source sealed dirty disk but this host has
-                        // no NBD data plane to overlay it on — resuming
-                        // would run on a silently-stale rootfs.
-                        tracing::error!(
-                            sealed = info.sealed_chunk_indices.len(),
-                            "post-copy disk seal present but no NBD backend; NOT landing state.bin",
-                        );
-                        return;
-                    }
-                    _ => {
-                        // No chunked disk on the source — nothing to
-                        // overlay; release the publish fence armed at
-                        // attach (nothing gates durability).
-                        if let Some((nbd, _)) = device_state {
-                            nbd.set_migration_fence(false);
-                        }
-                    }
-                }
-            }
-
-            // 3. state.bin LAST — this opens the FC load gate.
-            if let Err(e) = fs::rename(&state_tmp, dest_dir.join("state.bin")).await {
+            if let Err(e) = fs::rename(tmp.join("state.bin"), dest_dir.join("state.bin")).await {
                 tracing::error!(error = %e, "post-copy state.bin land failed");
                 return;
             }
             tracing::info!(
                 export_id = %pending.export_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                fetch_ms,
+                precopy_blocks,
+                sealed_blocks,
                 "post-copy restore inputs staged (state.bin landed)",
             );
             // Demand faults can run now. The hint task polls for the
             // optional artifact, so idle reads do not extend blackout.
             poll_hot_hint(budget.saturating_sub(started.elapsed()), || async {
-                let Some(client) = source.as_ref() else {
-                    return true;
-                };
                 if let Err(error) = Self::fetch_postcopy_artifacts(
                     client,
                     &pending.export_id,
@@ -3562,36 +2643,122 @@ impl PooledBackend {
         })
     }
 
-    /// Await the disk drain's terminal outcome. `None` subscription =
-    /// no overlay (never a disk post-copy, or the drain already
-    /// completed and cleared it) = nothing to wait for.
-    #[cfg(target_os = "linux")]
-    async fn await_disk_drain(
-        sub: Option<crate::disk_daemon::PostCopyDrainSubscription>,
-    ) -> Result<u64, String> {
-        let Some(mut rx) = sub else { return Ok(0) };
-        let wait = async {
-            loop {
-                if let Some(result) = rx.borrow_and_update().clone() {
-                    return result;
-                }
-                if rx.changed().await.is_err() {
-                    // Sender dropped without a terminal value — the
-                    // drain task died. Check the final state once.
-                    return rx
-                        .borrow()
-                        .clone()
-                        .unwrap_or_else(|| Err("disk drain task dropped".into()));
+    /// Pull one tier of disk blocks into the live volumes: the
+    /// descriptor `tier` names for each role, then its blocks. Returns
+    /// the block count; `NotFound` while the source does not serve the
+    /// tier yet.
+    async fn pull_disk_tier(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        live: &[(DiskRole, Volume)],
+        tier: fn(DiskRole) -> engram_core::types::snapshot::MigrationItem,
+    ) -> Result<u64, SandboxError> {
+        let mut blocks = 0;
+        for (role, volume) in live {
+            let info = Self::fetch_disk_info(source, export_id, tier(*role)).await?;
+            Self::fetch_disk_blocks(source, export_id, *role, &info.block_indices, volume).await?;
+            blocks += info.block_indices.len() as u64;
+        }
+        Ok(blocks)
+    }
+
+    /// One descriptor item, read whole.
+    async fn fetch_disk_info(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        item: engram_core::types::snapshot::MigrationItem,
+    ) -> Result<engram_core::types::snapshot::DiskSealInfo, SandboxError> {
+        use futures::StreamExt;
+        let mut stream = source.migration_fetch(export_id, vec![item]).await?;
+        let mut bytes = Vec::new();
+        while let Some(frame) = stream.next().await {
+            bytes.extend_from_slice(&frame?.data);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))
+    }
+
+    /// Write the source's blocks of one disk into the live volume, a few
+    /// batches in flight at once, and sync it.
+    async fn fetch_disk_blocks(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        role: DiskRole,
+        blocks: &[u64],
+        volume: &Volume,
+    ) -> Result<(), SandboxError> {
+        use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
+        const BATCH: usize = 64;
+        const IN_FLIGHT: usize = 4;
+        let mut in_flight = FuturesUnordered::new();
+        let mut failed = None;
+        for batch in blocks.chunks(BATCH) {
+            if in_flight.len() >= IN_FLIGHT {
+                if let Some(Err(e)) = in_flight.next().await {
+                    failed = Some(e);
+                    break;
                 }
             }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(600), wait)
+            in_flight.push(Self::fetch_block_batch(
+                source, export_id, role, batch, volume,
+            ));
+        }
+        // Every batch lands or fails before this returns: a write still
+        // in flight would land under whatever the caller does next.
+        while let Some(done) = in_flight.next().await {
+            if let Err(e) = done {
+                failed.get_or_insert(e);
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        volume
+            .sync()
             .await
-            .map_err(|_| "disk drain timed out (600s)".to_string())?
+            .map_err(|e| SandboxError::Snapshot(format!("sync {role} volume: {e}")))
+    }
+
+    async fn fetch_block_batch(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        role: DiskRole,
+        batch: &[u64],
+        volume: &Volume,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let items = batch
+            .iter()
+            .map(|index| MigrationItem::DiskBlockAt(role, *index))
+            .collect();
+        let mut stream = source.migration_fetch(export_id, items).await?;
+        let mut current: Vec<u8> = Vec::new();
+        while let Some(frame) = stream.next().await {
+            let frame = frame?;
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let Some(index) = batch.get(frame.item_idx as usize) else {
+                    return Err(SandboxError::Snapshot(
+                        "migration fetch: unexpected item index".into(),
+                    ));
+                };
+                volume
+                    .write_range(
+                        index * MIGRATION_DISK_BLOCK_BYTES,
+                        std::mem::take(&mut current),
+                    )
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("write sealed disk block {index}: {e}"))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Dial a migration source's gRPC endpoint.
-    #[cfg(target_os = "linux")]
     async fn dial_migration_source(
         source_addr: &str,
     ) -> Result<engram_protocol::grpc_client::GrpcHostClient, SandboxError> {
@@ -3609,7 +2776,6 @@ impl PooledBackend {
     /// open yet (the poller's retry signal). Takes a CONNECTED client
     /// — the poller reuses one channel across attempts instead of a
     /// TCP+HTTP/2 handshake per poll.
-    #[cfg(target_os = "linux")]
     async fn fetch_postcopy_artifacts(
         source: &engram_protocol::grpc_client::GrpcHostClient,
         export_id: &str,
@@ -3639,7 +2805,6 @@ impl PooledBackend {
                 let name = match item_specs.get(idx) {
                     Some(MigrationItem::StateBin) => "state.bin",
                     Some(MigrationItem::HotHint) => "hot-hint.json",
-                    Some(MigrationItem::DiskSealInfo(role)) => role.seal_file_name(),
                     _ => {
                         return Err(SandboxError::Snapshot(
                             "fetch_postcopy_artifacts: unexpected item".into(),
@@ -3678,158 +2843,12 @@ impl PooledBackend {
     }
 
     /// ADR 0090: repopulate a binding the local table missed (e.g. a
-    /// pidfd-reattached survivor whose NBD rehydrate bailed before the
-    /// insert). Source of truth is the coordinator's `sandbox_owner`
-    /// answer; recording it locally restores the fast path for the
-    /// publisher/reconciler without another RPC.
+    /// pidfd-reattached survivor the registration ack did not list).
+    /// Source of truth is the coordinator's `sandbox_owner` answer;
+    /// recording it locally restores the reconciler's fast path without
+    /// another RPC.
     pub fn record_session_binding(&self, sandbox_id: SandboxId, session_id: SessionId) {
         self.session_bindings.insert(sandbox_id, session_id);
-    }
-
-    /// ADR 0090: the survivors whose NBD slots this generation
-    /// quarantined (rehydrate `RECONFIGURE` failed) — re-advertised in
-    /// every heartbeat until the sandbox is destroyed or the rehydrate
-    /// retry pass re-serves the disk, so the coordinator drives the
-    /// `evict_local → resume` remediation.
-    pub fn quarantined_survivors(&self) -> Vec<engram_protocol::heartbeat::QuarantinedSurvivor> {
-        self.quarantined_survivors
-            .iter()
-            .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
-                sandbox_id: *e.key(),
-                session_id: e.value().session_id,
-                reason: e.value().reason,
-            })
-            .collect()
-    }
-
-    /// Keep the root recovery reference until the whole device set is served.
-    ///
-    /// The quarantine entry is written only from the OUTCOME of the
-    /// recovery (an error, or a device set that is still not fully
-    /// served). It is never written before the recovery runs: the
-    /// heartbeat task advertises this map every 5 s, independently of
-    /// the registration task that runs the rehydrate passes, and the
-    /// coordinator reacts to the first advertise by enqueueing an
-    /// `evict_local` (ADR 0090). A pre-recovery mark for a sandbox that
-    /// then recovers a few seconds later still evicts a healthy VM
-    /// mid-build on every host-agent restart (every deploy, 2026-10).
-    #[cfg(any(test, target_os = "linux"))]
-    async fn track_rehydrate(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        disk_manifest: engram_core::ManifestRef,
-        recovery: impl std::future::Future<Output = Result<bool, SandboxError>>,
-        served: impl Fn() -> Option<bool>,
-    ) -> Result<bool, SandboxError> {
-        let quarantine = || {
-            self.quarantined_survivors
-                .entry(sandbox_id)
-                .and_modify(|q| q.disk_manifest = Some(disk_manifest))
-                .or_insert(QuarantinedSurvivor {
-                    session_id,
-                    disk_manifest: Some(disk_manifest),
-                    retry_attempts: 0,
-                    reason: engram_protocol::heartbeat::QuarantineReason::Rehydrate,
-                });
-        };
-        let result = recovery.await;
-        match served() {
-            _ if result.is_err() => quarantine(),
-            Some(false) => quarantine(),
-            Some(true) => {
-                self.quarantined_survivors.remove(&sandbox_id);
-            }
-            None => {}
-        }
-        result
-    }
-
-    /// 2026-08-02 durability-rollback RCA: one retry pass over the
-    /// quarantined survivors — re-attempt the failed rehydrate for each,
-    /// via [`Self::rehydrate_sandbox`]'s parked-slot reclaim. The
-    /// timer loop in `lib.rs` is a thin wrapper; this is the `run_once`
-    /// step (ADR 0098). Returns how many survivors were recovered.
-    ///
-    /// A recovered survivor leaves `quarantined_survivors` (its
-    /// heartbeat advertise stops) and serves reads/writes again; the
-    /// coordinator's parked quarantine op then captures + relocates it
-    /// cleanly on its next slow-lane attempt, with zero rollback. A
-    /// failed retry re-parks the slot and stays advertised; retries are
-    /// logged quietly after the first (a permanently de-configured
-    /// device — kernel "not configured" — never recovers by
-    /// RECONFIGURE, and the loud signal for that is the coordinator's
-    /// quarantine-stuck alert, not a per-tick WARN here).
-    #[cfg(target_os = "linux")]
-    pub async fn retry_quarantined_rehydrates_once(&self) -> usize {
-        let survivors: Vec<(SandboxId, QuarantinedSurvivor)> = self
-            .quarantined_survivors
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        let mut recovered = 0usize;
-        for (sandbox_id, q) in survivors {
-            // ADR 0116 C4: a data-plane-failed entry carries no
-            // failed-rehydrate manifest — its disk is still served, so
-            // there is nothing to RECONFIGURE; the quarantine evict
-            // owns the remediation.
-            let Some(disk_manifest) = q.disk_manifest else {
-                continue;
-            };
-            let attempt = q.retry_attempts.saturating_add(1);
-            match self
-                .rehydrate_sandbox(q.session_id, sandbox_id, disk_manifest)
-                .await
-            {
-                Ok(true) => {
-                    // rehydrate_sandbox removed the map entry on success.
-                    recovered += 1;
-                    ::metrics::counter!(crate::metrics::QUARANTINE_REHYDRATE_RECOVERED_TOTAL)
-                        .increment(1);
-                    tracing::info!(
-                        %sandbox_id,
-                        session_id = %q.session_id,
-                        attempt,
-                        "quarantined survivor RECOVERED by the rehydrate retry pass; \
-                         disk re-served, heartbeat advertise stops",
-                    );
-                }
-                Ok(false) => {
-                    // Structural skip (no pool / already served / no
-                    // device) — nothing to retry against; leave the
-                    // entry for the destroy path to clear.
-                    if let Some(mut e) = self.quarantined_survivors.get_mut(&sandbox_id) {
-                        e.retry_attempts = attempt;
-                    }
-                }
-                Err(e) => {
-                    if let Some(mut entry) = self.quarantined_survivors.get_mut(&sandbox_id) {
-                        entry.retry_attempts = attempt;
-                    }
-                    // First failure at WARN; then every 20th (≈10 min at
-                    // the 30s cadence) to keep a dead device from
-                    // flooding the log.
-                    if attempt == 1 || attempt % 20 == 0 {
-                        tracing::warn!(
-                            %sandbox_id,
-                            session_id = %q.session_id,
-                            attempt,
-                            error = %e,
-                            "quarantined-survivor rehydrate retry failed; will keep \
-                             retrying (slot re-parked, survivor still advertised)",
-                        );
-                    } else {
-                        tracing::debug!(
-                            %sandbox_id,
-                            attempt,
-                            error = %e,
-                            "quarantined-survivor rehydrate retry failed",
-                        );
-                    }
-                }
-            }
-        }
-        recovered
     }
 
     /// ADR 0091: record a control-plane-dead guest (checkpoint driver's
@@ -3868,6 +2887,11 @@ impl PooledBackend {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
+    /// Signalled after each record lands in `checkpoint_records_dir()`.
+    pub fn checkpoint_recorded(&self) -> Arc<tokio::sync::Notify> {
+        self.checkpoint_recorded.clone()
+    }
+
     /// Test-only view of a sandbox's in-RAM chain head.
     #[cfg(test)]
     pub(crate) fn chain_head_for_test(
@@ -3891,10 +2915,7 @@ impl PooledBackend {
     /// protocol (see the record's type doc): a record only exists if no
     /// FC snapshot create ran since the chain durably advanced, so
     /// seeding from it is exactly as sound as never having lost the
-    /// DashMap. NBD-quarantined survivors seed too — the disk plane's
-    /// health is orthogonal to the KVM dirty bitmap, and their
-    /// evict_local capture is precisely the one that must not be a
-    /// Full.
+    /// DashMap.
     pub async fn rehydrate_chain_heads(&self) {
         let Some(store) = self.chain_heads.clone() else {
             return;
@@ -3926,8 +2947,10 @@ impl PooledBackend {
             // invalidates + creates (bitmap reset) → seed stale head"
             // would rebuild exactly the corrupt diff this protocol
             // exists to prevent.
-            let lock = self.capture_lock(id);
-            let _guard = lock.lock_owned().await;
+            let _guard = self
+                .capture_gate(id)
+                .serialize(id, CaptureUser::ChainRehydrate)
+                .await;
             if self.checkpoint_chains.contains_key(&id) {
                 continue;
             }
@@ -3943,6 +2966,8 @@ impl PooledBackend {
                             manifest,
                         },
                     );
+                    self.last_snapshot_unix_ms
+                        .insert(id, record.updated_at.timestamp_millis());
                     tracing::info!(
                         sandbox_id = %id,
                         session_id = ?record.session_id,
@@ -3960,427 +2985,6 @@ impl PooledBackend {
                 }
             }
         }
-    }
-
-    /// Local-first survivor NBD rehydrate (session 731df805,
-    /// 2026-07-17): claim + RECONFIGURE the NBD device of every live
-    /// survivor the coordinator's register-time list MISSED. That list
-    /// is derived from PG session status and can be wrong — it was
-    /// empty for rung-parked (`evicting`) survivors, so nothing
-    /// re-claimed their devices after the pod roll and the
-    /// stale-binding sweep disconnected the live rootfs out from under
-    /// the paused guests. Everything this needs is already durable on
-    /// this host: the write-ahead `ChainHeadRecord` carries
-    /// (sandbox_id, session_id, manifest_ref) and the reattach pass
-    /// has rebuilt `inner`'s sandbox set — so a coordinator-side gap
-    /// must never again decide whether a resident VM keeps its disk.
-    ///
-    /// Run AFTER the coord-list `rehydrate_survivors` pass (entries
-    /// covered by both are skipped via the `nbd_sandboxes` presence
-    /// check inside [`Self::rehydrate_sandbox`]) and BEFORE the
-    /// stale-binding sweep snapshots the free slot pool.
-    ///
-    /// Returns `(rehydrated, failed)`.
-    #[cfg(target_os = "linux")]
-    pub async fn rehydrate_local_survivors(&self) -> (usize, usize) {
-        let Some(store) = self.chain_heads.clone() else {
-            return (0, 0);
-        };
-        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "local survivor rehydrate: backend list failed; skipping",
-                );
-                return (0, 0);
-            }
-        };
-        let served: std::collections::HashSet<SandboxId> =
-            self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
-        let served = served
-            .into_iter()
-            .filter(|id| self.all_disks_served(*id))
-            .collect();
-        let records = crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await;
-        let mut rehydrated = 0usize;
-        let mut failed = 0usize;
-        for (session_id, sandbox_id, _chain_head) in
-            local_survivor_candidates(records, &live, &served)
-        {
-            // The candidate's ChainHeadRecord names the MEMORY chain head
-            // — never attachable as a disk. The only local durable source
-            // of the survivor's chunked-DISK lineage is the predecessor's
-            // shutdown-spool marker (2026-07-21 61a03b7e incident: passing
-            // the chain head here failed the reattach on ManifestKind,
-            // quarantined the device, DISCARDED the spooled acked writes
-            // as "foreign lineage", and the quarantine ladder destroyed
-            // the healthy paused VM — a 93-event rewind). No spool → skip
-            // WITHOUT claiming the slot: the device stays kernel-connected
-            // and reconnectable, and the coordinator's list (or the next
-            // registration) owns the re-serve.
-            let disk_ref = match &self.shutdown_spool_root() {
-                Some(root) => {
-                    match crate::disk_daemon::spool::read_spool_meta(
-                        self.host_fs.as_ref(),
-                        root,
-                        sandbox_id,
-                        engram_core::types::snapshot::DiskRole::Root,
-                    )
-                    .await
-                    {
-                        Ok(Some(meta)) => Some(meta.manifest_ref()),
-                        Ok(None) => None,
-                        Err(e) => {
-                            tracing::error!(
-                                %sandbox_id,
-                                %session_id,
-                                error = %e,
-                                "local survivor rehydrate: spool marker unreadable; \
-                                 skipping (device left reconnectable for the \
-                                 coordinator's list)",
-                            );
-                            failed += 1;
-                            continue;
-                        }
-                    }
-                }
-                None => None,
-            };
-            let Some(disk_ref) = disk_ref else {
-                tracing::warn!(
-                    %sandbox_id,
-                    %session_id,
-                    "local survivor rehydrate: no local disk lineage (no shutdown \
-                     spool) — skipping; the device stays reconnectable and the \
-                     coordinator's rehydrate list owns the re-serve",
-                );
-                continue;
-            };
-            match self
-                .rehydrate_sandbox(session_id, sandbox_id, disk_ref)
-                .await
-            {
-                Ok(true) => {
-                    tracing::warn!(
-                        %sandbox_id,
-                        %session_id,
-                        manifest = %disk_ref,
-                        "local survivor rehydrate: re-served an NBD device the \
-                         coordinator's rehydrate list missed (coord-side gap — \
-                         the device would otherwise have been left to the \
-                         stale-binding sweep)",
-                    );
-                    rehydrated += 1;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(
-                        %sandbox_id,
-                        %session_id,
-                        error = %e,
-                        "local survivor rehydrate failed; continuing with the rest",
-                    );
-                    failed += 1;
-                }
-            }
-        }
-        (rehydrated, failed)
-    }
-
-    /// #1003 ladder 4 — the spec-based re-serve pass (pass 3 of 3).
-    /// Every survivor the first two passes could not serve — the
-    /// coordinator's list had no disk manifest (a session that never
-    /// published its first flush) and there is no shutdown spool (a
-    /// SIGKILL writes none) — is still fully recoverable from
-    /// host-local durable state: `sandbox.json` records the lineage
-    /// the NBD daemon was serving (stamped at create), the binding
-    /// record maps the sandbox to its session, and Recover-mode dirty
-    /// open re-adopts the overlay files (frozen generations included).
-    /// Before this pass such devices stayed RECONNECTABLE with NO
-    /// retry owner — unbounded guest I/O stall (the #1003 incident's
-    /// 30+ minute gap).
-    ///
-    /// Returns `(rehydrated, failed, unserved_after)`.
-    #[cfg(target_os = "linux")]
-    pub async fn rehydrate_unserved_from_specs(
-        &self,
-        work_dir: &std::path::Path,
-        bindings: &crate::bindings::BindingStore,
-    ) -> (usize, usize, usize) {
-        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "spec-based rehydrate: backend list failed; skipping",
-                );
-                return (0, 0, 0);
-            }
-        };
-        let mut rehydrated = 0usize;
-        let mut failed = 0usize;
-        for sandbox_id in &live {
-            if self.all_disks_served(*sandbox_id) {
-                continue;
-            }
-            let started = crate::time_source::metrics_now();
-            let manifest_path = work_dir.join(sandbox_id.to_string()).join("sandbox.json");
-            let spec_ref =
-                engram_sandbox_firecracker::sandbox_manifest::read_manifest(&manifest_path)
-                    .ok()
-                    .and_then(|m| m.spec.rootfs_manifest);
-            let Some(disk_ref) = spec_ref else {
-                ::metrics::counter!(
-                    "engram_nbd_rehydrate_skipped_total",
-                    "reason" => "no_spec_lineage",
-                )
-                .increment(1);
-                tracing::warn!(
-                    %sandbox_id,
-                    "spec-based rehydrate: sandbox.json carries no rootfs lineage \
-                     (pre-stamp sandbox or non-NBD rootfs); device stays reconnectable",
-                );
-                failed += 1;
-                continue;
-            };
-            let session_id = match bindings.find_by_sandbox(*sandbox_id) {
-                Ok(Some(record)) => record.session_id,
-                Ok(None) => {
-                    ::metrics::counter!(
-                        "engram_nbd_rehydrate_skipped_total",
-                        "reason" => "no_binding",
-                    )
-                    .increment(1);
-                    tracing::warn!(
-                        %sandbox_id,
-                        "spec-based rehydrate: no binding record maps this survivor \
-                         to a session; device stays reconnectable",
-                    );
-                    failed += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(%sandbox_id, error = %e, "spec-based rehydrate: binding scan failed");
-                    failed += 1;
-                    continue;
-                }
-            };
-            match self
-                .rehydrate_sandbox(session_id, *sandbox_id, disk_ref)
-                .await
-            {
-                Ok(true) => {
-                    ::metrics::histogram!("engram_nbd_reserve_seconds")
-                        .record(started.elapsed().as_secs_f64());
-                    tracing::warn!(
-                        %sandbox_id,
-                        %session_id,
-                        manifest = %disk_ref,
-                        "spec-based rehydrate: re-served a survivor BOTH earlier passes \
-                         missed (never-flushed session; lineage from sandbox.json)",
-                    );
-                    rehydrated += 1;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(
-                        %sandbox_id,
-                        %session_id,
-                        error = %e,
-                        "spec-based rehydrate failed; device stays reconnectable",
-                    );
-                    failed += 1;
-                }
-            }
-        }
-        let unserved = live
-            .iter()
-            .filter(|id| !self.all_disks_served(**id))
-            .count();
-        // The durability alert feed: nonzero after ALL THREE passes
-        // means a resident VM is running without its disk served.
-        ::metrics::gauge!("engram_nbd_survivors_unserved").set(unserved as f64);
-        (rehydrated, failed, unserved)
-    }
-
-    /// The Layer-2 kernel-derived inventory + Layer-3 classification barrier
-    /// (ADR 0098 §Phase 3, Wave 7b, #784). Run AFTER the two rehydrate passes
-    /// (coord-list + #739 local) and BEFORE the destructive stale-binding sweep:
-    /// enumerate the kernel's CONNECTED devices as ground truth and RECONCILE the
-    /// tracked records against them, classifying every connected slot into
-    /// exactly one [`SlotClass`](engram_host_core::SlotClass).
-    ///
-    /// engrams#1378: attribution comes first from the durable owner records
-    /// (`nbd-owners/<dev>` — no live process needed), reconciled against the
-    /// SANDBOX-ID record view (coord-list ∪ `ChainHeadRecord`s ∪ served ∪ the
-    /// reattached FC list); the legacy device-path view (resolved through the
-    /// live FC entry, plus the allocator's parked set) covers unattributed
-    /// devices. An ATTRIBUTED dead-owner device no record accounts for is
-    /// `ResidueAwaitingTombstone`: parked, registered in `nbd_residue` for the
-    /// heartbeat report, and torn down when the coordinator's tombstone comes
-    /// back (`destroy`) — never severed on the host's own verdict, never
-    /// operator-paged. Only an UNATTRIBUTED unaccounted device still fires the
-    /// `rehydrate-unknown-device` soft-invariant + counter (pre-owner-record
-    /// leftovers for one fleet roll, then genuine corruption).
-    ///
-    /// Returns the classification; the caller feeds `.reap` (the sole
-    /// `TerminalSafeToReap` subset) to [`recover_stuck_nbd_devices`] — the
-    /// ordering contract enforced by the [`ReapList`](engram_host_core::ReapList)
-    /// type, not a comment.
-    #[cfg(target_os = "linux")]
-    pub async fn classify_startup_slots(
-        &self,
-        kernel: &dyn engram_host_core::NbdKernel,
-        coord_survivors: &[crate::coord_client::RehydrateSandboxRef],
-    ) -> engram_host_core::StartupClassification<std::path::PathBuf> {
-        // The tracked-record views — the Layer-2 reconcile keys. The
-        // DEVICE-PATH view: a device is "accounted for" if a coord-list
-        // survivor, a durable ChainHeadRecord, or an already-served sandbox
-        // maps to it (`rootfs_device` resolves the sandbox's `/dev/nbdN`).
-        // The SANDBOX-ID view (engrams#1378): the same sources by id, plus
-        // the reattached FC list — needs no live-entry resolution, so an
-        // orphaned sandbox's records still count.
-        let mut records = crate::disk_daemon::StartupRecords::default();
-        for entry in coord_survivors {
-            records.sandboxes.insert(entry.sandbox_id);
-            if let Some(dev) = self.inner.rootfs_device(entry.sandbox_id) {
-                records.devices.insert(dev);
-            }
-        }
-        if let Some(store) = self.chain_heads.clone() {
-            for record in crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await {
-                records.sandboxes.insert(record.sandbox_id);
-                if let Some(dev) = self.inner.rootfs_device(record.sandbox_id) {
-                    records.devices.insert(dev);
-                }
-            }
-        }
-        for entry in self.nbd_sandboxes.iter() {
-            records.sandboxes.insert(*entry.key());
-            for (_, device) in entry.iter() {
-                records.devices.insert(device.device_path().to_path_buf());
-            }
-        }
-        // Every reattached (live) FC counts as a record: an attributed device
-        // whose guest survived the roll must classify ReconnectMe (the
-        // rehydrate passes own re-serving it), never residue — a live guest's
-        // disk is not a leftover, whatever the other records say.
-        match self.inner.list().await {
-            Ok(live) => records.sandboxes.extend(live),
-            Err(error) => tracing::warn!(
-                %error,
-                "startup classification: backend list failed; live sandboxes \
-                 counted only via their other records this pass",
-            ),
-        }
-        // Devices this process itself PARKED (a failed rehydrate's
-        // `slot.quarantine()`) are tracked records too. The device-path
-        // sources above all resolve through the live FC entry
-        // (`rootfs_device`), which a concurrent sandbox destroy can vacate
-        // between the park and this barrier — 2026-07-21: a rehydrate-failed
-        // survivor whose session completed two seconds later was reported as
-        // an UNKNOWN device demanding an operator, when this very process had
-        // parked it on purpose moments earlier. The allocator's parked set is
-        // device-keyed, so it survives the FC entry vanishing.
-        if let Some(pool) = self.nbd_pool.as_ref() {
-            for dev in pool.parked_devices() {
-                records.devices.insert(dev);
-            }
-        }
-
-        // engrams#1378: the durable owner records — device→sandbox
-        // attribution that survives every process death. Lazily clean the
-        // inert ones (devices no longer kernel-connected) first.
-        let owners = match self.nbd_owners.as_ref() {
-            Some(dir) => {
-                let connected: std::collections::HashSet<std::path::PathBuf> = kernel
-                    .connected_devices()
-                    .into_iter()
-                    .map(|d| d.device)
-                    .collect();
-                dir.remove_stale(&connected);
-                dir.load()
-                    .into_iter()
-                    .map(|(device, owner)| (device, owner.sandbox_id))
-                    .collect()
-            }
-            None => std::collections::HashMap::new(),
-        };
-
-        // With no pool (NBD off) every connected device is classified, as
-        // before ranges existed: any binding is then a leftover.
-        let owns = |device: &std::path::Path| {
-            self.nbd_pool
-                .as_ref()
-                .is_none_or(|pool| pool.owns_device(device))
-        };
-        let (classification, residue_pairs) =
-            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners, &owns);
-
-        // Attributed residue: report + await the coordinator's tombstone
-        // (existing from the interrupted destroy, or minted by the ADR 0116
-        // A5 unbound-entomb arm). `destroy` completes the teardown when it
-        // arrives.
-        for (sandbox_id, device) in residue_pairs {
-            tracing::warn!(
-                %sandbox_id,
-                device = %device.display(),
-                "startup classification: kernel-connected device attributed to a \
-                 dead sandbox with no rehydrate record — residue of an interrupted \
-                 teardown; reported to the coordinator, settled by its tombstone \
-                 (engrams#1378)",
-            );
-            self.nbd_residue.entry(sandbox_id).or_default().push(device);
-        }
-        ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES).set(
-            self.nbd_residue
-                .iter()
-                .map(|entry| entry.len())
-                .sum::<usize>() as f64,
-        );
-        self.nbd_residue_known
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // Quarantine: an UNATTRIBUTED connected device the reconcile could not
-        // account for. Fire the alertable soft-invariant + counter per device
-        // and leave it kernel-bound (RECONNECTABLE) — never sever, never
-        // silently skip.
-        for device in &classification.quarantined {
-            engram_core::soft_invariant!(
-                "rehydrate-unknown-device",
-                false,
-                "startup classification barrier: kernel-CONNECTED NBD device {} has a \
-                 live (or unprovable) holder but NO owner record and NO tracked record \
-                 accounts for it — a survivor invisible to the coordinator rehydrate \
-                 list, the #739 local ChainHeadRecord pass, AND the #1378 owner records \
-                 (#769 gap A). Quarantined: left RECONNECTABLE (kernel binding intact, \
-                 kept out of new-claim circulation by the nbd_kernel_busy probe), NEVER \
-                 handed to the stale-binding sweep. An operator/runbook must reconcile \
-                 this device's session",
-                device.display(),
-            );
-            ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
-        }
-        if !classification.reconnect.is_empty() {
-            tracing::warn!(
-                count = classification.reconnect.len(),
-                "startup classification: {} kernel-connected device(s) are known survivors \
-                 the rehydrate passes did not (yet) re-serve — left RECONNECTABLE for a \
-                 retry, never reaped",
-                classification.reconnect.len(),
-            );
-        }
-        tracing::info!(
-            serving = classification.serving.len(),
-            reconnect = classification.reconnect.len(),
-            quarantined = classification.quarantined.len(),
-            residue = classification.residue.len(),
-            reap = classification.reap.len(),
-            "startup NBD classification barrier complete (kernel-derived inventory \
-             reconciled against owner records + tracked records)",
-        );
-        classification
     }
 
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
@@ -4427,10 +3031,7 @@ impl PooledBackend {
         if self.checkpoint_dir.is_none() {
             return Vec::new();
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now_ms = self.clock.now_utc().timestamp_millis();
         self.session_bindings
             .iter()
             .filter_map(|e| {
@@ -4451,6 +3052,12 @@ impl PooledBackend {
             .collect()
     }
 
+    /// Whether a capture on this host has stamped this sandbox's
+    /// last-checkpoint time.
+    pub(crate) fn has_checkpoint_stamp(&self, id: SandboxId) -> bool {
+        self.last_snapshot_unix_ms.contains_key(&id)
+    }
+
     /// ADR 0028 Fix A: one periodic checkpoint — the same capture
     /// `snapshot()` runs for evictions (diff-flavored once the chain
     /// is seeded), self-committed because the durable record +
@@ -4464,10 +3071,11 @@ impl PooledBackend {
         let metadata = self
             .snapshot_with_class(
                 id,
-                // ADR 0116 C3: the periodic re-chunk is THE storm
-                // producer (2026-08-12: it held all 96 permits while a
-                // live NBD serve loop starved) — background class.
+                // ADR 0116 C3: the periodic re-chunk is the upload storm
+                // producer — background class, so foreground uploads go
+                // first.
                 engram_chunk_store::UploadClass::Background,
+                CaptureUser::PeriodicCheckpoint,
             )
             .await?;
         let _ = self.commit_snapshot(id).await;
@@ -4479,8 +3087,9 @@ impl PooledBackend {
         &self,
         id: SandboxId,
         class: engram_chunk_store::UploadClass,
+        user: CaptureUser,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let (_capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (_capture_guard, cap) = self.capture_phase(id, user).await?;
         // Lift the per-jail working-set trace into the blob store under the
         // session-canonical key so the next resume prefaults it (#517 keyed
         // the replay; the handler can't publish it itself — SIGKILLed on
@@ -4489,577 +3098,9 @@ impl PooledBackend {
         self.finisher_with_class(class).finish(id, cap).await
     }
 
-    /// ADR 0016 Phase B commit 4: build a coord-bound publisher
-    /// using the host-agent's `HttpCoordClient` and the freshly-wrapped
-    /// `session_bindings` map. The publisher spawns its own drain
-    /// task; the returned `LiveManifestPublisherHandle` is held
-    /// inside PooledBackend so the task dies with us.
-    ///
-    /// Internal session resolver closes over a clone of
-    /// `self.session_bindings` — that's the host-agent's
-    /// sandbox→session index, populated by `notify_session_policy`
-    /// (start_agent) and cleared by `destroy`. A publish that
-    /// arrives before `notify_session_policy` has populated the
-    /// entry (warm-pool sandbox pre-assignment, or the small
-    /// cold-create window between `inner.create()` and
-    /// `start_agent`) returns None from the resolver → drain task
-    /// skips with a debug log.
-    pub fn with_live_manifest_coord_publisher(
-        mut self,
-        coord: Arc<dyn engram_host_core::CoordControlPlane>,
-        host_id: engram_core::HostId,
-    ) -> Self {
-        let session_bindings = Arc::clone(&self.session_bindings);
-        let resolver: Arc<dyn crate::disk_daemon::SessionResolver> =
-            Arc::new(move |sandbox_id: SandboxId| -> Option<SessionId> {
-                session_bindings.get(&sandbox_id).map(|e| *e)
-            });
-        let (publisher, handle) =
-            crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord.clone(), host_id, resolver);
-        self.live_manifest_publisher = publisher;
-        self.live_manifest_publisher_handle = Some(handle);
-        // Issue #225: keep a direct handle to coord for the SIGTERM
-        // final-flush pass, which must publish synchronously (the
-        // async publisher's drain task is gone by the time the
-        // process exits).
-        self.shutdown_manifest_publish = Some((coord, host_id));
-        self
-    }
-
-    /// Attach a `/dev/nbdN` slot pool. When set + `chunk_store` +
-    /// `chunk_cache` are also wired AND the cached image bundle
-    /// carries a `disk_manifest`, `create()` spawns an NBD daemon
-    /// instead of materializing the manifest to a single file. FC's
-    /// `path_on_host` becomes `/dev/nbdN`. Linux-only at runtime;
-    /// on macOS the builder accepts a pool but the spawn path is
-    /// gated so dev workflows fall back to materialize-to-file.
-    pub fn with_nbd_pool(mut self, pool: Arc<crate::disk_daemon::NbdSlotAllocator>) -> Self {
-        self.nbd_pool = Some(pool);
-        // engrams#1378: a pooled Linux host classifies its kernel inventory
-        // at register; until that barrier runs, the residue report is "no
-        // information" and the heartbeat says so. macOS accepts a pool but
-        // never runs the (Linux-only) barrier, so its report stays
-        // vacuously known-empty.
-        #[cfg(target_os = "linux")]
-        self.nbd_residue_known
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self
-    }
-
-    /// engrams#1378: wire the durable NBD owner-record directory
-    /// (`<work_dir>/nbd-owners`). Written at every attach's id-known point
-    /// and every rehydrate; read by the startup classification barrier.
-    #[cfg(target_os = "linux")]
-    pub fn with_nbd_owner_dir(mut self, dir: std::path::PathBuf) -> Self {
-        match crate::disk_daemon::owners::NbdOwnerDir::open(dir) {
-            Ok(owners) => {
-                if let Err(error) = owners.sweep_stale_tmp() {
-                    tracing::warn!(%error, "NBD owner temporary file cleanup failed");
-                }
-                self.recovery_owners = owners.load();
-                self.nbd_owners = Some(Arc::new(owners));
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "NBD owner-record dir open failed; device attribution degrades \
-                 to the record-reconcile path",
-            ),
-        }
-        self
-    }
-
-    /// engrams#1378: the heartbeat's residue report — the attributed
-    /// kernel-connected leftovers awaiting a coordinator tombstone, plus
-    /// whether this generation has classified its inventory yet (the
-    /// issue-#215 "no information ≠ empty" asymmetry).
-    pub fn nbd_residue_report(&self) -> (Vec<SandboxId>, bool) {
-        let known = self
-            .nbd_residue_known
-            .load(std::sync::atomic::Ordering::SeqCst);
-        #[cfg(target_os = "linux")]
-        {
-            let mut ids: Vec<SandboxId> = self.nbd_residue.iter().map(|e| *e.key()).collect();
-            ids.sort();
-            (ids, known)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            (Vec::new(), known)
-        }
-    }
-
-    /// Current disk attachments. Sample before the allocator count so
-    /// an attachment still in progress retains its placement reservation.
-    pub fn nbd_sandbox_slots(&self) -> std::collections::HashMap<SandboxId, u32> {
-        #[cfg(target_os = "linux")]
-        {
-            self.nbd_sandboxes
-                .iter()
-                .map(|entry| (*entry.key(), 1 + u32::from(entry.swap.is_some())))
-                .collect()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Default::default()
-        }
-    }
-
-    /// The NBD pool used for chunked disks and survivor recovery.
-    pub fn nbd_pool(&self) -> Option<Arc<crate::disk_daemon::NbdSlotAllocator>> {
-        self.nbd_pool.clone()
-    }
-
-    /// Test-only: whether `id` currently has a live NBD data plane in
-    /// `nbd_sandboxes`. Used by the issue-#223 cancellation regression
-    /// test to assert the daemon landed in the map (and was therefore
-    /// retained, owned by normal `destroy()` teardown) even when the
-    /// `restore` handler future was dropped mid-flight.
-    #[cfg(target_os = "linux")]
-    #[doc(hidden)]
-    pub fn __test_nbd_sandbox_registered(&self, id: SandboxId) -> bool {
-        self.nbd_sandboxes.contains_key(&id)
-    }
-
-    /// Test-only: clone the live `ChunkedDiskBackend` Arc for a
-    /// registered sandbox. Used by the issue-#225 SIGTERM-final-flush
-    /// regression test to drive a dirty write through the same backend
-    /// the shutdown pass flushes and then assert durability.
-    #[cfg(target_os = "linux")]
-    #[doc(hidden)]
-    pub fn __test_nbd_backend(
-        &self,
-        id: SandboxId,
-    ) -> Option<Arc<crate::disk_daemon::ChunkedDiskBackend>> {
-        self.nbd_sandboxes.get(&id).map(|e| e.root.backend.clone())
-    }
-
-    /// Test-only: bind a sandbox to a session in `session_bindings`,
-    /// the same index `notify_session_policy` / registration populate.
-    /// The issue-#225 test uses it so the shutdown flush can resolve a
-    /// session id for its (mock) coord publish.
-    #[cfg(target_os = "linux")]
-    #[doc(hidden)]
-    pub fn __test_bind_session(&self, sandbox_id: SandboxId, session_id: SessionId) {
-        self.session_bindings.insert(sandbox_id, session_id);
-    }
-
-    /// Issue #225: SIGTERM final-flush pass. NBD WRITEs are acked to
-    /// the guest the instant the bytes land in the backend's in-RAM
-    /// `dirty` tier; durability rides the FlushScheduler's ~30 s /
-    /// 256 MiB cadence. A routine pod roll abandons each data plane
-    /// (`abandon_for_shutdown` → `drop(backend)`) WITHOUT a final
-    /// flush, discarding up to one cadence-window of ACKED writes —
-    /// the VM keeps running (K2 contract) but the successor rehydrates
-    /// from the last *published* manifest, silently rolling the live
-    /// guest's disk back under it. This pass closes that window: per
-    /// surviving sandbox, in parallel and under a hard deadline, it
-    /// quiesces in-flight I/O (`wait_idle`) then runs a full `flush()`
-    /// (drain → GCS upload → manifest rebase) and SYNCHRONOUSLY
-    /// publishes the new `live_disk_manifest` to coord — so the
-    /// successor's existing rehydrate path picks up the current ref.
-    ///
-    /// MUST run BEFORE `abandon_nbd_data_planes_for_shutdown`: this
-    /// only flushes, it does not tear anything down, so the abandon
-    /// sweep still runs afterward to leave the kernel-side devices
-    /// alive for the successor. The whole pass is budgeted against
-    /// `deadline` (derived from the pod's `terminationGracePeriodSeconds`
-    /// minus headroom). Any sandbox not flushed within the budget has its
-    /// flush task ABORTED and reaped before this returns — never left
-    /// running detached, where it would race the abandon sweep's spool
-    /// export and stamp the spool with a stale manifest head (2026-07-21
-    /// session-af28cac4 RCA) — and is logged LOUDLY with its id + dirty
-    /// byte count so the (now bounded) GCS-durability gap is visible; it
-    /// is then abandoned dirty by the following sweep, which spools it.
-    ///
-    /// The synchronous coord publish is deliberate: the normal flush
-    /// path publishes via the async `live_manifest_publisher`, whose
-    /// coalescing drain task is aborted on process exit — a manifest
-    /// queued there during shutdown would never reach coord. When no
-    /// coord publisher is wired (`shutdown_manifest_publish` is `None`:
-    /// no-op / test publishers) the chunks are still durably uploaded
-    /// to GCS; only the coord publish is skipped.
-    #[cfg(target_os = "linux")]
-    pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
-        let entries: Vec<(
-            SandboxId,
-            DiskRole,
-            Arc<crate::disk_daemon::ChunkedDiskBackend>,
-        )> = self
-            .nbd_sandboxes
-            .iter()
-            .flat_map(|e| {
-                e.iter()
-                    .map(|(role, d)| (*e.key(), role, d.backend.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        if entries.is_empty() {
-            return;
-        }
-        let total = entries.len();
-        tracing::info!(
-            sandboxes = total,
-            deadline_secs = deadline.as_secs_f64(),
-            "SIGTERM: final disk-flush pass over surviving NBD data planes",
-        );
-
-        // Fan out one flush task per sandbox; each resolves the
-        // session binding + does the synchronous coord publish itself.
-        // Budget the WHOLE fan-out against `deadline` — a single
-        // tokio::time::timeout around the join handles the per-sandbox
-        // parallelism + the global cap in one place. The `JoinSet`
-        // deliberately lives OUTSIDE the timed future: on overrun the
-        // tasks must be ABORTED, not merely no-longer-awaited (see
-        // `join_all_within`'s overrun arm). A `JoinSet`, NOT a
-        // `Vec<JoinHandle>`: `join_next` removes each task as it
-        // completes, so the overrun arm can never re-poll a handle the
-        // timed join already consumed (2026-08-02 RCA, see
-        // `join_all_within`).
-        let publish = self.shutdown_manifest_publish.clone();
-        let session_bindings = self.session_bindings.clone();
-        let mut tasks = tokio::task::JoinSet::new();
-        for (sandbox_id, role, backend) in entries {
-            let publish = publish.clone();
-            let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
-            tasks.spawn(async move {
-                // Quiesce the virtio → kernel-NBD → daemon pipeline so
-                // the flush captures the just-acked disk state, then
-                // drain + upload + rebase. `flush` no-ops (zero chunks)
-                // when the dirty tier is empty — cheap for quiescent
-                // survivors. The 2026-07-16 RCA's host page-cache sync
-                // (ADR 0098 P4) now lives INSIDE the capture primitive
-                // (`ChunkedDiskBackend::sync_host_device`, called by
-                // `flush_local`), while our serve loop is still alive to
-                // ack the writeback. A sync failure fails the flush; the
-                // Err arm below leaves the writes to ride the shutdown
-                // spool + the kernel's dead-conn parking to the
-                // successor — strictly safer than publishing a manifest
-                // that misses guest-acked bytes.
-                backend.wait_idle().await;
-                // ADR 0098 P4: the per-survivor disposition is the pure
-                // `classify_survivor` decision; the driver only sequences
-                // the effects off its verdict.
-                let bound_publish = if role == DiskRole::Root {
-                    publish.zip(session_id)
-                } else {
-                    None
-                };
-                let outcome = match backend.flush().await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // FlushProbe::FlushError ⇒ RelyOnSpool: the abandon
-                        // sweep's spool export is the durability backstop.
-                        tracing::warn!(
-                            %sandbox_id,
-                            error = %e,
-                            "SIGTERM final flush failed; survivor's un-uploaded \
-                             writes ride the shutdown spool to the successor",
-                        );
-                        return;
-                    }
-                };
-                let action =
-                    engram_host_core::classify_survivor(engram_host_core::FlushProbe::Flushed {
-                        chunks_flushed: outcome.chunks_flushed,
-                        bound: bound_publish.is_some(),
-                    });
-                match action {
-                    // Already clean — nothing new to publish.
-                    engram_host_core::SurvivorAction::SkipClean => return,
-                    // Unreachable for a `Flushed` probe (only `FlushError`
-                    // maps to RelyOnSpool, and that returned above); keep
-                    // the arm so the match stays exhaustive.
-                    engram_host_core::SurvivorAction::RelyOnSpool => return,
-                    engram_host_core::SurvivorAction::DurableNoPublish
-                    | engram_host_core::SurvivorAction::Publish => {}
-                }
-                tracing::info!(
-                    %sandbox_id,
-                    chunks = outcome.chunks_flushed,
-                    bytes = outcome.bytes_uploaded,
-                    manifest_version = outcome.manifest_ref.version,
-                    "SIGTERM final flush uploaded survivor's dirty chunks",
-                );
-                // Synchronously publish so the successor rehydrates
-                // from the just-uploaded ref instead of the stale one.
-                let Some(((coord, host_id), session_id)) = bound_publish else {
-                    // DurableNoPublish: no coord wired, or the sandbox
-                    // isn't bound to a session yet (warm-pool /
-                    // pre-start_agent window). The chunks are durable in
-                    // GCS regardless; the publish is what we cannot do here.
-                    tracing::debug!(
-                        %sandbox_id,
-                        "SIGTERM final flush: chunks durable in GCS but no \
-                         coord publish (unbound sandbox or no publisher)",
-                    );
-                    return;
-                };
-                let req = engram_host_core::LiveManifestPublishRequest {
-                    session_id,
-                    sandbox_id,
-                    manifest_id: outcome.manifest_ref.manifest_id,
-                    manifest_version: outcome.manifest_ref.version,
-                };
-                match coord.publish_live_manifest(host_id, &req).await {
-                    Ok(_) => tracing::info!(
-                        %sandbox_id,
-                        %session_id,
-                        manifest_version = outcome.manifest_ref.version,
-                        "SIGTERM final flush: live_disk_manifest published to coord",
-                    ),
-                    // A publish failure falls back to the same RelyOnSpool
-                    // posture: the shutdown spool's store-ahead ref covers
-                    // a same-node successor.
-                    Err(e) => tracing::warn!(
-                        %sandbox_id,
-                        %session_id,
-                        error = %e,
-                        "SIGTERM final flush: chunks uploaded to GCS but coord \
-                         publish failed; the shutdown spool's store-ahead ref \
-                         covers a same-node successor",
-                    ),
-                }
-            });
-        }
-
-        let overran = Self::join_all_within(&mut tasks, deadline).await;
-        if overran {
-            // Some survivors were not GCS-flushed in time. This is not a
-            // data-loss event: the abandon sweep that runs next exports
-            // every still-dirty tier to the node-local shutdown spool
-            // (2026-07-16 RCA), and the successor adopts it. Log the
-            // stragglers so the GCS-side durability gap on this node
-            // stays visible.
-            // INVARIANT (see `nbd_sandboxes`): snapshot id+backend Arcs out
-            // of the map, then `.await` on the owned Arcs — never hold a
-            // DashMap guard across the `unflushed_bytes` await.
-            let stragglers: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
-                .nbd_sandboxes
-                .iter()
-                .flat_map(|e| {
-                    e.iter()
-                        .map(|(_, d)| (*e.key(), d.backend.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            for (sandbox_id, backend) in stragglers {
-                // `unflushed_bytes`, not `dirty_bytes`: an aborted flush
-                // that got past its claim left the chunks claimed in the
-                // dirty tier — just as un-uploaded, and exactly the
-                // bytes the spool is about to carry.
-                let unflushed = backend.unflushed_bytes().await;
-                // ADR 0098 P4: `is_straggler` is the pure deadline-overrun
-                // decision (still-dirty at the deadline ⇒ loud, the spool
-                // catches it).
-                if engram_host_core::is_straggler(unflushed) {
-                    tracing::warn!(
-                        %sandbox_id,
-                        unflushed_bytes = unflushed,
-                        deadline_secs = deadline.as_secs_f64(),
-                        "SIGTERM final flush DEADLINE OVERRUN: survivor still has \
-                         un-uploaded (dirty + pending) bytes; the aborted flush's \
-                         work rides the shutdown spool for the successor to adopt",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Await every flush task in `tasks` within `deadline`; return `true`
-    /// on overrun. On overrun, ABORT the still-running tasks and reap
-    /// each one before returning, so the abandon sweep that runs next
-    /// can never race a still-live flush. Dropping the join future
-    /// alone left the tokio::spawn'd flushes running DETACHED
-    /// (2026-07-21 session-af28cac4 RCA): a detached final flush
-    /// rebased + published v368 while the sweep's spool export had
-    /// already snapshotted the dirty tier and then stamped the spool
-    /// with the pre-rebase v367 head — the successor refused the
-    /// behind-stamped spool per the `shutdown-spool-lineage-mismatch`
-    /// gate and rolled the live guest's acked writes back under it.
-    /// Aborting is safe at every await point in the flush pipeline:
-    /// the manifest-ref rebase precedes the pending-tier drop, so a
-    /// killed flush at worst leaves chunks to be exported redundantly
-    /// (content-addressed, idempotent) or a store-ahead manifest the
-    /// adopt gate's `>=` arm already covers. The almost-done upload's
-    /// progress is forfeit — acceptable: those bytes ride the spool
-    /// instead, which is what the post-deadline grace headroom exists
-    /// for.
-    ///
-    /// A `JoinSet`, NOT a `Vec<JoinHandle>` (2026-08-02 durability-
-    /// rollback RCA): the old shape re-awaited EVERY handle in the
-    /// overrun arm, including the ones the timed join had already
-    /// polled to completion — and a completed `JoinHandle` PANICS on
-    /// its next poll ("JoinHandle polled after completion"). So a
-    /// deadline overrun with at least one finished flush panicked the
-    /// SIGTERM path between the flush pass and the abandon sweep:
-    /// process unwind ran `NbdHandle::Drop`'s netlink disconnect on
-    /// every survivor's live device, the shutdown-spool export never
-    /// ran, and the quarantined survivors came back uncapturable —
-    /// the coordinator destroyed them and 8 sessions rolled back past
-    /// acked writes. `JoinSet::join_next` REMOVES a task from the set
-    /// when it yields it, so no task can ever be polled twice.
-    //
-    // `any(..., test)`: the only src caller is the linux-gated flush
-    // pass, but the regression tests below must compile on macOS too.
-    #[cfg(any(target_os = "linux", test))]
-    async fn join_all_within(
-        tasks: &mut tokio::task::JoinSet<()>,
-        deadline: std::time::Duration,
-    ) -> bool {
-        let join_all = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(deadline, join_all).await.is_ok() {
-            return false;
-        }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-        true
-    }
-
-    /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
-    /// plane WITHOUT disconnecting the kernel side, so surviving FC
-    /// VMs keep their (parked) devices for the successor generation
-    /// to RECONFIGURE. Called from the SIGTERM path right before the
-    /// process exits; per-sandbox destroy keeps its normal
-    /// disconnect-on-drop.
-    ///
-    /// Issue #224: this is a TERMINAL mode, not a one-shot sweep. The
-    /// `abandoning` flag is raised (SeqCst) BEFORE the drain so that
-    /// any insert site (`create` / `restore_with` /
-    /// `rehydrate_sandbox`) whose multi-second await window
-    /// (pool-claim, GCS manifest fetch, netlink RECONFIGURE / FC
-    /// restore) is still in flight will observe the flag at its
-    /// pre-insert check and `abandon_for_shutdown()` the state
-    /// in-place instead of leaking a live data plane into the map
-    /// after the drain. We then drain, and re-drain once: the
-    /// flag-before-drain ordering means anything that passes its
-    /// flag check before the store but inserts after the first drain
-    /// is rare, but the belt-and-braces second pass closes it (an
-    /// insert that lands between the two drains is caught here; one
-    /// that lands after both saw the flag set during its own check
-    /// and abandoned instead).
-    #[cfg(target_os = "linux")]
-    pub async fn abandon_nbd_data_planes_for_shutdown(&self) -> usize {
-        // Raise the terminal flag FIRST — ordering is the correctness
-        // gate. Every insert site loads it with SeqCst right before
-        // its `insert`; a store-then-drain here guarantees an insert
-        // that is about to land either (a) already saw the flag and
-        // abandoned in-place, or (b) lands in the map and is swept by
-        // one of the two drains below.
-        self.abandoning
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Keep a backend Arc per abandoned sandbox: after the serve
-        // loop dies the dirty tier is FROZEN (later guest writes park
-        // in the kernel's dead-conn window for the successor to
-        // replay), which makes post-abandon the one race-free moment
-        // to export un-uploaded chunks to the shutdown spool
-        // (2026-07-16 session-85e0298a RCA — pre-spool, these acked
-        // writes died with the process and the successor rolled the
-        // live guest's disk back under it).
-        let mut frozen: Vec<(
-            SandboxId,
-            DiskRole,
-            Arc<crate::disk_daemon::ChunkedDiskBackend>,
-        )> = Vec::new();
-        let drain = |frozen: &mut Vec<_>| {
-            let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
-            for id in ids {
-                if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
-                    for (role, device) in state.into_devices() {
-                        let backend = device.backend.clone();
-                        device.abandon_for_shutdown();
-                        frozen.push((id, role, backend));
-                    }
-                }
-            }
-        };
-        drain(&mut frozen);
-        // Belt-and-braces second pass: catches a state inserted
-        // between the flag store and the first drain's snapshot.
-        drain(&mut frozen);
-        let abandoned = frozen.len();
-
-        let Some(spool_root) = self.shutdown_spool_root() else {
-            for (sandbox_id, _, backend) in &frozen {
-                let dirty = backend.dirty_bytes().await;
-                if dirty > 0 {
-                    tracing::error!(
-                        %sandbox_id,
-                        dirty_bytes = dirty,
-                        "shutdown abandon: un-uploaded dirty bytes and NO spool root \
-                         (checkpoint_dir unset); the successor will roll back these \
-                         acked guest writes",
-                    );
-                }
-            }
-            return abandoned;
-        };
-        for (sandbox_id, role, backend) in frozen {
-            let (manifest_ref, chunks) = backend.export_unflushed().await;
-            // Written even when `chunks` is empty: a zero-chunk spool still
-            // carries the manifest ref, which covers the flush-succeeded-but-
-            // coord-publish-failed shutdown — the chunks and manifest are
-            // durable in the blob store under a version coord never heard
-            // about, and the successor must attach from THAT ref (the spool's
-            // store-ahead rule), not roll back to coord's stale one.
-            match crate::disk_daemon::spool::write_spool(
-                self.host_fs.as_ref(),
-                &spool_root,
-                sandbox_id,
-                role,
-                manifest_ref,
-                &chunks,
-            )
-            .await
-            {
-                Ok(bytes) => tracing::info!(
-                    %sandbox_id,
-                    chunks = chunks.len(),
-                    bytes,
-                    manifest = %manifest_ref,
-                    "shutdown abandon: un-uploaded dirty chunks preserved in the \
-                     local spool for the successor to adopt",
-                ),
-                Err(e) => tracing::error!(
-                    %sandbox_id,
-                    chunks = chunks.len(),
-                    error = %e,
-                    "shutdown abandon: SPOOL WRITE FAILED; the successor will roll \
-                     back these acked guest writes",
-                ),
-            }
-        }
-        abandoned
-    }
-
-    /// Node-local root for the shutdown spool (un-uploaded dirty
-    /// chunks handed from a dying host-agent generation to its
-    /// successor). Lives under `checkpoint_dir` — the same hostPath
-    /// volume the checkpoint chain records already rely on surviving
-    /// pod rolls. `None` ⟺ checkpointing is disabled (dev/tests).
-    #[cfg(target_os = "linux")]
-    fn shutdown_spool_root(&self) -> Option<std::path::PathBuf> {
-        self.checkpoint_dir.as_ref().map(|d| d.join("spool"))
-    }
-
-    /// Issue #224: whether the terminal shutdown-abandon mode is
-    /// engaged. Insert sites consult this immediately before adding a
-    /// freshly-built `NbdSandboxState` to `nbd_sandboxes`; when set
-    /// they `abandon_for_shutdown()` the state instead so the
-    /// successor host-agent generation keeps the kernel-side device.
-    #[cfg(target_os = "linux")]
-    fn is_abandoning(&self) -> bool {
-        self.abandoning.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Attach a chunk store + a per-host directory where chunked
-    /// manifests get materialized. Once set, `create()` resolves the
-    /// cached image's `bundle.json` → manifest → file via the chunk
-    /// store, bypassing the OCI-pulled `rootfs.ext4`. Required for
-    /// chunked storage to actually flow through dev / production
-    /// sessions.
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
+    /// Attach the chunk store that holds disk and memory manifests.
+    pub fn with_chunk_store(mut self, chunk_store: ChunkStore) -> Self {
         self.chunk_store = Some(chunk_store);
-        self.materialize_dir = Some(materialize_dir);
         self
     }
 
@@ -5081,20 +3122,6 @@ impl PooledBackend {
     pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
         self.chunk_cache = Some(cache);
         self
-    }
-
-    /// Set the root for stable per-sandbox dirty files.
-    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
-        self.dirty_root = Some(root);
-        self
-    }
-
-    fn resolved_dirty_root(&self) -> Option<PathBuf> {
-        self.dirty_root.clone().or_else(|| {
-            self.chunk_cache
-                .as_ref()
-                .map(|cache| cache.root().join("dirty"))
-        })
     }
 
     /// ADR 0111 + ADR 0121: replay the policies the previous process
@@ -5149,178 +3176,6 @@ impl PooledBackend {
         }
     }
 
-    /// Publish allocated root and swap dirty-file bytes to the cache budget.
-    pub async fn publish_disk_co_tenants(&self) {
-        let dirty_bytes: u64 = self
-            .resolved_dirty_root()
-            .map(|root| allocated_bytes_under(&root))
-            .unwrap_or(0);
-        if let Some(cache) = &self.chunk_cache {
-            cache.set_co_tenant_reserved("dirty-files", dirty_bytes);
-        }
-        metrics::gauge!(crate::metrics::HOST_DIRTY_FILES_BYTES).set(dirty_bytes as f64);
-    }
-
-    /// Run this after reattach and before coordinator registration.
-    /// The live set is complete, and no create or resume can race it.
-    /// Recovery only adopts files for VMs that survived reattach.
-    pub async fn sweep_dirty_root(&self) {
-        let Some(root) = self.resolved_dirty_root() else {
-            return;
-        };
-        let live: HashSet<SandboxId> = match self.inner.list().await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "dirty-root sweep: backend list failed; skipping",
-                );
-                return;
-            }
-        };
-        sweep_dirty_root_at(&root, &live);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn all_disks_served(&self, id: SandboxId) -> bool {
-        let Some(disks) = self.nbd_sandboxes.get(&id) else {
-            return false;
-        };
-        let mut expected = disks.expected.clone();
-        if self.inner.swap_device(id).is_some() {
-            expected.insert(DiskRole::Swap);
-        }
-        engram_host_core::all_disk_roles_served(&expected, disks.iter().map(|(role, _)| role))
-    }
-
-    /// Attach a host-side device to an existing sandbox. Root must exist first.
-    #[cfg(target_os = "linux")]
-    pub async fn attach_disk(
-        &self,
-        id: SandboxId,
-        role: DiskRole,
-        mut state: crate::disk_daemon::NbdSandboxState,
-    ) -> Result<(), SandboxError> {
-        let _capture = self.capture_lock(id).lock_owned().await;
-        let prepared: Result<(), SandboxError> = async {
-            if role == DiskRole::Swap && self.nbd_owners.is_none() {
-                return Err(SandboxError::InvalidSpec(
-                    "swap attachment requires durable device owners".into(),
-                ));
-            }
-
-            if self
-                .nbd_sandboxes
-                .get(&id)
-                .map_or(role != DiskRole::Root, |disks| disks.get(role).is_some())
-            {
-                return Err(SandboxError::InvalidSpec(
-                    "device role is occupied or root is absent".into(),
-                ));
-            }
-            let path = self
-                .dirty_file_path(id, role)
-                .ok_or_else(|| SandboxError::InvalidSpec("dirty root is absent".into()))?;
-            state
-                .backend
-                .relocate_dirty_file(&path)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("move device dirty file: {e}").into()))?;
-            if role == DiskRole::Swap {
-                state
-                    .backend
-                    .persist_recovery_ref()
-                    .await
-                    .map_err(|error| {
-                        SandboxError::Vm(format!("record device lineage: {error}").into())
-                    })?;
-            }
-            if role == DiskRole::Swap {
-                self.nbd_owners
-                    .as_ref()
-                    .expect("swap owner directory checked")
-                    .record(state.device_path(), id, role)
-                    .map_err(|e| SandboxError::Vm(format!("record swap owner: {e}").into()))?;
-            }
-            let mut config = self.flush_config.clone();
-            config.enabled &= role == DiskRole::Root;
-            state.install_flush_scheduler(
-                id,
-                role,
-                self.live_manifest_publisher.clone(),
-                self.data_plane_health.clone(),
-                config,
-                self.nbd_owners.clone().filter(|_| role == DiskRole::Root),
-            );
-            Ok(())
-        }
-        .await;
-        if let Err(error) = prepared {
-            // Keep the device connected until its live consumer has stopped.
-            if self.inner.swap_device(id).as_deref() == Some(state.device_path())
-                && self.inner.destroy(id).await.is_err()
-            {
-                state.abandon_for_shutdown();
-            }
-            return Err(error);
-        }
-        if self.is_abandoning() {
-            state.abandon_for_shutdown();
-            return Ok(());
-        }
-        match role {
-            DiskRole::Root => {
-                self.nbd_sandboxes.insert(
-                    id,
-                    SandboxDisks {
-                        expected: [engram_core::DiskRole::Root].into_iter().collect(),
-                        root: state,
-                        swap: None,
-                    },
-                );
-            }
-            DiskRole::Swap => {
-                let mut disks = self
-                    .nbd_sandboxes
-                    .get_mut(&id)
-                    .ok_or(SandboxError::NotFound)?;
-                disks.expected.insert(role);
-                disks.swap = Some(state);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn disk_backends(
-        &self,
-        id: SandboxId,
-    ) -> Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)> {
-        self.nbd_sandboxes
-            .get(&id)
-            .map(|entry| {
-                entry
-                    .iter()
-                    .map(|(role, state)| (role, state.backend.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn dirty_file_path(&self, sandbox_id: SandboxId, role: DiskRole) -> Option<PathBuf> {
-        self.resolved_dirty_root()
-            .map(|root| root.join(role.dirty_file_name(sandbox_id)))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn pending_dirty_file_path(&self) -> Option<PathBuf> {
-        let sequence =
-            PENDING_DIRTY_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.resolved_dirty_root()
-            .map(|root| root.join(format!(".pending-{}-{sequence}.cache", std::process::id())))
-    }
-
     /// Attach an image cache. Calling this after `new()` lets
     /// `create()` resolve `spec.image_uri` to a cached on-disk path
     /// before forwarding to the inner backend.
@@ -5352,426 +3207,6 @@ impl PooledBackend {
         self
     }
 
-    /// Resolve the disk for a cached image. Three branches in
-    /// priority order:
-    ///
-    /// 1. **NBD path** (Linux + `nbd_pool` + `chunk_store` +
-    ///    `chunk_cache` + `bundle.disk_manifest` all present):
-    ///    spawn an NBD daemon serving the chunk manifest, return
-    ///    `(/dev/nbdN, Some(NbdSandboxState))`. The state is held
-    ///    by `create()` and stashed in `nbd_sandboxes` keyed by
-    ///    the eventual SandboxId.
-    /// 2. **Materialize-to-file** (chunk_store + materialize_dir +
-    ///    bundle): walk the chunk manifest into a single ext4
-    ///    file at `<materialize_dir>/<manifest_id>-v<n>.ext4`,
-    ///    return that path. The legacy chunked path; still the
-    ///    only option on macOS or when NBD isn't wired.
-    /// 3. **OCI fallback**: hand back the OCI-pulled `rootfs.ext4`
-    ///    unchanged. The pre-chunked-storage path; retiring as
-    ///    every host gets a chunk_store.
-    async fn resolve_rootfs(
-        &self,
-        uri: &str,
-        cached: &CachedImage,
-    ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
-        // ADR 0008 Phase 5 final piece: chunked-OCI images carry
-        // the `Manifest` object only in the bake's BlobStorage
-        // namespace. The runtime host's namespace may be empty.
-        // Synthesize the manifest from the bootstrap sidecar (which
-        // arrived with the OCI pull) and persist it before either
-        // disk-resolution branch reads it. Idempotent — skips when
-        // the manifest is already present.
-        if let Some(cs) = self.chunk_store.as_ref() {
-            ensure_chunked_manifest_in_blob_storage(cs, cached)
-                .await
-                .map_err(|e| {
-                    tracing::error!(uri = %uri, error = %e, "chunked-OCI manifest synthesis failed");
-                    e
-                })?;
-        }
-
-        // Branch 1: NBD daemon.
-        #[cfg(target_os = "linux")]
-        if let Some(state) = self.try_spawn_nbd(uri, cached).await? {
-            tracing::info!(
-                uri = %uri,
-                device = %state.device_path().display(),
-                "rootfs branch: NBD daemon",
-            );
-            return Ok((state.device_path().to_path_buf(), Some(state)));
-        }
-
-        // Branch 2: materialize-to-file (the chunked path).
-        let (chunk_store, materialize_dir) = match (
-            self.chunk_store.as_ref(),
-            self.materialize_dir.as_ref(),
-        ) {
-            (Some(cs), Some(dir)) => (cs, dir),
-            _ => {
-                let path = legacy_rootfs_path(cached)?;
-                tracing::debug!(uri = %uri, path = %path.display(), "rootfs branch: legacy ext4 (no chunk store wired)");
-                return Ok((path, nbd_state_none()));
-            }
-        };
-        let bundle = match cached.bundle.as_ref() {
-            Some(b) => b,
-            None => {
-                let path = legacy_rootfs_path(cached)?;
-                tracing::debug!(uri = %uri, path = %path.display(), "rootfs branch: legacy ext4 (no bundle)");
-                return Ok((path, nbd_state_none()));
-            }
-        };
-
-        // ADR 0008 Phase 5: when the image is chunked-OCI shaped AND
-        // an `OciClient` is wired, build a per-call `ChunkStore`
-        // with a `TieredChunkResolver` so chunks missing from
-        // BlobStorage fall through to OCI Range GET. Successful OCI
-        // fetches tee back into BlobStorage (CDN-fill) so subsequent
-        // sessions on the same host hit the cache tier.
-        //
-        // For non-chunked-OCI images (legacy ADR 0007 path,
-        // BlobStorage-only) we use the default chunk_store as-is.
-        let effective_store = self
-            .upgrade_chunk_store_for_chunked_oci(chunk_store, uri, cached)
-            .await
-            .map_err(|e| {
-                tracing::error!(uri = %uri, error = %e, "chunk-store upgrade for chunked-OCI failed");
-                e
-            })?;
-        tracing::debug!(
-            uri = %uri,
-            manifest = %bundle.disk_manifest,
-            chunked_oci = cached.is_disk_chunked_oci(),
-            "rootfs branch: materialize-to-file",
-        );
-
-        // ADR 0008: chunk reads inside `materialize_to_file_cached`
-        // route through `effective_store` (the per-session tiered
-        // store) via the cache's closure-based fetcher. The cache
-        // itself is backend-agnostic — no rebind needed.
-        let path = materialize_chunked_rootfs(
-            &effective_store,
-            self.chunk_cache.as_ref(),
-            materialize_dir,
-            uri,
-            bundle.disk_manifest,
-            &self.materialize_lock,
-        )
-        .await?;
-        Ok((path, nbd_state_none()))
-    }
-
-    /// Attach a private blank swap disk, or recover a snapshot's swap lineage.
-    #[cfg(target_os = "linux")]
-    async fn prepare_swap_attach(
-        &self,
-        size_mib: u32,
-        manifest: Option<engram_core::ManifestRef>,
-    ) -> Result<crate::disk_daemon::NbdSandboxState, SandboxError> {
-        let (Some(pool), Some(store), Some(cache)) =
-            (&self.nbd_pool, &self.chunk_store, &self.chunk_cache)
-        else {
-            return Err(SandboxError::InvalidSpec(
-                "swap requires the NBD data plane".into(),
-            ));
-        };
-        if self.nbd_owners.is_none() {
-            return Err(SandboxError::InvalidSpec(
-                "swap requires durable device owners".into(),
-            ));
-        }
-        let dirty_path = self
-            .pending_dirty_file_path()
-            .expect("NBD requires a dirty root");
-        let threshold = self.flush_config.dirty_threshold_bytes;
-        if let Some(reference) = manifest {
-            // A live move can start before swap has ever flushed. Its base
-            // is still shared; keep the first destination publish private.
-            // A restored private lineage continues without another fork.
-            return crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
-                reference,
-                cache.clone(),
-                Arc::new(store.clone()),
-                pool,
-                threshold,
-                reference == blank_swap_base(size_mib).0,
-                dirty_path,
-            )
-            .await
-            .map_err(|e| SandboxError::Vm(format!("attach swap: {e}").into()));
-        }
-        // A blank base is one deterministic manifest per capacity. The
-        // device forks its own identity at attach, so the shared base
-        // never receives a flush; it exists so a rehydrate after a
-        // host-agent roll can read the recovery ref. Published once per
-        // process; a conflict means another host published the same
-        // bytes first.
-        let (reference, blank) = blank_swap_base(size_mib);
-        if !self.blank_swap_bases.contains_key(&size_mib) {
-            match store.put_manifest(reference, &blank).await {
-                Ok(()) | Err(engram_chunk_store::ChunkStoreError::VersionConflict { .. }) => {}
-                Err(e) => {
-                    return Err(SandboxError::Snapshot(format!(
-                        "publish blank swap base: {e}"
-                    )))
-                }
-            }
-            self.blank_swap_bases.insert(size_mib, ());
-        }
-        crate::disk_daemon::runtime::attach_manifest_from_memory(
-            reference,
-            &blank,
-            cache.clone(),
-            Arc::new(store.clone()),
-            pool,
-            threshold,
-            true,
-            dirty_path,
-        )
-        .await
-        .map_err(|e| SandboxError::Vm(format!("attach swap: {e}").into()))
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn prepare_resume_swap_attach(
-        &self,
-        metadata: &SnapshotMetadata,
-        src: &std::path::Path,
-        fresh: bool,
-    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
-        let path = src.join("manifest.json");
-        let bytes = fs::read(&path)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("read swap sidecar: {e}")))?;
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| SandboxError::Snapshot(format!("parse swap sidecar: {e}")))?;
-        let spec = value
-            .get_mut("spec")
-            .and_then(|v| v.as_object_mut())
-            .ok_or_else(|| SandboxError::Snapshot("sidecar spec is absent".into()))?;
-        let size = spec.get("swap_mib").and_then(|v| v.as_u64()).unwrap_or(0);
-        if size == 0 {
-            if metadata.swap_manifest.is_some() {
-                return Err(SandboxError::MemoryImageUnusable(
-                    "swap manifest has no device geometry".into(),
-                ));
-            }
-            return Ok(None);
-        }
-        let base = spec
-            .get("env")
-            .and_then(|v| v.get("ENGRAM_BASE_CAPTURE"))
-            .and_then(|v| v.as_str())
-            == Some("1");
-        if !fresh && !base && metadata.swap_manifest.is_none() {
-            return Err(SandboxError::MemoryImageUnusable(
-                "swap restore has no manifest; refusing a stale device".into(),
-            ));
-        }
-        if fresh && metadata.swap_manifest.is_some() {
-            return Err(SandboxError::Snapshot(
-                "base snapshot contains swap state".into(),
-            ));
-        }
-        let size = u32::try_from(size)
-            .map_err(|_| SandboxError::Snapshot("invalid swap capacity".into()))?;
-        let state = self
-            .prepare_swap_attach(size, metadata.swap_manifest)
-            .await?;
-        spec.insert("swap_source".into(), serde_json::json!(state.device_path()));
-        spec.insert(
-            "swap_manifest".into(),
-            serde_json::json!(state.backend.manifest_ref().await),
-        );
-        if fresh {
-            if let Some(env) = spec.get_mut("env").and_then(|v| v.as_object_mut()) {
-                env.remove("ENGRAM_BASE_CAPTURE");
-            }
-        }
-        fs::write(
-            path,
-            serde_json::to_vec_pretty(&value).map_err(|e| SandboxError::Snapshot(e.to_string()))?,
-        )
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("patch swap sidecar: {e}")))?;
-        Ok(Some(state))
-    }
-
-    /// ADR 0028 Fix B: resolve the root disk from an explicit chunked
-    /// manifest (`spec.rootfs_manifest`) instead of an image — the
-    /// disk-only cold-boot recovery shape, where a fresh kernel mounts
-    /// a session's evolved `live_disk_manifest`. NBD-attached when the
-    /// host has the prereqs (prod FC hosts always do), so the
-    /// continuous-flush scheduler continues the SAME manifest lineage
-    /// the recovery booted from; materialize-to-file otherwise
-    /// (dev/VZ parity — those hosts don't track flushes for any
-    /// sandbox, so the recovered session degrades identically).
-    async fn resolve_rootfs_from_manifest(
-        &self,
-        manifest_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
-        #[cfg(target_os = "linux")]
-        if let (Some(pool), Some(store), Some(cache)) = (
-            self.nbd_pool.as_ref(),
-            self.chunk_store.as_ref(),
-            self.chunk_cache.as_ref(),
-        ) {
-            let store_arc = Arc::new(store.clone());
-            let dirty_path = self
-                .pending_dirty_file_path()
-                .expect("chunk cache provides a default dirty root");
-            let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
-                manifest_ref,
-                cache.clone(),
-                store_arc,
-                pool,
-                self.flush_config.dirty_threshold_bytes,
-                // Disk-only cold recovery resumes the session's OWN evolved
-                // manifest — already a private id, so tick, don't fork.
-                /*fork_at_attach=*/
-                false,
-                dirty_path,
-            )
-            .await
-            .map_err(|e| SandboxError::Vm(format!("rootfs-manifest NBD attach: {e}").into()))?;
-            tracing::info!(
-                manifest = %manifest_ref,
-                device = %state.device_path().display(),
-                "rootfs branch: NBD daemon (explicit manifest override)",
-            );
-            return Ok((state.device_path().to_path_buf(), Some(state)));
-        }
-
-        let (chunk_store, materialize_dir) =
-            match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
-                (Some(cs), Some(dir)) => (cs, dir),
-                _ => {
-                    return Err(SandboxError::InvalidSpec(
-                        "spec.rootfs_manifest is set but this host has neither an NBD \
-                     pool nor a chunk store + materialize dir wired"
-                            .into(),
-                    ));
-                }
-            };
-        tracing::info!(
-            manifest = %manifest_ref,
-            "rootfs branch: materialize-to-file (explicit manifest override)",
-        );
-        let path = materialize_chunked_rootfs(
-            chunk_store,
-            self.chunk_cache.as_ref(),
-            materialize_dir,
-            "rootfs-manifest-override",
-            manifest_ref,
-            &self.materialize_lock,
-        )
-        .await?;
-        Ok((path, nbd_state_none()))
-    }
-
-    /// ADR 0008 Phase 5: upgrade the base `ChunkStore` to a tiered
-    /// one when the cached image carries Nydus-shaped chunked OCI
-    /// layers AND an `OciClient` is configured. Returns the
-    /// original store unchanged otherwise — non-chunked-OCI images
-    /// don't need the OCI tier.
-    ///
-    /// Errors here surface from bootstrap parsing (corrupt sidecar)
-    /// or the chunk-store's blob_storage handle; both indicate a
-    /// real failure mode worth aborting on.
-    async fn upgrade_chunk_store_for_chunked_oci(
-        &self,
-        base: &ChunkStore,
-        uri: &str,
-        cached: &CachedImage,
-    ) -> Result<ChunkStore, SandboxError> {
-        let oci = match self.oci_client.as_ref() {
-            Some(c) => c,
-            None => return Ok(base.clone()),
-        };
-        if !cached.is_disk_chunked_oci() {
-            return Ok(base.clone());
-        }
-        let index = cached
-            .build_oci_chunk_index()
-            .await
-            .map_err(|e| SandboxError::Vm(format!("chunked-OCI index: {e}").into()))?;
-        let index = match index {
-            Some(i) => i,
-            None => return Ok(base.clone()),
-        };
-        let blob = base.blob_storage();
-        let cache_tier: Arc<dyn engram_chunk_store::ChunkResolver> =
-            Arc::new(engram_chunk_store::BlobStorageResolver::new(blob.clone()));
-        let origin_tier: Arc<dyn engram_chunk_store::ChunkResolver> = Arc::new(
-            engram_oci::OciChunkResolver::new(oci.clone(), uri.to_string(), index),
-        );
-        let tiered: Arc<dyn engram_chunk_store::ChunkResolver> = Arc::new(
-            engram_chunk_store::TieredChunkResolver::new(vec![cache_tier, origin_tier], Some(blob)),
-        );
-        tracing::debug!(
-            uri = %uri,
-            "chunked-OCI image: installing TieredChunkResolver for materialize",
-        );
-        Ok(base.clone().with_resolver(tiered))
-    }
-
-    /// Linux-only NBD spawn branch. Returns `None` when any
-    /// prerequisite (pool / chunk_store / chunk_cache /
-    /// bundle.disk_manifest) is missing. Caller falls back to
-    /// materialize-to-file in that case.
-    ///
-    /// For chunked-OCI v2 images the store is wrapped with the
-    /// same `TieredChunkResolver` the materialize-to-file branch
-    /// uses, so NBD reads of chunks absent from BlobStorage fall
-    /// through to OCI Range GET and tee back into BlobStorage.
-    /// Without this the NBD daemon 404s forever on first-touch
-    /// chunks.
-    #[cfg(target_os = "linux")]
-    async fn try_spawn_nbd(
-        &self,
-        uri: &str,
-        cached: &CachedImage,
-    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
-        let (pool, store, cache) = match (
-            self.nbd_pool.as_ref(),
-            self.chunk_store.as_ref(),
-            self.chunk_cache.as_ref(),
-        ) {
-            (Some(p), Some(s), Some(c)) => (p, s, c),
-            _ => return Ok(None),
-        };
-        let bundle = match cached.bundle.as_ref() {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let effective_store = self
-            .upgrade_chunk_store_for_chunked_oci(store, uri, cached)
-            .await
-            .map_err(|e| {
-                tracing::error!(uri = %uri, error = %e, "chunk-store upgrade for chunked-OCI (NBD) failed");
-                e
-            })?;
-        let store_arc = Arc::new(effective_store);
-        let dirty_path = self
-            .pending_dirty_file_path()
-            .expect("chunk cache provides a default dirty root");
-        let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
-            bundle.disk_manifest,
-            cache.clone(),
-            store_arc,
-            pool,
-            self.flush_config.dirty_threshold_bytes,
-            // ADR 0049 follow-up: FRESH create from the shared base image —
-            // fork the disk manifest to a private per-session id on first write.
-            /*fork_at_attach=*/
-            true,
-            dirty_path,
-        )
-        .await
-        .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest: {e}").into()))?;
-        Ok(Some(state))
-    }
-
     /// Materialise `<src>/memory.bin` from the FC sidecar JSON's
     /// `memory_manifest` (if both the manifest exists in the
     /// chunk store and the local file is absent). Used by
@@ -5788,7 +3223,7 @@ impl PooledBackend {
     /// ADR 0014 M1.13: parallel prefetch the memory manifest's
     /// chunks into the local NVMe chunk cache. Idempotent (no-op
     /// when the cache is already warm) and best-effort (errors
-    /// degrade to the serial fault path inside materialize_to_file_cached).
+    /// degrade to the serial fault path inside materialize_to_file).
     ///
     /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
     /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
@@ -5803,16 +3238,14 @@ impl PooledBackend {
         &self,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
-        match (self.chunk_store.as_ref(), self.chunk_cache.as_ref()) {
-            (Some(cs), Some(cache)) => {
-                Self::prefetch_memory_chunks_inner(cs, cache, metadata).await
-            }
-            _ => Ok(0),
+        match self.chunk_store.as_ref() {
+            Some(cs) => Self::prefetch_memory_chunks_inner(cs, metadata).await,
+            None => Ok(0),
         }
     }
 
     /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
-    /// already-resolved store + cache (by ref) so it can run either inline
+    /// already-resolved store (by ref) so it can run either inline
     /// (`await`, on a NON-LAZY File restore where the serial
     /// `materialize_memory_if_missing` reads the warmed cache) or inside a
     /// spawned background task (ADR 0043 P1, any lazy UFFD restore — the warmed
@@ -5820,7 +3253,6 @@ impl PooledBackend {
     /// need not block restore).
     async fn prefetch_memory_chunks_inner(
         chunk_store: &ChunkStore,
-        cache: &ChunkCache,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
@@ -5873,18 +3305,10 @@ impl PooledBackend {
             }
         };
         let chunk_count = hashes_to_prefetch.len();
-        let store_for_fetch = chunk_store.clone();
-        cache
-            .prefetch_chunks_parallel(
-                hashes_to_prefetch,
-                MEMORY_PREFETCH_CONCURRENCY,
-                move |hash| {
-                    let s = store_for_fetch.clone();
-                    async move { s.get_chunk(hash).await }
-                },
-            )
+        chunk_store
+            .prefetch_chunks(hashes_to_prefetch, MEMORY_PREFETCH_CONCURRENCY)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks_parallel: {e}")))?;
+            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks: {e}")))?;
         tracing::debug!(
             manifest = %mref,
             chunk_count,
@@ -5960,18 +3384,10 @@ impl PooledBackend {
             .get_manifest(mref)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("get_manifest {mref}: {e}")))?;
-        match self.chunk_cache.as_ref() {
-            Some(cache) => chunk_store
-                .materialize_to_file_cached(&manifest, &mem_path, cache)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("materialize memory.bin (cached): {e}"))
-                })?,
-            None => chunk_store
-                .materialize_to_file(&manifest, &mem_path)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?,
-        }
+        chunk_store
+            .materialize_to_file(&manifest, &mem_path)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?;
         tracing::info!(
             manifest = %mref,
             path = %mem_path.display(),
@@ -5985,8 +3401,8 @@ impl PooledBackend {
     /// whose successor `snapshot()` call is about to overwrite it).
     /// Removes only the per-snapshot local dir at
     /// `<work_dir>/sandboxes/snapshots/<snapshot_id>/` (4+ GiB on FC;
-    /// the 99 GB `engrams-fc-xngk` host filled in ~12 min by leaking 25
-    /// of these in 13 min) — host-disk hygiene, and rebuildable from
+    /// 25 leaked dirs fill a 99 GB host) — host-disk hygiene, and
+    /// rebuildable from
     /// BlobStorage on the next restore.
     ///
     /// It does NOT delete the per-snapshot BlobStorage objects
@@ -6092,217 +3508,6 @@ async fn materialize_state_if_missing(
     Ok(())
 }
 
-/// Cross-host chunked-rootfs materialization: rebuild `rootfs.ext4`
-/// from chunks if it isn't already on disk, then patch the FC
-/// sidecar's `spec.rootfs_source` to the local file path. Without
-/// this, `restore_in_jail` installs the canonical-rootfs symlink
-/// pointing at the bake-time path (`/tmp/.tmpXXX/...`) which
-/// doesn't exist on the receiver, and FC `load_snapshot` errors
-/// with "Block: Virtio backend error: No such file or directory".
-///
-/// Reached today by the ADR 0018 dead-host evac path (source FC is
-/// gone; the snapshot lives in BlobStorage and the rootfs must be
-/// rebuilt locally before `load_snapshot`) and by any /resume that
-/// lands on a host that didn't capture the snapshot. The original
-/// caller — ADR 0014's warm-pool cross-host refill — was retired
-/// with ADR 0015 M5, but the same primitive serves the current
-/// restore shapes unchanged.
-///
-/// Called from `PooledBackend::restore` after `materialize_state_if_missing`
-/// (which downloads the sidecar that this function then patches).
-/// No-op when `metadata.disk_manifest` is None (legacy snapshots)
-/// or when the local rootfs file already exists at the canonical
-/// location (idempotent same-host resume).
-async fn materialize_disk_if_missing(
-    chunk_store: &ChunkStore,
-    chunk_cache: Option<&ChunkCache>,
-    src: &std::path::Path,
-    disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    materialize_lock: &Mutex<()>,
-) -> Result<(), SandboxError> {
-    let Some(disk_ref) = disk_manifest else {
-        return Ok(());
-    };
-    // Use the same content-addressed file name the cold-create path
-    // uses, in the same per-snapshot scratch dir, so a future
-    // `image_cache.ensure_image` materialization shares the file
-    // (and same-host resume short-circuits).
-    let local_rootfs = src.join(format!(
-        "{}-v{}.ext4",
-        disk_ref.manifest_id, disk_ref.version
-    ));
-    fs::create_dir_all(src).await.map_err(|e| {
-        SandboxError::Snapshot(format!("create snapshot dir {}: {e}", src.display()))
-    })?;
-    let _guard = materialize_lock.lock().await;
-    let manifest = chunk_store
-        .get_manifest(disk_ref)
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("get rootfs manifest {disk_ref}: {e}")))?;
-    if let Ok(meta) = fs::metadata(&local_rootfs).await {
-        if meta.len() == manifest.total_bytes {
-            tracing::debug!(
-                path = %local_rootfs.display(),
-                manifest = %disk_ref,
-                "rootfs already materialised; skipping rebuild",
-            );
-        }
-    }
-    if fs::metadata(&local_rootfs)
-        .await
-        .map(|m| m.len() != manifest.total_bytes)
-        .unwrap_or(true)
-    {
-        match chunk_cache {
-            Some(cache) => chunk_store
-                .materialize_to_file_cached(&manifest, &local_rootfs, cache)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!(
-                        "materialize rootfs (cached) {}: {e}",
-                        local_rootfs.display()
-                    ))
-                })?,
-            None => chunk_store
-                .materialize_to_file(&manifest, &local_rootfs)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!(
-                        "materialize rootfs {}: {e}",
-                        local_rootfs.display()
-                    ))
-                })?,
-        }
-        tracing::info!(
-            path = %local_rootfs.display(),
-            manifest = %disk_ref,
-            size_bytes = manifest.total_bytes,
-            "materialised rootfs.ext4 from chunked disk manifest",
-        );
-    }
-
-    // Patch the FC sidecar's `spec.rootfs_source` to point at the
-    // just-materialized file. ADR 0016 Phase B commit 5 factored
-    // this out into a shared helper so the resume-path NBD attach
-    // (which has no local file but needs the same sidecar patch
-    // pointing at /dev/nbdN) can call it without duplicating the
-    // serde + canonicalize ceremony.
-    //
-    // Must be absolute: the canonical-rootfs symlink lives at the
-    // bake's `/tmp/.tmpXXX/rootfs/<src>.dev`, so a relative target
-    // resolves against `/tmp/.tmpXXX/rootfs/` and points at nothing.
-    let local_rootfs = fs::canonicalize(&local_rootfs).await.map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "canonicalize materialised rootfs {}: {e}",
-            local_rootfs.display()
-        ))
-    })?;
-    patch_sidecar_rootfs_source(src, &local_rootfs).await?;
-
-    Ok(())
-}
-
-/// ADR 0016 Phase B commit 5 — patch the FC sidecar's
-/// `spec.rootfs_source` to `target`. Shared by:
-///
-/// - `materialize_disk_if_missing` (legacy path): `target` is the
-///   freshly-written `<src>/<manifest_id>-vN.ext4` flat file.
-/// - `prepare_resume_nbd_attach` (Phase B path): `target` is the
-///   `/dev/nbdN` device served by the chunked-disk daemon.
-///
-/// `restore_canonical_symlinks` inside FC's `inner.restore` reads
-/// this field and installs two symlinks (host's `<work_dir>/rootfs/
-/// <new_sandbox_id>.dev` AND the source-keyed path FC's `state.bin`
-/// embeds at bake time). Both point at `target`. FC's `load_snapshot`
-/// then reads its rootfs through whichever symlink it dereferences —
-/// either a flat file or the NBD device.
-///
-/// Pre-Phase-B, the symlink target was always a flat file. Phase B
-/// makes the chunked-disk lineage land at `/dev/nbdN` instead,
-/// rejoining the resumed sandbox with `nbd_sandboxes` tracking.
-async fn patch_sidecar_rootfs_source(
-    src: &std::path::Path,
-    target: &std::path::Path,
-) -> Result<(), SandboxError> {
-    let sidecar_path = src.join("manifest.json");
-    let bytes = fs::read(&sidecar_path).await.map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "read fc manifest.json {}: {e}",
-            sidecar_path.display()
-        ))
-    })?;
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "parse fc manifest.json {}: {e}",
-            sidecar_path.display()
-        ))
-    })?;
-    let spec = value
-        .get_mut("spec")
-        .and_then(|s| s.as_object_mut())
-        .ok_or_else(|| SandboxError::Snapshot("fc sidecar spec is not an object".into()))?;
-    spec.insert(
-        "rootfs_source".into(),
-        serde_json::Value::String(target.to_string_lossy().into_owned()),
-    );
-    let patched = serde_json::to_vec_pretty(&value)
-        .map_err(|e| SandboxError::Snapshot(format!("serialize patched sidecar: {e}")))?;
-    fs::write(&sidecar_path, patched).await.map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "write patched sidecar to {}: {e}",
-            sidecar_path.display()
-        ))
-    })?;
-    Ok(())
-}
-
-/// Read the FC sidecar's `spec.rootfs_source` back off disk — the inverse
-/// of [`patch_sidecar_rootfs_source`]'s write, reading the SAME
-/// `<src>/manifest.json`. Used by the resume path's D4 guard to detect a
-/// snapshot whose sidecar still names a capture-time literal `/dev/nbdN`
-/// device that no NBD attach replaced. Best-effort: a missing/unparseable
-/// sidecar or an absent field returns `None` (the guard then does not
-/// fire, and the normal restore proceeds — a malformed sidecar fails later
-/// in FC's own restore with its own error).
-async fn read_sidecar_rootfs_source(src: &std::path::Path) -> Option<String> {
-    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value
-        .get("spec")
-        .and_then(|s| s.get("rootfs_source"))
-        .and_then(|r| r.as_str())
-        .map(str::to_owned)
-}
-
-/// The blank swap base for a capacity: the same `ManifestRef` on every
-/// host, derived from the size, at version 1.
-#[cfg(target_os = "linux")]
-fn blank_swap_base(size_mib: u32) -> (engram_core::ManifestRef, engram_chunk_store::Manifest) {
-    // A fixed namespace with the capacity in the low bits: unique per
-    // size, identical on every host, no hash feature required.
-    const NAMESPACE: u128 = 0x3d6c_1b2a_7f4e_4c0b_9a51_2e8f_0b6d_0000;
-    let reference = engram_core::ManifestRef {
-        manifest_id: uuid::Uuid::from_u128(NAMESPACE | u128::from(size_mib)),
-        version: 1,
-    };
-    let manifest = engram_chunk_store::Manifest::empty(
-        engram_chunk_store::ManifestKind::Disk,
-        u64::from(size_mib) << 20,
-    );
-    (reference, manifest)
-}
-
-#[cfg(target_os = "linux")]
-async fn read_sidecar_swap_source(src: &std::path::Path) -> Option<String> {
-    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value
-        .get("spec")?
-        .get("swap_source")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 /// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
 /// referenced by `cached.bundle.disk_manifest` is reachable in
 /// the host's `BlobStorage`. For chunked-OCI images, the bake-
@@ -6313,8 +3518,8 @@ async fn read_sidecar_swap_source(src: &std::path::Path) -> Option<String> {
 /// manifest is already in BlobStorage, or when the artifact is
 /// not chunked-OCI shaped (legacy bundle.json / no bundle).
 ///
-/// Called from `resolve_rootfs` before either disk-resolution
-/// branch (NBD or materialize-to-file) reads the manifest.
+/// Called from `create` before the image's manifest seeds a session
+/// volume.
 pub async fn ensure_chunked_manifest_in_blob_storage(
     chunk_store: &ChunkStore,
     cached: &CachedImage,
@@ -6392,115 +3597,7 @@ pub async fn ensure_chunked_manifest_in_blob_storage(
     }
 }
 
-/// Materialize a chunked manifest to a content-addressed file under
-/// `materialize_dir`. The output path is named by
-/// `manifest_id-v{version}.ext4` so two sessions referencing the same
-/// manifest deterministically land at the same file (the inner backend
-/// can then APFS-clonefile or NBD-attach on top). Idempotent: returns
-/// fast when the file already exists with the expected size.
-async fn materialize_chunked_rootfs(
-    chunk_store: &ChunkStore,
-    chunk_cache: Option<&ChunkCache>,
-    materialize_dir: &std::path::Path,
-    uri: &str,
-    manifest_ref: engram_core::types::manifest::ManifestRef,
-    materialize_lock: &Mutex<()>,
-) -> Result<PathBuf, SandboxError> {
-    fs::create_dir_all(materialize_dir).await.map_err(|e| {
-        tracing::error!(
-            dir = %materialize_dir.display(),
-            error = %e,
-            "materialize_chunked_rootfs: create dir failed",
-        );
-        SandboxError::Vm(format!("materialize dir: {e}").into())
-    })?;
-    let dest = materialize_dir.join(format!(
-        "{}-v{}.ext4",
-        manifest_ref.manifest_id, manifest_ref.version,
-    ));
-
-    // Fast-path: file exists at the expected size. We trust local-
-    // disk integrity here — the chunk store's content addressing
-    // already validates bytes on the way in.
-    let manifest = chunk_store.get_manifest(manifest_ref).await.map_err(|e| {
-        tracing::error!(
-            uri = %uri,
-            manifest_ref = %manifest_ref,
-            error = %e,
-            "materialize_chunked_rootfs: get_manifest failed",
-        );
-        SandboxError::Vm(format!("get manifest {manifest_ref}: {e}").into())
-    })?;
-    if let Ok(meta) = fs::metadata(&dest).await {
-        if meta.len() == manifest.total_bytes {
-            tracing::debug!(
-                uri = %uri,
-                manifest = %manifest_ref,
-                path = %dest.display(),
-                "chunked rootfs already materialized",
-            );
-            return Ok(dest);
-        }
-    }
-
-    // Slow-path: hold the lock so two concurrent creates against the
-    // same manifest don't both walk the chunks. The second waiter
-    // sees the file once the first releases and short-circuits via
-    // the fast-path check we redo below.
-    let _guard = materialize_lock.lock().await;
-    if let Ok(meta) = fs::metadata(&dest).await {
-        if meta.len() == manifest.total_bytes {
-            return Ok(dest);
-        }
-    }
-
-    tracing::info!(
-        uri = %uri,
-        manifest = %manifest_ref,
-        chunks = manifest.chunks.len(),
-        total_bytes = manifest.total_bytes,
-        path = %dest.display(),
-        cached = chunk_cache.is_some(),
-        "materializing chunked rootfs",
-    );
-    // Route chunk reads through the local NVMe cache when one is
-    // attached. Without it we re-fetch from BlobStorage every
-    // materialize even when chunks haven't changed across
-    // manifests.
-    match chunk_cache {
-        Some(cache) => {
-            chunk_store
-                .materialize_to_file_cached(&manifest, &dest, cache)
-                .await
-        }
-        None => chunk_store.materialize_to_file(&manifest, &dest).await,
-    }
-    .map_err(|e| {
-        tracing::error!(
-            uri = %uri,
-            manifest_ref = %manifest_ref,
-            dest = %dest.display(),
-            chunks = manifest.chunks.len(),
-            total_bytes = manifest.total_bytes,
-            error = %e,
-            "materialize_chunked_rootfs: materialize_to_file failed",
-        );
-        SandboxError::Vm(format!("materialize {manifest_ref}: {e}").into())
-    })?;
-    Ok(dest)
-}
-
-/// Chunk an FC `memory.bin` snapshot file into the chunk store
-/// and commit a fresh memory manifest. Returns the new
-/// `ManifestRef` so callers can attach it to the FC sidecar JSON
-/// and `SnapshotMetadata`.
-///
-/// Uses [`engram_chunk_store::ChunkStore::chunk_file`] with the
-/// default 512 KiB memory chunk size. Sparse / all-zero blocks
-/// are omitted from the manifest (the chunk_file primitive already
-/// short-circuits them); on restore the resolver treats absent
-/// chunk entries as zero-fill (UFFDIO_ZEROPAGE) so zero pages cost
-/// ADR 0045 D5: what `capture_phase` hands the post phase.
+/// What `capture_phase` hands the post phase.
 pub(crate) struct SnapshotCapture {
     metadata: SnapshotMetadata,
     dest: PathBuf,
@@ -6509,10 +3606,8 @@ pub(crate) struct SnapshotCapture {
         engram_chunk_store::Manifest,
     )>,
     paused_at: chrono::DateTime<chrono::Utc>,
-    /// Issue #202: the armed capture-unwind guard. Owns the drained
-    /// `PendingDiskFlush` (Linux) and resumes the guest if this capture
-    /// is dropped before the finisher takes it over. The finisher
-    /// extracts the pending and defuses it.
+    /// Owns the pending disk checkpoints and resumes the guest if this
+    /// capture is dropped before the finisher takes it over.
     unwind: CaptureUnwind,
 }
 
@@ -6573,32 +3668,25 @@ impl DeferredSnapshot {
     }
 }
 
-/// ADR 0045 D5: see [`PooledBackend::finisher`]. Owns Arc-clones of the
-/// fields the snapshot post phase + chain bookkeeping touch, so the phase
-/// can run detached from the originating RPC.
+/// Arc-clones of the fields the snapshot post phase and the chain
+/// bookkeeping touch, so the phase can run detached from the RPC.
 #[derive(Clone)]
 pub(crate) struct SnapshotFinisher {
-    #[cfg(target_os = "linux")]
-    nbd_sandboxes: Arc<DashMap<SandboxId, SandboxDisks>>,
+    volumes: Option<Arc<SessionVolumes>>,
     chunk_store: Option<ChunkStore>,
     chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
-    /// The backend's staged-bundle extension (squashfs on both backends), so `publish`
-    /// opens the SAME staged filename the backend attaches. Copied from
-    /// `SandboxBackend::bundle_file_ext` at construction (like `bundle_dir`).
+    /// The backend's staged-bundle extension, so `publish` opens the
+    /// same staged filename the backend attaches.
     bundle_file_ext: &'static str,
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
-    /// ADR 0101 B: last completed epoch's pacing sample, written by the
-    /// diff arm of the post phase; read by the adaptive checkpoint
-    /// controller (`checkpoint_candidates_adaptive`).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     checkpoint_dir: Option<PathBuf>,
+    checkpoint_recorded: Arc<tokio::sync::Notify>,
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
-    /// ADR 0098 D1: cloned from the owning `PooledBackend` — the chain-head
-    /// record's `updated_at` reads through the injected clock.
     clock: Arc<dyn engram_core::traits::Clock>,
 }
 
@@ -6617,8 +3705,8 @@ impl SnapshotFinisher {
     /// ADR 0045 D5 + issue #147: the post phase — disk upload, memory
     /// re-chunk (parallel, `buffer_unordered(32)` inside the chunk
     /// store), portable-blob upload, bundle publish, then chain
-    /// bookkeeping / cleanup. Instrumented end-to-end (the re-chunk used
-    /// to be invisible in traces).
+    /// bookkeeping / cleanup. Each leg has its own `finish.*` span.
+    #[tracing::instrument(name = "host.snapshot_finish", skip_all, fields(sandbox_id = %id))]
     pub(crate) async fn finish(
         &self,
         id: SandboxId,
@@ -6640,91 +3728,51 @@ impl SnapshotFinisher {
         // ADR 0014 cleanup hygiene: from here on, FC has materialised
         // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
         // the post-inner steps below (chunking, sidecar patch, BlobStorage
-        // upload, NBD version conflict surfaced via the caller's
-        // earlier flush) MUST rm -rf `dest` before propagating, or
+        // upload, a disk checkpoint publish conflict) MUST rm -rf `dest`
+        // before propagating, or
         // we leak 4 GiB per failure — idle-evict retries every ~30s
         // and fills the host disk inside an hour.
         let metadata = cap.metadata;
         let dest = cap.dest;
         let chain_prev = cap.chain_prev;
         let paused_at = cap.paused_at;
-        // Issue #202: the finisher now owns the capture. Ordinary snapshots
-        // resume; snapshot_hold stays paused. `flush_upload` below
-        // owns the drained chunks' re-queue on its own error path, so
-        // take the pending out of the guard and defuse it — from here
-        // the guard's resume/requeue must NOT fire.
+        // The finisher owns the capture from here: the pending disk
+        // checkpoints leave the guard and the guard must not resume.
         let mut unwind = cap.unwind;
-        #[cfg(target_os = "linux")]
-        let nbd_pending_flush = std::mem::take(&mut unwind.disk_pending);
+        let pending = std::mem::take(&mut unwind.pending);
         unwind.defuse();
         drop(unwind);
         let mut metadata = metadata;
-        // Issue #529: stamp the exact pause instant unconditionally — the
-        // coord's composed eviction path resolves the session_events
-        // coherence cursor from this instead of its own wall-clock `now`
-        // sampled after the (possibly multi-second) post phase below,
-        // closing the skew that made a clean evict→resume rewind the
-        // coordinator's own lifecycle events (median 4, prod evidence).
+        // The exact pause instant: the coordinator's eviction path resolves
+        // the session_events coherence cursor from it.
         metadata.paused_at = Some(paused_at);
         let post = async {
-            // ADR 0038 B3: upload the drained disk chunks and publish the
-            // manifest. Ordinary snapshots have resumed; snapshot_hold keeps
-            // the source paused throughout this upload. The
-            // operation scope makes the chunk uploads attach `chunk.flush`
-            // spans to the snapshot op's trace. Awaited here (before the
-            // snapshot is recorded) so the recorded `disk_manifest`
-            // references durable chunks; `base` is rebased only after the
-            // upload, so the background scheduler never sees a
-            // not-yet-uploaded chunk.
-            #[cfg(target_os = "linux")]
-            let mut pending_disks = nbd_pending_flush.into_iter();
-            #[cfg(target_os = "linux")]
-            while let Some((role, pending)) = pending_disks.next() {
-                // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop
-                // the guard BEFORE `flush_upload` — this is the multi-
-                // second GCS upload (~32 s for ~1,936 chunks) and the
-                // worst guard-across-await offender. Holding the shard
-                // guard here parks every contending `destroy`/`create`
-                // worker for the upload's full duration and can deadlock
-                // the runtime. A `None`-after-clone (entry destroyed
-                // mid-upload) is treated as "entry missing", exactly as
-                // the previous `if let Some(entry)` did.
-                let backend = self
-                    .nbd_sandboxes
-                    .get(&id)
-                    .and_then(|e| e.get(role).map(|d| d.backend.clone()));
-                if let Some(backend) = backend {
-                    backend.operation_scope().begin("snapshot");
-                    let res = backend.flush_upload(pending).await;
-                    backend.operation_scope().end();
-                    let outcome = match res {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            for (role, pending) in pending_disks {
-                                let backend = self
-                                    .nbd_sandboxes
-                                    .get(&id)
-                                    .and_then(|e| e.get(role).map(|d| d.backend.clone()));
-                                if let Some(backend) = backend {
-                                    backend.requeue_pending(pending).await;
-                                }
-                            }
-                            return Err(SandboxError::Snapshot(format!(
-                                "nbd disk upload: {error}"
-                            )));
+            // Publish the disk checkpoints first, so the recorded manifests
+            // reference durable chunks. A held source stays paused
+            // throughout; an ordinary snapshot has already resumed.
+            let mut pending = pending.into_iter();
+            while let Some(checkpoint) = pending.next() {
+                let role = checkpoint.role();
+                let volumes = self.volumes.as_ref().expect("a pending checkpoint implies volumes");
+                let published = match volumes
+                    .publish(checkpoint)
+                    .instrument(tracing::info_span!("finish.disk_publish", %role))
+                    .await
+                {
+                    Ok(published) => published,
+                    Err(error) => {
+                        for rest in pending {
+                            discard_pending(volumes, rest).await;
                         }
-                    };
-                    tracing::info!(
-                        sandbox_id = %id,
-                        manifest = %outcome.manifest_ref,
-                        chunks_flushed = outcome.chunks_flushed,
-                        bytes_uploaded = outcome.bytes_uploaded,
-                        "chunked NBD disk uploaded (post-resume)",
-                    );
-                    match role {
-                        DiskRole::Root => metadata.disk_manifest = Some(outcome.manifest_ref),
-                        DiskRole::Swap => metadata.swap_manifest = Some(outcome.manifest_ref),
+                        return Err(SandboxError::Snapshot(format!(
+                            "{role} disk publish: {error}"
+                        )));
                     }
+                };
+                tracing::info!(sandbox_id = %id, %role, manifest = %published, "disk checkpoint published");
+                match role {
+                    DiskRole::Root => metadata.disk_manifest = Some(published),
+                    DiskRole::Swap => metadata.swap_manifest = Some(published),
                 }
             }
             // ADR 0007 / Phase 5: when a chunk store is wired AND the
@@ -6749,18 +3797,29 @@ impl SnapshotFinisher {
                 // its prev content (warm chunk cache) + the sparse diff —
                 // no full memfile to read, keep, or overlay.
                 let diff_path = dest.join("memory.diff");
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                // FC's Diff snapshot writes dirty pages at their
+                // guest-physical offsets into a sparse file, so its data
+                // extents are the dirty set.
+                let ranges = std::fs::File::open(&diff_path)
+                    .and_then(|f| engram_host_core::data_extents(&f))
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
                 // ADR 0101 B: the diff's dirty extent sum is the epoch's
                 // rate signal for the adaptive checkpoint controller.
-                epoch_dirty_bytes = Some(ranges.iter().map(|(_, len)| *len).sum());
+                let dirty_bytes: u64 = ranges.iter().map(|(_, len)| *len).sum();
+                epoch_dirty_bytes = Some(dirty_bytes);
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                    .instrument(tracing::info_span!(
+                        "finish.memory_rechunk",
+                        dirty_bytes,
+                        dirty_ranges = ranges.len()
+                    ))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
                 let next_ref = prev_ref.next_version();
                 chunk_store
                     .put_manifest(next_ref, &next)
+                    .instrument(tracing::info_span!("finish.manifest_put"))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
                 // The sparse diff did its job; drop it so the local
@@ -6785,6 +3844,7 @@ impl SnapshotFinisher {
                     self.chunk_cache.as_ref(),
                     "snapshot_finish",
                 )
+                .instrument(tracing::info_span!("finish.memory_chunk"))
                 .await?;
                 // ADR 0039: the dump is now durable in the chunk store and
                 // the chain seeds from the manifest (not this file) — drop
@@ -6831,20 +3891,24 @@ impl SnapshotFinisher {
             {
                 let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
                 let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &sidecar_key,
-                    &sidecar_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+                async {
+                    engram_chunk_store::snapshot_blob::upload_file(
+                        blob.as_ref(),
+                        &state_key,
+                        &state_path,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+                    engram_chunk_store::snapshot_blob::upload_file(
+                        blob.as_ref(),
+                        &sidecar_key,
+                        &sidecar_path,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))
+                }
+                .instrument(tracing::info_span!("finish.blob_upload"))
+                .await?;
                 metadata.state_blob_key = Some(state_key);
                 metadata.sidecar_blob_key = Some(sidecar_key);
                 metadata.source_sandbox_id = Some(id);
@@ -6866,6 +3930,7 @@ impl SnapshotFinisher {
                     self.bundle_file_ext,
                 )
                 .publish(&metadata.aux_bundles)
+                .instrument(tracing::info_span!("finish.bundle_publish"))
                 .await?;
             }
             Ok::<_, SandboxError>(metadata)
@@ -6880,18 +3945,10 @@ impl SnapshotFinisher {
                 // sandbox_id. Also lets a retry of this same sandbox's
                 // snapshot() find and tear down the prior attempt.
                 self.inflight_snapshots.insert(id, m.id);
-                // ADR 0016 Phase A: stamp the memory-tier RPO signal
-                // the `cow_state` RPC reports. Done AFTER post-
-                // processing succeeded — a snapshot whose state.bin /
-                // sidecar upload failed isn't durable and shouldn't
-                // advance the RPO indicator on the diagnostic
-                // surface. Pre-`commit_snapshot` is fine: the row
-                // hasn't been "claimed" by PG yet but the bytes are
-                // in BlobStorage, which is what the RPO measures.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
+                // Stamped after post-processing succeeded: a snapshot
+                // whose state.bin / sidecar upload failed is not a
+                // durable capture and must not advance the pacing epoch.
+                let now_ms = self.clock.now_utc().timestamp_millis();
                 let prev_ms = self.last_snapshot_unix_ms.insert(id, now_ms);
                 // ADR 0101 B: pacing sample for the adaptive checkpoint
                 // controller — the epoch is the gap since the previous
@@ -6921,6 +3978,7 @@ impl SnapshotFinisher {
                 // PG (if the caller's pipeline survives) knows this
                 // checkpoint. Both safe, both logged inside.
                 self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
+                    .instrument(tracing::info_span!("finish.record"))
                     .await;
                 Ok(m)
             }
@@ -7018,8 +4076,7 @@ impl SnapshotFinisher {
         }
         let Some(memory_ref) = metadata.memory_manifest else {
             // No chunked memory (no chunk store / non-FC backend):
-            // nothing to chain, and a record without a memory
-            // manifest adds nothing over the live disk manifest.
+            // nothing to chain.
             return;
         };
 
@@ -7072,18 +4129,26 @@ impl SnapshotFinisher {
             // (it uses `snapshot_begin`, not `snapshot()`).
             kind: engram_protocol::heartbeat::CheckpointKind::Periodic,
         };
-        if let Err(e) = record
+        match record
             .persist(&engram_host_core::TokioFs, &records_dir)
             .await
         {
-            tracing::warn!(
+            Ok(()) => self.checkpoint_recorded.notify_one(),
+            Err(e) => tracing::warn!(
                 sandbox_id = %id,
                 snapshot_id = %metadata.id,
                 error = %e,
                 "durable checkpoint record write failed; PG row (if the caller's \
                  pipeline survives) is the only reference",
-            );
+            ),
         }
+    }
+
+    /// A seeded chain means the memory matches a durable manifest now, so
+    /// the next checkpoint is not due yet. A capture's own stamp wins.
+    fn stamp_seeded(&self, id: SandboxId) {
+        let now_ms = self.clock.now_utc().timestamp_millis();
+        self.last_snapshot_unix_ms.entry(id).or_insert(now_ms);
     }
 
     /// ADR 0045 seed-at-create: seed the chain by FORKING the source
@@ -7141,11 +4206,12 @@ impl SnapshotFinisher {
         // The fork manifest is durable (put_manifest above succeeded) —
         // commit the chain-head record so the chain survives a pod roll.
         self.persist_chain_head(id, fork_ref).await;
+        self.stamp_seeded(id);
         tracing::info!(
             sandbox_id = %id,
             src = %src_ref,
             fork = %fork_ref,
-            "ADR 0045 seed-at-create: chain seeded on a forked lineage; first checkpoint will diff",
+            "chain seeded on a forked lineage; the first checkpoint diffs against it",
         );
     }
 
@@ -7189,6 +4255,7 @@ impl SnapshotFinisher {
                 // fetched it) — commit the chain-head record so the
                 // chain survives a pod roll.
                 self.persist_chain_head(id, memory_ref).await;
+                self.stamp_seeded(id);
                 tracing::info!(
                     sandbox_id = %id,
                     manifest = %memory_ref,
@@ -7550,249 +4617,89 @@ impl SandboxBackend for PooledBackend {
         self.inner.guest_memory_stats().await
     }
 
-    async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        // Issue #224: once SIGTERM has engaged terminal-abandon mode,
-        // refuse new cold-creates outright. Unlike resume/rehydrate
-        // (which re-serve a SURVIVING FC's already-attached device and
-        // must hand it off to the successor), a cold create has no
-        // surviving-VM contract — there is nothing to preserve, and
-        // letting it run would spawn a brand-new NBD daemon racing the
-        // abandon sweep. Reject early so the coordinator reschedules
-        // onto a live host rather than orphaning a half-built sandbox.
-        #[cfg(target_os = "linux")]
-        if self.is_abandoning() {
-            return Err(SandboxError::Vm(
-                "host-agent is shutting down (terminal abandon mode); \
-                 create rejected — reschedule onto another host"
-                    .into(),
-            ));
-        }
-        // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
-        // cached paths before warm-pool key derivation. Both paths
-        // overwrite the legacy filesystem fields when set, so the
-        // inner backend keeps working with rootfs_source / harness_
-        // substrate unchanged. On cache miss we pull synchronously;
-        // subsequent sessions for the same digest hit the cache and
-        // pay only the FS cost.
-        // `pending_nbd_state` carries the NBD daemon's state from
-        // the `resolve_rootfs` call (which spawns it) into the
-        // post-`inner.create` stash step. Linux-only — on macOS
-        // resolve_rootfs always returns `()` for the second slot.
-        #[cfg(target_os = "linux")]
-        let mut pending_nbd_state: Option<crate::disk_daemon::NbdSandboxState> = None;
-        // ADR 0014 follow-up: per-phase boot timing. Captured as
-        // sum-of-durations because the image + harness branches are
-        // independently optional (image-only specs skip the harness
-        // pull and vice-versa). The histogram labels follow the
-        // contract in `crate::metrics::SANDBOX_BOOT_SECONDS`.
+    async fn create(&self, id: SandboxId, mut spec: SandboxSpec) -> Result<(), SandboxError> {
         let phase_total = crate::time_source::metrics_now();
         let mut image_resolve = std::time::Duration::ZERO;
         let mut materialize = std::time::Duration::ZERO;
-        let result: Result<SandboxId, SandboxError> = async {
-            // ADR 0028 Fix B: explicit rootfs-manifest override wins
-            // over image resolution — the disk-only cold-boot recovery
-            // boots a fresh kernel against a session's evolved rootfs
-            // lineage, so the image's own disk (and its pull) is
-            // irrelevant; `spec.image_uri` stays as record-keeping.
-            if let Some(manifest_ref) = spec.rootfs_manifest {
-                let t = crate::time_source::metrics_now();
-                let (path, _state) = self.resolve_rootfs_from_manifest(manifest_ref).await?;
-                materialize += t.elapsed();
-                spec.rootfs_source = Some(path);
-                #[cfg(target_os = "linux")]
-                {
-                    pending_nbd_state = _state;
-                }
-            } else if let Some(cache) = &self.image_cache {
-                if let Some(uri) = spec.image_uri.clone() {
+        let result: Result<(), SandboxError> = async {
+            // An explicit rootfs manifest (the disk-only cold-boot recovery)
+            // wins over the image; `spec.image_uri` stays as record-keeping.
+            let cached = match (&self.image_cache, spec.image_uri.clone()) {
+                (Some(cache), Some(uri)) if spec.rootfs_manifest.is_none() => {
                     let t = crate::time_source::metrics_now();
                     let cached = cache.ensure_image(&uri).await.map_err(|e| {
                         SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
                     })?;
                     image_resolve += t.elapsed();
                     tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
-                    let t = crate::time_source::metrics_now();
-                    let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
-                    materialize += t.elapsed();
-                    spec.rootfs_source = Some(path);
-                    #[cfg(target_os = "linux")]
-                    {
-                        pending_nbd_state = _state;
-                    }
+                    Some((uri, cached))
                 }
-                // ADR 0021 P1.5: no harness substrate to build —
-                // the harness binary travels in the rootfs at the
-                // manifest-declared `[harness] exec` path.
-            }
-            // #1003 ladder 4: stamp the resolved chunked lineage into
-            // the spec BEFORE the sandbox manifest is written, so
-            // `sandbox.json` always records what the NBD daemon is
-            // serving. A survivor that never published a flush has no
-            // manifest anywhere else durable (no live ref in PG, no
-            // snapshot, no spool after a SIGKILL) — this stamp is what
-            // the spec-based re-serve pass recovers from.
-            #[cfg(target_os = "linux")]
-            if spec.rootfs_manifest.is_none() {
-                if let Some(state) = &pending_nbd_state {
-                    spec.rootfs_manifest = Some(state.backend.manifest_ref().await);
-                }
-            }
-
-            #[cfg(target_os = "linux")]
-            let mut pending_swap_state = if let Some(size) = spec.swap_mib.filter(|m| *m > 0) {
-                if pending_nbd_state.is_none() {
-                    return Err(SandboxError::InvalidSpec(
-                        "swap requires a chunked root disk".into(),
-                    ));
-                }
-                let state = self.prepare_swap_attach(size, spec.swap_manifest).await?;
-                spec.swap_source = Some(state.device_path().to_path_buf());
-                spec.swap_manifest = Some(state.backend.manifest_ref().await);
-                Some(state)
-            } else {
-                None
+                _ => None,
             };
-            #[cfg(target_os = "linux")]
-            let swap_owner = if pending_swap_state.is_some() {
-                Some(
-                    self.self_ref
-                        .get()
-                        .and_then(std::sync::Weak::upgrade)
-                        .ok_or_else(|| {
-                            SandboxError::InvalidSpec(
-                                "swap attach requires backend ownership".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
+            let t = crate::time_source::metrics_now();
+            let Some(volumes) = self.volumes.as_ref() else {
+                // No session disk on this host: the inner backend opens
+                // the image's flat rootfs file and nothing checkpoints it.
+                if let Some((_, cached)) = cached.as_ref() {
+                    spec.rootfs_source = Some(legacy_rootfs_path(cached)?);
+                }
+                materialize += t.elapsed();
+                return self.inner.create(id, spec).await;
             };
-
-            // `fc_boot` is emitted by the inner FC backend itself
-            // (see `engram_sandbox_firecracker::create`), with the
-            // same metric name + label set. We don't double-record
-            // here because that backend has finer-grained insight
-            // into the sub-steps of the FC `PUT` calls if we want
-            // to drill in later.
-            // Stash any spawned NBD daemon under the freshly-assigned
-            // sandbox id. `destroy()` removes the entry (Drop tears
-            // down the daemon + returns the slot); `snapshot()` reads
-            // it back to call `backend.flush()`.
-            //
-            // ADR 0016 Phase B: post-`inner.create()` is the first
-            // point where the sandbox_id is known — install the
-            // FlushScheduler now. The scheduler is keyed by sandbox_id
-            // and resolves session_id via the publisher's own
-            // sandbox→session lookup (so warm-pool sandboxes share the
-            // same path without re-spawn machinery). Field-ordered
-            // Drop on `NbdSandboxState` guarantees scheduler-cancel →
-            // NBD-disconnect → slot-release.
-            //
-            // Issue #223 — CANCELLATION SAFETY (same hazard as the restore
-            // path): the rootfs sidecar was patched to `/dev/nbdN` before
-            // `inner.create`, so the booted FC reads that device, but the
-            // `NbdSandboxState` only enters `nbd_sandboxes` AFTER create
-            // returns. A handler future dropped between `inner.create` and the
-            // insert drops `pending_nbd_state` under the live FC — disconnect
-            // under the running guest + slot freed for cross-session reuse.
-            // Run create + the insert inside a `tokio::spawn`ed task that MOVES
-            // the NBD state in, so the daemon always lands in the map and
-            // normal `destroy()` teardown owns it regardless of the request's
-            // fate. The non-NBD path stays inline (no drop chain to lose).
-            #[cfg(target_os = "linux")]
-            let create_result: Result<SandboxId, SandboxError> = if let Some(mut state) =
-                pending_nbd_state
-            {
-                let inner = self.inner.clone();
-                let nbd_sandboxes = self.nbd_sandboxes.clone();
-                let publisher = self.live_manifest_publisher.clone();
-                let health = self.data_plane_health.clone();
-                let flush_config = self.flush_config.clone();
-                let owners = self.nbd_owners.clone();
-                let abandoning = self.abandoning.clone();
-                let dirty_root = self
-                    .resolved_dirty_root()
-                    .expect("NBD state requires a dirty root");
-                let join = tokio::spawn(async move {
-                    let sandbox_id = inner.create(spec).await?;
-                    if let Err(error) = state
-                        .backend
-                        .relocate_dirty_file(
-                            &dirty_root.join(DiskRole::Root.dirty_file_name(sandbox_id)),
-                        )
-                        .await
-                    {
-                        if inner.destroy(sandbox_id).await.is_err() {
-                            state.abandon_for_shutdown();
-                            if let Some(swap) = pending_swap_state.take() {
-                                swap.abandon_for_shutdown();
-                            }
-                        }
-                        return Err(SandboxError::Vm(
-                            format!("move created sandbox dirty file into place: {error}").into(),
+            let root = match spec.rootfs_manifest {
+                Some(manifest) => Source::Continue {
+                    manifest,
+                    base: None,
+                },
+                None => {
+                    let Some((uri, cached)) = cached.as_ref() else {
+                        return Err(SandboxError::InvalidSpec(
+                            "create needs a rootfs manifest or an image".into(),
                         ));
+                    };
+                    let Some(chunk_store) = self.chunk_store.as_ref() else {
+                        return Err(SandboxError::InvalidSpec(
+                            "session disks need a chunk store".into(),
+                        ));
+                    };
+                    ensure_chunked_manifest_in_blob_storage(chunk_store, cached).await?;
+                    let Some(bundle) = cached.bundle.as_ref() else {
+                        return Err(SandboxError::InvalidSpec(format!(
+                            "image {uri} has no chunked disk manifest"
+                        )));
+                    };
+                    Source::Fork {
+                        manifest: bundle.disk_manifest,
+                        base: None,
                     }
-                    state.install_flush_scheduler(
-                        sandbox_id,
-                        DiskRole::Root,
-                        publisher,
-                        health,
-                        flush_config,
-                        owners,
-                    );
-                    // ADR 0019: open the cold-boot operation window. The guest's
-                    // rootfs/substrate ext4-mount page-ins (served by this NBD
-                    // backend) now attach `chunk.fetch` spans to the cold-boot
-                    // trace until `start_agent` ends the window at agent_ready.
-                    state.backend.operation_scope().begin("cold_boot");
-                    // Issue #224: terminal-mode check (defense in depth past
-                    // the early reject at the top of `create`). The flag may
-                    // have flipped during the `inner.create` await; this task
-                    // outlives a dropped handler future (issue #223), so it
-                    // outlives the SIGTERM too. Abandon the data plane in-place
-                    // rather than inserting after the sweep — the half-built
-                    // sandbox has no successor contract, but its device must
-                    // not be netlink-disconnected by a post-sweep normal drop.
-                    if abandoning.load(std::sync::atomic::Ordering::SeqCst) {
-                        tracing::warn!(
-                            %sandbox_id,
-                            "create completed during SIGTERM abandon; abandoning the \
-                             NBD data plane in-place instead of inserting after the sweep",
-                        );
-                        state.abandon_for_shutdown();
-                        if let Some(swap) = pending_swap_state.take() {
-                            swap.abandon_for_shutdown();
-                        }
-                        return Ok::<SandboxId, SandboxError>(sandbox_id);
-                    }
-                    nbd_sandboxes.insert(
-                        sandbox_id,
-                        SandboxDisks {
-                            expected: std::iter::once(DiskRole::Root)
-                                .chain(pending_swap_state.as_ref().map(|_| DiskRole::Swap))
-                                .collect(),
-                            root: state,
-                            swap: None,
-                        },
-                    );
-                    if let (Some(owner), Some(swap)) = (swap_owner, pending_swap_state) {
-                        if let Err(error) =
-                            owner.attach_disk(sandbox_id, DiskRole::Swap, swap).await
-                        {
-                            let _ = owner.destroy(sandbox_id).await;
-                            return Err(error);
-                        }
-                    }
-                    Ok::<SandboxId, SandboxError>(sandbox_id)
-                });
-                join.await
-                    .map_err(|e| SandboxError::Vm(format!("create task panicked: {e}").into()))?
-            } else {
-                self.inner.create(spec).await
+                }
             };
-            #[cfg(not(target_os = "linux"))]
-            let create_result: Result<SandboxId, SandboxError> = self.inner.create(spec).await;
-            create_result
+            let swap = match (spec.swap_manifest, spec.swap_mib.filter(|m| *m > 0)) {
+                (Some(manifest), _) => Some(Source::Continue {
+                    manifest,
+                    base: None,
+                }),
+                (None, Some(mib)) => Some(Source::Empty {
+                    size_bytes: u64::from(mib) << 20,
+                }),
+                (None, None) => None,
+            };
+            let provisioned = volumes
+                .provision(id, root, swap)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("provision session disks: {e}").into()))?;
+            materialize += t.elapsed();
+            spec.rootfs_source = Some(provisioned.root);
+            spec.rootfs_manifest = Some(provisioned.root_manifest);
+            spec.swap_source = provisioned.swap;
+            spec.swap_manifest = provisioned.swap_manifest;
+            let created = self.inner.create(id, spec).await;
+            if created.is_err() {
+                if let Err(error) = volumes.release(id).await {
+                    tracing::warn!(sandbox_id = %id, %error, "release after a failed create failed");
+                }
+            }
+            created
         }
         .await;
 
@@ -7801,27 +4708,19 @@ impl SandboxBackend for PooledBackend {
             Err(SandboxError::InvalidSpec(_)) => "invalid_spec",
             Err(_) => "fc_error",
         };
-        metrics::histogram!(
-            crate::metrics::SANDBOX_BOOT_SECONDS,
-            "phase" => "image_resolve",
-            "outcome" => outcome,
-            "kind" => "cold",
-        )
-        .record(image_resolve.as_secs_f64());
-        metrics::histogram!(
-            crate::metrics::SANDBOX_BOOT_SECONDS,
-            "phase" => "materialize",
-            "outcome" => outcome,
-            "kind" => "cold",
-        )
-        .record(materialize.as_secs_f64());
-        metrics::histogram!(
-            crate::metrics::SANDBOX_BOOT_SECONDS,
-            "phase" => "create_total",
-            "outcome" => outcome,
-            "kind" => "cold",
-        )
-        .record(phase_total.elapsed().as_secs_f64());
+        for (phase, elapsed) in [
+            ("image_resolve", image_resolve),
+            ("materialize", materialize),
+            ("create_total", phase_total.elapsed()),
+        ] {
+            metrics::histogram!(
+                crate::metrics::SANDBOX_BOOT_SECONDS,
+                "phase" => phase,
+                "outcome" => outcome,
+                "kind" => "cold",
+            )
+            .record(elapsed.as_secs_f64());
+        }
         result
     }
 
@@ -7872,7 +4771,7 @@ impl SandboxBackend for PooledBackend {
         if let Some(metadata) = self.held_snapshots.get(&id) {
             return Ok(metadata.clone());
         }
-        let (_guard, cap) = self.capture_phase(id, true).await?;
+        let (_guard, cap) = self.capture_phase(id, CaptureUser::HeldCapture).await?;
         let metadata = self
             .finisher_with_class(engram_chunk_store::UploadClass::Foreground)
             .finish(id, cap)
@@ -7883,31 +4782,23 @@ impl SandboxBackend for PooledBackend {
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // Foreground captures serve a waiting session.
-        self.snapshot_with_class(id, engram_chunk_store::UploadClass::Foreground)
-            .await
+        self.snapshot_with_class(
+            id,
+            engram_chunk_store::UploadClass::Foreground,
+            CaptureUser::SnapshotRpc,
+        )
+        .await
     }
 
-    /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
-    /// the capture, re-pauses the guest (it's being torn down), then
-    /// makes the finalize inputs DURABLE — the drained NBD disk chunks
-    /// (if any) to `<dest>/disk-pending/`, then an
-    /// [`crate::eviction_finalize::EvictionFinalizeRecord`] to
-    /// `<checkpoint_dir>/finalize/<snapshot_id>.json` — and only THEN
-    /// returns. From here the finalize is a host-owned job
-    /// (`eviction_finalize::run_eviction_finalize`, spawned below) that
-    /// never touches the sandbox, the coordinator, or this call's
-    /// stack again: it is a pure function of what was just persisted,
-    /// re-drivable by a fresh host-agent process
-    /// (`resume_pending_finalizes`) if this one dies mid-upload. The
-    /// coordinator may mark the session Idle as soon as this returns —
-    /// unlike the pre-#529 shape, that's now safe: the row will land via
-    /// the heartbeat reconcile regardless of what happens to the
-    /// coordinator or this process next.
+    /// The eviction flavor: capture, re-pause the guest (it is being
+    /// torn down), persist the finalize record, and return. The finalize
+    /// is then a host-owned job that is a pure function of what was
+    /// persisted: the pending disk checkpoints on the session disk and
+    /// the FC staging dir. A fresh host-agent process re-drives it.
     ///
-    /// Gate: VZ/Process (`!supports_diff_checkpoints()`) and hosts with
-    /// checkpointing disabled (`checkpoint_dir` unset) surface
-    /// `InvalidSpec` — the coordinator's caller falls through to the
-    /// composed `snapshot()` pipeline (`idle_evictor.rs`).
+    /// VZ/Process (`!supports_diff_checkpoints()`) and hosts with
+    /// checkpointing disabled surface `InvalidSpec`; the coordinator
+    /// falls through to the composed `snapshot()` pipeline.
     async fn snapshot_begin(
         &self,
         id: SandboxId,
@@ -7932,7 +4823,7 @@ impl SandboxBackend for PooledBackend {
             ));
         };
 
-        let (capture_guard, cap) = self.capture_phase(id, false).await?;
+        let (capture_guard, cap) = self.capture_phase(id, CaptureUser::EvictionCapture).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
         self.spawn_trace_publish(id);
@@ -7951,68 +4842,20 @@ impl SandboxBackend for PooledBackend {
         } = cap;
         let snapshot_id = metadata.id;
 
-        // Extract + durably persist the drained disk-flush chunks (if
-        // any) BEFORE returning. See `PendingDiskFlush::into_chunks` and
-        // the module-level deviation note in `eviction_finalize.rs`: we
-        // never call `flush_upload` on this handle — the sandbox is
-        // about to be destroyed, so there is no live reader left for its
-        // rebase side effect to matter to.
-        #[cfg(target_os = "linux")]
-        let (disk_pending_record, hot_disk_chunks) = {
-            let mut records = Vec::new();
-            let mut hot_root = None;
-            for (role, pending) in &unwind.disk_pending {
-                let backend = &unwind.disk_backend[role];
-                let exported = backend.export_pending_chunks(pending).await;
-                let persist_result = match &exported {
-                    Ok(chunks) => {
-                        crate::eviction_finalize::persist_disk_pending_chunks(&dest, *role, chunks)
-                            .await
-                            .map_err(|error| error.to_string())
-                    }
-                    Err(error) => Err(error.to_string()),
-                };
-                if let Err(error) = persist_result {
-                    if chain_prev.is_some() {
-                        poison_checkpoint_chain_after_failed_diff(
-                            &self.checkpoint_chains,
-                            self.chain_heads.as_deref(),
-                            id,
-                            "eviction disk-pending persist",
-                        );
-                    }
-                    let _ = tokio::fs::remove_dir_all(&dest).await;
-                    return Err(SandboxError::Snapshot(format!(
-                        "persist disk-pending chunks: {error}"
-                    )));
-                }
-                let chunks = exported.expect("export and persist succeeded");
-                records.push(crate::eviction_finalize::DiskPendingRecord {
-                    role: *role,
-                    base_manifest: backend.manifest_ref().await,
-                    chunk_size: backend.chunk_size(),
-                    total_bytes: backend.total_bytes(),
-                    chunks: chunks.iter().map(|(idx, hash, _)| (*idx, *hash)).collect(),
-                });
-                if *role == DiskRole::Root {
-                    hot_root = Some(chunks);
-                }
-            }
-            (records, hot_root)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (disk_pending_record, hot_disk_chunks): (
-            Vec<crate::eviction_finalize::DiskPendingRecord>,
-            Option<Vec<(usize, engram_chunk_store::manifest::ChunkHash, bytes::Bytes)>>,
-        ) = (Vec::new(), None);
-
-        // Ownership of the capture's recovery state transfers to the
-        // finalize record + the spawned job from here — the same
-        // "defuse the instant something durable/owned takes over" rule
-        // `finish()` follows.
+        // The pending disk checkpoints stay on the session disk under
+        // their transient names; the finalize job finds them by name and
+        // publishes them. From here the record and the job own the
+        // capture's recovery state.
+        let disk_pending = unwind
+            .pending
+            .drain(..)
+            .map(|p| crate::eviction_finalize::PendingDisk {
+                role: p.role(),
+                previous: p.previous(),
+            })
+            .collect();
         unwind.defuse();
         drop(unwind);
-
         let record = crate::eviction_finalize::EvictionFinalizeRecord {
             snapshot_id,
             session_id,
@@ -8023,7 +4866,7 @@ impl SandboxBackend for PooledBackend {
             captured_at: metadata.created_at,
             dest: dest.clone(),
             chain_prev_ref: chain_prev.map(|(r, _)| r),
-            disk_pending: disk_pending_record,
+            disk_pending,
             aux_bundles: metadata.aux_bundles.clone(),
             stage: crate::eviction_finalize::FinalizeStage::default(),
             attempts: 0,
@@ -8077,18 +4920,9 @@ impl SandboxBackend for PooledBackend {
         self.pending_finalizes.insert(id, snapshot_id);
 
         tokio::spawn(async move {
-            // The capture lock rides into the task: periodic checkpoints
-            // stay locked out until the finalize completes (chain
-            // bookkeeping is not concurrent-safe per sandbox) — same
-            // guarantee the pre-#529 shape gave, now held for the whole
-            // (re-drivable) job instead of just one process's attempt.
-            crate::eviction_finalize::run_eviction_finalize(
-                finalizer,
-                record,
-                capture_guard,
-                hot_disk_chunks,
-            )
-            .await;
+            // Chain bookkeeping is not concurrent-safe per sandbox, so the
+            // capture lock spans the whole finalize job.
+            crate::eviction_finalize::run_eviction_finalize(finalizer, record, capture_guard).await;
         });
         Ok(snapshot_id)
     }
@@ -8137,12 +4971,17 @@ impl SandboxBackend for PooledBackend {
         // one — the session lease serializes movers). Last-write-wins:
         // refusing here would brick every future move for this sandbox
         // until a host-agent restart.
-        if let Some(stale) = self.pending_presetups.get(&id) {
+        if let Some((_, stale)) = self.pending_presetups.remove(&id) {
             tracing::warn!(
                 sandbox_id = %id,
                 stale_export = %stale.export_id,
                 "presetup superseding an abandoned pending presetup",
             );
+            if let Some(volumes) = self.volumes.as_ref() {
+                for (_, seal) in stale.precopy {
+                    discard_seal(volumes, seal).await;
+                }
+            }
         }
         // The guest RAM must be a private mapping of a file (the
         // per-image memfile or the substrate base shm): the pagemap
@@ -8168,26 +5007,38 @@ impl SandboxBackend for PooledBackend {
                     view.memory_backing.display()
                 )));
             }
-            // Live post-copy moves the disk through the NBD seal; a
-            // file-backed rootfs has nothing to seal and the destination
-            // would run RAM and disk from different states.
-            if !self.all_disks_served(id) {
-                return Err(SandboxError::InvalidSpec(
-                    "no chunked disk for this sandbox (live post-copy needs the NBD rootfs) — \
-                     use snapshot-rehome"
-                        .into(),
-                ));
-            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = &view;
-        #[cfg(target_os = "linux")]
-        let backends = self.disk_backends(id);
-        #[cfg(not(target_os = "linux"))]
-        let backends = Vec::new();
-        let out = self
-            .prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), backends)
-            .await?;
+        // The disk moves in three tiers: the destination continues the
+        // checkpoint lineages advertised here, pulls the precopy taken
+        // now while the guest runs, and after the pause pulls only what
+        // changed since. A sandbox without a session disk cannot post-copy.
+        let volumes = self.volumes()?;
+        let precopy = self.take_precopy(volumes, id).await?;
+        if !precopy.contains_key(&DiskRole::Root) {
+            for (_, seal) in precopy {
+                discard_seal(volumes, seal).await;
+            }
+            return Err(SandboxError::InvalidSpec(
+                "the sandbox has no root volume — use snapshot-rehome".into(),
+            ));
+        }
+        let precopy_blocks: u64 = precopy.values().map(|s| s.sealed.len() as u64).sum();
+        let out = match self
+            .prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), precopy.clone())
+            .await
+        {
+            Ok(out) => out,
+            Err(error) => {
+                for (_, seal) in precopy {
+                    discard_seal(volumes, seal).await;
+                }
+                return Err(error);
+            }
+        };
+        tracing::info!(sandbox_id = %id, export_id = %out.export_id, precopy_blocks,
+            "post-copy presetup took the disk precopy");
         #[cfg(target_os = "linux")]
         {
             let pending_presetups = self.pending_presetups.clone();
@@ -8211,8 +5062,8 @@ impl SandboxBackend for PooledBackend {
         Ok(out)
     }
 
-    /// ADR 0045 C2: the blackout half. Pause → NBD host-cache fsync +
-    /// dirty-tail drain (kept local) → fork-v3 vmstate-only package →
+    /// ADR 0045 C2: the blackout half. Pause → take the disk seal (kept
+    /// local) → fork-v3 vmstate-only package →
     /// pagemap scan → register the export (page server SEALS; the
     /// parked dest handler unblocks). The guest stays paused serving
     /// pages until commit (post-drain) or abort.
@@ -8248,11 +5099,13 @@ impl SandboxBackend for PooledBackend {
                     "no matching presetup for this capture (export id skew?)".into(),
                 ));
             };
-            // Issue #202: keep a copy of the consumed presetup so an
-            // unwind can re-insert it — otherwise a coordinator retry
-            // hits "no matching presetup" and the dest parks until its
-            // 120 s budget burns out.
-            let presetup_restore = pending.clone();
+            // The consumed presetup is the unwind's from here: an exit
+            // before the export exists re-inserts it, so a coordinator
+            // retry finds it; the guest is resumed only once it is paused.
+            let mut unwind = CaptureUnwind::new(self, id);
+            unwind.resume_on_drop = false;
+            unwind.arm();
+            unwind.presetup_restore = Some((id, pending.clone(), self.pending_presetups.clone()));
             let Some((chain_ref, chain_manifest)) = self
                 .checkpoint_chains
                 .get(&id)
@@ -8284,7 +5137,9 @@ impl SandboxBackend for PooledBackend {
             }
 
             // Checkpoint fence: held for the export's lifetime.
-            let capture_guard = self.capture_lock(id).lock_owned().await;
+            let gate = self.capture_gate(id);
+            let capture_guard = gate.serialize(id, CaptureUser::PostCopyCapture).await;
+            let _quiesce = gate.quiesce(id, CaptureUser::PostCopyCapture).await;
 
             // Blackout leg 1: pause. (PR 10 decomposition.)
             let t_pause = crate::time_source::metrics_now();
@@ -8294,51 +5149,7 @@ impl SandboxBackend for PooledBackend {
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
             let pause_ms = t_pause.elapsed().as_millis() as u64;
-
-            // Issue #202: arm the unwind guard the instant the guest is
-            // paused. Any error/cancel before the export is registered
-            // must resume the guest, clear the fence, re-queue the
-            // (later-taken) seal, AND restore the consumed presetup. The
-            // old `FenceGuard` only lowered the fence — it left the guest
-            // frozen, dropped the seal, and consumed the presetup.
-            let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
-            unwind.arm();
-            unwind.presetup_restore = Some((id, presetup_restore, self.pending_presetups.clone()));
-
-            // Blackout leg 2: disk COHERENCE (disk post-copy). Fence
-            // flush publishes, push the host's block-device page cache
-            // down into the daemon (the presetup's pre-pause fsync
-            // shrank this to the since-presetup delta), quiesce
-            // in-flight requests. The SEAL itself is taken LAST (after
-            // vmstate + scan — the guest is paused, so the dirty map
-            // is stable): it DRAINS the dirty buffer, so nothing
-            // fallible may sit between the drain and the export
-            // taking ownership (a dropped seal = the guest's disk
-            // writes silently gone on the abort-resume). The unwind
-            // guard (issue #202) re-queues the seal, clears the fence,
-            // resumes the guest, and restores the presetup on every
-            // pre-export error arm AND on wire cancellation — a fenced
-            // backend whose capture failed would otherwise no-op
-            // flushes forever (silent durability stall).
-            let disk_entry = self.disk_backends(id);
-            let t_disk = crate::time_source::metrics_now();
-            for (role, backend) in &disk_entry {
-                backend.set_migration_fence(true);
-                // Issue #202: record the fence on the unwind guard.
-                unwind.disk_backend.insert(*role, backend.clone());
-                unwind.fenced = true;
-                // `seal_for_postcopy` below is a capture primitive of its
-                // own (it does not route through `flush_local`), so this
-                // path syncs the host page cache explicitly through the
-                // same seam. Hard error: an unsynced seal ships torn
-                // chunks to the destination.
-                backend
-                    .sync_host_device()
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
-                backend.wait_idle().await;
-            }
-            let mut disk_drain_ms = t_disk.elapsed().as_millis() as u64;
+            unwind.resume_on_drop = true;
 
             // Blackout leg 3: vmstate. Fork v3: state.bin + sidecar
             // only — the memory artifact never materializes (the whole
@@ -8381,50 +5192,55 @@ impl SandboxBackend for PooledBackend {
                 }
             }
 
-            // The disk SEAL — taken last (see the leg-2 comment): the
-            // drain empties `dirty`, so from here every error arm must
-            // requeue before returning. Only the descriptor write and
-            // the export insert sit in that window.
+            // The disk seal: a snapshot of each disk under the pause and
+            // the blocks that changed since the presetup's snapshot. The
+            // guard owns the seals until the export is registered.
             let t_seal = crate::time_source::metrics_now();
             let mut disk_seal = std::collections::BTreeMap::new();
-            let mut descriptors = std::collections::BTreeMap::new();
-            for (role, backend) in &disk_entry {
-                let (sealed, base_manifest, base_ref) = backend
-                    .seal_for_postcopy()
+            let volumes = self.volumes()?;
+            for role in volumes.roles(id).await.map_err(disk_err)? {
+                let checkpoint = volumes
+                    .take(id, role)
                     .await
-                    .map_err(|e| SandboxError::Snapshot(e.to_string()))?;
-                let sealed = Arc::new(sealed);
-                unwind.disk_seal.insert(*role, sealed.clone());
-                descriptors.insert(
-                    *role,
-                    serde_json::json!({
-                        "sealed_chunk_indices": sealed.indices(),
-                        "manifest": base_manifest,
-                        "disk_ref_bincode": bincode::serialize(&base_ref).ok(),
-                    }),
-                );
-                disk_seal.insert(*role, sealed);
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk seal: {e}")))?;
+                unwind.pending.push(checkpoint);
+                let checkpoint = unwind.pending.last().expect("just pushed");
+                let advertised = match role {
+                    DiskRole::Root => pending.disk_manifest_ref,
+                    DiskRole::Swap => pending.swap_manifest_ref,
+                };
+                if advertised != Some(checkpoint.previous()) {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "{role} disk checkpoint advanced between presetup and capture — retry the move"
+                    )));
+                }
+                let Some(precopy) = pending.precopy.get(&role) else {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "{role} disk gained a volume between presetup and capture — retry the move"
+                    )));
+                };
+                let changed = volumes
+                    .changed_since(&precopy.pending, checkpoint, MIGRATION_DISK_BLOCK_BYTES)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk seal diff: {e}")))?;
+                let checkpoint = unwind.pending.pop().expect("just pushed");
+                let seal = Arc::new(DiskSeal {
+                    sealed: changed.into_iter().collect(),
+                    pending: checkpoint,
+                });
+                unwind.disk_seal.push(seal.clone());
+                disk_seal.insert(role, seal);
             }
-            descriptors.entry(DiskRole::Root).or_insert_with(|| {
-                serde_json::json!({
-                    "sealed_chunk_indices": Vec::<u64>::new(),
-                    "manifest": serde_json::Value::Null,
-                    "disk_ref_bincode": serde_json::Value::Null,
-                })
-            });
-            let sealed_disk_chunks = disk_seal
+            let sealed_disk_blocks = disk_seal
                 .values()
-                .map(|seal| seal.len() as u64)
+                .map(|seal| seal.sealed.len() as u64)
                 .sum::<u64>();
-            // Publish immutable, hint-free disk seals before registering the export.
-            for (role, info) in &descriptors {
-                let bytes = serde_json::to_vec(info)
-                    .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))?;
-                tokio::fs::write(export_dir.join(role.seal_file_name()), bytes)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("write disk seal info: {e}")))?;
-            }
-            disk_drain_ms += t_seal.elapsed().as_millis() as u64;
+            let precopy_disk_blocks = pending
+                .precopy
+                .values()
+                .map(|seal| seal.sealed.len() as u64)
+                .sum::<u64>();
+            let disk_drain_ms = t_seal.elapsed().as_millis() as u64;
 
             // Register BOTH exports under the same identity, then the
             // role. Page-server registration is what unparks the dest
@@ -8441,20 +5257,18 @@ impl SandboxBackend for PooledBackend {
                 sandbox_id: id,
                 snapshot_dir: export_dir.clone(),
                 disk_seal,
+                precopy: pending.precopy.clone(),
                 clock: self.clock.clone(),
                 state_served,
                 last_activity,
                 capture_guard,
             });
             if !inserted {
-                // The unwind guard re-queues the seal (Arc clone),
-                // clears the fence, resumes, and restores the presetup.
                 return Err(SandboxError::AlreadyExists);
             }
-            // Issue #202: the export now owns the fence + seal and the
-            // dest is about to load — defuse the guard (abort unfences;
-            // commit destroys the sandbox). After this point the
-            // presetup must NOT be restored (the move is committing).
+            // The export owns the seals and the dest is about to load:
+            // abort discards them, commit destroys the sandbox. The
+            // presetup is not restored past this point.
             if let Err(error) = self
                 .set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
                 .await
@@ -8523,12 +5337,9 @@ impl SandboxBackend for PooledBackend {
                 export_id,
                 sealed_chunks,
                 total_chunks,
-                sealed_disk_chunks,
-                pause_ms,
-                disk_drain_ms,
-                vmstate_ms,
-                scan_ms,
-                "post-copy capture sealed; guest frozen as page server (ADR 0045 C2)",
+                sealed_disk_blocks,
+                precopy_disk_blocks,
+                "post-copy capture sealed; guest frozen as page server",
             );
             Ok(PostCopyCaptureOut {
                 sealed_chunks,
@@ -8537,18 +5348,17 @@ impl SandboxBackend for PooledBackend {
                 disk_drain_ms,
                 vmstate_ms,
                 scan_ms,
-                sealed_disk_chunks,
+                sealed_disk_blocks,
+                precopy_disk_blocks,
                 paused_at_unix_ms: paused_at.timestamp_millis(),
             })
         }
     }
 
-    /// ADR 0045 C2 (destination): await BOTH drains' terminal
-    /// outcomes — memory via the peer-mode handler's control socket,
-    /// disk via the NBD backend's overlay subscription. The source is
-    /// released only when the dest depends on it for NOTHING.
-    /// `PeerLost` (either plane) pauses (poisons) the dest VM before
-    /// returning — the caller rewinds.
+    /// Await the memory drain's terminal outcome over the handler's
+    /// control socket. The disk landed before `state.bin` did, so the
+    /// source is released when memory no longer depends on it.
+    /// `PeerLost` pauses (poisons) the dest VM before returning.
     async fn migration_drain_wait(
         &self,
         id: SandboxId,
@@ -8564,16 +5374,6 @@ impl SandboxBackend for PooledBackend {
                 "no post-copy control socket for this sandbox".into(),
             ));
         };
-        // Subscribe BEFORE awaiting memory: a disk drain that fails
-        // while we're parked on the control socket keeps its overlay
-        // (lost-latched) for us to read; one that succeeds clears the
-        // overlay, which reads as "nothing to wait for" — also right.
-        #[cfg(target_os = "linux")]
-        let disk_drains: Vec<_> = self
-            .disk_backends(id)
-            .into_iter()
-            .map(|(_, backend)| backend.postcopy_drain_subscribe())
-            .collect();
         let hint_pollers = self.hint_pollers.clone();
         let outcome = tokio::task::spawn_blocking(move || -> Result<DrainOutcome, String> {
             let mut stream = std::os::unix::net::UnixStream::connect(&sock)
@@ -8628,26 +5428,6 @@ impl SandboxBackend for PooledBackend {
         .map_err(|e| SandboxError::Snapshot(format!("drain wait join: {e}")))?
         .map_err(SandboxError::Snapshot)?;
 
-        // Disk plane: the memory drain finishing doesn't make the dest
-        // self-sufficient — sealed disk chunks may still live only in
-        // the source's RAM. Skip when memory already lost (rewind
-        // either way).
-        #[cfg(target_os = "linux")]
-        let outcome = match outcome {
-            DrainOutcome::Done { .. } => match futures::future::try_join_all(
-                disk_drains.into_iter().map(Self::await_disk_drain),
-            )
-            .await
-            {
-                Ok(_) => outcome,
-                Err(detail) => DrainOutcome::PeerLost {
-                    remaining: 0,
-                    detail: format!("disk drain: {detail}"),
-                },
-            },
-            lost => lost,
-        };
-
         if let DrainOutcome::PeerLost { remaining, detail } = &outcome {
             tracing::error!(
                 sandbox_id = %id,
@@ -8682,38 +5462,65 @@ impl SandboxBackend for PooledBackend {
     > {
         use engram_core::types::snapshot::{MigrationFrame, MigrationItem};
         // Resolve + validate under the registry ref, then drop it (the
-        // stream must not hold a dashmap guard).
-        let (snapshot_dir, disk_seal) = {
-            let Some(export) = self.migrations.find_by_export_id(export_id) else {
-                return Err(SandboxError::NotFound);
-            };
-            // Advisory hints never extend the export lease, even when absent.
-            // Required artifacts and disk chunks still count as activity.
-            if items
-                .iter()
-                .any(|item| !matches!(item, MigrationItem::HotHint))
-            {
-                export.touch();
+        // stream must not hold a dashmap guard). Before the capture the
+        // presetup serves its precopy; everything else is not yet there.
+        let (snapshot_dir, disk_seal, precopy) = match self.migrations.find_by_export_id(export_id)
+        {
+            Some(export) => {
+                // Advisory hints never extend the export lease, even when absent.
+                // Required artifacts and disk blocks still count as activity.
+                if items
+                    .iter()
+                    .any(|item| !matches!(item, MigrationItem::HotHint))
+                {
+                    export.touch();
+                }
+                // Once state.bin is served, the TTL sweep must not resume us.
+                if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
+                    export
+                        .state_served
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                (
+                    Some(export.snapshot_dir.clone()),
+                    export.disk_seal.clone(),
+                    export.precopy.clone(),
+                )
             }
-            // Once state.bin is served, the TTL sweep must not resume us.
-            if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
-                export
-                    .state_served
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            None => {
+                let Some(presetup) = self
+                    .pending_presetups
+                    .iter()
+                    .find(|p| crate::migration::constant_time_str_eq(&p.export_id, export_id))
+                else {
+                    return Err(SandboxError::NotFound);
+                };
+                (None, Default::default(), presetup.precopy.clone())
             }
-            (export.snapshot_dir.clone(), export.disk_seal.clone())
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<MigrationFrame, SandboxError>>(16);
         tokio::spawn(async move {
             const FRAME: usize = 1024 * 1024;
             for (idx, item) in items.into_iter().enumerate() {
                 let idx = idx as u32;
-                let bytes: Result<bytes::Bytes, SandboxError> = match item {
-                    MigrationItem::StateBin => fs::read(snapshot_dir.join("state.bin"))
+                let info = |seal: &Arc<DiskSeal>| {
+                    serde_json::to_vec(&seal.info())
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))
+                };
+                let bytes: Result<bytes::Bytes, SandboxError> = match (item, &snapshot_dir) {
+                    // Not captured yet: the dest keeps polling.
+                    (
+                        MigrationItem::StateBin
+                        | MigrationItem::HotHint
+                        | MigrationItem::DiskSealInfo(_),
+                        None,
+                    ) => Err(SandboxError::NotFound),
+                    (MigrationItem::StateBin, Some(dir)) => fs::read(dir.join("state.bin"))
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
-                    MigrationItem::HotHint => fs::read(snapshot_dir.join("hot-hint.json"))
+                    (MigrationItem::HotHint, Some(dir)) => fs::read(dir.join("hot-hint.json"))
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| {
@@ -8723,26 +5530,40 @@ impl SandboxBackend for PooledBackend {
                                 SandboxError::Snapshot(format!("read hot hint: {e}"))
                             }
                         }),
-                    MigrationItem::DiskSealInfo(role) => {
-                        fs::read(snapshot_dir.join(role.seal_file_name()))
-                            .await
-                            .map(bytes::Bytes::from)
-                            .map_err(|e| {
-                                SandboxError::Snapshot(format!("read disk seal info: {e}"))
-                            })
-                    }
-                    MigrationItem::DiskChunkAt(role, idx) => match disk_seal.get(&role) {
-                        // The seal IS the allowlist: only sealed
-                        // indices are servable, straight from RAM.
-                        Some(sealed) => sealed.get(idx).ok_or_else(|| {
-                            SandboxError::InvalidSpec(format!(
-                                "disk chunk {idx} is not sealed on this export"
-                            ))
-                        }),
-                        None => Err(SandboxError::InvalidSpec(
-                            "this export has no disk seal".into(),
-                        )),
+                    (MigrationItem::DiskSealInfo(role), Some(_)) => match disk_seal.get(&role) {
+                        Some(seal) => info(seal),
+                        None => Err(SandboxError::InvalidSpec(format!(
+                            "this export has no {role} disk seal"
+                        ))),
                     },
+                    (MigrationItem::DiskPrecopyInfo(role), _) => match precopy.get(&role) {
+                        Some(seal) => info(seal),
+                        None => Err(SandboxError::InvalidSpec(format!(
+                            "this export has no {role} disk precopy"
+                        ))),
+                    },
+                    // The seals are the allowlist; the newer snapshot
+                    // wins for a block both list.
+                    (MigrationItem::DiskBlockAt(role, index), _) => {
+                        let tier = [disk_seal.get(&role), precopy.get(&role)]
+                            .into_iter()
+                            .flatten()
+                            .find(|seal| seal.sealed.contains(&index));
+                        match tier {
+                            Some(seal) => seal
+                                .read_block(index)
+                                .await
+                                .map(bytes::Bytes::from)
+                                .map_err(|e| {
+                                    SandboxError::Snapshot(format!(
+                                        "read sealed disk block {index}: {e}"
+                                    ))
+                                }),
+                            None => Err(SandboxError::InvalidSpec(format!(
+                                "{role} disk block {index} is not sealed on this export"
+                            ))),
+                        }
+                    }
                 };
                 match bytes {
                     Ok(bytes) => {
@@ -8801,19 +5622,19 @@ impl SandboxBackend for PooledBackend {
         let destroyed = self.destroy(id).await;
         let _ = fs::remove_dir_all(&snapshot_dir).await;
         destroyed?;
-        tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045)");
+        tracing::info!(sandbox_id = %id, "migration committed; source destroyed");
         Ok(())
     }
 
-    /// ADR 0045: the move failed — re-queue the drained disk tier,
-    /// unfence, un-pause in place. Zero loss.
+    /// The move failed: discard the sealed checkpoints and un-pause in
+    /// place. Zero loss.
     async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
         // ADR 0045 C2 split-brain note: an EXPLICIT abort carries the
         // coordinator's knowledge that the dest provably never loaded
         // the shipped state (the postcopy-never-loaded marker), so it
         // is allowed even after StateBin was fetched. The forbidden
-        // arm is the dumb-host TTL's self-resume — gated by
-        // `ttl_verdict`'s state_served input, never reaching this RPC.
+        // arm is the dumb-host TTL's self-resume, which goes through
+        // `migration_abort_unserved`, never this RPC.
         //
         // Atomic validate+remove (see migration_commit): the TTL sweep
         // and a coordinator abort RPC race with nothing serializing
@@ -8825,11 +5646,30 @@ impl SandboxBackend for PooledBackend {
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
-        #[cfg(target_os = "linux")]
-        let backends = self.disk_backends(id);
-        #[cfg(not(target_os = "linux"))]
-        let backends = Vec::new();
-        self.abort_migration_export(export, backends).await
+        self.abort_migration_export(export).await
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<bool, SandboxError> {
+        use crate::migration::UnservedRemoval;
+        let export = match self.migrations.remove_unserved(id, export_id) {
+            UnservedRemoval::Removed(export) => export,
+            UnservedRemoval::Served => return Ok(false),
+            UnservedRemoval::Missing => return Err(SandboxError::NotFound),
+        };
+        if let Some(peer) = self.migrate_peer_server() {
+            peer.remove(export_id);
+        }
+        // The answer is final once the export is gone: no destination can
+        // load the state. A failed resume is left to the caller's rollback,
+        // whose `resume` is idempotent.
+        if let Err(error) = self.abort_migration_export(export).await {
+            tracing::warn!(sandbox_id = %id, %error, "unserved migration abort did not finish");
+        }
+        Ok(true)
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -8895,26 +5735,6 @@ impl SandboxBackend for PooledBackend {
     /// evictor) treats it like the checkpoint driver's own skip: retry
     /// next nomination.
     async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
-        // ADR 0116 C4: refuse to park a failed data plane. A park on a
-        // flush-escalated sandbox would freeze a VM whose disk writes
-        // cannot durably land — the 2026-08-12 incident's second leg.
-        // `InvalidSpec` is deliberate: the idle evictor maps it to the
-        // fall-through-to-full-eviction arm (no new wire variant), and
-        // that full eviction is quarantine-bounded by the survivor
-        // advert's keyed evict op.
-        if self.quarantined_survivors.get(&id).is_some_and(|q| {
-            q.reason == engram_protocol::heartbeat::QuarantineReason::DataPlaneFailed
-        }) {
-            ::metrics::counter!(
-                crate::metrics::RUNG2_PARK_FAILED_TOTAL,
-                "reason" => "data_plane_failed",
-            )
-            .increment(1);
-            return Err(SandboxError::InvalidSpec(format!(
-                "pause {id}: data plane failed (flush escalation); park refused — \
-                 a park would freeze nothing durable, evict instead"
-            )));
-        }
         if self.capture_in_flight(id) {
             ::metrics::counter!(
                 crate::metrics::RUNG2_PARK_FAILED_TOTAL,
@@ -8940,43 +5760,8 @@ impl SandboxBackend for PooledBackend {
         res
     }
 
-    /// ADR 0018 commit 12m: forward resume. Symmetric with pause.
-    ///
-    /// ADR 0098 P7 (#739 follow-up): the **un-pause data-plane gate**. A
-    /// rung-cancel resume must never un-pause a guest onto a rootfs NBD device
-    /// that THIS host-agent generation does not serve — the 731df805 outcome
-    /// (a coord-list gap left a rung-parked survivor's device unclaimed, the
-    /// stale-binding sweep disconnected its live rootfs, and the un-pause
-    /// landed on a dead data plane → EIO/garbage on the live guest, even
-    /// though the guest never left `paused`). The local-survivor rehydrate
-    /// pass is the primary fix; this gate is the last line — even if some
-    /// future listing bug recurs, we fail fast into the `evict_local → resume`
-    /// ladder rather than serving dead-plane reads.
+    /// Forward resume. Symmetric with pause.
     async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
-        #[cfg(target_os = "linux")]
-        {
-            let is_nbd_backed = self.inner.rootfs_device(id).is_some();
-            let served = self.all_disks_served(id);
-            let ok = engram_host_core::resume_data_plane_served(is_nbd_backed, served);
-            // Soft-invariant (ADR 0099 H6): logs the alertable line but never
-            // diverts control — the explicit early-return below is what routes
-            // the caller into recovery.
-            engram_core::soft_invariant!(
-                "un-pause-dead-plane",
-                ok,
-                "resume {id}: rootfs NBD device is not served by this host-agent \
-                 generation; refusing to un-pause onto a dead data plane"
-            );
-            if !ok {
-                return Err(SandboxError::Vm(
-                    format!(
-                        "resume {id}: rootfs NBD data plane not served by this generation; \
-                         routing to evict_local → resume"
-                    )
-                    .into(),
-                ));
-            }
-        }
         self.inner.resume(id).await?;
         self.held_snapshots.remove(&id);
         // A resumed guest carries no source role. Idempotent, and the retry
@@ -8989,7 +5774,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.swap_device(id)
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        id: SandboxId,
+        metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
+    ) -> Result<(), SandboxError> {
         // ADR 0038 B2: capture the source's memory manifest before
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
@@ -9028,14 +5818,14 @@ impl SandboxBackend for PooledBackend {
         }
         let memory_ref = metadata.memory_manifest;
         // Resume keeps the snapshot's pinned mounts — no per-session selection.
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ false,
-                /*fork_disk_at_attach=*/ false,
-                Vec::new(),
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ false,
+            /*fork_disk_at_attach=*/ false,
+            Vec::new(),
+        )
+        .await?;
         // Peer pages differ from the source chain. A post-copy destination
         // starts with a full checkpoint after drain; only ordinary restores
         // can seed a sparse checkpoint chain here.
@@ -9045,14 +5835,16 @@ impl SandboxBackend for PooledBackend {
             }
         }
         self.spawn_prefault_stats_probe(id);
-        Ok(id)
+        Ok(())
     }
 
     async fn restore_fresh(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
+        _disks: Option<engram_core::types::sandbox::SessionDisks>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // ADR 0045 seed-at-create: guest RAM right after a fresh restore
         // is byte-identical to the base snapshot's memory manifest, and
         // FC dirty-page tracking runs from the restore — exactly the
@@ -9062,18 +5854,18 @@ impl SandboxBackend for PooledBackend {
         // manifest is shared across sessions, so the chain must own a
         // fresh lineage (see seed_checkpoint_chain_forked).
         let memory_ref = metadata.memory_manifest;
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ true,
-                /*fork_disk_at_attach=*/ true,
-                selected_mounts,
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ true,
+            /*fork_disk_at_attach=*/ true,
+            selected_mounts,
+        )
+        .await?;
         if let Some(memory_ref) = memory_ref {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
         }
-        Ok(id)
+        Ok(())
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -9083,7 +5875,6 @@ impl SandboxBackend for PooledBackend {
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
-                let quarantined_survivors = self.quarantined_survivors.clone();
                 let unreachable_guests = self.unreachable_guests.clone();
                 let egress = self.egress.clone();
                 let inner = self.inner.clone();
@@ -9092,165 +5883,71 @@ impl SandboxBackend for PooledBackend {
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
                 let checkpoint_chains = self.checkpoint_chains.clone();
                 let chain_heads = self.chain_heads.clone();
-                let capture_locks = self.capture_locks.clone();
+                let capture_gates = self.capture_gates.clone();
                 let migration_roles = self.migration_roles.clone();
                 let drained_dests = self.drained_dests.clone();
-                #[cfg(target_os = "linux")]
-                let nbd_sandboxes = self.nbd_sandboxes.clone();
-                #[cfg(target_os = "linux")]
-                let nbd_residue = self.nbd_residue.clone();
-                #[cfg(target_os = "linux")]
-                let host_fs = self.host_fs.clone();
-                #[cfg(target_os = "linux")]
-                let dirty_file_paths: Vec<_> = DiskRole::ALL
-                    .into_iter()
-                    .filter_map(|role| self.dirty_file_path(id, role))
-                    .collect();
-                #[cfg(target_os = "linux")]
-                let shutdown_spool_root = self.shutdown_spool_root();
+                let volumes = self.volumes.clone();
+                let pending_finalizes = self.pending_finalizes.clone();
+                let pending_presetups = self.pending_presetups.clone();
+                let migrations = self.migrations.clone();
+                let migrate_peer = self.migrate_peer.get().cloned();
                 Box::pin(async move {
-                    // Unregister from the local egress proxy first, so any
-                    // outstanding traffic from a still-alive guest stops being
-                    // rewritten. The destroy below tears down the VM; in the
-                    // brief window between the two, a closed-fail-by-default
-                    // registry would reject — which is the safe behavior.
-                    //
-                    // ADR 0016 Phase B 4: the `session_bindings.remove` MUST run
-                    // regardless of whether an egress proxy is wired — Phase B's
-                    // LiveManifestPublisher resolves sandbox→session via this
-                    // map, and leaking a (destroyed) sandbox_id binding would
-                    // make the publisher repeat stale publishes for a session
-                    // whose sandbox is gone. Sister-bug to the
-                    // `notify_session_policy` fix (commit 5163366): both
-                    // population AND cleanup must be unconditional now that the
-                    // map is shared with the publisher.
+                    // Unregister from the egress proxy first, so a still-alive
+                    // guest's traffic stops being rewritten. The binding goes
+                    // whether or not a proxy is wired.
                     let removed_session = session_bindings.remove(&id).map(|(_, sid)| sid);
-                    // ADR 0090: a destroyed survivor stops advertising quarantine —
-                    // the evict_local remediation (or any destroy) closes the loop.
-                    quarantined_survivors.remove(&id);
                     unreachable_guests.remove(&id);
                     migration_roles.remove(&id);
                     drained_dests.remove(&id);
+                    // An open export's page-server entry reads the VM's
+                    // process, so it goes before the VM.
+                    let export = migrations.remove(id);
+                    if let (Some(export), Some(peer)) = (export.as_ref(), migrate_peer.as_ref()) {
+                        peer.remove(&export.export_id);
+                    }
                     if let Some(egress) = egress.as_ref() {
                         if let Some(session_id) = removed_session {
                             egress.unregister_session(session_id);
                         }
                     }
                     let result = inner.destroy(id).await;
-                    // Tear down the NBD daemon AFTER the inner backend has
-                    // closed the VM (so the kernel doesn't surface "device
-                    // busy" on disconnect). Drop on NbdSandboxState handles
-                    // disconnect → join → slot release. Done last so even
-                    // if inner.destroy errors, the daemon cleanup still runs.
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = nbd_sandboxes.remove(&id);
-                        for path in dirty_file_paths {
-                            match fs::remove_file(&path).await {
-                                Ok(()) => {}
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => tracing::warn!(
-                                    sandbox_id = %id,
-                                    path = %path.display(),
-                                    %error,
-                                    "destroy could not remove the sandbox dirty file",
-                                ),
+                    // The disks go after the VM has closed them. A pending
+                    // eviction finalize still publishes from them; it runs
+                    // this destroy again at its terminal step. A move holds
+                    // snapshots of them that the release cannot remove while
+                    // they are open: an export's seals and precopy, or the
+                    // precopy of a presetup that never reached its capture.
+                    if let Some(export) = export {
+                        let _ = fs::remove_dir_all(&export.snapshot_dir).await;
+                        if let Some(volumes) = volumes.as_ref() {
+                            for (_, seal) in export.disk_seal.into_iter().chain(export.precopy) {
+                                discard_seal(volumes, seal).await;
                             }
-                            let _ = fs::remove_file(crate::disk_daemon::backend::ref_sidecar_path(
-                                &path,
-                            ))
-                            .await;
-                        }
-                        // A destroyed sandbox's shutdown spool must not outlive it
-                        // (the sandbox_id will never rehydrate again; a leftover
-                        // spool is dead weight on the hostPath volume).
-                        if let Some(root) = shutdown_spool_root {
-                            for role in DiskRole::ALL {
-                                let _ = crate::disk_daemon::spool::discard_spool(
-                                    host_fs.as_ref(),
-                                    &root,
-                                    id,
-                                    role,
-                                )
-                                .await;
-                            }
-                        }
-                        // engrams#1378: complete an INTERRUPTED PREDECESSOR teardown. A
-                        // destroy that died between the FC kill and the NBD disconnect
-                        // left this sandbox's device kernel-connected with no in-memory
-                        // entry; the startup classification barrier attributed it via
-                        // its durable owner record and parked it as residue, and the
-                        // coordinator's tombstone (advertised on the heartbeat) re-drives
-                        // destroy on THIS generation — this arm is where that teardown
-                        // finally lands. On a disconnect error the residue entry is
-                        // restored, so the next tombstone advertise retries; the inert
-                        // owner record is lazily cleaned at the next startup.
-                        if let Some((_, devices)) = nbd_residue.remove(&id) {
-                            for device in devices {
-                                use engram_host_core::NbdKernel as _;
-                                match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            sandbox_id = %id,
-                                            device = %device.display(),
-                                            "destroy completed a predecessor's interrupted NBD \
-                                             teardown (tombstone-ordered residue disconnect)",
-                                        );
-                                        ::metrics::counter!(
-                                            crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL
-                                        )
-                                        .increment(1);
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            sandbox_id = %id,
-                                            device = %device.display(),
-                                            %error,
-                                            "residue NBD disconnect failed; kept for the next \
-                                             tombstone advertise to retry",
-                                        );
-                                        nbd_residue.entry(id).or_default().push(device);
-                                    }
-                                }
-                            }
-                            ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES)
-                                .set(nbd_residue.iter().map(|entry| entry.len()).sum::<usize>()
-                                    as f64);
                         }
                     }
-                    // ADR 0016 Phase A: drop the COW diagnostic timestamp so
-                    // the entry doesn't outlive its sandbox. A subsequent
-                    // `cow_state(id)` returns `None` (no NBD entry, no
-                    // snapshot timestamp) — same shape as a brand-new
-                    // sandbox.
+                    if let Some(volumes) = volumes.as_ref() {
+                        if let Some((_, presetup)) = pending_presetups.remove(&id) {
+                            for (_, seal) in presetup.precopy {
+                                discard_seal(volumes, seal).await;
+                            }
+                        }
+                        if !pending_finalizes.contains_key(&id) {
+                            if let Err(error) = volumes.release(id).await {
+                                tracing::warn!(sandbox_id = %id, %error, "release of the session disks failed");
+                            }
+                        }
+                    }
                     let _ = last_snapshot_unix_ms.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
                     let _ = dead_probe_inflight.remove(&id);
-                    // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
-                    // deliberately survive destroy — an eviction's final checkpoint
-                    // must stay re-advertisable until the coord acks it (that's the
-                    // whole reconciliation point). GCS chunks are the durable truth;
-                    // ADR 0039: the chain is manifest-only now (no local rolling
-                    // image), so there's nothing on disk to remove here.
-                    //
-                    // Issue #529: the same invariant covers `eviction_finalize.rs`'s
-                    // `EvictionFinalizeRecord`/`CheckpointRecord{kind:EvictionFinal}`
-                    // (`<checkpoint_dir>/finalize/`, `.../records/`) and the
-                    // `pending_finalizes` idempotency map — none of the three are
-                    // touched here. In the normal flow that's moot: `run_terminal`
-                    // deletes the `EvictionFinalizeRecord` and clears
-                    // `pending_finalizes` itself, strictly BEFORE calling this
-                    // `destroy()` (see the ordering in `run_terminal`). Were `destroy`
-                    // ever invoked directly on a sandbox with a still-in-flight
-                    // finalize (outside that job's own terminal step — not a path any
-                    // caller in this repo takes today), the finalize job would keep
-                    // running unaffected: it is a pure function of `dest` + the chunk
-                    // store, never the live sandbox, and this method deletes neither.
+                    // Durable checkpoint records survive destroy: an eviction's
+                    // final checkpoint stays re-advertisable until the
+                    // coordinator acks it.
                     let _ = checkpoint_chains.remove(&id);
                     if let Some(store) = &chain_heads {
                         store.remove_best_effort(id);
                     }
-                    let _ = capture_locks.remove(&id);
+                    let _ = capture_gates.remove(&id);
                     result.map_err(Arc::new)
                 })
             })
@@ -9259,9 +5956,10 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
-        let _capture_guard = self.capture_lock(id).lock_owned().await;
-        // This also waits for the checkpoint post phase. Capture and swap
-        // arming must be exclusive; the wait is bounded by the capture.
+        let _quiesce = self
+            .capture_gate(id)
+            .quiesce(id, CaptureUser::StartAgent)
+            .await;
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
         // before the backend sees it. Each backend rides it into the
@@ -9274,15 +5972,6 @@ impl SandboxBackend for PooledBackend {
             agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
         }
         let result = self.inner.start_agent(id, agent).await;
-        // ADR 0019: agent_ready has fired (or failed) — close the cold-boot
-        // operation window so steady-state session I/O falls back to
-        // metrics-only (no per-fetch spans for a running session).
-        #[cfg(target_os = "linux")]
-        if let Some(state) = self.nbd_sandboxes.get(&id) {
-            for (_, device) in state.iter() {
-                device.backend.operation_scope().end();
-            }
-        }
         result
     }
 
@@ -9398,21 +6087,22 @@ impl SandboxBackend for PooledBackend {
                 //   v2, latest is v2" — the exact FC-lane CI failure the
                 //   forked seed fixed).
                 // - disk: `fork_disk_at_attach=true` — the warm hook's
-                //   writes flush through the NBD chain, and an unforked
-                //   attach would tick (and race) the cold base's shared
-                //   disk manifest chain exactly the same way.
+                //   writes land in the session volume, and an unforked
+                //   attach would continue (and race) the cold base's
+                //   shared disk manifest lineage exactly the same way.
                 //
                 // `fresh=false`: this is a resume of the cold base's
                 // pinned device model, not a session fresh-create — no
                 // per-session mount swap, resume memory semantics.
-                let id = self
-                    .restore_with(
-                        (**snapshot).clone(),
-                        /*fresh=*/ false,
-                        /*fork_disk_at_attach=*/ true,
-                        Vec::new(),
-                    )
-                    .await?;
+                let id = SandboxId::new();
+                self.restore_with(
+                    id,
+                    (**snapshot).clone(),
+                    /*fresh=*/ false,
+                    /*fork_disk_at_attach=*/ true,
+                    Vec::new(),
+                )
+                .await?;
                 if let Some(memory_ref) = memory_ref {
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
                 }
@@ -9424,7 +6114,11 @@ impl SandboxBackend for PooledBackend {
                 self.spawn_prefault_stats_probe(id);
                 id
             }
-            ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => self.create(spec).await?,
+            ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => {
+                let id = SandboxId::new();
+                self.create(id, spec).await?;
+                id
+            }
         };
 
         // Capture-time egress (ADR 0080): register the coordinator-assembled
@@ -9529,10 +6223,6 @@ impl SandboxBackend for PooledBackend {
             let deferred_cold_base = if is_warm
                 && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
             {
-                #[cfg(target_os = "linux")]
-                if let Some(state) = self.nbd_sandboxes.get(&id) {
-                    for (_, device) in state.iter() { device.backend.operation_scope().end(); }
-                }
                 let cold_base_event = engram_core::types::CaptureProgress {
                     phase: engram_core::types::CapturePhase::Snapshot,
                     sandbox_id: Some(id),
@@ -9731,15 +6421,6 @@ impl SandboxBackend for PooledBackend {
                 // that cannot sync is a guest we must not ship as a base.
                 self.sync_guest_fs(id).await?;
             }
-            // Close the cold-boot window (mirrors `start_agent`) before the
-            // snapshot flush opens its own `snapshot` operation scope. A
-            // no-op if the Miss+warm arm above already ended it (or if
-            // this sandbox was restored, not cold-booted — no scope to
-            // end either way).
-            #[cfg(target_os = "linux")]
-            if let Some(state) = self.nbd_sandboxes.get(&id) {
-                for (_, device) in state.iter() { device.backend.operation_scope().end(); }
-            }
             // `phase=snapshot` — the warm hook (if any) is done; pause/flush/
             // chunk is next. Carries the warm tail forward so a live watcher
             // still sees it during the (usually short) snapshot phase.
@@ -9891,24 +6572,25 @@ impl SandboxBackend for PooledBackend {
     #[tracing::instrument(name = "host.restore_base_for_session", skip_all)]
     async fn restore_base_for_session(
         &self,
+        id: SandboxId,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    ) -> Result<SandboxId, SandboxError> {
+    ) -> Result<(), SandboxError> {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
         //    harness baked into the rootfs at /opt/engram/harness/.
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
         let memory_ref = metadata.memory_manifest;
-        let id = self
-            .restore_with(
-                metadata,
-                /*fresh=*/ true,
-                /*fork_disk_at_attach=*/ true,
-                selected_mounts,
-            )
-            .await?;
+        self.restore_with(
+            id,
+            metadata,
+            /*fresh=*/ true,
+            /*fork_disk_at_attach=*/ true,
+            selected_mounts,
+        )
+        .await?;
         // ADR 0045 seed-at-create: the session's RAM == the base
         // manifest at this instant (see `restore_fresh`); seed the
         // chain so the first eviction diffs instead of Full-dumping.
@@ -9955,7 +6637,7 @@ impl SandboxBackend for PooledBackend {
         // ADR 0021 P1.5: option-D substrate swap retired. The harness
         // travels in the rootfs (manifest `[harness] exec`); there's
         // no per-session harness file to materialize or swap.
-        Ok(id)
+        Ok(())
     }
 
     // ADR 0021 P1.5: `swap_harness_drive` wrapper retired with the
@@ -9983,19 +6665,8 @@ impl SandboxBackend for PooledBackend {
         let sandbox_id = policy.sandbox_id;
         let session_id = policy.session_id;
 
-        // ADR 0016 Phase B commit 4: the host-side
-        // LiveManifestPublisher's SessionResolver reads
-        // `session_bindings` to map sandbox_id → session_id at
-        // publish time. Phase A's design tied population to the
-        // egress-proxy branch, which means hosts without a wired
-        // proxy (the integration-up.sh dev stack, prod hosts with
-        // egress disabled) silently never populate the map — every
-        // FlushScheduler publish then skips with "sandbox not
-        // bound to a session" even though the session IS bound.
-        //
-        // Insert FIRST, unconditionally. The egress-proxy registration
-        // below is still gated on `self.egress`; only the sandbox→
-        // session bookkeeping is universal.
+        // The sandbox→session binding is recorded whether or not an
+        // egress proxy is attached.
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
@@ -10007,13 +6678,10 @@ impl SandboxBackend for PooledBackend {
                     "guest services and tunnels require a host egress proxy".into(),
                 ));
             }
-            // No proxy attached — egress is unfiltered. The
-            // coordinator may still send policy frames (the
-            // coordinator-side codepath doesn't know whether a host
-            // happens to have a proxy); skip the egress-proxy
-            // registration but the sandbox→session map insert above
-            // still ran, so Phase B's publisher resolver sees the
-            // binding.
+            // No proxy attached: egress is unfiltered. The coordinator
+            // still sends policy frames (it does not know whether a host
+            // has a proxy); the sandbox→session binding above is what
+            // this frame must record.
             tracing::debug!(
                 %sandbox_id,
                 %session_id,
@@ -10071,10 +6739,7 @@ impl SandboxBackend for PooledBackend {
     /// to in-VM agentd would never fire — host's proxy_shell would
     /// then dial port 7681 blind and hit Connection refused whenever
     /// the bake's init didn't auto-start ttyd or the warm-restore
-    /// stripped the listening socket. Prod 2026-05-20 session
-    /// 5c8d0ce5: zero start_shell logs on the host-agent despite a
-    /// completed proxy_shell GRPC roundtrip, exactly because this
-    /// forward was missing.
+    /// stripped the listening socket.
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         self.inner.start_shell(id).await
     }
@@ -10118,790 +6783,6 @@ impl SandboxBackend for PooledBackend {
     async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.inner.stop_ide(id).await
     }
-
-    /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
-    /// disk state (`nbd_sandboxes`) + the per-host `chunk_cache`
-    /// for base-chunk locality + the in-memory `last_snapshot_unix_ms`
-    /// tracker for the memory-tier RPO. `None` when:
-    ///
-    /// - The sandbox isn't NBD-attached (Process backend, macOS dev,
-    ///   Linux with `nbd_pool` unwired). The disk tier has no
-    ///   chunk-granularity view; the diagnostic surface reports
-    ///   "not chunk-tracked" upstream by absence.
-    /// - The sandbox_id isn't known here. Coord-side
-    ///   `host_for_sandbox` already gates on this; a stray query
-    ///   inherits the same shape.
-    ///
-    /// Cost: one map lookup for nbd state, two lock acquisitions on
-    /// the `ChunkedDiskBackend` (dirty + state), one map traversal
-    /// over `state.base.chunks` to count locals via
-    /// `ChunkCache::contains`. Bounded by manifest size (~256–1024
-    /// entries typical), dominated by FS `try_exists` cost. Caller
-    /// caches the result for ~1s.
-    async fn cow_state(&self, id: SandboxId) -> Option<engram_core::types::cow_state::CowState> {
-        #[cfg(target_os = "linux")]
-        {
-            // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
-            // guard before the `cow_state_for_entry` await. This read runs
-            // on the ~1 s heartbeat cadence; holding the guard across the
-            // manifest read would let a contending writer on the same
-            // shard stall the heartbeat worker.
-            let mut state = None;
-            for (_, backend) in self.disk_backends(id) {
-                let next = self.cow_state_for_entry(id, backend).await?;
-                match &mut state {
-                    None => state = Some(next),
-                    Some(total) => {
-                        total.dirty_chunks += next.dirty_chunks;
-                        total.dirty_bytes += next.dirty_bytes;
-                        total.base_chunks += next.base_chunks;
-                        total.base_chunks_local += next.base_chunks_local;
-                    }
-                }
-            }
-            state
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = id;
-            None
-        }
-    }
-
-    /// Bulk fan-out — one entry per NBD-attached sandbox. Skips any
-    /// per-sandbox lookup whose state read fails (best effort). One
-    /// dashmap iteration; the per-entry COW read holds its locks
-    /// only for its own state, so concurrent NBD writers see at most
-    /// a brief contention.
-    async fn cow_state_all(&self) -> Vec<engram_core::types::cow_state::CowStateRecord> {
-        #[cfg(target_os = "linux")]
-        {
-            let ids: Vec<_> = self
-                .nbd_sandboxes
-                .iter()
-                .map(|entry| *entry.key())
-                .collect();
-            let mut out = Vec::with_capacity(ids.len());
-            for sandbox_id in ids {
-                if let Some(state) = self.cow_state(sandbox_id).await {
-                    out.push(engram_core::types::cow_state::CowStateRecord { sandbox_id, state });
-                }
-            }
-            out
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Vec::new()
-        }
-    }
-
-    /// ADR 0016 Phase B commit 4a — admin trigger for the
-    /// FlushScheduler primitive. Forces an immediate flush on the
-    /// chunked-disk backend; returns the new manifest_ref if any
-    /// chunks were drained, `None` if the sandbox isn't NBD-attached
-    /// or has zero dirty bytes.
-    ///
-    /// Coord's `POST /api/admin/sessions/:id/flush-now` calls this
-    /// (via gRPC) and pipes the returned manifest_ref into
-    /// `MetadataStore::update_live_disk_manifest` immediately —
-    /// bypasses the publisher's coalescing drain so the round-trip
-    /// is deterministic for tests and operators.
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut root_ref = None;
-            let mut errors = Vec::new();
-            for (role, backend) in self.disk_backends(id) {
-                match backend.flush().await {
-                    Ok(outcome) if role == DiskRole::Root && outcome.chunks_flushed != 0 => {
-                        root_ref = Some(outcome.manifest_ref);
-                    }
-                    Ok(_) => {}
-                    Err(error) => errors.push(format!("{role:?}: {error}")),
-                }
-            }
-            if errors.is_empty() {
-                Ok(root_ref)
-            } else {
-                Err(SandboxError::Vm(
-                    format!("flush_sandbox: {}", errors.join("; ")).into(),
-                ))
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = id;
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl PooledBackend {
-    /// ADR 0016 Phase B commit 7 / ADR 0044 K2 — restart-time
-    /// rehydration. Coord hands the host a list of `(session_id,
-    /// sandbox_id, effective_disk_manifest)` rows at registration
-    /// time; this method rebuilds the chunked-disk DATA PLANE for
-    /// one surviving sandbox.
-    ///
-    /// Steps:
-    /// 1. Discover the survivor's existing `/dev/nbdN` from the
-    ///    reattached FC's rootfs drive and CLAIM that exact slot.
-    ///    The surviving FC holds an open fd to that device, so the
-    ///    pre-netlink behavior here — acquiring a FRESH slot —
-    ///    served a device nobody read while the survivor's real
-    ///    disk stayed dead (prod 2026-06-11: guest rootfs EIO after
-    ///    a pod roll).
-    /// 2. Build `ChunkedDiskBackend` from the manifest_ref and hand
-    ///    the kernel a fresh serve socket for the SAME device via
-    ///    netlink `NBD_CMD_RECONFIGURE`; guest I/O parked under
-    ///    `dead_conn_timeout` resumes.
-    /// 3. Insert into `nbd_sandboxes`, install the FlushScheduler,
-    ///    pre-populate `session_bindings[sandbox_id] = session_id`
-    ///    so the LiveManifestPublisher's resolver finds the binding
-    ///    on the first post-rehydrate flush.
-    ///
-    /// Skip (`Ok(false)`) on any short-circuit (no nbd_pool /
-    /// chunk_store / chunk_cache, sandbox already present, or no
-    /// block-device rootfs to re-serve). Callers log + move on.
-    pub async fn rehydrate_sandbox(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        disk_manifest: engram_core::types::manifest::ManifestRef,
-    ) -> Result<bool, SandboxError> {
-        self.track_rehydrate(
-            session_id,
-            sandbox_id,
-            disk_manifest,
-            self.rehydrate_all_devices(session_id, sandbox_id, disk_manifest),
-            || {
-                self.nbd_sandboxes
-                    .contains_key(&sandbox_id)
-                    .then(|| self.all_disks_served(sandbox_id))
-            },
-        )
-        .await
-    }
-
-    async fn rehydrate_all_devices(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        disk_manifest: engram_core::ManifestRef,
-    ) -> Result<bool, SandboxError> {
-        let Some(device) = self.inner.rootfs_device(sandbox_id) else {
-            return Ok(false);
-        };
-        let mut changed = self
-            .rehydrate_device(
-                session_id,
-                sandbox_id,
-                DiskRole::Root,
-                device,
-                disk_manifest,
-            )
-            .await?;
-        if !self.nbd_sandboxes.contains_key(&sandbox_id) {
-            return Ok(changed);
-        }
-        if let Some(mut disks) = self.nbd_sandboxes.get_mut(&sandbox_id) {
-            disks.expected.extend(
-                self.recovery_owners
-                    .values()
-                    .filter(|owner| owner.sandbox_id == sandbox_id)
-                    .map(|owner| owner.role),
-            );
-        }
-        for (device, owner) in &self.recovery_owners {
-            if owner.sandbox_id != sandbox_id || owner.role == DiskRole::Root {
-                continue;
-            }
-            let mut disk_ref = self
-                .dirty_file_path(sandbox_id, owner.role)
-                .and_then(|path| crate::disk_daemon::backend::read_ref_sidecar(&path));
-            if disk_ref.is_none() {
-                if let Some(root) = self.shutdown_spool_root() {
-                    disk_ref = crate::disk_daemon::spool::read_spool_meta(
-                        self.host_fs.as_ref(),
-                        &root,
-                        sandbox_id,
-                        owner.role,
-                    )
-                    .await
-                    .map_err(|e| SandboxError::Vm(format!("read device spool: {e}").into()))?
-                    .map(|meta| meta.manifest_ref());
-                }
-            }
-            let disk_ref = disk_ref
-                .ok_or_else(|| SandboxError::Vm("owned device has no recovery manifest".into()))?;
-            changed |= self
-                .rehydrate_device(session_id, sandbox_id, owner.role, device.clone(), disk_ref)
-                .await?;
-        }
-        Ok(changed)
-    }
-
-    async fn rehydrate_device(
-        &self,
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-        role: DiskRole,
-        device: PathBuf,
-        disk_manifest: engram_core::types::manifest::ManifestRef,
-    ) -> Result<bool, SandboxError> {
-        let (pool, chunk_store, chunk_cache) = match (
-            self.nbd_pool.as_ref(),
-            self.chunk_store.as_ref(),
-            self.chunk_cache.as_ref(),
-        ) {
-            (Some(p), Some(s), Some(c)) => (p, s, c),
-            _ => return Ok(false),
-        };
-        if self
-            .nbd_sandboxes
-            .get(&sandbox_id)
-            .is_some_and(|disks| disks.get(role).is_some())
-        {
-            return Ok(false);
-        }
-        // Register-time rehydrate claims the device from the pool; a
-        // RETRY (2026-08-02 durability-rollback RCA) finds it PARKED by
-        // its own earlier failure and reclaims it instead — the
-        // `Parked → Claimed` edge. Reclaim first: it is lock-cheap,
-        // and a parked device would spend `claim`'s full retry budget
-        // to conclude "reserved by someone" anyway.
-        let slot = match pool.reclaim_parked(&device) {
-            Some(slot) => slot,
-            None => match pool.claim(&device).await {
-                Some(slot) => slot,
-                None => {
-                    // Not parked and not in the free pool: either the
-                    // device isn't part of this host's slot set, or
-                    // something else already leased it — both mean
-                    // re-serving here would fight another owner. Loud,
-                    // because the survivor's disk stays dead.
-                    tracing::warn!(
-                        %sandbox_id,
-                        device = %device.display(),
-                        "rehydrate: survivor's NBD device could not be claimed from \
-                         the slot pool; its disk stays unserved (recover via \
-                         evict_local → resume)",
-                    );
-                    return Ok(false);
-                }
-            },
-        };
-
-        let dirty_path = self
-            .dirty_file_path(sandbox_id, role)
-            .expect("chunk cache provides a default dirty root");
-        let dirty_file_exists = dirty_path.try_exists().map_err(|error| {
-            SandboxError::Vm(
-                format!(
-                    "check survivor dirty file {}: {error}",
-                    dirty_path.display()
-                )
-                .into(),
-            )
-        })?;
-
-        // A dirty file is the primary seed. A pre-upgrade sandbox has no
-        // file, so it keeps the shutdown-spool fallback unchanged. The
-        // spool seed still lands before RECONFIGURE releases guest I/O.
-        let spool_root = self.shutdown_spool_root();
-        let mut attach_ref = disk_manifest;
-        if dirty_file_exists {
-            attach_ref = crate::disk_daemon::backend::resolve_recover_attach_ref(
-                disk_manifest,
-                crate::disk_daemon::backend::read_ref_sidecar(&dirty_path),
-            );
-            if attach_ref != disk_manifest {
-                tracing::info!(
-                    %sandbox_id,
-                    coordinator_ref = %disk_manifest,
-                    attach_ref = %attach_ref,
-                    "predecessor published past the coordinator's ref, attaching at the recorded publish — store-ahead",
-                );
-            }
-        }
-        let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
-        if !dirty_file_exists {
-            if let Some(root) = &spool_root {
-                match crate::disk_daemon::spool::read_spool(
-                    self.host_fs.as_ref(),
-                    root,
-                    sandbox_id,
-                    role,
-                )
-                .await
-                {
-                    Ok(Some((meta, chunks)))
-                        if meta.manifest_id == disk_manifest.manifest_id
-                            && meta.version >= disk_manifest.version =>
-                    {
-                        // meta.version can be AHEAD of coord's ref: the
-                        // predecessor uploaded chunks + manifest but died
-                        // before its coord publish landed. The manifest
-                        // object is already durable in the blob store
-                        // (upload precedes publish), so attach from the
-                        // spool's ref — the store-ahead recovery the flush
-                        // path's version-conflict retry also leans on.
-                        attach_ref = meta.manifest_ref();
-                        seed_dirty = Some(chunks);
-                    }
-                    Ok(Some((meta, _))) => {
-                        // A spool that disagrees with the reference lineage is
-                        // an invariant-class surprise, not routine: the spool
-                        // is written by the predecessor's OWN flush backend at
-                        // shutdown, and sandbox ids never recur — the expected
-                        // divergence is only version-behind (stale coord
-                        // publish), which the adopt arm above already covers.
-                        // The 2026-07-21 61a03b7e incident hit this arm with a
-                        // WRONG-KIND reference (the memory chain head) and
-                        // discarded real acked writes as "foreign". Keep the
-                        // spool ON DISK — it is the only copy of acked guest
-                        // data; a later correctly-referenced attach can still
-                        // adopt it, and an operator can inspect it.
-                        engram_core::soft_invariant!(
-                            "shutdown-spool-lineage-mismatch",
-                            false,
-                            "sandbox {}: shutdown-spool lineage {} disagrees with the \
-                         reference disk manifest {} — spool PRESERVED on disk, not \
-                         adopted (it is the only copy of acked guest writes; a \
-                         correctly-referenced attach can still adopt it, an \
-                         operator can inspect it)",
-                            sandbox_id,
-                            meta.manifest_ref(),
-                            disk_manifest,
-                        );
-                        ::metrics::counter!(crate::metrics::SPOOL_LINEAGE_MISMATCH_TOTAL)
-                            .increment(1);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            %sandbox_id,
-                            error = %e,
-                            "shutdown spool unreadable; discarding — acked writes it \
-                             held are rolled back",
-                        );
-                        let _ = crate::disk_daemon::spool::discard_spool(
-                            self.host_fs.as_ref(),
-                            root,
-                            sandbox_id,
-                            role,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        let adopted_spool = seed_dirty.is_some();
-
-        // ADR 0110's primary rollout gate. The old and the new recovery
-        // path are both silent when they succeed, so a clean roll proves
-        // nothing on its own — this names which one actually ran.
-        //
-        // Read the shape, not one sample. The FIRST roll after the upgrade
-        // reports `spool` for every survivor, because no sandbox had a
-        // dirty file when the old binary died. Those survivors get one on
-        // reattach (the Truncate arm below), so the roll AFTER that is the
-        // first real exercise of `dirty_file`. Over a week `dirty_file`
-        // must climb while `spool` falls to zero as pre-upgrade sandboxes
-        // age out. `spool` still climbing means dirty files are not
-        // surviving the roll, which is the ADR's whole premise failing.
-        ::metrics::counter!(
-            crate::metrics::REATTACH_SEED_TOTAL,
-            "source" => if dirty_file_exists {
-                "dirty_file"
-            } else if adopted_spool {
-                "spool"
-            } else {
-                "none"
-            },
-        )
-        .increment(1);
-
-        let store_arc = Arc::new(chunk_store.clone());
-        let dirty_mode = if dirty_file_exists {
-            crate::disk_daemon::backend::DirtyFileOpenMode::Recover
-        } else {
-            crate::disk_daemon::backend::DirtyFileOpenMode::Truncate
-        };
-        let mut state = match crate::disk_daemon::runtime::reattach_manifest_with_dirty_file(
-            attach_ref,
-            chunk_cache.clone(),
-            store_arc,
-            slot,
-            self.flush_config.dirty_threshold_bytes,
-            crate::disk_daemon::runtime::DirtyTierSpec {
-                path: dirty_path,
-                mode: dirty_mode,
-                seed: seed_dirty,
-            },
-        )
-        .await
-        {
-            Ok(state) => state,
-            Err((slot, e)) => {
-                // Reattach refused — a RECONFIGURE failure (a device
-                // configured by a pre-netlink host-agent generation, or an
-                // identifier mismatch), or the pre-RECONFIGURE verify-on-read
-                // finding the adopted spool bytes missing from the backend.
-                // The survivor's disk stays dead; the evict_local → resume
-                // ladder recovers the session.
-                //
-                // PARK the slot rather than letting it drop back into the
-                // general pool: the surviving FC may still hold an open fd
-                // to this exact /dev/nbdN, so releasing it would let the
-                // stale-binding sweep DISCONNECT it (immediate guest EIO)
-                // or hand it to an unrelated session. Quarantine keeps the
-                // reserved bit set so the device is unavailable to new
-                // claims until the session is recovered out-of-band.
-                tracing::warn!(
-                    %sandbox_id,
-                    device = %device.display(),
-                    error = %e,
-                    "rehydrate reattach failed; parking the survivor's NBD slot \
-                     (quarantined, kept out of the pool) to protect a possibly-live \
-                     device; recover via evict_local → resume",
-                );
-                slot.quarantine();
-                return Err(SandboxError::Vm(
-                    format!(
-                        "rehydrate nbd reattach at {}: {e} \
-                         (survivor disk unserved; slot quarantined; recover via \
-                         evict_local → resume)",
-                        device.display()
-                    )
-                    .into(),
-                ));
-            }
-        };
-
-        let mut config = self.flush_config.clone();
-        config.enabled &= role == DiskRole::Root;
-        state.install_flush_scheduler(
-            sandbox_id,
-            role,
-            self.live_manifest_publisher.clone(),
-            self.data_plane_health.clone(),
-            config,
-            self.nbd_owners.clone(),
-        );
-
-        // Issue #224: terminal-mode check. The await window above
-        // (pool.claim → reattach_manifest's netlink RECONFIGURE) is
-        // multi-second; SIGTERM can have raised the abandon flag and
-        // drained the (then-empty-of-this-id) map while we were in it.
-        // If so, inserting `state` here would leak a live NBD data
-        // plane that the abandon sweep has already passed — process
-        // exit would then run `NbdHandle::Drop` and netlink-disconnect
-        // the survivor's device the successor is about to RECONFIGURE.
-        // Abandon in-place instead: the device the RECONFIGURE just
-        // re-established stays kernel-configured for the successor.
-        if self.is_abandoning() {
-            tracing::warn!(
-                %sandbox_id,
-                "rehydrate completed during SIGTERM abandon; abandoning the \
-                 re-served NBD data plane in-place (kernel config left alive \
-                 for the successor) instead of inserting after the sweep",
-            );
-            state.abandon_for_shutdown();
-            return Ok(false);
-        }
-        match role {
-            DiskRole::Root => {
-                self.nbd_sandboxes.insert(
-                    sandbox_id,
-                    SandboxDisks {
-                        expected: std::iter::once(DiskRole::Root)
-                            .chain(
-                                self.recovery_owners
-                                    .values()
-                                    .filter(|o| o.sandbox_id == sandbox_id)
-                                    .map(|o| o.role),
-                            )
-                            .collect(),
-                        root: state,
-                        swap: None,
-                    },
-                );
-            }
-            DiskRole::Swap => {
-                let mut disks = self.nbd_sandboxes.get_mut(&sandbox_id).ok_or_else(|| {
-                    SandboxError::Vm("swap recovery requires a served root".into())
-                })?;
-                disks.swap = Some(state);
-            }
-        }
-
-        // Pre-populate session_bindings so the LiveManifestPublisher
-        // resolver finds the binding on the first post-rehydrate
-        // flush. Without this, the scheduler would skip-publish
-        // with "sandbox not bound" — same shape as the pre-commit-
-        // 5163366 cold-create regression.
-        self.session_bindings.insert(sandbox_id, session_id);
-
-        // The seeded chunks are now owned by the live dirty tier (and
-        // the scheduler installed above will upload them promptly);
-        // drop the spool so a LATER generation can't re-adopt stale
-        // bytes over a newer divergence.
-        if adopted_spool {
-            if let Some(root) = &spool_root {
-                if let Err(e) = crate::disk_daemon::spool::discard_spool(
-                    self.host_fs.as_ref(),
-                    root,
-                    sandbox_id,
-                    role,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %sandbox_id,
-                        error = %e,
-                        "adopted shutdown spool could not be discarded",
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            %session_id,
-            %sandbox_id,
-            manifest = %attach_ref,
-            device = %device.display(),
-            spool_adopted = adopted_spool,
-            "rehydrated chunked-disk data plane (RECONFIGURE) for survivor sandbox",
-        );
-        Ok(true)
-    }
-
-    /// ADR 0016 Phase B commit 5 — pre-restore half of the
-    /// resume-path NBD attach. Spawned from `restore()` before
-    /// `inner.restore()` reads the sidecar.
-    ///
-    /// When all four conditions hold — Linux + `nbd_pool` +
-    /// `chunk_store` + `chunk_cache` — AND the snapshot row carries
-    /// a chunked `disk_manifest`, this returns `Ok(Some(state))`:
-    ///
-    /// 1. Build a `ChunkedDiskBackend` from the snapshot's disk
-    ///    manifest. The base manifest IS the snapshot's manifest;
-    ///    no flat-file materialization happens.
-    /// 2. Acquire a `/dev/nbdN` slot + spawn the NBD daemon. State
-    ///    carries `scheduler: None` (the FlushScheduler is installed
-    ///    post-`inner.restore` when the new sandbox_id is known).
-    /// 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
-    ///    device path. `restore_canonical_symlinks` (called from
-    ///    `inner.restore`) then installs BOTH canonical symlinks
-    ///    (host + source-keyed per FC's `state.bin` embedded path)
-    ///    pointing at /dev/nbdN. FC's `load_snapshot` reads through
-    ///    the symlink → through virtio-blk → through the NBD daemon
-    ///    → through `ChunkedDiskBackend::read`. No bytes ever resident.
-    ///
-    /// On any short-circuit (no nbd_pool, no disk_manifest, etc.),
-    /// returns `Ok(None)` and the caller falls back to
-    /// `materialize_disk_if_missing` (the pre-Phase-B path).
-    ///
-    /// Closes ADR 0016 §"Phase B failure mode to close":
-    /// - Symptom 1: cow_state_all iterates `nbd_sandboxes`. The
-    ///   resumed sandbox is now in that map → diagnostic returns
-    ///   non-null.
-    /// - Symptom 2: snapshot path expects the canonical chunked-
-    ///   disk layout (symlinks + nbd_sandboxes entry). Both are
-    ///   present after a NBD-attach resume.
-    async fn prepare_resume_nbd_attach(
-        &self,
-        metadata: &SnapshotMetadata,
-        src: &std::path::Path,
-        fork_at_attach: bool,
-    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
-        let (pool, chunk_store, chunk_cache) = match (
-            self.nbd_pool.as_ref(),
-            self.chunk_store.as_ref(),
-            self.chunk_cache.as_ref(),
-        ) {
-            (Some(p), Some(s), Some(c)) => (p, s, c),
-            // Non-NBD configuration. Caller falls back to
-            // materialize-to-file (the pre-Phase-B path).
-            _ => return Ok(None),
-        };
-        let Some(disk_ref) = metadata.disk_manifest else {
-            // Legacy snapshot without a chunked disk lineage — the
-            // materialize-to-file fallback handles it (and is itself
-            // a no-op when disk_manifest is None).
-            return Ok(None);
-        };
-
-        // 1+2. Spawn NBD. attach_manifest builds the ChunkedDiskBackend
-        //      rebased on `disk_ref` and starts the daemon. The
-        //      returned NbdSandboxState carries scheduler=None;
-        //      install_flush_scheduler runs post-restore.
-        //
-        let store_arc = Arc::new(chunk_store.clone());
-        // Fork vs tick is the CALLER's call (see `restore_with`'s
-        // `fork_disk_at_attach`): a resume re-attaches the session's OWN
-        // already-forked manifest id (tick), while a fresh create off a
-        // base snapshot — or a capture VM restoring a shared cold base —
-        // attaches a SHARED manifest and must fork a private lineage.
-        // Hardcoding `false` here was the incident-2026-07-10 bug: every
-        // base-restored session published onto the shared base chain.
-        let dirty_path = self
-            .pending_dirty_file_path()
-            .expect("chunk cache provides a default dirty root");
-        let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
-            disk_ref,
-            chunk_cache.clone(),
-            store_arc,
-            pool,
-            self.flush_config.dirty_threshold_bytes,
-            fork_at_attach,
-            dirty_path,
-        )
-        .await
-        .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest (resume): {e}").into()))?;
-
-        // 3. Patch the FC sidecar's `spec.rootfs_source` to the NBD
-        //    device path. `restore_canonical_symlinks` (inside
-        //    `inner.restore`) follows this field to install the
-        //    canonical-rootfs symlinks; without the patch the symlink
-        //    targets the bake-time path that doesn't exist on the
-        //    receiver, FC errors, and the resume bails.
-        let device_path = state.device_path().to_path_buf();
-        patch_sidecar_rootfs_source(src, &device_path).await?;
-
-        tracing::info!(
-            src = %src.display(),
-            manifest = %disk_ref,
-            device = %device_path.display(),
-            "resume NBD attach: ChunkedDiskBackend ready, sidecar patched to /dev/nbdN",
-        );
-        Ok(Some(state))
-    }
-
-    /// Compute a [`CowState`] from one NBD backend + the host's
-    /// caches. Shared by [`SandboxBackend::cow_state`] and
-    /// [`SandboxBackend::cow_state_all`] so the two never drift.
-    async fn cow_state_for_entry(
-        &self,
-        id: SandboxId,
-        backend: Arc<crate::disk_daemon::ChunkedDiskBackend>,
-    ) -> Option<engram_core::types::cow_state::CowState> {
-        let disk_manifest = backend.manifest_ref().await;
-        let dirty_chunks = backend.dirty_chunks_count().await as u32;
-        let dirty_bytes = backend.dirty_bytes().await;
-        let last_flush_unix_ms = backend.last_flush_unix_ms();
-
-        // Count base chunks (manifest entries) + how many are
-        // resident on local NVMe. Fetched once; the manifest comes
-        // from BlobStorage via the chunk store and is cached in
-        // `ChunkedDiskBackend.state` so this is one cheap lookup
-        // server-side.
-        let (base_chunks, base_chunks_local) = if let Some(cache) = self.chunk_cache.as_ref() {
-            match self.chunk_store.clone() {
-                Some(store) => match store.get_manifest(disk_manifest).await {
-                    Ok(manifest) => {
-                        let mut local = 0u32;
-                        for chunk in &manifest.chunks {
-                            if cache.contains(chunk.hash).await {
-                                local += 1;
-                            }
-                        }
-                        (manifest.chunks.len() as u32, local)
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            sandbox_id = %id,
-                            manifest = %disk_manifest,
-                            error = %e,
-                            "cow_state: failed to read disk manifest for locality counts; \
-                             falling back to base_chunks=0",
-                        );
-                        (0, 0)
-                    }
-                },
-                None => (0, 0),
-            }
-        } else {
-            // No chunk cache wired (dev / mode=all without
-            // NVMe tier). Manifest size is still observable, but
-            // "local vs remote" is meaningless without a cache —
-            // report both as 0 so the renderer can show "no
-            // locality tracking" rather than a confusing "0/0".
-            (0, 0)
-        };
-
-        let last_snapshot_unix_ms = self
-            .last_snapshot_unix_ms
-            .get(&id)
-            .map(|r| *r.value())
-            .unwrap_or(0);
-
-        Some(engram_core::types::cow_state::CowState {
-            disk_manifest,
-            dirty_chunks,
-            dirty_bytes,
-            last_flush_unix_ms,
-            base_chunks,
-            base_chunks_local,
-            // Memory manifest is snapshot-bounded and lives on the
-            // PG `snapshots` row, not host-side. Coord layers it on
-            // when projecting the host's response into the
-            // session-shaped endpoint (`GET /api/sessions/:id/cow-state`).
-            memory_manifest: None,
-            last_snapshot_unix_ms,
-        })
-    }
-}
-
-/// Candidate filter for [`PooledBackend::rehydrate_local_survivors`],
-/// factored pure so the selection semantics are testable without an
-/// NBD stack: a durable chain-head record is a local rehydrate
-/// candidate iff its sandbox is live in the backend (reattach pass
-/// found the FC process's config), is not already NBD-served (the
-/// coord-list pass got there first), and the record knows its bound
-/// session (a `session_id: None` record predates binding — nothing
-/// sound to rehydrate under; the coord list remains its only path).
-#[cfg(any(target_os = "linux", test))]
-fn local_survivor_candidates(
-    records: Vec<crate::checkpoint::ChainHeadRecord>,
-    live: &std::collections::HashSet<SandboxId>,
-    served: &std::collections::HashSet<SandboxId>,
-) -> Vec<(
-    SessionId,
-    SandboxId,
-    engram_core::types::manifest::ManifestRef,
-)> {
-    records
-        .into_iter()
-        .filter_map(|r| {
-            // The pure predicate (ADR 0098 P7, `engram_host_core::reattach`):
-            // live ∧ unserved ∧ session-bound. Extracted so the host-internal
-            // simulator drives the #739 park→roll→register scenario over the
-            // same decision core.
-            let has_session = r.session_id.is_some();
-            if !engram_host_core::is_local_survivor_candidate(
-                live.contains(&r.sandbox_id),
-                served.contains(&r.sandbox_id),
-                has_session,
-            ) {
-                if live.contains(&r.sandbox_id) && !served.contains(&r.sandbox_id) && !has_session {
-                    tracing::debug!(
-                        sandbox_id = %r.sandbox_id,
-                        "local survivor rehydrate: chain-head record has no session \
-                         binding; leaving this sandbox to the coordinator list",
-                    );
-                }
-                return None;
-            }
-            let session_id = r.session_id.expect("candidate implies a bound session");
-            Some((session_id, r.sandbox_id, r.manifest_ref))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -10909,251 +6790,9 @@ mod tests {
     // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
     #![allow(clippy::disallowed_methods)]
     use super::*;
-    use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
+    use engram_host_core::ChunkIndex;
     use engram_sandbox_process::ProcessBackend;
-
-    #[tokio::test]
-    async fn root_recovered_swap_lineage_failure_remains_retryable() {
-        use engram_core::DiskRole::{Root, Swap};
-        let dir = tempfile::tempdir().unwrap();
-        let inner = Arc::new(FakeCaptureBackend {
-            payload: vec![],
-            staging_root: dir.path().join("snapshots"),
-            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
-        });
-        let pooled = PooledBackend::new(inner);
-        let id = SandboxId::new();
-        let session = SessionId::new();
-        let root_ref = engram_core::ManifestRef::new();
-        let swap_ref = engram_core::ManifestRef::new();
-        let expected = [Root, Swap].into_iter().collect();
-        let served_roles = PlMutex::new(std::collections::BTreeSet::new());
-        let sidecar = dir.path().join("swap.ref");
-        let served = || {
-            Some(engram_host_core::all_disk_roles_served(
-                &expected,
-                served_roles.lock().iter().copied(),
-            ))
-        };
-        let recover = || async {
-            served_roles.lock().insert(Root);
-            let bytes = tokio::fs::read(&sidecar)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("swap lineage: {e}").into()))?;
-            let _: engram_core::ManifestRef = serde_json::from_slice(&bytes)
-                .map_err(|e| SandboxError::Vm(format!("swap lineage: {e}").into()))?;
-            served_roles.lock().insert(Swap);
-            Ok(true)
-        };
-        assert!(pooled
-            .track_rehydrate(session, id, root_ref, recover(), served)
-            .await
-            .is_err());
-        assert_eq!(*served_roles.lock(), [Root].into_iter().collect());
-        let retry = pooled.quarantined_survivors.get(&id).unwrap().clone();
-        assert_eq!(retry.disk_manifest, Some(root_ref));
-        assert_eq!(pooled.quarantined_survivors().len(), 1);
-        tokio::fs::write(sidecar.clone(), serde_json::to_vec(&swap_ref).unwrap())
-            .await
-            .unwrap();
-        assert!(pooled
-            .track_rehydrate(
-                retry.session_id,
-                id,
-                retry.disk_manifest.unwrap(),
-                recover(),
-                served
-            )
-            .await
-            .unwrap());
-        assert_eq!(*served_roles.lock(), expected);
-        assert!(pooled.quarantined_survivors().is_empty());
-    }
-
-    /// Regression (2026-11): a survivor whose recovery is still in
-    /// flight must not be advertised as quarantined. The heartbeat
-    /// task reads `quarantined_survivors` on its own 5 s cadence while
-    /// the registration task runs the rehydrate passes one sandbox at
-    /// a time, so any pre-recovery mark is visible to the coordinator
-    /// and evicts a VM that recovers moments later.
-    #[tokio::test]
-    async fn in_flight_rehydrate_is_not_advertised_as_quarantined() {
-        use engram_core::DiskRole::{Root, Swap};
-        let dir = tempfile::tempdir().unwrap();
-        let inner = Arc::new(FakeCaptureBackend {
-            payload: vec![],
-            staging_root: dir.path().join("snapshots"),
-            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
-        });
-        let pooled = Arc::new(PooledBackend::new(inner));
-        let id = SandboxId::new();
-        let session = SessionId::new();
-        let root_ref = engram_core::ManifestRef::new();
-        let expected: std::collections::BTreeSet<_> = [Root, Swap].into_iter().collect();
-        let served_roles = Arc::new(PlMutex::new(std::collections::BTreeSet::new()));
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let tracked = {
-            let pooled = Arc::clone(&pooled);
-            let served_roles = Arc::clone(&served_roles);
-            tokio::spawn(async move {
-                let served_view = Arc::clone(&served_roles);
-                let served = move || {
-                    Some(engram_host_core::all_disk_roles_served(
-                        &expected,
-                        served_view.lock().iter().copied(),
-                    ))
-                };
-                let recover = async {
-                    started_tx.send(()).unwrap();
-                    release_rx.await.unwrap();
-                    served_roles.lock().insert(Root);
-                    served_roles.lock().insert(Swap);
-                    Ok(true)
-                };
-                pooled
-                    .track_rehydrate(session, id, root_ref, recover, served)
-                    .await
-            })
-        };
-
-        // Recovery has begun (a swap device is expected) and is parked.
-        started_rx.await.unwrap();
-        assert!(
-            pooled.quarantined_survivors().is_empty(),
-            "an in-flight recovery must not be advertised"
-        );
-
-        release_tx.send(()).unwrap();
-        assert!(tracked.await.unwrap().unwrap());
-        assert!(pooled.quarantined_survivors().is_empty());
-    }
-
-    #[test]
-    fn dirty_role_names_and_reaping() {
-        let id = SandboxId::new();
-        assert_eq!(DiskRole::Root.dirty_file_name(id), format!("{id}.cache"));
-        assert_eq!(
-            DiskRole::Swap.dirty_file_name(id),
-            format!("{id}.swap.cache")
-        );
-        for role in DiskRole::ALL {
-            assert!(should_reap_dirty_entry(
-                &role.dirty_file_name(id),
-                &HashSet::new()
-            ));
-            assert!(!should_reap_dirty_entry(
-                &role.dirty_file_name(id),
-                &HashSet::from([id])
-            ));
-        }
-        assert!(should_reap_dirty_entry(
-            &format!("{id}.swap.ref"),
-            &HashSet::new()
-        ));
-    }
-
-    #[test]
-    fn dirty_sweep_classifies_entries_by_owner() {
-        let live_id = SandboxId::new();
-        let dead_id = SandboxId::new();
-        let live = HashSet::from([live_id]);
-
-        assert!(should_reap_dirty_entry(".pending-123-4.cache", &live));
-        assert!(!should_reap_dirty_entry(&format!("{live_id}.cache"), &live));
-        assert!(should_reap_dirty_entry(&format!("{dead_id}.cache"), &live));
-        assert!(should_reap_dirty_entry(&format!("{dead_id}.ref"), &live));
-        assert!(should_reap_dirty_entry(
-            &format!("{dead_id}.ref.tmp"),
-            &live
-        ));
-        assert!(!should_reap_dirty_entry("foo.txt", &live));
-        assert!(!should_reap_dirty_entry("not-a-uuid.cache", &live));
-    }
-
-    #[test]
-    fn dirty_sweep_removes_only_unowned_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let live_id = SandboxId::new();
-        let dead_id = SandboxId::new();
-        let live = HashSet::from([live_id]);
-        let names = [
-            format!("{live_id}.cache"),
-            format!("{live_id}.ref"),
-            format!("{dead_id}.cache"),
-            format!("{dead_id}.ref"),
-            format!("{dead_id}.ref.tmp"),
-            ".pending-123-4.cache".to_owned(),
-            "foo.txt".to_owned(),
-            "not-a-uuid.cache".to_owned(),
-        ];
-        for name in &names {
-            std::fs::write(dir.path().join(name), name).unwrap();
-        }
-
-        sweep_dirty_root_at(dir.path(), &live);
-
-        let remaining: HashSet<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(
-            remaining,
-            HashSet::from([
-                format!("{live_id}.cache"),
-                format!("{live_id}.ref"),
-                "foo.txt".to_owned(),
-                "not-a-uuid.cache".to_owned(),
-            ])
-        );
-    }
-
-    /// 2026-08-02 durability-rollback RCA regression: a deadline overrun
-    /// with a MIX of already-completed and still-running flush tasks
-    /// must abort + reap the stragglers without re-polling the
-    /// completed ones. The old `Vec<JoinHandle>` shape re-awaited every
-    /// handle in the overrun arm and panicked ("JoinHandle polled after
-    /// completion"), unwinding the SIGTERM path before the abandon
-    /// sweep — the panic that destroyed 8 sessions' survivors. Paused
-    /// clock: the deadline elapses deterministically, no real sleeping.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_flush_join_overrun_with_completed_tasks_does_not_panic() {
-        let mut tasks = tokio::task::JoinSet::new();
-        // Completes immediately — the timed join reaps it, which is
-        // exactly the state that made the old overrun arm re-poll a
-        // consumed handle.
-        tasks.spawn(async {});
-        // Never completes — forces the deadline overrun.
-        tasks.spawn(async {
-            std::future::pending::<()>().await;
-        });
-
-        let overran =
-            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
-
-        assert!(overran, "the pending task must trip the deadline");
-        assert!(
-            tasks.is_empty(),
-            "every task must be reaped before the abandon sweep runs",
-        );
-    }
-
-    /// The no-overrun path: all tasks finish inside the deadline, the
-    /// join reports no overrun, and the set is fully drained.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_flush_join_within_deadline_reports_no_overrun() {
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async {});
-        tasks.spawn(async {});
-
-        let overran =
-            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
-
-        assert!(!overran);
-        assert!(tasks.is_empty());
-    }
 
     /// 2026-08-03 `chain_poisoned` alert regression: once the SIGTERM
     /// capture quiesce is raised, `capture_phase` must refuse BEFORE the
@@ -11181,7 +6820,7 @@ mod tests {
             .unwrap();
 
         pooled.quiesce_captures_for_shutdown();
-        let err = match pooled.capture_phase(id, false).await {
+        let err = match pooled.capture_phase(id, CaptureUser::EvictionCapture).await {
             Ok(_) => panic!("a quiesced capture must refuse"),
             Err(e) => e,
         };
@@ -11213,7 +6852,10 @@ mod tests {
         let id = SandboxId::new();
 
         // A capture in flight that outlives the deadline is a straggler.
-        let guard = pooled.capture_lock(id).lock_owned().await;
+        let guard = pooled
+            .capture_gate(id)
+            .serialize(id, CaptureUser::PeriodicCheckpoint)
+            .await;
         let stragglers = pooled
             .drain_captures_for_shutdown(std::time::Duration::from_millis(50))
             .await;
@@ -11365,50 +7007,6 @@ mod tests {
         );
         pooled.end_dead_probe(sb);
         assert!(pooled.try_begin_dead_probe(sb), "released slot reclaimable");
-    }
-
-    /// Session 731df805 (2026-07-17): the local survivor-rehydrate
-    /// candidate filter. Live + unserved + session-bound records are
-    /// candidates regardless of what the coordinator's list said;
-    /// dead sandboxes (record outlived the VM), already-served ones
-    /// (coord list got there first), and session-less records are not.
-    #[test]
-    fn local_survivor_candidates_filters() {
-        let mk = |session: Option<SessionId>| crate::checkpoint::ChainHeadRecord {
-            sandbox_id: SandboxId::new(),
-            manifest_ref: engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 3,
-            },
-            session_id: session,
-            updated_at: chrono::Utc::now(),
-        };
-        let live_unserved = mk(Some(SessionId::new()));
-        let live_served = mk(Some(SessionId::new()));
-        let dead = mk(Some(SessionId::new()));
-        let live_sessionless = mk(None);
-
-        let live: std::collections::HashSet<SandboxId> = [
-            live_unserved.sandbox_id,
-            live_served.sandbox_id,
-            live_sessionless.sandbox_id,
-        ]
-        .into_iter()
-        .collect();
-        let served: std::collections::HashSet<SandboxId> =
-            [live_served.sandbox_id].into_iter().collect();
-
-        let expect = vec![(
-            live_unserved.session_id.unwrap(),
-            live_unserved.sandbox_id,
-            live_unserved.manifest_ref,
-        )];
-        let got = local_survivor_candidates(
-            vec![live_unserved, live_served, dead, live_sessionless],
-            &live,
-            &served,
-        );
-        assert_eq!(got, expect);
     }
 
     /// ADR 0019 / telemetry restoration (#526): the stats-file → outcome
@@ -11593,8 +7191,8 @@ mod tests {
         struct DeadGuest(Arc<std::sync::atomic::AtomicBool>);
         #[async_trait]
         impl SandboxBackend for DeadGuest {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Err(SandboxError::Vm(
@@ -11615,7 +7213,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!("dead guest has no snapshot")
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 unreachable!("cold boot")
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11673,8 +7276,8 @@ mod tests {
         struct SlowBootMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for SlowBootMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
                 // Longer than 2 keepalive ticks (1s each): proves the
@@ -11714,6 +7317,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -11728,7 +7332,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11751,8 +7360,7 @@ mod tests {
         );
         let cs = engram_chunk_store::ChunkStore::new(blob);
         let inner: Arc<dyn SandboxBackend> = Arc::new(SlowBootMock(probe));
-        let pooled =
-            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized"));
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs);
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
 
         pooled
@@ -11798,8 +7406,8 @@ mod tests {
         struct EarlySignalKillMock;
         #[async_trait]
         impl SandboxBackend for EarlySignalKillMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -11822,7 +7430,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -11896,8 +7509,8 @@ mod tests {
         struct SilentAfterStartMock;
         #[async_trait]
         impl SandboxBackend for SilentAfterStartMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -11922,7 +7535,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12015,8 +7633,8 @@ mod tests {
         struct ChattyStuckStageMock;
         #[async_trait]
         impl SandboxBackend for ChattyStuckStageMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12054,7 +7672,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12138,8 +7761,8 @@ mod tests {
         struct NoiseThenLineMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for NoiseThenLineMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12190,6 +7813,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12204,7 +7828,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12227,9 +7856,7 @@ mod tests {
         );
         let cs = engram_chunk_store::ChunkStore::new(blob);
         let inner: Arc<dyn SandboxBackend> = Arc::new(NoiseThenLineMock(probe));
-        let pooled = Arc::new(
-            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
-        );
+        let pooled = Arc::new(PooledBackend::new(inner).with_chunk_store(cs));
         let warm = WarmConfig {
             command: vec!["true".into()],
             timeout_secs: Some(30),
@@ -12280,8 +7907,8 @@ mod tests {
         struct TwoStageMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for TwoStageMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Ok(SandboxId::new())
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12329,6 +7956,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12343,7 +7971,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.0.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -12366,9 +7999,7 @@ mod tests {
         );
         let cs = engram_chunk_store::ChunkStore::new(blob);
         let inner: Arc<dyn SandboxBackend> = Arc::new(TwoStageMock(probe.clone()));
-        let pooled = Arc::new(
-            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
-        );
+        let pooled = Arc::new(PooledBackend::new(inner).with_chunk_store(cs));
 
         let warm = WarmConfig {
             command: vec!["true".into()],
@@ -12464,9 +8095,9 @@ mod tests {
 
         #[async_trait]
         impl SandboxBackend for ColdBaseMock {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 self.create_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -12510,6 +8141,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -12524,9 +8156,14 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging.join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 self.restore_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 self.destroy_calls.fetch_add(1, Ordering::SeqCst);
@@ -12560,6 +8197,7 @@ mod tests {
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
+                base_disk_manifest: None,
                 migration_source: None,
                 source_sandbox_id: None,
                 state_blob_key: None,
@@ -12579,9 +8217,7 @@ mod tests {
             );
             let cs = engram_chunk_store::ChunkStore::new(blob);
             let inner: Arc<dyn SandboxBackend> = Arc::new(mock);
-            let p = Arc::new(
-                PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
-            );
+            let p = Arc::new(PooledBackend::new(inner).with_chunk_store(cs));
             std::mem::forget(tmp);
             p
         }
@@ -12859,7 +8495,7 @@ mod tests {
     /// Export identity gates the framed VM-state and disk-seal artifacts.
     #[tokio::test]
     async fn migration_fetch_checks_export_id_and_frames_artifacts() {
-        use engram_core::types::snapshot::MigrationItem;
+        use engram_core::types::snapshot::{DiskSealInfo, MigrationItem};
         use futures::StreamExt;
         let tmp = tempfile::tempdir().unwrap();
         let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
@@ -12869,15 +8505,16 @@ mod tests {
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
         std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
-        std::fs::write(export_dir.join("disk-seal.json"), b"{}").unwrap();
         let sandbox_id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), sandbox_id).await;
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
         let guard_src = Arc::new(tokio::sync::Mutex::new(()));
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: export_id.clone(),
             sandbox_id,
             snapshot_dir: export_dir,
-            disk_seal: Default::default(),
+            disk_seal: [(DiskRole::Root, seal_root(&volumes, sandbox_id).await)].into(),
+            precopy: Default::default(),
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -12895,31 +8532,48 @@ mod tests {
         };
         assert!(matches!(err, SandboxError::NotFound));
 
-        // Valid pull: state.bin and the disk seal descriptor, framed in order.
+        // Valid pull: state.bin, the disk seal descriptor and a sealed
+        // block, framed in order.
         let stream = pooled
             .migration_fetch(
                 &export_id,
                 vec![
                     MigrationItem::StateBin,
                     MigrationItem::DiskSealInfo(DiskRole::Root),
+                    MigrationItem::DiskBlockAt(DiskRole::Root, 0),
                 ],
             )
             .await
             .expect("valid fetch");
         let frames: Vec<_> = stream.map(|f| f.expect("frame")).collect().await;
-        let item0: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 0)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(item0, b"vmstate-bytes");
-        let item1: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 1)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(item1, b"{}");
-        assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
+        let item = |idx: u32| -> Vec<u8> {
+            frames
+                .iter()
+                .filter(|f| f.item_idx == idx)
+                .flat_map(|f| f.data.to_vec())
+                .collect()
+        };
+        assert_eq!(item(0), b"vmstate-bytes");
+        assert_eq!(
+            serde_json::from_slice::<DiskSealInfo>(&item(1)).unwrap(),
+            DiskSealInfo {
+                block_indices: vec![0]
+            }
+        );
+        assert_eq!(item(2), root_block());
+        assert!(frames.iter().any(|f| f.item_idx == 2 && f.last));
+
+        // A block the seal does not list is refused.
+        let frames: Vec<_> = pooled
+            .migration_fetch(
+                &export_id,
+                vec![MigrationItem::DiskBlockAt(DiskRole::Root, 1)],
+            )
+            .await
+            .expect("fetch opens")
+            .collect()
+            .await;
+        assert!(matches!(&frames[0], Err(SandboxError::InvalidSpec(_))));
     }
 
     /// The first descriptor permits resume; a later update carries the final
@@ -13056,20 +8710,19 @@ mod tests {
         let dest = tmp.path().join("dest");
         std::fs::create_dir_all(&export_dir).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
-        let descriptor = serde_json::json!({"sealed_chunk_indices": [0], "manifest": null, "disk_ref_bincode": null});
-        std::fs::write(
-            export_dir.join("disk-seal.json"),
-            serde_json::to_vec(&descriptor).unwrap(),
-        )
-        .unwrap();
         std::fs::write(export_dir.join("state.bin"), b"state").unwrap();
         let id = SandboxId::new();
-        let guard = pooled.capture_lock(id).lock_owned().await;
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let guard = pooled
+            .capture_gate(id)
+            .serialize(id, CaptureUser::PeriodicCheckpoint)
+            .await;
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: "hot-export".into(),
             sandbox_id: id,
             snapshot_dir: export_dir.clone(),
-            disk_seal: Default::default(),
+            disk_seal: [(DiskRole::Root, seal_root(&volumes, id).await)].into(),
+            precopy: Default::default(),
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(pooled.clock.now_mono())),
@@ -13080,35 +8733,35 @@ mod tests {
             &trace_path,
         ));
         assert!(futures::poll!(&mut loader).is_pending());
-        let descriptor_bytes = std::fs::read(export_dir.join("disk-seal.json")).unwrap();
+        let initial = || async {
+            pooled
+                .migration_fetch(
+                    "hot-export",
+                    vec![
+                        MigrationItem::DiskSealInfo(DiskRole::Root),
+                        MigrationItem::StateBin,
+                    ],
+                )
+                .await
+                .unwrap()
+                .map(|f| f.unwrap().data)
+                .collect::<Vec<_>>()
+                .await
+        };
+        let before = initial().await;
         // Even a large, already published hint cannot enlarge the initial fetch.
         let hot = vec![[255; 32]; 4096];
         publish_hot_hint(&export_dir, &hot).unwrap();
-        assert_eq!(
-            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
-            descriptor_bytes
-        );
-        assert_eq!(
-            std::fs::metadata(export_dir.join("disk-seal.json"))
-                .unwrap()
-                .len(),
-            descriptor_bytes.len() as u64
-        );
-        let frames: Vec<_> = pooled
-            .migration_fetch(
-                "hot-export",
-                vec![
-                    MigrationItem::DiskSealInfo(DiskRole::Root),
-                    MigrationItem::StateBin,
-                ],
-            )
-            .await
-            .unwrap()
-            .collect()
-            .await;
+        let frames = initial().await;
+        assert_eq!(frames, before);
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].as_ref().unwrap().data.as_ref(), descriptor_bytes);
-        assert_eq!(frames[1].as_ref().unwrap().data.as_ref(), b"state");
+        assert_eq!(
+            serde_json::from_slice::<engram_core::types::snapshot::DiskSealInfo>(&frames[0])
+                .unwrap()
+                .block_indices,
+            vec![0]
+        );
+        assert_eq!(frames[1].as_ref(), b"state");
         // Both missing and published hints must leave the lease untouched.
         let last_activity = pooled
             .migrations
@@ -13151,10 +8804,6 @@ mod tests {
                 .map(|h| *h.as_bytes())
                 .collect::<Vec<_>>(),
             vec![[2; 32], [1; 32]]
-        );
-        assert_eq!(
-            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
-            descriptor_bytes
         );
     }
 
@@ -13203,7 +8852,9 @@ mod tests {
                 export_id: live_export.clone(),
                 peer_token: "tok".into(),
                 chain_ref: engram_core::types::manifest::ManifestRef::new(),
+                disk_manifest_ref: None,
                 swap_manifest_ref: None,
+                precopy: Default::default(),
                 sidecar_json: Vec::new(),
                 idle_marked: false,
                 hot_chunks: Vec::new(),
@@ -13229,10 +8880,9 @@ mod tests {
             "the surviving presetup must still be E2"
         );
 
-        // The legitimate capture for E2 now gets PAST the presetup gate:
-        // it consumes E2 (so it no longer returns "no matching presetup")
-        // and instead fails at the next check — the checkpoint chain was
-        // never registered for this synthetic sandbox.
+        // The legitimate capture for E2 gets past the presetup gate and
+        // fails at the next check: the checkpoint chain was never
+        // registered for this synthetic sandbox.
         let Err(err) = pooled.migration_capture_postcopy(id, &live_export).await else {
             panic!("E2 capture must proceed past the presetup gate");
         };
@@ -13240,162 +8890,14 @@ mod tests {
             matches!(&err, SandboxError::InvalidSpec(m) if m.contains("checkpoint chain vanished")),
             "expected to pass the presetup gate and fail at the chain check, got: {err:?}"
         );
-        // E2 was consumed by the matching capture.
-        assert!(
-            !pooled.pending_presetups.contains_key(&id),
-            "the matching capture must consume the presetup"
-        );
-    }
-
-    /// ADR 0045 C2 disk post-copy: `DiskChunkAt` serves a sealed
-    /// chunk's raw bytes straight from the export's seal (the seal IS
-    /// the allowlist — unsealed indices and seal-less exports are
-    /// refused), and `DiskSealInfo` serves the descriptor file.
-    #[tokio::test]
-    async fn migration_fetch_serves_sealed_disk_chunks_by_index() {
-        use engram_core::types::snapshot::MigrationItem;
-        use futures::StreamExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
-        );
-        let cs = engram_chunk_store::ChunkStore::new(blob.clone());
-        let cache = engram_chunk_store::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
-        );
-        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
-            tmp.path().join("sandboxes"),
-        ));
-        let pooled = PooledBackend::new(inner)
-            .with_chunk_store(cs, tmp.path().join("materialize"))
-            .with_chunk_cache(cache.clone());
-
-        // A real seal: a tiny disk backend with one dirty chunk.
-        let chunk_size = 4096u64;
-        let store2 = Arc::new(engram_chunk_store::ChunkStore::new(blob));
-        let base_bytes = vec![0xAAu8; chunk_size as usize];
-        let h0 = store2.put_chunk(&base_bytes).await.unwrap();
-        let manifest = engram_chunk_store::Manifest {
-            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
-            kind: engram_chunk_store::manifest::ManifestKind::Disk,
-            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
-            total_bytes: 2 * chunk_size,
-            chunks: vec![engram_chunk_store::manifest::ChunkRef {
-                offset: 0,
-                hash: h0,
-            }],
-            parent: None,
-            working_set_trace: None,
-            annotations: serde_json::Value::Null,
-        };
-        let mref = engram_core::types::manifest::ManifestRef::new();
-        store2.put_manifest(mref, &manifest).await.unwrap();
-        let disk = crate::disk_daemon::ChunkedDiskBackend::new(
-            mref,
-            &manifest,
-            engram_chunk_store::ChunkCache::new(engram_chunk_store::cache::ChunkCacheConfig::new(
-                tmp.path().join("cache2"),
-            )),
-            store2,
-            u64::MAX,
-        )
-        .unwrap();
-        disk.write(0, &vec![0x42u8; chunk_size as usize])
-            .await
-            .unwrap();
-        let (seal, _m, _r) = disk.seal_for_postcopy().await.unwrap();
-        assert_eq!(seal.indices(), vec![0]);
-
-        disk.write(0, &vec![0x73u8; chunk_size as usize])
-            .await
-            .unwrap();
-        let (swap_seal, _, _) = disk.seal_for_postcopy().await.unwrap();
-        let export_dir = tmp.path().join("export");
-        std::fs::create_dir_all(&export_dir).unwrap();
-        std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
-        std::fs::write(
-            export_dir.join("disk-seal.json"),
-            b"{\"seal\":\"descriptor\"}",
-        )
-        .unwrap();
-        std::fs::write(export_dir.join("disk-seal.swap.json"), b"swap-descriptor").unwrap();
-        let sandbox_id = SandboxId::new();
-        let export_id = crate::migration::MigrationRegistry::mint_export_id();
-        let guard = Arc::new(tokio::sync::Mutex::new(()));
-        assert!(pooled.migrations.insert(crate::migration::MigrationExport {
-            export_id: export_id.clone(),
-            sandbox_id,
-            snapshot_dir: export_dir,
-            disk_seal: [
-                (DiskRole::Root, Arc::new(seal)),
-                (DiskRole::Swap, Arc::new(swap_seal))
-            ]
-            .into_iter()
-            .collect(),
-            clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
-            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
-                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
-            )),
-            capture_guard: guard.clone().try_lock_owned().unwrap(),
-        }));
-
-        // Sealed index: raw bytes from RAM.
-        let stream = pooled
-            .migration_fetch(
-                &export_id,
-                vec![
-                    MigrationItem::DiskSealInfo(DiskRole::Root),
-                    MigrationItem::DiskChunkAt(DiskRole::Root, 0),
-                    MigrationItem::DiskSealInfo(DiskRole::Swap),
-                    MigrationItem::DiskChunkAt(DiskRole::Swap, 0),
-                ],
-            )
-            .await
-            .expect("valid fetch");
-        let frames: Vec<_> = stream.map(|f| f.expect("frame")).collect().await;
-        let info: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 0)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(info, b"{\"seal\":\"descriptor\"}");
-        let chunk: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 1)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(chunk.len(), chunk_size as usize);
-        assert!(
-            chunk.iter().all(|b| *b == 0x42),
-            "the SEALED bytes, not base"
-        );
-
-        let swap_info: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 2)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(swap_info, b"swap-descriptor");
-        let swap_chunk: Vec<u8> = frames
-            .iter()
-            .filter(|f| f.item_idx == 3)
-            .flat_map(|f| f.data.to_vec())
-            .collect();
-        assert_eq!(swap_chunk, vec![0x73; chunk_size as usize]);
-
-        // Unsealed index: refused (streamed error).
-        let stream = pooled
-            .migration_fetch(
-                &export_id,
-                vec![MigrationItem::DiskChunkAt(DiskRole::Root, 1)],
-            )
-            .await
-            .expect("stream opens; the per-item error rides it");
-        let results: Vec<_> = stream.collect().await;
-        assert!(
-            results.iter().any(|r| r.is_err()),
-            "unsealed index must be refused",
+        // A failed capture puts the presetup back for the coordinator's retry.
+        assert_eq!(
+            pooled
+                .pending_presetups
+                .get(&id)
+                .map(|p| p.export_id.clone()),
+            Some(live_export),
+            "a capture that fails before the export exists restores the presetup"
         );
     }
 
@@ -13451,7 +8953,7 @@ mod tests {
         ) -> Result<Vec<u8>, SandboxError> {
             Ok(b"{}".to_vec())
         }
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -13467,7 +8969,12 @@ mod tests {
         fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
             PathBuf::new()
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -13482,544 +8989,314 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn fake_capture_and_destination_poller_deliver_final_hot_trace() {
-        use engram_chunk_store::manifest::{ChunkHash, ChunkRef, ChunkSize, ManifestKind};
-        use std::os::fd::AsRawFd;
-        let tmp = tempfile::tempdir().unwrap();
-        let file = std::fs::File::create(tmp.path().join("ram")).unwrap();
-        file.set_len(4096).unwrap();
-        drop(file);
-        let file = std::fs::File::open(tmp.path().join("ram")).unwrap();
-        // SAFETY: private file mapping owned by the guard below.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED);
-        struct Mapping(*mut libc::c_void);
-        impl Drop for Mapping {
-            fn drop(&mut self) {
-                // SAFETY: this guard owns the complete live mapping.
-                unsafe {
-                    libc::munmap(self.0, 4096);
-                }
-            }
-        }
-        let _mapping = Mapping(ptr);
-        let inner = Arc::new(ResumeSpy {
-            capture_root: Some(tmp.path().to_path_buf()),
-            resumes: Default::default(),
-        });
-        let source = Arc::new(PooledBackend::new(inner));
-        source.set_migrate_peer_server(crate::migrate_peer::PeerServer::new(0));
-        let mut trace = engram_chunk_store::working_set::WorkingSetTrace::new(
-            0,
-            0,
-            chrono::DateTime::UNIX_EPOCH,
+    /// Session volumes over a file-backed disk, with one provisioned
+    /// root volume that holds a non-zero chunk.
+    async fn volumes_with_a_root(tmp: &std::path::Path, id: SandboxId) -> Arc<SessionVolumes> {
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.join("blob")));
+        let disk: Arc<dyn engram_host_core::SessionDisk> = Arc::new(
+            engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
+                .unwrap(),
         );
-        trace.chunks = vec![ChunkHash::from_bytes([7; 32])];
-        std::fs::write(
-            tmp.path().join("trace.json"),
-            serde_json::to_vec(&trace).unwrap(),
-        )
-        .unwrap();
-        let manifest = engram_chunk_store::Manifest {
-            schema_version: 1,
-            kind: ManifestKind::Memory,
-            chunk_size: ChunkSize::bytes(4096),
-            total_bytes: 4096,
-            chunks: vec![ChunkRef {
-                offset: 0,
-                hash: trace.chunks[0],
-            }],
-            parent: None,
-            working_set_trace: None,
-            annotations: serde_json::Value::Null,
-        };
-        let id = SandboxId::new();
-        let chain_ref = engram_core::types::manifest::ManifestRef::new();
-        let pre = source
-            .prepare_migration_export(id, chain_ref, &manifest, 0, vec![])
-            .await
-            .unwrap();
-        source.checkpoint_chains.insert(
-            id,
-            crate::checkpoint::CheckpointChain {
-                manifest_ref: chain_ref,
-                manifest,
-            },
-        );
-        let capture = source
-            .migration_capture_postcopy(id, &pre.export_id)
-            .await
-            .unwrap();
-        assert_eq!(capture.total_chunks, 1);
-        // Wait for the independent publisher before the first initial fetch.
-        let seal_path = tmp.path().join("export/disk-seal.json");
-        let descriptor_bytes = std::fs::read(&seal_path).unwrap();
-        let hint_path = tmp.path().join("export/hot-hint.json");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !hint_path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        for case in [
-            "published",
-            "fetch-failed",
-            "fetch-stage-failed",
-            "unavailable",
-            "empty",
-            "delayed",
-            "malformed",
-            "write-failed",
-            "rename-failed",
-        ] {
-            let _ = std::fs::remove_file(&hint_path);
-            let _ = std::fs::remove_dir(&hint_path);
-            match case {
-                "published" | "fetch-stage-failed" => {
-                    publish_hot_hint(&tmp.path().join("export"), &vec![[7; 32]; 4096]).unwrap()
-                }
-                "fetch-failed" => std::fs::create_dir(&hint_path).unwrap(),
-                "empty" => publish_hot_hint(&tmp.path().join("export"), &[]).unwrap(),
-                "malformed" => std::fs::write(&hint_path, br#"{"hot_chunks":"invalid"}"#).unwrap(),
-                "write-failed" | "rename-failed" => {
-                    publish_hot_hint(&tmp.path().join("export"), &[[7; 32]]).unwrap()
-                }
-                _ => {}
-            }
-            assert_eq!(std::fs::read(&seal_path).unwrap(), descriptor_bytes);
-            assert_eq!(
-                std::fs::metadata(&seal_path).unwrap().len(),
-                descriptor_bytes.len() as u64
-            );
-            let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listen.local_addr().unwrap();
-            drop(listen);
-            let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-                crate::host_client::LocalHostClient::with_noop_hub(source.clone()),
-            );
-            let server = tokio::spawn(crate::grpc_server::boot(
-                addr,
-                client,
-                None,
-                crate::session_epochs::ephemeral(),
-                None,
-            ));
-            let dest = tmp.path().join(case);
-            std::fs::create_dir_all(&dest).unwrap();
-            let destination = PooledBackend::new(Arc::new(
-                engram_sandbox_process::ProcessBackend::new(tmp.path().join("dest-inner")),
-            ));
-            let path = dest.join(engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE);
-            if case == "write-failed" {
-                std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
-            }
-            if case == "rename-failed" {
-                std::fs::create_dir(&path).unwrap();
-            }
-            if case == "fetch-stage-failed" {
-                std::fs::create_dir_all(dest.join("postcopy-tmp/hot-hint.json")).unwrap();
-            }
-            let poller = destination.spawn_postcopy_fetch_poller(
-                PostCopyDestPending {
-                    hot_trace_file: engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE.into(),
-                    source_addr: format!("http://{addr}"),
-                    export_id: pre.export_id.clone(),
+        let volumes = Arc::new(SessionVolumes::new(disk, ChunkStore::new(blob)));
+        volumes
+            .provision(
+                id,
+                Source::Empty {
+                    size_bytes: 2 * MIGRATION_DISK_BLOCK_BYTES,
                 },
-                dest.clone(),
-                vec![],
-            );
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !dest.join("state.bin").exists() {
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(std::fs::read(dest.join("state.bin")).unwrap(), b"state");
-            if matches!(case, "fetch-failed" | "fetch-stage-failed" | "unavailable") {
-                let client = PooledBackend::dial_migration_source(&format!("http://{addr}"))
-                    .await
-                    .unwrap();
-                let error = PooledBackend::fetch_postcopy_artifacts(
-                    &client,
-                    &pre.export_id,
-                    &dest.join("postcopy-tmp"),
-                    &[engram_core::types::snapshot::MigrationItem::HotHint],
-                )
-                .await
-                .unwrap_err();
-                if case == "unavailable" {
-                    assert!(matches!(error, SandboxError::NotFound));
-                }
-                assert_eq!(std::fs::read(dest.join("state.bin")).unwrap(), b"state");
-            }
-            if case == "delayed" {
-                assert!(!path.exists());
-                publish_hot_hint(&tmp.path().join("export"), &[[7; 32]]).unwrap();
-                let loaded = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    engram_uffd_handler::working_set::load_migration_trace(&path),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(loaded.chunks, trace.chunks);
-            }
-            if case == "published" {
-                let loaded = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    engram_uffd_handler::working_set::load_migration_trace(&path),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(loaded.chunks.len(), 4096);
-            }
-            assert_eq!(
-                std::fs::read(dest.join("postcopy-tmp/disk-seal.json")).unwrap(),
-                descriptor_bytes
-            );
-            // A local terminal report stops the real fetch loop without a
-            // migration_drain_wait RPC, even when publication failed.
-            let sock = dest.join("control.sock");
-            let control = engram_uffd_handler::peer::ControlTx::bind(&sock).unwrap();
-            control.report(engram_migrate_proto::HandlerControl::DrainDone {
-                pulled: 1,
-                alt_sourced: 0,
-                zero_chunks: 0,
-                ms: 1,
-                faults: 0,
-                fault_us: 0,
-                fault_max_us: 0,
-                fault_around_chunks_installed: 0,
-            });
-            let abort = poller.abort_handle();
-            let mut observer = monitor_hint_poller(AbortTaskOnDrop(poller), Some(sock));
-            tokio::time::timeout(std::time::Duration::from_secs(5), &mut observer.0)
-                .await
-                .unwrap()
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !abort.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            server.abort();
-        }
-    }
-
-    /// Build a `ChunkedDiskBackend` over a 4-chunk sparse base with one
-    /// dirty chunk written, plus its store. Mirrors the disk_daemon
-    /// `build_backend` test helper.
-    async fn unwind_test_disk_backend() -> (
-        std::sync::Arc<crate::disk_daemon::ChunkedDiskBackend>,
-        std::sync::Arc<engram_chunk_store::ChunkStore>,
-        tempfile::TempDir,
-    ) {
-        use engram_chunk_store::manifest::{ChunkSize, ManifestKind, ManifestRef};
-        use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
-        let dir = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-            engram_storage_local::LocalBlobStorage::new(dir.path().to_path_buf()),
-        );
-        let store = Arc::new(ChunkStore::new(blob));
-        let chunk_size = 4096u64;
-        let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(dir.path().join("cache"));
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg);
-        let manifest = Manifest {
-            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
-            kind: ManifestKind::Disk,
-            chunk_size: ChunkSize::bytes(chunk_size),
-            total_bytes: chunk_size * 4,
-            chunks: Vec::new(),
-            parent: None,
-            working_set_trace: None,
-            annotations: serde_json::Value::Null,
-        };
-        let manifest_ref = ManifestRef::new();
-        store.put_manifest(manifest_ref, &manifest).await.unwrap();
-        let backend = Arc::new(
-            crate::disk_daemon::ChunkedDiskBackend::new(
-                manifest_ref,
-                &manifest,
-                cache,
-                store.clone(),
-                u64::MAX,
+                None,
             )
-            .unwrap(),
-        );
-        // One acked write → one dirty chunk.
-        backend
-            .write(0, &vec![0x42; chunk_size as usize])
             .await
             .unwrap();
-        (backend, store, dir)
+        let live = volumes.live(id, DiskRole::Root).await.unwrap();
+        live.write_chunk(ChunkIndex(0), root_block()).await.unwrap();
+        volumes
     }
 
-    #[tokio::test]
-    async fn presetup_reports_each_device_base_lineage() {
-        let (root, store, _root_dir) = unwind_test_disk_backend().await;
-        let (swap, _, _swap_dir) = unwind_test_disk_backend().await;
-        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
-            capture_root: None,
-            resumes: Default::default(),
-        }));
-        let root_ref = root.manifest_ref().await;
-        let swap_ref = swap.manifest_ref().await;
-        let manifest = store.get_manifest(root_ref).await.unwrap();
-        for swap_present in [false, true] {
-            let id = SandboxId::new();
-            let mut disks = vec![(DiskRole::Root, root.clone())];
-            if swap_present {
-                disks.push((DiskRole::Swap, swap.clone()));
-            }
-            let presetup = pooled
-                .prepare_migration_export(id, root_ref, &manifest, 9000, disks)
-                .await
-                .unwrap();
-            assert_eq!(presetup.disk_manifest_ref, Some(root_ref));
-            assert_eq!(presetup.swap_manifest_ref, swap_present.then_some(swap_ref));
-            assert_eq!(
-                pooled.pending_presetups.get(&id).unwrap().swap_manifest_ref,
-                presetup.swap_manifest_ref
-            );
-        }
+    /// The bytes `volumes_with_a_root` writes into block 0.
+    fn root_block() -> Vec<u8> {
+        vec![0x42; MIGRATION_DISK_BLOCK_BYTES as usize]
     }
 
-    #[tokio::test]
-    async fn migration_abort_requeues_both_device_seals() {
-        let (root, root_store, _root_dir) = unwind_test_disk_backend().await;
-        let (swap, swap_store, _swap_dir) = unwind_test_disk_backend().await;
-        swap.write(0, &[0x73; 4096]).await.unwrap();
-        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
-            capture_root: None,
-            resumes: resumes.clone(),
-        }));
-        let id = SandboxId::new();
-        let dir = tempfile::tempdir().unwrap();
-        let export_id = open_export(&pooled, id, dir.path().join("export")).await;
-        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
-        let disks = vec![
-            (DiskRole::Root, root.clone()),
-            (DiskRole::Swap, swap.clone()),
-        ];
-        for (role, backend) in &disks {
-            backend.set_migration_fence(true);
-            let (seal, _, _) = backend.seal_for_postcopy().await.unwrap();
-            export.disk_seal.insert(*role, Arc::new(seal));
-            // Remove the local dirty copy so recovery must use the role's seal.
-            backend.set_migration_fence(false);
-            assert_eq!(backend.flush().await.unwrap().chunks_flushed, 1);
-            backend.set_migration_fence(true);
-        }
-        pooled.abort_migration_export(export, disks).await.unwrap();
-        assert_eq!(*resumes.lock(), vec![id]);
-        for (backend, store, byte) in [(root, root_store, 0x42), (swap, swap_store, 0x73)] {
-            let flushed = backend.flush().await.unwrap();
-            assert_eq!(
-                flushed.chunks_flushed, 1,
-                "abort must requeue and unfence each device"
-            );
-            let manifest = store.get_manifest(flushed.manifest_ref).await.unwrap();
-            assert_eq!(manifest.chunks.len(), 1);
-            let data = store.get_chunk(manifest.chunks[0].hash).await.unwrap();
-            assert_eq!(data.as_ref(), &[byte; 4096]);
-        }
+    /// A seal of the root volume's pending snapshot, listing block 0.
+    async fn seal_root(volumes: &SessionVolumes, id: SandboxId) -> Arc<DiskSeal> {
+        let pending = volumes.take(id, DiskRole::Root).await.unwrap();
+        let sealed = volumes
+            .changed_blocks(&pending, MIGRATION_DISK_BLOCK_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(sealed, vec![0]);
+        Arc::new(DiskSeal {
+            pending,
+            sealed: sealed.into_iter().collect(),
+        })
     }
 
-    /// THE regression: an armed-but-not-defused guard (an error or a
-    /// cancelled capture) must resume the guest, clear the fence, and
-    /// re-queue the drained chunk so it lands in the next published
-    /// manifest. Without the fix the guest stays paused forever, the
-    /// fence no-ops every future flush, and the drained chunk is gone.
-    #[tokio::test]
-    async fn capture_unwind_on_drop_resumes_unfences_and_requeues() {
-        let (backend, store, _dir) = unwind_test_disk_backend().await;
-        let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
-            capture_root: None,
-            resumes: resumes.clone(),
-        });
-        let id = SandboxId::new();
-
-        // Simulate a migration capture up to the "point of no return":
-        // fence raised, dirty buffer drained out into `pending`.
-        backend.set_migration_fence(true);
-        let pending = backend.flush_local().await.unwrap();
-        // A fenced flush no-ops (the bug's consequence #2 surface).
-        assert_eq!(
-            backend.flush().await.unwrap().chunks_flushed,
-            0,
-            "fence raised: flush must no-op",
-        );
-
-        // Arm the guard with the drained state — then DROP it without
-        // defusing, exactly as an `Err`/cancel between pause and the
-        // export insert would.
-        {
-            let mut guard = CaptureUnwind::new(inner.clone(), id);
-            guard.arm();
-            guard.disk_backend.insert(DiskRole::Root, backend.clone());
-            guard.fenced = true;
-            guard.disk_pending.insert(DiskRole::Root, pending);
-            // guard dropped here (never defused)
-        }
-        // Drop spawns the async recovery; let it run.
+    async fn settle(resumes: &parking_lot::Mutex<Vec<SandboxId>>) {
         for _ in 0..50 {
             tokio::task::yield_now().await;
             if !resumes.lock().is_empty() {
                 break;
             }
         }
-
-        assert_eq!(
-            resumes.lock().clone(),
-            vec![id],
-            "unwind must resume the guest exactly once",
-        );
-        // Fence cleared + chunk re-queued ⟹ the next flush publishes it.
-        let after = backend.flush().await.unwrap();
-        assert_eq!(
-            after.chunks_flushed, 1,
-            "unwind must clear the fence AND re-queue the drained chunk",
-        );
-        // And that chunk is durable in the store (present in the next
-        // published manifest's chunk set).
-        let manifest = store.get_manifest(after.manifest_ref).await.unwrap();
-        assert!(
-            !manifest.chunks.is_empty(),
-            "the re-queued write must appear in the next published manifest",
-        );
     }
 
-    /// The success path: a defused guard is an inert no-op — no resume,
-    /// the fence stays as the owning export left it, and the pending it
-    /// no longer holds is owned elsewhere (here: dropped by the test,
-    /// standing in for the export taking ownership).
+    /// A guard dropped armed (an error or a cancelled capture after the
+    /// pause) discards the checkpoint it holds and resumes the guest;
+    /// the live volume and the last published checkpoint stay.
     #[tokio::test]
-    async fn capture_unwind_defused_is_a_noop() {
-        let (backend, _store, _dir) = unwind_test_disk_backend().await;
-        let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
+    async fn capture_unwind_on_drop_discards_the_pending_checkpoint_and_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
             capture_root: None,
             resumes: resumes.clone(),
-        });
-        let id = SandboxId::new();
-
-        backend.set_migration_fence(true);
-        let pending = backend.flush_local().await.unwrap();
-
+        }))
+        .with_session_volumes(volumes.clone());
         {
-            let mut guard = CaptureUnwind::new(inner.clone(), id);
+            let mut guard = CaptureUnwind::new(&pooled, id);
             guard.arm();
-            guard.disk_backend.insert(DiskRole::Root, backend.clone());
-            guard.fenced = true;
-            guard.disk_pending.insert(DiskRole::Root, pending);
-            // Success path: the export takes ownership of the drained
-            // pending, then the guard is defused.
-            let _owned_by_export = std::mem::take(&mut guard.disk_pending);
+            guard
+                .pending
+                .push(volumes.take(id, DiskRole::Root).await.unwrap());
+        }
+        settle(&resumes).await;
+        assert_eq!(*resumes.lock(), vec![id], "unwind resumes the guest once");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let gone = volumes.pending(id, DiskRole::Root).await.unwrap_err();
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(volumes.roles(id).await.unwrap(), vec![DiskRole::Root]);
+        let live = volumes.live(id, DiskRole::Root).await.unwrap();
+        assert_eq!(live.read_chunk(ChunkIndex(0)).await.unwrap(), root_block());
+    }
+
+    /// A defused guard is inert: no resume, and the checkpoint it handed
+    /// over is still on disk for its new owner.
+    #[tokio::test]
+    async fn capture_unwind_defused_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let owned_elsewhere;
+        {
+            let mut guard = CaptureUnwind::new(&pooled, id);
+            guard.arm();
+            guard
+                .pending
+                .push(volumes.take(id, DiskRole::Root).await.unwrap());
+            owned_elsewhere = guard.pending.pop();
             guard.defuse();
         }
-        // Give any erroneously-spawned recovery task a chance to run.
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            resumes.lock().is_empty(),
-            "a defused guard must NOT resume the guest",
+        assert!(resumes.lock().is_empty(), "a defused guard must not resume");
+        assert!(owned_elsewhere.is_some());
+        volumes.pending(id, DiskRole::Root).await.unwrap();
+    }
+
+    /// A destroy retires the pending presetup of a move that never
+    /// reached its capture, precopy snapshot included.
+    #[tokio::test]
+    async fn destroy_retires_a_pending_presetup_and_its_precopy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let precopy = pooled.take_precopy(&volumes, id).await.unwrap();
+        let seal = std::sync::Arc::downgrade(&precopy[&DiskRole::Root]);
+        pooled.pending_presetups.insert(
+            id,
+            PendingPresetup {
+                export_id: "E1".into(),
+                peer_token: "tok".into(),
+                chain_ref: engram_core::types::manifest::ManifestRef::new(),
+                disk_manifest_ref: None,
+                swap_manifest_ref: None,
+                precopy,
+                sidecar_json: Vec::new(),
+                idle_marked: false,
+                hot_chunks: Vec::new(),
+            },
         );
-        // Fence untouched by the guard (the export owns it now).
-        assert_eq!(
-            backend.flush().await.unwrap().chunks_flushed,
-            0,
-            "defused guard must leave the fence raised (export owns it)",
+
+        pooled.destroy(id).await.unwrap();
+        assert!(!pooled.pending_presetups.contains_key(&id));
+        assert!(
+            seal.upgrade().is_none(),
+            "nothing holds the precopy snapshot after destroy"
         );
     }
 
+    /// A destroy consumes an open export first, so its seal does not hold
+    /// a snapshot open when the session disks are released.
     #[tokio::test]
-    async fn materialize_chunked_rootfs_round_trips_and_dedupes() {
-        // ADR 0007 acceptance: a chunked manifest is sufficient to
-        // reproduce the disk bit-for-bit, AND concurrent resolves
-        // share the materialized file rather than each producing
-        // their own.
-        use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
+    async fn destroy_consumes_an_open_export_and_its_seal() {
         let tmp = tempfile::tempdir().unwrap();
-        // Local-filesystem BlobStorage = production code path for
-        // dev. Same trait the host-agent uses against GCS in prod.
-        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
-        );
-        let cs = ChunkStore::new(blob);
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        let sealed = seal_root(&volumes, id).await;
+        let seal = Arc::downgrade(&sealed);
+        export.disk_seal.insert(DiskRole::Root, sealed);
+        assert!(pooled.migrations.insert(export));
 
-        // A fake "ext4" — small but enough to span more than one
-        // 16 MiB chunk so the chunking path is exercised end-to-end.
-        let src = tmp.path().join("rootfs.ext4");
-        let mut bytes = vec![0u8; 24 * 1024 * 1024];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
+        pooled.destroy(id).await.unwrap();
+        assert!(pooled.migrations.export_id_of(id).is_none());
+        assert!(
+            seal.upgrade().is_none(),
+            "nothing holds the seal after destroy"
+        );
+        assert!(!dir.exists(), "the export dir goes with the destroy");
+        assert!(volumes.roles(id).await.unwrap().is_empty());
+    }
+
+    /// Aborting an export discards its seal, removes the export dir and
+    /// resumes the guest in place.
+    #[tokio::test]
+    async fn migration_abort_discards_the_seal_and_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        export
+            .disk_seal
+            .insert(DiskRole::Root, seal_root(&volumes, id).await);
+        pooled.abort_migration_export(export).await.unwrap();
+        settle(&resumes).await;
+        assert_eq!(*resumes.lock(), vec![id]);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
         }
-        tokio::fs::write(&src, &bytes).await.unwrap();
-        let manifest = cs.chunk_file(&src, ManifestKind::Disk, None).await.unwrap();
-        let mref = ManifestRef::new();
-        cs.put_manifest(mref, &manifest).await.unwrap();
+        assert!(!dir.exists(), "the export dir goes with the abort");
+        let gone = volumes.pending(id, DiskRole::Root).await.unwrap_err();
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(volumes.roles(id).await.unwrap(), vec![DiskRole::Root]);
+    }
 
-        let bundle = ImageBundle {
-            schema_version: 1,
-            disk_manifest: mref,
-            bootstrap_disk_available: false,
-        };
-        let materialize_dir = tmp.path().join("materialized");
-        let lock = Mutex::new(());
+    /// An abort that requires an unserved state resumes the guest only
+    /// while no destination has fetched `state.bin`; after a fetch it
+    /// leaves the export open and the guest paused.
+    #[tokio::test]
+    async fn migration_abort_unserved_refuses_after_the_state_is_fetched() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
 
-        let path1 = materialize_chunked_rootfs(
-            &cs,
-            None,
-            &materialize_dir,
-            "img:1",
-            bundle.disk_manifest,
-            &lock,
-        )
-        .await
-        .unwrap();
-        let restored = tokio::fs::read(&path1).await.unwrap();
-        assert_eq!(restored, bytes, "byte-for-byte mismatch");
+        let served = SandboxId::new();
+        let dir = tmp.path().join("served");
+        let export_id = open_export(&pooled, served, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        assert!(!pooled
+            .migration_abort_unserved(served, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(pooled.migrations.export_id_of(served), Some(export_id));
+        assert!(dir.exists());
 
-        // Second call short-circuits via the size check — same path,
-        // no rewrite.
-        let mtime_before = std::fs::metadata(&path1).unwrap().modified().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let path2 = materialize_chunked_rootfs(
-            &cs,
-            None,
-            &materialize_dir,
-            "img:1",
-            bundle.disk_manifest,
-            &lock,
-        )
-        .await
-        .unwrap();
-        assert_eq!(path1, path2);
-        let mtime_after = std::fs::metadata(&path2).unwrap().modified().unwrap();
-        assert_eq!(
-            mtime_before, mtime_after,
-            "second call must not rewrite the file",
-        );
+        let unserved = SandboxId::new();
+        let dir = tmp.path().join("unserved");
+        let export_id = open_export(&pooled, unserved, dir.clone()).await;
+        assert!(matches!(
+            pooled.migration_abort_unserved(unserved, "other").await,
+            Err(SandboxError::NotFound)
+        ));
+        assert!(pooled
+            .migration_abort_unserved(unserved, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(*resumes.lock(), vec![unserved]);
+        assert!(pooled.migrations.export_id_of(unserved).is_none());
+        assert!(!dir.exists());
+    }
+
+    /// A fetch of `state.bin` after the TTL sweep chose to abort makes the
+    /// abort refuse: the source stays paused and its export stays open.
+    #[tokio::test]
+    async fn export_ttl_abort_refuses_a_state_fetched_after_the_verdict() {
+        use crate::migration::{ttl_verdict, TtlVerdict};
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
+
+        let raced = SandboxId::new();
+        let dir = tmp.path().join("raced");
+        let export_id = open_export(&pooled, raced, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(raced));
+        assert_eq!(verdict, TtlVerdict::AbortInPlace);
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        pooled
+            .run_export_ttl_verdict(raced, &export_id, verdict)
+            .await
+            .unwrap();
+        assert!(resumes.lock().is_empty(), "a served source never resumes");
+        assert_eq!(pooled.migrations.export_id_of(raced), Some(export_id));
+
+        let idle = SandboxId::new();
+        let export_id = open_export(&pooled, idle, tmp.path().join("idle")).await;
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(idle));
+        pooled
+            .run_export_ttl_verdict(idle, &export_id, verdict)
+            .await
+            .unwrap();
+        assert_eq!(*resumes.lock(), vec![idle]);
+        assert!(pooled.migrations.export_id_of(idle).is_none());
     }
 
     /// ADR 0007 / Phase 5: snapshot wrap chunks an FC-style
@@ -14065,7 +9342,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14120,6 +9397,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14134,7 +9412,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14156,8 +9439,7 @@ mod tests {
             payload: bytes.clone(),
             staging_root: tmp.path().join("fc-snaps"),
         });
-        let materialize_dir = tmp.path().join("materialized");
-        let pooled = PooledBackend::new(inner).with_chunk_store(cs.clone(), materialize_dir);
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs.clone());
 
         // 4. Take the snapshot. PooledBackend's wrap chunks
         //    memory.bin and patches manifest.json.
@@ -14215,7 +9497,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14262,6 +9544,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14276,7 +9559,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -14298,7 +9586,7 @@ mod tests {
             payload,
             staging_root: tmp.path().join("fc-snaps"),
         });
-        let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("mat"));
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs);
 
         let source_sandbox = SandboxId::new();
         let metadata = pooled.snapshot(source_sandbox).await.unwrap();
@@ -14357,7 +9645,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for AssertingInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14404,6 +9692,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -14418,7 +9707,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                meta: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 // Capture what was on disk at the moment inner.restore ran.
                 let dest = self.dir_for(meta.id);
                 let state = tokio::fs::read(dest.join("state.bin"))
@@ -14429,7 +9723,7 @@ mod tests {
                     .expect("manifest.json must be materialised before inner.restore");
                 *self.saw_state.lock() = Some(state);
                 *self.saw_sidecar.lock() = Some(sidecar);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14453,7 +9747,7 @@ mod tests {
             saw_sidecar: parking_lot::Mutex::new(None),
         });
         let inner_dyn: Arc<dyn SandboxBackend> = inner.clone();
-        let pooled = PooledBackend::new(inner_dyn).with_chunk_store(cs, tmp.path().join("mat"));
+        let pooled = PooledBackend::new(inner_dyn).with_chunk_store(cs);
 
         // Snapshot — uploads state + sidecar to BlobStorage.
         let metadata = pooled.snapshot(SandboxId::new()).await.unwrap();
@@ -14477,247 +9771,16 @@ mod tests {
 
         // Restore — wrap must re-download state.bin + sidecar
         // before delegating to inner.
-        pooled.restore(metadata).await.unwrap();
+        pooled
+            .restore(SandboxId::new(), metadata, None)
+            .await
+            .unwrap();
 
         let seen_state = inner.saw_state.lock().clone().expect("inner.restore ran");
         assert_eq!(&seen_state[..], b"upload-me-state");
         let seen_sidecar = inner.saw_sidecar.lock().clone().expect("inner.restore ran");
         let parsed: serde_json::Value = serde_json::from_slice(&seen_sidecar).unwrap();
         assert_eq!(parsed["format"], "fc");
-    }
-
-    /// D4 (2026-07-17 corruption path, session 03e6535e): a chunked
-    /// snapshot whose `disk_manifest` is None takes no NBD attach and no
-    /// sidecar patch, so FC would reopen the capture-time LITERAL
-    /// `/dev/nbdN` still named in the sidecar — a dead or FOREIGN device on
-    /// the receiving host. On a host that runs the NBD data plane, the
-    /// resume must REFUSE rather than boot onto it. (Runs on macOS: the
-    /// guard sits at the platform-neutral `!took_nbd_path` join.)
-    #[tokio::test]
-    async fn resume_refuses_a_stale_literal_nbd_rootfs_when_no_attach_happened() {
-        use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore};
-        use engram_storage_local::LocalBlobStorage;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Inner whose snapshot writes a sidecar naming a literal /dev/nbd7
-        // rootfs with disk_manifest=None (the corruption shape), and whose
-        // `restore` must never be reached.
-        struct LiteralNbdSidecarInner {
-            staging_root: PathBuf,
-            restored: Arc<AtomicBool>,
-        }
-        impl LiteralNbdSidecarInner {
-            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
-                self.staging_root.join(id.to_string())
-            }
-        }
-        #[async_trait]
-        impl SandboxBackend for LiteralNbdSidecarInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn exec_stream(
-                &self,
-                _: SandboxId,
-                _: ExecRequest,
-            ) -> Result<ExecStream, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-                let snapshot_id = engram_core::SnapshotId::new();
-                let dest = self.dir_for(snapshot_id);
-                tokio::fs::create_dir_all(&dest).await.unwrap();
-                tokio::fs::write(dest.join("memory.bin"), b"mem")
-                    .await
-                    .unwrap();
-                tokio::fs::write(dest.join("state.bin"), b"state")
-                    .await
-                    .unwrap();
-                // The load-bearing bit: a sidecar that names a literal NBD
-                // device as the rootfs source.
-                let sidecar = serde_json::json!({
-                    "sandbox_id": uuid::Uuid::new_v4(),
-                    "created_at": chrono::Utc::now(),
-                    "spec": {
-                        "image": "t", "rootfs_source": "/dev/nbd7", "image_uri": null,
-                        "harness_pack_uri": null, "cpu": {"vcpus": 1},
-                        "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
-                        "ttl": null, "env": {}, "workdir": null,
-                        "harness_substrate": null, "network": {}
-                    },
-                    "format": "fc"
-                });
-                tokio::fs::write(
-                    dest.join("manifest.json"),
-                    serde_json::to_vec_pretty(&sidecar).unwrap(),
-                )
-                .await
-                .unwrap();
-                Ok(SnapshotMetadata {
-                    id: snapshot_id,
-                    size_bytes: 3,
-                    created_at: chrono::Utc::now(),
-                    image_version: "t".into(),
-                    swap_manifest: None,
-                    disk_manifest: None,
-                    memory_manifest: None,
-                    base_memory_manifest: None,
-                    migration_source: None,
-                    source_sandbox_id: None,
-                    state_blob_key: None,
-                    sidecar_blob_key: None,
-                    rootfs_blob_key: None,
-                    working_set_blob_key: None,
-                    aux_bundles: vec![],
-                    paused_at: None,
-                    peer_hints: Vec::new(),
-                })
-            }
-            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
-                self.dir_for(id)
-            }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-                self.restored.store(true, Ordering::SeqCst);
-                Err(SandboxError::InvalidSpec(
-                    "inner.restore must not be reached".into(),
-                ))
-            }
-            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
-                Ok(())
-            }
-            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-                Ok(Vec::new())
-            }
-            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
-                Ok(())
-            }
-        }
-
-        let blob: Arc<dyn engram_core::traits::BlobStorage> =
-            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
-        let cs = ChunkStore::new(blob);
-        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("cache")));
-        // A fake `/dev/nbd7` path — the allocator only validates the string,
-        // never opens the device (the guard fires before any slot claim).
-        let pool =
-            crate::disk_daemon::NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd7")])
-                .unwrap();
-        let restored = Arc::new(AtomicBool::new(false));
-        let inner: Arc<dyn SandboxBackend> = Arc::new(LiteralNbdSidecarInner {
-            staging_root: tmp.path().join("fc-snaps"),
-            restored: restored.clone(),
-        });
-        // The full NBD-data-plane triple → `host_runs_nbd_data_plane()` true.
-        let pooled = PooledBackend::new(inner)
-            .with_chunk_store(cs, tmp.path().join("mat"))
-            .with_chunk_cache(cache)
-            .with_nbd_pool(pool);
-
-        let md = pooled.snapshot(SandboxId::new()).await.unwrap();
-        assert!(md.disk_manifest.is_none(), "fixture precondition");
-
-        let err = pooled.restore(md).await.expect_err("restore must refuse");
-        assert!(
-            matches!(err, SandboxError::Snapshot(_)),
-            "expected a Snapshot refusal, got {err:?}",
-        );
-        assert!(
-            format!("{err}").contains("/dev/nbd7"),
-            "the refusal names the stale literal device: {err}",
-        );
-        assert!(
-            !restored.load(Ordering::SeqCst),
-            "inner.restore must never run for a refused resume",
-        );
-    }
-
-    /// D5 (2026-07-17 corruption path, session 03e6535e): a sandbox with an
-    /// NBD-backed rootfs but NO `nbd_sandboxes` entry is a post-pod-roll
-    /// survivor whose disk server is gone. Snapshotting it would silently
-    /// skip the disk drain and record `disk_manifest=None` — dropping the
-    /// session's acked disk writes. The capture must REFUSE. Linux-only:
-    /// the guard + `nbd_sandboxes` are `cfg(target_os = "linux")`.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn capture_refuses_an_untracked_nbd_rootfs_survivor() {
-        use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore};
-        use engram_storage_local::LocalBlobStorage;
-
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Inner reporting an NBD-backed rootfs device (the survivor's live
-        // spec). `snapshot` is never reached — the guard fires first.
-        struct NbdRootfsInner;
-        #[async_trait]
-        impl SandboxBackend for NbdRootfsInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn exec_stream(
-                &self,
-                _: SandboxId,
-                _: ExecRequest,
-            ) -> Result<ExecStream, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            fn supports_diff_checkpoints(&self) -> bool {
-                true
-            }
-            fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
-                Some(PathBuf::from("/dev/nbd7"))
-            }
-            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-                panic!("inner.snapshot must not be reached — the guard fires first")
-            }
-            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
-                std::env::temp_dir().join(id.to_string())
-            }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-                Err(SandboxError::InvalidSpec("unused".into()))
-            }
-            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
-                Ok(())
-            }
-            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-                Ok(Vec::new())
-            }
-            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
-                Ok(())
-            }
-        }
-
-        let blob: Arc<dyn engram_core::traits::BlobStorage> =
-            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
-        let cs = ChunkStore::new(blob);
-        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("cache")));
-        let pool =
-            crate::disk_daemon::NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd7")])
-                .unwrap();
-        let pooled = PooledBackend::new(Arc::new(NbdRootfsInner))
-            .with_chunk_store(cs, tmp.path().join("mat"))
-            .with_chunk_cache(cache)
-            .with_nbd_pool(pool)
-            .with_checkpoint_dir(tmp.path().join("ckpt"));
-
-        let sandbox_id = SandboxId::new();
-        pooled.session_bindings.insert(sandbox_id, SessionId::new());
-        // Deliberately do NOT insert into `nbd_sandboxes` — the survivor
-        // whose disk server died with the rolled pod.
-
-        let err = pooled
-            .snapshot(sandbox_id)
-            .await
-            .expect_err("capture must refuse an untracked NBD-rootfs sandbox");
-        assert!(
-            matches!(err, SandboxError::Snapshot(_)),
-            "expected a Snapshot refusal, got {err:?}",
-        );
-        assert!(
-            format!("{err}").contains("nbd_sandboxes"),
-            "the refusal explains the missing NBD tracking: {err}",
-        );
     }
 
     /// Snapshot wrap is a no-op when no chunk store is wired —
@@ -14731,12 +9794,13 @@ mod tests {
         let inner: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(dir));
         let pooled = PooledBackend::new(inner);
 
-        let _id = pooled.create(live_spec("warm-test")).await.unwrap();
+        let id = SandboxId::new();
+        pooled.create(id, live_spec("warm-test")).await.unwrap();
         // ProcessBackend's snapshot writes the directory structure
         // without a memory.bin (no guest RAM concept). The wrap
         // skips chunking silently and metadata.memory_manifest
         // stays None.
-        let metadata = pooled.snapshot(_id).await.expect("ProcessBackend snapshot");
+        let metadata = pooled.snapshot(id).await.expect("ProcessBackend snapshot");
         assert!(
             metadata.memory_manifest.is_none(),
             "no chunk_store wired must leave memory_manifest unset",
@@ -14788,7 +9852,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for CapturingInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14804,9 +9868,14 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.staging_root.join(id.to_string())
             }
-            async fn restore(&self, m: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                m: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(m);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14863,8 +9932,7 @@ mod tests {
             "precondition: memory.bin must be absent before restore"
         );
 
-        let pooled = PooledBackend::new(inner.clone())
-            .with_chunk_store(cs.clone(), tmp.path().join("materialized"));
+        let pooled = PooledBackend::new(inner.clone()).with_chunk_store(cs.clone());
 
         // Restore — should materialise memory.bin then delegate.
         let metadata = SnapshotMetadata {
@@ -14876,6 +9944,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -14886,7 +9955,10 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        pooled.restore(metadata.clone()).await.unwrap();
+        pooled
+            .restore(SandboxId::new(), metadata.clone(), None)
+            .await
+            .unwrap();
 
         // Inner backend saw the metadata; memory.bin is now
         // present and byte-equal to the original.
@@ -14966,7 +10038,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for StagedInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -14982,10 +10054,15 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 self.snap_dir.clone()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 // Inner restore is irrelevant for this test — we
                 // only assert the materialize branch was a no-op.
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
                 Ok(())
@@ -14997,8 +10074,7 @@ mod tests {
         let inner: Arc<dyn SandboxBackend> = Arc::new(StagedInner {
             snap_dir: snap_dir.clone(),
         });
-        let pooled =
-            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized"));
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs);
         let metadata = SnapshotMetadata {
             id: engram_core::SnapshotId::new(),
             size_bytes: 0,
@@ -15008,6 +10084,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -15018,106 +10095,17 @@ mod tests {
             paused_at: None,
             peer_hints: Vec::new(),
         };
-        let _ = pooled.restore(metadata).await;
+        let _ = pooled.restore(SandboxId::new(), metadata, None).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
         assert_eq!(after, original, "memory.bin must not be overwritten");
     }
 
-    /// Cache wiring: when a `ChunkCache` is provided,
-    /// `materialize_chunked_rootfs` routes chunk reads through it.
-    /// We verify by materializing twice — once to populate, once
-    /// against a "broken" store (drop the chunks underneath). The
-    /// second materialize succeeds iff reads served from the cache.
+    /// `create` with an `image_uri` provisions a root volume from the
+    /// image bundle's disk manifest: the inner backend receives the
+    /// volume path (not the OCI-pulled `rootfs.ext4`), the volume holds
+    /// the image bytes, and the spec carries a new lineage ref.
     #[tokio::test]
-    async fn materialize_chunked_rootfs_uses_chunk_cache_when_present() {
-        use engram_chunk_store::{
-            cache::ChunkCacheConfig, ChunkCache, ChunkStore, ManifestKind, ManifestRef,
-        };
-
-        // A near-full dev/CI disk trips the cache's default free-space
-        // floor and evicts the chunks the first `materialize_chunked_rootfs`
-        // warms below before the second (store-deleted) call can read them
-        // back. Nextest runs each test in its own process, so this env
-        // override is safe (see two_host_drain_wave.rs / migration_source.rs).
-        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
-
-        let tmp = tempfile::tempdir().unwrap();
-        let blob_root = tmp.path().join("blob");
-        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-            engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
-        );
-        let cs = ChunkStore::new(blob);
-        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("chunk-cache")));
-
-        // Plant a small source + manifest.
-        let src = tmp.path().join("source.ext4");
-        let bytes: Vec<u8> = (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
-        tokio::fs::write(&src, &bytes).await.unwrap();
-        let manifest = cs.chunk_file(&src, ManifestKind::Disk, None).await.unwrap();
-        let mref = ManifestRef::new();
-        cs.put_manifest(mref, &manifest).await.unwrap();
-
-        let bundle = ImageBundle {
-            schema_version: 1,
-            disk_manifest: mref,
-            bootstrap_disk_available: false,
-        };
-        let materialize_dir = tmp.path().join("materialized");
-        let lock = Mutex::new(());
-
-        // First materialize warms the cache.
-        let path1 = materialize_chunked_rootfs(
-            &cs,
-            Some(&cache),
-            &materialize_dir,
-            "img:cached",
-            bundle.disk_manifest,
-            &lock,
-        )
-        .await
-        .unwrap();
-        let restored = tokio::fs::read(&path1).await.unwrap();
-        assert_eq!(restored, bytes, "first materialize must reproduce bytes");
-
-        // Delete the materialized file and the underlying blob store —
-        // the cache should still have everything we need.
-        tokio::fs::remove_file(&path1).await.unwrap();
-        let chunks_dir = blob_root.join("chunks");
-        tokio::fs::remove_dir_all(&chunks_dir).await.unwrap();
-
-        // Second materialize would fail if it hit the store; succeeds
-        // when reads are served from the cache.
-        let path2 = materialize_chunked_rootfs(
-            &cs,
-            Some(&cache),
-            &materialize_dir,
-            "img:cached",
-            bundle.disk_manifest,
-            &lock,
-        )
-        .await
-        .expect("cache should serve chunks after store is gone");
-        let restored2 = tokio::fs::read(&path2).await.unwrap();
-        assert_eq!(restored2, bytes, "cached materialize must reproduce bytes");
-    }
-
-    /// Tier 1 regression guard for the ADR 0007 chunked-lifecycle
-    /// rollout. Exercises the full `PooledBackend::create()` flow with
-    /// a real `ImageCache` + `ChunkStore` wired, asserting that an
-    /// `image_uri`-driven spec lands a chunked-materialized path on
-    /// the inner backend's spec — not the OCI-pulled `rootfs.ext4`.
-    ///
-    /// Covered ground:
-    /// - `ImageCache.ensure_image()` returns a `CachedImage.bundle`
-    ///   when the on-disk artifact carries a `bundle.json`.
-    /// - `PooledBackend.resolve_rootfs()` dispatches to the chunk
-    ///   store rather than the cached file.
-    /// - The materialized file lands at the deterministic content-
-    ///   addressed path, and its bytes match the chunked source.
-    /// - The inner backend's `create()` receives `spec.rootfs_source`
-    ///   pointing at that materialized path.
-    #[tokio::test]
-    async fn create_with_image_uri_resolves_chunked_path_on_inner() {
+    async fn create_with_image_uri_provisions_a_root_volume_for_the_inner_backend() {
         use crate::image_cache::ImageCache;
         use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
         use engram_core::traits::SandboxBackend;
@@ -15187,9 +10175,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for Capturing {
-            async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(spec);
-                Ok(SandboxId::new())
+                Ok(())
             }
             async fn exec_stream(
                 &self,
@@ -15206,7 +10194,12 @@ mod tests {
                     .join("engram-test-snaps")
                     .join(id.to_string())
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -15228,13 +10221,20 @@ mod tests {
         });
         let inner: Arc<dyn SandboxBackend> = captured.clone();
 
-        // 5. PooledBackend wires both image cache + chunk store +
-        //    materialize dir. We only care about the single create
-        //    path here.
-        let materialize_dir = tmp.path().join("materialized");
+        // 5. PooledBackend wires the image cache, the chunk store and
+        //    session volumes over a file-backed disk.
+        let volumes_root = tmp.path().join("volumes");
+        let disk: Arc<dyn engram_host_core::SessionDisk> = Arc::new(
+            engram_host_core::FileDisk::new(
+                &volumes_root,
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+            )
+            .unwrap(),
+        );
         let pooled = PooledBackend::new(inner)
             .with_image_cache(cache)
-            .with_chunk_store(cs.clone(), materialize_dir.clone());
+            .with_chunk_store(cs.clone())
+            .with_session_volumes(Arc::new(SessionVolumes::new(disk, cs.clone())));
 
         // 6. Drive a session-create with image_uri set.
         let mut spec = SandboxSpec {
@@ -15255,26 +10255,30 @@ mod tests {
             swap_manifest: None,
         };
         spec.image_uri = Some("test:1".into());
-        let _id = pooled.create(spec).await.unwrap();
+        pooled.create(SandboxId::new(), spec).await.unwrap();
 
-        // 7. The inner backend must have received the chunked
-        //    materialized path, NOT the OCI-pulled rootfs.ext4.
+        // 7. The inner backend received the root volume, not the
+        //    OCI-pulled rootfs.ext4, and the spec carries a fresh
+        //    lineage forked from the image manifest.
         let received = captured.captured.lock().clone().expect("inner not called");
         let received_rootfs = received.rootfs_source.expect("rootfs_source not set");
-        let expected =
-            materialize_dir.join(format!("{}-v{}.ext4", mref.manifest_id, mref.version,));
-        assert_eq!(
-            received_rootfs, expected,
-            "PooledBackend must route chunked manifests through materialize_dir, not the OCI rootfs.ext4",
+        assert!(
+            received_rootfs.starts_with(&volumes_root),
+            "rootfs_source {received_rootfs:?} is not a session volume",
+        );
+        let lineage = received.rootfs_manifest.expect("rootfs_manifest not set");
+        assert_ne!(
+            lineage, mref,
+            "a create forks the image into its own lineage"
         );
 
-        // 8. The materialized file exists and is byte-equal.
-        let materialized = tokio::fs::read(&expected).await.unwrap();
-        assert_eq!(materialized, bytes, "materialized file bytes mismatch");
+        // 8. The volume holds the image bytes.
+        let volume = tokio::fs::read(&received_rootfs).await.unwrap();
+        assert_eq!(volume, bytes, "root volume bytes mismatch");
     }
 
     // ──────────────────────────────────────────────────────────────
-    // ADR 0014 follow-up (prod 2026-05-20 session 5c8d0ce5):
+    // ADR 0014 follow-up:
     // PooledBackend MUST forward start_shell / guest_endpoints to its
     // inner backend. The SandboxBackend trait has default impls for
     // these (Ok(7681) / None respectively) that exist for backends
@@ -15340,7 +10344,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for SpyInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15356,7 +10360,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15403,9 +10412,7 @@ mod tests {
         /// the inner — host-agent's proxy_shell then dials port
         /// 7681 blind even when the FC backend would have correctly
         /// minted the connection (warm restore in a netns, lazy
-        /// ttyd spawn, etc.). Prod 2026-05-20 session 5c8d0ce5 was
-        /// exactly this: zero `start_shell:` log lines on the
-        /// host-agent despite a successful proxy_shell GRPC roundtrip.
+        /// ttyd spawn, etc.).
         #[tokio::test]
         async fn pooled_backend_forwards_start_shell_to_inner() {
             let inner = Arc::new(SpyInner::new());
@@ -15579,7 +10586,7 @@ mod tests {
         struct NoopInner;
         #[async_trait]
         impl SandboxBackend for NoopInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15595,7 +10602,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15809,7 +10821,7 @@ mod tests {
         struct FixedListInner(Vec<SandboxId>);
         #[async_trait]
         impl SandboxBackend for FixedListInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15825,7 +10837,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 PathBuf::new()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -15839,9 +10856,8 @@ mod tests {
         /// ADR 0111: the registry a host-agent restart wiped is
         /// rebuilt from the policies the previous process persisted
         /// beside its binding records — a local read, no coordinator.
-        /// (Prod 2026-08-03, session 51fc6af7: the in-RAM registry
-        /// died with a DaemonSet roll and the coordinator-side re-push
-        /// could not rebuild it, stranding a healthy VM egress-less.)
+        /// A coordinator-side re-push cannot rebuild it, and a healthy
+        /// VM stays without egress.
         #[tokio::test]
         async fn restart_rebuilds_egress_registry_from_persisted_policies() {
             let bindings_dir = tempfile::tempdir().expect("tempdir");
@@ -15949,7 +10965,7 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for LifecycleInner {
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn exec_stream(
@@ -15998,6 +11014,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    base_disk_manifest: None,
                     migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
@@ -16012,7 +11029,12 @@ mod tests {
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
                 self.dir_for(id)
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -16035,7 +11057,7 @@ mod tests {
             let inner: Arc<dyn SandboxBackend> = Arc::new(LifecycleInner {
                 staging_root: tmp.path().join("fc-snaps"),
             });
-            let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("mat"));
+            let pooled = PooledBackend::new(inner).with_chunk_store(cs);
             (pooled, blob)
         }
 
@@ -16167,7 +11189,7 @@ mod tests {
     }
 
     /// Issue #200 regression: the snapshot/migration paths must not hold
-    /// a `nbd_sandboxes` `DashMap` guard across an `.await`.
+    /// a `DashMap` guard across an `.await`.
     ///
     /// Why this matters: a `DashMap` `Ref`/`RefMut` guard pins the
     /// shard's **synchronous** `RwLock`. A `.get()` read guard held
@@ -16268,8 +11290,8 @@ mod tests {
 
     #[async_trait]
     impl SandboxBackend for CustodyBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            Ok(self.id)
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+            Ok(())
         }
         async fn exec_stream(
             &self,
@@ -16285,9 +11307,14 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.root.join(id.to_string())
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             self.park("restore").await;
-            Ok(self.id)
+            Ok(())
         }
         async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
             self.park("destroy").await;
@@ -16352,7 +11379,7 @@ mod tests {
         let id = inner.id;
         pooled.bind_session(SessionId::new(), id);
         pooled.last_snapshot_unix_ms.insert(id, 1);
-        let _lock = pooled.capture_lock(id);
+        let _gate = pooled.capture_gate(id);
         let mut first = Box::pin(pooled.destroy(id));
         assert!(futures::poll!(&mut first).is_pending());
         inner.entered.notified().await;
@@ -16366,7 +11393,7 @@ mod tests {
         assert!(pooled.list().await.unwrap().is_empty());
         assert!(!pooled.session_bindings.contains_key(&id));
         assert!(!pooled.last_snapshot_unix_ms.contains_key(&id));
-        assert!(!pooled.capture_locks.contains_key(&id));
+        assert!(!pooled.capture_gates.contains_key(&id));
     }
 
     #[tokio::test]
@@ -16383,8 +11410,12 @@ mod tests {
         )
         .unwrap();
         let caller = pooled.clone();
-        let restore =
-            tokio::spawn(async move { caller.restore_with(metadata, false, false, vec![]).await });
+        let id = inner.id;
+        let restore = tokio::spawn(async move {
+            caller
+                .restore_with(id, metadata, false, false, vec![])
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(2), inner.entered.notified())
             .await
             .unwrap();
@@ -16404,12 +11435,23 @@ mod tests {
         );
     }
 
+    /// ADR 0123 D4: `start_agent` waits while the capture holds the guest
+    /// paused, and runs while the post phase still holds the capture lock.
     #[tokio::test]
-    async fn start_agent_waits_for_capture_and_post_phase() {
+    async fn start_agent_waits_for_the_pause_but_not_the_post_phase() {
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
         let pooled = PooledBackend::new(inner.clone());
-        let mut capture = Box::pin(pooled.capture_phase(inner.id, false));
+        let spawn = pooled
+            .capture_gate(inner.id)
+            .quiesce(inner.id, CaptureUser::StartAgent)
+            .await;
+        assert!(
+            pooled.capture_in_flight(inner.id),
+            "a harness spawn defers the periodic checkpoint"
+        );
+        drop(spawn);
+        let mut capture = Box::pin(pooled.capture_phase(inner.id, CaptureUser::PeriodicCheckpoint));
         assert!(futures::poll!(&mut capture).is_pending());
         let agent = AgentSpec {
             argv: vec![],
@@ -16423,11 +11465,15 @@ mod tests {
         assert_eq!(*inner.calls.lock(), vec!["snapshot"]);
         release.send(()).unwrap();
         let (guard, cap) = capture.await.unwrap();
-        assert!(futures::poll!(&mut start).is_pending());
-        drop(cap);
-        drop(guard);
         start.await.unwrap();
         assert_eq!(*inner.calls.lock(), vec!["snapshot", "start_agent"]);
+        assert!(
+            pooled.capture_in_flight(inner.id),
+            "the post phase still serializes captures"
+        );
+        drop(cap);
+        drop(guard);
+        assert!(!pooled.capture_in_flight(inner.id));
     }
 
     /// An open export for `id` whose local directory exists on disk.
@@ -16439,10 +11485,14 @@ mod tests {
             sandbox_id: id,
             snapshot_dir: dir,
             disk_seal: Default::default(),
+            precopy: Default::default(),
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
-            capture_guard: pooled.capture_lock(id).lock_owned().await,
+            capture_guard: pooled
+                .capture_gate(id)
+                .serialize(id, CaptureUser::PeriodicCheckpoint)
+                .await,
         }));
         export_id
     }
@@ -16484,9 +11534,7 @@ mod tests {
         assert_eq!(*inner.calls.lock(), vec!["resume", "role"]);
         assert!(!dir.exists());
         assert!(pooled.migrations.export_id_of(id).is_none());
-        assert!(
-            !pooled.capture_locks.contains_key(&id) || pooled.capture_lock(id).try_lock().is_ok()
-        );
+        assert!(!pooled.capture_gates.contains_key(&id) || !pooled.capture_in_flight(id));
         // The in-memory fence is down: this process no longer treats the
         // guest as a frozen source.
         assert_eq!(pooled.migration_role(id), None);
@@ -16546,6 +11594,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
+            base_disk_manifest: None,
             migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
@@ -16652,7 +11701,7 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for FakeCaptureBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -16678,6 +11727,7 @@ mod tests {
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
+                base_disk_manifest: None,
                 migration_source: None,
                 source_sandbox_id: None,
                 state_blob_key: None,
@@ -16692,7 +11742,12 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.dir_for(id)
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -16745,9 +11800,8 @@ mod tests {
             destroy_calls: destroy_calls.clone(),
         });
         let checkpoint_dir = tmp.path().join("checkpoints");
-        let materialize_dir = tmp.path().join("materialized");
         let p = PooledBackend::new(inner)
-            .with_chunk_store(cs.clone(), materialize_dir)
+            .with_chunk_store(cs.clone())
             .with_checkpoint_dir(checkpoint_dir.clone());
         let arc = Arc::new(p);
         arc.set_self_ref(&arc);
@@ -16847,12 +11901,19 @@ mod tests {
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         pooled.session_bindings.insert(sandbox_id, session_id);
+        let checkpoint_recorded = pooled.checkpoint_recorded();
 
         let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
 
         let records_dir = ckpt_dir.join("records");
         let record_path = records_dir.join(format!("{snapshot_id}.json"));
-        wait_for("eviction-final checkpoint record", || record_path.exists()).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            checkpoint_recorded.notified(),
+        )
+        .await
+        .expect("the eviction-final record signals the heartbeat");
+        assert!(record_path.exists(), "the signal follows the record write");
 
         let bytes = tokio::fs::read(&record_path).await.unwrap();
         // R5: records are sealed in a content-hash envelope keyed on their id.
@@ -17042,7 +12103,7 @@ mod tests {
         });
         let checkpoint_dir = tmp.path().join("checkpoints");
         let p = PooledBackend::new(inner)
-            .with_chunk_store(cs, tmp.path().join("materialized"))
+            .with_chunk_store(cs)
             .with_checkpoint_dir(checkpoint_dir.clone());
         let pooled = Arc::new(p);
         pooled.set_self_ref(&pooled);
@@ -17107,7 +12168,7 @@ mod tests {
             "test premise: ProcessBackend must not opt into diff checkpoints"
         );
         let pooled = PooledBackend::new(inner)
-            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_chunk_store(cs)
             .with_checkpoint_dir(tmp.path().join("checkpoints"));
 
         let err = pooled
@@ -17138,7 +12199,7 @@ mod tests {
             destroy_calls: Arc::new(PlMutex::new(Vec::new())),
         });
         // Deliberately no `.with_checkpoint_dir(..)`.
-        let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialize"));
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs);
 
         let err = pooled
             .snapshot_begin(SandboxId::new())
@@ -17225,7 +12286,7 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for SurvivorListBackend {
-        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn exec_stream(
@@ -17244,7 +12305,12 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -17256,6 +12322,57 @@ mod tests {
         async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
             Ok(())
         }
+    }
+
+    /// A chain seed (restore, create) stamps the checkpoint clock, so the
+    /// periodic driver does not capture right after the bind; a capture's
+    /// own stamp is never overwritten.
+    #[tokio::test]
+    async fn chain_seed_stamps_the_checkpoint_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let pooled = PooledBackend::new(Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        }) as Arc<dyn SandboxBackend>)
+        .with_chunk_store(ChunkStore::new(blob))
+        .with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let source = SandboxId::new();
+        let memory_ref = pooled
+            .snapshot(source)
+            .await
+            .expect("capture")
+            .memory_manifest
+            .expect("chunked");
+
+        let restored = SandboxId::new();
+        pooled.bind_session(SessionId::new(), restored);
+        pooled
+            .seed_checkpoint_chain_sparse(restored, memory_ref)
+            .await;
+        let cfg = crate::checkpoint::CheckpointConfig {
+            interval: Some(std::time::Duration::from_secs(600)),
+            min_interval: std::time::Duration::from_secs(30),
+            target_epoch_bytes: 256 * 1024 * 1024,
+        };
+        assert!(pooled.last_snapshot_unix_ms.contains_key(&restored));
+        assert!(
+            pooled.checkpoint_candidates_adaptive(&cfg).is_empty(),
+            "a freshly seeded sandbox is not due"
+        );
+
+        let captured = SandboxId::new();
+        pooled.last_snapshot_unix_ms.insert(captured, 7);
+        pooled
+            .seed_checkpoint_chain_forked(captured, memory_ref)
+            .await;
+        assert_eq!(
+            pooled.last_snapshot_unix_ms.get(&captured).map(|v| *v),
+            Some(7)
+        );
     }
 
     /// The pod-roll simulation at the unit level: generation A captures
@@ -17286,7 +12403,7 @@ mod tests {
         // both get chain-head records.
         let gen_a = {
             let p = PooledBackend::new(Arc::new(fake.clone()) as Arc<dyn SandboxBackend>)
-                .with_chunk_store(cs.clone(), tmp.path().join("materialize-a"))
+                .with_chunk_store(cs.clone())
                 .with_checkpoint_dir(checkpoint_dir.clone());
             let arc = Arc::new(p);
             arc.set_self_ref(&arc);
@@ -17308,7 +12425,7 @@ mod tests {
                 inner: fake,
                 survivors: vec![survivor, torn],
             }) as Arc<dyn SandboxBackend>)
-            .with_chunk_store(cs, tmp.path().join("materialize-b"))
+            .with_chunk_store(cs)
             .with_checkpoint_dir(checkpoint_dir.clone());
             let arc = Arc::new(p);
             arc.set_self_ref(&arc);
@@ -17322,6 +12439,15 @@ mod tests {
             Some(survivor_ref),
             "survivor's chain must be re-seeded from the durable record"
         );
+        let record = crate::checkpoint::ChainHeadRecord::load(&chains_dir, survivor)
+            .await
+            .expect("survivor record");
+        assert_eq!(
+            gen_b.last_snapshot_unix_ms.get(&survivor).map(|v| *v),
+            Some(record.updated_at.timestamp_millis()),
+            "a survivor's checkpoint age continues from its record"
+        );
+        assert!(!gen_b.last_snapshot_unix_ms.contains_key(&torn));
         assert!(
             !chain_head_file(&checkpoint_dir, dead).exists(),
             "record for a non-surviving sandbox must be GC'd"
@@ -17391,7 +12517,7 @@ mod tests {
             }
 
             // ---- unused required surface ----
-            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 unreachable!()
             }
             async fn exec_stream(
@@ -17407,7 +12533,12 @@ mod tests {
             fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
                 unreachable!()
             }
-            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            async fn restore(
+                &self,
+                _: SandboxId,
+                _: SnapshotMetadata,
+                _disks: Option<engram_core::types::sandbox::SessionDisks>,
+            ) -> Result<(), SandboxError> {
                 unreachable!()
             }
             async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
@@ -17522,8 +12653,8 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for HoldBackend {
-        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            self.inner.create(spec).await
+        async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
+            self.inner.create(id, spec).await
         }
         async fn exec_stream(
             &self,
@@ -17573,8 +12704,13 @@ mod tests {
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
             self.inner.snapshot_path_for(id)
         }
-        async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-            self.inner.restore(meta).await
+        async fn restore(
+            &self,
+            id: SandboxId,
+            meta: SnapshotMetadata,
+            disks: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
+            self.inner.restore(id, meta, disks).await
         }
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.inner.destroy(id).await

@@ -219,7 +219,6 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
     let mut server = tokio::spawn(engram_host_agent::grpc_server::boot_with_managed_tls(
         addr,
         local,
-        None,
         engram_host_agent::session_epochs::SessionEpochStore::open(dir.join("epochs")).unwrap(),
         None,
         Some(engram_host_agent::managed_tls::ManagedHostTls {

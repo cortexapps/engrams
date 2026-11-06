@@ -23,7 +23,6 @@ use async_trait::async_trait;
 
 use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, SessionFence};
-use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
@@ -55,6 +54,19 @@ impl LocalHostClient {
     pub fn with_managed_boot(mut self, boot: Arc<crate::managed_boot::ManagedBootHost>) -> Self {
         self.boot = Some(boot);
         self
+    }
+    /// The coordinator has disowned this exact sandbox through its heartbeat.
+    pub(crate) async fn destroy_tombstoned(&self, id: SandboxId) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            self.boot()?.destroy_tombstoned(id).await
+        } else {
+            self.sandbox.destroy(id).await
+        }
     }
     fn boot(&self) -> Result<&Arc<crate::managed_boot::ManagedBootHost>, SandboxError> {
         self.boot
@@ -147,7 +159,9 @@ impl HostClient for LocalHostClient {
         if let Some(boot) = &self.boot {
             boot.ordinary_spec(&spec)?;
         }
-        self.sandbox.create(spec).await
+        let id = SandboxId::new();
+        self.sandbox.create(id, spec).await?;
+        Ok(id)
     }
 
     // ADR 0079: the `fence` params below are checked by the gRPC
@@ -171,8 +185,17 @@ impl HostClient for LocalHostClient {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        let mut ids = self.sandbox.list().await?;
-        ids.retain(|id| self.ordinary_only(*id).is_ok());
+        let mut ids = Vec::new();
+        for id in self.sandbox.list().await? {
+            if !self
+                .harness_hub
+                .binding_store()
+                .managed_sandbox_required(id)
+                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            {
+                ids.push(id);
+            }
+        }
         if let Some(boot) = &self.boot {
             ids.extend(boot.list()?);
         }
@@ -367,6 +390,16 @@ impl HostClient for LocalHostClient {
         self.sandbox.migration_abort(id, export_id).await
     }
 
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        self.ordinary_only(id)?;
+        self.sandbox.migration_abort_unserved(id, export_id).await
+    }
+
     async fn commit_snapshot(
         &self,
         id: SandboxId,
@@ -395,7 +428,9 @@ impl HostClient for LocalHostClient {
             boot.ordinary_disk(metadata.disk_manifest, None)?;
             boot.ordinary_disk(metadata.swap_manifest, None)?;
         }
-        self.sandbox.restore(metadata).await
+        let id = SandboxId::new();
+        self.sandbox.restore(id, metadata, None).await?;
+        Ok(id)
     }
 
     async fn materialize_image(
@@ -431,9 +466,11 @@ impl HostClient for LocalHostClient {
             boot.ordinary_disk(metadata.disk_manifest, None)?;
             boot.ordinary_disk(metadata.swap_manifest, None)?;
         }
+        let id = SandboxId::new();
         self.sandbox
-            .restore_base_for_session(metadata, session_env, selected_mounts)
-            .await
+            .restore_base_for_session(id, metadata, session_env, selected_mounts)
+            .await?;
+        Ok(id)
     }
 
     async fn read_managed_cold_assets(
@@ -708,8 +745,7 @@ impl HostClient for LocalHostClient {
         // agentd probes a local TCP connect before replying, so
         // when we get here we're guaranteed a listener exists — no
         // more racing the warm-restore against the snapshot's init
-        // script (prod session 73fe33a3 on 2026-05-20 saw the host
-        // dial 48s after lease and still hit Connection refused).
+        // script.
         let port = self.sandbox.start_shell(sandbox_id).await?;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
         // ADR 0066: reach ttyd via the in-guest agentd relay (FC; VZ after its
@@ -827,23 +863,6 @@ impl HostClient for LocalHostClient {
 
     fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
         self.sandbox.set_upload_sink(sink);
-    }
-
-    async fn cow_state(&self, id: SandboxId) -> Result<Option<CowState>, SandboxError> {
-        self.ordinary_only(id)?;
-        Ok(self.sandbox.cow_state(id).await)
-    }
-
-    async fn cow_state_all(&self) -> Result<Vec<CowStateRecord>, SandboxError> {
-        Ok(self.sandbox.cow_state_all().await)
-    }
-
-    async fn flush_sandbox(
-        &self,
-        id: SandboxId,
-    ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
-        self.ordinary_only(id)?;
-        self.sandbox.flush_sandbox(id).await
     }
 }
 

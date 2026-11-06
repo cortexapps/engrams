@@ -13,7 +13,7 @@
 //! | `PUT`   | `/drives/{id}`             | attach rootfs / scratch disks     |
 //! | `PUT`   | `/network-interfaces/{id}` | attach TAP                        |
 //! | `PUT`   | `/vsock`                   | attach virtio-vsock               |
-//! | `PUT`   | `/actions`                 | `InstanceStart`, `SendCtrlAltDel` |
+//! | `PUT`   | `/actions`                 | `InstanceStart`                   |
 //! | `PATCH` | `/vm`                      | `Paused` / `Resumed` (snapshots)  |
 //! | `PUT`   | `/snapshot/create`         | take a Full or Diff snapshot      |
 //! | `PUT`   | `/snapshot/load`           | resume from snapshot (with UFFD)  |
@@ -50,6 +50,7 @@ use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tracing::Instrument as _;
 
 /// Client bound to one Firecracker control socket. Cheap to clone —
 /// the actual HTTP connection is established per-request.
@@ -181,7 +182,7 @@ impl FirecrackerClient {
         self.put(&path, iface).await
     }
 
-    /// `PUT /actions` — `InstanceStart`, `SendCtrlAltDel`, etc.
+    /// `PUT /actions` — `InstanceStart`.
     pub async fn put_action(&self, action: ActionType) -> Result<(), SandboxError> {
         let body = ActionBody {
             action_type: action,
@@ -250,12 +251,18 @@ impl FirecrackerClient {
             snapshot_type,
             vmstate_only: false,
         };
-        let create_res = self.put("/snapshot/create", &body).await;
+        let create_res = self
+            .put("/snapshot/create", &body)
+            .instrument(tracing::info_span!("fc.snapshot_create"))
+            .await;
 
         // Always try to resume, regardless of whether the create
         // succeeded — leaving the VM paused on error is worse than
         // doubling up on the failure path.
-        let resume_res = self.resume().await;
+        let resume_res = self
+            .resume()
+            .instrument(tracing::info_span!("fc.snapshot_resume"))
+            .await;
         guard.disarm();
 
         create_res?;
@@ -283,6 +290,7 @@ impl FirecrackerClient {
                 vmstate_only: false,
             },
         )
+        .instrument(tracing::info_span!("fc.snapshot_create"))
         .await?;
         Ok(SnapshotPaths {
             state_path,
@@ -784,8 +792,6 @@ struct VmStatePatch {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum ActionType {
     InstanceStart,
-    FlushMetrics,
-    SendCtrlAltDel,
 }
 
 #[derive(Debug, Serialize)]
@@ -902,13 +908,9 @@ struct FaultMessage {
 // VM will be unpaused on the next runtime tick, regardless of what
 // happened to the original future. On the happy path the guard's
 // `disarm` is called after the inline resume so we don't
-// double-resume.
-//
-// Surfaced on 2026-05-23 during the COW diagnostic spot-check on
-// session 96392fd3: 3 successful flushes on the host with 0 PG
-// snapshot rows, then a follow-up prompt that the harness never
-// processed — consistent with a partially-completed snapshot
-// pipeline leaving the VM stuck Paused.
+// double-resume. Without the guard, a partially-completed snapshot
+// pipeline leaves the VM Paused and the harness never processes
+// the next prompt.
 
 /// Defuse-on-success guard: if dropped while armed, spawns a
 /// detached `resume` so the VM doesn't stay paused on cancellation.
@@ -1172,14 +1174,10 @@ mod tests {
 
     #[test]
     fn action_type_serializes_pascal_case() {
-        // Firecracker expects exactly these strings.
+        // Firecracker expects exactly this string.
         assert_eq!(
             serde_json::to_string(&ActionType::InstanceStart).unwrap(),
             "\"InstanceStart\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ActionType::SendCtrlAltDel).unwrap(),
-            "\"SendCtrlAltDel\""
         );
     }
 

@@ -14,11 +14,8 @@
 //!     `open_shell_tunnel_at(...)` (direct `dial_ip` dial) →
 //!     WS-frame round-trip with ttyd.
 //!
-//! That's the path prod session 5c8d0ce5 (2026-05-20) silently
-//! broke on: `PooledBackend.start_shell` was using the trait
-//! default `Ok(7681)` because the impl block was missing the
-//! forward to its inner FC backend. None of the existing tests
-//! went through `PooledBackend`; this one does.
+//! This test goes through `PooledBackend`, so a missing
+//! `start_shell` forward (the trait default `Ok(7681)`) fails it.
 //!
 //! Coverage matrix:
 //!   - shell_cold: cold-created FC sandbox, dial from host root.
@@ -43,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -72,7 +70,16 @@ fn agentd_musl_bin() -> PathBuf {
 /// — every InRelease fetch timed out after 40s). So we do all the
 /// network work HOST-side (download ttyd via `curl`) and use only
 /// `COPY` inside Docker, which doesn't need DNS.
-async fn bake_shell_rootfs(busybox: &Path) -> PathBuf {
+/// The baked rootfs file, the chunk store holding its manifest, and the
+/// manifest: a cold test boots the file, a warm test restores through
+/// session volumes staged from the manifest.
+async fn bake_shell_rootfs(
+    busybox: &Path,
+) -> (
+    PathBuf,
+    engram_chunk_store::ChunkStore,
+    engram_core::ManifestRef,
+) {
     let src = tempfile::tempdir().expect("source dir");
 
     // Download ttyd host-side (where network works). ADR 0080 §D moves ttyd
@@ -131,7 +138,7 @@ async fn bake_shell_rootfs(busybox: &Path) -> PathBuf {
     )
     .await;
 
-    outcome.rootfs_path
+    (outcome.rootfs_path, chunk_store, outcome.disk_manifest)
 }
 
 /// Drive a WS round-trip through the ShellTunnel.
@@ -262,7 +269,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
     cleanup_host_state();
 
     // ---- 1. Bake a real rootfs with ttyd + agentd ----
-    let rootfs_path = bake_shell_rootfs(&busybox).await;
+    let (rootfs_path, _, _) = bake_shell_rootfs(&busybox).await;
 
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
@@ -294,7 +301,8 @@ async fn e2e_shell_cold_via_pooled_backend() {
         swap_source: None,
         swap_manifest: None,
     };
-    let sandbox_id = pooled.create(spec).await.expect("create");
+    let sandbox_id = SandboxId::new();
+    pooled.create(sandbox_id, spec).await.expect("create");
 
     // ---- 4. Wait for in-VM agentd to come up so guest_endpoints resolves
     //         AND the bake's init has had a chance to spawn ttyd. ----
@@ -330,7 +338,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
     };
     cleanup_host_state();
 
-    let rootfs_path = bake_shell_rootfs(&busybox).await;
+    let (_, chunk_store, image) = bake_shell_rootfs(&busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -341,13 +349,19 @@ async fn e2e_shell_warm_via_pooled_backend() {
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
-    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+    let pooled = Arc::new(
+        PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>)
+            .with_chunk_store(chunk_store.clone())
+            .with_session_volumes(common::session_volumes(work.path(), &chunk_store))
+            .with_checkpoint_dir(work.path().join("checkpoints")),
+    );
+    pooled.set_self_ref(&pooled);
 
     let spec = SandboxSpec {
         image: "engram-e2e-shell-warm".into(),
-        rootfs_source: Some(rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        rootfs_manifest: Some(common::fork_lineage(&chunk_store, image).await),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -362,7 +376,8 @@ async fn e2e_shell_warm_via_pooled_backend() {
     };
 
     // ---- Cold create + wait for VM to be ready ----
-    let cold_id = pooled.create(spec).await.expect("create");
+    let cold_id = SandboxId::new();
+    pooled.create(cold_id, spec).await.expect("create");
     let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     sleep(Duration::from_secs(2)).await; // ttyd bind window
 
@@ -375,7 +390,11 @@ async fn e2e_shell_warm_via_pooled_backend() {
     //      bug: without it, guest_endpoints().netns returns None and the
     //      tunnel dial happens from host root, which has no route
     //      to the netns'd 10.200.0.x. ----
-    let warm_id = pooled.restore(metadata).await.expect("restore");
+    let warm_id = SandboxId::new();
+    pooled
+        .restore(warm_id, metadata, None)
+        .await
+        .expect("restore");
     let endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // ttyd's TCP listen socket should survive the snapshot/restore
     // (FC restores the kernel state including sockets). But give a

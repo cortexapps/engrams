@@ -129,7 +129,8 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(Arc::new(FirecrackerBackend::new(work.path(), config)))
-        .with_chunk_store(chunks, work.path().join("materialize"))
+        .with_chunk_store(chunks.clone())
+        .with_session_volumes(common::session_volumes(work.path(), &chunks))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache))
         .with_checkpoint_dir(work.path().join("checkpoints"));
 
@@ -150,24 +151,28 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
     pooled.set_harness_sink(Arc::new(move |stream| {
         accepting.accept_via_session_lookup(stream);
     }));
-    let source = pooled
-        .create(SandboxSpec {
-            image: "rehome-retained-harness".into(),
-            rootfs_source: Some(image.rootfs_path),
-            image_uri: None,
-            rootfs_manifest: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 256 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: HashMap::new(),
-            workdir: None,
-            network: Default::default(),
-            aux_ro_drives: vec![staged.agentd_slot()],
-            swap_mib: None,
-            swap_source: None,
-            swap_manifest: None,
-        })
+    let source = SandboxId::new();
+    pooled
+        .create(
+            source,
+            SandboxSpec {
+                image: "rehome-retained-harness".into(),
+                rootfs_source: None,
+                image_uri: None,
+                rootfs_manifest: Some(common::fork_lineage(&chunks, image.disk_manifest).await),
+                cpu: CpuLimit { vcpus: 1 },
+                memory: MemoryLimit { max_mib: 256 },
+                disk: DiskLimit { max_gib: 1 },
+                ttl: None,
+                env: HashMap::new(),
+                workdir: None,
+                network: Default::default(),
+                aux_ro_drives: vec![staged.agentd_slot()],
+                swap_mib: None,
+                swap_source: None,
+                swap_manifest: None,
+            },
+        )
         .await
         .expect("create source VM");
     exec(&pooled, source, "true").await;
@@ -232,11 +237,11 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
         "capture must occur while the tool and run are open"
     );
 
-    let restored = pooled
-        .restore(snapshot)
+    let restored = SandboxId::new();
+    pooled
+        .restore(restored, snapshot, None)
         .await
         .expect("restore memory snapshot");
-    assert_ne!(restored, source);
     hub.bind_session(session, restored, 2)
         .expect("bind epoch 2");
     agent.binding_epoch = 2;

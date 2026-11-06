@@ -43,7 +43,7 @@ impl PostgresStore {
         let t = &k.context.target;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         crate::managed_operator_gate::require(&mut tx, k).await?;
-        let s = sqlx::query("SELECT status,host_id,sandbox_id,binding_epoch,image_uri,mem_budget_mib,cpu_budget_vcpus,nbd_slot_need FROM sessions WHERE id=$1 FOR UPDATE")
+        let s = sqlx::query("SELECT status,host_id,sandbox_id,binding_epoch,image_uri,mem_budget_mib,cpu_budget_vcpus FROM sessions WHERE id=$1 FOR UPDATE")
             .bind(t.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
         if spec.image != s.try_get::<String, _>("image_uri").map_err(db_err)?
             || spec.cpu.vcpus == 0
@@ -145,8 +145,6 @@ impl PostgresStore {
             0,
             s.try_get("mem_budget_mib").map_err(db_err)?,
             i64::from(s.try_get::<i32, _>("cpu_budget_vcpus").map_err(db_err)?),
-            u32::try_from(s.try_get::<i64, _>("nbd_slot_need").map_err(db_err)?)
-                .map_err(|_| conflict())?,
         )
         .await?;
         if picked != Some(t.host_id.as_uuid()) {

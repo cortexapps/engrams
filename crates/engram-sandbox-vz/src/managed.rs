@@ -276,7 +276,7 @@ impl PreparedManagedVz {
         let destination = destination.to_owned();
         tokio::task::spawn_blocking(move || {
             std::fs::File::open(&source)?.sync_all()?;
-            crate::disk::clone_or_copy_blocking(&source, &destination).map_err(io::Error::other)?;
+            std::fs::copy(&source, &destination)?;
             std::fs::File::open(&destination)?.sync_all()
         })
         .await
@@ -528,7 +528,7 @@ impl PinnedFiles {
         size: Option<u64>,
     ) -> Result<(), engram_core::SandboxError> {
         let dest = self.path.join(name);
-        crate::disk::clone_or_copy_blocking(source, &dest)?;
+        std::fs::copy(source, &dest)?;
         if !std::fs::symlink_metadata(&dest)?.is_file() {
             return Err(io::Error::other("managed artifact is not a regular file").into());
         }

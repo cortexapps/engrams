@@ -12,7 +12,7 @@
 //!   mid-write don't leave the cache pointing at half-written chunks.
 //!   The temp name carries pid + a process-global counter for
 //!   IN-process concurrency: many tokio tasks (restore prefetch,
-//!   populate-server connections, disk-daemon flushes) populate
+//!   populate-server connections) populate
 //!   concurrently inside the ONE writer process. (ADR 0075 made this
 //!   single-writer; the pid component is vestigial-but-harmless
 //!   belt-and-braces from the multi-writer era, whose fixed-temp
@@ -549,8 +549,7 @@ type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
 /// the slot — holding the leader's own sender — lingers forever and
 /// every waiter (and every later `get` for this hash, which joins the
 /// orphaned slot) blocks on a broadcast that never comes. That poisons
-/// the host's chunk cache (prod incident: session 9f82064b wedged every
-/// resume retry). This guard removes the slot on drop, dropping its
+/// the host's chunk cache and wedges every resume retry. This guard removes the slot on drop, dropping its
 /// senders so waiters observe `RecvError` and retry as a fresh leader.
 /// The leader disarms it once it has removed the slot itself.
 struct LeaderGuard<'a> {
@@ -789,8 +788,7 @@ impl ChunkCache {
     }
 
     /// Does this chunk's content-addressed file exist on local NVMe right now?
-    /// The disk daemon reads this to label a read's tier (nvme vs blobstorage);
-    /// it also distinguishes "never warmed here" / "evicted" from "warmed but
+    /// Distinguishes "never warmed here" / "evicted" from "warmed but
     /// `get` still missed".
     pub fn contains_on_disk(&self, hash: ChunkHash) -> bool {
         self.path_for(hash).try_exists().unwrap_or(false)
@@ -917,6 +915,25 @@ impl ChunkCache {
         .await
     }
 
+    /// The chunk's bytes when its file is in the cache, else `None`.
+    /// Never fetches and never stores. Every populate path verifies the
+    /// hash before its atomic rename, so a present file is whole and
+    /// correct and is not hashed again (a 16 MiB sha256 costs about
+    /// 80 ms on hosts without SHA extensions).
+    pub async fn read_resident(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
+        let start = crate::time_source::metrics_now();
+        let Some(bytes) = read_if_present(&self.path_for(hash)).await? else {
+            // A miss is a failed open, not a latency sample.
+            return Ok(None);
+        };
+        metrics::histogram!("engram_chunk_fetch_seconds", "tier" => "nvme")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("engram_chunk_cache_hits_total", "tier" => "nvme").increment(1);
+        metrics::counter!("engram_chunk_cache_bytes_total", "tier" => "nvme")
+            .increment(bytes.len() as u64);
+        Ok(Some(bytes))
+    }
+
     /// [`Self::get`] with a source-aware fetcher: the closure reports
     /// where the bytes actually came from, so the
     /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label
@@ -931,49 +948,7 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
     {
-        // Fast path: local hit. The cache is content-addressed and every
-        // populate path verifies `bytes == hash` before the atomic write
-        // (`get`'s fetch arm below, and `put`), so a file present at
-        // `path_for(hash)` is known-good. We deliberately do NOT re-hash it
-        // here. ADR 0021: a full sha256 of a 16 MiB chunk is ~80 ms on our
-        // no-SHA-NI (Cascade Lake) hosts, and the disk daemon re-reads hot
-        // ext4 chunks dozens of times per restore — re-verifying on every
-        // read was ~2.2 s of a 2.6 s substrate, the dominant cost. Verify on
-        // populate; trust on read. (Atomic temp+rename means a present file is
-        // never torn; post-write bit-rot is left to PD/local-SSD durability.)
-        let path = self.path_for(hash);
-        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
-        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
-        // `blobstorage` arm (the miss path below), so there was no signal
-        // for "the fast tier got slow" (a saturated NVMe device, ext4
-        // fragmentation, etc). Time the read regardless of hit/miss; a miss
-        // here is a fast negative stat (no file), not a meaningful latency
-        // sample, so only record on a hit.
-        let nvme_read_start = crate::time_source::metrics_now();
-        let nvme_read = read_if_present(&path).await?;
-        if let Some(bytes) = nvme_read {
-            metrics::histogram!(
-                "engram_chunk_fetch_seconds",
-                "tier" => "nvme",
-            )
-            .record(nvme_read_start.elapsed().as_secs_f64());
-            // ADR 0014 M1.15: local NVMe hit. Don't differentiate
-            // singleflight-piggyback from true cache hit here —
-            // the user-visible win is the same.
-            metrics::counter!(
-                "engram_chunk_cache_hits_total",
-                "tier" => "nvme",
-            )
-            .increment(1);
-            // ADR 0019 0d: bytes served per tier. With the hit counter
-            // this gives page-in volume + the nvme/blob split — the
-            // aggregate view of chunked-NBD page-in during ext4 mount
-            // (per-read spans would flood the trace; this is the metric).
-            metrics::counter!(
-                "engram_chunk_cache_bytes_total",
-                "tier" => "nvme",
-            )
-            .increment(bytes.len() as u64);
+        if let Some(bytes) = self.read_resident(hash).await? {
             return Ok(bytes);
         }
 
@@ -1012,7 +987,7 @@ impl ChunkCache {
                 // without this, a stale-miss caller that wins leadership
                 // re-fetches a chunk that is already on NVMe (the
                 // `concurrent_clients_collapse_to_one_fetch` flake).
-                if let Some(bytes) = read_if_present(&path).await? {
+                if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
                     let waiters = {
                         let mut inflight = self.inner.inflight.lock();
                         inflight.remove(&hash).unwrap_or_default()
@@ -1628,8 +1603,7 @@ impl ChunkCache {
                 tracing::debug!("chunk cache periodic sweeper disabled (interval=0)");
                 return;
             }
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(interval);
             // Consume the immediate t=0 tick without sweeping — see the
             // doc comment above. Every tick after this one is spaced a
             // full `interval` apart, so the first real sweep lands at
@@ -1645,9 +1619,8 @@ impl ChunkCache {
     }
 
     /// Write bytes to the cache atomically. Used internally on
-    /// miss; also exposed so the disk daemon can populate the
-    /// cache directly from in-VM writes (the daemon already has
-    /// the bytes; no point round-tripping through BlobStorage).
+    /// miss; also exposed so a caller that already has the bytes
+    /// can populate the cache without a BlobStorage round trip.
     pub async fn put(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
         // Verify caller's hash claim — defensive; cheap.
         let actual = ChunkHash::of(bytes);
@@ -1791,8 +1764,8 @@ impl ChunkCache {
         // sweeper can't evict (today: the per-image base memfiles that File
         // restores read). The static ceiling was derived assuming the cache
         // owns its disk fraction outright, so an unbudgeted 40 GB co-tenant
-        // silently authorizes overshooting the kubelet eviction line (the
-        // 2026-07-14 w8wq DiskPressure incident). Subtract whatever the
+        // silently authorizes overshooting the kubelet eviction line.
+        // Subtract whatever the
         // co-tenants currently claim so the cache *aims* below it — the
         // statvfs floor stays the independent backstop.
         let reserved = self
@@ -2851,7 +2824,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_leader_does_not_poison_the_inflight_slot() {
-        // Regression for the single-flight poison (prod: session 9f82064b).
+        // Regression for the single-flight poison.
         // A leader cancelled mid-fetch (FC `load_snapshot` 60 s timeout tears
         // down the restore) must clean its slot so a later `get` for the same
         // hash leads a fresh fetch instead of wedging forever as a waiter.

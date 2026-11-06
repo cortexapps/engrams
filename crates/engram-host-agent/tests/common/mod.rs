@@ -11,8 +11,6 @@
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
-pub mod nbd_release;
-#[cfg(target_os = "linux")]
 pub mod postcopy;
 
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
@@ -310,7 +308,7 @@ pub fn stage_agentd_bundle(bundle_dir: &Path, agentd_binary: &Path) -> StagedAge
 /// shape the host-agent tests still consume.
 pub struct BakedFixture {
     pub rootfs_path: PathBuf,
-    pub disk_manifest: Option<ManifestRef>,
+    pub disk_manifest: ManifestRef,
     pub runtime_defaults: OciRuntimeDefaults,
 }
 
@@ -444,7 +442,67 @@ pub async fn bake_fixture_ext4(
     }
     BakedFixture {
         rootfs_path: out_ext4.to_path_buf(),
-        disk_manifest: Some(manifest_ref),
+        disk_manifest: manifest_ref,
         runtime_defaults: OciRuntimeDefaults::default(),
     }
+}
+
+/// A sandbox's own lineage of an image manifest: the manifest under a
+/// new ref, chunks shared. `create` continues the lineage a spec names,
+/// so two sandboxes must never name the same one.
+pub async fn fork_lineage(chunk_store: &ChunkStore, image: ManifestRef) -> ManifestRef {
+    let manifest = chunk_store
+        .get_manifest(image)
+        .await
+        .expect("image manifest");
+    let lineage = ManifestRef::new();
+    chunk_store
+        .put_manifest(lineage, &manifest)
+        .await
+        .expect("fork lineage");
+    lineage
+}
+
+/// The session disk a pool-aware test runs over: the dm-thin pool
+/// `ENGRAM_TEST_THIN_POOL` names (Linux, root), else sparse files under
+/// `work`.
+pub async fn session_disk(work: &Path) -> std::sync::Arc<dyn engram_host_core::SessionDisk> {
+    #[cfg(target_os = "linux")]
+    if let Ok(pool) = std::env::var("ENGRAM_TEST_THIN_POOL") {
+        return std::sync::Arc::new(
+            engram_disk_thin::ThinPoolDisk::open(
+                &pool,
+                engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+                Path::new("/dev/engram-test"),
+            )
+            .await
+            .expect("open the thin pool"),
+        );
+    }
+    std::sync::Arc::new(
+        engram_host_core::FileDisk::new(
+            work.join("volumes"),
+            engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+        )
+        .expect("file disk"),
+    )
+}
+
+/// Session volumes over sparse files under `work`: the shape the
+/// host-agent runs with no dm-thin pool.
+pub fn session_volumes(
+    work: &Path,
+    chunk_store: &ChunkStore,
+) -> std::sync::Arc<engram_host_core::SessionVolumes> {
+    let disk: std::sync::Arc<dyn engram_host_core::SessionDisk> = std::sync::Arc::new(
+        engram_host_core::FileDisk::new(
+            work.join("volumes"),
+            engram_chunk_store::DEFAULT_DISK_CHUNK_SIZE,
+        )
+        .expect("file disk"),
+    );
+    std::sync::Arc::new(engram_host_core::SessionVolumes::new(
+        disk,
+        chunk_store.clone(),
+    ))
 }

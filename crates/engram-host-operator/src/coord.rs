@@ -1,24 +1,17 @@
-//! ADR 0044 K3 / ADR 0051: app-gRPC client for the coordinator `FleetService`
-//! used for image rolls and durable host retirement (ADR 0123 E).
+//! The coordinator `FleetService` calls the operator makes for image rolls,
+//! scaling, and durable host retirement (ADR 0044 K3, ADR 0123 E).
 //!
-//! This was a REST (`reqwest`) client until the coordinator retired its
-//! HTTP control plane (ADR 0051, gRPC-only). The REST routes the operator
-//! called (`/api/v1/admin/hosts/:id/{cordon,uncordon,drain}`, `DELETE
-//! /admin/hosts/:id`, `GET /hosts[/:id]`, `/admin/fleet/demand`) were
-//! removed but the operator was never migrated, so every call 404'd and the
-//! fleet silently stopped rolling. This client now talks `FleetService`.
-//!
-//! Auth: a service bearer token via `ENGRAM_COORDINATOR_TOKEN`, sent as
-//! `Authorization: Bearer <token>` gRPC metadata (the same scheme the cli
-//! uses). In a synthetic-admin dev coord (no accepted tokens) it's omitted.
+//! Auth: `ENGRAM_COORDINATOR_TOKEN` as `Authorization: Bearer <token>`
+//! metadata; a coordinator with no accepted tokens gets no header.
 
 use std::time::Duration;
 
 use engram_core::HostId;
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
+use engram_upgrade_drain::Bearer;
 use tonic::codegen::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::autoscale::Retirement;
 use crate::error::OperatorError;
@@ -59,39 +52,7 @@ pub struct HostLoad {
     pub free_vcpus: u64,
 }
 
-/// `Authorization: Bearer <token>` gRPC metadata interceptor (mirrors the
-/// cli's `BearerFn`). `None` omits the header — a dev coord with no accepted
-/// tokens.
-#[derive(Clone)]
-struct BearerFn {
-    token: Option<String>,
-}
-
-impl tonic::service::Interceptor for BearerFn {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(token) = &self.token {
-            req.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {token}")
-                    .parse()
-                    .map_err(|_| tonic::Status::invalid_argument("bearer token is not ASCII"))?,
-            );
-        }
-        Ok(req)
-    }
-}
-
-type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
-
-/// Ensure the endpoint carries a scheme so `Channel::from_shared` parses it
-/// — the CR's `coordinator_url` may be set scheme-less (mirrors the cli).
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.contains("://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    }
-}
+type FleetClient = FleetServiceClient<InterceptedService<Channel, Bearer>>;
 
 pub struct CoordClient {
     fleet: FleetClient,
@@ -100,18 +61,13 @@ pub struct CoordClient {
 impl CoordClient {
     /// `endpoint` is the coordinator's app-gRPC address (e.g.
     /// `http://engram-coordinator:50061`), from the CR's `coordinator_url`.
-    /// Connects lazily (`connect_lazy`) so construction stays infallible +
-    /// synchronous; a down coordinator surfaces as `Unavailable` on the
-    /// first RPC (which the reconcile loop already requeues on).
+    /// It connects lazily; a down coordinator surfaces as `Unavailable` on
+    /// the first RPC, which the reconcile loop requeues.
     pub fn new(endpoint: String, token: Option<String>) -> Self {
-        let endpoint = normalize_endpoint(&endpoint);
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .unwrap_or_else(|e| panic!("invalid coordinator gRPC endpoint {endpoint:?}: {e}"))
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .connect_lazy();
-        let fleet = FleetServiceClient::with_interceptor(channel, BearerFn { token });
-        Self { fleet }
+        let channel = engram_upgrade_drain::channel(&endpoint, Duration::from_secs(10));
+        Self {
+            fleet: FleetServiceClient::with_interceptor(channel, Bearer::new(token)),
+        }
     }
 
     /// `FleetService.CordonHost` — stop the picker placing new sessions on
@@ -132,14 +88,10 @@ impl CoordClient {
     }
 
     /// ADR 0116 A-D2: `FleetService.BeginHostHandoff` — declare the
-    /// planned roll so the coordinator's binding-lease deadline covers
-    /// the whole pod replacement. ANY failure is an error the caller
-    /// treats exactly like a cordon failure: with the A3 cutover the
-    /// lease is the ONLY shield (the staleness heuristics that used to
-    /// cover an undeclared roll are retired), so a roll must never
-    /// delete the pod without a durable deadline in PG. (The
-    /// Unimplemented-tolerant arm for pre-A2 coordinators died here in
-    /// A3, per the ADR's scaffolding ledger — coord fleet ≥ A2.)
+    /// planned roll so the coordinator's binding-lease deadline covers the
+    /// whole pod replacement. The lease is the only shield for a roll, so
+    /// the caller treats any failure like a cordon failure and never deletes
+    /// the pod without a durable deadline in PG.
     pub async fn handoff(&self, host: HostId, ttl_secs: u64) -> Result<bool, OperatorError> {
         self.fleet
             .clone()
@@ -218,6 +170,14 @@ impl CoordClient {
     /// `FleetService.ListHosts` — every host's load + budget, for the
     /// scale-down wave planner's victim selection + 2D capacity guard.
     pub async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
+        self.host_views()
+            .await?
+            .into_iter()
+            .map(host_view_to_load)
+            .collect()
+    }
+
+    async fn host_views(&self) -> Result<Vec<app::HostView>, OperatorError> {
         let resp = self
             .fleet
             .clone()
@@ -227,11 +187,7 @@ impl CoordClient {
                 op: "list_hosts",
                 status: Box::new(status),
             })?;
-        resp.into_inner()
-            .hosts
-            .into_iter()
-            .map(host_view_to_load)
-            .collect()
+        Ok(resp.into_inner().hosts)
     }
 
     /// Read the host for the image roll enable-work gate.
@@ -283,11 +239,8 @@ impl CoordClient {
 
 /// proto `HostView` → the operator's `HostLoad` (the wave-relevant subset).
 fn host_view_to_load(v: app::HostView) -> Result<HostLoad, OperatorError> {
-    let id: HostId = v.id.parse().map_err(|_| {
-        OperatorError::Invalid(format!("coordinator returned malformed host id {:?}", v.id))
-    })?;
     Ok(HostLoad {
-        id,
+        id: engram_upgrade_drain::parse_host_id(&v.id)?,
         cordoned: v.cordoned,
         running_sandboxes: v.running_sandboxes,
         reserved_mib: v.reserved_mib,

@@ -336,8 +336,7 @@ impl<F: EndpointFactory> TunnelPool<F> {
     ) -> tokio::task::JoinHandle<()> {
         let pool = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(period);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut interval = engram_core::periodic(period);
             interval.tick().await;
             loop {
                 interval.tick().await;

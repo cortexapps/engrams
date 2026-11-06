@@ -5,15 +5,13 @@ import type { IndexedEvent } from "@/lib/types";
 
 /**
  * The working indicator is the only thing that tells a spec owner the agent is
- * still on it. A prod spec ran one Bash tool call for THIRTY minutes while the
- * pane looked idle, which reads as a dead session — the natural response is to
- * re-send the instruction, or give up on the spec.
+ * still on it. A long tool call with an idle-looking pane reads as a dead
+ * session.
  *
- * This replays that session's real event sequence (spec 7f9a275a, idx 143-155)
- * to pin the invariant the indicator depends on: a run stays open across a long
- * tool call, and a prompt steered INTO that run does not end it. Two prompts
- * arrived mid-call there and both were honored after the call returned, so a
- * steer must never read as "the turn is over".
+ * This replays a real event sequence to pin the invariant the indicator
+ * depends on: a run stays open across a long tool call, and a prompt steered
+ * INTO that run does not end it. Both prompts that arrive mid-call are honored
+ * after the call returns, so a steer must never read as "the turn is over".
  */
 const SEQUENCE: Array<Record<string, unknown>> = [
   { type: "harness_parked" },

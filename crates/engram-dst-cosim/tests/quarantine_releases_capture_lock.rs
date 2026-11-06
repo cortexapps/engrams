@@ -1,4 +1,4 @@
-//! Rung 2 (ADR 0098 R-CoSim, #784, deliverable 5): the capture-lock release
+//! ADR 0098 R-CoSim (#784, deliverable 5): the capture-lock release
 //! pin.
 //!
 //! #783 gave the teardown-reconcile ownership check a `capture_in_flight`
@@ -11,7 +11,7 @@
 //!
 //! Rung 1's finalize-convergence oracle implies this only indirectly. This test
 //! pins it directly against the REAL `run_eviction_finalize_attempt`: force a
-//! finalize to quarantine (every redrive fails on a deleted staging dir) and
+//! finalize to quarantine (every redrive fails on deleted inputs) and
 //! assert `capture_in_flight → false`.
 
 use engram_dst_cosim::host::{FinalizeTickOutcome, FINALIZE_MAX_ATTEMPTS};
@@ -33,9 +33,9 @@ async fn quarantined_finalize_releases_the_capture_lock() {
         "the capture lock is held while the finalize is in flight (#783 exemption applies)"
     );
 
-    // Sabotage the staging dir so every redrive attempt fails (the ENOENT
+    // Remove the finalize's inputs so every redrive attempt fails (the ENOENT
     // class), driving the REAL finalizer to quarantine after the budget.
-    sim.sabotage_finalize_staging(sandbox).await;
+    sim.sabotage_finalize_inputs(sandbox).await;
 
     let mut quarantined = false;
     for _ in 0..(FINALIZE_MAX_ATTEMPTS + 2) {

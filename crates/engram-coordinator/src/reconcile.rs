@@ -7,13 +7,10 @@
 //! consecutive heartbeats (default 3, ~15 s at the 5 s cadence)
 //! transition per the missing-sandbox policy:
 //!
-//! - latest `snapshots` row has `recoverable = true`, OR the session
-//!   carries a live disk manifest → `Idle` (next user prompt rehydrates
-//!   via the existing resume / disk-only cold-boot path).
-//! - else → `Dead` (terminal). Issue #777 honest-Dead: an un-recoverable
-//!   snapshot row is NOT enough — the shared `dead_host::recovery_target`
-//!   predicate keys on the `recoverable` flag, never mere row presence,
-//!   so we never land an `Idle` that lies about resumability.
+//! - latest `snapshots` row has `recoverable = true` → `Idle` (the next
+//!   user prompt resumes it).
+//! - else → `Dead` (terminal). The shared `dead_host::recovery_target`
+//!   predicate keys on the `recoverable` flag, never mere row presence.
 //!
 //! This closes case **B** from the failure-mode taxonomy (Active
 //! sessions stuck pointing at sandbox_ids that no longer exist
@@ -125,6 +122,11 @@ impl Reconciler {
     /// avoiding the window where a concurrent reader sees a stale
     /// in-memory route after PG already knows the session is
     /// HostLost.
+    #[tracing::instrument(
+        name = "coord.reconcile",
+        skip_all,
+        fields(host_id = %host_id, running = running_sandboxes.len())
+    )]
     pub async fn reconcile_with_deps(
         &self,
         meta: &dyn MetadataStore,
@@ -260,13 +262,9 @@ async fn flip_missing(
     // ADR 0068 probe-before-host_lost: before flipping on nothing but
     // absence from the host's self-reported `running_sandboxes`, ask
     // the host directly whether the VMM process for THIS sandbox is
-    // actually alive. Rescues the fbd3794c incident shape (a provably-
-    // alive VM — in-guest uptime + a surviving marker file — declared
-    // `host_lost` and "resumed" 8 times in 12 minutes while the host
-    // was reachable the entire time): the desync producing a stale
-    // `running_sandboxes` list belongs to epic-binding-epoch-delivery;
-    // this is the belt that stops the coordinator killing sessions
-    // over it. A probe error (RPC unreachable, or `Unsupported` from
+    // actually alive. A stale `running_sandboxes` list must not make
+    // the coordinator declare a live VM `host_lost` and resume it over
+    // and over while the host stays reachable. A probe error (RPC unreachable, or `Unsupported` from
     // an old host-agent mid-roll with no `ProbeSandbox` handler yet)
     // falls through to the flip unchanged — only an explicit
     // `process_alive == true` answer rescues.
@@ -404,26 +402,10 @@ async fn flip_missing(
     // HostLost -> {Idle, Dead} via the ONE shared predicate
     // `dead_host::recovery_target`. A session is recoverable iff its
     // latest snapshot's `recoverable` flag is true (the BlobStorage HEAD
-    // result at snapshot-take time — false means even an Idle-ready
-    // snapshot wouldn't survive a /resume) OR it has a live disk manifest
-    // (disk-only cold-boot resume). Before #777 this site ignored the
-    // manifest (a disk-recoverable session could be lied into Dead) and
-    // the two dead-host sites keyed on mere snapshot presence (an
-    // un-recoverable snapshot could be lied into Idle) — the shared
-    // predicate closes both directions.
-    // ADR 0116 A4: the shared settle. NOTE the error-posture change
-    // from the pre-A4 copy this replaces: a snapshot-read error now
-    // leaves the row at HostLost for the straggler sweep (the old copy
-    // treated it as not-recoverable — a PG blip could terminally Dead a
-    // recoverable session, a latent honest-Dead violation).
-    crate::dead_host::settle_host_lost(
-        meta,
-        events,
-        session_id,
-        Some(session.live_disk_manifest.is_some()),
-        now,
-    )
-    .await;
+    // result at snapshot-take time; false means even an Idle-ready
+    // snapshot would not survive a /resume).
+    // ADR 0116 A4: the shared settle.
+    crate::dead_host::settle_host_lost(meta, events, session_id, now).await;
     // The Active -> HostLost transition above landed regardless of
     // whether stage 2 (HostLost -> {Idle,Dead}) also succeeded — the
     // session left Active, which is what `to_flip` promises callers.
@@ -492,7 +474,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 /// empty set for one tick; next tick recovers).
 pub fn spawn_in_proc(state: SharedState, tick: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tick);
+        let mut interval = engram_core::periodic(tick);
         // Skip the immediate-fire first tick so a coord that's just
         // bound the local backend doesn't insta-strike a session
         // whose create() is mid-flight.
@@ -557,7 +539,7 @@ mod tests {
     /// wildcard-free so a new `SessionState` variant is a compile error
     /// here, not a silent inherit. The e2e stack caught the cost of
     /// getting this wrong in both directions: Active-only missed
-    /// vanished parked VMs (61a03b7e audit finding 3); every-resident
+    /// vanished parked VMs; every-resident
     /// struck the ADR 0101 C post-capture `Evicting` window and flipped
     /// clean evictions to HostLost.
     #[test]

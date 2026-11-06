@@ -142,7 +142,6 @@ use engram_core::{HostId, SessionId, SnapshotId};
 pub struct SessRow {
     pub mcp_write_policy: Option<engram_core::types::mcp_policy::StoredWritePolicy>,
     pub mcp_policy_parent_id: Option<SessionId>,
-    pub nbd_slot_need: u32,
     pub session: Session,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,

@@ -1,11 +1,10 @@
-//! ADR 0103 regression for prod session `6d403c4b` on 2026-07-23.
+//! ADR 0103 regression: a periodic checkpoint severs an exec mid-stream.
 //!
-//! The review bootstrap emitted `exec_started` at 15:03:46 and one
-//! `Cloning into…` stderr chunk. A periodic checkpoint completed at 15:04:09,
-//! its vsock `TRANSPORT_RESET` silently forgot the guest connection without
-//! host EOF, and the caller then saw 20+ minutes of silence. Before durable
-//! exec, the host reader parked in `read_msg` forever and the coordinator
-//! never persisted `exec_completed`.
+//! The exec emits `exec_started` and one stderr chunk. A checkpoint then
+//! completes, and its vsock `TRANSPORT_RESET` silently forgets the guest
+//! connection without host EOF. Without durable exec, the host reader
+//! parks in `read_msg` forever and the coordinator never persists
+//! `exec_completed`.
 //!
 //! This scenario composes the real coordinator `exec_stream_core`, the real
 //! Firecracker host protocol driver, and a real agentd journal handler. Only

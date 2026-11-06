@@ -36,8 +36,8 @@ const MIB: u64 = 1024 * 1024;
 /// a percent of the filesystem (0-100) — the line
 /// [`metrics::HOST_DISK_HEADROOM_TO_KUBELET_BYTES`] measures distance
 /// to. Default 10 matches GKE's documented `nodefs.available < 10%`
-/// default and is consistent with the 611v prod incident's arithmetic
-/// (31,259,425,233 B free at eviction ≈ 10.5% of a 298.1 GB disk).
+/// default and matches an observed eviction at ≈ 10.5% free of a
+/// 298.1 GB disk.
 ///
 /// TODO(ADR 0070): this is a placeholder pending confirmation against
 /// the actual nodepool/kubelet config in the engrams-internal deploy
@@ -109,14 +109,12 @@ impl UtilizationProbe {
         let (disk_total_mib, disk_used_mib) = self.sample_disk(work_dir);
         let cpu_pct = self.cpu_pct();
         HostUtilization {
-            nbd_slots_total: 0,
-            nbd_slots_in_use: 0,
-            nbd_sandboxes: Default::default(),
+            pool_data_free_mib: 0,
+            pool_data_total_mib: 0,
+            pool_metadata_free_mib: 0,
+            pool_metadata_total_mib: 0,
             disk_total_mib,
             disk_used_mib,
-            // ADR 0112: filled by the heartbeat loop from
-            // `publish_disk_co_tenants` (needs the backend, which the
-            // probe deliberately doesn't hold).
             mem_total_mib: ledger.mem_total_mib,
             mem_used_mib: ledger
                 .mem_total_mib

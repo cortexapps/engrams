@@ -24,12 +24,7 @@ use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::{
     ForgeRequest, ForgeResponse, HarnessEvent, UploadRequest, UploadResponse,
 };
-// ADR 0098 Phase 2: the coordinator control-plane seam + its portable
-// types live in engram-host-core. `HttpCoordClient` implements
-// `CoordControlPlane` below.
-use engram_host_core::{
-    CoordControlPlane, CoordError, LiveManifestPublishRequest, LiveManifestPublishResponse,
-};
+use engram_host_core::{CoordControlPlane, CoordError};
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use engram_protocol::heartbeat::HostCapacityReport;
 use serde::{Deserialize, Serialize};
@@ -112,13 +107,9 @@ impl HttpCoordClient {
             // activity) but ensures slower lanes always pick a fresh
             // connection. Per-request overhead is one TCP connect
             // (~5-10ms over the internal LB) — negligible against
-            // the workload.
-            //
-            // Surfaced on 2026-05-23 during the COW diagnostic
-            // spot-check on session 96392fd3: the host's
-            // idle-eviction POSTs failed with `transport error`
-            // while heartbeats on the same `HttpCoordClient` succeeded.
-            // Diagnosis: stale pool connection, exactly this class.
+            // the workload. Without it, a slow lane picks a stale
+            // pooled connection and fails with `transport error` while
+            // heartbeats on the same client succeed.
             .pool_idle_timeout(Some(Duration::from_secs(10)))
             .timeout(Duration::from_secs(30))
             .build()
@@ -339,55 +330,11 @@ impl HttpCoordClient {
     }
 }
 
-/// The three decision-feeding coordinator calls the host-agent's
-/// lifecycle flows make (ADR 0098 Phase 2). Behind the
-/// [`CoordControlPlane`] seam so the host-internal simulator can supply an
-/// adversarial scripted stub; the bodies moved here wholesale from the
-/// inherent surface (no duplicate inherent copies — callers bring the
-/// trait into scope).
+/// The decision-feeding coordinator calls the host-agent's lifecycle flows
+/// make (ADR 0098 Phase 2), behind the [`CoordControlPlane`] seam so the
+/// boundary simulator can answer them. Callers bring the trait into scope.
 #[async_trait]
 impl CoordControlPlane for HttpCoordClient {
-    /// POST /api/v1/hosts/:id/live-manifest
-    ///
-    /// ADR 0016 Phase B: tells coord that the host just flushed
-    /// `(sandbox_id, manifest_ref)` so `sessions.live_disk_manifest_*`
-    /// can be updated. Coord's UPDATE is gated on `sandbox_id` match,
-    /// so a stale publish (sandbox destroyed/rebound) returns
-    /// `LiveManifestPublishOutcome::Stale` and the host should NOT
-    /// retry; staleness is structural, not transient.
-    ///
-    /// Publishes are tiny (sub-100-byte payload) and fast; the
-    /// shared client's 30s default timeout is plenty. No per-request
-    /// override here, unlike the eviction lane in A.1.5a.
-    async fn publish_live_manifest(
-        &self,
-        host_id: HostId,
-        req: &LiveManifestPublishRequest,
-    ) -> Result<LiveManifestPublishResponse, CoordError> {
-        let url = self.endpoint(&format!("/hosts/{host_id}/live-manifest"));
-        let builder = self.http.post(&url);
-        let resp = match self.auth(builder, req).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // ADR 0016 §A.1.3 pattern: log transport-error
-                // breakdown for ops diagnosis. Don't escalate to
-                // warn — a single stale-pool error is benign; the
-                // drain task retries on the next wake.
-                tracing::debug!(
-                    %host_id,
-                    is_connect = e.is_connect(),
-                    is_timeout = e.is_timeout(),
-                    is_request = e.is_request(),
-                    is_body = e.is_body(),
-                    error = %e,
-                    "publish_live_manifest transport error",
-                );
-                return Err(CoordError::Transport(e.to_string()));
-            }
-        };
-        decode_json(resp, "publish_live_manifest").await
-    }
-
     /// POST /api/v1/hosts/:id/idle-eviction-candidates
     /// ADR 0045: the export-TTL ownership check. `Ok(true)` = the
     /// coordinator still binds this sandbox to the session (the move
@@ -431,8 +378,8 @@ impl CoordControlPlane for HttpCoordClient {
 
     /// ADR 0090: the unknown-binding ownership form — "does ANY session
     /// own this sandbox on me?" Used by the teardown reconciler when the
-    /// local binding table has no entry (fresh generation after a roll
-    /// whose NBD rehydrate failed). Returns the owning session id so the
+    /// local binding table has no entry (a fresh generation after a roll
+    /// that missed the registration ack). Returns the owning session id so the
     /// caller can repopulate its binding table.
     async fn sandbox_owner(
         &self,
@@ -502,11 +449,8 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub server_time: DateTime<Utc>,
     pub coord_wire_version: u32,
-    /// ADR 0016 Phase B commit 7: rehydration list. One entry per
-    /// Active session bound to this host with a chunked-disk
-    /// manifest PG knows about. Empty on first registration / no
-    /// survivors. Coord-side: see
-    /// `engram_coordinator::api::host_http::RehydrateSandboxRef`.
+    /// Every VM-resident binding PG still holds for this host; empty on
+    /// a first registration.
     #[serde(default)]
     pub rehydrate_sandboxes: Vec<RehydrateSandboxRef>,
 }
@@ -515,8 +459,6 @@ pub struct RegisterResponse {
 pub struct RehydrateSandboxRef {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
-    pub disk_manifest_id: Option<uuid::Uuid>,
-    pub disk_manifest_version: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -603,10 +545,6 @@ pub struct HeartbeatRequest {
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined —
-    /// re-advertised until destroyed; the coord drives evict_local.
-    #[serde(default)]
-    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: guests whose control plane stopped answering (the
     /// checkpoint driver's 3/3-probe verdict) — `(sandbox_id,
     /// session_id)` pairs, re-advertised until a successful capture or
@@ -614,21 +552,6 @@ pub struct HeartbeatRequest {
     /// Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
-    /// engrams#1378: sandboxes whose kernel NBD binding survives on this
-    /// host as attributed residue of an interrupted teardown (a destroy that
-    /// died between the FC kill and the NBD disconnect, attributed via the
-    /// durable owner records). The coordinator counts these as PRESENT for
-    /// tombstone ack-by-absence and the ADR 0116 A5 unbound-entomb arm, so
-    /// the tombstone stays advertised until the binding is actually gone.
-    #[serde(default)]
-    pub device_residue_sandboxes: Vec<SandboxId>,
-    /// engrams#1378: `false` until this generation's startup classification
-    /// barrier has run (or the host has no NBD data plane). The issue-#215
-    /// asymmetry, applied to residue: an unclassified generation's empty
-    /// residue list is "no information", and the coordinator must withhold
-    /// tombstone ack-by-absence against it — exactly the window the
-    /// 2026-08-25 incident's tombstone was wrongly acked in.
-    pub device_residue_known: bool,
 }
 
 #[derive(Deserialize)]
@@ -816,10 +739,7 @@ mod tests {
             capabilities: Default::default(),
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
-            quarantined_survivors: Vec::new(),
             unreachable_guests: Vec::new(),
-            device_residue_sandboxes: Vec::new(),
-            device_residue_known: true,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

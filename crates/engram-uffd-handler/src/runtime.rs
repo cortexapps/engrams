@@ -52,6 +52,7 @@ use tokio::runtime::Handle as TokioHandle;
 use userfaultfd::{Event, Uffd};
 
 use crate::chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
+use crate::fault_stats::{self, Source};
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 use crate::working_set::WorkingSetRecorder;
 
@@ -640,6 +641,33 @@ impl Runtime {
         self.trace_output = Some(path);
     }
 
+    /// Log the memory manifest's composition once.
+    fn log_composition(&self) {
+        let c = self.backend.composition();
+        let canonical_in_shm = self.base_shm.as_ref().map(|base| {
+            let chunk_size = self.backend.chunk_size();
+            let total = self.backend.total_bytes();
+            (0..total.div_ceil(chunk_size))
+                .map(|i| i * chunk_size)
+                .filter(|&off| {
+                    matches!(
+                        self.backend.resolve(off),
+                        Some(ResolvedPage::Canonical { .. })
+                    ) && base.is_populated(off, chunk_size.min(total - off))
+                })
+                .count()
+        });
+        tracing::info!(
+            canonical = c.canonical,
+            canonical_in_shm,
+            divergent = c.divergent,
+            divergent_local = c.divergent_local,
+            zero = c.zero,
+            chunk_size = self.backend.chunk_size(),
+            "memory manifest composition"
+        );
+    }
+
     /// The per-jail `prefault-stats.json` sibling of this run's
     /// `--trace-output` path, or `None` when no `--trace-output` was
     /// given (VZ/Process backends never spawn this binary; a test
@@ -778,7 +806,7 @@ impl Runtime {
     /// (the checkpoint chain's accumulated diff — hundreds of 512 KiB
     /// chunks, all prestaged on local NVMe) faulted in one at a time
     /// through the single-threaded fault loop: the residual ~27 s
-    /// post-teleport guest crawl (prod canary 51d51740). Idempotent
+    /// post-teleport guest crawl. Idempotent
     /// against the fault loop via the `installed` bitmap; `wake=false`
     /// (no vCPU waits on a page it hasn't faulted).
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
@@ -1350,14 +1378,19 @@ impl Runtime {
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
     pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
-        let mut faults_served: u64 = 0;
         loop {
             match self.uffd.read_event() {
                 Ok(Some(Event::Pagefault { addr, .. })) => {
-                    self.serve_pagefault(addr as u64)?;
-                    faults_served += 1;
-                    if faults_served.is_power_of_two() {
-                        tracing::info!(faults_served, "served page fault");
+                    let started = std::time::Instant::now();
+                    fault_stats::take_fetch_source();
+                    let arm = self.serve_pagefault_classified(addr as u64)?;
+                    let source = match arm {
+                        Source::Peer => Source::Peer,
+                        arm => fault_stats::take_fetch_source().unwrap_or(arm),
+                    };
+                    let served = fault_stats::STATS.record_fault(source, started.elapsed());
+                    if served.is_power_of_two() {
+                        fault_stats::STATS.log("pow2");
                         // ADR 0014 M1.14: dump trace_output on the
                         // same log-cadence so a hung run loop still
                         // produces a usable file. Cheap (~1 KiB
@@ -1388,10 +1421,7 @@ impl Runtime {
                     return Ok(());
                 }
                 Err(userfaultfd::Error::ReadEof) => {
-                    tracing::info!(
-                        faults_served,
-                        "uffd closed by firecracker; handler exiting cleanly"
-                    );
+                    tracing::info!("uffd closed by firecracker; handler exiting cleanly");
                     return Ok(());
                 }
                 Err(e) => return Err(HandlerError::Uffd(e)),
@@ -1463,7 +1493,18 @@ impl Runtime {
         }
     }
 
+    #[cfg(test)]
     fn serve_pagefault(self: &Arc<Self>, fault_addr: u64) -> Result<(), HandlerError> {
+        self.serve_pagefault_classified(fault_addr).map(|_| ())
+    }
+
+    /// Serve one fault and return where its bytes came from. A chunk
+    /// fetch overrides the returned source through
+    /// [`fault_stats::set_fetch_source`].
+    fn serve_pagefault_classified(
+        self: &Arc<Self>,
+        fault_addr: u64,
+    ) -> Result<Source, HandlerError> {
         // Locate the region this fault came from to translate
         // host_va → byte_offset (the inverse of `locate_offset`).
         let region = self
@@ -1492,7 +1533,7 @@ impl Runtime {
                     // Drain (or an earlier fault) already landed it; the
                     // vCPU queued before the install — wake it.
                     self.wake_page(page_aligned, page_size)?;
-                    return Ok(());
+                    return Ok(Source::Wake);
                 }
                 // ADR 0045 C2 / issue #227 (a): once the drain has pulled
                 // every sealed chunk, the source's export may be torn down
@@ -1517,17 +1558,17 @@ impl Runtime {
                     );
                     if offsets.is_empty() {
                         self.wake_page(page_aligned, page_size)?;
-                        return Ok(());
+                        return Ok(Source::Wake);
                     }
                     match self.serve_fault_window(peer, offsets, chunk_byte_offset) {
                         Ok(()) => {
                             self.wake_page(page_aligned, page_size)?;
-                            return Ok(());
+                            return Ok(Source::Peer);
                         }
                         Err(e) => {
                             if self.chunk_installed(chunk_idx) {
                                 self.wake_page(page_aligned, page_size)?;
-                                return Ok(());
+                                return Ok(Source::Wake);
                             }
                             self.report_window_failure(peer, &e.to_string());
                             return Err(e);
@@ -1537,7 +1578,7 @@ impl Runtime {
             }
         }
 
-        match self
+        let source = match self
             .backend
             .resolve(chunk_byte_offset)
             .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
@@ -1579,6 +1620,9 @@ impl Runtime {
                             // kernel may have queued the fault before our
                             // earlier prefault landed.
                             self.wake_page(page_aligned, page_size)?;
+                            Source::Wake
+                        } else {
+                            Source::Shm
                         }
                     }
                     None => {
@@ -1589,6 +1633,9 @@ impl Runtime {
                         };
                         if !installed {
                             self.wake_page(page_aligned, page_size)?;
+                            Source::Wake
+                        } else {
+                            Source::Zero
                         }
                     }
                 }
@@ -1608,6 +1655,7 @@ impl Runtime {
                 if !installed {
                     self.wake_page(page_aligned, page_size)?;
                 }
+                Source::Wake
             }
             ResolvedPage::Zero { offset } => {
                 // Session omits this offset → authoritative zero page,
@@ -1620,11 +1668,14 @@ impl Runtime {
                 };
                 if !installed {
                     self.wake_page(page_aligned, page_size)?;
+                    Source::Wake
+                } else {
+                    Source::Zero
                 }
             }
-        }
+        };
 
-        Ok(())
+        Ok(source)
     }
 
     /// Cheap read of whether a chunk is fully `Installed` (a chunk that
@@ -2208,6 +2259,14 @@ pub fn run_listener(
     // sound. Previously prefault ran to completion before `run()`, which put
     // the entire working-set fetch on the resume critical path.
     let rt = Arc::new(rt);
+    {
+        // Off the fault path: the composition stats every divergent chunk.
+        let composition = Arc::clone(&rt);
+        let _ = std::thread::Builder::new()
+            .name("engram-uffd-composition".to_string())
+            .spawn(move || composition.log_composition());
+        fault_stats::spawn_periodic_log();
+    }
     let prefault_thread = {
         let rt = Arc::clone(&rt);
         std::thread::Builder::new()
@@ -2351,6 +2410,7 @@ pub fn run_listener(
     tracing::info!(pid, "starting fault loop");
     let result = rt.run();
     tracing::info!(pid, ?result, "fault loop returned");
+    fault_stats::STATS.log("exit");
     rt.stop_fault_window();
     // Join the prefault producer before freezing the recorder so it's
     // quiesced. Once the uffd closes (FC exited) the prefault's next install

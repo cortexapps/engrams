@@ -3,8 +3,7 @@
 //! The host attaches at most one WRITABLE non-vda virtio disk — the
 //! swap drive (`SandboxSpec.swap_mib`; every aux bundle attaches
 //! read-only, and vda is the rootfs). This module finds it, runs
-//! `mkswap` + `swapon`, and applies the reclaim sysctls sized for a
-//! guest whose file pages live on chunked-NBD backing.
+//! `mkswap` + `swapon`, and applies the reclaim sysctls.
 //!
 //! Cold boots and session binds arm inactive devices.
 //! An existing swap signature is never reformatted.
@@ -16,11 +15,10 @@ use std::path::{Path, PathBuf};
 /// `vm.*` sysctls applied when (and only when) a swap device is armed.
 ///
 /// - `swappiness=100` (kernel 6.1 range 0-200): "anonymous and file
-///   reclaim cost the same." Post-#1044 that is approximately true
-///   (ranged-pread refault ≈ swap-in on the same NVMe), and the
-///   measured incident (session f660f022, 22:1 scan-to-steal) was the
-///   default 60 forcing reclaim onto hot NBD-backed file pages because
-///   anon was unreclaimable.
+///   reclaim cost the same." That is approximately true here: a file
+///   refault and a swap-in both read a volume on the same local disk.
+///   The default 60 forces reclaim onto hot file pages because anon is
+///   unreclaimable (measured at 22:1 scan-to-steal).
 /// - `page-cluster=0`: swap readahead is 2^n pages; swap-in here is
 ///   random 4 KiB against fast backing — cluster reads only amplify
 ///   I/O during exactly the reclaim storms swap exists to survive.

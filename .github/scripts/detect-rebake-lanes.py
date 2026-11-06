@@ -88,20 +88,11 @@ from pathlib import Path
 # Binaries that bake into each artifact.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"}
 
-# ADR 0098 P9: the host-internal simulation lane. Gated on the release
-# closure of the sim binary's own crate — engram-dst-host pulls
-# engram-host-agent + engram-host-core + engram-sim + the chunk/storage
-# crates as NORMAL deps, so any change that can alter host-sim behavior
-# trips the lane, and nothing else does (disjoint from engram-dst's
-# coordinator closure by construction — the two sims share no sim crate
-# dep direction).
-HOST_SIM_BINS = {"engram-dst-host"}
-
-# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator. Unlike
-# the two disjoint sims above, engram-dst-cosim deliberately spans BOTH
-# closures — it pulls engram-coordinator AND engram-host-agent/-core +
-# engram-dst-host + engram-sim as normal deps — so any change that can alter
-# either side's boundary behavior trips this lane. Its own release closure
+# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator.
+# engram-dst-cosim deliberately spans BOTH closures — it pulls
+# engram-coordinator AND engram-host-agent/-core + engram-sim as normal deps
+# — so any change that can alter either side's boundary behavior trips this
+# lane. Its own release closure
 # is therefore the union that gates `test-cosim`.
 COSIM_BINS = {"engram-dst-cosim"}
 # engram-host-operator (ADR 0044 K3) bakes into its own container image; add
@@ -197,6 +188,12 @@ IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "mcp-worker/", "deploy/migra
 # not in the image's base still surfaces on main, as it does today.)
 DOCKERFILE_PATHS = ["docker/"]
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
+# Node prep's pool script and the test that builds every pool state it can
+# find; that test runs on the Firecracker root lane, which needs /dev/kvm.
+FC_POOL_PATHS = [
+    "deploy/helm/engram-host-fleet/files/thin-pool.sh",
+    "scripts/thin-pool-states-test.sh",
+]
 # ADR 0027: the RO session bundles (skills / browser / …). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image
 # re-baked to pull the new squashfs. Independent of the Rust/OS lanes.
@@ -252,7 +249,7 @@ E2E_PATHS = [
 ]
 
 
-# ── PR test-lane gating (ci.yml + ci-macos-vz.yml) ─────────────────────
+# ── PR test-lane gating (ci.yml) ─────────────────────
 # These gate the CI *test* lanes (not the bake lanes above) so a change only
 # runs the lanes it can affect. Protos live in the engram-protocol crate, so a
 # proto change is already in every Rust binary's closure (→ cc, host_binaries,
@@ -446,7 +443,6 @@ def main():
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
-    host_sim_closure = release_closure(meta, HOST_SIM_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
     cli = release_closure(meta, CLI_BINS)
 
@@ -589,7 +585,8 @@ def main():
     # fixtures and mount bundles via the sandbox crates already in the closure;
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
-    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(changed, ["sandbox-netstack/"])
+    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(
+        changed, FC_POOL_PATHS + ["sandbox-netstack/"])
     # web / orchestrator: their own sources or the protos they codegen from.
     # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
@@ -603,8 +600,6 @@ def main():
     test_deploy = ci_self or tf_or_helm or any_path(changed, ["docker/web.Dockerfile"])
     # The site lane: leak lint + astro build, build-only (no deploy on PRs).
     test_site = ci_self or any_path(changed, SITE_PATHS)
-    # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
-    test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
     # release closure.
     test_cosim = ci_self or bool(cc & cosim_closure)
@@ -687,7 +682,7 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
+          f"test_cosim={test_cosim} "
           f"test_integrations_cli={test_integrations_cli} "
           f"test_deploy={test_deploy} test_site={test_site}",
           file=sys.stderr)
@@ -714,7 +709,7 @@ def main():
             f.write(f"e2e={b(e2e)}\n")
             f.write(f"e2e_matrix={json.dumps({'include': e2e_matrix})}\n")
             f.write(f"e2e_full_matrix={json.dumps({'include': e2e_full_matrix})}\n")
-            # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
+            # PR test lanes (ci.yml gates on these).
             f.write(f"test_rust={b(test_rust)}\n")
             f.write(f"test_mcp_worker={b(test_mcp_worker)}\n")
             f.write(f"test_mcp_physical={b(test_mcp_physical)}\n")
@@ -724,7 +719,6 @@ def main():
             f.write(f"test_web={b(test_web)}\n")
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
-            f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             f.write(f"test_deploy={b(test_deploy)}\n")

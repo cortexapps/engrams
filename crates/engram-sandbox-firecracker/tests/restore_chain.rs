@@ -32,10 +32,9 @@
 //! regression gate: it must get through at least two chained restores
 //! across BOTH devices.
 //!
-//! Flat-file rootfs (not NBD) is sufficient to reproduce — the bug
-//! lives in the canonical-path stamping layer
-//! (`source_{rootfs,vsock}_canonical`), identical for flat-file and
-//! NBD-backed rootfs.
+//! A flat-file rootfs is sufficient: the canonical-path stamping
+//! (`source_{rootfs,vsock}_canonical`) does not depend on what backs
+//! the drive.
 //!
 //! ADR 0021 P1.5 retired the harness virtio-blk drive (the harness
 //! lives in the rootfs now), so §12p's harness-drive lineage gate
@@ -62,6 +61,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
@@ -117,7 +117,11 @@ async fn chained_restore_snapshot_lineage_holds() {
 
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the
     // snapshot we restore the first hop from.
-    let source_id = backend.create(spec).await.expect("create source");
+    let source_id = SandboxId::new();
+    backend
+        .create(source_id, spec)
+        .await
+        .expect("create source");
     // Fixed settle before S1. This test RE-snapshots a VM restored from S1, so
     // S1 must capture a fully-settled guest; a bare kernel-banner poll snapshots
     // too early and the restored VM is then too fragile to re-snapshot (FC
@@ -141,8 +145,9 @@ async fn chained_restore_snapshot_lineage_holds() {
     let mut seen = std::collections::HashSet::new();
     seen.insert(source_id);
     for hop in 1..=HOPS {
-        let restored = backend
-            .restore(metadata.clone())
+        let restored = SandboxId::new();
+        backend
+            .restore(restored, metadata.clone(), common::disks(&local_rootfs))
             .await
             .unwrap_or_else(|e| panic!("hop {hop}: restore failed: {e}"));
         assert!(

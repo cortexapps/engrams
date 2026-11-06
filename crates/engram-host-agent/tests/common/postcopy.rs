@@ -42,8 +42,9 @@ pub async fn base(
 }
 
 pub async fn fresh(pooled: &Arc<PooledBackend>, base: SnapshotMetadata) -> SandboxId {
-    let vm = pooled
-        .restore_fresh(base, Vec::new())
+    let vm = SandboxId::new();
+    pooled
+        .restore_fresh(vm, base, None, Vec::new())
         .await
         .expect("File-mode fresh create");
     assert!(
@@ -63,7 +64,7 @@ pub fn metadata(
     row.disk_manifest = Some(
         presetup
             .disk_manifest_ref
-            .expect("post-copy source must have an NBD disk manifest"),
+            .expect("a post-copy source advertises its disk checkpoint"),
     );
     row.swap_manifest = presetup.swap_manifest_ref;
     row.source_sandbox_id = None;
@@ -123,66 +124,11 @@ pub async fn drain(pooled: &Arc<PooledBackend>, vm: SandboxId) {
     );
 }
 
-/// Check the fork and a consecutive set of NBD devices before a KVM test.
-/// Each live VM needs its own device, including a paused source.
-pub fn nbd_devices(count: usize) -> Option<Vec<std::path::PathBuf>> {
+/// The forked Firecracker the vmstate-only capture needs.
+pub fn fork_gate() -> Option<()> {
     if std::env::var_os("ENGRAM_FC_FORK_BIN").is_none() {
         eprintln!("SKIP: ENGRAM_FC_FORK_BIN not set");
         return None;
     }
-    let Some(first) = std::env::var("ENGRAM_TEST_NBD_DEVICE").ok() else {
-        eprintln!("SKIP: ENGRAM_TEST_NBD_DEVICE not set");
-        return None;
-    };
-    let prefix = first.trim_end_matches(|c: char| c.is_ascii_digit());
-    let Some(start) = first[prefix.len()..].parse::<usize>().ok() else {
-        eprintln!("SKIP: NBD device must end in a device number");
-        return None;
-    };
-    let mut devices = Vec::with_capacity(count);
-    for offset in 0..count {
-        let number = start.checked_add(offset)?;
-        let dev = std::path::PathBuf::from(format!("{prefix}{number}"));
-        if std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&dev)
-            .is_err()
-        {
-            eprintln!("SKIP: cannot open {} R/W", dev.display());
-            return None;
-        }
-        wait_until_free(&dev);
-        devices.push(dev);
-    }
-    Some(devices)
-}
-
-/// Wait for every device in `devices` to read as free (see
-/// [`wait_until_free`]). A test that re-attaches a device it just
-/// released calls this between the destroy and the next attach.
-pub fn wait_devices_free(devices: &[std::path::PathBuf]) {
-    for dev in devices {
-        wait_until_free(dev);
-    }
-}
-
-/// The previous test in this binary destroyed its VMs, but the kernel
-/// clears an NBD device's `pid` and zeroes its `size` only once the
-/// daemon's socket is gone, which lags the destroy by a moment. Attaching
-/// before that returns `EBUSY`. Wait for the kernel's free signal (the
-/// same two signals the slot allocator reads) for a bounded time; a
-/// device that stays busy still fails loudly at attach.
-fn wait_until_free(dev: &std::path::Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if super::nbd_release::kernel_released(dev) {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            eprintln!("{} still busy after 30 s; attaching anyway", dev.display());
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
+    Some(())
 }

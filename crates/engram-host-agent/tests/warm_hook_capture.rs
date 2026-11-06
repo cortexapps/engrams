@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::ids::SandboxId;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -90,7 +91,7 @@ async fn warm_hook_process_survives_base_snapshot() {
     let result = pooled
         .build_base_snapshot(
             engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -103,8 +104,9 @@ async fn warm_hook_process_survives_base_snapshot() {
 
     // Restore a fresh session from the captured base snapshot and confirm
     // the warmed process came back live (the snapshot froze it running).
-    let restored = pooled
-        .restore_fresh(result.snapshot, Vec::new())
+    let restored = SandboxId::new();
+    pooled
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("restore from warm base snapshot");
 
@@ -167,7 +169,7 @@ async fn warm_hook_sees_manifest_env() {
 
     // The probe rides the manifest `[env]` (SandboxSpec.env) — the same
     // channel JAVA_HOME/PATH travel on for a real image.
-    let mut spec = env.spec(&rootfs);
+    let mut spec = env.spec(rootfs);
     spec.env
         .insert("ENGRAM_WARM_ENV_PROBE".into(), "present".into());
 
@@ -188,8 +190,9 @@ async fn warm_hook_sees_manifest_env() {
 
     // Confirm the value the hook observed was the manifest one (not a stray
     // default), surviving into a restored session.
-    let restored = pooled
-        .restore_fresh(result.snapshot, Vec::new())
+    let restored = SandboxId::new();
+    pooled
+        .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
         .expect("restore");
     let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;
@@ -221,7 +224,7 @@ async fn warm_hook_nonzero_exit_fails_capture() {
     let err = pooled
         .build_base_snapshot(
             engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec: env.spec(rootfs),
                 warm: Some(warm),
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -324,10 +327,8 @@ impl TestEnv {
         cache_cfg.budget_bytes = 1024 * 1024 * 1024;
         Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(
-                    self.chunk_store.clone(),
-                    self.work.path().join("materialize"),
-                )
+                .with_chunk_store(self.chunk_store.clone())
+                .with_session_volumes(common::session_volumes(self.work.path(), &self.chunk_store))
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
                 .with_checkpoint_dir(self.work.path().join("checkpoints")),
         )
@@ -335,7 +336,8 @@ impl TestEnv {
 
     /// Bake a minimal agentd-injected debian rootfs and return its path
     /// (docker-free, ADR 0080 §D).
-    async fn bake(&self, name: &str) -> std::path::PathBuf {
+    /// The sandbox's own lineage of a freshly baked rootfs.
+    async fn bake(&self, name: &str) -> engram_core::types::manifest::ManifestRef {
         let outcome = common::bake_fixture_ext4(
             &self.images.path().join(format!("{name}.ext4")),
             &self.chunk_store,
@@ -348,15 +350,15 @@ impl TestEnv {
             |_tree| Ok(()),
         )
         .await;
-        outcome.rootfs_path
+        common::fork_lineage(&self.chunk_store, outcome.disk_manifest).await
     }
 
-    fn spec(&self, rootfs: &Path) -> SandboxSpec {
+    fn spec(&self, rootfs: engram_core::types::manifest::ManifestRef) -> SandboxSpec {
         SandboxSpec {
             image: "engram-warm-hook-test".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
+            rootfs_source: None,
             image_uri: None,
-            rootfs_manifest: None,
+            rootfs_manifest: Some(rootfs),
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },

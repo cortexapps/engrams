@@ -14,6 +14,8 @@
  *     admin-role key, rejects a user-role key (PermissionDenied — RBAC), and
  *     rejects junk/expired keys as Unauthenticated (NOT Internal — pins the
  *     catch-to-null wrapper)
+ *   - the session cache: a verified key is served from the cache, and a
+ *     revoke on this process drops it at once
  *   - expiry: expired keys are auto-deleted at verify; the orphaned service
  *     user is swept on the next List
  *   - lockdown: the plugin's own HTTP endpoints 404 even with a valid cookie
@@ -31,6 +33,7 @@ import { registerApiKeys, isServiceAccountEmail } from "../rpc/api-key.ts";
 import type { ApiKeyBackend, ApiKeyDeps, GetSession, MintedKey } from "../rpc/api-key.ts";
 import { ApiKeyService } from "../gen/engram/app/v1/api_key_pb.ts";
 import { checkDb } from "../db/client.ts";
+import { apiKeySessions } from "../auth/session.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
@@ -77,6 +80,30 @@ async function spawn(deps?: ApiKeyDeps, mountAuth = false) {
       ),
     close: () => new Promise<void>((res, rej) => srv.close((e) => (e ? rej(e) : res()))),
   };
+}
+
+/** Put a session for API key `keyId` into the cache, as a verified request would. */
+function cacheKeySession(keyId: string, key: string): void {
+  const now = new Date();
+  apiKeySessions.set(key, {
+    user: {
+      id: `owner-of-${keyId}`,
+      email: "owner@example.com",
+      emailVerified: true,
+      name: "owner",
+      banned: false,
+      createdAt: now,
+      updatedAt: now,
+    },
+    session: {
+      id: keyId,
+      token: key,
+      userId: `owner-of-${keyId}`,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(now.getTime() + 3_600_000),
+    },
+  });
 }
 
 async function expectErr(p: Promise<unknown>, code: Code) {
@@ -286,8 +313,10 @@ describe("ApiKeyService (native, stubbed backend)", () => {
     try {
       expect((await s.client.revokeApiKey({ id: "nope" })).revoked).toBe(false);
       await s.client.createApiKey({ name: "k", role: "user", expiresAt: "" });
+      cacheKeySession("key-1", "engk_revoke-global");
       expect((await s.client.revokeApiKey({ id: "key-1" })).revoked).toBe(true);
       expect(rec.deletedUsers).toEqual(["svc-0"]);
+      expect(apiKeySessions.get("engk_revoke-global")).toBeNull();
       // Second revoke: the key row is gone → idempotent false.
       expect((await s.client.revokeApiKey({ id: "key-1" })).revoked).toBe(false);
     } finally {
@@ -398,13 +427,16 @@ describe("ApiKeyService CLI keys (stubbed backend)", () => {
     try {
       const r = await alice.client.createCliKey({ name: "cli:laptop" });
       const id = r.meta!.id;
+      cacheKeySession(id, "engk_revoke-cli");
       // Someone else's key reads exactly like an absent one (anti-enumeration).
       expect((await mallory.client.revokeCliKey({ id })).revoked).toBe(false);
       expect(rec.deletedKeyRows).toHaveLength(0);
+      expect(apiKeySessions.get("engk_revoke-cli")).not.toBeNull();
       // The owner revokes: key row deleted, the human user untouched.
       expect((await alice.client.revokeCliKey({ id })).revoked).toBe(true);
       expect(rec.deletedKeyRows).toEqual([id]);
       expect(rec.deletedUsers).toHaveLength(0);
+      expect(apiKeySessions.get("engk_revoke-cli")).toBeNull();
       // Idempotent on retry.
       expect((await alice.client.revokeCliKey({ id })).revoked).toBe(false);
     } finally {
@@ -488,13 +520,29 @@ describe("ApiKeyService (live DB + real plugin)", () => {
         // Junk key → Unauthenticated, NOT Internal/Unknown.
         await expectErr(e2e.keyedClient({ "x-api-key": "engk_junk" }).listApiKeys({}), Code.Unauthenticated);
 
+        // --- the cache: a valid key's session is served without the DB ---
+        const keyRow = eq(apikey.id, userKey.meta!.id);
+        await db.update(apikey).set({ enabled: false }).where(keyRow);
+        expect(
+          (await getSessionFromHeaders(new Headers({ "x-api-key": userKey.key })))?.user.role,
+        ).toBe("user");
+        await db.update(apikey).set({ enabled: true }).where(keyRow);
+
         // --- expiry: backdate, then the key both fails AND self-deletes ---
+        // A change made directly in the DB is seen only after the cache entry
+        // goes, so drop it here instead of waiting out the TTL.
+        apiKeySessions.clear();
         await db
           .update(apikey)
           .set({ expiresAt: new Date(Date.now() - 1000) })
-          .where(eq(apikey.id, userKey.meta!.id));
+          .where(keyRow);
         expect(await getSessionFromHeaders(new Headers({ "x-api-key": userKey.key }))).toBeNull();
-        const expiredRow = await db.select({ id: apikey.id }).from(apikey).where(eq(apikey.id, userKey.meta!.id));
+        // The plugin deletes the expired row after the response (deferUpdates).
+        let expiredRow = [{}];
+        for (let i = 0; i < 50 && expiredRow.length > 0; i++) {
+          await Bun.sleep(20);
+          expiredRow = await db.select({ id: apikey.id }).from(apikey).where(keyRow);
+        }
         expect(expiredRow).toHaveLength(0);
         // The orphaned service user is swept by the next admin List.
         await admin.client.listApiKeys({});

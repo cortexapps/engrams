@@ -527,8 +527,8 @@ describe("compileSessionCreateInput", () => {
   test("a human-owned task injects user_env and no org_env secret", async () => {
     // The PRINCIPAL decides the credential, never the task type/surface: a
     // Slack mention email-matched to a real engrams user rides that user's
-    // token exactly like the chat UI. (Under the old `type === "chat"` gate,
-    // Slack session e721311e booted credential-less — "Not logged in".)
+    // token exactly like the chat UI. (A `type === "chat"` gate would boot Slack
+    // sessions credential-less — "Not logged in".)
     const inp = await compileSessionCreateInput(
       profile({ includeUserTokens: true }),
       deps("tok"),
