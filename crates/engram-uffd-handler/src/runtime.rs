@@ -525,10 +525,10 @@ pub struct Runtime {
     /// private `UFFDIO_COPY`. Session-divergent chunks keep COPY.
     /// `None` ⇒ stock Route-B behavior, byte-identical.
     base_shm: Option<crate::base_shm::BaseShm>,
-    /// Whether `UFFDIO_ZEROPAGE` works on the substrate's MAP_PRIVATE
-    /// file-backed mapping (kernel-version dependent). Starts `true`;
-    /// flips to `false` on the first EINVAL and zero chunks fall back
-    /// to a private COPY of a zeroed buffer.
+    /// Whether `UFFDIO_ZEROPAGE` works on the guest mapping (the
+    /// substrate's MAP_PRIVATE file mapping depends on the kernel).
+    /// Starts `true`; the first EINVAL flips it, and zero chunks then
+    /// install copies of a zeroed buffer.
     zeropage_ok: std::sync::atomic::AtomicBool,
     /// ADR 0045 C2: post-copy migration mode. Sealed (dirtied-since-
     /// checkpoint) chunks are peer-authoritative: the fault path asks
@@ -1188,10 +1188,12 @@ impl Runtime {
     }
 
     /// Install a zero-filled chunk: `UFFDIO_ZEROPAGE` over the
-    /// chunk-aligned range. Used for canonical chunks the manifest
-    /// omits (implicit zero pages). No copy — the kernel maps its
-    /// shared zero page, COW on the guest's first write. Same
-    /// idempotency + clamping discipline as `install_chunk_at`.
+    /// chunk-aligned range, so the kernel maps its shared zero page and
+    /// the guest's first write copies it. Some kernels reject ZEROPAGE
+    /// on the substrate's MAP_PRIVATE file mapping; then this and every
+    /// later zero install copies a zeroed buffer (one private page per
+    /// touched page). Same idempotency and clamping as
+    /// `install_chunk_at`.
     fn install_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
@@ -1215,13 +1217,37 @@ impl Runtime {
             self.backend.total_bytes().saturating_sub(byte_offset),
         );
         let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
-            // SAFETY: `host_va` is a guest-visible address in a UFFD-
-            // registered region we hold zeropage access to. ZEROPAGE
-            // installs zero pages over the range + wakes blocked vCPUs
-            // atomically per page when `wake`.
+            if self.zeropage_ok.load(Ordering::Relaxed) {
+                // SAFETY: `host_va` is a guest-visible address in a UFFD-
+                // registered region we hold zeropage access to. ZEROPAGE
+                // installs zero pages over the range and wakes blocked
+                // vCPUs atomically per page when `wake`.
+                match unsafe {
+                    self.uffd
+                        .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)
+                } {
+                    Ok(_) => return Ok(()),
+                    Err(userfaultfd::Error::ZeropageFailed(errno))
+                        if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
+                    {
+                        self.zeropage_ok.store(false, Ordering::Relaxed);
+                        tracing::info!(
+                            "UFFDIO_ZEROPAGE unsupported on this mapping; installing copies of zeros"
+                        );
+                    }
+                    Err(e) => return Err(HandlerError::Uffd(e)),
+                }
+            }
+            let zeros = vec![0u8; seg_len];
+            // SAFETY: a zeroed buffer of `seg_len`; same contract as
+            // `install_claimed_chunk_at`'s copy.
             unsafe {
-                self.uffd
-                    .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)?;
+                self.uffd.copy(
+                    zeros.as_ptr() as *const _,
+                    host_va as *mut std::ffi::c_void,
+                    seg_len,
+                    wake,
+                )?;
             }
             Ok(())
         });
@@ -1314,73 +1340,6 @@ impl Runtime {
             }
             Ok(())
         })
-    }
-
-    /// ADR 0045 substrate (v2b): zero canonical chunks. Try
-    /// `UFFDIO_ZEROPAGE` (maps the kernel zero page — zero RAM until the
-    /// guest writes); some kernels reject it on MAP_PRIVATE file-backed
-    /// mappings, in which case fall back to a private COPY of a zeroed
-    /// buffer (correct, costs one private page per touched page).
-    fn install_zero_substrate(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_zero_substrate(byte_offset, wake)
-    }
-
-    fn install_claimed_zero_substrate(
-        &self,
-        byte_offset: u64,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Walk every region the chunk spans (clamped to the manifest's
-        // total). Per segment try ZEROPAGE; on a kernel that rejects it
-        // for this MAP_PRIVATE file mapping, fall back to a COPY of a
-        // zeroed buffer for that segment and every later one.
-        let total_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
-            if self.zeropage_ok.load(Ordering::Relaxed) {
-                // SAFETY: range is inside a registered region.
-                match unsafe {
-                    self.uffd
-                        .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)
-                } {
-                    Ok(_) => return Ok(()),
-                    Err(userfaultfd::Error::ZeropageFailed(errno))
-                        if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
-                    {
-                        self.zeropage_ok.store(false, Ordering::Relaxed);
-                        tracing::info!(
-                            "UFFDIO_ZEROPAGE unsupported on the substrate mapping;                          falling back to COPY-of-zeros"
-                        );
-                    }
-                    Err(e) => return Err(HandlerError::Uffd(e)),
-                }
-            }
-            let zeros = bytes::Bytes::from(vec![0u8; seg_len]);
-            // SAFETY: zeroed buffer of seg_len; same contract as
-            // install_chunk_at's copy.
-            unsafe {
-                self.uffd.copy(
-                    zeros.as_ptr() as *const _,
-                    host_va as *mut std::ffi::c_void,
-                    seg_len,
-                    wake,
-                )?;
-            }
-            Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
     }
 
     /// Run forever, draining events from the UFFD and serving each
@@ -1520,7 +1479,6 @@ impl Runtime {
     ) -> Result<bool, HandlerError> {
         match bytes {
             Some(bytes) => self.install_claimed_chunk_at(offset, bytes, false),
-            None if self.base_shm.is_some() => self.install_claimed_zero_substrate(offset, false),
             None => self.install_claimed_zero_at(offset, false),
         }
     }
@@ -1660,11 +1618,7 @@ impl Runtime {
                         }
                     }
                     None => {
-                        let installed = if self.base_shm.is_some() {
-                            self.install_zero_substrate(chunk_byte_offset, true)?
-                        } else {
-                            self.install_zero_at(chunk_byte_offset, true)?
-                        };
+                        let installed = self.install_zero_at(chunk_byte_offset, true)?;
                         if !installed {
                             self.wake_page(page_aligned, page_size)?;
                             Source::Wake
@@ -1695,11 +1649,7 @@ impl Runtime {
                 // Session omits this offset → authoritative zero page,
                 // regardless of what the base holds there (the session
                 // capture is full + zero-omitted). No chunk to record.
-                let installed = if self.base_shm.is_some() {
-                    self.install_zero_substrate(offset, true)?
-                } else {
-                    self.install_zero_at(offset, true)?
-                };
+                let installed = self.install_zero_at(offset, true)?;
                 if !installed {
                     self.wake_page(page_aligned, page_size)?;
                     Source::Wake
@@ -2119,11 +2069,7 @@ impl Runtime {
                     stats.pulled += 1;
                 }
                 PeerPage::Zero => {
-                    if self.base_shm.is_some() {
-                        self.install_zero_substrate(offset, false)?;
-                    } else {
-                        self.install_zero_at(offset, false)?;
-                    }
+                    self.install_zero_at(offset, false)?;
                     stats.zero_chunks += 1;
                 }
                 PeerPage::AltSource(_durable) => {
@@ -2142,11 +2088,7 @@ impl Runtime {
                                     self.install_chunk_at(offset, bytes, false)?;
                                 }
                                 None => {
-                                    if self.base_shm.is_some() {
-                                        self.install_zero_substrate(offset, false)?;
-                                    } else {
-                                        self.install_zero_at(offset, false)?;
-                                    }
+                                    self.install_zero_at(offset, false)?;
                                 }
                             }
                         }
@@ -2154,11 +2096,7 @@ impl Runtime {
                             // Session omits this offset → private zero
                             // page (the shared base is never written
                             // with session-addressed content here).
-                            if self.base_shm.is_some() {
-                                self.install_zero_substrate(offset, false)?;
-                            } else {
-                                self.install_zero_at(offset, false)?;
-                            }
+                            self.install_zero_at(offset, false)?;
                         }
                         None => {
                             return Err(HandlerError::PeerLost(format!(
