@@ -736,10 +736,15 @@ mod steps {
             let kind = if crate::placement::host_meets_capabilities(&host, &caps_for(true)).is_ok()
             {
                 TeleportKind::Live
-            } else if crate::placement::host_meets_capabilities(&host, &caps_for(false)).is_ok() {
-                TeleportKind::Snapshot
             } else {
-                return Err(ApiError::Conflict("target_lacks_capability".into()));
+                match crate::placement::host_meets_capabilities(&host, &caps_for(false)) {
+                    Ok(()) => TeleportKind::Snapshot,
+                    Err(missing) => {
+                        return Err(ApiError::Conflict(format!(
+                            "target_lacks_capability: {missing}"
+                        )));
+                    }
+                }
             };
             let candidates = candidates_for(caps_for(kind == TeleportKind::Live)).await?;
             if !candidates.contains(&target) {
