@@ -56,3 +56,10 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = "package(engram-tui) & binary(perf)"
 threads-required = "num-cpus"
+
+# The ublk root tests each finish in seconds. A device that no process
+# serves holds its I/O, so a test that wedges is ended at 2 minutes
+# instead of the default 3.
+[[profile.default.overrides]]
+filter = "package(engram-disk-source) & binary(ublk_device)"
+slow-timeout = { period = "30s", terminate-after = 4 }

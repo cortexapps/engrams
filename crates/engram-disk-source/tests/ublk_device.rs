@@ -23,6 +23,7 @@ const CHUNK: u64 = 1 << 20;
 /// Chunk seeds; `None` is a hole.
 const LAYOUT: [Option<u8>; 6] = [Some(1), None, Some(2), Some(3), None, Some(4)];
 const READ: usize = 64 * 1024;
+const QUEUES: u16 = 2;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! ublk_or_skip {
@@ -91,13 +92,19 @@ struct Source {
 
 /// Start the binary and wait for its ready line.
 fn start(disk: &Disk, recover: Option<u32>) -> Source {
+    try_start(disk, recover, QUEUES).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`start`] with `queues` queues, or why it failed. A binary that
+/// printed no ready line is reaped, and killed first if it still runs.
+fn try_start(disk: &Disk, recover: Option<u32>, queues: u16) -> Result<Source, String> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram-disk-source"));
     cmd.args([
         "serve",
         "--manifest",
         &disk.manifest.to_string(),
         "--queues",
-        "2",
+        &queues.to_string(),
         "--depth",
         "16",
     ])
@@ -108,7 +115,9 @@ fn start(disk: &Disk, recover: Option<u32>) -> Source {
     if let Some(id) = recover {
         cmd.args(["--recover", &id.to_string()]);
     }
-    let mut child = cmd.spawn().expect("spawn engram-disk-source");
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn engram-disk-source: {e}"))?;
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -116,18 +125,26 @@ fn start(disk: &Disk, recover: Option<u32>) -> Source {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
-    let line = rx
-        .recv_timeout(READY_TIMEOUT)
-        .expect("engram-disk-source printed no ready line");
-    let (path, id) = line
-        .trim()
-        .split_once(' ')
-        .unwrap_or_else(|| panic!("ready line {line:?} is not \"<path> <id>\""));
-    Source {
+    let line = rx.recv_timeout(READY_TIMEOUT);
+    let ready = line.as_deref().ok().and_then(|line| {
+        let (path, id) = line.trim().split_once(' ')?;
+        Some((PathBuf::from(path), id.parse().ok()?))
+    });
+    let Some((path, dev_id)) = ready else {
+        // An empty line is the end of its output: the binary exits.
+        if !matches!(line.as_deref(), Ok("")) {
+            let _ = child.kill();
+        }
+        let status = child.wait().map(|s| s.to_string());
+        return Err(format!(
+            "engram-disk-source gave {line:?}, not a ready line \"<path> <id>\" ({status:?})"
+        ));
+    };
+    Ok(Source {
         child: Some(child),
-        path: PathBuf::from(path),
-        dev_id: id.parse().unwrap(),
-    }
+        path,
+        dev_id,
+    })
 }
 
 impl Source {
@@ -142,11 +159,46 @@ impl Source {
     }
 
     /// SIGKILL: the device stays for recovery.
-    fn crash(mut self) -> u32 {
+    fn crash(mut self, disk: &Disk) -> Crashed<'_> {
         let mut child = self.child.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
-        self.dev_id
+        Crashed {
+            disk,
+            dev_id: Some(self.dev_id),
+        }
+    }
+}
+
+/// A device whose process died. Dropped before [`Crashed::recover`]
+/// succeeds, it recovers the device and stops it: a device left without
+/// a process holds its I/O, and a read blocked on it keeps the test
+/// process from exiting.
+struct Crashed<'a> {
+    disk: &'a Disk,
+    dev_id: Option<u32>,
+}
+
+impl Crashed<'_> {
+    fn dev_id(&self) -> u32 {
+        self.dev_id.unwrap()
+    }
+
+    fn recover(mut self) -> Source {
+        let source = start(self.disk, self.dev_id);
+        self.dev_id = None;
+        source
+    }
+}
+
+impl Drop for Crashed<'_> {
+    fn drop(&mut self) {
+        let Some(dev_id) = self.dev_id else { return };
+        match try_start(self.disk, Some(dev_id), QUEUES) {
+            // Its drop stops it, which deletes the device.
+            Ok(source) => drop(source),
+            Err(e) => eprintln!("device {dev_id} stays without a process: {e}"),
+        }
     }
 }
 
@@ -269,10 +321,11 @@ fn reads_stall_across_a_crash_and_complete_after_recovery() {
 
     std::thread::sleep(Duration::from_millis(200));
     let crashed_at = Instant::now();
-    let dev_id = source.crash();
+    let crashed = source.crash(&disk);
+    let dev_id = crashed.dev_id();
     // The kernel holds the device's I/O while no process serves it.
     std::thread::sleep(Duration::from_millis(500));
-    let recovered = start(&disk, Some(dev_id));
+    let recovered = crashed.recover();
     let recovered_at = Instant::now();
     assert_eq!(recovered.dev_id, dev_id);
     assert_eq!(recovered.path, source_path(dev_id));
@@ -291,6 +344,27 @@ fn reads_stall_across_a_crash_and_complete_after_recovery() {
         spans.iter().any(|(began, _)| *began > recovered_at),
         "reads continue after recovery"
     );
+    recovered.stop();
+}
+
+#[test]
+#[ignore]
+fn a_recovery_with_another_queue_count_is_refused_and_leaves_the_device() {
+    ublk_or_skip!();
+    let disk = publish();
+    let crashed = start(&disk, None).crash(&disk);
+    let err = match try_start(&disk, Some(crashed.dev_id()), QUEUES - 1) {
+        Ok(_) => panic!("a recovery with another queue count is refused"),
+        Err(e) => e,
+    };
+    // A refusal exits 1; a panic exits 101.
+    assert!(err.contains("exit status: 1\""), "{err}");
+    let recovered = crashed.recover();
+    let mut buf = Aligned::new(READ);
+    open_direct(&recovered.path)
+        .read_exact_at(buf.as_mut(), 0)
+        .unwrap();
+    assert!(buf.as_mut() == &disk.expected[..READ]);
     recovered.stop();
 }
 

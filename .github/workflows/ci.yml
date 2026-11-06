@@ -1193,6 +1193,7 @@ jobs:
           ENGRAM_TEST_UBLK: "1"
         run: |
           if ! sudo modprobe ublk_drv; then
+            sudo apt-get update -qq
             sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
             sudo modprobe ublk_drv
           fi
