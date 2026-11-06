@@ -41,6 +41,7 @@
 
 pub mod admission;
 pub mod bootstrap;
+pub mod buffers;
 pub mod cache;
 pub mod error;
 pub mod file;
@@ -58,6 +59,7 @@ pub mod working_set;
 
 pub use admission::{Admission, Class, Permit};
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
+pub use buffers::ChunkBuf;
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;

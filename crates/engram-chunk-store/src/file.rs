@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
+use crate::buffers::ChunkBuf;
 use crate::cache::ChunkCache;
 use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
@@ -289,8 +290,8 @@ impl ChunkStore {
     /// (elided = all-zero) seeds from zeros (it was UFFDIO_ZEROPAGE'd at
     /// the prev capture).
     ///
-    /// Cost: one `get_chunk` per dirty chunk (warm-cache hit for any
-    /// page the guest faulted/wrote).
+    /// Cost: one `get_chunk` per dirty chunk the diff does not cover whole
+    /// (a warm-cache hit for any page the guest faulted or wrote).
     pub async fn update_for_dirty_ranges_sparse(
         &self,
         prev: &Manifest,
@@ -393,6 +394,13 @@ impl ChunkStore {
         let mut ranges = dirty_ranges.to_vec();
         ranges.sort_unstable();
         let ranges: Arc<[(u64, u64)]> = ranges.into();
+        // Every task reads the diff through this one handle with `pread`.
+        let diff = Arc::new(std::fs::File::open(diff_path).map_err(|e| {
+            crate::error::ChunkStoreError::Internal(format!(
+                "open diff {}: {e}",
+                diff_path.display()
+            ))
+        })?);
         let mut tasks = tokio::task::JoinSet::new();
         let mut results: Vec<(u64, Option<ChunkRef>)> = Vec::with_capacity(work.len());
         let joined = |done: std::result::Result<
@@ -407,52 +415,55 @@ impl ChunkStore {
                 results.push(joined(done)?);
             }
             let store = self.clone();
-            let diff_path = diff_path.to_path_buf();
             let local_sink = local_sink.cloned();
             let claimed = Arc::clone(&claimed);
             let ranges = Arc::clone(&ranges);
+            let diff = Arc::clone(&diff);
             tasks.spawn(async move {
-                let mut slice = vec![0u8; want];
-
-                // Seed the chunk from its previous content (warm
-                // cache) — or zeros if `prev` elided this offset
-                // (all-zero chunk).
-                match prev_hash {
+                let end = offset + want as u64;
+                let first = ranges.partition_point(|&(off, len)| off + len <= offset);
+                // Seed the chunk from its previous content (warm cache),
+                // or zeros if `prev` elided this offset (an all-zero
+                // chunk). A chunk the diff covers whole needs no seed.
+                let slice = match prev_hash {
+                    _ if covers(&ranges[first..], offset, end) => ChunkBuf::take(want),
                     Some(prev_hash) => {
                         let bytes = store.get_chunk(prev_hash).await?;
                         let n = bytes.len().min(want);
+                        let mut slice = ChunkBuf::take(want);
                         slice[..n].copy_from_slice(&bytes[..n]);
-                        // `slice` was zero-initialized, so a short
-                        // prev chunk already leaves the tail zeroed.
+                        slice[n..].fill(0);
+                        slice
                     }
-                    None => { /* already zeros */ }
-                }
+                    None => ChunkBuf::zeroed(want),
+                };
 
-                // Overlay the diff's dirty bytes that fall in this
-                // chunk. `dirty_ranges` are the diff's data extents,
-                // so reads land on real bytes (never a hole). A
-                // fresh handle per task keeps the seek+read state
-                // private.
-                let mut diff = fs::File::open(&diff_path).await.map_err(|e| {
-                    crate::error::ChunkStoreError::Internal(format!(
-                        "open diff {}: {e}",
-                        diff_path.display()
-                    ))
-                })?;
-                let first = ranges.partition_point(|&(off, len)| off + len <= offset);
-                for &(off, len) in &ranges[first..] {
-                    if off >= offset + want as u64 {
-                        break;
+                // Overlay the diff's dirty bytes that fall in this chunk,
+                // in one blocking hop. `dirty_ranges` are the diff's data
+                // extents, so reads land on real bytes (never a hole).
+                let slice = tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    let mut slice = slice;
+                    for &(off, len) in &ranges[first..] {
+                        if off >= end {
+                            break;
+                        }
+                        if len == 0 {
+                            continue;
+                        }
+                        let lo = off.max(offset);
+                        let hi = (off + len).min(end);
+                        diff.read_exact_at(
+                            &mut slice[(lo - offset) as usize..(hi - offset) as usize],
+                            lo,
+                        )?;
                     }
-                    if len == 0 {
-                        continue;
-                    }
-                    let lo = off.max(offset);
-                    let hi = (off + len).min(offset + want as u64);
-                    diff.seek(std::io::SeekFrom::Start(lo)).await?;
-                    diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
-                        .await?;
-                }
+                    Ok::<_, std::io::Error>(slice)
+                })
+                .await
+                .map_err(|e| {
+                    crate::error::ChunkStoreError::Internal(format!("diff read task: {e}"))
+                })??;
 
                 if is_all_zero(&slice) {
                     return Ok::<_, crate::error::ChunkStoreError>((offset, None));
@@ -466,7 +477,7 @@ impl ChunkStore {
                     // below, once.
                     Some(cache) => {
                         let hash = crate::manifest::ChunkHash::of(&slice);
-                        cache.put_no_evict(hash, Bytes::from(slice)).await?;
+                        cache.put_no_evict(hash, slice.freeze()).await?;
                         hash
                     }
                     None => {
@@ -506,7 +517,7 @@ impl ChunkStore {
                             // the dedup HEAD would almost always miss:
                             // unchecked PUT (ADR 0078 move 5).
                             store
-                                .put_chunk_unchecked_prehashed(hash, Bytes::from(slice))
+                                .put_chunk_unchecked_prehashed(hash, slice.freeze())
                                 .await?;
                         }
                         hash
@@ -662,13 +673,29 @@ fn rechunk_channel_capacity(chunk_size: u64) -> usize {
         .clamp(1, SPARSE_RECHUNK_CONCURRENCY * 2)
 }
 
+/// Whether `ranges` (sorted by offset, starting at the first that ends
+/// past `start`) cover every byte of `[start, end)`.
+fn covers(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let mut pos = start;
+    for &(off, len) in ranges {
+        if off > pos {
+            return false;
+        }
+        pos = pos.max(off + len);
+        if pos >= end {
+            return true;
+        }
+    }
+    false
+}
+
 /// Blocking-side reader for [`ChunkStore::chunk_file_into`]: stream the
 /// first `total_bytes` of `file` in large sequential reads (a multiple
 /// of `chunk_size`), split each block into `chunk_size` pieces,
 /// zero-check on this thread, and send the non-zero `(offset, bytes)`
-/// chunks (each an owned copy — the shared read block is reused, and
-/// per-chunk copies keep a mostly-zero block from pinning its whole
-/// buffer in the channel). Terminates when the consumer drops the
+/// chunks (each a copy in a pooled buffer — the shared read block is
+/// reused, and per-chunk copies keep a mostly-zero block from pinning its
+/// whole buffer in the channel). Terminates when the consumer drops the
 /// receiver (upload error / caller cancelled): `blocking_send` fails
 /// and the thread exits. A short read before `total_bytes` is an error
 /// (the staged snapshot files this scans are immutable and
@@ -711,12 +738,15 @@ fn read_nonzero_chunks(
         while pos < want {
             let len = (chunk_size as usize).min(want - pos);
             let slice = &buf[pos..pos + len];
-            if !is_all_zero(slice)
-                && tx
-                    .blocking_send(Ok((offset + pos as u64, Bytes::copy_from_slice(slice))))
+            if !is_all_zero(slice) {
+                let mut chunk = ChunkBuf::take(len);
+                chunk.copy_from_slice(slice);
+                if tx
+                    .blocking_send(Ok((offset + pos as u64, chunk.freeze())))
                     .is_err()
-            {
-                return;
+                {
+                    return;
+                }
             }
             pos += len;
         }
@@ -1423,6 +1453,60 @@ mod tests {
         let out = work.path().join("out.bin");
         s.materialize_to_file(&got, &out).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    /// A chunk the diff covers whole (here in two adjacent ranges) is
+    /// rebuilt from the diff alone: its previous content is never read,
+    /// so the re-chunk succeeds with the previous chunk gone.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_does_not_read_a_covered_prev_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let s = ChunkStore::new(blob.clone());
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+
+        let p = work.path().join("prev.bin");
+        let mut prev_img = vec![0xAAu8; cs as usize];
+        prev_img.extend(vec![0xBBu8; cs as usize]);
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        let gone = prev.chunks[0].hash;
+        blob.delete(&gone.storage_key()).await.unwrap();
+
+        let half = (cs / 2) as usize;
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(
+            &diff,
+            prev.total_bytes,
+            &[(0, vec![0x11u8; half]), (cs / 2, vec![0x22u8; half])],
+        )
+        .await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, cs / 2), (cs / 2, cs / 2)])
+            .await
+            .unwrap();
+
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        let mut want = vec![0x11u8; half];
+        want.extend(vec![0x22u8; half]);
+        want.extend(vec![0xBBu8; cs as usize]);
+        assert_eq!(fs::read(&out).await.unwrap(), want);
+    }
+
+    #[test]
+    fn covers_needs_every_byte_of_the_range() {
+        assert!(covers(&[(0, 10)], 0, 10));
+        assert!(covers(&[(0, 4), (4, 6)], 0, 10));
+        assert!(covers(&[(0, 6), (2, 20)], 4, 10));
+        assert!(!covers(&[(0, 4), (5, 6)], 0, 10), "a gap at 4");
+        assert!(!covers(&[(2, 10)], 0, 10), "the start is not covered");
+        assert!(!covers(&[(0, 9)], 0, 10), "the end is not covered");
+        assert!(!covers(&[], 0, 10));
     }
 
     /// An unaligned interior dirty range over a non-zero prev chunk:

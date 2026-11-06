@@ -1925,12 +1925,23 @@ impl EvictedRing {
     }
 }
 
+/// The file's bytes, read into a pooled buffer in one blocking task, or
+/// `None` when there is no file.
 async fn read_if_present(path: &Path) -> Result<Option<Bytes>> {
-    match fs::read(path).await {
-        Ok(bytes) => Ok(Some(Bytes::from(bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut buf = crate::buffers::ChunkBuf::take(file.metadata()?.len() as usize);
+        file.read_exact(&mut buf)?;
+        Ok(Some(buf.freeze()))
+    })
+    .await
+    .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
 }
 
 /// `Result<Bytes>` isn't `Clone` because `ChunkStoreError` carries
