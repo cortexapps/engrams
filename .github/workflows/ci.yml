@@ -1166,15 +1166,24 @@ jobs:
       - name: Node-prep pool states (root)
         run: sudo sh scripts/thin-pool-states-test.sh
 
-      # The disk over the pool, then the session disk under a real guest
-      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # The disk over the pool, its cloned drives over a loop-device
+      # source (dm-delay slows the copy where a test needs it), then the
+      # session disk under a real guest over the same pool (`session_disk`
+      # reads ENGRAM_TEST_THIN_POOL). A runner without the clone or delay
+      # target fails the lane, as a missing pool does.
       - name: dm-thin session-disk tests (root)
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
         run: |
+          if ! sudo modprobe -a dm_clone dm_delay; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a dm_clone dm_delay
+          fi
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
+            --test clone \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
