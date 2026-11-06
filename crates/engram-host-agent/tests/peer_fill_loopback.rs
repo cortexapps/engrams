@@ -6,8 +6,8 @@
 //! REQUESTER side (structurally zero GCS involvement for peer-landed
 //! chunks — there is nothing to fall back to, so every assertion about
 //! landed bytes is an assertion about the peer path):
-//!   1. batch pull lands CRC-checked bytes as unverified-origin; the
-//!      scrubber verifies them; the serve-onward gate opens only then;
+//!   1. batch pull lands CRC-checked, sha256-verified bytes that serve
+//!      onward at once;
 //!   2. a locally-missing hash streams a `missing` marker (peer stays
 //!      healthy);
 //!   3. a stale BaseImage scope is rejected (`scope_reject`), which the
@@ -236,7 +236,7 @@ async fn pull_lands_verified_chunks_that_serve_onward_at_once() {
 
     // The landing verifies each chunk, so it serves onward at once.
     for (h, body) in hashes.iter().zip(&bodies) {
-        let bytes = land_cache.read_verified_for_serve(*h).await.unwrap();
+        let bytes = land_cache.read_resident(*h).await.unwrap();
         assert_eq!(bytes.as_deref(), Some(body.as_slice()), "chunk {h}");
     }
 }

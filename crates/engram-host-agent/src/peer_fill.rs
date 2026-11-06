@@ -1,16 +1,15 @@
 //! ADR 0095: the standing peer-chunk tier — both halves.
 //!
 //! **Serve** ([`PeerServe`], driven by `grpc_server`'s `PeerChunkGet`
-//! arm): stream cache-resident, verified-origin chunks to any fleet
-//! peer, batch semantics, resident-only (a peer can never induce a GCS
-//! read here), bounded by a host-global stream semaphore.
+//! arm): stream cache-resident chunks to any fleet peer, batch
+//! semantics, resident-only (a peer can never induce a GCS read here),
+//! bounded by a host-global stream semaphore.
 //!
 //! **Pull** ([`pull_chunks_from_peer`] for bulk; [`PeerBinding`] for
 //! the resume fault-time tier): dial a coordinator-hinted sibling,
 //! stream the wanted set over a few fat connections, CRC32C-check each
-//! frame, and land bulk chunks via the unverified-origin path
-//! (`ChunkCache::put_unverified_no_evict` — sha256 deferred to the
-//! background scrubber; ADR 0095 §Integrity). The pull is a
+//! frame, and land bulk chunks through `ChunkCache::put`, which sha256s
+//! each one before it becomes resident. The pull is a
 //! best-effort PRE-PASS: callers re-check residency afterwards and
 //! complete whatever is still missing through the existing verified
 //! GCS path, so a dead/missing/saturated peer degrades to today's
@@ -145,10 +144,9 @@ impl PeerServe {
 
     /// Produce the frame stream for one request. Runs as a spawned
     /// task feeding `tx`; holds `permit` for its lifetime. Chunks are
-    /// served resident-only via the verified-origin gate
-    /// (`read_verified_for_serve`): absent OR not-yet-scrubbed ⇒ a
-    /// terminal `missing` frame for that item (the requester sources
-    /// it from GCS; never a fault).
+    /// served resident-only: an absent chunk is a terminal `missing`
+    /// frame for that item (the requester sources it from GCS; never a
+    /// fault).
     pub async fn stream_frames(
         self: Arc<Self>,
         hashes: Vec<ChunkHash>,
@@ -157,7 +155,7 @@ impl PeerServe {
     ) {
         for (idx, hash) in hashes.into_iter().enumerate() {
             let item_idx = idx as u32;
-            let bytes = match self.cache.read_verified_for_serve(hash).await {
+            let bytes = match self.cache.read_resident(hash).await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     metrics::counter!("engram_peer_serve_total", "outcome" => "missing")
@@ -275,8 +273,8 @@ fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
         .tcp_nodelay(true))
 }
 
-/// Bulk-pull `hashes` from the peer at `addr` into `cache` via the
-/// unverified-origin landing path. Best-effort pre-pass (see module
+/// Bulk-pull `hashes` from the peer at `addr` into `cache` through the
+/// verifying [`ChunkCache::put`]. Best-effort pre-pass (see module
 /// docs): every outcome short of success leaves the caller's GCS
 /// completion pass to pick up the remainder.
 ///
@@ -361,18 +359,11 @@ pub async fn pull_chunks_from_peer(
         stats.failed = true;
     }
     stats.backpressure = any_backpressure;
-    // Batch-closing sweep — put_unverified_no_evict skips the per-write
-    // sweep by contract (same as put_no_evict).
-    if stats.landed > 0 {
-        if let Err(e) = cache.sweep().await {
-            tracing::warn!(error = %e, "peer pull: batch-closing cache sweep failed");
-        }
-    }
     stats
 }
 
 /// One connection's shard: a single `PeerChunkGet` request, frames
-/// reassembled per item, CRC32C-checked, landed unverified-origin.
+/// reassembled per item, CRC32C-checked, landed through `ChunkCache::put`.
 async fn pull_shard(
     client: GrpcHostClient,
     scope: PeerChunkScope,

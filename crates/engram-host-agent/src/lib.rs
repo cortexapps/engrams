@@ -990,20 +990,22 @@ impl HostAgent {
 
             // ADR 0095: the standing peer-chunk tier — serve state for
             // the gRPC arm (cache-less hosts serve nothing and answer
-            // `unavailable`), plus the background scrubber that drains
-            // the unverified-origin backlog bulk peer pulls create.
+            // `unavailable`).
             let peer_serve = self
                 .chunk_cache
                 .clone()
                 .map(|cache| peer_fill::PeerServe::new(cache, readiness.clone()));
-            let _scrubber_task = self.chunk_cache.as_ref().map(|cache| {
-                let bps = std::env::var("ENGRAM_CHUNK_SCRUB_BPS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|&v| v > 0)
-                    .unwrap_or(256 * 1024 * 1024);
-                cache.spawn_scrubber(bps)
-            });
+            if let Some(cache) = self.chunk_cache.clone() {
+                tokio::spawn(async move {
+                    let removed = cache.discard_unverified_landings().await;
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            "chunk cache: discarded chunks landed without a hash check",
+                        );
+                    }
+                });
+            }
 
             // ADR 0013: boot the gRPC HostService server. The
             // coord's GrpcHostPool dials this address (populated

@@ -112,8 +112,8 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 ///   fetch happened but the cache did NOT fill — see the `write_local`
 ///   error-handling comment just above the increment site).
 /// - `source="peer"` is ALSO incremented by
-///   `engram-host-agent::peer_fill` at the bulk
-///   [`ChunkCache::put_unverified_no_evict`] landings (ADR 0095).
+///   `engram-host-agent::peer_fill` at its bulk [`ChunkCache::put`]
+///   landings (ADR 0095).
 pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
 
 /// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
@@ -596,12 +596,6 @@ struct CacheInner {
     /// stays the sweep's cheap read; this map exists so multiple
     /// writers can't clobber each other's terms.
     co_tenant_sources: Mutex<std::collections::HashMap<&'static str, u64>>,
-    /// ADR 0095: live feed from [`ChunkCache::put_unverified_no_evict`]
-    /// to the background scrubber. `None` until
-    /// [`ChunkCache::spawn_scrubber`] runs (a cache without a scrubber
-    /// still lands unverified chunks correctly — the markers are
-    /// durable and a later scrubber's boot scan picks them up).
-    scrub_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ChunkHash>>>,
     /// #1003: in-memory eviction index — hash → (size, populate time),
     /// plus a maintained byte total. Built from ONE directory walk on
     /// the first sweep, then updated by every in-process populate and
@@ -690,7 +684,6 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
-                scrub_tx: Mutex::new(None),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
             }),
@@ -721,7 +714,6 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
-                scrub_tx: Mutex::new(None),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
             }),
@@ -930,9 +922,7 @@ impl ChunkCache {
     /// and the fetch histogram's `tier` stay honest when a call site
     /// composes a peer tier ahead of BlobStorage (ADR 0095). Populate
     /// semantics are identical — singleflight, sha256
-    /// verify-on-populate (a fault-time peer chunk IS verified; only
-    /// the bulk `put_unverified_no_evict` path defers hashing to the
-    /// scrubber), atomic write-through.
+    /// verify-on-populate, atomic write-through.
     pub async fn get_with_source<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
@@ -1350,171 +1340,17 @@ impl ChunkCache {
         self.evict_with_index().await
     }
 
-    /// ADR 0095: land peer-pulled bytes WITHOUT the sha256
-    /// verify-on-populate — the bulk peer-fill landing path, where
-    /// hashing at line rate would cost cores the co-tenant guests need
-    /// (no SHA-NI on this fleet). Integrity contract: the transport
-    /// already CRC32C-checked every frame; this call marks the chunk
-    /// **unverified-origin** (a `.unverified` sidecar, written BEFORE
-    /// the chunk becomes visible) and enqueues it for the background
-    /// scrubber ([`Self::spawn_scrubber`]), which sha256s it off the
-    /// critical path — a mismatch deletes the file (next read refetches
-    /// from GCS) and counts `engram_chunk_scrub_total{outcome="corrupt"}`.
-    /// Until the scrub clears the marker the chunk is readable LOCALLY
-    /// (CRC-checked bytes; trust-on-read as usual) but is NOT served
-    /// onward to peers ([`Self::read_verified_for_serve`]) — corruption
-    /// can travel at most one hop.
-    ///
-    /// Like [`Self::put_no_evict`], skips the per-write budget sweep:
-    /// bulk callers MUST call [`Self::sweep`] once after the batch.
-    pub async fn put_unverified_no_evict(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-        let target = self.path_for(hash);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        // Marker FIRST: a crash between the two writes must leave
-        // either (marker, no chunk) — a stale marker the scrubber
-        // reaps — or nothing. The bad state (unverified chunk with no
-        // marker) must be unreachable. Markers are never removed
-        // outside the scrubber (racing a verified writer on the same
-        // hash then converges to "marked, scrub verifies" instead of
-        // leaving unhashed bytes unmarked).
-        write_atomic(&self.marker_path_for(hash), b"").await?;
-        write_atomic(&target, bytes).await?;
-        self.index_insert(hash, bytes.len() as u64);
-        if let Some(tx) = self.inner.scrub_tx.lock().as_ref() {
-            let _ = tx.send(hash);
-        }
-        Ok(())
-    }
-
-    /// `.unverified` sidecar path for a chunk. Lives next to the chunk
-    /// file; invisible to the LRU walk ([`Self::list_entries`] only
-    /// matches 62-hex names), so eviction can never strip a marker out
-    /// from under its chunk.
-    fn marker_path_for(&self, hash: ChunkHash) -> PathBuf {
-        let mut p = self.path_for(hash).into_os_string();
-        p.push(".unverified");
-        PathBuf::from(p)
-    }
-
-    /// ADR 0095 serve-onward gate: the chunk's bytes IF it is resident
-    /// AND verified-origin (sha256'd at populate, or scrubbed since a
-    /// bulk peer landing). `None` ⇒ the peer-serve path streams a
-    /// `missing` marker and the requester sources it from GCS — an
-    /// unverified chunk is never re-served, so a corrupt source can
-    /// poison at most its direct pullers, and only until the scrub.
-    pub async fn read_verified_for_serve(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
-        if fs::try_exists(self.marker_path_for(hash))
-            .await
-            .unwrap_or(false)
-        {
-            return Ok(None);
-        }
-        read_if_present(&self.path_for(hash)).await
-    }
-
-    /// ADR 0095: spawn the background scrubber that drains the
-    /// unverified-origin backlog. Rate-limited to `bytes_per_sec`
-    /// (sha256 on no-SHA-NI hosts is ~0.5-1 GB/s/core — the limit keeps
-    /// the drain to a fraction of a core next to live guests). On boot
-    /// it scans for leftover markers (crash recovery), then drains the
-    /// live queue fed by [`Self::put_unverified_no_evict`].
-    ///
-    /// Outcomes (`engram_chunk_scrub_total{outcome}`):
-    /// - `ok`: content matches its hash — marker removed, chunk becomes
-    ///   servable onward.
-    /// - `corrupt`: mismatch — chunk + marker deleted (next read
-    ///   refetches from GCS), logged at ERROR.
-    /// - `missing`: marker with no chunk (evicted mid-queue, or a
-    ///   crashed landing) — marker reaped.
-    ///
-    /// The caller keeps the returned handle alive for the process
-    /// lifetime (same held-handle pattern as [`Self::spawn_sweeper`]).
-    pub fn spawn_scrubber(&self, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChunkHash>();
-        *self.inner.scrub_tx.lock() = Some(tx);
-        let cache = self.clone();
-        tokio::spawn(async move {
-            // Crash recovery: enqueue every marker already on disk.
-            let leftover = cache.scan_unverified_markers().await;
-            if !leftover.is_empty() {
-                tracing::info!(
-                    count = leftover.len(),
-                    "chunk scrubber: found unverified-origin markers from a prior life",
-                );
-            }
-            let mut backlog: std::collections::VecDeque<ChunkHash> = leftover.into();
-            loop {
-                let hash = match backlog.pop_front() {
-                    Some(h) => h,
-                    None => match rx.recv().await {
-                        Some(h) => h,
-                        None => return, // cache dropped
-                    },
-                };
-                let started = crate::time_source::metrics_now();
-                let scrubbed = cache.scrub_one(hash).await;
-                // Rate limit: sleep so that (bytes hashed) / (elapsed +
-                // sleep) ≤ bytes_per_sec. Zero-byte outcomes (missing)
-                // pace on a nominal floor so a marker storm can't spin.
-                let bytes = scrubbed.max(64 * 1024) as f64;
-                let budget =
-                    std::time::Duration::from_secs_f64(bytes / (bytes_per_sec.max(1) as f64));
-                if let Some(sleep) = budget.checked_sub(started.elapsed()) {
-                    tokio::time::sleep(sleep).await;
-                }
-            }
-        })
-    }
-
-    /// Scrub one unverified-origin chunk; returns the byte count hashed
-    /// (0 for `missing`). See [`Self::spawn_scrubber`].
-    async fn scrub_one(&self, hash: ChunkHash) -> usize {
-        let marker = self.marker_path_for(hash);
-        if !fs::try_exists(&marker).await.unwrap_or(false) {
-            // Already scrubbed (duplicate queue entry) — not an outcome.
-            return 0;
-        }
-        let bytes = match read_if_present(&self.path_for(hash)).await {
-            Ok(Some(b)) => b,
-            _ => {
-                let _ = fs::remove_file(&marker).await;
-                // The chunk file is gone (evicted mid-queue or a crashed
-                // landing) — drop any stale index entry with it.
-                self.index_remove(hash);
-                metrics::counter!("engram_chunk_scrub_total", "outcome" => "missing").increment(1);
-                return 0;
-            }
-        };
-        if ChunkHash::of(&bytes) == hash {
-            let _ = fs::remove_file(&marker).await;
-            metrics::counter!("engram_chunk_scrub_total", "outcome" => "ok").increment(1);
-        } else {
-            // Delete chunk BEFORE marker (the crash-safe order: the bad
-            // bytes must never linger unmarked). Next read misses and
-            // refetches from GCS through the verifying populate.
-            let _ = fs::remove_file(self.path_for(hash)).await;
-            self.index_remove(hash);
-            let _ = fs::remove_file(&marker).await;
-            metrics::counter!("engram_chunk_scrub_total", "outcome" => "corrupt").increment(1);
-            tracing::error!(
-                hash = %hash,
-                "chunk scrubber: peer-landed chunk FAILED sha256 — deleted (will refetch \
-                 from GCS); if this fires repeatedly the sourcing peer has disk rot or a \
-                 serve bug (ADR 0095 §Integrity)",
-            );
-        }
-        bytes.len()
-    }
-
-    /// Walk the cache for `.unverified` sidecars (boot-time crash
-    /// recovery for the scrubber). Same two-level layout as
-    /// [`Self::list_entries`].
-    async fn scan_unverified_markers(&self) -> Vec<ChunkHash> {
-        let mut out = Vec::new();
+    /// Delete every chunk that carries a `.unverified` sidecar, and the
+    /// sidecar with it; returns the number of sidecars removed. A
+    /// previous build landed peer-pulled chunks without a sha256 check
+    /// and marked each one this way. Reads trust the cache, so such a
+    /// chunk must not stay resident: the next read misses and refetches
+    /// it through a verifying populate. The chunk goes before its
+    /// sidecar, so a crash mid-reap leaves a sidecar for the next boot.
+    pub async fn discard_unverified_landings(&self) -> usize {
+        let mut removed = 0;
         let Ok(mut top) = fs::read_dir(&self.inner.config.root).await else {
-            return out;
+            return removed;
         };
         while let Ok(Some(prefix_entry)) = top.next_entry().await {
             let prefix_path = prefix_entry.path();
@@ -1546,15 +1382,17 @@ impl ChunkCache {
                 let Some(rest) = name.strip_suffix(".unverified") else {
                     continue;
                 };
-                if rest.len() != 62 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) else {
                     continue;
-                }
-                if let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) {
-                    out.push(hash);
+                };
+                let _ = fs::remove_file(self.path_for(hash)).await;
+                self.index_remove(hash);
+                if fs::remove_file(file.path()).await.is_ok() {
+                    removed += 1;
                 }
             }
         }
-        out
+        removed
     }
 
     /// Spawn the periodic sweeper (ADR 0070): calls [`Self::sweep`] every
@@ -1935,8 +1773,8 @@ impl ChunkCache {
         }
     }
 
-    /// Record an in-process unlink (eviction, scrub-delete, test
-    /// helper) in the index; buffered while the first walk is in
+    /// Record an in-process unlink (eviction, unverified-landing
+    /// discard, test helper) in the index; buffered while the first walk is in
     /// flight, same as inserts.
     fn index_remove(&self, hash: ChunkHash) {
         match &mut *self.inner.index.lock() {
@@ -3831,91 +3669,40 @@ mod tests {
         );
     }
 
-    /// ADR 0095: an unverified-origin landing is locally readable but
-    /// NOT servable onward until the scrubber sha256s it; a good chunk
-    /// clears its marker, and the read path serves it afterwards.
+    /// A chunk that a previous build landed with a `.unverified`
+    /// sidecar is deleted with its sidecar; a sidecar with no chunk is
+    /// reaped; a verified chunk is not touched.
     #[tokio::test]
-    async fn put_unverified_marks_then_scrub_clears() {
+    async fn discard_unverified_landings_removes_marked_chunks_only() {
         let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        let body = b"peer-landed bytes".to_vec();
-        let h = ChunkHash::of(&body);
-        cache.put_unverified_no_evict(h, &body).await.unwrap();
-        // Locally readable (CRC-checked upstream; trust-on-read)...
-        assert!(cache.contains(h).await);
-        // ...but gated from onward serving until scrubbed.
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-        // Scrub (direct call — the spawned loop is timing, not logic).
-        assert!(cache.scrub_one(h).await > 0);
-        let served = cache.read_verified_for_serve(h).await.unwrap();
-        assert_eq!(served.as_deref(), Some(body.as_slice()));
-    }
+        let sidecar = |h: ChunkHash| {
+            let mut p = cache.path_for(h).into_os_string();
+            p.push(".unverified");
+            std::path::PathBuf::from(p)
+        };
+        let marked = b"landed by a previous build".to_vec();
+        let marked_h = ChunkHash::of(&marked);
+        cache.put(marked_h, &marked).await.unwrap();
+        crate::cache::write_atomic(&sidecar(marked_h), b"")
+            .await
+            .unwrap();
+        let ghost = ChunkHash::of(b"evicted before the reap");
+        fs::create_dir_all(sidecar(ghost).parent().unwrap())
+            .await
+            .unwrap();
+        crate::cache::write_atomic(&sidecar(ghost), b"")
+            .await
+            .unwrap();
+        let verified = b"verified at populate".to_vec();
+        let verified_h = ChunkHash::of(&verified);
+        cache.put(verified_h, &verified).await.unwrap();
 
-    /// ADR 0095 §Integrity: a peer-landed chunk whose content does not
-    /// match its claimed hash (source rot / serve bug) is deleted by
-    /// the scrub — the next read misses and refetches through the
-    /// verifying GCS populate; it is never served onward.
-    #[tokio::test]
-    async fn scrub_deletes_corrupt_peer_landing() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        let honest = b"the real content".to_vec();
-        let h = ChunkHash::of(&honest);
-        cache
-            .put_unverified_no_evict(h, b"corrupt impostor bytes")
-            .await
-            .unwrap();
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-        cache.scrub_one(h).await;
-        assert!(
-            !cache.contains(h).await,
-            "corrupt chunk must be deleted, not kept",
-        );
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-    }
-
-    /// ADR 0095: the spawned scrubber drains the live queue AND the
-    /// boot-time marker scan (crash recovery), and a marker whose chunk
-    /// was evicted mid-queue is reaped without error.
-    #[tokio::test]
-    async fn scrubber_drains_queue_and_boot_scan() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        // Landed BEFORE the scrubber exists — covered by the boot scan.
-        let pre = b"landed before scrubber".to_vec();
-        let pre_h = ChunkHash::of(&pre);
-        cache.put_unverified_no_evict(pre_h, &pre).await.unwrap();
-        // A stale marker with no chunk (evicted mid-queue).
-        let ghost = ChunkHash::of(b"ghost");
-        let ghost_marker = cache.marker_path_for(ghost);
-        fs::create_dir_all(ghost_marker.parent().unwrap())
-            .await
-            .unwrap();
-        crate::cache::write_atomic(&ghost_marker, b"")
-            .await
-            .unwrap();
-        let _scrubber = cache.spawn_scrubber(u64::MAX);
-        // Landed AFTER — covered by the live queue.
-        let post = b"landed after scrubber".to_vec();
-        let post_h = ChunkHash::of(&post);
-        cache.put_unverified_no_evict(post_h, &post).await.unwrap();
-        for _ in 0..300 {
-            let pre_ok = cache
-                .read_verified_for_serve(pre_h)
-                .await
-                .unwrap()
-                .is_some();
-            let post_ok = cache
-                .read_verified_for_serve(post_h)
-                .await
-                .unwrap()
-                .is_some();
-            let ghost_gone = !fs::try_exists(cache.marker_path_for(ghost))
-                .await
-                .unwrap_or(true);
-            if pre_ok && post_ok && ghost_gone {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("scrubber did not drain the backlog within 3s");
+        assert_eq!(cache.discard_unverified_landings().await, 2);
+        assert!(!cache.contains(marked_h).await);
+        assert!(!fs::try_exists(sidecar(marked_h)).await.unwrap());
+        assert!(!fs::try_exists(sidecar(ghost)).await.unwrap());
+        assert!(cache.contains(verified_h).await);
+        assert_eq!(cache.discard_unverified_landings().await, 0);
     }
 
     /// ADR 0095: `get_with_source` keeps the populate contract of `get`
@@ -3933,8 +3720,6 @@ mod tests {
             .unwrap();
         assert_eq!(got, body);
         assert!(cache.contains(h).await);
-        // Verified at populate ⇒ immediately servable onward.
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_some());
 
         let wrong = ChunkHash::of(b"something else");
         let err = cache
