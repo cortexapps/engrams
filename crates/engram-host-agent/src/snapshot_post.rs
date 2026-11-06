@@ -119,18 +119,25 @@ impl PostPhase<'_> {
         } = work;
         let state_path = dest.join("state.bin");
         let sidecar_path = dest.join("manifest.json");
-        // The blobs need the chunk store and a memory file; a backend
-        // without one (VZ, Process) publishes its disks only. A capture
-        // with a memory file also wrote `state.bin` and the sidecar, so a
-        // missing or empty one is a lost file, not a backend without it.
+        // Only a backend that writes guest memory (Firecracker) writes
+        // `state.bin`. A full capture with neither file is a backend
+        // without memory (VZ, Process): it publishes its disks only. One
+        // with `state.bin` and no `memory.bin` lost its memory. A capture
+        // with memory also wrote the sidecar, so a missing or empty
+        // restore file is a lost file.
+        let memoryless =
+            matches!(memory, Some(Memory::Full)) && !fs_exists(&dest.join("memory.bin")).await;
+        if memoryless && fs_exists(&state_path).await {
+            return Err(SandboxError::Snapshot(format!(
+                "{} has state.bin but no memory.bin",
+                dest.display()
+            )));
+        }
+        let memory = memory.filter(|_| !memoryless);
         let blob = self
             .chunk_store
             .map(|store| store.blob_storage())
-            .filter(|_| blobs);
-        let blob = match (&memory, blob) {
-            (Some(Memory::Full), Some(_)) if !fs_exists(&dest.join("memory.bin")).await => None,
-            (_, blob) => blob,
-        };
+            .filter(|_| blobs && !memoryless);
         if blob.is_some() {
             check_restore_files(&state_path, &sidecar_path).await?;
         }
@@ -345,9 +352,6 @@ impl PostPhase<'_> {
             }
             Memory::Full => {
                 let mem_path = dest.join("memory.bin");
-                if !fs_exists(&mem_path).await {
-                    return Ok(None);
-                }
                 let manifest_ref =
                     chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache, source)
                         .instrument(tracing::info_span!("finish.memory_chunk"))

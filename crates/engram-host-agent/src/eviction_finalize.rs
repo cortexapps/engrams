@@ -920,6 +920,26 @@ mod tests {
         assert!(checkpoints(&finalizer).await.is_empty());
     }
 
+    /// `state.bin` comes only from a capture that also wrote guest
+    /// memory, so a full capture without `memory.bin` lost it. The
+    /// redrive fails instead of recording a checkpoint with no memory.
+    #[tokio::test]
+    async fn a_redrive_over_a_full_capture_without_its_memory_bin_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::remove_file(dest.join("memory.bin")).unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+    }
+
     /// 64 KiB of non-zero bytes: small, so a test can run many passes.
     fn finalize_memory() -> Vec<u8> {
         (0..64 * 1024).map(|i| (i % 251 + 1) as u8).collect()
