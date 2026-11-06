@@ -83,6 +83,7 @@ pub mod migration;
 pub mod page_idle;
 pub mod peer_fill;
 pub mod session_epochs;
+pub(crate) mod snapshot_post;
 pub mod substrate_server;
 pub use host_client::LocalHostClient;
 #[cfg(target_os = "linux")]
