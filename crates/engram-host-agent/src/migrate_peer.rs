@@ -643,8 +643,8 @@ impl PeerServer {
         // ONLY for drain serves. On the fault path a demote is strictly
         // WORSE than shipping the resident bytes — it converts one
         // stalled-vCPU round trip into a dest-side cache/GCS fetch.
-        // The zero check stays on
-        // both paths (cheap scan, saves the whole payload).
+        // The zero check stays on both paths (cheap scan, saves the
+        // whole payload).
         let t_classify = crate::time_source::metrics_now();
         let classified = if latency_critical {
             if bytes.iter().all(|b| *b == 0) {
@@ -674,10 +674,17 @@ impl PeerServer {
                 durable_sha256: *hash.as_bytes(),
             },
             ServedChunk::Page(bytes, _raw_hash) => {
-                // v2: ship the smaller of lz4/raw; integrity covers
+                // Fault serves ship raw: on the fleet LAN, lz4 of a
+                // 512 KiB chunk takes longer than sending the raw bytes,
+                // and a vCPU waits on every fault. Every destination
+                // build since v2 accepts `lz4: false`. Integrity covers
                 // the wire bytes.
                 let t_encode = crate::time_source::metrics_now();
-                let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
+                let (wire, lz4) = if latency_critical {
+                    (bytes, false)
+                } else {
+                    engram_migrate_proto::compress_page(bytes)
+                };
                 let hash = engram_migrate_proto::wire_hash(&wire);
                 export
                     .serve
@@ -937,6 +944,54 @@ mod tests {
             assert_eq!(
                 engram_migrate_proto::decompress_page(bytes.clone(), *lz4).unwrap(),
                 memory[offset as usize..offset as usize + 4096]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fault_serves_ship_raw_and_drain_serves_compress() {
+        let memory = vec![0x5Au8; 16384];
+        for (purpose, want_lz4) in [
+            (engram_migrate_proto::ConnPurpose::Fault, false),
+            (engram_migrate_proto::ConnPurpose::Drain, true),
+        ] {
+            let server = PeerServer::new(9102);
+            let mut export = test_export("t");
+            export.vmas = vec![GuestVma {
+                start: memory.as_ptr() as u64,
+                end: memory.as_ptr() as u64 + memory.len() as u64,
+                file_offset: 0,
+            }];
+            server.register(export);
+            let got = talk(
+                server,
+                vec![
+                    ToSource::Hello {
+                        version: PROTO_VERSION,
+                        export_id: "exp-1".into(),
+                        token: "t".into(),
+                        purpose,
+                    },
+                    ToSource::NeedAt {
+                        req_id: 1,
+                        chunk_offset: 4096,
+                    },
+                ],
+                3,
+            )
+            .await;
+            let Some(FromSource::Page {
+                bytes, hash, lz4, ..
+            }) = got.get(2)
+            else {
+                panic!("{purpose:?}: expected Page, got {got:?}")
+            };
+            assert_eq!(*lz4, want_lz4, "{purpose:?}");
+            assert_eq!(*hash, engram_migrate_proto::wire_hash(bytes));
+            assert_eq!(
+                engram_migrate_proto::decompress_page(bytes.clone(), *lz4).unwrap(),
+                memory[4096..8192]
             );
         }
     }
