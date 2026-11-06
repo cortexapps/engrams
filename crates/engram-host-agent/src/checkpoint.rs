@@ -556,20 +556,26 @@ pub async fn run_checkpoint_pass(
     }
     let due = backend.checkpoint_candidates_adaptive(cfg);
     for (sandbox_id, session_id) in due {
-        // ADR 0038 B1: skip if a capture is already in flight —
-        // queuing this best-effort checkpoint behind another
-        // capture is what let one slow/hung capture gridlock the
-        // fleet. The next tick retries.
+        // ADR 0038 B1: a best-effort checkpoint never queues behind a
+        // capture or a harness spawn. The next tick retries.
         if backend.capture_in_flight(sandbox_id) {
             metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
             tracing::debug!(
                 %sandbox_id,
                 %session_id,
-                "skipping periodic checkpoint; a capture is already in flight",
+                "skipping periodic checkpoint; a capture or harness spawn is in flight",
             );
             continue;
         }
-        match backend.checkpoint_sandbox(sandbox_id).await {
+        // A root span: the driver runs on its own timer, not for a request.
+        let span = tracing::info_span!(
+            parent: None,
+            "checkpoint.periodic",
+            %sandbox_id,
+            %session_id,
+            stamped = backend.has_checkpoint_stamp(sandbox_id),
+        );
+        match tracing::Instrument::instrument(backend.checkpoint_sandbox(sandbox_id), span).await {
             Ok(metadata) => {
                 // A successful capture proves the control plane
                 // answers — clear any unreachable suspicion.

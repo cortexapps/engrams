@@ -256,6 +256,8 @@ pub struct EpochSeveredStream<S> {
     read_epoch: EpochWaiter,
     write_epoch: EpochWaiter,
     severed: bool,
+    /// Set for a guest-dialed channel: the severance is logged once.
+    label: Option<(SandboxId, &'static str)>,
 }
 
 impl<S> EpochSeveredStream<S> {
@@ -266,16 +268,33 @@ impl<S> EpochSeveredStream<S> {
             read_epoch: EpochWaiter::new(epoch.clone()),
             write_epoch: EpochWaiter::new(epoch.clone()),
             severed: false,
+            label: None,
         }
+    }
+
+    fn labelled(mut self, sandbox_id: SandboxId, channel: &'static str) -> Self {
+        self.label = Some((sandbox_id, channel));
+        self
     }
 
     fn poll_epoch_change(
         severed: &mut bool,
+        label: Option<(SandboxId, &'static str)>,
         epoch: &mut EpochWaiter,
         cx: &mut Context<'_>,
     ) -> bool {
-        if *severed || epoch.poll_changed(cx) {
+        if *severed {
+            return true;
+        }
+        if epoch.poll_changed(cx) {
             *severed = true;
+            if let Some((sandbox_id, channel)) = label {
+                tracing::info!(
+                    %sandbox_id,
+                    channel,
+                    "snapshot transport reset severed the guest's vsock connection",
+                );
+            }
             return true;
         }
         false
@@ -302,7 +321,12 @@ where
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(result) => Poll::Ready(result),
             Poll::Pending
-                if Self::poll_epoch_change(&mut this.severed, &mut this.read_epoch, cx) =>
+                if Self::poll_epoch_change(
+                    &mut this.severed,
+                    this.label,
+                    &mut this.read_epoch,
+                    cx,
+                ) =>
             {
                 Poll::Ready(Ok(()))
             }
@@ -321,7 +345,7 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
@@ -329,7 +353,7 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_flush(cx)
@@ -337,7 +361,7 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
@@ -942,8 +966,8 @@ struct LiveSandbox {
     /// ladder's park/unpark ops will flip. `guest_memory_stats` buckets
     /// the PSS/RSS sum by this flag so a parked sandbox's memory is
     /// never added back into `allocatable_mib`. Linux-only, like the
-    /// `smaps_rollup` read that consumes it (`guest_memory_stats` is
-    /// `None` on non-Linux, so the flag has no reader there).
+    /// memory sample that consumes it (`guest_memory_stats` is `None` on
+    /// non-Linux, so the flag has no reader there).
     #[cfg(target_os = "linux")]
     parked: bool,
     /// Bumped once per FC `PUT /snapshot/create` against this sandbox.
@@ -959,6 +983,9 @@ struct LiveSandbox {
     /// subscribe BEFORE dialing and treat any bump as connection
     /// death.
     vsock_epoch: tokio::sync::watch::Sender<u64>,
+    /// When this process booted or restored the VM; `None` for a VM
+    /// reattached from an earlier host-agent process.
+    started_at: Option<std::time::Instant>,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -1118,6 +1145,11 @@ pub struct FirecrackerBackend {
     /// (a host-agent pod restart replaces them), so the stamp can't
     /// change under a running host-agent. `drive_id` → sha256.
     bundle_stamp: tokio::sync::OnceCell<std::collections::HashMap<String, String>>,
+    /// The last PSS read of each live FC process and its time, keyed by
+    /// `(sandbox, fc_pid)`. Only `guest_memory_stats` reads or writes it,
+    /// and it drops the entries of sandboxes that are gone.
+    #[cfg(target_os = "linux")]
+    pss_samples: parking_lot::Mutex<HashMap<(SandboxId, u32), (tokio::time::Instant, u64)>>,
 }
 
 /// Restore-time inputs that the capture-time sidecar cannot carry.
@@ -1192,6 +1224,8 @@ impl FirecrackerBackend {
             forge_sink: Arc::new(parking_lot::RwLock::new(None)),
             upload_sink: Arc::new(parking_lot::RwLock::new(None)),
             bundle_stamp: tokio::sync::OnceCell::new(),
+            #[cfg(target_os = "linux")]
+            pss_samples: Default::default(),
         }
     }
 
@@ -1647,6 +1681,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped: false,
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
 
@@ -2732,6 +2767,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready_rx,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: Some(std::time::Instant::now()),
             },
         );
         if let Some(pid) = fc_pid {
@@ -2898,7 +2934,9 @@ impl FirecrackerBackend {
             .get(&sandbox_id)
             .map(|live| live.vsock_epoch.subscribe());
         match epoch {
-            Some(epoch) => Box::pin(EpochSeveredStream::new(stream, epoch)),
+            Some(epoch) => {
+                Box::pin(EpochSeveredStream::new(stream, epoch).labelled(sandbox_id, channel))
+            }
             None => {
                 tracing::debug!(
                     %sandbox_id,
@@ -3584,6 +3622,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped,
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: Some(std::time::Instant::now()),
             },
         );
         if let Some(pid) = fc_pid {
@@ -4168,25 +4207,45 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> 
     }
 }
 
-/// ADR 0022 Option A: read `(Pss, Rss)` in bytes from one FC process's
-/// `/proc/<pid>/smaps_rollup`. Returns `None` if the file is unreadable
-/// (process exited mid-sample) or the fields are missing — the caller
-/// skips that pid rather than failing the whole density sample. The
-/// kernel pre-aggregates `smaps_rollup`, so this is a single small read,
-/// not a walk of every VMA.
+/// How long one PSS sample of a sandbox stands in for the next. A
+/// `smaps_rollup` read walks every page table of the process (35-160 ms
+/// of CPU for a 32 GiB guest), so the heartbeat reads RSS from
+/// `/proc/<pid>/status` on each tick and reads PSS at this interval.
 #[cfg(target_os = "linux")]
-async fn read_smaps_rollup_pss_rss(pid: u32) -> Option<(u64, u64)> {
+const PSS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The value of one `Name:   <value> kB` line of a `/proc/<pid>` text
+/// file, in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn proc_kb_field_bytes(text: &str, name: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+}
+
+/// `VmRSS` of one process, in bytes, from `/proc/<pid>/status`. The
+/// kernel reads it from the per-mm RSS counters and does not walk the
+/// page tables. `None` if the process exited or the field is missing.
+#[cfg(target_os = "linux")]
+async fn read_status_rss(pid: u32) -> Option<u64> {
+    let text = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+        .await
+        .ok()?;
+    proc_kb_field_bytes(&text, "VmRSS")
+}
+
+/// `Pss` of one process, in bytes, from `/proc/<pid>/smaps_rollup`. To
+/// make this sum the kernel walks the page tables of every VMA, so the
+/// cost grows with the resident size. `None` if the process exited or the
+/// field is missing.
+#[cfg(target_os = "linux")]
+async fn read_smaps_rollup_pss(pid: u32) -> Option<u64> {
     let text = tokio::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
         .await
         .ok()?;
-    // Each line is `Field:   <value> kB`. Convert kB → bytes.
-    let field_kb = |name: &str| -> Option<u64> {
-        text.lines()
-            .find(|l| l.starts_with(name))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
-    };
-    Some((field_kb("Pss:")? * 1024, field_kb("Rss:")? * 1024))
+    proc_kb_field_bytes(&text, "Pss")
 }
 
 /// ADR 0009 §4: per-VM process supervisor. Spawned at create/restore
@@ -5980,36 +6039,60 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
-        // ADR 0022 Option A: sum PSS/RSS over every live FC process from
-        // `/proc/<pid>/smaps_rollup`. PSS divides shared clean pages by
-        // their mapcount, so Σpss/Σrss across same-template File-backend
-        // siblings is the density ratio. Error-tolerant: a vanished or
-        // unreadable pid is skipped, never fatal.
+        // ADR 0022 Option A: sum PSS/RSS over every live FC process. PSS
+        // divides shared clean pages by their mapcount, so Σpss/Σrss across
+        // same-template File-backend siblings is the density ratio. RSS is
+        // read on each call; PSS is at most `PSS_REFRESH_INTERVAL` old and
+        // is clamped to the current RSS, because PSS never exceeds RSS. A
+        // vanished or unreadable pid is skipped, never fatal.
         //
         // Issue #540: bucket the sum by the per-sandbox `parked` flag so
-        // the RAM ledger can add back only reservation-backed (non-parked)
-        // residents into `allocatable_mib`. `parked` is always `false`
-        // today (no backend transition sets it yet), so this is a
-        // behavior-preserving split until epic-parking-ladder lands.
+        // the RAM ledger adds back only reservation-backed (non-parked)
+        // residents into `allocatable_mib`.
         #[cfg(target_os = "linux")]
         {
-            let pids: Vec<(u32, bool)> = self
+            let live: Vec<(SandboxId, u32, bool)> = self
                 .sandboxes
                 .iter()
-                .filter_map(|e| e.value().fc_pid.map(|pid| (pid, e.value().parked)))
+                .filter_map(|e| {
+                    let sandbox = e.value();
+                    sandbox.fc_pid.map(|pid| (*e.key(), pid, sandbox.parked))
+                })
                 .collect();
+            self.pss_samples
+                .lock()
+                .retain(|key, _| live.iter().any(|(id, pid, _)| (*id, *pid) == *key));
             let mut stats = engram_core::traits::sandbox::GuestMemoryStats::default();
-            for (pid, parked) in pids {
-                if let Some((pss, rss)) = read_smaps_rollup_pss_rss(pid).await {
-                    if parked {
-                        stats.parked_pss_bytes += pss;
-                        stats.parked_rss_bytes += rss;
-                        stats.parked_sampled += 1;
-                    } else {
-                        stats.pss_bytes += pss;
-                        stats.rss_bytes += rss;
-                        stats.sampled += 1;
+            for (id, pid, parked) in live {
+                let Some(rss) = read_status_rss(pid).await else {
+                    continue;
+                };
+                let now = tokio::time::Instant::now();
+                let recent = self
+                    .pss_samples
+                    .lock()
+                    .get(&(id, pid))
+                    .filter(|(at, _)| now.duration_since(*at) < PSS_REFRESH_INTERVAL)
+                    .map(|(_, pss)| *pss);
+                let pss = match recent {
+                    Some(pss) => pss,
+                    None => {
+                        let Some(pss) = read_smaps_rollup_pss(pid).await else {
+                            continue;
+                        };
+                        self.pss_samples.lock().insert((id, pid), (now, pss));
+                        pss
                     }
+                }
+                .min(rss);
+                if parked {
+                    stats.parked_pss_bytes += pss;
+                    stats.parked_rss_bytes += rss;
+                    stats.parked_sampled += 1;
+                } else {
+                    stats.pss_bytes += pss;
+                    stats.rss_bytes += rss;
+                    stats.sampled += 1;
                 }
             }
             Some(stats)
@@ -6063,7 +6146,11 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(())
     }
 
-    #[tracing::instrument(name = "fc.start_agent", skip_all, fields(sandbox_id = %id))]
+    #[tracing::instrument(
+        name = "fc.start_agent",
+        skip_all,
+        fields(sandbox_id = %id, since_vm_start_ms = tracing::field::Empty)
+    )]
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -6093,9 +6180,12 @@ impl SandboxBackend for FirecrackerBackend {
         // dial). Shared with the base-snapshot
         // capture via `wait_agent_ready`.
         self.wait_agent_ready(id).await?;
-        let t_ready = phase_start.elapsed().as_millis() as u64;
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            if let Some(started_at) = live.started_at {
+                tracing::Span::current()
+                    .record("since_vm_start_ms", started_at.elapsed().as_millis() as u64);
+            }
             live.state.vsock_uds_path.clone()
         };
 
@@ -6220,15 +6310,6 @@ impl SandboxBackend for FirecrackerBackend {
         let resp: engram_agentd::WireResponse = loop {
             attempt += 1;
             let span = tracing::info_span!("fc.spawn_harness", attempt);
-            // Per-attempt, not per-round-trip: reset at the top of each
-            // iteration so `connect_ms` below measures THIS attempt's
-            // CONNECT leg only. A single Instant hoisted above the loop
-            // would accumulate prior attempts' full connect+write+read
-            // plus their 50 ms backoff sleeps into later attempts'
-            // `connect_ms`, corrupting the sub-leg split the ADR 0045 C1
-            // diagnosis below relies on (a slow CONNECT reading as a
-            // starved guest that was actually just a late retry).
-            let t_attempt = std::time::Instant::now();
             // Cap this attempt at whatever remains of the total budget, so
             // the loop's wall-clock can never exceed SPAWN_TOTAL_BUDGET
             // (and thus stays under the caller's gRPC deadline). A hung
@@ -6246,24 +6327,19 @@ impl SandboxBackend for FirecrackerBackend {
             }
             let attempt_timeout = remaining.min(SPAWN_ATTEMPT_TIMEOUT);
             let inner = async {
-                let mut conn = Self::connect_fc_vsock(
-                    &self.sandboxes,
-                    id,
-                    &vsock_uds_path,
-                    ENGRAM_AGENTD_PORT,
+                // A slow connect means the guest does not accept (vCPUs
+                // starved or vsock not settled); a slow round trip after a
+                // fast connect means agentd is stuck past accept.
+                let mut conn = tracing::Instrument::instrument(
+                    Self::connect_fc_vsock(
+                        &self.sandboxes,
+                        id,
+                        &vsock_uds_path,
+                        ENGRAM_AGENTD_PORT,
+                    ),
+                    tracing::info_span!("fc.vsock_connect"),
                 )
                 .await?;
-                // ADR 0045 C1 tail diagnosis: split the handshake into
-                // host-visible sub-legs — a slow CONNECT means the guest
-                // isn't accepting (vCPUs starved / vsock not settled); a
-                // slow round-trip after a fast CONNECT means agentd
-                // itself is stuck past accept.
-                tracing::info!(
-                    sandbox_id = %id,
-                    attempt,
-                    connect_ms = t_attempt.elapsed().as_millis() as u64,
-                    "spawn-harness vsock connected",
-                );
                 // Gate the WRITE on the concurrent clock push (see the
                 // `clock_done` note above). Best-effort like the push
                 // itself: a sender dropped without sending (task panic)
@@ -6361,8 +6437,6 @@ impl SandboxBackend for FirecrackerBackend {
                 // `attempt > 1` as "unknown", not "no rotation happened".
                 tracing::info!(
                     sandbox_id = %id,
-                    elapsed_ms = (elapsed * 1000.0) as u64,
-                    wait_ready_ms = t_ready,
                     pid = ?pid,
                     ca_changed = ?ca_changed,
                     attempt,
@@ -6903,6 +6977,16 @@ impl FirecrackerBackend {
 /// Identical sidecar/vmstate/dir contract either way; only the memory
 /// artifact's name + capture type differ.
 impl FirecrackerBackend {
+    #[tracing::instrument(
+        name = "fc.snapshot",
+        skip_all,
+        fields(
+            sandbox_id = %id,
+            snapshot_type = ?snapshot_type,
+            hold,
+            memory_written_bytes = tracing::field::Empty,
+        )
+    )]
     async fn snapshot_with_type(
         &self,
         id: SandboxId,
@@ -7086,10 +7170,17 @@ impl FirecrackerBackend {
         // landed in `dest`. memory.bin dominates (= guest RAM size).
         let mut size_bytes = 0u64;
         for p in [&paths.state_path, &paths.mem_path, &manifest_path] {
-            size_bytes += tokio::fs::metadata(p)
+            let meta = tokio::fs::metadata(p)
                 .await
-                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?
-                .len();
+                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?;
+            if p == &paths.mem_path {
+                // A diff file is sparse: its allocated blocks are the dirty pages.
+                tracing::Span::current().record(
+                    "memory_written_bytes",
+                    std::os::unix::fs::MetadataExt::blocks(&meta) * 512,
+                );
+            }
+            size_bytes += meta.len();
         }
 
         Ok(SnapshotMetadata {
@@ -9089,6 +9180,7 @@ mod tests {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             }
         };
         assert!(be.post_copy_source_view(id).is_none(), "unknown sandbox");
@@ -9158,6 +9250,7 @@ mod tests {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             }
         };
 
@@ -9178,22 +9271,53 @@ mod tests {
         );
     }
 
-    // ADR 0022: the smaps_rollup parser, exercised against the test
-    // process's own /proc entry. Linux-only (no smaps_rollup on macOS);
-    // runs on CI's Linux runner in the normal unit-test job.
+    const PROC_STATUS_FIXTURE: &str = "\
+Name:\tfirecracker
+VmHWM:\t 8400000 kB
+VmRSS:\t 8388612 kB
+RssAnon:\t 8126464 kB
+VmSwap:\t       0 kB
+";
+
+    const SMAPS_ROLLUP_FIXTURE: &str = "\
+55d0c0000000-7ffd00000000 ---p 00000000 00:00 0                          [rollup]
+Rss:             8388612 kB
+Pss:             8200000 kB
+";
+
+    #[test]
+    fn proc_kb_field_reads_status_rss_and_rollup_pss() {
+        use super::proc_kb_field_bytes;
+        assert_eq!(
+            proc_kb_field_bytes(PROC_STATUS_FIXTURE, "VmRSS"),
+            Some(8_388_612 * 1024)
+        );
+        assert_eq!(proc_kb_field_bytes(PROC_STATUS_FIXTURE, "VmSwap"), Some(0));
+        assert_eq!(
+            proc_kb_field_bytes(SMAPS_ROLLUP_FIXTURE, "Pss"),
+            Some(8_200_000 * 1024)
+        );
+        // A name matches the whole field name, not a prefix of `RssAnon`.
+        assert_eq!(proc_kb_field_bytes(PROC_STATUS_FIXTURE, "Rss"), None);
+        assert_eq!(proc_kb_field_bytes("VmRSS:\tlots kB\n", "VmRSS"), None);
+    }
+
+    // Linux-only (no /proc on macOS); runs on CI's Linux runner in the
+    // normal unit-test job.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn read_smaps_rollup_parses_own_process() {
+    async fn proc_readers_parse_own_process() {
         let pid = std::process::id();
-        let (pss, rss) = super::read_smaps_rollup_pss_rss(pid)
+        let rss = super::read_status_rss(pid)
+            .await
+            .expect("own process must have a readable status");
+        let pss = super::read_smaps_rollup_pss(pid)
             .await
             .expect("own process must have a readable smaps_rollup");
-        // A running process has non-zero resident + proportional set.
-        assert!(rss > 0, "Rss must be > 0");
+        assert!(rss > 0, "VmRSS must be > 0");
         assert!(pss > 0, "Pss must be > 0");
-        assert!(pss <= rss, "Pss ({pss}) can never exceed Rss ({rss})");
-        // A nonexistent pid returns None, not an error.
-        assert!(super::read_smaps_rollup_pss_rss(u32::MAX).await.is_none());
+        assert!(super::read_status_rss(u32::MAX).await.is_none());
+        assert!(super::read_smaps_rollup_pss(u32::MAX).await.is_none());
     }
 
     #[tokio::test]
@@ -9253,6 +9377,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
         let mut first = Box::pin(be.wait_agent_ready(id));
@@ -9308,61 +9433,14 @@ mod tests {
     /// per-sandbox `parked` flag so the RAM ledger never adds a parked
     /// resident's memory back into `allocatable_mib`. Both entries
     /// sample the test process's own pid (no real FC process needed) —
-    /// the property under test is the split, not the smaps parse
-    /// (covered by `read_smaps_rollup_parses_own_process`).
+    /// the property under test is the split, not the parse (covered by
+    /// `proc_readers_parse_own_process`).
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn guest_memory_stats_buckets_parked_pss_separately() {
         let (be, _dir) = backend();
-        let own_pid = std::process::id();
-        let (_tx, agent_ready) = tokio::sync::watch::channel(true);
-        let dummy_state = || SandboxState {
-            spec: spec(),
-            firecracker_socket: PathBuf::new(),
-            rootfs_path: PathBuf::new(),
-            vsock_cid: 3,
-            vsock_uds_path: PathBuf::new(),
-            rootfs_canonical: PathBuf::new(),
-            swap_canonical: None,
-            memory_backing: None,
-        };
-
-        let running_id = SandboxId::new();
-        be.sandboxes.insert(
-            running_id,
-            LiveSandbox {
-                state: dummy_state(),
-                child: None,
-                fc_pid: Some(own_pid),
-                uffd_handler: None,
-                uffd_pid: None,
-                net: None,
-                netns: None,
-                guest_endpoints: parking_lot::Mutex::new(None),
-                parked: false,
-                agentd_slot_swapped: false,
-                agent_ready: agent_ready.clone().into(),
-                vsock_epoch: tokio::sync::watch::channel(0).0,
-            },
-        );
-        let parked_id = SandboxId::new();
-        be.sandboxes.insert(
-            parked_id,
-            LiveSandbox {
-                state: dummy_state(),
-                child: None,
-                fc_pid: Some(own_pid),
-                uffd_handler: None,
-                uffd_pid: None,
-                net: None,
-                netns: None,
-                guest_endpoints: parking_lot::Mutex::new(None),
-                parked: false,
-                agentd_slot_swapped: false,
-                agent_ready: agent_ready.clone().into(),
-                vsock_epoch: tokio::sync::watch::channel(0).0,
-            },
-        );
+        insert_own_pid_sandbox(&be);
+        let parked_id = insert_own_pid_sandbox(&be);
         be.set_parked_for_test(parked_id, true);
 
         let stats = be
@@ -9388,6 +9466,76 @@ mod tests {
             stats.pss_bytes, 0,
             "parked residency must not silently zero out the running bucket"
         );
+    }
+
+    /// A PSS sample stands for `PSS_REFRESH_INTERVAL`, never exceeds the
+    /// current RSS, is read again once it is older, and goes away with
+    /// its sandbox.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn guest_memory_stats_reuses_a_recent_pss_sample() {
+        let (be, _dir) = backend();
+        let id = insert_own_pid_sandbox(&be);
+        let key = (id, std::process::id());
+        let now = tokio::time::Instant::now();
+        be.pss_samples.lock().insert(key, (now, u64::MAX));
+
+        let stats = be.guest_memory_stats().await.expect("linux samples memory");
+        assert_eq!(
+            stats.pss_bytes, stats.rss_bytes,
+            "a recent sample is used, clamped to the current RSS"
+        );
+
+        let old = now
+            .checked_sub(super::PSS_REFRESH_INTERVAL)
+            .expect("monotonic clock is past the refresh interval");
+        be.pss_samples.lock().insert(key, (old, u64::MAX));
+        be.guest_memory_stats().await.expect("linux samples memory");
+        let (at, pss) = be.pss_samples.lock()[&key];
+        assert!(at >= now, "an old sample is read again");
+        assert!(pss < u64::MAX);
+
+        be.sandboxes.remove(&id);
+        be.guest_memory_stats().await.expect("linux samples memory");
+        assert!(
+            be.pss_samples.lock().is_empty(),
+            "a gone sandbox drops its sample"
+        );
+    }
+
+    /// Insert a sandbox whose `fc_pid` is this test process, so the
+    /// memory readers have a real `/proc` entry to read.
+    #[cfg(target_os = "linux")]
+    fn insert_own_pid_sandbox(be: &FirecrackerBackend) -> SandboxId {
+        let id = SandboxId::new();
+        be.sandboxes.insert(
+            id,
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: PathBuf::new(),
+                    rootfs_path: PathBuf::new(),
+                    vsock_cid: 3,
+                    vsock_uds_path: PathBuf::new(),
+                    rootfs_canonical: PathBuf::new(),
+                    swap_canonical: None,
+                    memory_backing: None,
+                },
+                child: None,
+                fc_pid: Some(std::process::id()),
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                parked: false,
+                agentd_slot_swapped: false,
+                agent_ready: tokio::sync::watch::channel(true).1.into(),
+                vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
+            },
+        );
+        id
     }
 
     /// True iff `pid` is alive (`kill(pid, 0)` succeeds). A dead/reaped
@@ -9507,6 +9655,7 @@ mod tests {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
 
