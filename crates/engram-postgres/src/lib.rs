@@ -969,13 +969,13 @@ impl PostgresStore {
         // pin set before the row committed would miss the snapshot's
         // chunks; with the bump, the sweep's post-collection
         // generation read catches the divergence and restarts.
-        let now = self.clock.now_utc();
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
         if fence.is_some() && snap.session_id.is_none() {
             return Err(MetaError::Serialization(
                 "fenced_record_snapshot requires a session-scoped snapshot".into(),
             ));
         }
+        let now = self.clock.now_utc();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Lock order: the session row, then the snapshot row, then
         // `chunk_generation`. Every session-scoped write takes the session
         // row FIRST, fenced or not: the durable-head UPDATE below locks it
@@ -4934,27 +4934,48 @@ impl MetadataStore for PostgresStore {
         // portable `snapshots/<id>/` blobs (state.bin / sidecar), which
         // the chunk GC doesn't sweep (different namespace) and would
         // otherwise orphan in BlobStorage.
+        let retention = sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
+        };
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Lock order: the session rows first (the delete's ON DELETE SET
+        // NULL on `durable_head_snapshot_id` writes them), in id order.
+        let sessions: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM sessions
+            WHERE id IN (
+                SELECT session_id FROM snapshots
+                WHERE session_id IS NOT NULL AND created_at < $2 - $1::interval
+            )
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(retention)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
         let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
             r#"
             DELETE FROM snapshots s
-            WHERE s.session_id IS NOT NULL
+            WHERE s.session_id = ANY($3)
               AND s.created_at < $2 - $1::interval
               AND s.id NOT IN (
                   SELECT DISTINCT ON (session_id) id
                   FROM snapshots
-                  WHERE session_id IS NOT NULL
+                  WHERE session_id = ANY($3)
                   ORDER BY session_id, created_at DESC
               )
             RETURNING s.id
             "#,
         )
-        .bind(sqlx::postgres::types::PgInterval {
-            months: 0,
-            days: 0,
-            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
-        })
-        .bind(self.clock.now_utc())
+        .bind(retention)
+        .bind(now)
+        .bind(&sessions)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
