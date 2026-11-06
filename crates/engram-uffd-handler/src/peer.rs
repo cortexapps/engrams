@@ -244,9 +244,10 @@ pub struct PeerSession {
     seal: SealBitmap,
     chunk_size: u64,
     expected_total: u64,
-    /// The fault-path connection. Single in-flight by construction
-    /// (the fault loop is single-threaded); the mutex also covers the
-    /// reconnect-swap.
+    /// The fault-path connection: one window at a time, held for the
+    /// whole round trip (the mutex also covers the reconnect-swap). A
+    /// fault thread that finds it busy uses a spare Fault connection
+    /// instead (see [`Self::need_window`]).
     fault_conn: Mutex<TcpStream>,
     /// Idle fault-window connections. A window takes one instead of
     /// dialing (Hello, HelloAck, Seal) and gives it back when it ends
@@ -595,6 +596,8 @@ impl PeerSession {
     /// Stream a window; retry only the suffix not yet installed.
     /// The outer error is a peer failure. The inner error is from the
     /// installer; it stops the stream and the caller must exit the handler.
+    /// It runs on the fault connection or, while another fault thread
+    /// holds that, on a spare one, so two faults do not wait on each other.
     pub fn need_window<E>(
         &self,
         offsets: &[u64],
@@ -604,12 +607,43 @@ impl PeerSession {
             return Err(PeerError::Lost("peer already marked lost".into()));
         }
         let _fault = self.begin_fault();
-        let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
-        let result = self.stream_window(&mut conn, offsets, install, || false, |_| Ok(true));
+        let result = match self.fault_conn.try_lock() {
+            Ok(mut conn) => self.stream_window(&mut conn, offsets, install, || false, |_| Ok(true)),
+            Err(std::sync::TryLockError::WouldBlock) => self.need_window_on_spare(offsets, install),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("fault conn poisoned"),
+        };
         if result.is_err() {
             self.mark_lost();
         }
         result
+    }
+
+    /// [`Self::need_window`] while the fault connection is busy: on an idle
+    /// or new Fault connection, given back to the pool when the window ends
+    /// cleanly. When none opens, it waits for the fault connection.
+    fn need_window_on_spare<E>(
+        &self,
+        offsets: &[u64],
+        install: impl FnMut(u64, PeerPage) -> Result<(), E>,
+    ) -> Result<Result<(), E>, PeerError> {
+        #[cfg(target_os = "linux")]
+        {
+            match self.open_prefetch_conn(|_| Ok(true)) {
+                Ok(mut conn) => {
+                    let result =
+                        self.stream_window(&mut conn, offsets, install, || false, |_| Ok(true));
+                    if matches!(result, Ok(Ok(()))) {
+                        self.return_prefetch_conn(conn);
+                    }
+                    return result;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "no spare fault connection; waiting for the fault connection");
+                }
+            }
+        }
+        let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
+        self.stream_window(&mut conn, offsets, install, || false, |_| Ok(true))
     }
 
     /// Shared streaming and suffix-only retry logic. The prefetch caller owns
