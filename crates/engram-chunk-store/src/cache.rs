@@ -535,34 +535,72 @@ pub struct ChunkCache {
 /// the working-set-too-big-for-the-disk thrash this metric targets.
 const EVICTED_RING_CAP: usize = 4096;
 
-/// Singleflight slot map: hash → the waiters' oneshot senders the
-/// leader broadcasts the fetched bytes to. An entry exists iff a leader
-/// is in flight for that hash.
-type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
+/// One chunk's fetch in flight. The entry exists while a leader of it
+/// fetches the chunk or writes it.
+struct Flight {
+    /// Tells this flight from a later one for the same hash.
+    id: u64,
+    /// The highest class among the flight's fetches.
+    class: Class,
+    /// Calls that run a fetch for this flight, or write its bytes.
+    leaders: usize,
+    /// Every call waiting for the bytes, the leaders included.
+    waiters: Vec<oneshot::Sender<Result<Bytes>>>,
+    /// The verified bytes, set while the winning leader writes them. A
+    /// call that arrives in that time is served from here.
+    fetched: Option<Bytes>,
+}
 
-/// Removes a leader's in-flight slot on drop **unless disarmed** — the
-/// cancel-safety net for [`ChunkCache::get`]. The leader registers a
-/// slot, then `fetch().await`s; if that future is *cancelled* (e.g. an
-/// FC `load_snapshot` 60 s timeout tears down the whole restore), the
-/// leader's normal "remove slot + notify waiters" tail never runs, so
-/// the slot — holding the leader's own sender — lingers forever and
-/// every waiter (and every later `get` for this hash, which joins the
-/// orphaned slot) blocks on a broadcast that never comes. That poisons
-/// the host's chunk cache and wedges every resume retry. This guard removes the slot on drop, dropping its
-/// senders so waiters observe `RecvError` and retry as a fresh leader.
-/// The leader disarms it once it has removed the slot itself.
+/// Singleflight map: the flight of each chunk being fetched.
+type InflightMap = HashMap<ChunkHash, Flight>;
+
+/// Ids of flights, unique within the process.
+static NEXT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One leader leaves flight `id`. The last leader to leave ends the
+/// flight; the ended flight is returned, so the caller can answer its
+/// waiters.
+fn leave(inflight: &mut InflightMap, hash: ChunkHash, id: u64) -> Option<Flight> {
+    let flight = inflight.get_mut(&hash).filter(|f| f.id == id)?;
+    flight.leaders -= 1;
+    if flight.leaders == 0 {
+        inflight.remove(&hash)
+    } else {
+        None
+    }
+}
+
+/// A leader's place in its flight, given up on drop unless disarmed: the
+/// cancel-safety net for [`ChunkCache::fill_with`]. A leader dropped
+/// mid-fetch (an FC `load_snapshot` timeout tears down the restore)
+/// never reaches its own cleanup. Without the guard the flight would
+/// stay in the map, and its waiters and every later call for the hash
+/// would wait for an answer that never comes. When the last leader
+/// leaves, the guard removes the flight; its waiters see `RecvError`
+/// and retry.
 struct LeaderGuard<'a> {
     inflight: &'a Mutex<InflightMap>,
     hash: ChunkHash,
+    id: u64,
     armed: bool,
 }
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.inflight.lock().remove(&self.hash);
+            leave(&mut self.inflight.lock(), self.hash, self.id);
         }
     }
+}
+
+/// What a call to [`ChunkCache::fill_with`] does for a missing chunk.
+enum Role {
+    /// The flight has verified bytes.
+    Served(Bytes),
+    /// Wait for the flight's answer.
+    Wait,
+    /// Run a fetch for flight `id`; `first` when this call started it.
+    Lead { id: u64, first: bool },
 }
 
 struct CacheInner {
@@ -936,14 +974,7 @@ impl ChunkCache {
         Ok(Some(bytes))
     }
 
-    /// A chunk's bytes. Local NVMe first; on a miss, `fetch` runs once
-    /// (singleflight: concurrent callers for the same hash share its
-    /// result), its bytes are verified (unless they came from a peer),
-    /// written to local NVMe at `class` ([`Self::write_slot`]), then
-    /// returned. The closure reports where the bytes came from, so the
-    /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label and
-    /// the fetch histogram's `tier` stay honest (ADR 0095). If the fetch
-    /// errors, the error reaches every waiter.
+    /// [`Self::fill_with`] without a slot taken ahead.
     pub async fn get_with_source<F, Fut>(
         &self,
         hash: ChunkHash,
@@ -954,203 +985,304 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
     {
+        self.fill_with(hash, class, None, |_| fetch()).await
+    }
+
+    /// A chunk's bytes. Local NVMe first. On a miss, one fetch serves
+    /// every concurrent caller (singleflight): its bytes are verified
+    /// (unless they came from a peer), handed to every waiter, then
+    /// written to local NVMe at the writer's class
+    /// ([`Self::write_slot`]). The fetch reports where its bytes came
+    /// from, so the [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`]
+    /// `source` label and the fetch histogram's `tier` stay honest
+    /// (ADR 0095). When every fetch of the flight fails, the last error
+    /// reaches every waiter.
+    ///
+    /// A caller of a higher class than the running fetch (a fault on a
+    /// chunk a bulk fill fetches) does not wait for that fetch: it runs
+    /// its own `fetch` beside it, and the first verified answer serves
+    /// every caller.
+    ///
+    /// `permit` is an admission slot the caller took ahead (a fill takes
+    /// its slots in fetch order). It goes to `fetch`, and is dropped when
+    /// this call waits for another call's fetch.
+    pub async fn fill_with<F, Fut>(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        mut permit: Option<Permit>,
+        fetch: F,
+    ) -> Result<Bytes>
+    where
+        F: FnOnce(Option<Permit>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
+    {
         if let Some(bytes) = self.read_resident(hash).await? {
             return Ok(bytes);
         }
-
-        // Singleflight, cancel-safe. We loop because a waiter whose leader
-        // is cancelled mid-fetch (see `LeaderGuard`) wakes with `RecvError`
-        // and re-enters — re-checking the local hit, then re-leading or
-        // re-joining — rather than failing the read. The leader path runs
-        // at most once per call (the `fetch` closure is `FnOnce`, taken via
-        // `Option::take`); a call only re-loops as a woken waiter.
+        // A call loops only as a waiter whose flight ended without an
+        // answer (its last leader was cancelled); a leader returns.
         let mut fetch = Some(fetch);
         loop {
             let (tx, rx) = oneshot::channel();
-            let do_fetch = {
+            let role = {
                 let mut inflight = self.inner.inflight.lock();
-                let entry = inflight.entry(hash).or_default();
-                let first = entry.is_empty();
-                entry.push(tx);
-                first
-            };
-
-            if do_fetch {
-                // Arm the cancel-safety guard for the whole leader section:
-                // if this future is dropped before we remove the slot below,
-                // the guard removes it so waiters retry instead of wedging.
-                let mut guard = LeaderGuard {
-                    inflight: &self.inner.inflight,
-                    hash,
-                    armed: true,
-                };
-                // Double-checked hit: leadership was won on the state of the
-                // inflight MAP, but this call's fast-path disk check ran
-                // before the lock — a prior leader may have persisted and
-                // drained in between (its persist happens before its slot
-                // removal, below, so slot-gone implies file-present). Serve
-                // from disk instead of paying a duplicate remote fetch —
-                // without this, a stale-miss caller that wins leadership
-                // re-fetches a chunk that is already on NVMe (the
-                // `concurrent_clients_collapse_to_one_fetch` flake).
-                if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
-                    let waiters = {
-                        let mut inflight = self.inner.inflight.lock();
-                        inflight.remove(&hash).unwrap_or_default()
-                    };
-                    guard.armed = false;
-                    for waiter in waiters {
-                        let _ = waiter.send(Ok(bytes.clone()));
+                match inflight.get_mut(&hash) {
+                    None => {
+                        let id = NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        inflight.insert(
+                            hash,
+                            Flight {
+                                id,
+                                class,
+                                leaders: 1,
+                                waiters: vec![tx],
+                                fetched: None,
+                            },
+                        );
+                        Role::Lead { id, first: true }
                     }
-                    metrics::counter!(
-                        "engram_chunk_cache_hits_total",
-                        "tier" => "nvme",
-                    )
-                    .increment(1);
-                    metrics::counter!(
-                        "engram_chunk_cache_bytes_total",
-                        "tier" => "nvme",
-                    )
-                    .increment(bytes.len() as u64);
-                    return Ok(bytes);
-                }
-                let fetch = fetch.take().expect("leader runs the fetch once");
-                // ADR 0039 #16: thrash signal. If we're about to pay a remote
-                // round-trip for a hash we recently evicted, the cache is too
-                // small for the working set — count it (and stop tracking the
-                // hash; it's about to be re-cached). A sustained nonzero rate
-                // says "raise the budget / the disk is the bottleneck."
-                if self.inner.evicted_ring.lock().take(&hash) {
-                    metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
-                }
-                // ADR 0019 0d: time the remote fetch — the cold-cache page-in
-                // cost that stretches cold boot (the slow tier). Histogram +
-                // the bytes counter below quantify "how much of the boot is
-                // blob page-in" without per-read trace spam.
-                let fetch_start = crate::time_source::metrics_now();
-                let fetched = fetch().await;
-                let source = fetched
-                    .as_ref()
-                    .map(|(_, s)| *s)
-                    .unwrap_or(FillSource::BlobStorage);
-                let fetched = fetched.map(|(b, _)| b);
-                metrics::histogram!(
-                    "engram_chunk_fetch_seconds",
-                    "tier" => source.fetch_tier(),
-                )
-                .record(fetch_start.elapsed().as_secs_f64());
-                // A chunk from the object store is hashed here, once, before
-                // it is stored or served; a mismatch fails every waiter and
-                // stores nothing. A peer's chunk is trusted: the peer checked
-                // it when it stored it, and each frame carries a CRC32C.
-                let result = match fetched {
-                    Ok(bytes) if source == FillSource::Peer => Ok(bytes),
-                    Ok(bytes) => verify_fetched(hash, &bytes).await.map(|()| bytes),
-                    Err(e) => Err(e),
-                };
-                // Persist BEFORE releasing the slot. The ordering is the
-                // singleflight's collapse invariant: a fresh caller can only
-                // become the next leader after this slot is removed, so
-                // slot-gone must imply file-present — otherwise every caller
-                // arriving in the remove→persist window (fast-path miss, then
-                // an empty inflight entry) re-fetches a chunk that is already
-                // in flight to disk. The leader's double-checked read above
-                // relies on the same invariant. Cancellation mid-persist is
-                // covered by the still-armed guard (slot removed on drop;
-                // waiters wake with RecvError and retry).
-                if let Ok(bytes) = result.as_ref() {
-                    // write_local failure is non-fatal I/O (ENOSPC, perms): the
-                    // fetched bytes still return to the caller, but the chunk
-                    // isn't cached, so every later read re-fetches from GCS —
-                    // which presents exactly as "warming ran but reads still
-                    // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    let write_local_ok = match self.write_local(hash, bytes.clone(), class).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            tracing::warn!(
-                                hash = %hash,
-                                root = %self.inner.config.root.display(),
-                                bytes = bytes.len(),
-                                error = %e,
-                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                            );
-                            false
+                    Some(flight) => match &flight.fetched {
+                        Some(bytes) => Role::Served(bytes.clone()),
+                        // `Class` orders `Demand` first.
+                        None if class < flight.class => {
+                            flight.class = class;
+                            flight.leaders += 1;
+                            flight.waiters.push(tx);
+                            Role::Lead {
+                                id: flight.id,
+                                first: false,
+                            }
                         }
-                    };
-                    // This measures the fetch (bytes pulled from
-                    // BlobStorage), not the fill — it stays unconditional
-                    // even when write_local below fails.
-                    metrics::counter!(
-                        "engram_chunk_cache_bytes_total",
-                        "tier" => source.fetch_tier(),
-                    )
-                    .increment(bytes.len() as u64);
-                    // ADR 0019 / telemetry restoration (#526), review finding
-                    // 4: the baseline meter for epic-gcs-free-resume's
-                    // "GCS-free by policy" claim. ADR 0095 moved the label to
-                    // the closure seam: the fetcher reports its actual source
-                    // (`gcs` = the cold BlobStorage tier in every deployed
-                    // configuration; `peer` = a fleet sibling's NVMe), so a
-                    // tiered fetcher can't launder a peer fill as GCS or vice
-                    // versa. Gated on `write_local_ok`: a fetch whose local
-                    // persist failed did NOT fill the cache — counting it
-                    // here would mask exactly the "warming ran but reads
-                    // still miss" state the write_local warning above exists
-                    // to catch.
-                    if write_local_ok {
-                        metrics::counter!(
-                            CHUNK_FILL_TOTAL,
-                            "source" => source.label(),
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            CHUNK_FILL_BYTES_TOTAL,
-                            "source" => source.label(),
-                        )
-                        .increment(bytes.len() as u64);
+                        None => {
+                            flight.waiters.push(tx);
+                            Role::Wait
+                        }
+                    },
+                }
+            };
+            match role {
+                Role::Served(bytes) => return Ok(bytes),
+                Role::Wait => {
+                    drop(permit.take());
+                    match rx.await {
+                        Ok(result) => return result,
+                        Err(_) => continue,
                     }
                 }
-                // Drain waiters + DISARM: the slot is gone, so the guard must
-                // not remove a fresh slot a later leader may have created.
-                let waiters = {
-                    let mut inflight = self.inner.inflight.lock();
-                    inflight.remove(&hash).unwrap_or_default()
-                };
-                guard.armed = false;
-                // Notify waiters. Send-failure (their rx dropped)
-                // is benign.
-                for waiter in waiters {
-                    let _ = waiter.send(clone_result(&result));
-                }
-                // ADR 0014 M1.15: count the leader's fetch as a remote-tier
-                // hit (we went past local NVMe — `blobstorage`, or `peer`
-                // when a tiered fetcher resolved there, ADR 0095).
-                // Singleflight FOLLOWERS are not counted here at all — the
-                // rx-await arm increments no metric; a follower surfaces as
-                // an nvme hit only on its own later `get` call that finds
-                // the now-cached chunk.
-                metrics::counter!(
-                    "engram_chunk_cache_hits_total",
-                    "tier" => source.fetch_tier(),
-                )
-                .increment(1);
-                return result;
-            } else {
-                // We're not the first; await the leader's broadcast. The
-                // closure we were passed stays unused (the leader's fetcher
-                // fires; content-addressing means any fetcher yields the same
-                // bytes).
-                match rx.await {
-                    Ok(result) => return result,
-                    // `RecvError` ⇒ the leader was dropped (cancelled) before
-                    // broadcasting and its `LeaderGuard` cleaned the slot.
-                    // Retry: re-loop to re-check the local hit, then re-lead
-                    // or re-join. This is the un-poisoning — a cancelled
-                    // restore no longer wedges every later read of this hash.
-                    Err(_) => continue,
+                Role::Lead { id, first } => {
+                    let fetch = fetch.take().expect("a call leads at most once");
+                    let guard = LeaderGuard {
+                        inflight: &self.inner.inflight,
+                        hash,
+                        id,
+                        armed: true,
+                    };
+                    return self
+                        .lead(guard, class, first, rx, fetch(permit.take()))
+                        .await;
                 }
             }
         }
+    }
+
+    /// One leader of a flight: run `fetching` until it or another leader
+    /// answers, then answer the flight.
+    async fn lead<Fut>(
+        &self,
+        mut guard: LeaderGuard<'_>,
+        class: Class,
+        first: bool,
+        mut rx: oneshot::Receiver<Result<Bytes>>,
+        fetching: Fut,
+    ) -> Result<Bytes>
+    where
+        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
+    {
+        let (hash, id) = (guard.hash, guard.id);
+        if first {
+            // Double-checked hit: this call's fast-path disk check ran
+            // before it took the map lock, and a previous flight may have
+            // written the file and ended in between (a flight ends only
+            // after its write, so no flight implies the file is there).
+            // Serve the file instead of fetching it again.
+            if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
+                let ended = {
+                    let mut inflight = self.inner.inflight.lock();
+                    match inflight.get(&hash) {
+                        Some(f) if f.id == id => inflight.remove(&hash),
+                        _ => None,
+                    }
+                };
+                guard.armed = false;
+                for waiter in ended.into_iter().flat_map(|f| f.waiters) {
+                    let _ = waiter.send(Ok(bytes.clone()));
+                }
+                metrics::counter!(
+                    "engram_chunk_cache_hits_total",
+                    "tier" => "nvme",
+                )
+                .increment(1);
+                metrics::counter!(
+                    "engram_chunk_cache_bytes_total",
+                    "tier" => "nvme",
+                )
+                .increment(bytes.len() as u64);
+                return Ok(bytes);
+            }
+        }
+        // ADR 0039 #16: thrash signal. If we're about to pay a remote
+        // round-trip for a hash we recently evicted, the cache is too
+        // small for the working set — count it (and stop tracking the
+        // hash; it's about to be re-cached). A sustained nonzero rate
+        // says "raise the budget / the disk is the bottleneck."
+        if self.inner.evicted_ring.lock().take(&hash) {
+            metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
+        }
+        // ADR 0019 0d: time the remote fetch — the cold-cache page-in
+        // cost that stretches cold boot (the slow tier).
+        let fetch_start = crate::time_source::metrics_now();
+        tokio::pin!(fetching);
+        let mut rx_open = true;
+        let fetched = loop {
+            tokio::select! {
+                got = &mut fetching => break got,
+                answer = &mut rx, if rx_open => match answer {
+                    // Another leader of the flight answered first; the
+                    // guard gives up this leader's place.
+                    Ok(result) => return result,
+                    Err(_) => rx_open = false,
+                },
+            }
+        };
+        let source = fetched
+            .as_ref()
+            .map(|(_, s)| *s)
+            .unwrap_or(FillSource::BlobStorage);
+        metrics::histogram!(
+            "engram_chunk_fetch_seconds",
+            "tier" => source.fetch_tier(),
+        )
+        .record(fetch_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            "engram_chunk_cache_hits_total",
+            "tier" => source.fetch_tier(),
+        )
+        .increment(1);
+        // A chunk from the object store is hashed here, once, before
+        // it is stored or served; a mismatch fails the fetch and stores
+        // nothing. A peer's chunk is trusted: the peer checked it when it
+        // stored it, and each frame carries a CRC32C.
+        let verified = match fetched {
+            Ok((bytes, FillSource::Peer)) => Ok(bytes),
+            Ok((bytes, FillSource::BlobStorage)) => {
+                verify_fetched(hash, &bytes).await.map(|()| bytes)
+            }
+            Err(e) => Err(e),
+        };
+        match verified {
+            Ok(bytes) => self.answer_flight(guard, class, bytes, source).await,
+            Err(e) => {
+                let ended = leave(&mut self.inner.inflight.lock(), hash, id);
+                guard.armed = false;
+                match ended {
+                    Some(Flight {
+                        fetched: Some(bytes),
+                        ..
+                    }) => Ok(bytes),
+                    // This was the flight's last fetch: its error is the
+                    // flight's answer.
+                    Some(flight) => {
+                        for waiter in flight.waiters {
+                            let _ = waiter.send(Err(e.duplicate()));
+                        }
+                        Err(e)
+                    }
+                    // Another leader still fetches, or has answered.
+                    None if rx_open => match rx.await {
+                        Ok(Ok(bytes)) => Ok(bytes),
+                        _ => Err(e),
+                    },
+                    None => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Serve verified `bytes` to the flight's waiters at once, then write
+    /// them to local NVMe at `class` and end the flight. A later leader
+    /// with the same answer only leaves the flight.
+    async fn answer_flight(
+        &self,
+        mut guard: LeaderGuard<'_>,
+        class: Class,
+        bytes: Bytes,
+        source: FillSource,
+    ) -> Result<Bytes> {
+        let (hash, id) = (guard.hash, guard.id);
+        let first_answer = {
+            let mut inflight = self.inner.inflight.lock();
+            match inflight.get_mut(&hash) {
+                Some(f) if f.id == id && f.fetched.is_none() => {
+                    f.fetched = Some(bytes.clone());
+                    for waiter in f.waiters.drain(..) {
+                        let _ = waiter.send(Ok(bytes.clone()));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !first_answer {
+            return Ok(bytes);
+        }
+        // The flight stays in the map during the write, so a call that
+        // arrives now is served from it instead of fetching again; it
+        // ends after the write, so no flight implies the file is there.
+        // A leader cancelled mid-write leaves through the still-armed
+        // guard, and the write's blocking task still ends.
+        //
+        // A failed write (ENOSPC, permissions) is not fatal: the bytes
+        // still return, but the chunk is not cached and every later read
+        // fetches it again — which looks like "warming ran but reads
+        // still miss". Log it loudly rather than swallow it.
+        let written = match self.write_local(hash, bytes.clone(), class).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    hash = %hash,
+                    root = %self.inner.config.root.display(),
+                    bytes = bytes.len(),
+                    error = %e,
+                    "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                );
+                false
+            }
+        };
+        // This measures the fetch, not the fill, so it counts a chunk
+        // whose write failed too.
+        metrics::counter!(
+            "engram_chunk_cache_bytes_total",
+            "tier" => source.fetch_tier(),
+        )
+        .increment(bytes.len() as u64);
+        // ADR 0019 / ADR 0095: fills by their actual source (`gcs` = the
+        // object store, `peer` = a fleet sibling's NVMe). Only a chunk
+        // that reached the disk counts, so a failed write cannot hide the
+        // "warming ran but reads still miss" state.
+        if written {
+            metrics::counter!(CHUNK_FILL_TOTAL, "source" => source.label()).increment(1);
+            metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => source.label())
+                .increment(bytes.len() as u64);
+        }
+        {
+            let mut inflight = self.inner.inflight.lock();
+            if inflight.get(&hash).is_some_and(|f| f.id == id) {
+                inflight.remove(&hash);
+            }
+        }
+        guard.armed = false;
+        Ok(bytes)
     }
 
     /// Pin a chunk against eviction (increments its refcount). Used by
@@ -2032,15 +2164,6 @@ async fn read_if_present(path: &Path) -> Result<Option<Bytes>> {
     })
     .await
     .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
-}
-
-/// The leader's outcome for one singleflight waiter. The error keeps its
-/// variant, so a waiter can tell a missing chunk from a failed fetch.
-fn clone_result(r: &Result<Bytes>) -> Result<Bytes> {
-    match r {
-        Ok(bytes) => Ok(bytes.clone()),
-        Err(e) => Err(e.duplicate()),
-    }
 }
 
 #[cfg(test)]

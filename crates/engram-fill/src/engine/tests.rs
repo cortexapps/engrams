@@ -168,6 +168,64 @@ async fn bulk_fetches_are_not_hedged() {
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_fault_on_a_chunk_a_bulk_fetch_holds_gets_its_own_fetch() {
+    let f = fixture();
+    let hash = put(&f, b"prefetched and faulted").await;
+    let resolver = counting(&f, Some(Duration::from_secs(30)));
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+    let bulk = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.get(hash, Class::Hydrate).await }
+    });
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let started = tokio::time::Instant::now();
+    let bytes = engine.get(hash, Class::Demand).await.unwrap();
+
+    assert_eq!(&bytes[..], b"prefetched and faulted");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    let bulk = tokio::time::timeout(Duration::from_millis(10), bulk)
+        .await
+        .expect("the bulk caller gets the fault's answer");
+    assert_eq!(&bulk.unwrap().unwrap()[..], b"prefetched and faulted");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_caller_that_waits_for_another_fetch_holds_no_slot() {
+    let f = fixture();
+    let slow = put(&f, b"slow chunk").await;
+    let other = put(&f, b"other chunk").await;
+    let resolver = counting(&f, Some(Duration::from_secs(30)));
+    let cfg = Config {
+        in_flight: 2,
+        max_in_flight: 2,
+        demand_reserve: 0,
+        ..Config::default()
+    };
+    let engine = engine_over(&f, resolver.clone(), cfg);
+    let mut callers = Vec::new();
+    for _ in 0..2 {
+        let engine = engine.clone();
+        callers.push(tokio::spawn(async move {
+            engine.get(slow, Class::Hydrate).await
+        }));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let started = tokio::time::Instant::now();
+    engine.get(other, Class::Hydrate).await.unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the second slot is free while its caller waits"
+    );
+    for caller in callers {
+        caller.abort();
+    }
+}
+
 #[tokio::test]
 async fn fill_returns_the_first_error_after_the_other_fetches_finish() {
     let f = fixture();

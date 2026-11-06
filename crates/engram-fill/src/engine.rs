@@ -226,13 +226,7 @@ impl FillEngine {
     /// `class` slot, then is fetched, verified and stored by the cache.
     /// Without a cache the engine verifies.
     pub async fn get(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
-        if let Some(cache) = self.store().chunk_cache() {
-            if let Some(bytes) = cache.read_resident(hash).await? {
-                return Ok(bytes);
-            }
-        }
-        let permit = self.inner.admission.acquire(class).await;
-        self.fetch_admitted(hash, class, permit).await
+        self.get_admitted(hash, class, None).await
     }
 
     /// The chunk's bytes for a caller that keeps them itself (a volume
@@ -244,9 +238,7 @@ impl FillEngine {
                 return Ok(bytes);
             }
         }
-        let permit = self.inner.admission.acquire(class).await;
-        metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
-        self.fetch_verified(hash, class, permit).await
+        self.fetch_verified(hash, class, None).await
     }
 
     /// Make every chunk in `hashes` resident in the cache at `class`, each
@@ -280,7 +272,7 @@ impl FillEngine {
             // Waiting here, not in the task, keeps the fetch order.
             let permit = self.inner.admission.acquire(class).await;
             let engine = self.clone();
-            tasks.spawn(async move { engine.fetch_admitted(hash, class, permit).await });
+            tasks.spawn(async move { engine.get_admitted(hash, class, Some(permit)).await });
             while let Some(done) = tasks.try_join_next() {
                 record(done, &mut stats, &mut first_err);
             }
@@ -294,12 +286,21 @@ impl FillEngine {
         }
     }
 
-    async fn fetch_admitted(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
-        metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
+    /// [`Self::get`] with an optional slot taken ahead. The cache hands
+    /// the slot to this call's fetch, or drops it when the call waits for
+    /// another call's fetch of the same chunk.
+    async fn get_admitted(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        permit: Option<Permit>,
+    ) -> Result<Bytes> {
         match self.store().chunk_cache() {
             Some(cache) => {
                 cache
-                    .get_with_source(hash, class, || self.fetch_unverified(hash, class, permit))
+                    .fill_with(hash, class, permit, |permit| {
+                        self.fetch_unverified(hash, class, permit)
+                    })
                     .await
             }
             None => self.fetch_verified(hash, class, permit).await,
@@ -307,7 +308,12 @@ impl FillEngine {
     }
 
     /// [`Self::fetch_unverified`], with the store's bytes hashed here.
-    async fn fetch_verified(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
+    async fn fetch_verified(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        permit: Option<Permit>,
+    ) -> Result<Bytes> {
         let (bytes, source) = self.fetch_unverified(hash, class, permit).await?;
         if source == FillSource::BlobStorage {
             engram_chunk_store::cache::verify_fetched(hash, &bytes).await?;
@@ -321,15 +327,21 @@ impl FillEngine {
         self.peer.as_ref()?.fetch(hash).await
     }
 
-    /// [`Self::fetch_tiers`] under `permit`, which is freed when the bytes
-    /// are in hand (before the cache writes them). A store answer reports
-    /// its outcome to the adaptive limit; a peer answer does not.
+    /// [`Self::fetch_tiers`] under `permit` (a `class` slot when `None`),
+    /// which is freed when the bytes are in hand (before the cache writes
+    /// them). A store answer reports its outcome to the adaptive limit; a
+    /// peer answer does not.
     async fn fetch_unverified(
         &self,
         hash: ChunkHash,
         class: Class,
-        permit: Permit,
+        permit: Option<Permit>,
     ) -> Result<(Bytes, FillSource)> {
+        let permit = match permit {
+            Some(p) => p,
+            None => self.inner.admission.acquire(class).await,
+        };
+        metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
         let got = self.fetch_tiers(hash, class).await;
         match &got {
             Ok((bytes, FillSource::BlobStorage)) => permit.done(bytes.len() as u64),
