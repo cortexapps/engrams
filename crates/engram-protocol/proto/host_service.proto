@@ -396,6 +396,9 @@ message MigrationFrame {
   bytes data = 3;
   // Last frame for this item.
   bool last = 4;
+  // On the last frame: blake3 of the whole item. Empty from a source
+  // that predates it.
+  bytes item_hash = 5;
 }
 
 // --- ADR 0095: PeerChunkGet ---

@@ -30,6 +30,96 @@ use crate::capture_lock::{CaptureGate, CaptureUser};
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageCache};
 
+/// Rebuilds `migration_fetch` items from their frames. Frames of one item
+/// arrive in order and back to back; the last carries the item's hash.
+#[derive(Default)]
+struct ItemAssembler {
+    item: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+impl ItemAssembler {
+    /// Add `frame`; on an item's last frame, return its index and bytes.
+    fn push(
+        &mut self,
+        frame: engram_core::types::snapshot::MigrationFrame,
+    ) -> Result<Option<(u32, Vec<u8>)>, SandboxError> {
+        if self.item.is_some_and(|i| i != frame.item_idx) || frame.offset != self.bytes.len() as u64
+        {
+            return Err(SandboxError::Snapshot(format!(
+                "migration fetch: frame of item {} at offset {} out of order",
+                frame.item_idx, frame.offset
+            )));
+        }
+        self.item = Some(frame.item_idx);
+        self.bytes.extend_from_slice(&frame.data);
+        if !frame.last {
+            return Ok(None);
+        }
+        self.item = None;
+        let bytes = std::mem::take(&mut self.bytes);
+        // A source of the previous release sends no hash.
+        if let Some(want) = frame.item_hash {
+            if engram_migrate_proto::wire_hash(&bytes) != want {
+                return Err(SandboxError::Snapshot(format!(
+                    "migration fetch: item {} does not match its hash",
+                    frame.item_idx
+                )));
+            }
+        }
+        Ok(Some((frame.item_idx, bytes)))
+    }
+}
+
+#[cfg(test)]
+mod item_assembler_tests {
+    use engram_core::types::snapshot::MigrationFrame;
+
+    use super::ItemAssembler;
+
+    fn frame(item: u32, offset: u64, data: &'static [u8], last: Option<&[u8]>) -> MigrationFrame {
+        MigrationFrame {
+            item_idx: item,
+            offset,
+            data: bytes::Bytes::from_static(data),
+            last: last.is_some(),
+            item_hash: last.map(engram_migrate_proto::wire_hash),
+        }
+    }
+
+    #[test]
+    fn an_item_is_returned_whole_on_its_last_frame() {
+        let mut a = ItemAssembler::default();
+        assert!(a.push(frame(0, 0, b"ab", None)).unwrap().is_none());
+        let (idx, bytes) = a.push(frame(0, 2, b"cd", Some(b"abcd"))).unwrap().unwrap();
+        assert_eq!((idx, bytes.as_slice()), (0, &b"abcd"[..]));
+        let (idx, _) = a.push(frame(1, 0, b"x", Some(b"x"))).unwrap().unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn a_gap_a_mix_of_items_or_a_bad_hash_is_refused() {
+        let mut gap = ItemAssembler::default();
+        gap.push(frame(0, 0, b"ab", None)).unwrap();
+        assert!(gap.push(frame(0, 3, b"d", Some(b"abd"))).is_err());
+
+        let mut mixed = ItemAssembler::default();
+        mixed.push(frame(0, 0, b"ab", None)).unwrap();
+        assert!(mixed.push(frame(1, 2, b"cd", Some(b"abcd"))).is_err());
+
+        let mut bad = ItemAssembler::default();
+        assert!(bad.push(frame(0, 0, b"ab", Some(b"other"))).is_err());
+    }
+
+    #[test]
+    fn an_item_from_a_source_without_hashes_is_accepted() {
+        let mut a = ItemAssembler::default();
+        let mut f = frame(0, 0, b"ab", Some(b"ab"));
+        f.item_hash = None;
+        assert!(a.push(f).unwrap().is_some());
+    }
+}
+
 /// The sidecar's `trace_lineage_id`: the session whose traces this
 /// snapshot's restores read.
 async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
@@ -2812,26 +2902,27 @@ impl PooledBackend {
             .map(|index| MigrationItem::DiskBlockAt(role, *index))
             .collect();
         let mut stream = source.migration_fetch(export_id, items).await?;
-        let mut current: Vec<u8> = Vec::new();
+        let mut items = ItemAssembler::default();
         while let Some(frame) = stream.next().await {
-            let frame = frame?;
-            current.extend_from_slice(&frame.data);
-            if frame.last {
-                let Some(index) = batch.get(frame.item_idx as usize) else {
-                    return Err(SandboxError::Snapshot(
-                        "migration fetch: unexpected item index".into(),
-                    ));
-                };
-                volume
-                    .write_range(
-                        index * MIGRATION_DISK_BLOCK_BYTES,
-                        std::mem::take(&mut current),
-                    )
-                    .await
-                    .map_err(|e| {
-                        SandboxError::Snapshot(format!("write sealed disk block {index}: {e}"))
-                    })?;
+            let Some((idx, bytes)) = items.push(frame?)? else {
+                continue;
+            };
+            let Some(index) = batch.get(idx as usize) else {
+                return Err(SandboxError::Snapshot(
+                    "migration fetch: unexpected item index".into(),
+                ));
+            };
+            let start = index * MIGRATION_DISK_BLOCK_BYTES;
+            let want = MIGRATION_DISK_BLOCK_BYTES.min(volume.size_bytes.saturating_sub(start));
+            if bytes.len() as u64 != want {
+                return Err(SandboxError::Snapshot(format!(
+                    "sealed disk block {index}: {} bytes, want {want}",
+                    bytes.len()
+                )));
             }
+            volume.write_range(start, bytes).await.map_err(|e| {
+                SandboxError::Snapshot(format!("write sealed disk block {index}: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -2865,22 +2956,10 @@ impl PooledBackend {
             .migration_fetch(export_id, item_specs.to_vec())
             .await?;
         use futures::StreamExt;
-        let mut current: Vec<u8> = Vec::new();
-        let mut current_idx: Option<u32> = None;
+        let mut items = ItemAssembler::default();
         while let Some(frame) = stream.next().await {
-            let frame = frame?;
-            if current_idx != Some(frame.item_idx) {
-                if !current.is_empty() {
-                    return Err(SandboxError::Snapshot(
-                        "migration fetch: out-of-order frame".into(),
-                    ));
-                }
-                current_idx = Some(frame.item_idx);
-            }
-            current.extend_from_slice(&frame.data);
-            if frame.last {
-                let idx = frame.item_idx as usize;
-                let name = match item_specs.get(idx) {
+            if let Some((idx, current)) = items.push(frame?)? {
+                let name = match item_specs.get(idx as usize) {
                     Some(MigrationItem::StateBin) => "state.bin",
                     Some(MigrationItem::HotHint) => "hot-hint.json",
                     _ => {
@@ -2892,8 +2971,6 @@ impl PooledBackend {
                 fs::write(dir.join(name), &current)
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("write {name}: {e}")))?;
-                current = Vec::new();
-                current_idx = None;
             }
         }
         Ok(())
@@ -5550,14 +5627,17 @@ impl SandboxBackend for PooledBackend {
                 match bytes {
                     Ok(bytes) => {
                         let total = bytes.len();
+                        let item_hash = engram_migrate_proto::wire_hash(&bytes);
                         let mut off = 0usize;
                         loop {
                             let end = (off + FRAME).min(total);
+                            let last = end == total;
                             let frame = MigrationFrame {
                                 item_idx: idx,
                                 offset: off as u64,
                                 data: bytes.slice(off..end),
-                                last: end == total,
+                                last,
+                                item_hash: last.then_some(item_hash),
                             };
                             if tx.send(Ok(frame)).await.is_err() {
                                 return;

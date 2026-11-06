@@ -479,6 +479,7 @@ impl GrpcHostClient {
                         offset: f.offset,
                         data: bytes::Bytes::from(f.data),
                         last: f.last,
+                        item_hash: f.item_hash.as_slice().try_into().ok(),
                     })
                     .map_err(grpc_to_sandbox_err)
             })

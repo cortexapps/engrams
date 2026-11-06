@@ -451,6 +451,7 @@ impl HostService for HostServiceImpl {
                     offset: f.offset,
                     data: f.data.to_vec(),
                     last: f.last,
+                    item_hash: f.item_hash.map(|h| h.to_vec()).unwrap_or_default(),
                 })
                 .map_err(sandbox_to_status)
         });
