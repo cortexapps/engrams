@@ -15,7 +15,6 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
@@ -27,6 +26,7 @@ use nix::sys::eventfd::{EfdFlags, EventFd};
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
 
+use crate::policy::read_until_served;
 use crate::reader::DiskReader;
 
 /// The device's logical and physical block size.
@@ -34,8 +34,6 @@ const BLOCK_SHIFT: u8 = 12;
 const BLOCK_BYTES: u64 = 1 << BLOCK_SHIFT;
 /// The largest single request the kernel sends.
 const IO_BUF_BYTES: u32 = 512 * 1024;
-/// The longest wait between attempts at a read that fails.
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// How the device is shaped and whether it is new.
 #[derive(Clone, Debug)]
@@ -345,58 +343,4 @@ async fn read_on_runtime(
             }
         }
     }
-}
-
-/// A read that fails for a reason that may pass is attempted again until
-/// it succeeds, so a slow or unreachable store stalls the guest's read
-/// and never fails it. A chunk the store does not hold, or whose bytes
-/// fail the hash check, is data loss: after one fresh fetch the read is
-/// refused. A request outside the disk, or a read still waiting when the
-/// server stops, is refused at once.
-async fn read_until_served(
-    reader: &DiskReader,
-    offset: u64,
-    len: usize,
-    mut stopping: watch::Receiver<bool>,
-) -> io::Result<Vec<u8>> {
-    let stopped = || io::Error::other("the server is stopping");
-    let mut delay = Duration::from_millis(50);
-    let mut attempt = 1u32;
-    let mut lost_once = false;
-    loop {
-        let result = tokio::select! {
-            result = reader.read(offset, len) => result,
-            _ = stopping.wait_for(|s| *s) => return Err(stopped()),
-        };
-        match result {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e),
-            Err(e) if is_lost(&e) && lost_once => {
-                tracing::error!(offset, len, error = %e, "disk source data lost: the chunk store cannot serve this read");
-                return Err(e);
-            }
-            Err(e) if is_lost(&e) => {
-                // The failed fetch left no cached copy, so this attempt
-                // fetches again.
-                tracing::warn!(offset, len, error = %e, "read failed for lost data; fetching once more");
-                lost_once = true;
-            }
-            Err(e) => {
-                tracing::error!(offset, len, attempt, error = %e, "read failed; trying again");
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = stopping.wait_for(|s| *s) => return Err(stopped()),
-                }
-                delay = (delay * 2).min(MAX_RETRY_DELAY);
-                attempt += 1;
-            }
-        }
-    }
-}
-
-fn is_lost(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
-    )
 }
