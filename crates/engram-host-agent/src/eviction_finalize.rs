@@ -841,4 +841,48 @@ mod tests {
         };
         assert!(message.contains("never published"), "{message}");
     }
+
+    /// A cloned role's publish renames its destination to the new
+    /// version. The redrive answers with that version while nothing is
+    /// pending, and refuses to publish a cloned role's pending pair.
+    #[tokio::test]
+    async fn a_redrive_reads_a_cloned_role_lineage_from_its_destination() {
+        use engram_host_core::session_volumes::{bitmap_snapshot_name, dest_name};
+        let tmp = tempfile::tempdir().unwrap();
+        let (finalizer, volumes) = finalizer_with_a_root(tmp.path(), SandboxId::new()).await;
+        let sandbox = SandboxId::new();
+        let previous = ManifestRef::new();
+        let published = ManifestRef {
+            version: previous.version + 1,
+            ..previous
+        };
+        let disk = volumes.disk();
+        disk.create(&dest_name(sandbox, DiskRole::Root, published), 128 * 1024)
+            .await
+            .unwrap();
+        let record = record_for(
+            sandbox,
+            vec![PendingDisk {
+                role: DiskRole::Root,
+                previous,
+            }],
+        );
+
+        let (root, _) = disk_leg_work(&finalizer, &record).await.unwrap();
+        assert_eq!(root, Some(published));
+
+        let pair = engram_host_core::VolumeName::new(format!(
+            "tmp-sb-{}-root",
+            sandbox.as_uuid().simple()
+        ))
+        .unwrap();
+        disk.create(&pair, 128 * 1024).await.unwrap();
+        disk.create(&bitmap_snapshot_name(sandbox, DiskRole::Root), 4096)
+            .await
+            .unwrap();
+        let Err(SandboxError::Snapshot(message)) = disk_leg_work(&finalizer, &record).await else {
+            panic!("a cloned role's pending checkpoint must not publish");
+        };
+        assert!(message.contains("cloned drive"), "{message}");
+    }
 }
