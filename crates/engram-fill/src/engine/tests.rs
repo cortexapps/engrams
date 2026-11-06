@@ -157,6 +157,35 @@ async fn a_slow_demand_fetch_is_hedged_and_the_first_answer_wins() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_hedge_waits_for_a_slot_of_its_own() {
+    let f = fixture();
+    let hash = put(&f, b"one slot").await;
+    let resolver = counting(&f, Some(Duration::from_secs(30)));
+    let cfg = Config {
+        in_flight: 1,
+        max_in_flight: 1,
+        demand_reserve: 0,
+        hedge_after: Some(Duration::from_millis(200)),
+        ..Config::default()
+    };
+    let engine = engine_over(&f, resolver.clone(), cfg);
+
+    let fault = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.get(hash, Class::Demand).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "the hedge waits while the first request holds the only slot"
+    );
+    assert_eq!(engine.admission().in_flight(), 1);
+    fault.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn bulk_fetches_are_not_hedged() {
     let f = fixture();
     let hash = put(&f, b"bulk page").await;

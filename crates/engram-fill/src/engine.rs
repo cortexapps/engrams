@@ -327,10 +327,12 @@ impl FillEngine {
         self.peer.as_ref()?.fetch(hash).await
     }
 
-    /// [`Self::fetch_tiers`] under `permit` (a `class` slot when `None`),
-    /// which is freed when the bytes are in hand (before the cache writes
-    /// them). A store answer reports its outcome to the adaptive limit; a
-    /// peer answer does not.
+    /// The peer (when this view has one), then the store, under `permit`
+    /// (a `class` slot when `None`). A `Demand` fetch races the store
+    /// against a peer that has not answered after `peer_race_after`. The
+    /// slot is freed when the bytes are in hand (before the cache writes
+    /// them); a peer answer frees it without a report to the adaptive
+    /// limit. The caller hashes what came from the store.
     async fn fetch_unverified(
         &self,
         hash: ChunkHash,
@@ -342,48 +344,31 @@ impl FillEngine {
             None => self.inner.admission.acquire(class).await,
         };
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
-        let got = self.fetch_tiers(hash, class).await;
-        match &got {
-            Ok((bytes, FillSource::BlobStorage)) => permit.done(bytes.len() as u64),
-            Ok((_, FillSource::Peer)) => drop(permit),
-            Err(e) => permit.finish(Err(e)),
-        }
-        got
-    }
-
-    /// The peer (when this view has one), then the store. A `Demand`
-    /// fetch races the store against a peer that has not answered after
-    /// `peer_race_after`. The caller hashes what came from the store.
-    async fn fetch_tiers(&self, hash: ChunkHash, class: Class) -> Result<(Bytes, FillSource)> {
-        let from_store = |engine: &Self| {
-            let engine = engine.clone();
-            async move {
-                engine
-                    .fetch_store(hash, class)
-                    .await
-                    .map(|b| (b, FillSource::BlobStorage))
-            }
+        let from_store = |permit: Permit| async move {
+            self.fetch_store(hash, class, permit)
+                .await
+                .map(|b| (b, FillSource::BlobStorage))
         };
         if self.peer.is_none() {
-            return from_store(self).await;
+            return from_store(permit).await;
         }
         let peer = self.peer_answer(hash);
         tokio::pin!(peer);
         if class != Class::Demand {
             return match peer.await {
                 Some(b) => Ok((b, FillSource::Peer)),
-                None => from_store(self).await,
+                None => from_store(permit).await,
             };
         }
         tokio::select! {
             got = &mut peer => return match got {
                 Some(b) => Ok((b, FillSource::Peer)),
-                None => from_store(self).await,
+                None => from_store(permit).await,
             },
             () = tokio::time::sleep(self.inner.peer_race_after) => {}
         }
         metrics::counter!("engram_fill_peer_race_total").increment(1);
-        let store = from_store(self);
+        let store = from_store(permit);
         tokio::pin!(store);
         tokio::select! {
             got = &mut peer => match got {
@@ -400,21 +385,26 @@ impl FillEngine {
         }
     }
 
-    /// One store fetch, hedged for `Demand`. The caller verifies.
-    async fn fetch_store(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
-        let resolver = self.store().resolver();
+    /// One store fetch under `permit`, hedged for `Demand`: a request still
+    /// running after `hedge_after` gets a second one under its own `Demand`
+    /// slot, so each request on the wire holds a slot and reports to the
+    /// adaptive limit. The caller verifies.
+    async fn fetch_store(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
+        let first = self.store_get(hash, permit);
         let hedge_after = match (class, self.inner.hedge_after) {
             (Class::Demand, Some(d)) => d,
-            _ => return resolver.fetch_chunk_unverified(hash).await,
+            _ => return first.await,
         };
-        let first = resolver.fetch_chunk_unverified(hash);
         tokio::pin!(first);
         tokio::select! {
             r = &mut first => return r,
             () = tokio::time::sleep(hedge_after) => {}
         }
-        metrics::counter!("engram_fill_hedge_total").increment(1);
-        let second = resolver.fetch_chunk_unverified(hash);
+        let second = async {
+            let permit = self.inner.admission.acquire(Class::Demand).await;
+            metrics::counter!("engram_fill_hedge_total").increment(1);
+            self.store_get(hash, permit).await
+        };
         tokio::pin!(second);
         // The first success wins; an error waits for the other request.
         tokio::select! {
@@ -427,6 +417,13 @@ impl FillEngine {
                 Err(_) => first.await,
             },
         }
+    }
+
+    /// One store GET under `permit`, which reports its outcome.
+    async fn store_get(&self, hash: ChunkHash, permit: Permit) -> Result<Bytes> {
+        let got = self.store().resolver().fetch_chunk_unverified(hash).await;
+        permit.finish(got.as_ref().map(|b| b.len() as u64));
+        got
     }
 }
 
