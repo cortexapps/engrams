@@ -1277,8 +1277,14 @@ jobs:
           test -c /dev/ublk-control \
             || { echo "FATAL: kernel $(uname -r) has no ublk driver" >&2; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc and libclang
-        run: sudo apt-get install -y -qq --no-install-recommends protobuf-compiler libclang-dev
+      # The 22.04 protoc is too old for proto3 optional fields; pin the
+      # release the bake uses.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.9"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install libclang
+        run: sudo apt-get install -y -qq --no-install-recommends libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ublk
