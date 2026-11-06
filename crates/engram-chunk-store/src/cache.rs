@@ -59,9 +59,10 @@
 //!   raced over the same directory with disjoint in-memory pin state, so
 //!   a pressured non-pinning evictor could unlink exactly the chunks the
 //!   pinning one was protecting.
-//! - **Singleflight on miss**: if N threads simultaneously ask for
-//!   a chunk that's not cached, exactly one BlobStorage fetch
-//!   runs; the others await its completion.
+//! - **Singleflight on miss**: if N callers ask at once for a chunk
+//!   that is not cached, one fetch runs and the others wait for its
+//!   answer. A caller of a higher class than the running fetch runs a
+//!   second fetch beside it (see [`ChunkCache::fill_with`]).
 //! - **Pin set**: working-set chunks can be marked never-evict. The
 //!   image-prefetch supervisor (ADR 0039) pins each enabled image's
 //!   canonical base manifest (disk + memory) so the LRU can never evict
@@ -112,12 +113,11 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 /// name — a typo in either literal would silently fork the series.
 ///
 /// - `source="gcs"` / `source="peer"`: incremented in
-///   [`ChunkCache::get_with_source`]'s leader-persist arm with the label
-///   the fetch closure reported (ADR 0095: the closure seam is the one
-///   place that knows the backend), only when `write_local` actually
-///   landed the fetched bytes on disk (a `write_local` failure means the
-///   fetch happened but the cache did NOT fill — see the `write_local`
-///   error-handling comment just above the increment site).
+///   [`ChunkCache::fill_with`] after the winning leader's write, with
+///   the label the fetch reported (ADR 0095: the fetch is the one place
+///   that knows the backend), only when `write_local` landed the bytes on
+///   disk (a failed write means the fetch happened but the cache did NOT
+///   fill).
 /// - `source="peer"` is ALSO incremented by
 ///   `engram-host-agent::peer_fill` at its bulk [`ChunkCache::put`]
 ///   landings (ADR 0095).
