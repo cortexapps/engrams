@@ -171,6 +171,15 @@ pub struct ChunkedMemoryBackend {
     store: ChunkStore,
 }
 
+/// See [`ChunkedMemoryBackend::composition`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Composition {
+    pub canonical: usize,
+    pub divergent: usize,
+    pub divergent_local: usize,
+    pub zero: usize,
+}
+
 /// Anything that can go wrong in this module. Kept distinct from
 /// `HandlerError` so unit tests don't need a UFFD setup.
 #[derive(Debug)]
@@ -469,6 +478,7 @@ impl ChunkedMemoryBackend {
     pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
         // 1. Fast path: resident.
         if let Some(bytes) = self.reader.read(hash).map_err(ChunkedBackendError::Io)? {
+            crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Cache);
             return Ok(Bytes::from(bytes));
         }
         // 2. Populate via the writer. Sync UDS I/O — hop off the
@@ -484,7 +494,10 @@ impl ChunkedMemoryBackend {
                     )))
                 })?;
             match res {
-                Ok(bytes) => return Ok(Bytes::from(bytes)),
+                Ok(bytes) => {
+                    crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Populate);
+                    return Ok(Bytes::from(bytes));
+                }
                 Err(crate::populate_client::PopulateError::WriterUnreachable(msg)) => {
                     // The handler exports no Prometheus metrics (it is a
                     // per-VM leaf process; its telemetry rides logs + the
@@ -507,7 +520,28 @@ impl ChunkedMemoryBackend {
             }
         }
         // 3. Last resort — memory-only, never written to the cache dir.
+        crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Fallback);
         self.store.get_chunk(hash).await.map_err(Into::into)
+    }
+
+    /// Chunk counts by how a fault would resolve them: canonical,
+    /// divergent (and how many of those the local cache holds), zero.
+    pub fn composition(&self) -> Composition {
+        let mut c = Composition::default();
+        for idx in 0..self.session.chunks.len() {
+            match self.resolve(idx as u64 * self.session.chunk_size) {
+                Some(ResolvedPage::Canonical { .. }) => c.canonical += 1,
+                Some(ResolvedPage::Chunk { hash }) => {
+                    c.divergent += 1;
+                    if self.reader.contains_on_disk(hash) {
+                        c.divergent_local += 1;
+                    }
+                }
+                Some(ResolvedPage::Zero { .. }) => c.zero += 1,
+                None => {}
+            }
+        }
+        c
     }
 
     /// Chunk-start byte offsets where the session manifest holds

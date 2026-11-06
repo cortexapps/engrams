@@ -116,6 +116,7 @@ mod linux {
     use engram_core::types::manifest::ManifestRef;
     use engram_uffd_handler::ChunkedMemoryBackend;
     use tokio::runtime::Handle as TokioHandle;
+    use tracing::Instrument as _;
     use uuid::Uuid;
 
     /// Default trace-recorder window. The literature (FaaSnap, REAP)
@@ -464,7 +465,11 @@ mod linux {
                     Arc::new(engram_storage_local::LocalBlobStorage::new(root.clone()));
                 s
             }
-            None => pick_blob_backend(&args.cache_root).await?,
+            None => {
+                pick_blob_backend(&args.cache_root)
+                    .instrument(tracing::info_span!("uffd.blob_backend"))
+                    .await?
+            }
         };
         tokio::fs::create_dir_all(&args.cache_root)
             .await
@@ -482,7 +487,10 @@ mod linux {
                 let client = std::sync::Arc::new(
                     engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
                 );
-                match client.hello(Some(args.canonical_manifest), Some(args.session_manifest)) {
+                let hello = tracing::info_span!("uffd.substrate_hello").in_scope(|| {
+                    client.hello(Some(args.canonical_manifest), Some(args.session_manifest))
+                });
+                match hello {
                     Ok((tmpfs_ok, cache_writable)) => {
                         if !tmpfs_ok {
                             return Err(
@@ -525,6 +533,7 @@ mod linux {
             &args.cache_root,
             populate,
         )
+        .instrument(tracing::info_span!("uffd.build_backend"))
         .await
         .map_err(|e| format!("build chunked backend: {e}"))?;
         let backend = Arc::new(backend);
@@ -564,6 +573,7 @@ mod linux {
                         total_bytes,
                     )
                 })
+                .instrument(tracing::info_span!("uffd.peer_connect"))
                 .await
                 .map_err(|e| format!("peer connect join: {e}"))?
                 .map_err(|e| format!("peer connect: {e}"))?;
@@ -680,7 +690,10 @@ mod linux {
         };
         let base_shm = match base_shm_arg {
             Some(path) => {
-                let b = engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                let b = tracing::info_span!("uffd.base_shm_open")
+                    .in_scope(|| {
+                        engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                    })
                     .map_err(|e| format!("base shm: {e}"))?;
                 tracing::info!(
                     path = %path.display(),
