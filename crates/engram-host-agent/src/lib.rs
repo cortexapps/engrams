@@ -884,6 +884,18 @@ impl HostAgent {
             // lands. Background loop with exponential backoff.
             //
             // The SIGTERM path aborts this task.
+            //
+            // The gRPC listener is bound first: the register POST carries
+            // the `grpc_self_connect` probe, and a probe that runs before
+            // the bind fails, which keeps the host out of placement until
+            // the next heartbeat. The server starts serving it below.
+            let grpc_incoming = self.cfg.grpc_listen_addr.and_then(|addr| {
+                grpc_server::bind(addr)
+                    .inspect_err(|e| {
+                        tracing::error!(addr = %addr, error = %e, "gRPC listener bind failed");
+                    })
+                    .ok()
+            });
             let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
@@ -1002,20 +1014,19 @@ impl HostAgent {
             // via /api/hosts/register) to dispatch coord→host
             // RPCs. Required in production; mode=all leaves
             // `grpc_listen_addr=None`.
-            let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
+            let grpc_task = grpc_incoming.map(|incoming| {
                 let local_for_grpc = local_host.clone();
                 let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
-                let epochs = session_epochs::SessionEpochStore::open(
-                    self.cfg.work_dir.join("epochs"),
-                )
-                .expect("open session epoch store under work_dir (ADR 0079)");
+                let epochs =
+                    session_epochs::SessionEpochStore::open(self.cfg.work_dir.join("epochs"))
+                        .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
                     if let Err(e) =
-                        grpc_server::boot(addr, local_for_grpc, epochs, peer_for_grpc).await
+                        grpc_server::serve(incoming, local_for_grpc, epochs, peer_for_grpc).await
                     {
-                        tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
+                        tracing::error!(error = %e, "gRPC server terminated with error");
                     }
                 })
             });
@@ -1153,21 +1164,11 @@ impl HostAgent {
                 );
             }
 
-            // ADR 0068: the blocking "gRPC readiness gate" (ADR 0050 D)
-            // that used to live here — a synchronous up-to-30s TCP-connect
-            // retry loop with a "heartbeat anyway" optimism escape hatch
-            // once it gave up — is RETIRED, not hardened. The heartbeat
-            // loop below now starts immediately and its every-tick
-            // `capabilities::probe_all` re-runs this exact TCP self-connect
-            // as the `grpc_self_connect` capability; a still-binding
-            // listener just reports `Failed` on this tick (and `Ok` on a
-            // later one) instead of the host racing to heartbeat before it
-            // can actually serve anything. The coordinator's placement
-            // filter (`host_meets_capabilities`, PR 2) requires
-            // `grpc_self_connect: Ok` for ANY placement, so the same
-            // "coord can't dispatch before the listener is up" failure
-            // mode this gate closed is now closed at the scheduler instead
-            // of at host-agent startup.
+            // ADR 0068: every heartbeat tick's `capabilities::probe_all`
+            // re-runs the TCP self-connect as the `grpc_self_connect`
+            // capability, and placement (`host_meets_capabilities`)
+            // requires it `Ok`, so the coordinator places nothing on this
+            // host before its listener answers.
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
