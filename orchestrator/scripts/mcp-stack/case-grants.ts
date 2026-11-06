@@ -2,6 +2,7 @@ import { Code } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { z } from "zod";
 import { ProfileIntegrationGrantSchema } from "../../src/gen/engram/app/v1/profile_pb.ts";
+import type { GetSessionMcpStateResponse } from "../../src/gen/engram/app/v1/integration_pb.ts";
 import {
   bindingTools,
   expectRejected,
@@ -800,6 +801,82 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
   return completeAssertions("grant-denials", assertions);
 };
 
+export function expectedWriteAuthorityDenial(harness: "claude" | "codex") {
+  const text = "External tool request denied.";
+  const metadata = {
+    source: "runtime",
+    denial: "write_not_allowed",
+    delivery: "available",
+    isError: true,
+  };
+  return harness === "claude"
+    ? {
+        content: [{ type: "text", text }],
+        isError: true,
+        _meta: { "engrams/toolResult": metadata },
+      }
+    : {
+        success: false,
+        contentItems: [
+          { type: "inputText", text },
+          { type: "inputText", text: canonicalJson(metadata) },
+        ],
+      };
+}
+export function assertPlanWriteDenial(
+  harness: "claude" | "codex",
+  completed: {
+    proof: Parameters<typeof assertPolicyDenial>[0] & {
+      denialPlanMode?: boolean;
+      resultSha256?: string;
+      expectedResultSha256?: string;
+      resultMatchesExpected?: boolean;
+    };
+  }[],
+  state: GetSessionMcpStateResponse,
+  expected: { sessionId: string; connectionId: string; alias: string },
+) {
+  requireThat(completed.length === 1, "one_plan_call_proof");
+  const proof = completed[0]!.proof;
+  assertPolicyDenial(proof);
+  const expectedHash = `sha256:${sha256(canonicalJson(expectedWriteAuthorityDenial(harness)))}`;
+  requireThat(
+    proof.resultMatchesExpected === true &&
+      proof.resultSha256 === expectedHash &&
+      proof.expectedResultSha256 === expectedHash,
+    "trusted_plan_write_denial",
+  );
+  const policy = state.writePolicy?.policy;
+  assertReadOnlyPolicy(policy);
+  requireThat(
+    policy?.current === true &&
+      policy.initialized === true &&
+      policy.ref?.sessionId === expected.sessionId,
+    "trusted_current_plan_policy",
+  );
+  const tool = state.bindingTools[0];
+  requireThat(
+    state.bindingReceipt?.current === true &&
+      state.availability === "available" &&
+      !state.hasMoreBindingTools &&
+      state.bindingTools.length === 1 &&
+      tool?.connectionId === expected.connectionId &&
+      tool.modelToolName === expected.alias &&
+      tool.reviewedTool?.upstreamName === "write_counter" &&
+      tool.reviewedTool.classification === "write" &&
+      tool.reviewedTool.enabled === true &&
+      !tool.unrestricted,
+    "exact_plan_write_grant",
+  );
+  assertDeltaOneConstraints(tool!.argumentConstraintDocumentsJson);
+  requireThat(
+    !state.hasMoreExecutions &&
+      state.executions.length === 0 &&
+      state.approvals.length === 0,
+    "plan_write_denied_before_journal_authority",
+  );
+}
+
 export const planChildIntersectionDriver: CaseDriver = async (input) => {
   const { ctx, principals, database, harness } = input;
   const assertions: DriverAssertion[] = [];
@@ -815,11 +892,15 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
       arguments: upstreamName === "read_counter" ? {} : { delta: 1 },
       constraints: upstreamName === "read_counter" ? [] : [deltaOne],
       callId: "policy-allowed",
-      callPlan: (alias) =>
-        fixedPolicyPlan(
+      callPlan: (alias) => {
+        const plan = fixedPolicyPlan(
           alias,
           upstreamName === "read_counter" ? "read" : "write",
-        ),
+        );
+        if (upstreamName === "write_counter")
+          plan.steps[0]!.expectedResult = expectedWriteAuthorityDenial(harness);
+        return plan;
+      },
     });
     try {
       const before = await scenario.fixture.observe();
@@ -846,11 +927,19 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
           false,
         );
       } else {
-        assertPolicyDenial(proofs[0]!.proof);
-        requireThat(
-          proofs[0]!.proof.denialPlanMode,
-          "trusted_plan_write_denial",
-        );
+        const state =
+          await scenario.reviewClient.integration.getSessionMcpState({
+            sessionId: scenario.sessionId,
+            omitBindings: false,
+            omitExecutions: false,
+            bindingPageSize: 16,
+            pageSize: 16,
+          });
+        assertPlanWriteDenial(harness, proofs, state, {
+          sessionId: scenario.sessionId,
+          connectionId: scenario.connection.id,
+          alias: scenario.alias,
+        });
         assertNoDispatch(before, after);
       }
       assertions.push({

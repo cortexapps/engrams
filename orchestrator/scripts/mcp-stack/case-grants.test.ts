@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertPolicyDenial,
+  assertPlanWriteDenial,
   assertReadOnlyPolicy,
   assertNoDispatch,
   grantUpdateRequest,
@@ -13,6 +14,11 @@ import {
 import { create } from "@bufbuild/protobuf";
 import { sha256 } from "./context.ts";
 import { canonicalJson } from "./guest.ts";
+import {
+  GetSessionMcpStateResponseSchema,
+  McpExecutionReviewSchema,
+  McpApprovalSchema,
+} from "../../src/gen/engram/app/v1/integration_pb.ts";
 import {
   ProfileSchema,
   UpdateProfileRequestSchema,
@@ -268,3 +274,166 @@ test("generic plan approval requires an observed exact read-only MCP policy", ()
     expect(() => assertReadOnlyPolicy(policy)).toThrow();
   }
 });
+
+for (const harness of ["claude", "codex"] as const) {
+  test(`${harness} plan write denial requires the exact native receipt and trusted read-only grant`, () => {
+    const metadata = {
+      source: "runtime",
+      denial: "write_not_allowed",
+      delivery: "available",
+      isError: true,
+    };
+    const native = {
+      claude: {
+        content: [{ type: "text", text: "External tool request denied." }],
+        isError: true,
+        _meta: { "engrams/toolResult": metadata },
+      },
+      codex: {
+        success: false,
+        contentItems: [
+          { type: "inputText", text: "External tool request denied." },
+          {
+            type: "inputText",
+            text: '{"delivery":"available","denial":"write_not_allowed","isError":true,"source":"runtime"}',
+          },
+        ],
+      },
+    };
+    const digest = (value: unknown) => `sha256:${sha256(canonicalJson(value))}`;
+    const resultSha256 = digest(native[harness]);
+    const proof = {
+      resultReceived: true,
+      delivery: "available",
+      outcome: null,
+      isError: true,
+      denialPlanMode: false,
+      resultSha256,
+      expectedResultSha256: resultSha256,
+      resultMatchesExpected: true,
+    };
+    const legacyNative = JSON.parse(
+      JSON.stringify(native[harness]).replaceAll(
+        "write_not_allowed",
+        "plan_mode",
+      ),
+    );
+    const expected = {
+      sessionId: "session",
+      connectionId: "connection",
+      alias: "mcp_fixture",
+    };
+    const state = create(GetSessionMcpStateResponseSchema, {
+      bindingReceipt: { current: true },
+      availability: "available",
+      writePolicy: {
+        policy: {
+          current: true,
+          initialized: true,
+          writeEligibility: "read_only",
+          ref: { sessionId: "session" },
+        },
+      },
+      bindingTools: [
+        {
+          connectionId: "connection",
+          modelToolName: "mcp_fixture",
+          reviewedTool: {
+            upstreamName: "write_counter",
+            classification: "write",
+            enabled: true,
+          },
+          argumentConstraintDocumentsJson: [
+            '{"type":"object","properties":{"delta":{"const":1}},"required":["delta"],"additionalProperties":false}',
+          ],
+        },
+      ],
+    });
+    expect(() =>
+      assertPlanWriteDenial(harness, [{ proof }], state, expected),
+    ).not.toThrow();
+    for (const completed of [
+      [],
+      [{ proof }, { proof }],
+      [{ proof: { ...proof, resultReceived: false } }],
+      [{ proof: { ...proof, delivery: "unavailable" } }],
+      [{ proof: { ...proof, outcome: "failed" } }],
+      [{ proof: { ...proof, isError: false } }],
+      [{ proof: { ...proof, resultSha256: undefined } }],
+      [{ proof: { ...proof, resultMatchesExpected: false } }],
+      [{ proof: { ...proof, expectedResultSha256: undefined } }],
+      [
+        {
+          proof: {
+            ...proof,
+            resultSha256: digest(
+              native[harness === "claude" ? "codex" : "claude"],
+            ),
+          },
+        },
+      ],
+      [
+        {
+          proof: {
+            ...proof,
+            denialPlanMode: true,
+            resultSha256: digest(legacyNative),
+          },
+        },
+      ],
+    ])
+      expect(() =>
+        assertPlanWriteDenial(harness, completed, state, expected),
+      ).toThrow();
+    for (const change of [
+      (value: typeof state) => {
+        value.writePolicy = undefined;
+      },
+      (value: typeof state) => {
+        value.writePolicy!.policy!.writeEligibility = "write_eligible";
+      },
+      (value: typeof state) => {
+        value.writePolicy!.policy!.current = false;
+      },
+      (value: typeof state) => {
+        value.writePolicy!.policy!.initialized = false;
+      },
+      (value: typeof state) => {
+        value.writePolicy!.policy!.ref!.sessionId = "other";
+      },
+      (value: typeof state) => {
+        value.bindingReceipt!.current = false;
+      },
+      (value: typeof state) => {
+        value.bindingTools = [];
+      },
+      (value: typeof state) => {
+        value.hasMoreBindingTools = true;
+      },
+      (value: typeof state) => {
+        value.bindingTools[0]!.reviewedTool!.classification = "read";
+      },
+      (value: typeof state) => {
+        value.bindingTools[0]!.unrestricted = true;
+      },
+      (value: typeof state) => {
+        value.bindingTools[0]!.argumentConstraintDocumentsJson = [];
+      },
+      (value: typeof state) => {
+        value.hasMoreExecutions = true;
+      },
+      (value: typeof state) => {
+        value.executions.push(create(McpExecutionReviewSchema));
+      },
+      (value: typeof state) => {
+        value.approvals.push(create(McpApprovalSchema));
+      },
+    ]) {
+      const changed = structuredClone(state);
+      change(changed);
+      expect(() =>
+        assertPlanWriteDenial(harness, [{ proof }], changed, expected),
+      ).toThrow();
+    }
+  });
+}
