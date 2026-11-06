@@ -1863,6 +1863,10 @@ impl ChunkCache {
 /// sweep several times an hour on every busy host, so the cache grew far
 /// past its budget. A vanished entry is skipped; only other I/O errors
 /// abort.
+///
+/// The walk also deletes `<62-hex>.unverified` sidecars. Earlier builds
+/// wrote one beside each chunk they landed from a peer; no build reads
+/// them, and the chunk beside one is trusted like any peer chunk.
 fn list_entries_blocking(root: &Path) -> Result<Vec<CacheEntry>> {
     fn vanished(e: &std::io::Error) -> bool {
         e.kind() == std::io::ErrorKind::NotFound
@@ -1902,13 +1906,18 @@ fn list_entries_blocking(root: &Path) -> Result<Vec<CacheEntry>> {
                 Err(e) if vanished(&e) => continue,
                 Err(e) => return Err(e.into()),
             };
-            let Some(rest) = file.file_name().to_str().map(str::to_owned) else {
+            let Some(name) = file.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if rest.len() != 62 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            let is_chunk_name = |n: &str| n.len() == 62 && n.chars().all(|c| c.is_ascii_hexdigit());
+            if name.strip_suffix(".unverified").is_some_and(is_chunk_name) {
+                let _ = std::fs::remove_file(file.path());
                 continue;
             }
-            let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) else {
+            if !is_chunk_name(&name) {
+                continue;
+            }
+            let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{name}")) else {
                 continue;
             };
             let meta = match file.metadata() {
@@ -3511,6 +3520,24 @@ mod tests {
             "oldest chunk must be evicted by the index-driven populate-path sweep",
         );
         assert!(cache.contains(hc), "newest chunk must survive");
+    }
+
+    /// The walk deletes a sidecar an earlier build left beside a chunk,
+    /// and keeps the chunk.
+    #[tokio::test]
+    async fn the_walk_deletes_unverified_sidecars() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from_static(b"landed by an earlier build");
+        let h = ChunkHash::of(&body);
+        cache.put(h, body).await.unwrap();
+        let mut sidecar = cache.path_for(h).into_os_string();
+        sidecar.push(".unverified");
+        std::fs::write(&sidecar, b"").unwrap();
+
+        cache.sweep_for_test().await;
+
+        assert!(!std::path::Path::new(&sidecar).exists());
+        assert!(cache.contains_on_disk(h));
     }
 
     #[tokio::test]
