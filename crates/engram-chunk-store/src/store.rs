@@ -372,6 +372,30 @@ impl ChunkStore {
         self.resolver.chunk_exists(hash).await
     }
 
+    /// Whether the blob store holds every chunk `manifest` lists. A HEAD
+    /// per chunk, 32 at a time, stopping at the first miss. A local
+    /// cache or a peer does not count: other hosts read from the blob
+    /// store.
+    pub async fn all_chunks_stored(&self, manifest: &Manifest) -> Result<bool> {
+        use futures::stream::{self, StreamExt as _, TryStreamExt as _};
+        let keys: Vec<String> = manifest
+            .chunks
+            .iter()
+            .map(|c| c.hash.storage_key())
+            .collect();
+        let mut checks = stream::iter(keys.into_iter().map(|key| {
+            let blob = self.inner.clone();
+            async move { blob.exists(&key).await }
+        }))
+        .buffer_unordered(32);
+        while let Some(present) = checks.try_next().await? {
+            if !present {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     // ---------- manifests ----------
 
     /// PUT a manifest at the given (`manifest_id`, `version`).
