@@ -128,7 +128,7 @@ impl Rig {
                     hydrated_regions, ..
                 } if hydrated_regions >= at_least => return hydrated_regions,
                 CloneState::Copying { .. } => {}
-                CloneState::CutOver => panic!("the drive was cut over"),
+                state => panic!("the drive is {state:?}"),
             }
             assert!(
                 tokio::time::Instant::now() < deadline,

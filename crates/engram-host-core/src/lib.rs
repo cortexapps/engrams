@@ -21,10 +21,10 @@
 //!   rename / sync_dir / read / read_dir / remove_file) so a crash injector
 //!   can fail between each.
 //! - [`disk::SessionDisk`] — volumes the kernel owns (create, O(1)
-//!   snapshot, delete, dirty-chunk diff, cloned drives); [`disk_flows`] moves chunks
-//!   between a volume and the chunk store; [`image_volumes`] keeps the
-//!   enabled images staged and [`session_volumes`] owns every session's
-//!   volumes.
+//!   snapshot, delete, dirty-chunk diff, cloned drives); [`disk_flows`]
+//!   moves chunks between a volume and the chunk store; [`image_volumes`]
+//!   keeps the enabled images staged and [`session_volumes`] owns every
+//!   session's volumes.
 
 pub mod checkpoint;
 pub mod coord;

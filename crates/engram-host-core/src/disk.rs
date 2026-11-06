@@ -77,8 +77,16 @@ impl Capacity {
     }
 }
 
-/// The unit a cloned drive copies in (ADR 0127): the pool's block size.
+/// The unit a cloned drive copies in (ADR 0127), equal to the default
+/// block size of a production pool. It is part of the on-disk format: a
+/// bitmap records the region size it was made with, and the kernel
+/// refuses a table over that bitmap with any other size.
 pub const CLONE_REGION_BYTES: u64 = 64 * 1024;
+
+/// The start of a bitmap that holds its header (a dm-clone superblock is
+/// one 4 KiB metadata block). A bitmap no drive has used reads as zeros
+/// here.
+pub const CLONE_HEADER_BYTES: u64 = 4096;
 
 /// How a cloned drive copies the regions the guest has not written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +112,10 @@ pub enum CloneState {
     /// The drive maps the destination alone; the source and the bitmap
     /// are no longer read.
     CutOver,
+    /// A [`SessionDisk::clone_drive`] that did not finish left the name
+    /// with no live table. The bitmap can hold a header already: remove
+    /// the drive, and make it again on a new bitmap.
+    Incomplete,
 }
 
 impl CloneState {
@@ -117,6 +129,7 @@ impl CloneState {
                 ..
             } => hydrated_regions == total_regions,
             Self::CutOver => true,
+            Self::Incomplete => false,
         }
     }
 }
@@ -259,6 +272,33 @@ impl Volume {
         .map_err(|e| io::Error::other(format!("read_range task: {e}")))?
     }
 
+    /// [`Self::read_range`] past the host page cache, where the platform
+    /// allows and the range is aligned for it: for bytes the kernel writes
+    /// beneath the cache, such as a dm-clone superblock.
+    pub async fn read_direct(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        self.check_range(offset, len)?;
+        let aligned =
+            offset.is_multiple_of(DIRECT_ALIGN as u64) && len.is_multiple_of(DIRECT_ALIGN as u64);
+        let direct = self.direct.as_ref().filter(|_| aligned).map(Arc::clone);
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || {
+            let zeros = vec![0u8; len as usize];
+            match direct.zip(AlignedBuf::copy_of(&zeros)) {
+                Some((direct, mut buf)) => {
+                    direct.read_exact_at(buf.as_mut_slice(), offset)?;
+                    Ok(buf.as_slice().to_vec())
+                }
+                None => {
+                    let mut buf = zeros;
+                    file.read_exact_at(&mut buf, offset)?;
+                    Ok(buf)
+                }
+            }
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("read_direct task: {e}")))?
+    }
+
     /// Write `bytes` at `offset`; the range must lie inside the volume.
     pub async fn write_range(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
         self.check_range(offset, bytes.len() as u64)?;
@@ -345,6 +385,31 @@ impl AlignedBuf {
     fn as_slice(&self) -> &[u8] {
         &self.buf[self.start..self.start + self.len]
     }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.start + self.len]
+    }
+}
+
+/// `bitmap` can take a new drive: it holds a header and no drive has
+/// written one. `InvalidInput` otherwise.
+pub async fn check_fresh_bitmap(bitmap: &Volume) -> io::Result<()> {
+    if bitmap.size_bytes < CLONE_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bitmap {} has {} bytes, under the {CLONE_HEADER_BYTES}-byte header",
+                bitmap.name, bitmap.size_bytes
+            ),
+        ));
+    }
+    if !is_zero_chunk(&bitmap.read_direct(0, CLONE_HEADER_BYTES).await?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bitmap {} was used by a drive before", bitmap.name),
+        ));
+    }
+    Ok(())
 }
 
 /// Two volumes are snapshots of one origin when their shapes match.
@@ -447,11 +512,14 @@ pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
 
 /// The platform's volume store.
 ///
-/// Operations on one drive are serialized. An operation that suspends a
-/// drive or a volume resumes it before it returns, even when its caller
-/// is dropped; a process death between the two leaves the device
-/// suspended, and the platform's disk resumes it when it is opened again
-/// (`ThinPoolDisk::open`).
+/// Volumes, drives and views share one name space. A drive (ADR 0127)
+/// is made by [`Self::clone_drive`]; a view by [`Self::clone_view`].
+/// While a drive or view uses a volume, `delete` of that volume fails
+/// with `ResourceBusy`. Operations on one drive are serialized. An
+/// operation that suspends a drive or a volume resumes it before it
+/// returns, even when its caller is dropped; a process death between
+/// the two leaves the device suspended, and the platform's disk resumes
+/// it when it is opened again (`ThinPoolDisk::open`).
 #[async_trait]
 pub trait SessionDisk: Send + Sync {
     /// A new volume of `size_bytes` that reads as zeros.
@@ -464,24 +532,28 @@ pub trait SessionDisk: Send + Sync {
     /// A volume that already exists. `NotFound` when it does not.
     async fn open(&self, name: &VolumeName) -> io::Result<Volume>;
 
-    /// Remove a volume. Fails while a process holds it open.
+    /// Remove a volume. Fails while a process, a drive or a view holds
+    /// it.
     async fn delete(&self, name: &VolumeName) -> io::Result<()>;
 
-    /// Every volume that exists, in no particular order.
+    /// Every volume that exists, in no particular order. Drives and views
+    /// are not volumes.
     async fn list(&self) -> io::Result<Vec<VolumeName>>;
 
     /// Give a volume a new name atomically. `AlreadyExists` when `to`
-    /// is taken. Open handles keep working under the new name.
+    /// is taken. Open handles keep working under the new name. A drive
+    /// or a view is not renamed: `InvalidInput`.
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()>;
 
     async fn capacity(&self) -> io::Result<Capacity>;
 
-    /// A new drive `drive` that reads as `source` and writes into
-    /// `dest`, with the copy bitmap on `bitmap` (ADR 0127). `source` is
-    /// a read-only block device (a file on [`FileDisk`]) at least as large
-    /// as `dest`; `bitmap`
-    /// is a fresh volume that reads as zeros. The drive is as large as
-    /// `dest`. `AlreadyExists` when `drive` is taken.
+    /// A new drive `drive` that reads as `source` and writes into `dest`,
+    /// with the copy bitmap on `bitmap`. `source` is a read-only block
+    /// device (a file on [`FileDisk`]) at least as large as `dest`, and
+    /// the drive is as large as `dest`. `AlreadyExists` when the name is
+    /// taken; `ResourceBusy` when another drive or view uses `dest` or
+    /// `bitmap`; `InvalidInput` when `bitmap` is smaller than
+    /// [`CLONE_HEADER_BYTES`] or a drive wrote its header before.
     async fn clone_drive(
         &self,
         drive: &VolumeName,
@@ -491,21 +563,24 @@ pub trait SessionDisk: Send + Sync {
         hydration: Hydration,
     ) -> io::Result<Volume>;
 
-    /// A drive [`Self::clone_drive`] made, before or after its cutover.
-    /// `NotFound` when it does not exist.
+    /// A drive [`Self::clone_drive`] made, before or after its cutover,
+    /// or a view, which opens read-only. `NotFound` when it does not
+    /// exist; `InvalidData` for [`CloneState::Incomplete`].
     async fn open_clone(&self, drive: &VolumeName) -> io::Result<Volume>;
 
+    /// A view reports the regions copied when its snapshots were taken,
+    /// with hydration off.
     async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState>;
 
     /// Start the background copy of a drive made with hydration off.
-    /// `InvalidInput` after the cutover.
+    /// `InvalidInput` after the cutover and on a view.
     async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()>;
 
     /// Make a fully hydrated drive map its destination alone. The drive's
     /// path and every open handle stay valid; afterwards the caller can
     /// delete the bitmap and stop the source. `ResourceBusy` while a
-    /// region is not yet copied. A drive already cut over is left as it
-    /// is.
+    /// region is not yet copied; `InvalidInput` on a view. A drive
+    /// already cut over is left as it is.
     async fn cut_over(&self, drive: &VolumeName) -> io::Result<()>;
 
     /// Point-in-time copies of a drive's destination and bitmap that
@@ -513,7 +588,7 @@ pub trait SessionDisk: Send + Sync {
     /// guest must be paused and the drive synced first, so the bitmap
     /// records every region the guest wrote. Returns `(dest, bitmap)`.
     /// On failure neither copy is left. `InvalidInput` after the cutover,
-    /// when the destination alone is the drive.
+    /// on a view, and when `dest` and `bitmap` are not the drive's.
     async fn snapshot_clone(
         &self,
         drive: &VolumeName,
@@ -534,8 +609,11 @@ pub trait SessionDisk: Send + Sync {
         source: &Path,
     ) -> io::Result<Volume>;
 
-    /// Remove a drive or a view; its volumes stay. Fails while a process
-    /// holds it open.
+    /// Remove a drive or a view; its volumes stay. `InvalidInput` for a
+    /// name that is neither. A `ThinPoolDisk` refuses while a process
+    /// holds the drive open; a [`FileDisk`] cannot see open handles and
+    /// removes it, and the handles keep reading and writing the
+    /// destination.
     async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()>;
 
     /// Ascending indices of the `block_bytes`-sized blocks that differ
@@ -585,17 +663,33 @@ pub trait SessionDisk: Send + Sync {
 /// Volumes as sparse files in one directory: the macOS implementation
 /// (`fs::copy` is a clone on APFS) and the Linux one without a thin pool.
 ///
-/// A cloned drive is a hard link to its destination under `.drives/`,
-/// which [`SessionDisk::list`] does not read. `FileDisk` hydrates
+/// A drive or view `d` is files under `.drives/`, which
+/// [`SessionDisk::list`] does not read: `d`, a hard link to its
+/// destination (the destination snapshot for a view), which exists only
+/// once the rest is made; `d.bitmap`, a hard link to its bitmap while
+/// its table would read it; and a `d.cut-over` or `d.view` marker. A
+/// volume with more than one link is in use. `FileDisk` hydrates
 /// eagerly: `clone_drive` copies the source into the destination before
 /// it returns, so every drive is hydrated from the start and `cut_over`
-/// only records the state. A view is a read-only link to the destination
-/// snapshot, which already holds every byte the guest saw.
+/// only records the state. A view reads its destination snapshot, which
+/// already holds every byte the guest saw.
 #[derive(Clone, Debug)]
 pub struct FileDisk {
     root: PathBuf,
     chunk_size: u64,
 }
+
+/// What a name under `.drives/` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileDrive {
+    Copying,
+    CutOver,
+    View,
+}
+
+/// The header `FileDisk` writes into a bitmap, as the kernel writes a
+/// superblock: a later `clone_drive` sees the bitmap as used.
+const FILE_BITMAP_HEADER: &[u8] = b"engram FileDisk clone bitmap\n";
 
 impl FileDisk {
     pub fn new(root: impl Into<PathBuf>, chunk_size: u64) -> io::Result<Self> {
@@ -622,31 +716,119 @@ impl FileDisk {
         self.drives_dir().join(drive.as_str())
     }
 
-    fn cut_over_marker(&self, drive: &VolumeName) -> PathBuf {
-        self.drives_dir().join(format!("{drive}.cut-over"))
+    fn drive_file(&self, drive: &VolumeName, suffix: &str) -> PathBuf {
+        self.drives_dir().join(format!("{drive}.{suffix}"))
     }
 
-    /// `drive` exists and is not cut over.
-    fn copying(&self, drive: &VolumeName) -> io::Result<()> {
-        std::fs::metadata(self.drive_path(drive))?;
-        if self.cut_over_marker(drive).exists() {
+    /// `name` is free for a new volume, drive or view.
+    fn check_free(&self, name: &VolumeName) -> io::Result<()> {
+        if self.path_of(name).exists() || self.drive_path(name).exists() {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{drive} is cut over"),
+                io::ErrorKind::AlreadyExists,
+                format!("{name} already exists"),
             ));
         }
         Ok(())
     }
 
-    /// Hard-link `volume`'s file as `drive`. `AlreadyExists` when taken.
-    fn link_drive(&self, volume: &Volume, drive: &VolumeName) -> io::Result<PathBuf> {
+    /// The drive or view `name`. `NotFound` when the name is free;
+    /// `InvalidInput` when it is a volume.
+    fn drive(&self, name: &VolumeName) -> io::Result<FileDrive> {
+        match std::fs::metadata(self.drive_path(name)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.path_of(name).exists() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is not a cloned drive or a view"),
+                ))
+            }
+            found => found?,
+        };
+        Ok(if self.drive_file(name, "view").exists() {
+            FileDrive::View
+        } else if self.drive_file(name, "cut-over").exists() {
+            FileDrive::CutOver
+        } else {
+            FileDrive::Copying
+        })
+    }
+
+    /// The drive `name` before its cutover; `InvalidInput` for a view or a
+    /// drive cut over.
+    fn copying(&self, name: &VolumeName) -> io::Result<()> {
+        match self.drive(name)? {
+            FileDrive::Copying => Ok(()),
+            other => Err(refused(name, other)),
+        }
+    }
+
+    fn remove_drive_files(&self, name: &VolumeName) -> io::Result<()> {
+        for suffix in ["bitmap", "cut-over", "view"] {
+            remove_if_present(&self.drive_file(name, suffix))?;
+        }
+        Ok(())
+    }
+
+    /// Remove `name`'s files; the link to the destination, which makes
+    /// `name` exist, goes last.
+    fn unlink_drive(&self, name: &VolumeName) -> io::Result<()> {
+        self.remove_drive_files(name)?;
+        std::fs::remove_file(self.drive_path(name))
+    }
+
+    /// Make `name`'s files: the bitmap link and `marker`, then the link to
+    /// `dest`. Leftovers of a make that did not finish are replaced.
+    fn link_drive(
+        &self,
+        name: &VolumeName,
+        dest: &Volume,
+        bitmap: &Volume,
+        marker: Option<&str>,
+    ) -> io::Result<PathBuf> {
         std::fs::create_dir_all(self.drives_dir())?;
-        let path = self.drive_path(drive);
-        std::fs::hard_link(&volume.path, &path).map_err(|e| {
-            io::Error::new(e.kind(), format!("drive {drive} over {}: {e}", volume.name))
-        })?;
+        self.remove_drive_files(name)?;
+        std::fs::hard_link(&bitmap.path, self.drive_file(name, "bitmap"))?;
+        if let Some(marker) = marker {
+            File::create(self.drive_file(name, marker))?;
+        }
+        let path = self.drive_path(name);
+        std::fs::hard_link(&dest.path, &path)?;
         Ok(path)
     }
+}
+
+fn refused(name: &VolumeName, drive: FileDrive) -> io::Error {
+    let what = match drive {
+        FileDrive::CutOver => "is cut over",
+        FileDrive::View => "is a view",
+        FileDrive::Copying => "is copying",
+    };
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{name} {what}"))
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// `ResourceBusy` when a drive or view links `volume`'s file.
+fn check_unused(volume: &Path, name: &VolumeName) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(volume)?.nlink() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("{name} is used by a drive or a view"),
+        ));
+    }
+    Ok(())
+}
+
+/// `a` and `b` are one file.
+fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
 /// Make the first `len` bytes of `dest` equal those of `source`, writing
@@ -683,19 +865,15 @@ fn hydrate_file(source: &Path, dest: &File, len: u64) -> io::Result<()> {
 #[async_trait]
 impl SessionDisk for FileDisk {
     async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
+        self.check_free(name)?;
         let path = self.path_of(name);
         File::create_new(&path)?.set_len(size_bytes)?;
         Volume::open(name.clone(), &path, size_bytes, self.chunk_size)
     }
 
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
+        self.check_free(name)?;
         let path = self.path_of(name);
-        if path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("volume {name} already exists"),
-            ));
-        }
         let (from, to) = (origin.path.clone(), path.clone());
         tokio::task::spawn_blocking(move || std::fs::copy(from, to))
             .await
@@ -710,7 +888,9 @@ impl SessionDisk for FileDisk {
     }
 
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
-        std::fs::remove_file(self.path_of(name))
+        let path = self.path_of(name);
+        check_unused(&path, name)?;
+        std::fs::remove_file(path)
     }
 
     async fn list(&self) -> io::Result<Vec<VolumeName>> {
@@ -725,14 +905,14 @@ impl SessionDisk for FileDisk {
     }
 
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
-        let target = self.path_of(to);
-        if target.exists() {
+        if self.drive_path(from).exists() {
             return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("volume {to} already exists"),
+                io::ErrorKind::InvalidInput,
+                format!("{from} is a drive or a view, which is not renamed"),
             ));
         }
-        std::fs::rename(self.path_of(from), target)
+        self.check_free(to)?;
+        std::fs::rename(self.path_of(from), self.path_of(to))
     }
 
     async fn capacity(&self) -> io::Result<Capacity> {
@@ -750,16 +930,14 @@ impl SessionDisk for FileDisk {
         &self,
         drive: &VolumeName,
         dest: &Volume,
-        _bitmap: &Volume,
+        bitmap: &Volume,
         source: &Path,
         _hydration: Hydration,
     ) -> io::Result<Volume> {
-        if self.drive_path(drive).exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("drive {drive} already exists"),
-            ));
-        }
+        self.check_free(drive)?;
+        check_unused(&dest.path, &dest.name)?;
+        check_unused(&bitmap.path, &bitmap.name)?;
+        check_fresh_bitmap(bitmap).await?;
         let (file, len, from) = (
             Arc::clone(&dest.file),
             dest.size_bytes,
@@ -768,26 +946,38 @@ impl SessionDisk for FileDisk {
         tokio::task::spawn_blocking(move || hydrate_file(&from, &file, len))
             .await
             .map_err(|e| io::Error::other(format!("clone task: {e}")))??;
-        let path = self.link_drive(dest, drive)?;
+        bitmap.write_range(0, FILE_BITMAP_HEADER.to_vec()).await?;
+        bitmap.sync().await?;
+        let path = self.link_drive(drive, dest, bitmap, None)?;
         Volume::open(drive.clone(), &path, dest.size_bytes, self.chunk_size)
     }
 
     async fn open_clone(&self, drive: &VolumeName) -> io::Result<Volume> {
+        let kind = self.drive(drive)?;
         let path = self.drive_path(drive);
         let size_bytes = std::fs::metadata(&path)?.len();
-        Volume::open(drive.clone(), &path, size_bytes, self.chunk_size)
+        match kind {
+            FileDrive::View => {
+                Volume::open_read_only(drive.clone(), &path, size_bytes, self.chunk_size)
+            }
+            FileDrive::Copying | FileDrive::CutOver => {
+                Volume::open(drive.clone(), &path, size_bytes, self.chunk_size)
+            }
+        }
     }
 
     async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
-        let size_bytes = std::fs::metadata(self.drive_path(drive))?.len();
-        if self.cut_over_marker(drive).exists() {
-            return Ok(CloneState::CutOver);
-        }
-        let regions = size_bytes.div_ceil(CLONE_REGION_BYTES);
-        Ok(CloneState::Copying {
-            hydrated_regions: regions,
-            total_regions: regions,
-            hydration_enabled: true,
+        let kind = self.drive(drive)?;
+        let regions = std::fs::metadata(self.drive_path(drive))?
+            .len()
+            .div_ceil(CLONE_REGION_BYTES);
+        Ok(match kind {
+            FileDrive::CutOver => CloneState::CutOver,
+            FileDrive::Copying | FileDrive::View => CloneState::Copying {
+                hydrated_regions: regions,
+                total_regions: regions,
+                hydration_enabled: kind == FileDrive::Copying,
+            },
         })
     }
 
@@ -795,9 +985,14 @@ impl SessionDisk for FileDisk {
         self.copying(drive)
     }
 
+    /// Also removes a bitmap link that a cutover cut short left behind.
     async fn cut_over(&self, drive: &VolumeName) -> io::Result<()> {
-        std::fs::metadata(self.drive_path(drive))?;
-        File::create(self.cut_over_marker(drive)).map(drop)
+        match self.drive(drive)? {
+            FileDrive::View => return Err(refused(drive, FileDrive::View)),
+            FileDrive::Copying => File::create(self.drive_file(drive, "cut-over")).map(drop)?,
+            FileDrive::CutOver => {}
+        }
+        remove_if_present(&self.drive_file(drive, "bitmap"))
     }
 
     async fn snapshot_clone(
@@ -809,6 +1004,17 @@ impl SessionDisk for FileDisk {
         bitmap_snapshot: &VolumeName,
     ) -> io::Result<(Volume, Volume)> {
         self.copying(drive)?;
+        if !same_file(&dest.path, &self.drive_path(drive))?
+            || !same_file(&bitmap.path, &self.drive_file(drive, "bitmap"))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{drive} does not copy into {} with bitmap {}",
+                    dest.name, bitmap.name
+                ),
+            ));
+        }
         let bitmap_snap = self.snapshot(bitmap, bitmap_snapshot).await?;
         match self.snapshot(dest, dest_snapshot).await {
             Ok(dest_snap) => Ok((dest_snap, bitmap_snap)),
@@ -829,10 +1035,11 @@ impl SessionDisk for FileDisk {
         &self,
         view: &VolumeName,
         dest_snapshot: &Volume,
-        _bitmap_snapshot: &Volume,
+        bitmap_snapshot: &Volume,
         _source: &Path,
     ) -> io::Result<Volume> {
-        let path = self.link_drive(dest_snapshot, view)?;
+        self.check_free(view)?;
+        let path = self.link_drive(view, dest_snapshot, bitmap_snapshot, Some("view"))?;
         Volume::open_read_only(
             view.clone(),
             &path,
@@ -842,11 +1049,8 @@ impl SessionDisk for FileDisk {
     }
 
     async fn remove_clone(&self, drive: &VolumeName) -> io::Result<()> {
-        std::fs::remove_file(self.drive_path(drive))?;
-        match std::fs::remove_file(self.cut_over_marker(drive)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        }
+        self.drive(drive)?;
+        self.unlink_drive(drive)
     }
 }
 
@@ -1358,24 +1562,39 @@ mod tests {
         }
     }
 
+    /// The guest's writes on pass `pass`: a partial-region write on the
+    /// first pass, a whole-region write on the second.
+    fn guest_writes(pass: u8) -> (u64, Vec<u8>) {
+        match pass {
+            1 => (REGION + 512, vec![0xA1; 4096]),
+            _ => (2 * REGION, vec![0xB2; REGION as usize]),
+        }
+    }
+
     /// A lazy restore and its cutover, written to converge from any state
     /// an earlier pass left: the drive's state decides what is left to
-    /// do. The guest's writes are the same on every pass.
-    async fn lazy_restore(disk: &dyn SessionDisk, source: &Path) -> io::Result<Volume> {
+    /// do. Each guest write that lands is applied to `expected`.
+    async fn lazy_restore(
+        disk: &dyn SessionDisk,
+        source: &Path,
+        pass: u8,
+        expected: &mut [u8],
+    ) -> io::Result<Volume> {
         let drive = match disk.clone_state(&name("drive")).await {
-            Ok(_) => disk.open_clone(&name("drive")).await?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let dest = create_or_open(disk, "dest", DRIVE).await?;
-                let bitmap = create_or_open(disk, "bitmap", REGION).await?;
-                disk.clone_drive(&name("drive"), &dest, &bitmap, source, hydration())
-                    .await?
+            Ok(CloneState::Incomplete) => {
+                disk.remove_clone(&name("drive")).await?;
+                match disk.delete(&name("bitmap")).await {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+                new_drive(disk, source).await?
             }
+            Ok(_) => disk.open_clone(&name("drive")).await?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => new_drive(disk, source).await?,
             Err(e) => return Err(e),
         };
-        drive.write_range(REGION + 512, vec![0xAA; 4096]).await?;
-        drive
-            .write_range(2 * REGION, vec![0xBB; REGION as usize])
-            .await?;
+        let (offset, bytes) = guest_writes(pass);
+        write(&drive, expected, offset, bytes).await;
         if !disk.clone_state(&name("drive")).await?.is_hydrated() {
             return Err(io::Error::other("the drive is not hydrated"));
         }
@@ -1387,15 +1606,24 @@ mod tests {
         Ok(drive)
     }
 
+    async fn new_drive(disk: &dyn SessionDisk, source: &Path) -> io::Result<Volume> {
+        let dest = create_or_open(disk, "dest", DRIVE).await?;
+        let bitmap = create_or_open(disk, "bitmap", REGION).await?;
+        disk.clone_drive(&name("drive"), &dest, &bitmap, source, hydration())
+            .await
+    }
+
+    /// A second pass keeps every write the first pass made: a pass that
+    /// copied the source over a live destination fails here.
     #[tokio::test]
     async fn a_lazy_restore_cut_at_any_op_converges_on_the_next_pass() {
         let dir = tempfile::tempdir().unwrap();
-        let (source, mut expected) = source_file(dir.path());
-        expected[(REGION + 512) as usize..(REGION + 512 + 4096) as usize].fill(0xAA);
-        expected[(2 * REGION) as usize..(3 * REGION) as usize].fill(0xBB);
+        let (source, bytes) = source_file(dir.path());
 
         let recording = CrashDisk::new(&dir.path().join("recorded"), None);
-        lazy_restore(&recording, &source).await.unwrap();
+        lazy_restore(&recording, &source, 1, &mut bytes.clone())
+            .await
+            .unwrap();
         assert_eq!(
             recording.trace(),
             vec![
@@ -1411,12 +1639,19 @@ mod tests {
 
         for k in 0..recording.trace().len() {
             let root = dir.path().join(format!("cut-{k}"));
+            let mut expected = bytes.clone();
             let cut = CrashDisk::new(&root, Some(k));
-            let err = lazy_restore(&cut, &source).await.unwrap_err();
+            let err = lazy_restore(&cut, &source, 1, &mut expected)
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("injected crash"), "k={k}: {err}");
+            let first_pass_wrote = expected != bytes;
+            assert_eq!(first_pass_wrote, k > 3, "k={k}");
 
             let disk = FileDisk::new(&root, CHUNK).unwrap();
-            let drive = lazy_restore(&disk, &source).await.unwrap();
+            let drive = lazy_restore(&disk, &source, 2, &mut expected)
+                .await
+                .unwrap();
             assert_eq!(whole(&drive).await, expected, "k={k}");
             assert_eq!(
                 whole(&disk.open(&name("dest")).await.unwrap()).await,
@@ -1430,5 +1665,222 @@ mod tests {
             );
             assert_eq!(disk.list().await.unwrap(), vec![name("dest")], "k={k}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_clone_takes_only_a_fresh_bitmap_and_unused_volumes() {
+        let (dir, disk) = disk();
+        let (source, _) = source_file(dir.path());
+        let dest = disk.create(&name("dest"), DRIVE).await.unwrap();
+        let bitmap = disk.create(&name("bitmap"), REGION).await.unwrap();
+        let small = disk.create(&name("small"), 512).await.unwrap();
+        let used = disk.create(&name("used"), REGION).await.unwrap();
+        used.write_range(100, vec![1]).await.unwrap();
+        let clone = |bitmap: &Volume| {
+            let (dest, bitmap) = (dest.clone(), bitmap.clone());
+            let (disk, source) = (disk.clone(), source.clone());
+            async move {
+                disk.clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+                    .await
+                    .map(drop)
+                    .unwrap_err()
+                    .kind()
+            }
+        };
+        assert_eq!(clone(&small).await, io::ErrorKind::InvalidInput);
+        assert_eq!(clone(&used).await, io::ErrorKind::InvalidInput);
+        disk.delete(&name("small")).await.unwrap();
+        assert_eq!(clone(&small).await, io::ErrorKind::NotFound);
+
+        disk.clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap();
+        let other = disk.create(&name("other"), DRIVE).await.unwrap();
+        let fresh = disk.create(&name("fresh"), REGION).await.unwrap();
+        for (d, b) in [(&dest, &fresh), (&other, &bitmap)] {
+            let err = disk
+                .clone_drive(&name("second"), d, b, &source, hydration())
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ResourceBusy, "{err}");
+        }
+        for volume in ["dest", "bitmap"] {
+            assert_eq!(
+                disk.delete(&name(volume)).await.unwrap_err().kind(),
+                io::ErrorKind::ResourceBusy
+            );
+        }
+
+        // After the cutover the bitmap is free but holds a header.
+        disk.cut_over(&name("drive")).await.unwrap();
+        let err = disk
+            .clone_drive(&name("second"), &other, &bitmap, &source, hydration())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        disk.delete(&name("bitmap")).await.unwrap();
+        assert_eq!(
+            disk.delete(&name("dest")).await.unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy
+        );
+        disk.remove_clone(&name("drive")).await.unwrap();
+        disk.delete(&name("dest")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_drives_share_the_volume_name_space_and_are_not_renamed() {
+        let (dir, disk) = disk();
+        let (source, _) = source_file(dir.path());
+        let dest = disk.create(&name("dest"), DRIVE).await.unwrap();
+        let bitmap = disk.create(&name("bitmap"), REGION).await.unwrap();
+        let err = disk
+            .clone_drive(&name("dest"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        disk.clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap();
+        assert_eq!(
+            disk.create(&name("drive"), REGION)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            disk.snapshot(&dest, &name("drive"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let other = disk.create(&name("other"), REGION).await.unwrap();
+        assert_eq!(
+            disk.rename(&other.name, &name("drive"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            disk.rename(&name("drive"), &name("moved"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            disk.remove_clone(&name("other")).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            disk.remove_clone(&name("free")).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_view_opens_read_only_and_refuses_drive_operations() {
+        let (dir, disk) = disk();
+        let (source, bytes) = source_file(dir.path());
+        let dest = disk.create(&name("dest"), DRIVE).await.unwrap();
+        let bitmap = disk.create(&name("bitmap"), REGION).await.unwrap();
+        disk.clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap();
+        let (dest_snap, bitmap_snap) = disk
+            .snapshot_clone(
+                &name("drive"),
+                &dest,
+                &bitmap,
+                &name("dest-snap"),
+                &name("bitmap-snap"),
+            )
+            .await
+            .unwrap();
+        disk.clone_view(&name("view"), &dest_snap, &bitmap_snap, &source)
+            .await
+            .unwrap();
+
+        let view = disk.open_clone(&name("view")).await.unwrap();
+        assert_eq!(whole(&view).await, bytes);
+        assert!(view.write_range(0, vec![3; 512]).await.is_err());
+        assert!(matches!(
+            disk.clone_state(&name("view")).await.unwrap(),
+            CloneState::Copying {
+                hydration_enabled: false,
+                ..
+            }
+        ));
+        let refused = [
+            disk.cut_over(&name("view")).await,
+            disk.enable_hydration(&name("view")).await,
+            disk.snapshot_clone(
+                &name("view"),
+                &dest_snap,
+                &bitmap_snap,
+                &name("s1"),
+                &name("s2"),
+            )
+            .await
+            .map(drop),
+        ];
+        for result in refused {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        for volume in ["dest-snap", "bitmap-snap"] {
+            assert_eq!(
+                disk.delete(&name(volume)).await.unwrap_err().kind(),
+                io::ErrorKind::ResourceBusy
+            );
+        }
+        disk.remove_clone(&name("view")).await.unwrap();
+        disk.delete(&name("dest-snap")).await.unwrap();
+        disk.delete(&name("bitmap-snap")).await.unwrap();
+    }
+
+    /// A failed `snapshot_clone` leaves no snapshot of its own and deletes
+    /// nothing it did not make, so a retry under a free name succeeds.
+    #[tokio::test]
+    async fn a_failed_file_snapshot_clone_removes_only_what_it_made() {
+        let (dir, disk) = disk();
+        let (source, _) = source_file(dir.path());
+        let dest = disk.create(&name("dest"), DRIVE).await.unwrap();
+        let bitmap = disk.create(&name("bitmap"), REGION).await.unwrap();
+        disk.clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap();
+        disk.create(&name("taken"), REGION).await.unwrap();
+        let other = disk.create(&name("other"), REGION).await.unwrap();
+
+        let snap = |dest_snap: &'static str, bitmap: Volume| {
+            let (disk, dest) = (disk.clone(), dest.clone());
+            async move {
+                disk.snapshot_clone(
+                    &name("drive"),
+                    &dest,
+                    &bitmap,
+                    &name(dest_snap),
+                    &name("bitmap-snap"),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            snap("taken", other).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            snap("taken", bitmap.clone()).await.unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let mut names = disk.list().await.unwrap();
+        names.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(
+            names,
+            vec![name("bitmap"), name("dest"), name("other"), name("taken")]
+        );
+        snap("dest-snap", bitmap).await.unwrap();
     }
 }
