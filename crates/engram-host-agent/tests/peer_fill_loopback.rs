@@ -377,3 +377,54 @@ async fn dead_peer_costs_one_bounded_dial_and_is_cached_lost() {
         "health-cached peer must be skipped without dialing"
     );
 }
+
+/// The fill engine's peer tier against a real peer server: many
+/// concurrent requests share batched streams and each gets its own
+/// chunk; a chunk the peer lacks answers None and does not mark it lost.
+#[tokio::test]
+async fn peer_fetcher_answers_concurrent_requests_and_misses() {
+    use engram_fill::PeerSource;
+    use engram_host_agent::peer_fill::PeerFetcher;
+
+    let serve_dir = tempfile::tempdir().unwrap();
+    let serve_cache = mk_cache(&serve_dir);
+    let bodies: Vec<Vec<u8>> = (0..100u8).map(|i| vec![i; 4096 + i as usize]).collect();
+    let hashes = seed_verified(&serve_cache, &bodies).await;
+    let peer = PeerServe::with_limits(serve_cache, ready_digest(DIGEST), 4, 4 * 1024 * 1024);
+    let addr = boot_peer_server(peer).await;
+
+    let health = PeerHealth::new();
+    let fetcher = PeerFetcher::spawn(
+        addr.clone(),
+        PeerChunkScope::BaseImage(DIGEST.into()),
+        health.clone(),
+    );
+    let answers = futures::future::join_all(hashes.iter().map(|h| fetcher.fetch(*h))).await;
+    for (answer, body) in answers.iter().zip(&bodies) {
+        assert_eq!(answer.as_deref(), Some(body.as_slice()));
+    }
+
+    assert!(fetcher.fetch(ChunkHash::of(b"never seeded")).await.is_none());
+    assert!(!health.is_lost(&addr), "a miss must not mark the peer lost");
+}
+
+/// A dead peer is marked lost on the first failed dial; later requests
+/// answer None at once instead of dialing again.
+#[tokio::test]
+async fn peer_fetcher_on_a_dead_peer_answers_none_and_stays_fast() {
+    use engram_fill::PeerSource;
+    use engram_host_agent::peer_fill::PeerFetcher;
+
+    let addr = format!("http://{}", pick_local_addr()); // nothing listening
+    let health = PeerHealth::new();
+    let fetcher = PeerFetcher::spawn(
+        addr.clone(),
+        PeerChunkScope::Snapshot(engram_core::SnapshotId::new()),
+        health.clone(),
+    );
+    assert!(fetcher.fetch(ChunkHash::of(b"a")).await.is_none());
+    assert!(health.is_lost(&addr));
+    let started = std::time::Instant::now();
+    assert!(fetcher.fetch(ChunkHash::of(b"b")).await.is_none());
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
