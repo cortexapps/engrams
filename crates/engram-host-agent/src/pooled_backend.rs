@@ -356,7 +356,9 @@ pub struct PooledBackend {
     /// The metadata of the snapshot a held source produced, for the
     /// coordinator's durable finalize after the hold.
     held_snapshots: DashMap<SandboxId, SnapshotMetadata>,
-    /// Unix-ms timestamp of the last successful capture per sandbox.
+    /// Unix ms at which each sandbox's memory last matched a durable
+    /// manifest: its last successful capture, or the chain seed of its
+    /// restore. A sandbox without a stamp is due for a checkpoint.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
@@ -2920,6 +2922,8 @@ impl PooledBackend {
                             manifest,
                         },
                     );
+                    self.last_snapshot_unix_ms
+                        .insert(id, record.updated_at.timestamp_millis());
                     tracing::info!(
                         sandbox_id = %id,
                         session_id = ?record.session_id,
@@ -2983,10 +2987,7 @@ impl PooledBackend {
         if self.checkpoint_dir.is_none() {
             return Vec::new();
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now_ms = self.clock.now_utc().timestamp_millis();
         self.session_bindings
             .iter()
             .filter_map(|e| {
@@ -3873,10 +3874,7 @@ impl SnapshotFinisher {
                 // Stamped after post-processing succeeded: a snapshot
                 // whose state.bin / sidecar upload failed is not a
                 // durable capture and must not advance the pacing epoch.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
+                let now_ms = self.clock.now_utc().timestamp_millis();
                 let prev_ms = self.last_snapshot_unix_ms.insert(id, now_ms);
                 // ADR 0101 B: pacing sample for the adaptive checkpoint
                 // controller — the epoch is the gap since the previous
@@ -4070,6 +4068,13 @@ impl SnapshotFinisher {
         }
     }
 
+    /// A seeded chain means the memory matches a durable manifest now, so
+    /// the next checkpoint is not due yet. A capture's own stamp wins.
+    fn stamp_seeded(&self, id: SandboxId) {
+        let now_ms = self.clock.now_utc().timestamp_millis();
+        self.last_snapshot_unix_ms.entry(id).or_insert(now_ms);
+    }
+
     /// ADR 0045 seed-at-create: seed the chain by FORKING the source
     /// lineage — publish the source manifest's content under a fresh
     /// manifest id @v1, and chain on that. Required because fresh
@@ -4125,6 +4130,7 @@ impl SnapshotFinisher {
         // The fork manifest is durable (put_manifest above succeeded) —
         // commit the chain-head record so the chain survives a pod roll.
         self.persist_chain_head(id, fork_ref).await;
+        self.stamp_seeded(id);
         tracing::info!(
             sandbox_id = %id,
             src = %src_ref,
@@ -4173,6 +4179,7 @@ impl SnapshotFinisher {
                 // fetched it) — commit the chain-head record so the
                 // chain survives a pod roll.
                 self.persist_chain_head(id, memory_ref).await;
+                self.stamp_seeded(id);
                 tracing::info!(
                     sandbox_id = %id,
                     manifest = %memory_ref,
@@ -12208,6 +12215,57 @@ mod tests {
         }
     }
 
+    /// A chain seed (restore, create) stamps the checkpoint clock, so the
+    /// periodic driver does not capture right after the bind; a capture's
+    /// own stamp is never overwritten.
+    #[tokio::test]
+    async fn chain_seed_stamps_the_checkpoint_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let pooled = PooledBackend::new(Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        }) as Arc<dyn SandboxBackend>)
+        .with_chunk_store(ChunkStore::new(blob))
+        .with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let source = SandboxId::new();
+        let memory_ref = pooled
+            .snapshot(source)
+            .await
+            .expect("capture")
+            .memory_manifest
+            .expect("chunked");
+
+        let restored = SandboxId::new();
+        pooled.bind_session(SessionId::new(), restored);
+        pooled
+            .seed_checkpoint_chain_sparse(restored, memory_ref)
+            .await;
+        let cfg = crate::checkpoint::CheckpointConfig {
+            interval: Some(std::time::Duration::from_secs(600)),
+            min_interval: std::time::Duration::from_secs(30),
+            target_epoch_bytes: 256 * 1024 * 1024,
+        };
+        assert!(pooled.last_snapshot_unix_ms.contains_key(&restored));
+        assert!(
+            pooled.checkpoint_candidates_adaptive(&cfg).is_empty(),
+            "a freshly seeded sandbox is not due"
+        );
+
+        let captured = SandboxId::new();
+        pooled.last_snapshot_unix_ms.insert(captured, 7);
+        pooled
+            .seed_checkpoint_chain_forked(captured, memory_ref)
+            .await;
+        assert_eq!(
+            pooled.last_snapshot_unix_ms.get(&captured).map(|v| *v),
+            Some(7)
+        );
+    }
+
     /// The pod-roll simulation at the unit level: generation A captures
     /// (committing the chain-head record) and dies; generation B — a
     /// fresh `PooledBackend` on the same checkpoint_dir + chunk store,
@@ -12272,6 +12330,15 @@ mod tests {
             Some(survivor_ref),
             "survivor's chain must be re-seeded from the durable record"
         );
+        let record = crate::checkpoint::ChainHeadRecord::load(&chains_dir, survivor)
+            .await
+            .expect("survivor record");
+        assert_eq!(
+            gen_b.last_snapshot_unix_ms.get(&survivor).map(|v| *v),
+            Some(record.updated_at.timestamp_millis()),
+            "a survivor's checkpoint age continues from its record"
+        );
+        assert!(!gen_b.last_snapshot_unix_ms.contains_key(&torn));
         assert!(
             !chain_head_file(&checkpoint_dir, dead).exists(),
             "record for a non-surviving sandbox must be GC'd"
