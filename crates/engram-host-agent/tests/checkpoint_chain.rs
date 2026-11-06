@@ -172,6 +172,12 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     let m1 = ckpt1
         .memory_manifest
         .expect("seed must publish a memory manifest");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        pooled.checkpoint_recorded().notified(),
+    )
+    .await
+    .expect("a persisted checkpoint record signals the heartbeat");
 
     // ADR 0039: the Full capture chunked guest RAM into the store and
     // then removed the local memory.bin — committed snapshot dirs must

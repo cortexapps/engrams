@@ -47,6 +47,21 @@ pub fn build_heartbeat(
     }
 }
 
+/// Waits until the next heartbeat is due: the next `tick`, or earlier when
+/// a checkpoint record lands. An early beat restarts the period. A signal
+/// sent while no one waits is kept, so a record that lands during a send
+/// gets the next beat at once.
+pub async fn next_beat(
+    tick: &mut tokio::time::Interval,
+    checkpoint_recorded: &tokio::sync::Notify,
+) {
+    tokio::select! {
+        biased;
+        () = checkpoint_recorded.notified() => tick.reset(),
+        _ = tick.tick() => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
@@ -109,5 +124,54 @@ mod tests {
         let after = chrono::Utc::now();
         assert!(hb.sent_at >= before);
         assert!(hb.sent_at <= after);
+    }
+
+    const PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+    async fn started_interval() -> tokio::time::Interval {
+        let mut tick = tokio::time::interval(PERIOD);
+        tick.tick().await;
+        tick
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_beat_waits_one_period_without_a_record() {
+        let mut tick = started_interval().await;
+        let recorded = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        next_beat(&mut tick, &recorded).await;
+        assert_eq!(start.elapsed(), PERIOD);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_beat_fires_when_a_record_lands_mid_period() {
+        let mut tick = started_interval().await;
+        let recorded = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = recorded.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            signal.notify_one();
+        });
+        let start = tokio::time::Instant::now();
+        next_beat(&mut tick, &recorded).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
+
+        let start = tokio::time::Instant::now();
+        next_beat(&mut tick, &recorded).await;
+        assert_eq!(
+            start.elapsed(),
+            PERIOD,
+            "the early beat restarts the period"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_beat_keeps_a_record_signalled_between_beats() {
+        let mut tick = started_interval().await;
+        let recorded = tokio::sync::Notify::new();
+        recorded.notify_one();
+        let start = tokio::time::Instant::now();
+        next_beat(&mut tick, &recorded).await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 }

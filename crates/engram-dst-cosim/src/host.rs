@@ -1014,6 +1014,7 @@ impl CosimHost {
             self.bundle_dir(),
             BUNDLE_EXT,
             self.root.path().to_path_buf(),
+            Arc::new(tokio::sync::Notify::new()),
             self.pending_finalizes.clone(),
             self.destroyer.clone(),
             self.fs_seam.clone(),

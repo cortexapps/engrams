@@ -1166,16 +1166,17 @@ impl HostAgent {
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
-            // draining, ready_images} every `heartbeat_interval` to
-            // any coord pod via the L4-LB. Coord pod that receives
-            // it updates host_registry, runs ADR 0009 reconcile, and
-            // persists to PG. Idempotent across pods. The ack
-            // carries `enabled_images`, which the supervisor diffs
-            // against the local ready set.
+            // draining, ready_images} every `heartbeat_interval`, and at
+            // once after a checkpoint record lands, to any coord pod via
+            // the L4-LB. Coord pod that receives it updates
+            // host_registry, runs ADR 0009 reconcile, and persists to PG.
+            // Idempotent across pods. The ack carries `enabled_images`,
+            // which the supervisor diffs against the local ready set.
             let heartbeat_interval = self.cfg.heartbeat_interval;
             let coord_for_heartbeat = coord_client.clone();
             let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
+            let checkpoint_recorded = pooled.checkpoint_recorded();
             let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
@@ -1215,7 +1216,7 @@ impl HostAgent {
                 // delta; the first tick reports cpu_pct=0.
                 let mut util_probe = crate::util::UtilizationProbe::new();
                 loop {
-                    tick.tick().await;
+                    crate::heartbeat::next_beat(&mut tick, &checkpoint_recorded).await;
                     // Issue #215: a `list()` error is "no information",
                     // not "no sandboxes running". Reporting empty would
                     // make the coord's ADR 0009 reconcile strike every
