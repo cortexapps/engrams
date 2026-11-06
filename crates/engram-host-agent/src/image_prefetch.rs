@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use engram_chunk_store::manifest::ChunkHash;
-use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
+use engram_chunk_store::{ChunkCache, Manifest};
 use engram_core::types::SnapshotId;
 use engram_fill::{Class, FillEngine};
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
@@ -1065,8 +1065,7 @@ async fn prefetch_one(
                         base_path.clone(),
                         pending_bytes,
                     );
-                    let prewarm_result =
-                        prewarm_base_shm(&base_path, &memory_manifest, chunk_store).await;
+                    let prewarm_result = prewarm_base_shm(&base_path, &memory_manifest, fill).await;
                     ram_ledger.settle_pending(&memory_ref);
                     match prewarm_result {
                         Ok(written) => {
@@ -1146,13 +1145,14 @@ fn manifest_non_hole_bytes(manifest: &Manifest) -> u64 {
 }
 
 /// ADR 0045: populate a per-image base shm file from a memory
-/// manifest's chunks (NVMe-warm after the preceding prefetch). Grow-only
-/// size like the handler's `BaseShm::open`; chunk bytes land at their
-/// manifest offsets; elided ranges stay holes. Returns chunks written.
+/// manifest's chunks (NVMe-warm after the preceding prefetch), read
+/// through the fill engine at `Background`. Grow-only size like the
+/// handler's `BaseShm::open`; chunk bytes land at their manifest offsets;
+/// elided ranges stay holes. Returns chunks written.
 async fn prewarm_base_shm(
     path: &std::path::Path,
     manifest: &Manifest,
-    chunk_store: &ChunkStore,
+    fill: &FillEngine,
 ) -> Result<usize, String> {
     use std::os::unix::fs::FileExt;
     if let Some(parent) = path.parent() {
@@ -1174,8 +1174,8 @@ async fn prewarm_base_shm(
     let file = std::sync::Arc::new(file);
     let mut written = 0usize;
     for chunk in &manifest.chunks {
-        let bytes = chunk_store
-            .get_chunk(chunk.hash)
+        let bytes = fill
+            .read(chunk.hash, Class::Background)
             .await
             .map_err(|e| format!("chunk {}: {e}", chunk.hash))?;
         let file = file.clone();
@@ -1326,7 +1326,7 @@ mod tests {
 
     // ---- ADR 0022 Option A: residency memfile materialization ----
 
-    use engram_chunk_store::{ChunkCacheConfig, ManifestKind};
+    use engram_chunk_store::{ChunkCacheConfig, ChunkStore, ManifestKind};
     use engram_core::traits::BlobStorage;
     use engram_core::types::manifest::ManifestRef;
     use engram_storage_local::LocalBlobStorage;
@@ -2279,6 +2279,7 @@ mod tests {
 #[cfg(test)]
 mod prewarm_tests {
     use super::*;
+    use engram_chunk_store::ChunkStore;
     use std::sync::Arc;
 
     /// ADR 0045: the pre-warm writes each manifest chunk at its
@@ -2305,7 +2306,8 @@ mod prewarm_tests {
         assert_eq!(manifest.chunks.len(), 2, "the zero chunk is elided");
 
         let base = tmp.path().join("shm").join("base.base");
-        let written = prewarm_base_shm(&base, &manifest, &store)
+        let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
+        let written = prewarm_base_shm(&base, &manifest, &fill)
             .await
             .expect("prewarm");
         assert_eq!(written, 2);
