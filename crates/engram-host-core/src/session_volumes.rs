@@ -50,8 +50,8 @@ use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
 use crate::disk::{
-    clone_bitmap_bytes, Capacity, ChunkIndex, CloneState, Hydration, SessionDisk, Volume,
-    VolumeName, CLONE_REGION_BYTES,
+    clone_bitmap_bytes, Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName,
+    CLONE_REGION_BYTES,
 };
 use crate::disk_flows::{checkpoint_split, shape_matches, stage};
 use crate::disk_sources::DiskSources;
@@ -505,7 +505,8 @@ enum Shape {
     /// where the drive had not copied, so the upload reads through a view.
     Hydrating { bitmap: Volume },
     /// A cloned drive's destination after the cutover, with no complete
-    /// volume of `previous`: the upload hashes every chunk.
+    /// volume of `previous`: the upload hashes every chunk the snapshot
+    /// maps.
     CutOver,
 }
 
@@ -1350,13 +1351,14 @@ impl SessionVolumes {
                 self.upload_through_view(sandbox, role, &snapshot, bitmap)
                     .await?
             }
-            // Every chunk is hashed; one equal to the durable previous
+            // A chunk the snapshot does not map reads as zeros, so only the
+            // mapped chunks are read; one equal to the durable previous
             // manifest's chunk is not uploaded.
             Shape::CutOver => {
                 let previous_manifest =
                     self.store.get_manifest(previous).await.map_err(store_err)?;
-                let every = (0..snapshot.chunk_count()).map(ChunkIndex).collect();
-                checkpoint_split::upload_over(&self.store, &snapshot, every, &previous_manifest)
+                let mapped = self.disk.written_chunks(None, &snapshot).await?;
+                checkpoint_split::upload_only(&self.store, &snapshot, mapped, &previous_manifest)
                     .await?
             }
         };

@@ -23,7 +23,9 @@ use engram_host_core::disk::{
 };
 use engram_host_core::disk_sources::Served;
 use engram_host_core::image_volumes;
-use engram_host_core::session_volumes::{dest_name, live_name, Cutover, Source, Waiting};
+use engram_host_core::session_volumes::{
+    checkpoint_name, dest_name, live_name, Cutover, Source, Waiting,
+};
 use engram_host_core::{checkpoint, stage, DiskSources, FileDisk, FileSources, SessionVolumes};
 use engram_storage_local::LocalBlobStorage;
 
@@ -1213,6 +1215,102 @@ async fn a_lazy_role_over_a_new_volume_copies_only_the_listed_chunks() {
     assert!(grown < SIZE / 4, "the pool grew by {grown} bytes");
     drop((drive, dest));
     rig.release_clean().await;
+}
+
+/// The bytes the kernel has read from a volume's device.
+fn bytes_read(volume: &Volume) -> u64 {
+    let stat = std::fs::read_to_string(format!("/sys/dev/block/{}/stat", devno(volume))).unwrap();
+    let sectors: u64 = stat.split_whitespace().nth(2).unwrap().parse().unwrap();
+    sectors * 512
+}
+
+/// After the cutover of a mostly-zero disk over a new destination, the
+/// first checkpoint reads only the chunks the destination maps: the ones
+/// hydration copied and the one the guest wrote. Staged again, the
+/// published manifest is what the drive reads.
+#[tokio::test]
+#[ignore]
+async fn the_first_checkpoint_after_a_cutover_reads_only_the_mapped_chunks() {
+    let Some(rig) = SessionRig::new(None).await else {
+        return;
+    };
+    let size = 16 * SIZE;
+    let listed = [3u64, 20, 21, 50];
+    let mut bytes = vec![0u8; size as usize];
+    for (i, chunk) in listed.iter().enumerate() {
+        let at = (chunk * CHUNK) as usize;
+        bytes[at..at + CHUNK as usize].copy_from_slice(&pattern(CHUNK as usize, i as u32 + 1));
+    }
+    let manifest = publish(&rig.files, &rig.store, "sparse", &bytes).await;
+    let provisioned = rig
+        .volumes
+        .provision(
+            rig.sandbox,
+            Source::LazyContinue {
+                manifest,
+                base: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let drive = Volume::open(
+        VolumeName::new("probe").unwrap(),
+        &provisioned.root,
+        size,
+        CHUNK,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + HYDRATION_DEADLINE;
+    while rig
+        .volumes
+        .cut_over(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap()
+        != Cutover::Done
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not cut over in {HYDRATION_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rig.volumes
+        .stop_source(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
+    let mut expected = bytes;
+    write(
+        &drive,
+        &mut expected,
+        40 * CHUNK,
+        pattern(CHUNK as usize, 0x40),
+    )
+    .await;
+
+    let published = rig
+        .volumes
+        .checkpoint(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
+
+    let volume = rig
+        .disk
+        .open(&checkpoint_name(rig.sandbox, DiskRole::Root, published))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.disk.written_chunks(None, &volume).await.unwrap(),
+        [3, 20, 21, 40, 50].map(ChunkIndex).to_vec()
+    );
+    let read = bytes_read(&volume);
+    eprintln!("the checkpoint read {read} of {size} bytes");
+    assert!(read < size / 8, "the checkpoint read {read} bytes");
+    let staged = staged_bytes(&rig.files, &rig.store, "staged", published).await;
+    assert_eq!(first_difference(&staged, &expected), None);
+    drop((drive, volume));
+    let report = rig.volumes.purge(rig.sandbox).await.unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
 }
 
 /// Over a staged base, hydration copies only the chunks that differ from

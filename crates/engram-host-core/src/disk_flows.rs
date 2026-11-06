@@ -179,6 +179,30 @@ pub mod checkpoint_split {
         }
         Ok(base.apply(&delta))
     }
+
+    /// The manifest of `from` when only the chunks at `indices` can hold
+    /// data: every other chunk is a hole and is not read. A chunk equal
+    /// to the one `known` holds at its offset is not uploaded.
+    pub async fn upload_only(
+        store: &ChunkStore,
+        from: &Volume,
+        indices: Vec<ChunkIndex>,
+        known: &Manifest,
+    ) -> io::Result<Manifest> {
+        let chunk_size = from.chunk_size;
+        let listed: std::collections::BTreeSet<u64> =
+            indices.iter().map(|i| i.0 * chunk_size).collect();
+        let holes = ManifestDelta {
+            write: Vec::new(),
+            zero: known
+                .chunks
+                .iter()
+                .map(|c| c.offset)
+                .filter(|offset| !listed.contains(offset))
+                .collect(),
+        };
+        upload_over(store, from, indices, &known.apply(&holes)).await
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +310,45 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_of(&fresh).await, bytes_of(&c2).await);
         assert_eq!(bytes_of(&over).await, bytes_of(&c2).await);
+    }
+
+    /// Only the listed chunks are read: an unlisted chunk is a hole, also
+    /// where the volume holds data or `known` lists a chunk.
+    #[tokio::test]
+    async fn an_upload_of_only_some_chunks_makes_every_other_chunk_a_hole() {
+        let r = rig();
+        let live = r.disk.create(&name("live"), CHUNK * 4).await.unwrap();
+        for (i, byte) in [1, 2, 3, 4].into_iter().enumerate() {
+            live.write_chunk(ChunkIndex(i as u64), fill(byte))
+                .await
+                .unwrap();
+        }
+        let (snap, known) = checkpoint(&r.disk, &r.store, &live, &name("c1"), None)
+            .await
+            .unwrap();
+
+        let manifest = checkpoint_split::upload_only(
+            &r.store,
+            &snap,
+            vec![ChunkIndex(1), ChunkIndex(2)],
+            &known,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manifest.chunks,
+            vec![
+                ChunkRef {
+                    offset: CHUNK,
+                    hash: ChunkHash::of(&fill(2)),
+                },
+                ChunkRef {
+                    offset: 2 * CHUNK,
+                    hash: ChunkHash::of(&fill(3)),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
