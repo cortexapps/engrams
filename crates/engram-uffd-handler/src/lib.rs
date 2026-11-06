@@ -39,6 +39,7 @@
 pub mod chunked;
 pub mod fault_stats;
 pub mod first_touch;
+pub mod mapped;
 /// ADR 0045 C2: the post-copy peer channel — `PeerSession` (sync TCP
 /// client to the source host-agent's page server) + `ControlTx` (the
 /// one-way `--control-sock` reports). Portable (plain sockets); the

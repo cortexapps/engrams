@@ -163,8 +163,8 @@ impl FaultStats {
 pub static STATS: FaultStats = FaultStats::new();
 
 thread_local! {
-    /// Set by `ChunkedMemoryBackend::fetch_chunk` on the calling thread
-    /// (the future runs on the thread that `block_on`s it).
+    /// Set by `ChunkedMemoryBackend::fetch_chunk` on the fault thread
+    /// that calls it.
     static FETCH_SOURCE: Cell<Option<Source>> = const { Cell::new(None) };
 }
 

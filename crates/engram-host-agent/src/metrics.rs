@@ -454,7 +454,8 @@ pub const HOST_BASE_SHM_TMPFS_USED_MIB: &str = "engram_host_base_shm_tmpfs_used_
 pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skipped_total";
 
 /// Counter (ADR 0075). Populate requests served by the substrate
-/// writer. Labels: outcome = already_local | populated | error.
+/// writer. Labels: outcome = already_local | populated | error;
+/// proto = 1 | 2 (the protocol version of the connection).
 pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";
 
 /// ADR 0035 amendment D1: a startup pass that publishes the baked stamp's bundle

@@ -1,45 +1,48 @@
-//! ADR 0075: the read-only client of the substrate populate socket.
+//! The read-only client of the substrate populate socket (ADR 0075).
 //!
-//! The handler no longer owns a `ChunkCache` — misses are resolved by
-//! asking the one writer (the host-agent) to populate and hand back an
-//! `O_RDONLY` fd. Fully synchronous (the fault loop is a blocking
-//! thread; the `peer.rs` no-tokio discipline applies), with bounded
-//! reconnect: handlers deliberately OUTLIVE host-agent rolls (ADR 0044
-//! K2), so a `request` landing while the successor re-binds the socket
-//! retries briefly — and the CALLER falls back to a direct blob fetch
-//! (served from memory, never written to the cache dir) when the
-//! writer stays unreachable, so a fault can never wedge on the control
-//! plane being mid-roll.
+//! The handler asks the one writer (the host-agent) for each chunk the
+//! cache does not hold. Synchronous: it runs on the fault threads.
+//! Handlers outlive host-agent rolls (ADR 0044 K2), so a request that
+//! finds the socket gone redials a bounded number of times; past that
+//! the caller fetches the chunk from the object store itself.
+//!
+//! Each connection speaks protocol version 2 (the chunk arrives in the
+//! connection's shared-memory slot) or, against a writer that refuses
+//! version 2, version 1 (the chunk arrives as an fd). Every dial asks
+//! for version 2 first, so a handler moves to it once the writer rolls.
 
-#[cfg(target_os = "linux")]
-use std::io::Read as _;
+use std::fs::File;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use engram_chunk_store::ChunkHash;
-use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION};
+use engram_core::types::manifest::ManifestRef;
+use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION, PROTO_VERSION_V1, SLOT_BYTES};
 
-/// Bounded reconnect: a rolling host-agent's successor re-binds the
-/// socket within seconds; a dead writer must surface fast so the
-/// caller's direct-blob fallback keeps the vCPU un-wedged.
+use crate::mapped::{chunk_file_bytes, Mapping};
+
+/// Dial attempts per request. A rolled host-agent's successor binds
+/// the socket within seconds; a dead writer must surface fast so the
+/// caller's object-store fallback keeps the vCPU moving.
 const RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
-/// The writer's populate includes a GCS fetch on a cold chunk
-/// (~190 ms mean, tail above that) — give it room without letting a
-/// wedged writer hold a fault hostage (the fallback exists).
+/// A cold chunk costs the writer an object-store fetch (about 190 ms
+/// mean). A writer that does not answer in this time is wedged: the
+/// request goes to the fallback with no retry.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum PopulateError {
-    /// Writer unreachable past the retry budget — the caller should
-    /// take the direct-blob fallback.
+    /// No answer from the writer within the dial or reply budget; the
+    /// caller should fetch from the object store.
     WriterUnreachable(String),
-    /// The writer answered but could not populate (blob-store error).
+    /// The writer answered but could not deliver the chunk.
     Failed(String),
-    Io(std::io::Error),
 }
 
 impl std::fmt::Display for PopulateError {
@@ -47,37 +50,107 @@ impl std::fmt::Display for PopulateError {
         match self {
             Self::WriterUnreachable(m) => write!(f, "substrate writer unreachable: {m}"),
             Self::Failed(m) => write!(f, "populate failed: {m}"),
-            Self::Io(e) => write!(f, "populate io: {e}"),
         }
     }
 }
 
 impl std::error::Error for PopulateError {}
 
+/// The `Hello` manifests: canonical, then session.
+type HelloManifests = (Option<ManifestRef>, Option<ManifestRef>);
+
+/// `HelloAck` probe results: `(tmpfs_ok, cache_writable)`.
+pub type HelloProbes = (bool, bool);
+
 /// Synchronous populate client, safe to call from every fault thread at
 /// once (the writer's singleflight collapses duplicate chunks).
 pub struct PopulateClient {
     sock_path: PathBuf,
     /// Connections not in use. A request takes one or dials a new one,
-    /// so concurrent fault threads each get their own exchange; the
-    /// writer serves every connection on its own thread.
-    idle: Mutex<Vec<UnixStream>>,
-    /// The manifest refs from the startup `hello`, replayed on every
-    /// fresh dial: the server-side session-chunk PIN SET (and the
-    /// proto-version check) live for the CONNECTION, and the designed-
-    /// for reconnect case — a host-agent roll, whose successor holds a
-    /// brand-new empty pin set — is exactly when losing them silently
-    /// would let the evictor thrash this handler's divergent chunks
-    /// for the rest of the sandbox's life.
-    hello_manifests: Mutex<
-        Option<(
-            Option<engram_core::types::manifest::ManifestRef>,
-            Option<engram_core::types::manifest::ManifestRef>,
-        )>,
-    >,
-    /// The most recent `HelloAck`'s probe results, written by the
-    /// fresh-dial replay in `with_conn`.
-    last_hello_ack: Mutex<Option<(bool, bool)>>,
+    /// so concurrent fault threads each get their own exchange.
+    idle: Mutex<Vec<Conn>>,
+    /// The manifests from [`Self::hello`], sent again on every dial: the
+    /// writer pins the session's chunks per connection, and a rolled
+    /// writer starts with no pins.
+    hello_manifests: Mutex<Option<HelloManifests>>,
+}
+
+struct Conn {
+    stream: UnixStream,
+    /// The writer's slot, mapped read-only; `None` on version 1.
+    slot: Option<Mapping>,
+}
+
+enum Reply {
+    /// The chunk is in the connection's slot, `len` bytes.
+    Slot(usize),
+    Bytes(Bytes),
+    Failed(String),
+}
+
+enum HelloReply {
+    Ack(HelloProbes),
+    Refused(String),
+}
+
+impl Conn {
+    fn exchange(&mut self, hash: ChunkHash) -> std::io::Result<Reply> {
+        engram_substrate_proto::write_frame(
+            &mut self.stream,
+            &ToWriter::Populate {
+                hash: *hash.as_bytes(),
+            },
+        )?;
+        match engram_substrate_proto::read_frame(&mut self.stream)? {
+            FromWriter::Filled { len } if self.slot.is_some() && len <= SLOT_BYTES => {
+                Ok(Reply::Slot(len as usize))
+            }
+            FromWriter::Populated { len } => {
+                let file = File::from(engram_substrate_proto::recv_fd(self.stream.as_fd())?);
+                let bytes = chunk_file_bytes(&file)?;
+                if bytes.len() as u64 != len {
+                    return Err(invalid(format!(
+                        "populate fd holds {} bytes, reply said {len}",
+                        bytes.len()
+                    )));
+                }
+                Ok(Reply::Bytes(bytes))
+            }
+            FromWriter::PopulateErr { msg } => Ok(Reply::Failed(msg)),
+            other => Err(invalid(format!("unexpected Populate reply: {other:?}"))),
+        }
+    }
+}
+
+/// A chunk in a connection's slot. It holds the connection out of the
+/// pool until it is dropped, so no request rewrites the slot while
+/// these bytes are in use.
+struct SlotLease {
+    /// `None` only inside `drop`.
+    conn: Option<Conn>,
+    len: usize,
+    client: Arc<PopulateClient>,
+}
+
+impl AsRef<[u8]> for SlotLease {
+    fn as_ref(&self) -> &[u8] {
+        match self.conn.as_ref().and_then(|c| c.slot.as_ref()) {
+            // SAFETY: `len <= SLOT_BYTES`, the mapped length and the
+            // slot file's size (checked at dial). The writer writes the
+            // slot only while it serves a request on this connection,
+            // and the lease holds the connection, so none is in flight.
+            Some(slot) => unsafe { slot.prefix(self.len) },
+            None => &[],
+        }
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.client.checkin(conn);
+        }
+    }
 }
 
 impl PopulateClient {
@@ -86,169 +159,255 @@ impl PopulateClient {
             sock_path,
             idle: Mutex::new(Vec::new()),
             hello_manifests: Mutex::new(None),
-            last_hello_ack: Mutex::new(None),
         }
     }
 
-    fn dial(&self) -> std::io::Result<UnixStream> {
+    /// Startup handshake. Returns the probe results so `main` can refuse
+    /// to serve on an unready host, before it binds the FC-facing UDS.
+    /// The manifests are sent again on every later dial.
+    pub fn hello(
+        &self,
+        canonical_manifest: Option<ManifestRef>,
+        session_manifest: Option<ManifestRef>,
+    ) -> Result<HelloProbes, PopulateError> {
+        let manifests = (canonical_manifest, session_manifest);
+        *self.hello_manifests.lock().expect("hello_manifests lock") = Some(manifests);
+        self.idle.lock().expect("populate idle lock").clear();
+        let mut last_err = None;
+        for _ in 0..RECONNECT_ATTEMPTS {
+            match self.dial_with_hello(manifests) {
+                Ok((conn, probes)) => {
+                    self.checkin(conn);
+                    return Ok(probes);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(RECONNECT_BACKOFF);
+                }
+            }
+        }
+        Err(unreachable_err(last_err))
+    }
+
+    /// The bytes of one chunk. On version 2 they are the slot itself,
+    /// and the connection returns to the pool when the last clone of
+    /// the `Bytes` drops; on version 1 they map the fd the writer
+    /// passed (an eviction unlink after the reply is harmless).
+    pub fn request(self: &Arc<Self>, hash: ChunkHash) -> Result<Bytes, PopulateError> {
+        let mut last_err = None;
+        for _ in 0..RECONNECT_ATTEMPTS {
+            let pooled = self.idle.lock().expect("populate idle lock").pop();
+            let mut conn = match pooled.map_or_else(|| self.dial(), Ok) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(RECONNECT_BACKOFF);
+                    continue;
+                }
+            };
+            match conn.exchange(hash) {
+                Ok(Reply::Slot(len)) => {
+                    return Ok(Bytes::from_owner(SlotLease {
+                        conn: Some(conn),
+                        len,
+                        client: Arc::clone(self),
+                    }))
+                }
+                Ok(Reply::Bytes(bytes)) => {
+                    self.checkin(conn);
+                    return Ok(bytes);
+                }
+                Ok(Reply::Failed(msg)) => {
+                    self.checkin(conn);
+                    return Err(PopulateError::Failed(msg));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(PopulateError::WriterUnreachable(format!(
+                        "no reply within {READ_TIMEOUT:?}: {e}"
+                    )));
+                }
+                Err(e) => {
+                    // A broken connection means the writer went away;
+                    // the idle ones are as stale. Redial now.
+                    tracing::debug!(error = %e, "populate exchange failed; redialing");
+                    self.idle.lock().expect("populate idle lock").clear();
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(unreachable_err(last_err))
+    }
+
+    fn checkin(&self, conn: Conn) {
+        self.idle.lock().expect("populate idle lock").push(conn);
+    }
+
+    fn connect(&self) -> std::io::Result<UnixStream> {
         let s = UnixStream::connect(&self.sock_path)?;
         s.set_read_timeout(Some(READ_TIMEOUT))?;
         s.set_write_timeout(Some(WRITE_TIMEOUT))?;
         Ok(s)
     }
 
-    /// The `Hello` exchange on `stream`. Shared by the startup
-    /// handshake and the re-dial replay.
-    fn hello_on(
-        stream: &mut UnixStream,
-        canonical_manifest: Option<engram_core::types::manifest::ManifestRef>,
-        session_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    ) -> std::io::Result<(bool, bool)> {
-        engram_substrate_proto::write_frame(
-            stream,
-            &ToWriter::Hello {
-                proto_version: PROTO_VERSION,
-                canonical_manifest,
-                session_manifest,
-            },
-        )?;
-        let reply: FromWriter = engram_substrate_proto::read_frame(stream)?;
-        match reply {
-            FromWriter::HelloAck {
-                tmpfs_ok,
-                cache_writable,
-            } => Ok((tmpfs_ok, cache_writable)),
-            FromWriter::PopulateErr { msg } => {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-            }
-            other => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unexpected Hello reply: {other:?}"),
-            )),
-        }
-    }
-
-    /// Startup handshake: send `Hello`, await `HelloAck`. Returns the
-    /// probe results so `main` can refuse to serve on an unready host
-    /// (exit BEFORE binding the FC-facing UDS — the ADR 0075 readiness
-    /// ordering, same pattern as `peer.rs` connect-before-bind). The
-    /// manifest refs are remembered and REPLAYED on every reconnect —
-    /// the pins die with the connection, so a redial without a fresh
-    /// `Hello` would leave the handler unpinned forever.
-    pub fn hello(
-        &self,
-        canonical_manifest: Option<engram_core::types::manifest::ManifestRef>,
-        session_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    ) -> Result<(bool, bool), PopulateError> {
-        *self.hello_manifests.lock().expect("hello_manifests lock") =
-            Some((canonical_manifest, session_manifest));
-        // Force a fresh dial: with_conn runs the Hello exchange on
-        // every new connection (the replay path) and caches the ack.
-        self.idle.lock().expect("populate idle lock").clear();
-        self.with_conn(|_| Ok(()))?;
-        self.last_hello_ack
-            .lock()
-            .expect("last_hello_ack lock")
-            .ok_or_else(|| {
-                PopulateError::WriterUnreachable("Hello exchange produced no ack".into())
-            })
-    }
-
-    /// Populate one chunk and return its bytes (read from the fd the
-    /// writer passed — an eviction unlink after the reply is harmless).
-    pub fn request(&self, hash: ChunkHash) -> Result<Vec<u8>, PopulateError> {
-        let bytes = self.with_conn(|stream| {
-            engram_substrate_proto::write_frame(
-                stream,
-                &ToWriter::Populate {
-                    hash: *hash.as_bytes(),
-                },
-            )?;
-            let reply: FromWriter = engram_substrate_proto::read_frame(stream)?;
-            match reply {
-                FromWriter::Populated { len } => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        let fd = engram_substrate_proto::recv_fd(stream)?;
-                        let mut file = std::fs::File::from(fd);
-                        let mut buf = Vec::with_capacity(len as usize);
-                        file.read_to_end(&mut buf)?;
-                        Ok(Ok(buf))
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        // No SCM_RIGHTS off-Linux, and no out-of-process
-                        // clients exist there (ADR 0075) — this arm is
-                        // only reachable from unit tests, which use the
-                        // fallback path.
-                        let _ = len;
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "fd-passing populate is Linux-only",
-                        ))
-                    }
-                }
-                FromWriter::PopulateErr { msg } => Ok(Err(msg)),
-                other => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unexpected Populate reply: {other:?}"),
-                )),
-            }
-        })?;
-        bytes.map_err(PopulateError::Failed)
-    }
-
-    /// Run `f` against the live connection, redialing (bounded) on
-    /// connect/transport failure. A mid-exchange error poisons the
-    /// connection (drop + redial next attempt) — the protocol is
-    /// strictly request/response, so a fresh dial is always safe.
-    fn with_conn<T>(
-        &self,
-        mut f: impl FnMut(&mut UnixStream) -> std::io::Result<T>,
-    ) -> Result<T, PopulateError> {
-        let mut last_err = None;
-        let mut idle = self.idle.lock().expect("populate idle lock").pop();
-        for attempt in 0..RECONNECT_ATTEMPTS {
-            let mut stream = match idle.take() {
-                Some(s) => s,
-                None => match self.dial_with_hello() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        last_err = Some(e);
-                        std::thread::sleep(RECONNECT_BACKOFF);
-                        continue;
-                    }
-                },
-            };
-            match f(&mut stream) {
-                Ok(v) => {
-                    self.idle.lock().expect("populate idle lock").push(stream);
-                    return Ok(v);
-                }
-                Err(e) => {
-                    tracing::debug!(attempt, error = %e, "populate exchange failed; redialing");
-                    last_err = Some(e);
-                    std::thread::sleep(RECONNECT_BACKOFF);
-                }
-            }
-        }
-        Err(PopulateError::WriterUnreachable(
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no attempts".into()),
-        ))
-    }
-
-    /// A new connection with `Hello` replayed. The server's session-chunk
-    /// pin set and its protocol check are per connection, and a rolled
-    /// host-agent's successor starts with none, so every dial repeats it.
-    fn dial_with_hello(&self) -> std::io::Result<UnixStream> {
-        let mut s = self.dial()?;
+    /// A new connection. Before [`Self::hello`] it sends no `Hello` and
+    /// speaks version 1.
+    fn dial(&self) -> std::io::Result<Conn> {
         let manifests = *self.hello_manifests.lock().expect("hello_manifests lock");
-        if let Some((c, sm)) = manifests {
-            let ack = Self::hello_on(&mut s, c, sm)?;
-            *self.last_hello_ack.lock().expect("last_hello_ack lock") = Some(ack);
+        match manifests {
+            Some(manifests) => self.dial_with_hello(manifests).map(|(conn, _)| conn),
+            None => Ok(Conn {
+                stream: self.connect()?,
+                slot: None,
+            }),
         }
-        Ok(s)
+    }
+
+    /// A new connection that asks for version 2 and, if the writer
+    /// refuses, speaks version 1 on a second connection.
+    fn dial_with_hello(&self, manifests: HelloManifests) -> std::io::Result<(Conn, HelloProbes)> {
+        let mut stream = self.connect()?;
+        match hello_on(&mut stream, PROTO_VERSION, manifests)? {
+            HelloReply::Ack(probes) => {
+                let slot = File::from(engram_substrate_proto::recv_fd(stream.as_fd())?);
+                if slot.metadata()?.len() != SLOT_BYTES {
+                    return Err(invalid("slot file is not SLOT_BYTES long".into()));
+                }
+                let slot = Mapping::lazy(slot.as_fd(), SLOT_BYTES as usize)?;
+                let conn = Conn {
+                    stream,
+                    slot: Some(slot),
+                };
+                Ok((conn, probes))
+            }
+            HelloReply::Refused(msg) => {
+                tracing::debug!(%msg, "writer refused protocol v2; using v1");
+                let mut stream = self.connect()?;
+                match hello_on(&mut stream, PROTO_VERSION_V1, manifests)? {
+                    HelloReply::Ack(probes) => Ok((Conn { stream, slot: None }, probes)),
+                    HelloReply::Refused(msg) => Err(invalid(msg)),
+                }
+            }
+        }
+    }
+}
+
+fn hello_on(
+    stream: &mut UnixStream,
+    proto_version: u32,
+    (canonical_manifest, session_manifest): HelloManifests,
+) -> std::io::Result<HelloReply> {
+    engram_substrate_proto::write_frame(
+        stream,
+        &ToWriter::Hello {
+            proto_version,
+            canonical_manifest,
+            session_manifest,
+        },
+    )?;
+    match engram_substrate_proto::read_frame(stream)? {
+        FromWriter::HelloAck {
+            tmpfs_ok,
+            cache_writable,
+        } => Ok(HelloReply::Ack((tmpfs_ok, cache_writable))),
+        FromWriter::PopulateErr { msg } => Ok(HelloReply::Refused(msg)),
+        other => Err(invalid(format!("unexpected Hello reply: {other:?}"))),
+    }
+}
+
+fn invalid(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+fn unreachable_err(last: Option<std::io::Error>) -> PopulateError {
+    PopulateError::WriterUnreachable(last.map_or_else(|| "no attempts".into(), |e| e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A writer that refuses version 2 the way a version-1 writer does
+    /// (`PopulateErr`, then close), then serves version 1.
+    fn v1_writer(listener: UnixListener, chunk: Vec<u8>) {
+        use std::io::Write as _;
+        let (mut refused, _) = listener.accept().unwrap();
+        let hello: ToWriter = engram_substrate_proto::read_frame(&mut refused).unwrap();
+        assert!(matches!(
+            hello,
+            ToWriter::Hello {
+                proto_version: PROTO_VERSION,
+                ..
+            }
+        ));
+        engram_substrate_proto::write_frame(
+            &mut refused,
+            &FromWriter::PopulateErr {
+                msg: "proto version mismatch: writer 1, client 2".into(),
+            },
+        )
+        .unwrap();
+        drop(refused);
+
+        let (mut s, _) = listener.accept().unwrap();
+        let hello: ToWriter = engram_substrate_proto::read_frame(&mut s).unwrap();
+        assert!(matches!(
+            hello,
+            ToWriter::Hello {
+                proto_version: PROTO_VERSION_V1,
+                ..
+            }
+        ));
+        engram_substrate_proto::write_frame(
+            &mut s,
+            &FromWriter::HelloAck {
+                tmpfs_ok: true,
+                cache_writable: true,
+            },
+        )
+        .unwrap();
+        let _populate: ToWriter = engram_substrate_proto::read_frame(&mut s).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&chunk).unwrap();
+        engram_substrate_proto::write_frame(
+            &mut s,
+            &FromWriter::Populated {
+                len: chunk.len() as u64,
+            },
+        )
+        .unwrap();
+        engram_substrate_proto::send_fd(s.as_fd(), file.as_fd()).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_version_one_against_an_older_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("substrate.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let chunk: Vec<u8> = (0..8192u32).map(|i| (i * 3) as u8).collect();
+        let writer = std::thread::spawn({
+            let chunk = chunk.clone();
+            move || v1_writer(listener, chunk)
+        });
+        let client = Arc::new(PopulateClient::new(sock));
+        assert_eq!(client.hello(None, None).unwrap(), (true, true));
+        let got = client.request(ChunkHash::of(&chunk)).unwrap();
+        assert_eq!(got.as_ref(), chunk.as_slice());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_dead_socket_is_unreachable_within_the_dial_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(PopulateClient::new(dir.path().join("absent.sock")));
+        let started = std::time::Instant::now();
+        let err = client.request(ChunkHash::of(b"x")).unwrap_err();
+        assert!(matches!(err, PopulateError::WriterUnreachable(_)));
+        assert!(started.elapsed() < RECONNECT_BACKOFF * (RECONNECT_ATTEMPTS + 1));
     }
 }

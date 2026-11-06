@@ -39,7 +39,7 @@
 //!
 //! - [`ChunkedMemoryBackend`] — the data plane: carries the canonical
 //!   and session manifests, resolves an offset, and fetches chunks
-//!   via a [`ChunkCache`] over a [`ChunkStore`].
+//!   (local cache file, then the host-agent, then the object store).
 //! - [`ResolvedPage`] — what the resolver returns. Types-only so the
 //!   syscall path stays out of the unit-testable surface.
 //!
@@ -80,9 +80,8 @@ pub enum ResolvedPage {
     /// installs it (shared base-shm CONTINUE, else fetch + COPY).
     Canonical { canonical_offset: u64 },
     /// Page diverges from canonical. The named chunk is what to
-    /// fetch from the store + copy into the guest. The runtime
-    /// hands this hash to the [`ChunkCache`] (via
-    /// [`ChunkedMemoryBackend::fetch_chunk`]) for the bytes.
+    /// fetch and copy into the guest, via
+    /// [`ChunkedMemoryBackend::fetch_chunk`].
     Chunk { hash: ChunkHash },
     /// The session manifest omits this chunk-aligned offset. Because
     /// the session capture is full + zero-omitted (see `file.rs`'s
@@ -155,19 +154,14 @@ pub struct ChunkedMemoryBackend {
     canonical: PositionalManifest,
     session: PositionalManifest,
     session_positions: std::collections::HashMap<ChunkHash, Vec<u64>>,
-    /// ADR 0075: the READ-ONLY view of the shared cache dir. The
-    /// handler cannot mutate the directory by construction.
+    /// The read-only view of the shared cache dir (ADR 0075): the
+    /// handler cannot change the directory.
     reader: ChunkCacheReader,
-    /// ADR 0075: the populate channel to the one writer (the
-    /// host-agent). `None` = no writer configured (unit tests, and
-    /// the explicit fallback-only mode) — misses go straight to the
-    /// direct-blob fallback.
+    /// The channel to the one writer (the host-agent). `None` when no
+    /// writer answered at startup: misses go to the object store.
     populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
-    /// Blob store for the LAST-RESORT fallback fetch (writer
-    /// unreachable — e.g. a host-agent mid-roll; ADR 0044 K2 handlers
-    /// outlive rolls). Served from memory, never written to the cache
-    /// dir, counted via `engram_substrate_fallback_fetch_total`.
-    /// backend-agnostic — see the docstring on `ChunkCache`.
+    /// The object store, used only when the writer is unreachable.
+    /// Chunks from it stay in memory and never reach the cache dir.
     store: ChunkStore,
 }
 
@@ -393,12 +387,6 @@ impl ChunkedMemoryBackend {
             }
             None => store.get_manifest(session_ref).await?,
         };
-        // ADR 0075: the handler holds a READ-ONLY view of the shared
-        // cache_root — population happens in the one writer (the
-        // host-agent) via the substrate socket, so its global
-        // singleflight / pin set / budget govern this handler's
-        // traffic too. The #437/#522-era per-handler ChunkCache (and
-        // its eviction_enabled:false half-measure) is gone.
         let reader = ChunkCacheReader::new(cache_root);
         Self::new(&canonical, &session, reader, populate, store)
     }
@@ -466,51 +454,47 @@ impl ChunkedMemoryBackend {
         self.canonical.chunks.get(chunk_idx).copied().flatten()
     }
 
-    /// Bytes for a session-divergent chunk — the ADR 0075 3-step read
-    /// path: (1) resident on NVMe → serve (trust-on-read, unchanged);
-    /// (2) ask the one writer to populate and read back the fd —
-    /// cross-process misses collapse in the WRITER's singleflight;
-    /// (3) writer unreachable past its retry budget (host-agent
-    /// mid-roll) → direct blob fetch served from memory, never written
-    /// to the cache dir. Step 3 keeps the fault path independent of
-    /// the control plane (ADR 0044 K2) while preserving the
-    /// single-writer invariant.
-    pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
-        // 1. Fast path: resident.
-        if let Some(bytes) = self.reader.read(hash).map_err(ChunkedBackendError::Io)? {
-            crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Cache);
-            return Ok(Bytes::from(bytes));
+    /// The bytes of one chunk, from the first tier that has it:
+    ///
+    /// 1. The local cache file, mapped (no read into a buffer).
+    /// 2. The writer (the host-agent), which makes it available through
+    ///    the fill engine; misses from every handler collapse there.
+    /// 3. Only when the writer is unreachable (a host-agent roll, or a
+    ///    writer past the client's reply timeout): the object store
+    ///    directly, hash-verified, kept in memory and never written to
+    ///    the cache. Each fault thread waits on at most one such fetch,
+    ///    so the fault threads bound the fan-out.
+    ///
+    /// Synchronous: the fault and producer threads call it, never a
+    /// runtime worker. `rt` runs the object-store fetch of step 3.
+    pub fn fetch_chunk(
+        &self,
+        rt: &tokio::runtime::Handle,
+        hash: ChunkHash,
+    ) -> Result<Bytes, ChunkedBackendError> {
+        match std::fs::File::open(self.reader.path_for(hash)) {
+            Ok(file) => {
+                crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Cache);
+                return Ok(crate::mapped::chunk_file_bytes(&file)?);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-        // 2. Populate via the writer. Sync UDS I/O — hop off the
-        // runtime worker (the fault loop block_on's this future on the
-        // handler's small private runtime).
         if let Some(client) = &self.populate {
-            let client = client.clone();
-            let res = tokio::task::spawn_blocking(move || client.request(hash))
-                .await
-                .map_err(|e| {
-                    ChunkedBackendError::Io(std::io::Error::other(format!(
-                        "populate task join: {e}"
-                    )))
-                })?;
-            match res {
+            match client.request(hash) {
                 Ok(bytes) => {
                     crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Populate);
-                    return Ok(Bytes::from(bytes));
+                    return Ok(bytes);
                 }
                 Err(crate::populate_client::PopulateError::WriterUnreachable(msg)) => {
-                    // The handler exports no Prometheus metrics (it is a
-                    // per-VM leaf process; its telemetry rides logs + the
-                    // stats-file pattern). This WARN is the alarm signal —
-                    // sustained occurrences mean the writer is unreachable
-                    // — and the writer-side populate counter going quiet
-                    // corroborates. (ADR 0075 divergence note.)
+                    // The handler exports no metrics; this WARN is the
+                    // signal, and the writer's populate counter going
+                    // quiet confirms it.
                     tracing::warn!(
                         %hash,
                         %msg,
-                        "substrate writer unreachable; direct-blob fallback (uncached)",
+                        "substrate writer unreachable; direct object-store fetch (uncached)",
                     );
-                    // fall through to 3
                 }
                 Err(e) => {
                     return Err(ChunkedBackendError::Io(std::io::Error::other(format!(
@@ -519,9 +503,8 @@ impl ChunkedMemoryBackend {
                 }
             }
         }
-        // 3. Last resort — memory-only, never written to the cache dir.
         crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Fallback);
-        self.store.get_chunk(hash).await.map_err(Into::into)
+        rt.block_on(self.store.get_chunk(hash)).map_err(Into::into)
     }
 
     /// Chunk counts by how a fault would resolve them: canonical,
@@ -793,7 +776,11 @@ mod tests {
         )
         .unwrap();
 
-        let got = b.fetch_chunk(hash).await.expect("fallback fetch");
+        let rt = tokio::runtime::Handle::current();
+        let got = tokio::task::spawn_blocking(move || b.fetch_chunk(&rt, hash))
+            .await
+            .unwrap()
+            .expect("fallback fetch");
         assert_eq!(got, bytes, "fallback must serve correct bytes");
 
         // The single-writer invariant in degraded mode: nothing landed

@@ -766,7 +766,7 @@ impl Runtime {
                         let did = if shared {
                             self.install_canonical_shared(base, byte_offset, *hash, false)?
                         } else {
-                            let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
+                            let bytes = self.backend.fetch_chunk(&self.handle, *hash)?;
                             self.install_chunk_at(byte_offset, bytes, false)?
                         };
                         if did {
@@ -775,7 +775,7 @@ impl Runtime {
                     }
                     continue;
                 }
-                let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
+                let bytes = self.backend.fetch_chunk(&self.handle, *hash)?;
                 for byte_offset in positions {
                     if self.install_chunk_at(byte_offset, bytes.clone(), false)? {
                         installed += 1;
@@ -882,7 +882,7 @@ impl Runtime {
                 }
                 let did = match (pass, self.backend.resolve(offset)) {
                     ("divergent", Some(ResolvedPage::Chunk { hash })) => {
-                        let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                         self.install_chunk_at(offset, bytes, false)?
                     }
                     ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
@@ -892,8 +892,7 @@ impl Runtime {
                                     self.install_canonical_shared(base, offset, hash, false)?
                                 }
                                 None => {
-                                    let bytes =
-                                        self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                    let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                                     self.install_chunk_at(offset, bytes, false)?
                                 }
                             },
@@ -1282,7 +1281,7 @@ impl Runtime {
         // Ensure the base shm holds this chunk's bytes (file-offset keyed
         // — independent of the region layout) before we map them.
         if !base.is_populated(byte_offset, populate_len) {
-            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
             base.write_chunk(byte_offset, &bytes)
                 .map_err(HandlerError::BaseShm)?;
         }
@@ -1496,7 +1495,7 @@ impl Runtime {
                         )))
                     }
                 };
-                hash.map(|hash| handle.block_on(backend.fetch_chunk(hash)))
+                hash.map(|hash| backend.fetch_chunk(handle, hash))
                     .transpose()?
             }
         })
@@ -1646,7 +1645,7 @@ impl Runtime {
                                 self.install_canonical_shared(base, chunk_byte_offset, hash, true)?
                             }
                             None => {
-                                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                                 self.install_chunk_at(chunk_byte_offset, bytes, true)?
                             }
                         };
@@ -1685,7 +1684,7 @@ impl Runtime {
                         r.observe(hash);
                     }
                 }
-                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                 let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
                 if !installed {
                     self.wake_page(page_aligned, page_size)?;
@@ -2133,14 +2132,13 @@ impl Runtime {
                     // written with session-addressed content here).
                     match self.backend.resolve(offset) {
                         Some(ResolvedPage::Chunk { hash }) => {
-                            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                             self.install_chunk_at(offset, bytes, false)?;
                         }
                         Some(ResolvedPage::Canonical { canonical_offset }) => {
                             match self.backend.canonical_chunk_hash(canonical_offset) {
                                 Some(hash) => {
-                                    let bytes =
-                                        self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                    let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                                     self.install_chunk_at(offset, bytes, false)?;
                                 }
                                 None => {
@@ -4187,7 +4185,7 @@ mod tests {
                 } else {
                     write_frame(&mut socket, &FromWriter::Populated { len: 4096 }).unwrap();
                     let file = std::fs::File::open(file_path).unwrap();
-                    engram_substrate_proto::send_fd(&socket, file.as_fd()).unwrap();
+                    engram_substrate_proto::send_fd(socket.as_fd(), file.as_fd()).unwrap();
                 }
             });
             Arc::get_mut(&mut rt).unwrap().backend = Arc::new(
