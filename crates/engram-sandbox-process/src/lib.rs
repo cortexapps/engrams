@@ -886,6 +886,7 @@ impl SandboxBackend for ProcessBackend {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
             aux_bundles: vec![],
             // Issue #529: no real pause instant when run unwrapped by
             // `PooledBackend` (which stamps it from its own capture_phase);
@@ -2722,6 +2723,7 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
+            working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
             peer_hints: Vec::new(),

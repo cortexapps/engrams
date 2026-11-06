@@ -66,6 +66,11 @@ pub struct SnapshotMetadata {
     /// represented via `disk_manifest` (chunked path) instead.
     #[serde(default)]
     pub rootfs_blob_key: Option<String>,
+    /// Unused: nothing sets or reads it. It stays because this struct is
+    /// bincode on the host wire, where fields are positional, so removing
+    /// it would need a wire version change.
+    #[serde(default)]
+    pub working_set_blob_key: Option<String>,
     /// ADR 0035: bundle generations this snapshot's device model
     /// references (resolved `aux_ro_drives`), filled by the host at
     /// snapshot time — base captures AND eviction snapshots, since a

@@ -266,6 +266,7 @@ pub(crate) async fn boot_on_reserved_host(
         rootfs_blob_key: None,
         // The canonical working-set trace is never produced, so the host
         // always falls back to full-manifest memory-chunk prefetch.
+        working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
         // Issue #529: restore-side reconstruction, not a fresh capture.
         paused_at: None,

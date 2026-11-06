@@ -137,6 +137,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
                 state_blob_key: None,
                 sidecar_blob_key: None,
                 rootfs_blob_key: None,
+                working_set_blob_key: None,
                 aux_bundles: Vec::new(),
                 paused_at: None,
                 peer_hints: Vec::new(),

@@ -71,6 +71,7 @@ pub fn metadata(
     row.state_blob_key = None;
     row.sidecar_blob_key = None;
     row.rootfs_blob_key = None;
+    row.working_set_blob_key = None;
     row.paused_at = None;
     row.peer_hints.clear();
     row.migration_source = Some(MigrationSourceInfo {

@@ -208,6 +208,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
         state_blob_key: Some("snapshots/x/state.bin".into()),
         sidecar_blob_key: None,
         rootfs_blob_key: None,
+        working_set_blob_key: None,
         aux_bundles: vec![AuxBundleRef {
             drive_id: "skills".into(),
             sha256: "b".repeat(64),

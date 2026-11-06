@@ -1812,6 +1812,7 @@ async fn resume_from_fc_snapshot(
         state_blob_key: portable_state_key,
         sidecar_blob_key: portable_sidecar_key,
         rootfs_blob_key: None,
+        working_set_blob_key: None,
         // ADR 0035: resume keeps the pinned generations (no swap); the
         // host materializes any the receiving host is missing.
         aux_bundles: record.aux_bundles.clone(),
