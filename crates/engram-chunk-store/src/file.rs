@@ -161,7 +161,9 @@ impl ChunkStore {
             rechunk_channel_capacity(chunk_size),
         );
         let std_file = file.into_std().await;
-        tokio::task::spawn_blocking(move || {
+        // The channel closes when the reader ends or panics; only its
+        // join result tells the two apart.
+        let reader = tokio::task::spawn_blocking(move || {
             read_nonzero_chunks(std_file, total_bytes, chunk_size, &tx)
         });
 
@@ -256,6 +258,9 @@ impl ChunkStore {
                 }
             }
         }
+        reader
+            .await
+            .map_err(|e| crate::error::ChunkStoreError::Internal(format!("file scan task: {e}")))?;
         if let Some(report) = progress {
             report(windows_total, windows_total);
         }
