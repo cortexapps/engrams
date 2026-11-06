@@ -68,4 +68,4 @@ pub use manifest::{
 };
 pub use resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
 pub use store::ChunkStore;
-pub use working_set::{TraceRef, WorkingSetTrace};
+pub use working_set::{FirstTouch, TraceRef, WorkingSetTrace};

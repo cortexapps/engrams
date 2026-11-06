@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use engram_chunk_store::working_set::WorkingSetTrace;
+use engram_chunk_store::FirstTouch;
 use sendfd::RecvWithFd;
 use tokio::runtime::Handle as TokioHandle;
 use userfaultfd::{Event, Uffd};
@@ -146,6 +147,17 @@ pub struct PrefaultStats {
 /// [`crate::runtime`]'s per-jail `working-set-trace.json`
 /// (`WORKING_SET_TRACE_FILE` in `engram-sandbox-firecracker`).
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
+
+/// Write `bytes` to `path` through a temp file and a rename, so a reader
+/// never sees a partial file. Best-effort: a failure is logged.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+        tracing::warn!(error = %e, path = %path.display(), "write");
+    }
+}
 
 /// Where `PrefaultStats` lands for a jail whose per-jail trace file is
 /// `trace_output` — the sibling `<jail_dir>/prefault-stats.json`.
@@ -492,6 +504,8 @@ pub struct Runtime {
     /// A failed install rolls the chunk back to `Empty` so it is retried
     /// rather than permanently poisoned (issue #206).
     installed: Mutex<Vec<ChunkState>>,
+    /// The chunks faulted first, by position, for the next restore's prefix.
+    first_touch: crate::first_touch::FirstTouchRecorder,
     /// Notified whenever a chunk leaves `Installing` (→ `Installed` on
     /// success, → `Empty` on rollback). A fault that found the chunk
     /// `Installing` waits on this until the in-flight install settles.
@@ -606,6 +620,7 @@ impl Runtime {
             handle,
             recorder,
             installed: Mutex::new(vec![ChunkState::Empty; chunk_count]),
+            first_touch: crate::first_touch::FirstTouchRecorder::new(chunk_count),
             install_cv: Condvar::new(),
             page_size,
             trace_output: None,
@@ -696,19 +711,14 @@ impl Runtime {
         trace.chunks = r.chunks_snapshot();
         drop(r);
         match serde_json::to_vec(&trace) {
-            Ok(bytes) => {
-                let tmp = path.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &bytes) {
-                    tracing::warn!(error = %e, path = %tmp.display(), "trace_output tmp write");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, path) {
-                    tracing::warn!(error = %e, path = %path.display(), "trace_output rename");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "trace_output serialize");
-            }
+            Ok(bytes) => write_atomic(path, &bytes),
+            Err(e) => tracing::warn!(error = %e, "trace_output serialize"),
+        }
+        if let Some(dir) = path.parent() {
+            write_atomic(
+                &dir.join(FirstTouch::FILE),
+                &self.first_touch.snapshot().encode(),
+            );
         }
     }
 
@@ -1377,7 +1387,30 @@ impl Runtime {
     /// Run forever, draining events from the UFFD and serving each
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
+    ///
+    /// [`crate::fault_threads`] threads read the userfaultfd. The kernel
+    /// gives each fault message to exactly one reader, and the claim table
+    /// makes two installs of one chunk safe: one thread installs, the
+    /// others wait for it and wake. The first thread to end (end of file
+    /// or an error) ends the handler; the others end with the process.
     pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
+        let threads = crate::fault_threads();
+        let (done, ended) = std::sync::mpsc::channel();
+        for i in 0..threads {
+            let rt = Arc::clone(self);
+            let done = done.clone();
+            std::thread::Builder::new()
+                .name(format!("engram-uffd-fault-{i}"))
+                .spawn(move || {
+                    let _ = done.send(rt.serve_faults());
+                })?;
+        }
+        drop(done);
+        tracing::info!(threads, "serving faults");
+        ended.recv().unwrap_or(Ok(()))
+    }
+
+    fn serve_faults(self: &Arc<Self>) -> Result<(), HandlerError> {
         loop {
             match self.uffd.read_event() {
                 Ok(Some(Event::Pagefault { addr, .. })) => {
@@ -1521,6 +1554,8 @@ impl Runtime {
         // lands consistently across faults in the same chunk.
         let chunk_size = self.backend.chunk_size();
         let chunk_byte_offset = byte_offset - (byte_offset % chunk_size);
+        self.first_touch
+            .touch((chunk_byte_offset / chunk_size) as usize);
 
         // ADR 0045 C2: sealed chunks are peer-authoritative — their truth
         // lives only in the paused source's address space, so they MUST
@@ -3733,6 +3768,45 @@ mod tests {
     // install-state machine directly so they run unconditionally in CI
     // (no privileged userfaultfd required); the end-to-end retry through
     // a real UFFD is covered by `fetch_failure_rolls_back_then_retries`.
+
+    /// Several fault threads serving faults on the same chunks: each chunk
+    /// is installed by exactly one of them, and the rest only wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fault_threads_on_overlapping_faults_install_each_chunk_once() {
+        let n_chunks = 8usize;
+        let chunk_size = 4 * 4096u64;
+        let Some(rt) = test_runtime_with_chunk_size(n_chunks, chunk_size) else {
+            return;
+        };
+        let base = rt.mappings()[0].base_host_virt_addr;
+        let pages = n_chunks as u64 * chunk_size / 4096;
+        let threads: Vec<_> = (0..4u64)
+            .map(|t| {
+                let rt = Arc::clone(&rt);
+                std::thread::spawn(move || {
+                    (0..pages)
+                        .map(|p| {
+                            // Each thread walks the pages from its own start.
+                            let page = (p + t * 3) % pages;
+                            let source = rt
+                                .serve_pagefault_classified(base + page * 4096)
+                                .expect("serve fault");
+                            ((page * 4096 / chunk_size) as usize, source)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut installs = vec![0usize; n_chunks];
+        for t in threads {
+            for (idx, source) in t.join().unwrap() {
+                if source != Source::Wake {
+                    installs[idx] += 1;
+                }
+            }
+        }
+        assert_eq!(installs, vec![1; n_chunks]);
+    }
 
     /// Build a small runtime with a real anonymous UFFD mapping, for
     /// install-state tests and demand-window tests. Returns None when

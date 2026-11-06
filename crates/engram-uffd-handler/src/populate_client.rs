@@ -54,12 +54,14 @@ impl std::fmt::Display for PopulateError {
 
 impl std::error::Error for PopulateError {}
 
-/// Synchronous populate client. One connection, lazily (re)dialed
-/// under a mutex — the fault loop serializes chunk misses per handler
-/// anyway (the writer's singleflight collapses cross-handler dupes).
+/// Synchronous populate client, safe to call from every fault thread at
+/// once (the writer's singleflight collapses duplicate chunks).
 pub struct PopulateClient {
     sock_path: PathBuf,
-    conn: Mutex<Option<UnixStream>>,
+    /// Connections not in use. A request takes one or dials a new one,
+    /// so concurrent fault threads each get their own exchange; the
+    /// writer serves every connection on its own thread.
+    idle: Mutex<Vec<UnixStream>>,
     /// The manifest refs from the startup `hello`, replayed on every
     /// fresh dial: the server-side session-chunk PIN SET (and the
     /// proto-version check) live for the CONNECTION, and the designed-
@@ -82,7 +84,7 @@ impl PopulateClient {
     pub fn new(sock_path: PathBuf) -> Self {
         Self {
             sock_path,
-            conn: Mutex::new(None),
+            idle: Mutex::new(Vec::new()),
             hello_manifests: Mutex::new(None),
             last_hello_ack: Mutex::new(None),
         }
@@ -142,7 +144,7 @@ impl PopulateClient {
             Some((canonical_manifest, session_manifest));
         // Force a fresh dial: with_conn runs the Hello exchange on
         // every new connection (the replay path) and caches the ack.
-        *self.conn.lock().expect("populate conn lock") = None;
+        self.idle.lock().expect("populate idle lock").clear();
         self.with_conn(|_| Ok(()))?;
         self.last_hello_ack
             .lock()
@@ -204,49 +206,27 @@ impl PopulateClient {
         &self,
         mut f: impl FnMut(&mut UnixStream) -> std::io::Result<T>,
     ) -> Result<T, PopulateError> {
-        let mut guard = self.conn.lock().expect("populate conn lock");
         let mut last_err = None;
+        let mut idle = self.idle.lock().expect("populate idle lock").pop();
         for attempt in 0..RECONNECT_ATTEMPTS {
-            if guard.is_none() {
-                match self.dial() {
-                    Ok(mut s) => {
-                        // Replay `Hello` on EVERY fresh connection: the
-                        // server's session-chunk pin set (and its proto
-                        // check) are per-connection state, and the
-                        // designed-for reconnect — a rolled host-agent's
-                        // successor, holding a brand-new empty pin set —
-                        // is exactly when silently skipping it would
-                        // leave this handler unpinned for the rest of
-                        // the sandbox's life.
-                        let manifests = *self.hello_manifests.lock().expect("hello_manifests lock");
-                        if let Some((c, sm)) = manifests {
-                            match Self::hello_on(&mut s, c, sm) {
-                                Ok(ack) => {
-                                    *self.last_hello_ack.lock().expect("last_hello_ack lock") =
-                                        Some(ack);
-                                }
-                                Err(e) => {
-                                    last_err = Some(e);
-                                    std::thread::sleep(RECONNECT_BACKOFF);
-                                    continue;
-                                }
-                            }
-                        }
-                        *guard = Some(s);
-                    }
+            let mut stream = match idle.take() {
+                Some(s) => s,
+                None => match self.dial_with_hello() {
+                    Ok(s) => s,
                     Err(e) => {
                         last_err = Some(e);
                         std::thread::sleep(RECONNECT_BACKOFF);
                         continue;
                     }
+                },
+            };
+            match f(&mut stream) {
+                Ok(v) => {
+                    self.idle.lock().expect("populate idle lock").push(stream);
+                    return Ok(v);
                 }
-            }
-            let stream = guard.as_mut().expect("conn present");
-            match f(stream) {
-                Ok(v) => return Ok(v),
                 Err(e) => {
                     tracing::debug!(attempt, error = %e, "populate exchange failed; redialing");
-                    *guard = None;
                     last_err = Some(e);
                     std::thread::sleep(RECONNECT_BACKOFF);
                 }
@@ -257,5 +237,18 @@ impl PopulateClient {
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no attempts".into()),
         ))
+    }
+
+    /// A new connection with `Hello` replayed. The server's session-chunk
+    /// pin set and its protocol check are per connection, and a rolled
+    /// host-agent's successor starts with none, so every dial repeats it.
+    fn dial_with_hello(&self) -> std::io::Result<UnixStream> {
+        let mut s = self.dial()?;
+        let manifests = *self.hello_manifests.lock().expect("hello_manifests lock");
+        if let Some((c, sm)) = manifests {
+            let ack = Self::hello_on(&mut s, c, sm)?;
+            *self.last_hello_ack.lock().expect("last_hello_ack lock") = Some(ack);
+        }
+        Ok(s)
     }
 }
