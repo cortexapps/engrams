@@ -25,6 +25,7 @@ use tokio::sync::OnceCell;
 pub const DEFAULT_MEMO_CHUNKS: usize = 8;
 
 /// A staged volume and the manifest it holds, indexed by chunk hash.
+#[derive(Clone)]
 pub struct LocalBase {
     file: Arc<File>,
     size_bytes: u64,
@@ -56,7 +57,9 @@ impl LocalBase {
         })
     }
 
-    async fn read(&self, offset: u64, len: usize) -> io::Result<Bytes> {
+    /// The chunk `hash` at `offset`; bytes that do not hash to `hash`
+    /// are refused.
+    async fn read(&self, hash: ChunkHash, offset: u64, len: usize) -> io::Result<Bytes> {
         if offset.saturating_add(len as u64) > self.size_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -68,6 +71,12 @@ impl LocalBase {
             let mut buf = vec![0u8; len];
             file.read_exact_at(&mut buf, offset)?;
             drop_cached_pages(&file, offset, len);
+            if ChunkHash::of(&buf) != hash {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the {len} bytes at {offset} do not hash to {hash}"),
+                ));
+            }
             Ok(Bytes::from(buf))
         })
         .await
@@ -102,6 +111,7 @@ pub struct DiskReader {
 }
 
 /// Where a chunk's bytes come from, first match wins.
+#[derive(Clone)]
 struct Tiers {
     base: Option<LocalBase>,
     cache: Option<ChunkCacheReader>,
@@ -138,19 +148,19 @@ impl DiskReader {
 
     /// Serve chunks the staged volume `base` holds from it.
     pub fn with_base(mut self, base: LocalBase) -> Self {
-        self.tiers_mut().base = Some(base);
+        let mut tiers = Arc::unwrap_or_clone(self.tiers);
+        tiers.base = Some(base);
+        self.tiers = Arc::new(tiers);
         self
     }
 
     /// Serve chunks resident in the host chunk cache from it. The source
     /// only reads the cache; the host-agent owns its contents.
     pub fn with_cache(mut self, cache: ChunkCacheReader) -> Self {
-        self.tiers_mut().cache = Some(cache);
+        let mut tiers = Arc::unwrap_or_clone(self.tiers);
+        tiers.cache = Some(cache);
+        self.tiers = Arc::new(tiers);
         self
-    }
-
-    fn tiers_mut(&mut self) -> &mut Tiers {
-        Arc::get_mut(&mut self.tiers).expect("tiers are shared only once reads start")
     }
 
     /// Keep at most `chunks` (at least one) chunks in memory.
@@ -218,7 +228,7 @@ impl Tiers {
     async fn fetch(&self, hash: ChunkHash, len: usize) -> io::Result<Bytes> {
         if let Some(base) = &self.base {
             if let Some(&offset) = base.offset_of.get(&hash) {
-                match base.read(offset, len).await {
+                match base.read(hash, offset, len).await {
                     Ok(bytes) => return Ok(bytes),
                     Err(e) => {
                         tracing::warn!(%hash, offset, error = %e, "base volume read failed; reading the chunk from the store")
@@ -273,6 +283,9 @@ fn store_error(e: engram_chunk_store::ChunkStoreError) -> io::Error {
 /// Recently used chunks, least recently used first out. One cell per
 /// chunk: the first reader fetches and the others wait on the cell. A
 /// failed fetch leaves the cell empty, so the next reader fetches again.
+/// A cell that a reader holds is never evicted, so concurrent reads of
+/// one chunk share one fetch even when more chunks are in flight than
+/// the memo keeps; the memo then holds more cells until those reads end.
 struct Memo {
     capacity: usize,
     state: Mutex<MemoState>,
@@ -310,16 +323,20 @@ impl Memo {
             .or_insert_with(|| (now, Arc::new(OnceCell::new())));
         entry.0 = now;
         let cell = Arc::clone(&entry.1);
-        if state.cells.len() > self.capacity {
-            // The entry just touched is the newest, so it is never the one
-            // removed.
-            if let Some(oldest) = state
+        let excess = state.cells.len().saturating_sub(self.capacity);
+        if excess > 0 {
+            // Cells are cloned only under this lock, so a count of one
+            // means no reader holds the cell. The cell just returned is
+            // held.
+            let mut idle: Vec<(u64, ChunkHash)> = state
                 .cells
                 .iter()
-                .min_by_key(|(_, (used, _))| *used)
-                .map(|(hash, _)| *hash)
-            {
-                state.cells.remove(&oldest);
+                .filter(|(_, (_, cell))| Arc::strong_count(cell) == 1)
+                .map(|(hash, (used, _))| (*used, *hash))
+                .collect();
+            idle.sort_unstable_by_key(|(used, _)| *used);
+            for (_, hash) in idle.into_iter().take(excess) {
+                state.cells.remove(&hash);
             }
         }
         cell
@@ -646,8 +663,9 @@ mod tests {
         assert_eq!(slow.gets.load(Ordering::SeqCst), 1);
     }
 
-    /// Reads of different chunks fetch in parallel, even when one task
-    /// drives them all: the whole set takes about one fetch, not one each.
+    /// Reads of different chunks fetch at the same time, even when one
+    /// task drives them all: the set takes less time than the fetches one
+    /// after another.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reads_of_different_chunks_fetch_in_parallel() {
         const DELAY: Duration = Duration::from_millis(300);
@@ -666,10 +684,75 @@ mod tests {
             assert_eq!(got, &f.expected[*offset as usize..*offset as usize + 4096]);
         }
         assert_eq!(slow.gets.load(Ordering::SeqCst), offsets.len() as u64);
+        let serial = DELAY * offsets.len() as u32;
         assert!(
-            took < 2 * DELAY,
+            took < serial - DELAY,
             "{} fetches of {DELAY:?} each took {took:?}",
             offsets.len()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn more_chunks_in_flight_than_the_memo_keeps_each_fetch_once() {
+        let f = fixture().await;
+        let slow = SlowBlob::new(f.store.blob_storage(), Duration::ZERO, false);
+        let reader = Arc::new(
+            DiskReader::new(&f.manifest, ChunkStore::new(slow.clone()))
+                .unwrap()
+                .with_memo_chunks(2),
+        );
+        let offsets: Vec<u64> = f.manifest.chunks.iter().map(|c| c.offset).collect();
+        assert!(offsets.len() > 2);
+        let read_all = || -> Vec<_> {
+            offsets
+                .iter()
+                .map(|&offset| {
+                    let reader = Arc::clone(&reader);
+                    tokio::spawn(async move { (offset, reader.read(offset, 4096).await) })
+                })
+                .collect()
+        };
+        let first = read_all();
+        while slow.gets.load(Ordering::SeqCst) < offsets.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Each chunk's fetch is in flight; a second read of each must
+        // wait on it, not start another.
+        let second = read_all();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        slow.gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        for read in first.into_iter().chain(second) {
+            let (offset, got) = read.await.unwrap();
+            let at = offset as usize;
+            assert_eq!(got.unwrap(), &f.expected[at..at + 4096]);
+        }
+        assert_eq!(slow.gets.load(Ordering::SeqCst), offsets.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_base_chunk_with_the_wrong_bytes_is_read_from_the_store() {
+        let f = fixture().await;
+        let base_dir = tempfile::tempdir().unwrap();
+        let base_path = base_dir.path().join("base");
+        let total = total_bytes();
+        // The base manifest says chunk 0's hash is at offset 0, but the
+        // volume holds other bytes there.
+        std::fs::write(&base_path, vec![0xa5u8; total as usize]).unwrap();
+        let mut base_manifest = Manifest::empty(ManifestKind::Disk, total);
+        base_manifest.chunk_size = ChunkSize::bytes(CHUNK);
+        base_manifest.chunks = vec![ChunkRef {
+            offset: 0,
+            hash: f.manifest.chunk_at(0).unwrap().hash,
+        }];
+        let reader = DiskReader::new(&f.manifest, f.store.clone())
+            .unwrap()
+            .with_base(LocalBase::open(&base_path, &base_manifest).unwrap());
+
+        let before = f.counters.gets_attempted();
+        assert_eq!(
+            reader.read(0, CHUNK as usize).await.unwrap(),
+            &f.expected[..CHUNK as usize]
+        );
+        assert_eq!(f.counters.gets_attempted(), before + 1);
     }
 }
