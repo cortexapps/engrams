@@ -3,15 +3,17 @@
 //!
 //! Binds `<work_dir>/substrate.sock` and serves the per-VM uffd
 //! handlers, one tokio task per connection. `Hello` answers readiness
-//! from live probes and pins the session manifest's chunks for the
-//! connection's lifetime. `Populate` gets the chunk from the fill engine
+//! from live probes and pins the session manifest's chunks while any
+//! connection names that manifest. `Populate` gets the chunk from the fill engine
 //! at [`Class::Demand`] and delivers the bytes it got: protocol version
 //! 2 copies them into the connection's shared-memory slot; version 1
 //! passes an fd (see `engram-substrate-proto`).
 
+use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -19,6 +21,7 @@ use engram_chunk_store::{ChunkCache, ChunkHash};
 use engram_core::types::manifest::ManifestRef;
 use engram_fill::{Class, FillEngine};
 use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION, PROTO_VERSION_V1, SLOT_BYTES};
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -30,6 +33,10 @@ pub struct SubstrateServer {
     /// The uffd base-shm dir; `HelloAck.tmpfs_ok` is a live statfs of
     /// this path.
     uffd_base_dir: PathBuf,
+    /// The pinned chunk set of each session manifest that a live
+    /// connection names. All connections for one manifest share one
+    /// entry, so the manifest is read and pinned once, not per dial.
+    pins: Arc<Mutex<HashMap<ManifestRef, Weak<SessionPins>>>>,
 }
 
 /// Per-connection state.
@@ -38,20 +45,21 @@ struct Conn {
     slot: Option<std::fs::File>,
     /// The engine, scoped to the session manifest's hinted peer.
     fill: FillEngine,
-    pins: ConnPins,
+    pins: Option<Arc<SessionPins>>,
 }
 
-/// Session chunks pinned for one connection; unpinned on drop, so an
-/// ended or cancelled connection never leaks a pin.
-struct ConnPins {
+/// A session manifest's chunks, pinned while a connection holds this
+/// entry and unpinned when the last one drops it, so an ended or
+/// cancelled connection never leaks a pin.
+struct SessionPins {
     cache: ChunkCache,
-    hashes: Vec<ChunkHash>,
+    hashes: tokio::sync::OnceCell<Vec<ChunkHash>>,
 }
 
-impl Drop for ConnPins {
+impl Drop for SessionPins {
     fn drop(&mut self) {
-        for h in self.hashes.drain(..) {
-            self.cache.unpin(h);
+        if let Some(hashes) = self.hashes.get() {
+            self.cache.unpin_all(hashes.iter().copied());
         }
     }
 }
@@ -62,6 +70,7 @@ impl SubstrateServer {
             cache,
             fill,
             uffd_base_dir,
+            pins: Arc::default(),
         }
     }
 
@@ -96,10 +105,7 @@ impl SubstrateServer {
         let mut conn = Conn {
             slot: None,
             fill: self.fill.clone(),
-            pins: ConnPins {
-                cache: self.cache.clone(),
-                hashes: Vec::new(),
-            },
+            pins: None,
         };
         if let Err(e) = self.serve_frames(&mut stream, &mut conn).await {
             tracing::debug!(error = %e, "substrate connection ended");
@@ -137,8 +143,8 @@ impl SubstrateServer {
                     };
                     if let Some(mref) = session_manifest {
                         conn.fill = self.fill.for_manifest(mref.manifest_id);
-                        if conn.pins.hashes.is_empty() {
-                            self.pin_session_chunks(mref, &mut conn.pins).await;
+                        if conn.pins.is_none() {
+                            conn.pins = Some(self.pin_session_chunks(mref).await);
                         }
                     }
                     write_frame(stream, &self.hello_ack().await?).await?;
@@ -157,25 +163,45 @@ impl SubstrateServer {
     }
 
     /// Pin the session manifest's chunks so the evictor never removes
-    /// them while the handler can fault them. A manifest the store
-    /// cannot resolve (a migration destination's unpublished manifest)
-    /// pins nothing; its chunks are resident or come from the peer.
-    async fn pin_session_chunks(&self, mref: ManifestRef, pins: &mut ConnPins) {
-        match self.fill.store().get_manifest(mref).await {
-            Ok(manifest) => {
-                for chunk in &manifest.chunks {
-                    self.cache.pin(chunk.hash);
-                    pins.hashes.push(chunk.hash);
+    /// them while the handler can fault them. The first connection for
+    /// a manifest reads it and pins; the others wait for that read and
+    /// share its pins. A manifest the store cannot resolve (a migration
+    /// destination's unpublished manifest) pins nothing, and the next
+    /// connection reads it again; its chunks are resident or come from
+    /// the peer.
+    async fn pin_session_chunks(&self, mref: ManifestRef) -> Arc<SessionPins> {
+        let pins = {
+            let mut map = self.pins.lock();
+            match map.get(&mref).and_then(Weak::upgrade) {
+                Some(pins) => pins,
+                None => {
+                    map.retain(|_, pins| pins.strong_count() > 0);
+                    let pins = Arc::new(SessionPins {
+                        cache: self.cache.clone(),
+                        hashes: tokio::sync::OnceCell::new(),
+                    });
+                    map.insert(mref, Arc::downgrade(&pins));
+                    pins
                 }
+            }
+        };
+        let pinned = pins
+            .hashes
+            .get_or_try_init(|| async {
+                let manifest = self.fill.store().get_manifest(mref).await?;
+                let hashes: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
+                self.cache.pin_all(hashes.iter().copied());
                 tracing::debug!(
-                    pinned = pins.hashes.len(),
-                    "substrate: pinned session chunk set for connection lifetime",
+                    pinned = hashes.len(),
+                    "substrate: pinned session chunk set while a connection names it",
                 );
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "session manifest unavailable; no pins");
-            }
+                Ok::<_, engram_chunk_store::ChunkStoreError>(hashes)
+            })
+            .await;
+        if let Err(e) = pinned {
+            tracing::debug!(error = %e, "session manifest unavailable; no pins");
         }
+        pins
     }
 
     async fn hello_ack(&self) -> std::io::Result<FromWriter> {
@@ -549,6 +575,80 @@ mod tests {
         let mut got = Vec::new();
         (&anon).read_to_end(&mut got).unwrap();
         assert_eq!(got, bytes.as_ref());
+    }
+
+    /// Connections that name one session manifest read it once and share
+    /// one pin per chunk; the pins go when the last connection closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connections_for_one_manifest_read_and_pin_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, blob, _hash, _) = server_fixture(dir.path()).await;
+        let store = server.fill.store().clone();
+        let src = dir.path().join("mem.bin");
+        // Four distinct chunks.
+        let body: Vec<u8> = (0..4 * 4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        std::fs::write(&src, body).unwrap();
+        let manifest = store
+            .chunk_file(
+                &src,
+                engram_chunk_store::manifest::ManifestKind::Memory,
+                Some(4096),
+            )
+            .await
+            .unwrap();
+        let mref = ManifestRef::new();
+        store.put_manifest(mref, &manifest).await.unwrap();
+        blob.gets.store(0, Ordering::SeqCst);
+        let cache = server.cache.clone();
+        let sock = dir.path().join("substrate.sock");
+        let _accept = server.spawn(sock.clone()).unwrap();
+
+        let streams = tokio::task::spawn_blocking(move || {
+            (0..3)
+                .map(|_| {
+                    let mut stream = StdUnixStream::connect(&sock).expect("connect");
+                    engram_substrate_proto::write_frame(
+                        &mut stream,
+                        &ToWriter::Hello {
+                            proto_version: PROTO_VERSION_V1,
+                            canonical_manifest: None,
+                            session_manifest: Some(mref),
+                        },
+                    )
+                    .unwrap();
+                    let ack: FromWriter = engram_substrate_proto::read_frame(&mut stream).unwrap();
+                    assert!(matches!(ack, FromWriter::HelloAck { .. }));
+                    stream
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blob.gets.load(Ordering::SeqCst), 1, "one manifest read");
+        let chunks: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
+        assert!(chunks.iter().all(|h| cache.is_pinned(*h)));
+        for h in &chunks {
+            cache.unpin(*h);
+        }
+        assert!(
+            chunks.iter().all(|h| !cache.is_pinned(*h)),
+            "each chunk holds one pin, not one per connection"
+        );
+        for h in &chunks {
+            cache.pin(*h);
+        }
+
+        drop(streams);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while chunks.iter().any(|h| cache.is_pinned(*h)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pins outlive the connections"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

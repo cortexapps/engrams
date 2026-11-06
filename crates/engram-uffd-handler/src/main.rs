@@ -499,7 +499,11 @@ mod linux {
                     engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
                 );
                 let hello = tracing::info_span!("uffd.substrate_hello").in_scope(|| {
-                    client.hello(Some(args.canonical_manifest), Some(args.session_manifest))
+                    client.hello(
+                        Some(args.canonical_manifest),
+                        Some(args.session_manifest),
+                        engram_uffd_handler::fault_threads(),
+                    )
                 });
                 match hello {
                     Ok((tmpfs_ok, cache_writable)) => {

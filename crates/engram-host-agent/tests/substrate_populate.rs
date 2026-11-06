@@ -53,7 +53,7 @@ async fn real_client_gets_chunks_through_the_slot() {
 
     let client = Arc::new(PopulateClient::new(sock));
     let (_tmpfs_ok, cache_writable) = tokio::task::spawn_blocking(move || {
-        let probes = client.hello(None, None).expect("hello");
+        let probes = client.hello(None, None, 2).expect("hello");
         let held = client.request(first_hash).expect("populate first");
         let other = client.request(second_hash).expect("populate second");
         assert_eq!(held, first, "slot bytes must match the chunk");
