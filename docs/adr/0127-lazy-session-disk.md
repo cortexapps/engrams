@@ -171,6 +171,19 @@ network rates, and the estimate counts the bytes of both streams.
    source is a ublk device. The guest's drive is the dm-clone device,
    made under `/dev/engram/` as ADR 0125 makes every drive. The guest
    boots as soon as the table is loaded.
+
+   Hydration copies only what the destination lacks. dm-clone copies
+   every region it has not marked, and it has no zero detection, so
+   without help it would write the whole volume: every zero region
+   becomes allocated pool blocks and every region equal to the base
+   stops sharing the base's blocks. The drive is loaded with hydration
+   off and `no_discard_passdown`. The host discards every whole region
+   in which the destination already holds the manifest's bytes (a chunk
+   absent from both the manifest and the destination's origin, or with
+   the same hash in both), which marks those regions copied without
+   touching the destination. Then it turns hydration on. The set comes
+   from manifests only. The guest cannot discard (Decision 8), so these
+   host discards are the only ones.
 3. **The source is read-only and stateless.** It serves one manifest.
    For each read it uses the first tier that holds the chunk: a staged
    volume whose chunk has the same hash, the chunk cache, a peer, then
@@ -343,10 +356,9 @@ checkpoint.
 
 ### Placement
 
-The pool floor (ADR 0125) stays a hard gate. A lazy restore from an
-image with no staged base cannot share blocks with a base, so it
-consumes the volume's full size as it hydrates; placement counts the
-manifest's non-zero bytes against the floor for a lazy restore.
+The pool floor (ADR 0125) stays a hard gate. A lazy restore writes the
+chunks that differ from its destination's origin, as an eager restore
+does, so placement counts the same bytes for both paths.
 
 ## Tradeoffs
 
@@ -362,13 +374,11 @@ manifest's non-zero bytes against the floor for a lazy restore.
   wait.
 - **An fsync during hydration commits the bitmap.** Measured at about 3
   ms more than a plain thin volume.
-- **A lazy restore without a staged base uses the full volume in the
-  pool.** It shares no blocks. An eager restore over a staged base
-  shares them, which is one reason the eager path stays.
 - **Two restore paths.** Decision 1 decides between them from manifests
-  before the restore, and the fallback makes a wrong decision safe. A
-  later change can unify them if seeding the bitmap from the base proves
-  sound.
+  before the restore, and the fallback makes a wrong decision safe.
+  With the skipped regions, both paths write the same bytes into the
+  pool; they differ in when the bytes arrive. A later change can make
+  every restore lazy if the read latency during hydration allows it.
 - **A ublk device can block a node.** A device stopped with a request
   that nothing will finish blocks in the kernel until reboot (Decision
   5 states the rule that prevents it). The rule is enforced in the
