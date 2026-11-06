@@ -68,14 +68,10 @@ pub struct ChunkFileStats {
     pub bytes_uploaded: u64,
 }
 
-/// ADR 0088 addendum: upload width for `chunk_file`'s streaming
-/// read→upload pipeline. The old stop-and-wait window (read 32, drain
-/// 32) capped effective GCS throughput at ~60-80 MiB/s on the enable
-/// path; a continuous `try_buffer_unordered` keeps the sequential NVMe
-/// reads feeding uploads with no drain stalls. Peak buffered RAM =
-/// width × chunk_size (1 GiB at 16 MiB disk chunks — fine on a host,
-/// bounded, and the host-global UploadBudget arbitrates the wire when
-/// other upload workloads run concurrently).
+/// Uploads in flight in `chunk_file`'s read→upload pipeline; each runs on
+/// its own task and a finished one's slot refills at once. Peak buffered
+/// RAM is this × chunk_size (1 GiB at 16 MiB disk chunks); the host-wide
+/// UploadBudget shares the wire with other uploads.
 const CHUNK_UPLOAD_CONCURRENCY: usize = 64;
 
 impl ChunkStore {
@@ -183,7 +179,8 @@ impl ChunkStore {
                 // re-fetches its own write from GCS. Best-effort — the
                 // chunk is durable in the store regardless.
                 if let Some(cache) = &cache {
-                    if let Err(e) = cache.put(hash, &bytes).await {
+                    // `put_chunk` just hashed these bytes.
+                    if let Err(e) = cache.put_trusted(hash, &bytes).await {
                         tracing::warn!(
                             %hash,
                             error = %e,
@@ -208,7 +205,8 @@ impl ChunkStore {
             stats.chunks_uploaded += 1;
             stats.bytes_uploaded += bytes.len() as u64;
             *scanned_hi = offset + bytes.len() as u64;
-            inflight.push(put_one(offset, bytes));
+            // Its own task, so the SHA-256 and the PUT's TLS use every core.
+            inflight.push(tokio::spawn(put_one(offset, bytes)));
         };
         while !done_reading || !inflight.is_empty() {
             // Top up the in-flight set without blocking.
@@ -244,7 +242,9 @@ impl ChunkStore {
                 let flush_start = crate::time_source::metrics_now();
                 let done_put = inflight.next().await.expect("non-empty inflight");
                 stats.flush_seconds += flush_start.elapsed().as_secs_f64();
-                refs.push(done_put?);
+                refs.push(done_put.map_err(|e| {
+                    crate::error::ChunkStoreError::Internal(format!("chunk upload task: {e}"))
+                })??);
                 completed += 1;
                 if completed.is_multiple_of(SPARSE_RECHUNK_CONCURRENCY as u64) {
                     if let Some(report) = progress {
