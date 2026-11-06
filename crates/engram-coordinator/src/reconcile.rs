@@ -122,6 +122,11 @@ impl Reconciler {
     /// avoiding the window where a concurrent reader sees a stale
     /// in-memory route after PG already knows the session is
     /// HostLost.
+    #[tracing::instrument(
+        name = "coord.reconcile",
+        skip_all,
+        fields(host_id = %host_id, running = running_sandboxes.len())
+    )]
     pub async fn reconcile_with_deps(
         &self,
         meta: &dyn MetadataStore,

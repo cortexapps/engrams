@@ -14,7 +14,7 @@
 //!      between the durable persist and the upload finishing.
 //!   3. "Generation B" — an entirely FRESH `PooledBackend` +
 //!      `FirecrackerBackend` (disjoint in-RAM state: its own
-//!      `capture_locks`, `pending_finalizes`, no knowledge of
+//!      `capture_gates`, `pending_finalizes`, no knowledge of
 //!      generation A's sandbox) pointed at the SAME `work_dir` — runs
 //!      the SAME startup sequence a real host-agent restart runs
 //!      (`live_attach::reattach_pass` to rejoin the still-live VM, then

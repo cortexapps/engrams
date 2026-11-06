@@ -214,8 +214,9 @@ pub const HOST_BASE_MEMFILE_BYTES: &str = "engram_host_base_memfile_bytes";
 pub const HOST_MEM_FREE_PCT: &str = "engram_host_mem_free_pct";
 
 /// ADR 0022 Option A: gauges of summed guest memory across this host's
-/// live FC sandboxes, sampled each heartbeat tick from
-/// `/proc/<pid>/smaps_rollup`. The **density signal**:
+/// live FC sandboxes, set each heartbeat tick: RSS from `/proc/<pid>/status`,
+/// PSS from `/proc/<pid>/smaps_rollup` at most once a minute per sandbox.
+/// The **density signal**:
 /// `engram_sandbox_guest_pss_bytes / engram_sandbox_guest_rss_bytes` ≈ 1.0
 /// when every sandbox holds a private working-set copy (UFFD), and falls
 /// below 1.0 as same-template siblings `MAP_PRIVATE`-share one resident

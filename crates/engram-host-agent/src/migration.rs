@@ -90,9 +90,8 @@ pub struct MigrationExport {
     /// Last required page/artifact-serving activity (the export TTL clock), as a
     /// `now_mono` reading.
     pub last_activity: Arc<std::sync::Mutex<Duration>>,
-    /// The sandbox's capture lock, held for the export's lifetime —
-    /// this IS the checkpoint fence (the periodic driver's
-    /// `capture_in_flight` try_lock keeps skipping).
+    /// The sandbox's capture lock, held for the export's lifetime: the
+    /// checkpoint fence.
     pub capture_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 

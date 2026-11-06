@@ -28,6 +28,7 @@ use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
@@ -162,6 +163,16 @@ pub enum Source {
     Empty { size_bytes: u64 },
 }
 
+impl Source {
+    fn kind(&self) -> &'static str {
+        match self {
+            Source::Fork { .. } => "fork",
+            Source::Continue { .. } => "continue",
+            Source::Empty { .. } => "empty",
+        }
+    }
+}
+
 /// What `provision` made: the device paths a backend opens and the
 /// lineage each volume checkpoints under.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +288,11 @@ impl SessionVolumes {
     /// manifest is in the store; then the live volume as its snapshot.
     /// A `Continue` of a checkpoint this host kept for the lineage skips
     /// the stage; one of a newer manifest stages only the delta onto it.
+    #[tracing::instrument(
+        name = "disk.provision",
+        skip_all,
+        fields(sandbox_id = %sandbox, %role, source = source.kind())
+    )]
     async fn provision_role(
         &self,
         sandbox: SandboxId,
@@ -287,14 +303,24 @@ impl SessionVolumes {
         self.delete_if_present(&tmp).await?;
         let (checkpoint, lineage) = match source {
             Source::Fork { manifest, base } => {
-                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                let wanted = self
+                    .store
+                    .get_manifest(manifest)
+                    .instrument(tracing::info_span!("disk.manifest_get"))
+                    .await
+                    .map_err(store_err)?;
                 match self.staged(manifest).await {
                     Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
-                    None => self.stage_into(&tmp, &wanted, base).await?,
+                    None => {
+                        self.stage_into(&tmp, &wanted, base)
+                            .instrument(tracing::info_span!("disk.stage"))
+                            .await?
+                    }
                 };
                 let lineage = ManifestRef::new();
                 self.store
                     .put_manifest(lineage, &wanted)
+                    .instrument(tracing::info_span!("disk.manifest_put"))
                     .await
                     .map_err(store_err)?;
                 (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
@@ -306,7 +332,12 @@ impl SessionVolumes {
                         manifest,
                     ),
                     kept => {
-                        let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                        let wanted = self
+                            .store
+                            .get_manifest(manifest)
+                            .instrument(tracing::info_span!("disk.manifest_get"))
+                            .await
+                            .map_err(store_err)?;
                         match kept {
                             Some((_, volume, held_manifest, _))
                                 if volume.size_bytes == wanted.total_bytes =>
@@ -318,9 +349,14 @@ impl SessionVolumes {
                                     &wanted,
                                     Some((&volume, &held_manifest)),
                                 )
+                                .instrument(tracing::info_span!("disk.stage", onto_kept = true))
                                 .await?
                             }
-                            _ => self.stage_into(&tmp, &wanted, base).await?,
+                            _ => {
+                                self.stage_into(&tmp, &wanted, base)
+                                    .instrument(tracing::info_span!("disk.stage"))
+                                    .await?
+                            }
                         };
                         (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
                     }
@@ -335,6 +371,7 @@ impl SessionVolumes {
                 };
                 self.store
                     .put_manifest(lineage, &manifest)
+                    .instrument(tracing::info_span!("disk.manifest_put"))
                     .await
                     .map_err(store_err)?;
                 (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
@@ -343,6 +380,7 @@ impl SessionVolumes {
         let live = self
             .disk
             .snapshot(&checkpoint, &live_name(sandbox, role))
+            .instrument(tracing::info_span!("disk.live_snapshot"))
             .await?;
         Ok((live.path, lineage))
     }
