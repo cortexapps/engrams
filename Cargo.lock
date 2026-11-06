@@ -5073,9 +5073,9 @@ dependencies = [
 
 [[package]]
 name = "mkext4"
-version = "0.0.3"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d9b87ba418ec2aace835f39128b6c7a90a9f7f8130da2db95a3e00f94d97be1"
+checksum = "907262285b1fd903bb1f1190b98bc785250752be4f72d440d9f6befcd81f3f15"
 dependencies = [
  "crc32c",
 ]

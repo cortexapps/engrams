@@ -509,13 +509,13 @@ async fn materialize_scrubs_scratch_on_error() {
 }
 
 /// ADR 0093 addendum: `min_fs_size_bytes` floors the packed ext4 so
-/// `suggested_disk_gib` grants real workspace. Sized to the property
-/// (256 MiB, not GiB): the floor lands verbatim in `ext4_size_bytes`,
+/// `suggested_disk_gib` grants real workspace. The floor is above the
+/// fixture's content-sized image: it lands verbatim in `ext4_size_bytes`,
 /// the padding is zero-elided in the manifest (chunk bytes stay far
 /// below the fs size), and the padded image still checksum-verifies.
 #[tokio::test]
 async fn materialize_honors_the_min_fs_size_floor() {
-    const FLOOR: u64 = 256 * 1024 * 1024;
+    const FLOOR: u64 = 2 * 1024 * 1024 * 1024;
     let fx = publish_fixture(None).await;
     let store_dir = tempfile::tempdir().unwrap();
     let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
@@ -556,24 +556,28 @@ async fn materialize_honors_the_min_fs_size_floor() {
 /// Reassemble the materialized image from the chunk store (manifest
 /// gaps are zero-fill) and open it with the mkext4 verification
 /// reader — the streaming pack produces no image file, so the store
-/// IS the artifact (ADR 0093). Checksum-verifies before returning.
+/// IS the artifact (ADR 0093). The image goes into a sparse temporary
+/// file, since it is 1 GiB or more of mostly zero windows.
+/// Checksum-verifies before returning.
 async fn image_from_store(
     chunk_store: &engram_chunk_store::ChunkStore,
     manifest_ref: engram_chunk_store::ManifestRef,
-) -> Vec<u8> {
+) -> std::fs::File {
+    use std::os::unix::fs::FileExt;
     let manifest = chunk_store.get_manifest(manifest_ref).await.unwrap();
-    let mut image = vec![0u8; manifest.total_bytes as usize];
+    let image = tempfile::tempfile().unwrap();
+    image.set_len(manifest.total_bytes).unwrap();
     for c in &manifest.chunks {
         let bytes = chunk_store.get_chunk(c.hash).await.unwrap();
-        image[c.offset as usize..c.offset as usize + bytes.len()].copy_from_slice(&bytes);
+        image.write_all_at(&bytes, c.offset).unwrap();
     }
-    let fs = mkext4::reader::Fs::open(&image[..]).unwrap();
+    let fs = mkext4::reader::Fs::open(&image).unwrap();
     let issues = fs.verify().unwrap();
     assert!(issues.is_empty(), "image must verify clean: {issues:?}");
     image
 }
 
-fn read_path(image: &[u8], path: &str) -> Option<Vec<u8>> {
+fn read_path(image: &std::fs::File, path: &str) -> Option<Vec<u8>> {
     let fs = mkext4::reader::Fs::open(image).unwrap();
     let ino = fs.resolve(path).ok()?;
     fs.read_file(ino).ok()
