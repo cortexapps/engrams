@@ -95,9 +95,7 @@ impl Permit {
         use engram_core::error::BlobError as B;
         match outcome {
             Ok(bytes) => self.done(bytes),
-            Err(E::FetchTimeout(_) | E::Blob(B::Sdk(_) | B::Io(_) | B::Protocol(_))) => {
-                self.failed()
-            }
+            Err(E::Blob(B::Sdk(_) | B::Io(_) | B::Protocol(_))) => self.failed(),
             Err(_) => {}
         }
     }

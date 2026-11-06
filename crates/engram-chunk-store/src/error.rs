@@ -51,10 +51,6 @@ pub enum ChunkStoreError {
     /// Use for "should never reach here" branches that we still want
     /// to surface rather than panic.
     Internal(String),
-
-    /// A chunk fetch (blob/origin GET) exceeded its bounded deadline.
-    /// The string carries the chunk hash + the deadline that elapsed.
-    FetchTimeout(String),
 }
 
 impl fmt::Display for ChunkStoreError {
@@ -85,7 +81,6 @@ impl fmt::Display for ChunkStoreError {
             Self::Cache(e) => write!(f, "local cache I/O: {e}"),
             Self::Origin(msg) => write!(f, "origin tier: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
-            Self::FetchTimeout(msg) => write!(f, "chunk fetch timed out: {msg}"),
         }
     }
 }
