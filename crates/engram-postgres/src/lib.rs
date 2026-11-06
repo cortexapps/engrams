@@ -971,29 +971,37 @@ impl PostgresStore {
         // generation read catches the divergence and restarts.
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if fence.is_some() && snap.session_id.is_none() {
+            return Err(MetaError::Serialization(
+                "fenced_record_snapshot requires a session-scoped snapshot".into(),
+            ));
+        }
+        // Lock order: the session row, then the snapshot row, then
+        // `chunk_generation`. Every session-scoped write takes the session
+        // row FIRST, fenced or not: the durable-head UPDATE below locks it
+        // too, so an unfenced write that locked the snapshot row first
+        // deadlocks a fenced write of the same snapshot (the heartbeat
+        // reconcile against the Snapshot RPC's promote).
+        //
         // ADR 0079 (re-review findings #3/#4): the optional fence. When
         // `Some(epoch)`, gate the write on the session's `current_epoch`
-        // in the SAME transaction (the fence read + the write serialize
-        // against a concurrent claim/reclaim CAS via `FOR UPDATE`). A
-        // mismatch means the op executor was fenced by a successor's
-        // re-claim: write NOTHING (a reclaimed-out predecessor must never
-        // land a phantom `recoverable` row a resume would pick) and return
-        // `Ok(None)`.
-        if let Some(epoch) = fence {
-            let session_id = snap.session_id.ok_or_else(|| {
-                MetaError::Serialization(
-                    "fenced_record_snapshot requires a session-scoped snapshot".into(),
-                )
-            })?;
+        // read under that lock (it serializes against a concurrent
+        // claim/reclaim CAS). A mismatch means the op executor was fenced
+        // by a successor's re-claim: write NOTHING (a reclaimed-out
+        // predecessor must never land a phantom `recoverable` row a resume
+        // would pick) and return `Ok(None)`.
+        if let Some(session_id) = snap.session_id {
             let stored: Option<i64> =
                 sqlx::query_scalar("SELECT current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
                     .bind(session_id.as_uuid())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?;
-            if stored != Some(epoch) {
-                let _ = tx.rollback().await;
-                return Ok(None);
+            if let Some(epoch) = fence {
+                if stored != Some(epoch) {
+                    let _ = tx.rollback().await;
+                    return Ok(None);
+                }
             }
         }
         // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
