@@ -41,13 +41,16 @@ const DEFAULT_MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 /// (`off` skips the background warm of a lazy restore; faults then fetch
 /// on demand; `prefix` first warms the chunks of the session's recorded
 /// fault order, then the rest as `full`),
-/// `ENGRAM_MEMORY_PREFETCH_CONCURRENCY` (default 32) and
-/// `ENGRAM_MEMORY_PREFIX_LIMIT` (default 0 = the whole fault order).
+/// `ENGRAM_MEMORY_PREFETCH_CONCURRENCY` (default 32),
+/// `ENGRAM_MEMORY_PREFIX_LIMIT` (default 0 = the whole fault order) and
+/// `ENGRAM_MEMORY_PREFETCH_AFTER_DISKS` (`1` starts the background warm
+/// after the disks are provisioned; default `0`, before).
 #[derive(Clone, Copy)]
 struct MemoryPrefetchConfig {
     mode: MemoryPrefetchMode,
     concurrency: usize,
     prefix_limit: usize,
+    after_disks: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,10 +96,15 @@ fn memory_prefetch_config() -> MemoryPrefetchConfig {
             },
             Err(_) => DEFAULT_MEMORY_PREFETCH_CONCURRENCY,
         };
+        let after_disks = matches!(
+            std::env::var("ENGRAM_MEMORY_PREFETCH_AFTER_DISKS").as_deref(),
+            Ok("1")
+        );
         MemoryPrefetchConfig {
             mode,
             concurrency,
             prefix_limit,
+            after_disks,
         }
     })
 }
@@ -1348,7 +1356,9 @@ impl PooledBackend {
                     "chunked restore memory chunk prefetch failed; falling back to serial fault path",
                 );
             }
-        } else if memory_prefetch_config().mode == MemoryPrefetchMode::Full {
+        } else if memory_prefetch_config().mode == MemoryPrefetchMode::Full
+            && !memory_prefetch_config().after_disks
+        {
             self.spawn_memory_prefetch(&metadata, None);
         }
 
@@ -1378,7 +1388,10 @@ impl PooledBackend {
         }
         // The prefix needs the sidecar's trace lineage, so it starts
         // once the sidecar is local.
-        if memory_is_lazy && memory_prefetch_config().mode == MemoryPrefetchMode::Prefix {
+        if memory_is_lazy
+            && memory_prefetch_config().mode == MemoryPrefetchMode::Prefix
+            && !memory_prefetch_config().after_disks
+        {
             let lineage = read_sidecar_trace_lineage(&src).await;
             self.spawn_memory_prefetch(&metadata, Some(lineage));
         }
@@ -1393,6 +1406,16 @@ impl PooledBackend {
             ),
             None => None,
         };
+        if memory_is_lazy && memory_prefetch_config().after_disks {
+            match memory_prefetch_config().mode {
+                MemoryPrefetchMode::Full => self.spawn_memory_prefetch(&metadata, None),
+                MemoryPrefetchMode::Prefix => {
+                    let lineage = read_sidecar_trace_lineage(&src).await;
+                    self.spawn_memory_prefetch(&metadata, Some(lineage));
+                }
+                MemoryPrefetchMode::Off => {}
+            }
+        }
         let restore = async {
             // A staged post-copy destination arms its fetch poller as soon
             // as its disks exist: the poller writes the source's sealed
