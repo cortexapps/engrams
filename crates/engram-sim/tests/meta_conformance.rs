@@ -1508,6 +1508,61 @@ async fn dead_host_lease(ctx: &Ctx) {
         .unwrap());
 }
 
+/// A fixed-cadence wait requeues like a backoff and gives back the
+/// attempt the claim counted; a stale epoch writes nothing.
+async fn op_requeue_wait_refunds_the_attempt(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:ops-wait")).await.unwrap();
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Teleport, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("first op must be Claimed")
+    };
+    assert_eq!(op.attempts, 1);
+    let epoch = op.epoch.unwrap();
+    assert!(!meta
+        .op_requeue_wait(op.id, epoch + 99, Duration::from_secs(1), "wait")
+        .await
+        .unwrap());
+    for _ in 0..3 {
+        let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(claimed.state, OpState::Running);
+        assert!(meta
+            .op_requeue_wait(
+                op.id,
+                claimed.epoch.unwrap(),
+                Duration::from_secs(1),
+                "wait"
+            )
+            .await
+            .unwrap());
+        let queued = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(queued.state, OpState::Queued);
+        assert_eq!(queued.attempts, 0, "the wait spends no attempt");
+        assert!(meta.op_claim_head(sid, "pod-a").await.unwrap().is_none());
+        ctx.clock.advance(Duration::from_secs(2));
+        let again = meta
+            .op_claim_head(sid, "pod-a")
+            .await
+            .unwrap()
+            .expect("due after the wait");
+        assert_eq!(again.attempts, 1);
+    }
+    let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+    assert!(meta
+        .op_requeue_with_backoff(op.id, claimed.epoch.unwrap(), Duration::ZERO, "transient")
+        .await
+        .unwrap());
+    let again = meta
+        .op_claim_head(sid, "pod-a")
+        .await
+        .unwrap()
+        .expect("due");
+    assert_eq!(again.attempts, 2, "a failure keeps its attempt");
+}
+
 /// The op pipeline: claim epochs fence writes; requeue backoff gates
 /// due-ness on the clock; reclaim bumps the epoch and fences out the
 /// stalled claimant.
@@ -4068,6 +4123,10 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(
+    t_op_requeue_wait_refunds_the_attempt,
+    super::op_requeue_wait_refunds_the_attempt
+);
 conformance!(t_op_terminal_writes, super::op_terminal_writes);
 conformance!(t_op_resume_failure_streak, super::op_resume_failure_streak);
 conformance!(

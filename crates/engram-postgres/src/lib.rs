@@ -1134,6 +1134,37 @@ impl PostgresStore {
         tx.commit().await.map_err(db_err)?;
         Ok(Some(inserted))
     }
+
+    /// The body behind `op_requeue_with_backoff` / `op_requeue_wait`:
+    /// `refund` is how many of the claim's counted attempts to give back.
+    async fn op_requeue(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        error: &str,
+        refund: i32,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops
+                SET state = 'queued',
+                    not_before = $5 + make_interval(secs => $3),
+                    error = $4,
+                    attempts = GREATEST(attempts - $6, 0),
+                    epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .bind(delay.as_secs_f64())
+        .bind(error)
+        .bind(self.clock.now_utc())
+        .bind(refund)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[async_trait]
@@ -7924,23 +7955,17 @@ impl MetadataStore for PostgresStore {
         // Back to `queued` with the claim stamps cleared; `attempts`
         // stays (it was counted at claim) and `step` stays (the next
         // claimer resumes idempotent-from-step).
-        let res = sqlx::query(
-            "UPDATE session_ops
-                SET state = 'queued',
-                    not_before = $5 + make_interval(secs => $3),
-                    error = $4,
-                    epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
-              WHERE id = $1 AND epoch = $2 AND state = 'running'",
-        )
-        .bind(op_id)
-        .bind(epoch)
-        .bind(backoff.as_secs_f64())
-        .bind(error)
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        self.op_requeue(op_id, epoch, backoff, error, 0).await
+    }
+
+    async fn op_requeue_wait(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> Result<bool, MetaError> {
+        self.op_requeue(op_id, epoch, delay, reason, 1).await
     }
 
     async fn op_cancel_queued(

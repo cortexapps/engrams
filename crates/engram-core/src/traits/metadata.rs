@@ -1037,6 +1037,20 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
+    /// A fixed-cadence wait, not a failure: requeue as
+    /// [`Self::op_requeue_with_backoff`] does and give back the attempt the
+    /// claim counted, so the wait does not grow a later backoff or spend
+    /// an attempt budget. Fenced.
+    async fn op_requeue_wait(
+        &self,
+        _op_id: i64,
+        _epoch: i64,
+        _delay: std::time::Duration,
+        _reason: &str,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("op_requeue_wait")
+    }
+
     /// Make every QUEUED op of `kind` for this session due now
     /// (`not_before = LEAST(not_before, now)`) and NOTIFY when any such
     /// op exists — INCLUDING ops that are already due. ADR 0079

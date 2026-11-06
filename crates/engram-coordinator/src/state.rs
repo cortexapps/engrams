@@ -3249,6 +3249,16 @@ pub(crate) mod tests {
             Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
         }
 
+        async fn op_requeue_wait(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            delay: std::time::Duration,
+            reason: &str,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.requeue_wait(op_id, epoch, delay, reason))
+        }
+
         async fn op_cancel_queued(
             &self,
             session_id: SessionId,

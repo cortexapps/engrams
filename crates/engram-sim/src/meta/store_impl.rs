@@ -2887,6 +2887,25 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
+    /// As `op_requeue_with_backoff`, and the claim's attempt is given back.
+    async fn op_requeue_wait(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> Result<bool, MetaError> {
+        let requeued = self
+            .op_requeue_with_backoff(op_id, epoch, delay, reason)
+            .await?;
+        if requeued {
+            if let Some(o) = self.db.lock().session_ops.get_mut(&op_id) {
+                o.attempts = (o.attempts - 1).max(0);
+            }
+        }
+        Ok(requeued)
+    }
+
     /// Bulk-cancel every queued row of the kind.
     async fn op_cancel_queued(
         &self,
