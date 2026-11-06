@@ -47,10 +47,11 @@ struct ServeArgs {
     /// Attach to the existing device with this id instead of creating one.
     #[arg(long)]
     recover: Option<u32>,
-    /// Hardware queues. Ignored with --recover: the device keeps its own.
+    /// Hardware queues. With --recover, the device's own count.
     #[arg(long, default_value_t = 2)]
     queues: u16,
-    /// Requests in flight per queue. Ignored with --recover.
+    /// Requests in flight per queue. With --recover, the device's own
+    /// depth.
     #[arg(long, default_value_t = 64)]
     depth: u16,
 }

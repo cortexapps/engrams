@@ -35,7 +35,8 @@ const BLOCK_BYTES: u64 = 1 << BLOCK_SHIFT;
 /// The largest single request the kernel sends.
 const IO_BUF_BYTES: u32 = 512 * 1024;
 
-/// How the device is shaped and whether it is new.
+/// How the device is shaped and whether it is new. A recovered device
+/// keeps its shape, so `queues` and `depth` must equal its own.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub queues: u16,
@@ -176,10 +177,22 @@ fn open_ctrl(config: &Config, size: u64) -> io::Result<UblkCtrl> {
         .dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
         .build()
         .map_err(|e| ublk_err(&format!("open device {dev_id}"), e))?;
-    if ctrl.dev_info().flags & sys::UBLK_F_USER_RECOVERY as u64 == 0 {
+    let info = ctrl.dev_info();
+    if info.flags & sys::UBLK_F_USER_RECOVERY as u64 == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("device {dev_id} was not created for recovery"),
+        ));
+    }
+    // libublk sizes its per-queue state from the configured count but
+    // starts one thread per queue of the device.
+    if info.nr_hw_queues != config.queues || info.queue_depth != config.depth {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "device {dev_id} has {} queues of depth {}; this source was started with {} of depth {}",
+                info.nr_hw_queues, info.queue_depth, config.queues, config.depth
+            ),
         ));
     }
     let mut kernel = sys::ublk_params::default();
@@ -307,29 +320,58 @@ async fn handle_io(t: &Tag<'_>, buf: &mut [u8], done: &Arc<EventFd>) -> i32 {
     }
 }
 
+type ReadResult = io::Result<Vec<u8>>;
+
+/// The runtime side of a read: it sends the result, or drops the sender
+/// when the task ends without one (a panic), and then signals `done`.
+/// The tag's task therefore always wakes and finds the channel ready.
+struct Finish {
+    tx: Option<oneshot::Sender<ReadResult>>,
+    done: Arc<EventFd>,
+}
+
+impl Finish {
+    fn send(mut self, result: ReadResult) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        // The sender goes before the signal, so a woken waiter never
+        // finds the channel empty.
+        drop(self.tx.take());
+        if let Err(e) = self.done.write(1) {
+            tracing::error!(error = %e, "signal a finished read");
+        }
+    }
+}
+
 /// Run the read on the tokio runtime and wait for it through the queue
 /// ring: the runtime signals `done`, whose poll completes on the ring.
-async fn read_on_runtime(
-    t: &Tag<'_>,
-    offset: u64,
-    len: usize,
-    done: &Arc<EventFd>,
-) -> io::Result<Vec<u8>> {
+async fn read_on_runtime(t: &Tag<'_>, offset: u64, len: usize, done: &Arc<EventFd>) -> ReadResult {
     let (tx, mut rx) = oneshot::channel();
     let reader = Arc::clone(&t.reader);
     let stopping = t.stopping.clone();
-    let signal = Arc::clone(done);
+    let finish = Finish {
+        tx: Some(tx),
+        done: Arc::clone(done),
+    };
     t.rt.spawn(async move {
-        let _ = tx.send(read_until_served(&reader, offset, len, stopping).await);
-        if let Err(e) = signal.write(1) {
-            tracing::error!(error = %e, "signal a finished read");
-        }
+        let result = read_until_served(&reader, offset, len, stopping).await;
+        finish.send(result);
     });
     loop {
         let poll = opcode::PollAdd::new(types::Fd(done.as_raw_fd()), libc::POLLIN as u32).build();
         let res = ublk_submit_sqe_async(poll, UblkUringData::Target as u64)
             .await
             .map_err(|e| ublk_err("wait for a read", e))?;
+        // The read still runs, so a poll that ended early is armed again.
+        if matches!(-res, libc::EINTR | libc::EAGAIN | libc::ECANCELED) {
+            continue;
+        }
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
