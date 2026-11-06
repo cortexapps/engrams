@@ -644,6 +644,9 @@ pub struct PooledBackend {
     /// A restored sandbox's hinted peer, registered with the fill engine
     /// for its memory manifest until the sandbox goes.
     peer_registrations: Arc<DashMap<SandboxId, engram_fill::PeerRegistration>>,
+    /// A lazy restore's background memory prefetch; dropping the entry
+    /// cancels it.
+    memory_prefetches: DashMap<SandboxId, AbortTaskOnDrop>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1608,6 +1611,9 @@ impl PooledBackend {
         if let (true, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
             let session = read_trace_lineage(&src).await;
             let md = metadata.clone();
+            // An earlier restore's fetches for this id end before this
+            // restore registers its own.
+            self.drop_restore_fetches(id);
             // A hinted peer holds the session's chunks on local disk: every
             // memory fetch of this restore (faults through the substrate,
             // the prefix, the rest) asks it before the store.
@@ -1627,7 +1633,7 @@ impl PooledBackend {
                 }
                 _ => fill,
             };
-            tokio::spawn(tracing::Instrument::instrument(
+            let prefetch = tokio::spawn(tracing::Instrument::instrument(
                 async move {
                     if let Err(e) =
                         Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate, session).await
@@ -1641,16 +1647,22 @@ impl PooledBackend {
                 },
                 tracing::info_span!("restore.prefetch_memory_bg"),
             ));
+            self.memory_prefetches.insert(id, AbortTaskOnDrop(prefetch));
         }
 
         let disks = match self.volumes.as_ref() {
-            Some(volumes) => Some(
-                tracing::Instrument::instrument(
-                    self.provision_for_restore(volumes, id, &metadata, &src, fresh, fork_disk),
-                    tracing::info_span!("restore.provision_disks"),
-                )
-                .await?,
-            ),
+            Some(volumes) => match tracing::Instrument::instrument(
+                self.provision_for_restore(volumes, id, &metadata, &src, fresh, fork_disk),
+                tracing::info_span!("restore.provision_disks"),
+            )
+            .await
+            {
+                Ok(disks) => Some(disks),
+                Err(error) => {
+                    self.drop_restore_fetches(id);
+                    return Err(error);
+                }
+            },
             None => None,
         };
         let restore = async {
@@ -1752,6 +1764,7 @@ impl PooledBackend {
         }
         .await;
         if restore.is_err() {
+            self.drop_restore_fetches(id);
             if let Some(volumes) = self.volumes.as_ref() {
                 if let Err(error) = volumes.release(id).await {
                     tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
@@ -1759,6 +1772,13 @@ impl PooledBackend {
             }
         }
         restore
+    }
+
+    /// End a restore's memory fetches: cancel its background prefetch and
+    /// drop its peer registration, which ends the peer's batching task.
+    fn drop_restore_fetches(&self, id: SandboxId) {
+        self.memory_prefetches.remove(&id);
+        self.peer_registrations.remove(&id);
     }
 
     /// Provision a restored sandbox's disks from the snapshot's manifests.
@@ -1840,6 +1860,7 @@ impl PooledBackend {
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             attached_at_ms: Arc::new(DashMap::new()),
             peer_registrations: Arc::new(DashMap::new()),
+            memory_prefetches: DashMap::new(),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
             checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
@@ -5895,6 +5916,7 @@ impl SandboxBackend for PooledBackend {
         // A held source forgets its swap policy and metadata with the VM.
         self.held_snapshots.remove(&id);
         self.hint_pollers.remove(&id);
+        self.memory_prefetches.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
