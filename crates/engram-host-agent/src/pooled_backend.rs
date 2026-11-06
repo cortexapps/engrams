@@ -1652,6 +1652,28 @@ impl PooledBackend {
         self.migrations.state_served(id)
     }
 
+    /// Carry out the export TTL sweep's verdict. The abort re-checks
+    /// `state_served` in the same step that consumes the export, so a
+    /// fetch after the verdict leaves the source paused.
+    pub async fn run_export_ttl_verdict(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        verdict: crate::migration::TtlVerdict,
+    ) -> Result<(), SandboxError> {
+        use crate::migration::TtlVerdict;
+        match verdict {
+            TtlVerdict::AbortInPlace => {
+                if !self.migration_abort_unserved(id, export_id).await? {
+                    tracing::warn!(sandbox_id = %id, "export state served after the TTL verdict; stays paused");
+                }
+                Ok(())
+            }
+            TtlVerdict::Destroy => self.migration_commit(id, export_id).await,
+            TtlVerdict::StayPaused => Ok(()),
+        }
+    }
+
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
     /// (`rolling/` + `records/` subdirs are created lazily). Without
     /// this, `snapshot()` stays pure-Full and the periodic driver
@@ -5527,8 +5549,8 @@ impl SandboxBackend for PooledBackend {
         // coordinator's knowledge that the dest provably never loaded
         // the shipped state (the postcopy-never-loaded marker), so it
         // is allowed even after StateBin was fetched. The forbidden
-        // arm is the dumb-host TTL's self-resume — gated by
-        // `ttl_verdict`'s state_served input, never reaching this RPC.
+        // arm is the dumb-host TTL's self-resume, which goes through
+        // `migration_abort_unserved`, never this RPC.
         //
         // Atomic validate+remove (see migration_commit): the TTL sweep
         // and a coordinator abort RPC race with nothing serializing
@@ -9129,6 +9151,51 @@ mod tests {
         assert_eq!(*resumes.lock(), vec![unserved]);
         assert!(pooled.migrations.export_id_of(unserved).is_none());
         assert!(!dir.exists());
+    }
+
+    /// A fetch of `state.bin` after the TTL sweep chose to abort makes the
+    /// abort refuse: the source stays paused and its export stays open.
+    #[tokio::test]
+    async fn export_ttl_abort_refuses_a_state_fetched_after_the_verdict() {
+        use crate::migration::{ttl_verdict, TtlVerdict};
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
+
+        let raced = SandboxId::new();
+        let dir = tmp.path().join("raced");
+        let export_id = open_export(&pooled, raced, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(raced));
+        assert_eq!(verdict, TtlVerdict::AbortInPlace);
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        pooled
+            .run_export_ttl_verdict(raced, &export_id, verdict)
+            .await
+            .unwrap();
+        assert!(resumes.lock().is_empty(), "a served source never resumes");
+        assert_eq!(pooled.migrations.export_id_of(raced), Some(export_id));
+
+        let idle = SandboxId::new();
+        let export_id = open_export(&pooled, idle, tmp.path().join("idle")).await;
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(idle));
+        pooled
+            .run_export_ttl_verdict(idle, &export_id, verdict)
+            .await
+            .unwrap();
+        assert_eq!(*resumes.lock(), vec![idle]);
+        assert!(pooled.migrations.export_id_of(idle).is_none());
     }
 
     /// ADR 0007 / Phase 5: snapshot wrap chunks an FC-style
