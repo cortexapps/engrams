@@ -32,9 +32,13 @@ check:
     cargo hakari generate --diff
     cargo nextest run --workspace
 
-# Auto-format the workspace.
+# Auto-format the Rust workspace.
 fmt:
     cargo fmt --all
+
+# Auto-format web/ (needs `pnpm install` in web/ first). CI checks it.
+fmt-web:
+    pnpm --dir web run format
 
 # Regenerate `workspace-hack/Cargo.toml` from the current dep
 # graph. Run after adding or removing a workspace dep so
