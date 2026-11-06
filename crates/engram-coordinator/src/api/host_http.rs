@@ -501,6 +501,7 @@ pub struct HandoffResponse {
     pub accepted: bool,
 }
 
+#[tracing::instrument(name = "coord.heartbeat", skip_all, fields(host_id = %host_id))]
 pub async fn heartbeat(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,

@@ -15,6 +15,7 @@ use engram_core::types::teleport::*;
 use engram_core::types::{BindingDisposition, SessionState};
 use engram_core::{HostId, SandboxError, SessionId};
 use std::time::Duration;
+use tracing::Instrument as _;
 
 #[derive(Clone, Debug)]
 pub struct TeleportConfig {
@@ -295,17 +296,34 @@ async fn drive_inner(ctx: &OpCtx<'_>) -> Result<OpOutcome, ApiError> {
                 .await?;
             return Ok(OpOutcome::Done);
         }
-        let outcome = match row.phase {
-            TeleportPhase::Admitted => steps::capture(ctx, &row).await?,
-            TeleportPhase::Captured => steps::restore(ctx, &row).await?,
-            TeleportPhase::Restored => steps::commit(ctx, &row).await?,
-            TeleportPhase::Committed => steps::attach(ctx, &row).await?,
-            TeleportPhase::Attached => steps::release(ctx, &row).await?,
-            TeleportPhase::RollingBack => steps::rollback(ctx, &row).await?,
-            TeleportPhase::Done | TeleportPhase::Aborted | TeleportPhase::Failed => {
-                return Ok(OpOutcome::Done)
+        let span = tracing::info_span!(
+            "coord.teleport_step",
+            teleport_id = %row.id,
+            session_id = %row.session_id,
+            phase = row.phase.as_str(),
+            kind = ?row.kind,
+            pause_ms = tracing::field::Empty,
+            disk_drain_ms = tracing::field::Empty,
+            vmstate_ms = tracing::field::Empty,
+            scan_ms = tracing::field::Empty,
+            sealed_chunks = tracing::field::Empty,
+            sealed_disk_blocks = tracing::field::Empty,
+            blackout_ms = tracing::field::Empty,
+        );
+        let step = async {
+            match row.phase {
+                TeleportPhase::Admitted => steps::capture(ctx, &row).await,
+                TeleportPhase::Captured => steps::restore(ctx, &row).await,
+                TeleportPhase::Restored => steps::commit(ctx, &row).await,
+                TeleportPhase::Committed => steps::attach(ctx, &row).await,
+                TeleportPhase::Attached => steps::release(ctx, &row).await,
+                TeleportPhase::RollingBack => steps::rollback(ctx, &row).await,
+                TeleportPhase::Done | TeleportPhase::Aborted | TeleportPhase::Failed => {
+                    Ok(Some(OpOutcome::Done))
+                }
             }
         };
+        let outcome = step.instrument(span).await?;
         if let Some(outcome) = outcome {
             return Ok(outcome);
         }
@@ -473,17 +491,27 @@ mod steps {
                 ctx.fence(),
             )
             .await;
-        if let Err(e) = captured {
-            task.abort_all();
-            let error = if matches!(e, SandboxError::NotFound | SandboxError::AlreadyExists)
-                || e.to_string().contains("presetup")
-            {
-                "live_export_lost".into()
-            } else {
-                e.to_string()
-            };
-            return rollback_begin(ctx, row, error).await;
-        }
+        let captured = match captured {
+            Ok(out) => out,
+            Err(e) => {
+                task.abort_all();
+                let error = if matches!(e, SandboxError::NotFound | SandboxError::AlreadyExists)
+                    || e.to_string().contains("presetup")
+                {
+                    "live_export_lost".into()
+                } else {
+                    e.to_string()
+                };
+                return rollback_begin(ctx, row, error).await;
+            }
+        };
+        let span = tracing::Span::current();
+        span.record("pause_ms", captured.pause_ms);
+        span.record("disk_drain_ms", captured.disk_drain_ms);
+        span.record("vmstate_ms", captured.vmstate_ms);
+        span.record("scan_ms", captured.scan_ms);
+        span.record("sealed_chunks", captured.sealed_chunks);
+        span.record("sealed_disk_blocks", captured.sealed_disk_blocks);
         if let Some(out) =
             advance(ctx, row, TeleportPhase::Captured, TeleportPatch::default()).await?
         {
@@ -497,6 +525,14 @@ mod steps {
             .await
             .expect("restore task")
             .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+        if restored.is_ok() {
+            // The source host's pause stamp to the coordinator's receipt of
+            // the restore: an upper bound across two clocks.
+            span.record(
+                "blackout_ms",
+                state.services.clock.now_utc().timestamp_millis() - captured.paused_at_unix_ms,
+            );
+        }
         finish_live_restore(ctx, &captured_row, restored).await
     }
     async fn finish_live_restore(
