@@ -1,0 +1,48 @@
+[package]
+name = "engram-disk-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A read-only ublk block device whose bytes are one disk manifest, served from a local base volume, the chunk cache and the chunk store"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "engram-disk-source"
+path = "src/main.rs"
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+engram-blob-client.workspace = true
+engram-chunk-store.workspace = true
+engram-core.workspace = true
+futures.workspace = true
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+libublk = "0.4.8"
+nix = { version = "0.31", default-features = false, features = ["event", "fs"] }
+smol = "2"
+
+[dev-dependencies]
+async-trait.workspace = true
+engram-storage-local.workspace = true
+engram-testkit.workspace = true
+proptest.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["signal"] }
+tokio = { workspace = true, features = ["rt"] }

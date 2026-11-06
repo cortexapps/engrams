@@ -86,7 +86,8 @@ import sys
 from pathlib import Path
 
 # Binaries that bake into each artifact.
-FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"}
+FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd",
+           "engram-disk-source"}
 
 # ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator.
 # engram-dst-cosim deliberately spans BOTH closures — it pulls
@@ -111,12 +112,16 @@ COSIM_BINS = {"engram-dst-cosim"}
 # copies it to /usr/local/bin) and is spawned by path, not a cargo
 # dependency, so it must be listed here or a daemon-only change
 # deploys nowhere.
+#
+# engram-disk-source (ADR 0127): the same shape again — the host-agent
+# container carries it and spawns it by path.
 CONTAINER_BINS = {
     "engram-coordinator",
     "engram-host-agent",
     "engram-host-operator",
     "engram-uffd-handler",
     "engram-egress-proxyd",
+    "engram-disk-source",
 }
 # The built-in claude harness binary. ADR 0062: it is NOT baked into any
 # image — it rides the fleet `current_bundles` stamp (the
@@ -157,6 +162,11 @@ E2E_BINS = {
     # builds + ships the daemon too.
     "engram-egress-proxyd",
 }
+
+# Crates whose root tests need the kernel's ublk driver (ADR 0127). They
+# run on their own lane: the Firecracker runners' kernel has no ublk.
+# engram-host-agent runs its disk sources as engram-disk-source processes.
+UBLK_TEST_CRATES = {"engram-disk-source", "engram-host-agent"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -440,6 +450,7 @@ def main():
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
+    ublk_closure = release_closure(meta, UBLK_TEST_CRATES)
     cli = release_closure(meta, CLI_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
@@ -567,7 +578,12 @@ def main():
     # fixtures and mount bundles via the sandbox crates already in the closure;
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
-    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(changed, FC_POOL_PATHS)
+    test_fc = (
+        ci_self
+        or bool(cc & e2e_closure)
+        or fc_fork
+        or any_path(changed, FC_POOL_PATHS)
+    )
     # web / orchestrator: their own sources or the protos they codegen from.
     # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
@@ -584,6 +600,7 @@ def main():
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
     # release closure.
     test_cosim = ci_self or bool(cc & cosim_closure)
+    test_ublk = ci_self or bool(cc & ublk_closure)
 
     # ── per-image bake selectivity ─────────────────────────────────────
     # Each image's lane evaluates against ITS OWN changed set: the registry
@@ -602,8 +619,7 @@ def main():
         if baselines else ({}, {})
 
     coord_closure = release_closure(meta, {"engram-coordinator"})
-    ha_closure = release_closure(
-        meta, {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"})
+    ha_closure = release_closure(meta, FC_BINS)
     hop_closure = release_closure(meta, {"engram-host-operator"})
     dirs = crate_dirs(meta, repo_root)
 
@@ -660,7 +676,7 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_cosim={test_cosim} "
+          f"test_cosim={test_cosim} test_ublk={test_ublk} "
           f"test_integrations_cli={test_integrations_cli} "
           f"test_deploy={test_deploy} test_site={test_site}",
           file=sys.stderr)
@@ -695,6 +711,7 @@ def main():
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
+            f.write(f"test_ublk={b(test_ublk)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             f.write(f"test_deploy={b(test_deploy)}\n")
             f.write(f"test_site={b(test_site)}\n")

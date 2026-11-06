@@ -87,6 +87,12 @@ pub struct Heartbeat {
     /// must still decode).
     #[serde(default)]
     pub capture_job_reports: Vec<CaptureJobReport>,
+    /// Sandboxes whose disks still copy from a source, or whose cutover
+    /// has steps left (ADR 0127 Decision 9). A fact the host restates
+    /// every heartbeat, not an event. Absent from an older host's
+    /// heartbeat, which decodes as none.
+    #[serde(default)]
+    pub hydrating: Vec<SandboxId>,
 }
 
 /// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
@@ -294,6 +300,7 @@ mod tests {
             checkpoints: Vec::new(),
             utilization: Default::default(),
             capture_job_reports: Vec::new(),
+            hydrating: Vec::new(),
         }
     }
 
@@ -594,6 +601,25 @@ mod tests {
         // authoritative "cancel everything you're running".
         assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
+    }
+
+    #[test]
+    fn hydrating_round_trips_and_defaults_to_none_for_an_older_host() {
+        let mut h = sample();
+        h.hydrating = vec![SandboxId::new()];
+        let back: Heartbeat = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!(back.hydrating, h.hydrating);
+
+        let older = r#"{
+            "host_id": "00000000-0000-0000-0000-000000000000",
+            "sent_at": "2026-11-05T00:00:00Z",
+            "capacity": {"total_mib": 1024, "used_mib": 0, "running_sandboxes": 0},
+            "running_sandboxes": [],
+            "draining": false,
+            "capture_job_reports": []
+        }"#;
+        let hb: Heartbeat = serde_json::from_str(older).expect("decode without hydrating");
+        assert!(hb.hydrating.is_empty());
     }
 
     #[test]

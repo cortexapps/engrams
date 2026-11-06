@@ -4003,21 +4003,17 @@ fn persist_sandbox_manifest(
         .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))
 }
 
-/// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
-/// node-level cgroup-v2 leaf `<parent>/<sandbox_id>/`, OUT of the
-/// host-agent's own (pod) cgroup, so a pod-scope `cgroup.kill` on
-/// teardown doesn't reap the microVM. `hostPID` alone is insufficient —
-/// it shares the PID namespace, but the FC processes stay in the pod's
-/// cgroup and die with it. Best-effort: returns the error so the caller
-/// can log loudly, but it never aborts create/restore (the VM still
-/// runs; it just won't survive a pod restart on this host).
+/// ADR 0044 K2: move processes into the node-level cgroup-v2 leaf
+/// `<parent>/<leaf>/`, OUT of the host-agent's own (pod) cgroup, so a
+/// pod-scope `cgroup.kill` on teardown doesn't reap them. `hostPID`
+/// alone is insufficient — it shares the PID namespace, but the
+/// processes stay in the pod's cgroup and die with it. A VM's leaf
+/// (FC + any uffd-handler) is its sandbox id. Callers treat a failure as
+/// best-effort: the process still runs; it just won't survive a pod
+/// restart on this host.
 #[cfg(target_os = "linux")]
-fn escape_to_node_cgroup(
-    parent: &Path,
-    sandbox_id: SandboxId,
-    pids: &[u32],
-) -> std::io::Result<()> {
-    let dir = parent.join(sandbox_id.to_string());
+pub fn escape_to_node_cgroup(parent: &Path, leaf: &str, pids: &[u32]) -> std::io::Result<()> {
+    let dir = parent.join(leaf);
     std::fs::create_dir_all(&dir)?;
     let procs = dir.join("cgroup.procs");
     for &pid in pids {
@@ -4030,11 +4026,7 @@ fn escape_to_node_cgroup(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn escape_to_node_cgroup(
-    _parent: &Path,
-    _sandbox_id: SandboxId,
-    _pids: &[u32],
-) -> std::io::Result<()> {
+pub fn escape_to_node_cgroup(_parent: &Path, _leaf: &str, _pids: &[u32]) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -4046,7 +4038,7 @@ fn place_vm_in_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId, pids: &
     let Some(parent) = parent else {
         return; // dev / tests: no pod scope to escape.
     };
-    match escape_to_node_cgroup(parent, sandbox_id, pids) {
+    match escape_to_node_cgroup(parent, &sandbox_id.to_string(), pids) {
         Ok(()) => tracing::debug!(
             %sandbox_id,
             parent = %parent.display(),
@@ -4064,21 +4056,21 @@ fn place_vm_in_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId, pids: &
     }
 }
 
-/// Remove the per-VM node cgroup leaf [`escape_to_node_cgroup`] created.
-/// `rmdir` of a cgroup only succeeds once it's empty, so `destroy()`
-/// calls this AFTER killing FC + the uffd handler. Best-effort.
-fn remove_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId) {
+/// Remove a node cgroup leaf [`escape_to_node_cgroup`] created. `rmdir`
+/// of a cgroup only succeeds once it's empty, so callers run this AFTER
+/// its processes exit (`destroy()`: after killing FC + the uffd
+/// handler). Best-effort.
+pub fn remove_node_cgroup(parent: Option<&Path>, leaf: &str) {
     let Some(parent) = parent else {
         return;
     };
-    let dir = parent.join(sandbox_id.to_string());
+    let dir = parent.join(leaf);
     if let Err(e) = std::fs::remove_dir(&dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::debug!(
-                %sandbox_id,
                 path = %dir.display(),
                 error = %e,
-                "ADR 0044 K2: could not remove per-VM node cgroup (non-empty or already gone)"
+                "ADR 0044 K2: could not remove node cgroup leaf (non-empty or already gone)"
             );
         }
     }
@@ -6574,7 +6566,7 @@ async fn destroy_teardown(
     // ADR 0044 K2: FC + the uffd handler are gone, so the per-VM node
     // cgroup is now empty — remove it (rmdir of a cgroup only succeeds
     // once empty). No-op when no `vm_cgroup_parent` is configured.
-    remove_node_cgroup(vm_cgroup_parent.as_deref(), id);
+    remove_node_cgroup(vm_cgroup_parent.as_deref(), &id.to_string());
 
     // Tear down per-VM networking: yank iptables rules tagged
     // with this sandbox's chain comment, delete the TAP, return
@@ -7360,9 +7352,9 @@ mod tests {
     #[test]
     fn node_cgroup_escape_creates_leaf_and_writes_pid() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = SandboxId::new();
-        escape_to_node_cgroup(tmp.path(), id, &[4242]).expect("escape");
-        let leaf = tmp.path().join(id.to_string());
+        let id = SandboxId::new().to_string();
+        escape_to_node_cgroup(tmp.path(), &id, &[4242]).expect("escape");
+        let leaf = tmp.path().join(&id);
         assert!(leaf.is_dir(), "per-VM leaf cgroup dir created");
         let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
         assert_eq!(procs.trim(), "4242", "pid written to cgroup.procs");
@@ -7373,13 +7365,13 @@ mod tests {
     fn node_cgroup_remove_drops_empty_leaf_idempotently() {
         // Models destroy() after FC + the handler are killed (empty cgroup).
         let tmp = tempfile::tempdir().unwrap();
-        let id = SandboxId::new();
-        let leaf = tmp.path().join(id.to_string());
+        let id = SandboxId::new().to_string();
+        let leaf = tmp.path().join(&id);
         std::fs::create_dir_all(&leaf).unwrap();
-        remove_node_cgroup(Some(tmp.path()), id);
+        remove_node_cgroup(Some(tmp.path()), &id);
         assert!(!leaf.exists(), "empty leaf removed");
-        remove_node_cgroup(Some(tmp.path()), id); // gone → no-op
-        remove_node_cgroup(None, id); // unconfigured → no-op
+        remove_node_cgroup(Some(tmp.path()), &id); // gone → no-op
+        remove_node_cgroup(None, &id); // unconfigured → no-op
     }
 
     /// Default backend for negative-path unit tests: kernel/firecracker

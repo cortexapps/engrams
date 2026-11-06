@@ -552,6 +552,10 @@ pub struct HeartbeatRequest {
     /// Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
+    /// Sandboxes whose disks still copy from a source, or whose cutover
+    /// has steps left (ADR 0127 Decision 9).
+    #[serde(default)]
+    pub hydrating: Vec<SandboxId>,
 }
 
 #[derive(Deserialize)]
@@ -740,11 +744,13 @@ mod tests {
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
             unreachable_guests: Vec::new(),
+            hydrating: vec![engram_core::SandboxId::new()],
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
         // ADR 0035 amendment D2: the per-sandbox attachment leg rides the same wire.
         assert_eq!(v["sandbox_bundles"][0]["bundles"][0]["sha256"], "ab12");
+        assert_eq!(v["hydrating"].as_array().map(Vec::len), Some(1));
     }
 
     /// ADR 0084 P1b: the new capture-job HTTP-mirror fields must decode

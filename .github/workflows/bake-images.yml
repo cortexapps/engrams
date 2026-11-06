@@ -251,7 +251,7 @@ jobs:
           sudo cp -r /usr/include/linux /usr/include/asm-generic /opt/uapi/
           sudo cp -r /usr/include/x86_64-linux-gnu/asm /opt/uapi/asm
 
-      - name: Build engram-host-agent + engram-uffd-handler + engram-egress-proxyd (musl-static)
+      - name: Build engram-host-agent + engram-uffd-handler + engram-egress-proxyd + engram-disk-source (musl-static)
         env:
           # Point the musl C compile (cc-rs) + bindgen/clang at the system
           # kernel uapi headers so userfaultfd-sys finds <linux/types.h>.
@@ -269,12 +269,15 @@ jobs:
           ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" cargo build \
             --target x86_64-unknown-linux-musl \
             --release \
-            -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd
+            -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd \
+            -p engram-disk-source
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/engram-host-agent dist/
           cp target/x86_64-unknown-linux-musl/release/engram-uffd-handler dist/
           cp target/x86_64-unknown-linux-musl/release/engram-egress-proxyd dist/
-          file dist/engram-host-agent dist/engram-uffd-handler dist/engram-egress-proxyd
+          cp target/x86_64-unknown-linux-musl/release/engram-disk-source dist/
+          file dist/engram-host-agent dist/engram-uffd-handler dist/engram-egress-proxyd \
+            dist/engram-disk-source
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -317,7 +320,8 @@ jobs:
             --artifact-type application/vnd.engrams.fc-host-binaries.v1 \
             engram-host-agent:application/octet-stream \
             engram-uffd-handler:application/octet-stream \
-            engram-egress-proxyd:application/octet-stream
+            engram-egress-proxyd:application/octet-stream \
+            engram-disk-source:application/octet-stream
           # Convenience tags. `oras tag` is a cheap registry-side re-point.
           tag_with_retry "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then

@@ -4,6 +4,8 @@
 
 use std::io;
 
+use engram_host_core::disk::{CloneState, Hydration};
+
 /// A block device number: `major:minor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DevNo {
@@ -108,6 +110,106 @@ pub fn pool_status(status: &str) -> io::Result<PoolStatus> {
         }
         _ => Err(invalid(format!("not thin-pool status: {status:?}"))),
     }
+}
+
+/// `clone` target params: `<metadata> <dest> <source> <region sectors>`,
+/// then the feature and core arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloneTable {
+    pub metadata_dev: DevNo,
+    pub dest_dev: DevNo,
+    pub source_dev: DevNo,
+    pub region_sectors: u64,
+}
+
+impl CloneTable {
+    /// The params a table load takes. The kernel reads `no_hydration`
+    /// only at load; afterwards the `enable_hydration` message turns it
+    /// on. `no_discard_passdown` keeps a discard, which marks regions
+    /// copied, from reaching the destination: its blocks stay as they
+    /// are.
+    pub fn params(&self, hydration: Hydration) -> String {
+        let features = if hydration.enabled {
+            "1 no_discard_passdown"
+        } else {
+            "2 no_hydration no_discard_passdown"
+        };
+        format!(
+            "{} {} {} {} {features} 4 hydration_threshold {} hydration_batch_size {}",
+            self.metadata_dev,
+            self.dest_dev,
+            self.source_dev,
+            self.region_sectors,
+            hydration.threshold_regions,
+            hydration.batch_regions
+        )
+    }
+}
+
+pub fn clone_table(params: &str) -> io::Result<CloneTable> {
+    let fields: Vec<&str> = params.split_whitespace().collect();
+    match fields.as_slice() {
+        [metadata, dest, source, region_sectors, ..] => Ok(CloneTable {
+            metadata_dev: DevNo::parse(metadata)?,
+            dest_dev: DevNo::parse(dest)?,
+            source_dev: DevNo::parse(source)?,
+            region_sectors: number(region_sectors)?,
+        }),
+        _ => Err(invalid(format!("not clone params: {params:?}"))),
+    }
+}
+
+/// `clone` status: `<metadata block sectors> <used>/<total> <region
+/// sectors> <hydrated>/<total regions> <in flight> <n features>
+/// <features>... <n core args> <core args>... <mode>`.
+///
+/// A clone whose metadata is not read-write (`ro`, or a single-word
+/// `Fail`) is an error: it cannot record a copy, so its counts no longer
+/// move.
+pub fn clone_status(status: &str) -> io::Result<CloneState> {
+    let fields: Vec<&str> = status.split_whitespace().collect();
+    let [_, _, _, regions, _, features, rest @ ..] = fields.as_slice() else {
+        return match fields.as_slice() {
+            [word] => Err(invalid(format!("clone is {word}"))),
+            _ => Err(invalid(format!("not clone status: {status:?}"))),
+        };
+    };
+    let n_features: usize = number(features)?;
+    let feature_args = rest
+        .get(..n_features)
+        .ok_or_else(|| invalid(format!("clone status is short: {status:?}")))?;
+    match rest.last() {
+        Some(&"rw") => {}
+        Some(mode) => return Err(invalid(format!("clone is {mode}"))),
+        None => return Err(invalid(format!("not clone status: {status:?}"))),
+    }
+    let (hydrated_regions, total_regions) = fraction(regions)?;
+    Ok(CloneState::Copying {
+        hydrated_regions,
+        total_regions,
+        hydration_enabled: !feature_args.contains(&"no_hydration"),
+    })
+}
+
+const CLONE_MAGIC: u64 = 0x8af2_7f64;
+const CLONE_MAGIC_AT: usize = 32;
+const CLONE_REGION_AT: usize = 172;
+
+/// The region size, in sectors, that a dm-clone superblock records
+/// (`struct superblock_disk` in `drivers/md/dm-clone-metadata.c`: the
+/// magic at byte 32 and the region size at byte 172, little-endian).
+/// The kernel refuses a table whose region size differs.
+pub fn clone_superblock_region_sectors(superblock: &[u8]) -> io::Result<u64> {
+    let le64 = |at: usize| {
+        superblock
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| invalid("dm-clone superblock is short"))
+    };
+    if le64(CLONE_MAGIC_AT)? != CLONE_MAGIC {
+        return Err(invalid("no dm-clone superblock"));
+    }
+    le64(CLONE_REGION_AT)
 }
 
 /// The `DEVNAME=` line of a sysfs `uevent` file.
@@ -277,5 +379,125 @@ mod tests {
         assert!(delta_blocks("<superblock>\n<diff>\n</diff>\n</superblock>")
             .unwrap()
             .is_empty());
+    }
+
+    fn dev(major: u32, minor: u32) -> DevNo {
+        DevNo { major, minor }
+    }
+
+    /// `dmsetup table` of a clone made with hydration off, kernel 6.8.
+    const CLONE_TABLE: &str = "252:2 252:1 7:4 128 2 no_hydration no_discard_passdown 4 hydration_threshold 2 hydration_batch_size 3";
+
+    #[test]
+    fn clone_params_format_what_the_kernel_reads_back() {
+        let table = CloneTable {
+            metadata_dev: dev(252, 2),
+            dest_dev: dev(252, 1),
+            source_dev: dev(7, 4),
+            region_sectors: 128,
+        };
+        let off = Hydration {
+            enabled: false,
+            threshold_regions: 2,
+            batch_regions: 3,
+        };
+        assert_eq!(table.params(off), CLONE_TABLE);
+        assert_eq!(
+            table.params(Hydration {
+                enabled: true,
+                ..off
+            }),
+            "252:2 252:1 7:4 128 1 no_discard_passdown 4 hydration_threshold 2 hydration_batch_size 3"
+        );
+        assert_eq!(clone_table(CLONE_TABLE).unwrap(), table);
+        assert!(clone_table("252:2 252:1 7:4").is_err());
+    }
+
+    #[test]
+    fn clone_status_reads_the_region_counts_and_the_hydration_flag() {
+        // `dmsetup status` of one clone, kernel 6.8: new, after one guest
+        // write, hydrated with hydration on.
+        let fresh = clone_status(
+            "8 6/1024 128 0/64 0 1 no_hydration 4 hydration_threshold 2 hydration_batch_size 3 rw",
+        )
+        .unwrap();
+        assert_eq!(
+            fresh,
+            CloneState::Copying {
+                hydrated_regions: 0,
+                total_regions: 64,
+                hydration_enabled: false
+            }
+        );
+        let written = clone_status(
+            "8 6/1024 128 1/64 0 1 no_hydration 4 hydration_threshold 2 hydration_batch_size 3 rw",
+        )
+        .unwrap();
+        assert!(matches!(
+            written,
+            CloneState::Copying {
+                hydrated_regions: 1,
+                ..
+            }
+        ));
+        let done = clone_status(
+            "8 6/1024 128 64/64 0 0 4 hydration_threshold 2 hydration_batch_size 3 rw",
+        )
+        .unwrap();
+        assert_eq!(
+            done,
+            CloneState::Copying {
+                hydrated_regions: 64,
+                total_regions: 64,
+                hydration_enabled: true
+            }
+        );
+        // The kernel emits `no_hydration` before `no_discard_passdown`.
+        for (features, enabled) in [
+            ("2 no_hydration no_discard_passdown", false),
+            ("1 no_discard_passdown", true),
+        ] {
+            let status = format!(
+                "8 6/1024 128 5/64 0 {features} 4 hydration_threshold 2 hydration_batch_size 3 rw"
+            );
+            assert_eq!(
+                clone_status(&status).unwrap(),
+                CloneState::Copying {
+                    hydrated_regions: 5,
+                    total_regions: 64,
+                    hydration_enabled: enabled
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_region_size_comes_from_a_clone_superblock() {
+        // The first bytes of a bitmap after one `clone` table load with
+        // region 128 and 16384 sectors, kernel 6.8.
+        let mut superblock = vec![0u8; 4096];
+        superblock[..4].copy_from_slice(&[0x4a, 0x96, 0x31, 0xd2]);
+        superblock[32..36].copy_from_slice(&[0x64, 0x7f, 0xf2, 0x8a]);
+        superblock[40] = 1;
+        superblock[172] = 0x80;
+        superblock[181] = 0x40;
+        assert_eq!(clone_superblock_region_sectors(&superblock).unwrap(), 128);
+        assert!(clone_superblock_region_sectors(&vec![0u8; 4096]).is_err());
+        assert!(clone_superblock_region_sectors(&superblock[..100]).is_err());
+    }
+
+    #[test]
+    fn clone_status_rejects_a_clone_that_cannot_record_a_copy() {
+        for (status, want) in [
+            ("Fail", "clone is Fail"),
+            (
+                "8 6/1024 128 3/64 0 0 4 hydration_threshold 2 hydration_batch_size 3 ro",
+                "clone is ro",
+            ),
+        ] {
+            assert_eq!(clone_status(status).unwrap_err().to_string(), want);
+        }
+        assert!(clone_status("8 6/1024 128 3/64").is_err());
+        assert!(clone_status("8 6/1024 128 3/64 0 2 no_hydration").is_err());
     }
 }

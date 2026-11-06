@@ -349,8 +349,9 @@ pub struct PooledBackend {
     /// checkpoint completed; every later capture is a diff against it.
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     /// Serializes captures per sandbox: a periodic checkpoint never
-    /// interleaves with an eviction snapshot.
-    capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    /// interleaves with an eviction snapshot, and a disk cutover never
+    /// runs between a checkpoint's take and its publish.
+    capture_locks: Arc<CaptureLocks>,
     /// `sandbox_id → snapshot_id` of an in-flight, durably persisted
     /// eviction finalize job (issue #529). Makes `snapshot_begin`
     /// idempotent under an eviction-scanner retry storm, and keeps
@@ -377,6 +378,15 @@ pub struct PooledBackend {
     drained_dests: Arc<DashMap<SandboxId, engram_core::types::snapshot::DrainOutcome>>,
     /// Optional hint polling stops as soon as the memory drain terminates.
     hint_pollers: Arc<DashMap<SandboxId, AbortTaskOnDrop>>,
+    /// The task of each sandbox whose disks still copy from a source.
+    hydrations: Arc<crate::hydration::Hydrations>,
+    /// The background memory prefetch of a restore, which goes with its
+    /// sandbox.
+    memory_prefetches: Arc<DashMap<SandboxId, AbortTaskOnDrop>>,
+    /// When a restore boots over a source before its disks are written.
+    lazy_restore: crate::config::LazyRestore,
+    /// What `auto` allows an eager restore to write.
+    eager_budget: crate::config::EagerBudget,
     /// The SIGTERM capture quiesce: raised once, never lowered.
     /// `capture_phase` refuses under the capture lock before anything is
     /// consumed, so a capture never walks into the runtime teardown.
@@ -520,17 +530,25 @@ fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind)
         .increment(1);
 }
 
-/// Abort the wrapped task on drop, including hint polling after DrainDone.
-/// A leg wrapped by
-/// [`spawn_leg_keepalive`] stops resending stale progress the moment
-/// the guard goes out of scope — on every path, including an early
-/// `?`-return, since `Drop` runs during unwind too.
-struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+/// Aborts the wrapped task when dropped, on every path: an early
+/// `?`-return and an unwind drop it too.
+pub(crate) struct AbortTaskOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// The capture lock of each sandbox.
+pub(crate) type CaptureLocks = DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>;
+
+/// The sandbox's capture lock, made on first use.
+pub(crate) fn capture_lock_in(locks: &CaptureLocks, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
+    locks
+        .entry(id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Observe the local handler independently of the coordinator's drain-wait RPC.
@@ -1235,12 +1253,8 @@ impl PooledBackend {
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         let new_id = id;
-        let post_copy_dest = self.postcopy_dests.contains_key(&metadata.id)
-            || self
-                .inner
-                .snapshot_path_for(metadata.id)
-                .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
-                .exists();
+        let post_copy_dest =
+            self.is_post_copy_dest(metadata.id, &self.inner.snapshot_path_for(metadata.id));
         // Memory is served lazily (UFFD faults / peer) for a substrate
         // base-create, a UFFD resume, and every staged migration restore;
         // a File-mode restore needs a contiguous `memory.bin`. One
@@ -1270,7 +1284,7 @@ impl PooledBackend {
             }
         } else if let Some(cs) = self.chunk_store.clone() {
             let md = metadata.clone();
-            tokio::spawn(tracing::Instrument::instrument(
+            let prefetch = tokio::spawn(tracing::Instrument::instrument(
                 async move {
                     if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
                         tracing::warn!(
@@ -1282,6 +1296,7 @@ impl PooledBackend {
                 },
                 tracing::info_span!("restore.prefetch_memory_bg"),
             ));
+            self.memory_prefetches.insert(id, AbortTaskOnDrop(prefetch));
         }
 
         let src = self.inner.snapshot_path_for(metadata.id);
@@ -1309,15 +1324,27 @@ impl PooledBackend {
             }
         }
 
-        let disks = match self.volumes.as_ref() {
-            Some(volumes) => Some(
-                tracing::Instrument::instrument(
+        let (disks, lazy_disks) = match self.volumes.as_ref() {
+            Some(volumes) => {
+                let provisioned = tracing::Instrument::instrument(
                     self.provision_for_restore(volumes, id, &metadata, &src, fresh, fork_disk),
-                    tracing::info_span!("restore.provision_disks"),
+                    tracing::info_span!(
+                        "restore.provision_disks",
+                        root_path = tracing::field::Empty,
+                        root_estimate_seconds = tracing::field::Empty,
+                        swap_path = tracing::field::Empty,
+                        swap_estimate_seconds = tracing::field::Empty,
+                        provision_seconds = tracing::field::Empty,
+                    ),
                 )
-                .await?,
-            ),
-            None => None,
+                .await;
+                if provisioned.is_err() {
+                    self.memory_prefetches.remove(&id);
+                }
+                let (disks, lazy) = provisioned?;
+                (Some(disks), lazy)
+            }
+            None => (None, false),
         };
         let restore = async {
             // A staged post-copy destination arms its fetch poller as soon
@@ -1383,6 +1410,14 @@ impl PooledBackend {
             let inner = self.inner.clone();
             let migration_roles = self.migration_roles.clone();
             let hint_pollers = self.hint_pollers.clone();
+            let hydration = match (lazy_disks, &self.volumes) {
+                (true, Some(volumes)) => Some((
+                    self.hydrations.clone(),
+                    volumes.clone(),
+                    self.capture_locks.clone(),
+                )),
+                _ => None,
+            };
             let disks = disks.clone();
             tokio::spawn(async move {
                 if fresh {
@@ -1401,6 +1436,9 @@ impl PooledBackend {
                 if post_copy_dest {
                     migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
                 }
+                if let Some((hydrations, volumes, capture_locks)) = hydration {
+                    hydrations.arm(new_id, volumes, capture_locks);
+                }
                 Ok(())
             })
             .await
@@ -1408,6 +1446,7 @@ impl PooledBackend {
         }
         .await;
         if restore.is_err() {
+            self.memory_prefetches.remove(&id);
             if let Some(volumes) = self.volumes.as_ref() {
                 if let Err(error) = volumes.release(id).await {
                     tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
@@ -1417,7 +1456,18 @@ impl PooledBackend {
         restore
     }
 
-    /// Provision a restored sandbox's disks from the snapshot's manifests.
+    /// The restore of `snapshot` from its folder `dir` is the destination
+    /// of a live move.
+    fn is_post_copy_dest(&self, snapshot: engram_core::SnapshotId, dir: &Path) -> bool {
+        self.postcopy_dests.contains_key(&snapshot)
+            || dir
+                .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
+                .exists()
+    }
+
+    /// Provision a restored sandbox's disks from the snapshot's manifests,
+    /// each eagerly or over a source as [`Self::restore_paths`] picks.
+    /// Returns the disks and whether any boots over a source.
     async fn provision_for_restore(
         &self,
         volumes: &SessionVolumes,
@@ -1426,7 +1476,7 @@ impl PooledBackend {
         src: &Path,
         fresh: bool,
         fork_disk: bool,
-    ) -> Result<SessionDisks, SandboxError> {
+    ) -> Result<(SessionDisks, bool), SandboxError> {
         let manifest = metadata.disk_manifest.ok_or_else(|| {
             SandboxError::MemoryImageUnusable("snapshot has no disk manifest".into())
         })?;
@@ -1462,14 +1512,158 @@ impl PooledBackend {
                 size_bytes: mib << 20,
             }),
         };
+        let mut disks = vec![(DiskRole::Root, root)];
+        disks.extend(swap.map(|source| (DiskRole::Swap, source)));
+        let move_dest = self.is_post_copy_dest(metadata.id, src);
+        let mut chosen = self
+            .restore_paths(volumes, id, &disks, move_dest)
+            .await
+            .into_iter();
+        let root = chosen.next().expect("a source for each disk");
+        let swap = chosen.next();
+        let lazy = [Some(root), swap]
+            .into_iter()
+            .flatten()
+            .any(|s| matches!(s, Source::LazyFork { .. } | Source::LazyContinue { .. }));
+        let started = crate::time_source::metrics_now();
         let provisioned = volumes
             .provision(id, root, swap)
             .await
             .map_err(|e| SandboxError::Vm(format!("provision session disks: {e}").into()))?;
-        Ok(SessionDisks {
+        let seconds = started.elapsed().as_secs_f64();
+        tracing::Span::current().record("provision_seconds", seconds);
+        metrics::histogram!(
+            crate::metrics::DISK_RESTORE_PROVISION_SECONDS,
+            "path" => if lazy { "lazy" } else { "eager" },
+        )
+        .record(seconds);
+        let disks = SessionDisks {
             root: provisioned.root,
             swap: provisioned.swap,
-        })
+        };
+        Ok((disks, lazy))
+    }
+
+    /// The source each disk restores from: its eager source, or the lazy
+    /// counterpart (ADR 0127 Decision 1). `off` is always eager. `force` is
+    /// lazy for each disk whose eager provision would write. `auto` gives
+    /// the disks one budget ([`lazy_disks`]); a disk whose estimate cannot
+    /// be read is eager. A host that cannot start a source, and a disk of zeros,
+    /// is eager. `force` and `auto` record each estimate.
+    ///
+    /// A live move's destination (`move_dest`) is eager in every mode: the
+    /// move writes the source's later blocks into the live volumes before
+    /// the guest boots, and a drive that still copies cannot open as a
+    /// volume. Every other restore writes its disks only through the guest,
+    /// so it can be lazy.
+    ///
+    /// [`lazy_disks`]: engram_host_core::eager_estimate::lazy_disks
+    async fn restore_paths(
+        &self,
+        volumes: &SessionVolumes,
+        id: SandboxId,
+        disks: &[(DiskRole, Source)],
+        move_dest: bool,
+    ) -> Vec<Source> {
+        use crate::config::LazyRestore;
+        let considered = |source: &Source| {
+            self.lazy_restore != LazyRestore::Off
+                && !move_dest
+                && volumes.can_start_sources()
+                && !matches!(source, Source::Empty { .. })
+        };
+        let mut estimates = Vec::with_capacity(disks.len());
+        for (role, source) in disks {
+            if !considered(source) {
+                estimates.push(None);
+                continue;
+            }
+            estimates.push(match self.eager_estimate(volumes, id, *role, *source).await {
+                Ok(estimate) => Some(estimate),
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, %role, %error, "eager restore estimate failed");
+                    None
+                }
+            });
+        }
+        let lazy: Vec<bool> = match self.lazy_restore {
+            LazyRestore::Off => vec![false; disks.len()],
+            LazyRestore::Force => disks
+                .iter()
+                .zip(&estimates)
+                .map(|((_, source), e)| considered(source) && e.is_none_or(|e| e.writes()))
+                .collect(),
+            LazyRestore::Auto => {
+                let seconds: Vec<Option<f64>> =
+                    estimates.iter().map(|e| e.map(|e| e.seconds)).collect();
+                engram_host_core::eager_estimate::lazy_disks(&seconds, self.eager_budget.seconds)
+            }
+        };
+        let span = tracing::Span::current();
+        disks
+            .iter()
+            .zip(estimates)
+            .zip(lazy)
+            .map(|((&(role, source), estimate), lazy)| {
+                if !considered(&source) {
+                    return source;
+                }
+                let path = if lazy { "lazy" } else { "eager" };
+                let (path_field, estimate_field) = match role {
+                    DiskRole::Root => ("root_path", "root_estimate_seconds"),
+                    DiskRole::Swap => ("swap_path", "swap_estimate_seconds"),
+                };
+                span.record(path_field, path);
+                if let Some(e) = estimate {
+                    span.record(estimate_field, e.seconds);
+                    metrics::histogram!(crate::metrics::DISK_RESTORE_ESTIMATE_SECONDS, "role" => role.to_string())
+                        .record(e.seconds);
+                    tracing::info!(
+                        sandbox_id = %id,
+                        %role,
+                        path,
+                        estimate_seconds = e.seconds,
+                        local_bytes = e.local_bytes,
+                        remote_bytes = e.remote_bytes,
+                        "disk restore path",
+                    );
+                }
+                metrics::counter!(crate::metrics::DISK_RESTORE_TOTAL, "path" => path, "role" => role.to_string())
+                    .increment(1);
+                if lazy {
+                    source.into_lazy()
+                } else {
+                    source
+                }
+            })
+            .collect()
+    }
+
+    /// The time an eager provision of `source` writes before the guest
+    /// boots. A chunk in the chunk cache counts as local.
+    async fn eager_estimate(
+        &self,
+        volumes: &SessionVolumes,
+        id: SandboxId,
+        role: DiskRole,
+        source: Source,
+    ) -> std::io::Result<engram_host_core::eager_estimate::Estimate> {
+        use engram_host_core::eager_estimate::{estimate, Estimate};
+        let Some(plan) = volumes.eager_plan(id, role, source).await? else {
+            return Ok(Estimate {
+                local_bytes: 0,
+                remote_bytes: 0,
+                seconds: 0.0,
+            });
+        };
+        let cache = self.chunk_cache.as_ref();
+        estimate(
+            &plan.wanted,
+            plan.base.as_ref(),
+            |hash| cache.is_some_and(|c| c.contains_on_disk(hash)),
+            self.eager_budget.rates,
+        )
+        .map_err(std::io::Error::other)
     }
 
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
@@ -1507,6 +1701,10 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             drained_dests: Arc::new(DashMap::new()),
             hint_pollers: Arc::new(DashMap::new()),
+            hydrations: crate::hydration::Hydrations::new(crate::hydration::DEFAULT_INTERVAL),
+            memory_prefetches: Arc::new(DashMap::new()),
+            lazy_restore: crate::config::LazyRestore::Off,
+            eager_budget: crate::config::EagerBudget::default(),
             captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
@@ -1521,6 +1719,86 @@ impl PooledBackend {
 
     pub fn session_volumes(&self) -> Option<&Arc<SessionVolumes>> {
         self.volumes.as_ref()
+    }
+
+    /// When a restore boots over a source, and what `auto` allows an
+    /// eager restore to write.
+    pub fn with_lazy_restore(
+        mut self,
+        mode: crate::config::LazyRestore,
+        budget: crate::config::EagerBudget,
+    ) -> Self {
+        self.lazy_restore = mode;
+        self.eager_budget = budget;
+        self
+    }
+
+    /// How often a sandbox's hydration task looks at its disks.
+    pub fn with_hydration_interval(mut self, interval: std::time::Duration) -> Self {
+        self.hydrations = crate::hydration::Hydrations::new(interval);
+        self
+    }
+
+    /// Start the task that cuts the sandbox's cloned disks over to their
+    /// destinations once they are copied, unless it has one. A restore
+    /// that boots over a source arms it once the VM runs.
+    pub fn arm_hydration(&self, id: SandboxId) {
+        if let Some(volumes) = &self.volumes {
+            self.hydrations
+                .arm(id, volumes.clone(), self.capture_locks.clone());
+        }
+    }
+
+    /// Arm the hydration of every live sandbox with a disk that still
+    /// copies or whose cutover has steps left. Run once at startup, after
+    /// the sources are recovered and the volumes reconciled.
+    pub async fn rearm_hydrations(&self) {
+        if self.volumes.is_none() {
+            return;
+        }
+        let live = match self.inner.list().await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "hydration re-arm skipped: cannot list sandboxes");
+                return;
+            }
+        };
+        for id in live {
+            if self.hydrates(id).await {
+                self.arm_hydration(id);
+            }
+        }
+    }
+
+    /// The sandbox has a disk left to cut over. A disk whose state cannot
+    /// be read counts: the task tries again and logs why.
+    async fn hydrates(&self, id: SandboxId) -> bool {
+        let Some(volumes) = &self.volumes else {
+            return false;
+        };
+        let roles = match volumes.roles(id).await {
+            Ok(roles) => roles,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %id, %error, "hydration re-arm: cannot list the disks");
+                return true;
+            }
+        };
+        for role in roles {
+            match volumes.hydration(id, role).await {
+                Ok(None) => {}
+                Ok(Some(_)) => return true,
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, %role, %error, "hydration re-arm: cannot read the disk");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The sandboxes with a hydration task, for the heartbeat.
+    pub fn hydrating(&self) -> Vec<SandboxId> {
+        self.hydrations.sandboxes()
     }
 
     fn volumes(&self) -> Result<&Arc<SessionVolumes>, SandboxError> {
@@ -1673,10 +1951,7 @@ impl PooledBackend {
     /// The per-sandbox capture serialization lock (periodic
     /// checkpoint vs eviction/drain/SIGTERM snapshot).
     fn capture_lock(&self, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
-        self.capture_locks
-            .entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        capture_lock_in(&self.capture_locks, id)
     }
 
     /// ADR 0038 B1: is a capture (eviction / evac / drain / a prior
@@ -5743,6 +6018,8 @@ impl SandboxBackend for PooledBackend {
         // A held source forgets its swap policy and metadata with the VM.
         self.held_snapshots.remove(&id);
         self.hint_pollers.remove(&id);
+        self.hydrations.disarm(id);
+        self.memory_prefetches.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
@@ -8978,6 +9255,335 @@ mod tests {
         assert!(
             seal.upgrade().is_none(),
             "nothing holds the precopy snapshot after destroy"
+        );
+    }
+
+    /// Session volumes over a file-backed disk with file sources, and a
+    /// published manifest of a disk whose block 0 holds `root_block`.
+    async fn volumes_with_sources(
+        tmp: &std::path::Path,
+    ) -> (
+        Arc<SessionVolumes>,
+        engram_core::types::manifest::ManifestRef,
+    ) {
+        volumes_with_these_sources(tmp, true).await
+    }
+
+    /// [`volumes_with_sources`] whose sources start only when `can_start`.
+    async fn volumes_with_these_sources(
+        tmp: &std::path::Path,
+        can_start: bool,
+    ) -> (
+        Arc<SessionVolumes>,
+        engram_core::types::manifest::ManifestRef,
+    ) {
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+        let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(tmp.join("blob"))));
+        let disk: Arc<dyn engram_host_core::SessionDisk> = Arc::new(
+            engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
+                .unwrap(),
+        );
+        let files = engram_host_core::FileSources::new(tmp.join("sources"), store.clone()).unwrap();
+        let sources: Arc<dyn engram_host_core::DiskSources> = if can_start {
+            Arc::new(files)
+        } else {
+            Arc::new(NoStart(files))
+        };
+        let volumes = Arc::new(SessionVolumes::new(disk, store).with_sources(sources));
+        let published = SandboxId::new();
+        volumes
+            .provision(
+                published,
+                Source::Empty {
+                    size_bytes: 2 * MIGRATION_DISK_BLOCK_BYTES,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let live = volumes.live(published, DiskRole::Root).await.unwrap();
+        live.write_chunk(ChunkIndex(0), root_block()).await.unwrap();
+        drop(live);
+        let manifest = volumes.checkpoint(published, DiskRole::Root).await.unwrap();
+        volumes.purge(published).await.unwrap();
+        (volumes, manifest)
+    }
+
+    /// [`volumes_with_sources`] with a root `id` restored lazily from the
+    /// manifest. `FileDisk` copies the whole source at the restore, so the
+    /// root is hydrated.
+    async fn volumes_with_a_lazy_root(tmp: &std::path::Path, id: SandboxId) -> Arc<SessionVolumes> {
+        let (volumes, manifest) = volumes_with_sources(tmp).await;
+        volumes
+            .provision(
+                id,
+                Source::LazyFork {
+                    manifest,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        volumes
+    }
+
+    /// `off` restores eagerly, `force` over a source when the eager path
+    /// would write, and `auto` over a source only when the estimate passes
+    /// the budget.
+    #[tokio::test]
+    async fn the_lazy_restore_mode_picks_the_path_of_each_disk() {
+        use crate::config::{EagerBudget, LazyRestore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (volumes, manifest) = volumes_with_sources(tmp.path()).await;
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
+        let over = |seconds| EagerBudget {
+            seconds,
+            ..EagerBudget::default()
+        };
+        for (mode, budget, lazy) in [
+            (LazyRestore::Off, over(0.0), false),
+            (LazyRestore::Force, over(2.0), true),
+            (LazyRestore::Auto, over(2.0), false),
+            (LazyRestore::Auto, over(0.0), true),
+        ] {
+            let pooled = hydrating_backend(&volumes).with_lazy_restore(mode, budget);
+            let id = SandboxId::new();
+
+            let (disks, got) = pooled
+                .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+                .await
+                .unwrap();
+
+            assert_eq!(got, lazy, "{mode:?} with a budget of {}", budget.seconds);
+            let drive = engram_host_core::session_volumes::live_name(id, DiskRole::Root);
+            assert_eq!(volumes.disk().clone_state(&drive).await.is_ok(), lazy);
+            let root = std::fs::read(&disks.root).unwrap();
+            assert_eq!(&root[..root_block().len()], &root_block()[..]);
+            volumes.purge(id).await.unwrap();
+        }
+
+        // A checkpoint this host kept at exactly the manifest is adopted,
+        // which writes nothing, so `force` restores it eagerly.
+        let released = SandboxId::new();
+        let continued = Source::Continue {
+            manifest,
+            base: None,
+        };
+        volumes.provision(released, continued, None).await.unwrap();
+        volumes.release(released).await.unwrap();
+        let pooled = hydrating_backend(&volumes).with_lazy_restore(LazyRestore::Force, over(2.0));
+        let id = SandboxId::new();
+        let (_, lazy) = pooled
+            .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+            .await
+            .unwrap();
+        assert!(!lazy, "an adopted checkpoint restores eagerly under force");
+    }
+
+    /// A live move's destination restores eagerly under `force`: the move
+    /// writes into its live volumes before the guest boots.
+    #[tokio::test]
+    async fn a_move_destination_restores_eagerly_under_force() {
+        use crate::config::{EagerBudget, LazyRestore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (volumes, manifest) = volumes_with_sources(tmp.path()).await;
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
+        std::fs::write(
+            src.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
+            b"{}",
+        )
+        .unwrap();
+        let pooled = hydrating_backend(&volumes).with_lazy_restore(
+            LazyRestore::Force,
+            EagerBudget {
+                seconds: 0.0,
+                ..EagerBudget::default()
+            },
+        );
+        let id = SandboxId::new();
+
+        let (_, lazy) = pooled
+            .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+            .await
+            .unwrap();
+
+        assert!(!lazy);
+        assert!(volumes.live(id, DiskRole::Root).await.is_ok());
+    }
+
+    /// A snapshot folder and metadata for a restore of a root disk from
+    /// `manifest`, with no swap and no memory.
+    fn root_only_snapshot(
+        tmp: &std::path::Path,
+        manifest: engram_core::types::manifest::ManifestRef,
+    ) -> (std::path::PathBuf, SnapshotMetadata) {
+        let src = tmp.join("snapshot");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("manifest.json"), br#"{"spec":{}}"#).unwrap();
+        let metadata = SnapshotMetadata {
+            id: engram_core::SnapshotId::new(),
+            size_bytes: 4096,
+            created_at: chrono::Utc::now(),
+            image_version: "image:1".into(),
+            swap_manifest: None,
+            disk_manifest: Some(manifest),
+            memory_manifest: None,
+            base_memory_manifest: None,
+            base_disk_manifest: None,
+            migration_source: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+            aux_bundles: vec![],
+            paused_at: None,
+            peer_hints: Vec::new(),
+        };
+        (src, metadata)
+    }
+
+    /// File sources on a host that cannot start one, as a host without
+    /// the ublk driver.
+    struct NoStart(engram_host_core::FileSources);
+
+    #[async_trait::async_trait]
+    impl engram_host_core::DiskSources for NoStart {
+        fn can_start(&self) -> bool {
+            false
+        }
+        async fn start(
+            &self,
+            _: SandboxId,
+            _: DiskRole,
+            _: engram_core::types::manifest::ManifestRef,
+            _: Option<(
+                &engram_host_core::Volume,
+                engram_core::types::manifest::ManifestRef,
+            )>,
+        ) -> std::io::Result<std::path::PathBuf> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+            self.0.ensure_alive(sandbox, role).await
+        }
+        async fn served(
+            &self,
+            sandbox: SandboxId,
+            role: DiskRole,
+        ) -> std::io::Result<engram_host_core::disk_sources::Served> {
+            self.0.served(sandbox, role).await
+        }
+        async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+            self.0.stop(sandbox, role).await
+        }
+        async fn list(&self) -> std::io::Result<Vec<(SandboxId, DiskRole)>> {
+            self.0.list().await
+        }
+    }
+
+    /// A host that cannot start a source restores eagerly in every mode,
+    /// where a lazy restore would fail.
+    #[tokio::test]
+    async fn a_host_that_cannot_start_a_source_restores_eagerly() {
+        use crate::config::{EagerBudget, LazyRestore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (volumes, manifest) = volumes_with_these_sources(tmp.path(), false).await;
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
+        let budget = EagerBudget {
+            seconds: 0.0,
+            ..EagerBudget::default()
+        };
+        for mode in [LazyRestore::Force, LazyRestore::Auto] {
+            let pooled = hydrating_backend(&volumes).with_lazy_restore(mode, budget);
+            let id = SandboxId::new();
+            let (_, lazy) = pooled
+                .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+                .await
+                .unwrap();
+            assert!(!lazy, "{mode:?}");
+            volumes.purge(id).await.unwrap();
+        }
+    }
+
+    fn hydrating_backend(volumes: &Arc<SessionVolumes>) -> PooledBackend {
+        PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone())
+        .with_hydration_interval(std::time::Duration::from_millis(1))
+    }
+
+    /// A drive cut over before a crash, with its bitmap and source left,
+    /// needs the task on re-arm: it finishes the cutover and ends. A
+    /// sandbox without a cloned disk needs none.
+    #[tokio::test]
+    async fn a_rearmed_hydration_finishes_a_cutover_cut_short_and_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_lazy_root(tmp.path(), id).await;
+        volumes
+            .disk()
+            .cut_over(&engram_host_core::session_volumes::live_name(
+                id,
+                DiskRole::Root,
+            ))
+            .await
+            .unwrap();
+        let plain = SandboxId::new();
+        volumes
+            .provision(
+                plain,
+                Source::Empty {
+                    size_bytes: MIGRATION_DISK_BLOCK_BYTES,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let pooled = hydrating_backend(&volumes);
+        assert!(pooled.hydrates(id).await);
+        assert!(!pooled.hydrates(plain).await);
+
+        pooled.arm_hydration(id);
+        pooled.arm_hydration(id);
+        assert_eq!(pooled.hydrating(), vec![id]);
+        for _ in 0..500 {
+            if pooled.hydrating().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        assert!(pooled.hydrating().is_empty());
+        assert_eq!(volumes.hydration(id, DiskRole::Root).await.unwrap(), None);
+        assert!(!pooled.hydrates(id).await);
+    }
+
+    /// A cutover waits while a checkpoint pair exists, so the task keeps
+    /// running; destroy stops it with the sandbox.
+    #[tokio::test]
+    async fn destroy_stops_the_hydration_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_lazy_root(tmp.path(), id).await;
+        drop(volumes.take(id, DiskRole::Root).await.unwrap());
+        let pooled = hydrating_backend(&volumes);
+
+        pooled.arm_hydration(id);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(pooled.hydrating(), vec![id]);
+        pooled.destroy(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(pooled.hydrating().is_empty());
+        assert!(volumes.roles(id).await.unwrap().is_empty());
+        assert!(
+            !pooled.capture_locks.contains_key(&id),
+            "a stopped task takes no capture lock"
         );
     }
 

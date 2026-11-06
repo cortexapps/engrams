@@ -70,6 +70,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
 pub mod dirty_map;
+pub mod disk_source;
 pub mod durable_envelope;
 pub mod durable_record;
 pub mod egress;
@@ -87,6 +88,7 @@ pub use host_client::LocalHostClient;
 #[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
+mod hydration;
 pub mod idle_evictor;
 pub mod image_cache;
 pub mod image_prefetch;
@@ -129,6 +131,9 @@ pub struct HostAgent {
     /// Where image and session volumes live. `None` keeps readiness on
     /// the chunk cache alone and leaves the disks to the backend.
     pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
+    /// The sources lazy restores read from (ADR 0127), whatever the lazy
+    /// restore mode. `None` only in tests.
+    pub disk_sources: Option<Arc<dyn engram_host_core::DiskSources>>,
     /// This host's stable id, stamped on snapshot trace hints and passed
     /// to the UFFD handler. `None` generates one at run time.
     pub host_id: Option<engram_core::HostId>,
@@ -153,6 +158,7 @@ impl HostAgent {
             chunk_cache: None,
             fc_for_reattach: None,
             session_disk: None,
+            disk_sources: None,
             host_id: None,
             base_shm_protected: base_shm_gc::ProtectedPaths::new(),
         }
@@ -188,6 +194,11 @@ impl HostAgent {
 
     pub fn with_session_disk(mut self, disk: Arc<dyn engram_host_core::SessionDisk>) -> Self {
         self.session_disk = Some(disk);
+        self
+    }
+
+    pub fn with_disk_sources(mut self, sources: Arc<dyn engram_host_core::DiskSources>) -> Self {
+        self.disk_sources = Some(sources);
         self
     }
 
@@ -294,9 +305,11 @@ impl HostAgent {
                 }
                 if let Some(cs) = self.chunk_store.clone() {
                     if let Some(disk) = self.session_disk.clone() {
-                        p = p.with_session_volumes(Arc::new(
-                            engram_host_core::SessionVolumes::new(disk, cs.clone()),
-                        ));
+                        let mut volumes = engram_host_core::SessionVolumes::new(disk, cs.clone());
+                        if let Some(sources) = self.disk_sources.clone() {
+                            volumes = volumes.with_sources(sources);
+                        }
+                        p = p.with_session_volumes(Arc::new(volumes));
                     }
                     p = p.with_chunk_store(cs);
                     // ADR 0080 §C: the MaterializeImage scratch root —
@@ -331,6 +344,9 @@ impl HostAgent {
                 // from ever engaging the chain or the periodic driver
                 // below — VZ has no guest-memory snapshot, so a
                 // checkpoint there is just a wasteful VM pause.
+                p = p
+                    .with_hydration_interval(self.cfg.hydration_interval)
+                    .with_lazy_restore(self.cfg.lazy_restore, self.cfg.eager_budget);
                 let checkpoints_supported = self.sandbox.supports_diff_checkpoints();
                 if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
@@ -351,7 +367,11 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
+                if let Some(sources) = &self.disk_sources {
+                    disk_source::recover_all(sources.as_ref()).await;
+                }
                 arc.reconcile_volumes().await;
+                arc.rearm_hydrations().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -1443,6 +1463,7 @@ impl HostAgent {
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
+                        hydrating: pooled_for_heartbeat.hydrating(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

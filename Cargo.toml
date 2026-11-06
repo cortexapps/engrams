@@ -8,6 +8,7 @@ members = [
     "crates/engram-host-agent",
     "crates/engram-host-core",
     "crates/engram-disk-thin",
+    "crates/engram-disk-source",
     "crates/engram-host-operator",
     "crates/engram-upgrade-drain",
     "crates/engram-chunk-store",

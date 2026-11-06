@@ -25,6 +25,7 @@ const DM_TABLE_LOAD_CMD: u32 = 9;
 const DM_TABLE_STATUS_CMD: u32 = 12;
 const DM_TARGET_MSG_CMD: u32 = 14;
 
+const DM_READONLY_FLAG: u32 = 1 << 0;
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
 const DM_STATUS_TABLE_FLAG: u32 = 1 << 4;
 const DM_BUFFER_FULL_FLAG: u32 = 1 << 8;
@@ -53,6 +54,15 @@ const NAME_LIST_OFF_NAME: usize = 12;
 /// `_IOWR(DM_IOCTL, cmd, struct dm_ioctl)`.
 const fn request(cmd: u32) -> libc::Ioctl {
     (3 << 30 | (HEADER_LEN as u32) << 16 | DM_IOCTL << 8 | cmd) as libc::Ioctl
+}
+
+/// A device's number and state, from its status reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Info {
+    pub dev: DevNo,
+    pub suspended: bool,
+    /// The live table was loaded read-only.
+    pub read_only: bool,
 }
 
 /// One target line of a table or status.
@@ -323,6 +333,30 @@ impl Dm {
         kind: &str,
         params: &str,
     ) -> io::Result<()> {
+        self.create_with(name, length_sectors, kind, params, 0)
+            .await
+    }
+
+    /// [`Self::create`] for a device the kernel refuses writes to.
+    pub async fn create_read_only(
+        &self,
+        name: &str,
+        length_sectors: u64,
+        kind: &str,
+        params: &str,
+    ) -> io::Result<()> {
+        self.create_with(name, length_sectors, kind, params, DM_READONLY_FLAG)
+            .await
+    }
+
+    async fn create_with(
+        &self,
+        name: &str,
+        length_sectors: u64,
+        kind: &str,
+        params: &str,
+        load_flags: u32,
+    ) -> io::Result<()> {
         self.call(
             "create",
             name,
@@ -331,25 +365,50 @@ impl Dm {
             io::ErrorKind::AlreadyExists,
         )
         .await?;
-        let mut load = Request::new(name, 0)?;
-        load.push_target(length_sectors, kind, params);
-        let loaded = self
-            .call(
-                "load",
-                name,
-                load,
-                DM_TABLE_LOAD_CMD,
-                io::ErrorKind::ResourceBusy,
-            )
-            .await;
-        let ready = match loaded {
-            Ok(_) => self.resume(name).await,
+        let ready = match self
+            .load_with(name, length_sectors, kind, params, load_flags)
+            .await
+        {
+            Ok(()) => self.resume(name).await,
             Err(e) => Err(e),
         };
         if ready.is_err() {
             let _ = self.remove(name).await;
         }
         ready
+    }
+
+    /// Load a single-target table into the device's inactive slot; the
+    /// next `resume` makes it live.
+    pub async fn load(
+        &self,
+        name: &str,
+        length_sectors: u64,
+        kind: &str,
+        params: &str,
+    ) -> io::Result<()> {
+        self.load_with(name, length_sectors, kind, params, 0).await
+    }
+
+    async fn load_with(
+        &self,
+        name: &str,
+        length_sectors: u64,
+        kind: &str,
+        params: &str,
+        flags: u32,
+    ) -> io::Result<()> {
+        let mut load = Request::new(name, flags)?;
+        load.push_target(length_sectors, kind, params);
+        self.call(
+            "load",
+            name,
+            load,
+            DM_TABLE_LOAD_CMD,
+            io::ErrorKind::ResourceBusy,
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn remove(&self, name: &str) -> io::Result<()> {
@@ -410,6 +469,14 @@ impl Dm {
         .map(drop)
     }
 
+    /// [`Self::resume`] on the calling thread, for a `Drop`.
+    pub fn resume_blocking(&self, name: &str) -> io::Result<()> {
+        Request::new(name, 0)?
+            .ioctl_blocking(&self.control, DM_DEV_SUSPEND_CMD)
+            .map(drop)
+            .map_err(|e| describe("resume", name, io::ErrorKind::ResourceBusy, e))
+    }
+
     pub async fn message(&self, name: &str, text: &str) -> io::Result<()> {
         let mut req = Request::new(name, 0)?;
         req.push_message(text);
@@ -434,6 +501,10 @@ impl Dm {
     }
 
     pub async fn devno(&self, name: &str) -> io::Result<DevNo> {
+        Ok(self.info(name).await?.dev)
+    }
+
+    pub async fn info(&self, name: &str) -> io::Result<Info> {
         let reply = self
             .call(
                 "status",
@@ -443,7 +514,12 @@ impl Dm {
                 io::ErrorKind::ResourceBusy,
             )
             .await?;
-        Ok(reply.dev())
+        let flags = reply.flags();
+        Ok(Info {
+            dev: reply.dev(),
+            suspended: flags & DM_SUSPEND_FLAG != 0,
+            read_only: flags & DM_READONLY_FLAG != 0,
+        })
     }
 
     /// The active table's target lines.
@@ -484,6 +560,29 @@ impl Dm {
 pub async fn device_path(devno: DevNo) -> io::Result<PathBuf> {
     let uevent = tokio::fs::read_to_string(format!("{}/uevent", devno.sysfs_path())).await?;
     Ok(PathBuf::from("/dev").join(parse::devname(&uevent)?))
+}
+
+/// The device number of the block device node at `path`.
+pub fn block_devno(path: &Path) -> io::Result<DevNo> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_block_device() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a block device", path.display()),
+        ));
+    }
+    let rdev = meta.rdev();
+    Ok(DevNo {
+        major: libc::major(rdev),
+        minor: libc::minor(rdev),
+    })
+}
+
+/// The number of devices stacked on `devno`: a device-mapper table that
+/// uses it, a partition, a RAID member.
+pub fn holders(devno: DevNo) -> io::Result<usize> {
+    Ok(std::fs::read_dir(format!("{}/holders", devno.sysfs_path()))?.count())
 }
 
 /// Create a block device node, replacing one that points elsewhere.

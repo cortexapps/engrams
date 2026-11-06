@@ -50,6 +50,62 @@ pub struct HostAgentConfig {
     /// the mode=all / in-process test-harness backend, which never
     /// constructs a `HostAgentConfig` through `main.rs`'s match anyway.
     pub backend_name: String,
+    /// When a restore boots before its disk is complete (ADR 0127).
+    pub lazy_restore: LazyRestore,
+    /// What `auto` allows an eager restore to write.
+    pub eager_budget: EagerBudget,
+    /// How often a sandbox's hydration task checks whether its disks
+    /// are copied and can be cut over.
+    pub hydration_interval: Duration,
+}
+
+/// The longest an eager restore of a disk may write before `auto` boots
+/// it over a source, and the write rates its estimate uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EagerBudget {
+    pub seconds: f64,
+    pub rates: engram_host_core::eager_estimate::Rates,
+}
+
+impl Default for EagerBudget {
+    fn default() -> Self {
+        Self {
+            seconds: 2.0,
+            rates: engram_host_core::eager_estimate::Rates {
+                local: 800e6,
+                remote: 200e6,
+            },
+        }
+    }
+}
+
+/// When a restore boots over a source before its disk is complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LazyRestore {
+    /// Every restore writes the whole disk before it boots. The host
+    /// starts no disk source.
+    #[default]
+    Off,
+    /// Every restore boots over a source.
+    Force,
+    /// A restore boots over a source when it cannot finish its writes
+    /// within the eager budget.
+    Auto,
+}
+
+impl std::str::FromStr for LazyRestore {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(Self::Off),
+            "force" => Ok(Self::Force),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!(
+                "invalid lazy restore mode `{other}`: expected `off`, `force` or `auto`"
+            )),
+        }
+    }
 }
 
 impl Default for HostAgentConfig {
@@ -67,6 +123,9 @@ impl Default for HostAgentConfig {
             grpc_advertise_addr: None,
             migrate_peer_listen_addr: None,
             backend_name: "process".to_string(),
+            lazy_restore: LazyRestore::Off,
+            eager_budget: EagerBudget::default(),
+            hydration_interval: crate::hydration::DEFAULT_INTERVAL,
         }
     }
 }

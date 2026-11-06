@@ -1,0 +1,471 @@
+#![cfg(target_os = "linux")]
+//! The `engram-disk-source` binary against the kernel's ublk driver, as
+//! root. `ENGRAM_TEST_UBLK=1` runs them (the driver must be loaded:
+//! `modprobe ublk_drv`); unset, every test skips.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+use engram_chunk_store::{
+    ChunkHash, ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestKind, ManifestRef,
+};
+use engram_storage_local::LocalBlobStorage;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+
+const CHUNK: u64 = 1 << 20;
+/// Chunk seeds; `None` is a hole.
+const LAYOUT: [Option<u8>; 6] = [Some(1), None, Some(2), Some(3), None, Some(4)];
+const READ: usize = 64 * 1024;
+const QUEUES: u16 = 2;
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+macro_rules! ublk_or_skip {
+    () => {
+        if std::env::var_os("ENGRAM_TEST_UBLK").is_none() {
+            eprintln!("SKIP: ENGRAM_TEST_UBLK is not set");
+            return;
+        }
+    };
+}
+
+struct Disk {
+    _dir: tempfile::TempDir,
+    store_root: PathBuf,
+    manifest: ManifestRef,
+    expected: Vec<u8>,
+}
+
+fn chunk_bytes(seed: u8) -> Vec<u8> {
+    (0..CHUNK as usize)
+        .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> (seed % 24)) as u8 ^ seed)
+        .collect()
+}
+
+/// A manifest of `LAYOUT` published to a local store.
+fn publish() -> Disk {
+    let dir = tempfile::tempdir().unwrap();
+    let store_root = dir.path().to_path_buf();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let total = LAYOUT.len() as u64 * CHUNK;
+    let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(store_root.join("blobs"))));
+    let mut expected = vec![0u8; total as usize];
+    let mut chunks = Vec::new();
+    for (index, seed) in LAYOUT.iter().enumerate() {
+        let Some(seed) = seed else { continue };
+        let offset = index as u64 * CHUNK;
+        let bytes = chunk_bytes(*seed);
+        let hash = rt.block_on(store.put_chunk(&bytes)).unwrap();
+        expected[offset as usize..(offset + CHUNK) as usize].copy_from_slice(&bytes);
+        chunks.push(ChunkRef { offset, hash });
+    }
+    let mut manifest = Manifest::empty(ManifestKind::Disk, total);
+    manifest.chunk_size = ChunkSize::bytes(CHUNK);
+    manifest.chunks = chunks;
+    let manifest_ref = ManifestRef::new();
+    rt.block_on(store.put_manifest(manifest_ref, &manifest))
+        .unwrap();
+    Disk {
+        _dir: dir,
+        store_root,
+        manifest: manifest_ref,
+        expected,
+    }
+}
+
+/// A running binary. Dropped while it runs (a failed assertion), it is
+/// stopped so the device does not outlive the test.
+struct Source {
+    child: Option<Child>,
+    path: PathBuf,
+    dev_id: u32,
+}
+
+/// Start the binary and wait for its ready line.
+fn start(disk: &Disk, recover: Option<u32>) -> Source {
+    try_start(disk, recover, QUEUES).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`start`] with `queues` queues, or why it failed. A binary that
+/// printed no ready line is reaped, and killed first if it still runs.
+fn try_start(disk: &Disk, recover: Option<u32>, queues: u16) -> Result<Source, String> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram-disk-source"));
+    cmd.args([
+        "serve",
+        "--manifest",
+        &disk.manifest.to_string(),
+        "--queues",
+        &queues.to_string(),
+        "--depth",
+        "16",
+    ])
+    .env("ENGRAM_BLOB_BACKEND", "local")
+    .env("ENGRAM_LOCAL_PATH", &disk.store_root)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit());
+    if let Some(id) = recover {
+        cmd.args(["--recover", &id.to_string()]);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn engram-disk-source: {e}"))?;
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(READY_TIMEOUT);
+    let ready = line.as_deref().ok().and_then(|line| {
+        let (path, id) = line.trim().split_once(' ')?;
+        Some((PathBuf::from(path), id.parse().ok()?))
+    });
+    let Some((path, dev_id)) = ready else {
+        // An empty line is the end of its output: the binary exits.
+        if !matches!(line.as_deref(), Ok("")) {
+            let _ = child.kill();
+        }
+        let status = child.wait().map(|s| s.to_string());
+        return Err(format!(
+            "engram-disk-source gave {line:?}, not a ready line \"<path> <id>\" ({status:?})"
+        ));
+    };
+    Ok(Source {
+        child: Some(child),
+        path,
+        dev_id,
+    })
+}
+
+impl Source {
+    /// SIGTERM: a normal stop, which deletes the device.
+    fn stop(mut self) {
+        let mut child = self.child.take().unwrap();
+        kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "a stopped source exits cleanly: {status}");
+        let sysfs = PathBuf::from(format!("/sys/block/ublkb{}", self.dev_id));
+        assert!(!sysfs.exists(), "a normal stop deletes the device");
+    }
+
+    /// SIGKILL: the device stays for recovery.
+    fn crash(mut self, disk: &Disk) -> Crashed<'_> {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        Crashed {
+            disk,
+            dev_id: Some(self.dev_id),
+        }
+    }
+}
+
+/// A device whose process died. Dropped before [`Crashed::recover`]
+/// succeeds, it recovers the device and stops it: a device left without
+/// a process holds its I/O, and a read blocked on it keeps the test
+/// process from exiting.
+struct Crashed<'a> {
+    disk: &'a Disk,
+    dev_id: Option<u32>,
+}
+
+impl Crashed<'_> {
+    fn dev_id(&self) -> u32 {
+        self.dev_id.unwrap()
+    }
+
+    fn recover(mut self) -> Source {
+        let source = start(self.disk, self.dev_id);
+        self.dev_id = None;
+        source
+    }
+}
+
+impl Drop for Crashed<'_> {
+    fn drop(&mut self) {
+        let Some(dev_id) = self.dev_id else { return };
+        match try_start(self.disk, Some(dev_id), QUEUES) {
+            // Its drop stops it, which deletes the device.
+            Ok(source) => drop(source),
+            Err(e) => eprintln!("device {dev_id} stays without a process: {e}"),
+        }
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A buffer at an address aligned for direct I/O.
+struct Aligned {
+    buf: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl Aligned {
+    fn new(len: usize) -> Self {
+        let buf = vec![0u8; len + 4096];
+        let start = buf.as_ptr().align_offset(4096);
+        Self { buf, start, len }
+    }
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.start + self.len]
+    }
+}
+
+fn open_direct(path: &Path) -> File {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+#[ignore]
+fn the_device_reads_as_the_manifest_bytes() {
+    ublk_or_skip!();
+    let disk = publish();
+    let source = start(&disk, None);
+    let size = std::fs::read_to_string(format!("/sys/block/ublkb{}/size", source.dev_id)).unwrap();
+    assert_eq!(
+        size.trim().parse::<u64>().unwrap() * 512,
+        disk.expected.len() as u64
+    );
+
+    let device = open_direct(&source.path);
+    let mut buf = Aligned::new(READ);
+    for offset in (0..disk.expected.len()).step_by(READ) {
+        device.read_exact_at(buf.as_mut(), offset as u64).unwrap();
+        assert!(
+            buf.as_mut() == &disk.expected[offset..offset + READ],
+            "bytes at {offset} differ from the manifest"
+        );
+    }
+    drop(device);
+    source.stop();
+}
+
+#[test]
+#[ignore]
+fn writes_are_refused() {
+    ublk_or_skip!();
+    let disk = publish();
+    let source = start(&disk, None);
+    let ro = std::fs::read_to_string(format!("/sys/block/ublkb{}/ro", source.dev_id)).unwrap();
+    assert_eq!(ro.trim(), "1", "the kernel marks the device read-only");
+    // Root may open a read-only device for writing; the write itself fails.
+    let refused = match OpenOptions::new().write(true).open(&source.path) {
+        Err(e) => e,
+        Ok(device) => device
+            .write_at(&[0u8; 4096], 0)
+            .expect_err("a write to a read-only device fails"),
+    };
+    assert!(
+        matches!(
+            refused.raw_os_error(),
+            Some(libc::EROFS) | Some(libc::EACCES) | Some(libc::EPERM)
+        ),
+        "unexpected error {refused}"
+    );
+    source.stop();
+}
+
+#[test]
+#[ignore]
+fn reads_stall_across_a_crash_and_complete_after_recovery() {
+    ublk_or_skip!();
+    let disk = Arc::new(publish());
+    let source = start(&disk, None);
+    let path = source.path.clone();
+
+    let reading = Arc::new(AtomicBool::new(true));
+    let reader = {
+        let disk = Arc::clone(&disk);
+        let reading = Arc::clone(&reading);
+        std::thread::spawn(move || {
+            let device = open_direct(&path);
+            let mut buf = Aligned::new(READ);
+            let mut spans = Vec::new();
+            let mut offset = 0usize;
+            while reading.load(Ordering::SeqCst) {
+                let began = Instant::now();
+                // A crash must stall this read, never fail it.
+                device.read_exact_at(buf.as_mut(), offset as u64).unwrap();
+                assert!(
+                    buf.as_mut() == &disk.expected[offset..offset + READ],
+                    "bytes at {offset} differ from the manifest"
+                );
+                spans.push((began, Instant::now()));
+                offset = (offset + READ) % disk.expected.len();
+            }
+            spans
+        })
+    };
+
+    std::thread::sleep(Duration::from_millis(200));
+    let crashed_at = Instant::now();
+    let crashed = source.crash(&disk);
+    let dev_id = crashed.dev_id();
+    // The kernel holds the device's I/O while no process serves it.
+    std::thread::sleep(Duration::from_millis(500));
+    let recovered = crashed.recover();
+    let recovered_at = Instant::now();
+    assert_eq!(recovered.dev_id, dev_id);
+    assert_eq!(recovered.path, source_path(dev_id));
+    std::thread::sleep(Duration::from_millis(200));
+    reading.store(false, Ordering::SeqCst);
+    let spans = reader.join().expect("no read failed");
+
+    assert!(
+        spans.iter().any(
+            |(began, ended)| *began < crashed_at + Duration::from_millis(100)
+                && *ended > recovered_at - Duration::from_millis(100)
+        ),
+        "a read issued around the crash waits for the recovered process"
+    );
+    assert!(
+        spans.iter().any(|(began, _)| *began > recovered_at),
+        "reads continue after recovery"
+    );
+    recovered.stop();
+}
+
+#[test]
+#[ignore]
+fn a_recovery_with_another_queue_count_is_refused_and_leaves_the_device() {
+    ublk_or_skip!();
+    let disk = publish();
+    let crashed = start(&disk, None).crash(&disk);
+    let err = match try_start(&disk, Some(crashed.dev_id()), QUEUES - 1) {
+        Ok(_) => panic!("a recovery with another queue count is refused"),
+        Err(e) => e,
+    };
+    // A refusal exits 1; a panic exits 101.
+    assert!(err.contains("exit status: 1\""), "{err}");
+    let recovered = crashed.recover();
+    let mut buf = Aligned::new(READ);
+    open_direct(&recovered.path)
+        .read_exact_at(buf.as_mut(), 0)
+        .unwrap();
+    assert!(buf.as_mut() == &disk.expected[..READ]);
+    recovered.stop();
+}
+
+#[test]
+#[ignore]
+fn a_stop_ends_a_read_that_cannot_be_served() {
+    ublk_or_skip!();
+    let disk = publish();
+    // A directory where chunk 3's blob should be: the store fails to read
+    // it without reporting the chunk absent, so a read of it tries again
+    // until the server stops.
+    let blob = disk
+        .store_root
+        .join("blobs")
+        .join(ChunkHash::of(&chunk_bytes(3)).storage_key());
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::create_dir(&blob).unwrap();
+    let source = start(&disk, None);
+    let path = source.path.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Aligned::new(READ);
+        open_direct(&path).read_exact_at(buf.as_mut(), 3 * CHUNK)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !reader.is_finished(),
+        "the read waits while the store cannot serve it"
+    );
+    // The kernel stops a device only once its requests complete; the stop
+    // must end the waiting read, or it never finishes.
+    source.stop();
+    let err = reader
+        .join()
+        .unwrap()
+        .expect_err("a read ended by a stop fails");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EIO),
+        "unexpected error {err}"
+    );
+}
+
+#[test]
+#[ignore]
+fn a_chunk_the_store_does_not_hold_fails_its_read() {
+    ublk_or_skip!();
+    let disk = publish();
+    let lost = ChunkHash::of(&chunk_bytes(3));
+    std::fs::remove_file(disk.store_root.join("blobs").join(lost.storage_key())).unwrap();
+    let source = start(&disk, None);
+    let mut buf = Aligned::new(READ);
+    let err = open_direct(&source.path)
+        .read_exact_at(buf.as_mut(), 3 * CHUNK)
+        .expect_err("a read of lost data fails");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EIO),
+        "unexpected error {err}"
+    );
+    open_direct(&source.path)
+        .read_exact_at(buf.as_mut(), 0)
+        .expect("a read of data the store holds still succeeds");
+    source.stop();
+}
+
+/// Run `engram-disk-source delete`; whether it succeeded.
+fn delete(dev_id: u32, quiesced: bool) -> bool {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram-disk-source"));
+    cmd.args(["delete", "--device", &dev_id.to_string()]);
+    if quiesced {
+        cmd.arg("--quiesced");
+    }
+    cmd.status().unwrap().success()
+}
+
+#[test]
+#[ignore]
+fn delete_refuses_a_served_device_and_removes_one_whose_server_died() {
+    ublk_or_skip!();
+    let disk = publish();
+    let source = start(&disk, None);
+    let dev_id = source.dev_id;
+    assert!(!delete(dev_id, true), "a served device is refused");
+    let mut crashed = source.crash(&disk);
+    assert!(
+        !delete(dev_id, false),
+        "a device whose server died needs --quiesced"
+    );
+    // The kernel quiesces the device once it sees the server's queues go.
+    let deleted = (0..100).any(|_| {
+        delete(dev_id, true) || {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(deleted, "a device whose server died is deleted");
+    assert!(!PathBuf::from(format!("/sys/class/ublk-char/ublkc{dev_id}")).exists());
+    // Nothing is left to recover.
+    crashed.dev_id = None;
+}
+
+fn source_path(dev_id: u32) -> PathBuf {
+    PathBuf::from(format!("/dev/ublkb{dev_id}"))
+}

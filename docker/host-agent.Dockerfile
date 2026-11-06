@@ -30,9 +30,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && echo "egress-proxyd fingerprint: $FP" \
     && ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" \
        cargo build --release -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd \
+         -p engram-disk-source \
     && cp target/release/engram-host-agent /tmp/engram-host-agent \
     && cp target/release/engram-uffd-handler /tmp/engram-uffd-handler \
-    && cp target/release/engram-egress-proxyd /tmp/engram-egress-proxyd
+    && cp target/release/engram-egress-proxyd /tmp/engram-egress-proxyd \
+    && cp target/release/engram-disk-source /tmp/engram-disk-source
 
 # Trixie matches the builder's glibc — bookworm (2.36) refuses
 # binaries linked against trixie's glibc 2.39+.
@@ -80,4 +82,7 @@ COPY --from=builder /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler
 # text keeps the running process alive after the image is unlinked —
 # the FC precedent), so in-flight guest egress survives rolls.
 COPY --from=builder /tmp/engram-egress-proxyd /usr/local/bin/engram-egress-proxyd
+# ADR 0127: the ublk server a lazy restore reads its disk through. Spawned
+# by host-agent by a PATH lookup; like the daemon above, it outlives the pod.
+COPY --from=builder /tmp/engram-disk-source /usr/local/bin/engram-disk-source
 ENTRYPOINT ["/usr/local/bin/engram-host-agent"]

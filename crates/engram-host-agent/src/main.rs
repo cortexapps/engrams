@@ -62,6 +62,29 @@ struct Cli {
     #[arg(long, env = "ENGRAM_THIN_POOL")]
     thin_pool: Option<String>,
 
+    /// When a restore boots before its disk is complete: `off`, `force`
+    /// or `auto`. Any mode but `off` runs a disk source process per
+    /// restoring disk, which needs the ublk driver on a host with a thin
+    /// pool; without the driver every restore is eager. Sources that an
+    /// earlier run started are served to their end in every mode.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE", default_value = "off")]
+    lazy_restore: engram_host_agent::config::LazyRestore,
+
+    /// In `auto` mode, the longest an eager restore of a disk may write,
+    /// in seconds, before the restore boots over a source instead.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_BUDGET_SECS", default_value_t = engram_host_agent::config::EagerBudget::default().seconds, value_parser = non_negative)]
+    lazy_restore_budget_secs: f64,
+
+    /// In `auto` mode, the rate in MB/s (10^6 bytes) at which an eager
+    /// restore writes chunks it fetches from the chunk store.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_REMOTE_MBPS", default_value_t = engram_host_agent::config::EagerBudget::default().rates.remote / 1e6, value_parser = positive)]
+    lazy_restore_remote_mbps: f64,
+
+    /// In `auto` mode, the rate in MB/s (10^6 bytes) at which an eager
+    /// restore writes chunks the host's chunk cache holds.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_LOCAL_MBPS", default_value_t = engram_host_agent::config::EagerBudget::default().rates.local / 1e6, value_parser = positive)]
+    lazy_restore_local_mbps: f64,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -320,6 +343,14 @@ async fn main() -> Result<(), HostAgentError> {
         backend_name: match cli.sandbox_backend {
             BackendChoice::Firecracker => "firecracker".to_string(),
             BackendChoice::Vz => "vz".to_string(),
+        },
+        lazy_restore: cli.lazy_restore,
+        eager_budget: engram_host_agent::config::EagerBudget {
+            seconds: cli.lazy_restore_budget_secs,
+            rates: engram_host_core::eager_estimate::Rates {
+                local: cli.lazy_restore_local_mbps * 1e6,
+                remote: cli.lazy_restore_remote_mbps * 1e6,
+            },
         },
         ..HostAgentConfig::default()
     };
@@ -686,6 +717,7 @@ async fn main() -> Result<(), HostAgentError> {
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let observe_token = cfg.coordinator_token.clone();
 
+    let disk_sources = disk_sources(&cli, &chunk_store).await?;
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store)
         .with_chunk_cache(chunk_cache)
@@ -696,6 +728,7 @@ async fn main() -> Result<(), HostAgentError> {
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
     }
+    agent = agent.with_disk_sources(disk_sources);
     // The egress proxy is mandatory (issue #240) and, since ADR 0121,
     // lives in `engram-egress-proxyd` — a node-local daemon that
     // outlives this pod so in-flight guest streams survive a roll.
@@ -753,6 +786,66 @@ async fn main() -> Result<(), HostAgentError> {
         }
     }
     agent.run().await
+}
+
+/// A number above zero, for a rate.
+fn positive(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(n) if n > 0.0 && n.is_finite() => Ok(n),
+        _ => Err(format!("`{text}` is not a number above zero")),
+    }
+}
+
+/// A number of zero or more, for a budget.
+fn non_negative(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(n) if n >= 0.0 && n.is_finite() => Ok(n),
+        _ => Err(format!("`{text}` is not a number of zero or more")),
+    }
+}
+
+/// The sources lazy restores read from (ADR 0127): a process per source
+/// over a thin pool, a staged file per source over sparse files. Built
+/// whatever the lazy restore mode: a host that ran with it on keeps
+/// sources that drives still read, and only this host can recover, cut
+/// over and stop them. The mode gates only new lazy restores.
+async fn disk_sources(
+    cli: &Cli,
+    chunk_store: &engram_chunk_store::ChunkStore,
+) -> Result<Arc<dyn engram_host_core::DiskSources>, HostAgentError> {
+    use engram_host_agent::config::LazyRestore;
+    use engram_host_agent::disk_source::{ProcessSources, ProcessSourcesConfig};
+    if cli.thin_pool.is_none() {
+        let files = engram_host_core::FileSources::new(
+            cli.work_dir.join("file-sources"),
+            chunk_store.clone(),
+        )
+        .map_err(HostAgentError::Io)?;
+        return Ok(Arc::new(files));
+    }
+    let bin = std::env::var_os("ENGRAM_DISK_SOURCE_BIN")
+        .map_or_else(|| PathBuf::from("engram-disk-source"), PathBuf::from);
+    let mut cfg = ProcessSourcesConfig::new(bin, cli.work_dir.clone());
+    // The VMs' node cgroup (ADR 0044 K2): a source outlives the pod too.
+    cfg.cgroup_parent = std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    cfg.cache_root = Some(cli.work_dir.join("chunk-cache"));
+    let sources = ProcessSources::new(cfg);
+    if let Err(error) = sources.check_driver() {
+        if cli.lazy_restore != LazyRestore::Off {
+            tracing::error!(
+                %error,
+                mode = ?cli.lazy_restore,
+                "lazy restore is on, but this host cannot start a disk source; every restore is eager",
+            );
+        }
+    }
+    // Before anything starts a source. Without the driver it reports the
+    // records whose sources cannot serve.
+    sources.sweep_unrecorded().await;
+    Ok(Arc::new(sources))
 }
 
 /// Load the egress CA material for the daemon (ADR 0121): the daemon
