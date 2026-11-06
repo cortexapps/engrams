@@ -41,15 +41,7 @@ impl PostCopyFinish {
     /// the persisted role, seed the chain, then clear the in-memory role.
     /// `PeerLost` leaves the role set: the coordinator destroys this
     /// destination.
-    pub async fn complete(self, outcome: std::io::Result<DrainOutcome>, control_sock: &Path) {
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::warn!(sandbox_id = %self.id, %error,
-                    "post-copy drain observer failed; the destination keeps its role");
-                return;
-            }
-        };
+    pub async fn complete(self, outcome: DrainOutcome, control_sock: &Path) {
         if matches!(outcome, DrainOutcome::PeerLost { .. }) {
             return;
         }
@@ -106,8 +98,26 @@ impl PostCopyFinish {
     }
 }
 
-/// The drain's terminal report on the handler's control socket.
-pub(crate) async fn observe_drain(sock: &Path) -> std::io::Result<DrainOutcome> {
+/// The drain's terminal report on the handler's control socket. A failed
+/// dial or read dials again: the handler replays its terminal report to
+/// each new subscriber, and the destination role stays set until a
+/// report arrives. The caller cancels this future (destroy).
+pub(crate) async fn observe_drain_until_reported(sock: &Path) -> DrainOutcome {
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match observe_drain(sock).await {
+            Ok(outcome) => return outcome,
+            Err(error) => {
+                tracing::warn!(sock = %sock.display(), %error,
+                    "post-copy drain observer failed; dialing again");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+async fn observe_drain(sock: &Path) -> std::io::Result<DrainOutcome> {
     use engram_migrate_proto::HandlerControl;
     let mut stream = tokio::net::UnixStream::connect(sock).await?;
     loop {
@@ -131,5 +141,49 @@ pub(crate) async fn observe_drain(sock: &Path) -> std::io::Result<DrainOutcome> 
             }
             HandlerControl::Sealed { .. } | HandlerControl::DrainProgress { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A subscription that ends before the terminal report does not end
+    /// the observation: the observer dials again and reads the report
+    /// the handler replays, so the finish still clears the role.
+    #[tokio::test]
+    async fn a_failed_subscription_dials_again_until_the_report_arrives() {
+        use engram_migrate_proto::HandlerControl;
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let handler = tokio::spawn(async move {
+            let (dropped, _) = listener.accept().await.unwrap();
+            drop(dropped);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            engram_migrate_proto::write_frame(
+                &mut bytes,
+                &HandlerControl::DrainDone {
+                    pulled: 3,
+                    alt_sourced: 0,
+                    zero_chunks: 0,
+                    ms: 1,
+                    faults: 0,
+                    fault_us: 0,
+                    fault_max_us: 0,
+                    fault_around_chunks_installed: 0,
+                },
+            )
+            .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let outcome = observe_drain_until_reported(&sock).await;
+        assert!(
+            matches!(outcome, DrainOutcome::Done { pulled: 3, .. }),
+            "{outcome:?}"
+        );
+        handler.await.unwrap();
     }
 }

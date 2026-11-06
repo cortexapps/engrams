@@ -843,23 +843,22 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
-/// Observe the local handler independently of the coordinator's drain-wait RPC.
-/// ControlTx replays terminal reports to each subscriber, including late ones.
-/// Observe the destination's drain outcome locally, stop the optional
-/// hot-hint poller at that outcome, then run `then` (the post-copy
-/// finish). Destroy or a failed restore drops the returned task, which
-/// cancels the poller, the subscription, and `then`.
+/// Observe the destination's drain outcome locally, independently of the
+/// coordinator's drain-wait RPC, stop the optional hot-hint poller at
+/// that outcome, then run `then` (the post-copy finish). Destroy or a
+/// failed restore drops the returned task, which cancels the poller, the
+/// subscription, and `then`.
 fn observe_post_copy_drain<F, Fut>(
     sock: PathBuf,
     poller: Option<AbortTaskOnDrop>,
     then: F,
 ) -> AbortTaskOnDrop
 where
-    F: FnOnce(std::io::Result<engram_core::types::snapshot::DrainOutcome>) -> Fut + Send + 'static,
+    F: FnOnce(engram_core::types::snapshot::DrainOutcome) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
     AbortTaskOnDrop(tokio::spawn(async move {
-        let observe = crate::postcopy_finish::observe_drain(&sock);
+        let observe = crate::postcopy_finish::observe_drain_until_reported(&sock);
         tokio::pin!(observe);
         let outcome = match poller {
             Some(mut poller) => tokio::select! {
@@ -8701,7 +8700,7 @@ mod tests {
             }));
             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
             let mut observer = observe_post_copy_drain(sock, Some(poller), |outcome| async move {
-                outcome_tx.send(outcome.unwrap()).unwrap();
+                outcome_tx.send(outcome).unwrap();
             });
             ready_rx.await.unwrap();
             start_tx.send(()).unwrap();
@@ -11774,7 +11773,7 @@ mod tests {
             zero_chunks: 0,
             ms: 1,
         };
-        let task = tokio::spawn(async move { finish.complete(Ok(done), &sock).await });
+        let task = tokio::spawn(async move { finish.complete(done, &sock).await });
         while !inner.calls.lock().contains(&"role") {
             tokio::task::yield_now().await;
         }
