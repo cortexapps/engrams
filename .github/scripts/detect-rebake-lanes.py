@@ -158,9 +158,9 @@ E2E_BINS = {
     "engram-egress-proxyd",
 }
 
-# Crates whose root tests run on the Firecracker root lane but are not
-# in the e2e closure: the ublk disk source (ADR 0127).
-FC_ROOT_TEST_CRATES = {"engram-disk-source"}
+# Crates whose root tests need the kernel's ublk driver (ADR 0127). They
+# run on their own lane: the Firecracker runners' kernel has no ublk.
+UBLK_TEST_CRATES = {"engram-disk-source"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -444,7 +444,7 @@ def main():
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
-    fc_root_closure = release_closure(meta, FC_ROOT_TEST_CRATES)
+    ublk_closure = release_closure(meta, UBLK_TEST_CRATES)
     cli = release_closure(meta, CLI_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
@@ -574,7 +574,7 @@ def main():
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
     test_fc = (
         ci_self
-        or bool(cc & (e2e_closure | fc_root_closure))
+        or bool(cc & e2e_closure)
         or fc_fork
         or any_path(changed, FC_POOL_PATHS)
     )
@@ -594,6 +594,7 @@ def main():
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
     # release closure.
     test_cosim = ci_self or bool(cc & cosim_closure)
+    test_ublk = ci_self or bool(cc & ublk_closure)
 
     # ── per-image bake selectivity ─────────────────────────────────────
     # Each image's lane evaluates against ITS OWN changed set: the registry
@@ -670,7 +671,7 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_cosim={test_cosim} "
+          f"test_cosim={test_cosim} test_ublk={test_ublk} "
           f"test_integrations_cli={test_integrations_cli} "
           f"test_deploy={test_deploy} test_site={test_site}",
           file=sys.stderr)
@@ -705,6 +706,7 @@ def main():
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
+            f.write(f"test_ublk={b(test_ublk)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             f.write(f"test_deploy={b(test_deploy)}\n")
             f.write(f"test_site={b(test_site)}\n")

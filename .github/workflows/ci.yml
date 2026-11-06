@@ -131,6 +131,7 @@ jobs:
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
       test_cosim: ${{ steps.lanes.outputs.test_cosim }}
+      test_ublk: ${{ steps.lanes.outputs.test_ublk }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
       test_deploy: ${{ steps.lanes.outputs.test_deploy }}
@@ -1208,24 +1209,6 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # ADR 0127: the disk source against the kernel's ublk driver. The
-      # driver is in the distribution's extra modules; a runner that cannot
-      # load it fails the lane, as a missing pool does.
-      - name: ublk disk-source tests (root)
-        if: ${{ !cancelled() }}
-        env:
-          ENGRAM_TEST_UBLK: "1"
-        run: |
-          sudo modprobe ublk_drv || true
-          test -c /dev/ublk-control \
-            || { echo "FATAL: kernel $(uname -r) has no ublk driver" >&2; exit 1; }
-          sudo -E env "PATH=$PATH" cargo nextest run \
-            -p engram-disk-source \
-            --test ublk_device \
-            --run-ignored ignored-only \
-            --no-fail-fast \
-            --test-threads=1
-
       # Root-required tests: proxy_e2e provisions a TAP device and runs
       # the full guest→TAP→REDIRECT→proxy→upstream chain, snapshot_net
       # asserts that snapshot/restore re-provisions the per-VM TAP + /30
@@ -1270,6 +1253,48 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ADR 0127: the disk source against the kernel's ublk driver. The
+  # Blacksmith kernel has no ublk, and the 6.17 kernel of the hosted
+  # 24.04 image fails on a device add, so this lane uses the hosted 22.04
+  # image (kernel 6.8, the driver in its extra modules). A runner that
+  # cannot load the driver fails the lane.
+  test-ublk:
+    name: tests (ublk disk source, root)
+    needs: detect
+    if: needs.detect.outputs.test_ublk == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load the ublk driver
+        run: |
+          sudo apt-get update -qq
+          sudo modprobe ublk_drv || {
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          }
+          test -c /dev/ublk-control \
+            || { echo "FATAL: kernel $(uname -r) has no ublk driver" >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc and libclang
+        run: sudo apt-get install -y -qq --no-install-recommends protobuf-compiler libclang-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ublk
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: ublk disk-source tests (root)
+        env:
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          cargo nextest run -p engram-disk-source --no-run
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-disk-source \
+            --test ublk_device \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
 
   test-fc-e2e:
     name: tests (firecracker true-e2e, Linux + KVM)
@@ -2458,6 +2483,7 @@ jobs:
       - test-fc-unprivileged
       - test-fc-pooled
       - test-fc-root
+      - test-ublk
       - test-fc-e2e
       - vz
       - test-macos
