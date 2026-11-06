@@ -641,12 +641,12 @@ mod tests {
         }
 
         drop(streams);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while chunks.iter().any(|h| cache.is_pinned(*h)) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "pins outlive the connections"
-            );
+        // At most 5 s of 10 ms polls.
+        for poll in 0.. {
+            if !chunks.iter().any(|h| cache.is_pinned(*h)) {
+                break;
+            }
+            assert!(poll < 500, "pins outlive the connections");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
