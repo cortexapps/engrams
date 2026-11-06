@@ -494,13 +494,15 @@ mod linux {
                     Ok((tmpfs_ok, cache_writable)) => {
                         if !tmpfs_ok {
                             return Err(
-                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to                                  serve (the guest would die later with `register memory …                                  userfaultfd … System error`)"
+                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to \
+                                 serve (the guest would die later with `register memory … \
+                                 userfaultfd … System error`)"
                                     .to_string(),
                             );
                         }
                         if !cache_writable {
                             tracing::warn!(
-                                "substrate readiness: cache root not writable at the writer;                                  populates will fail to the direct-blob fallback",
+                                "substrate readiness: the writer's cache root is not writable",
                             );
                         }
                         Some(client)
