@@ -256,6 +256,8 @@ pub struct EpochSeveredStream<S> {
     read_epoch: EpochWaiter,
     write_epoch: EpochWaiter,
     severed: bool,
+    /// Set for a guest-dialed channel: the severance is logged once.
+    label: Option<(SandboxId, &'static str)>,
 }
 
 impl<S> EpochSeveredStream<S> {
@@ -266,16 +268,33 @@ impl<S> EpochSeveredStream<S> {
             read_epoch: EpochWaiter::new(epoch.clone()),
             write_epoch: EpochWaiter::new(epoch.clone()),
             severed: false,
+            label: None,
         }
+    }
+
+    fn labelled(mut self, sandbox_id: SandboxId, channel: &'static str) -> Self {
+        self.label = Some((sandbox_id, channel));
+        self
     }
 
     fn poll_epoch_change(
         severed: &mut bool,
+        label: Option<(SandboxId, &'static str)>,
         epoch: &mut EpochWaiter,
         cx: &mut Context<'_>,
     ) -> bool {
-        if *severed || epoch.poll_changed(cx) {
+        if *severed {
+            return true;
+        }
+        if epoch.poll_changed(cx) {
             *severed = true;
+            if let Some((sandbox_id, channel)) = label {
+                tracing::info!(
+                    %sandbox_id,
+                    channel,
+                    "snapshot transport reset severed the guest's vsock connection",
+                );
+            }
             return true;
         }
         false
@@ -302,7 +321,12 @@ where
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(result) => Poll::Ready(result),
             Poll::Pending
-                if Self::poll_epoch_change(&mut this.severed, &mut this.read_epoch, cx) =>
+                if Self::poll_epoch_change(
+                    &mut this.severed,
+                    this.label,
+                    &mut this.read_epoch,
+                    cx,
+                ) =>
             {
                 Poll::Ready(Ok(()))
             }
@@ -321,7 +345,7 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
@@ -329,7 +353,7 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_flush(cx)
@@ -337,7 +361,7 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+        if Self::poll_epoch_change(&mut this.severed, this.label, &mut this.write_epoch, cx) {
             return Poll::Ready(Err(Self::severed_write_error()));
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
@@ -959,6 +983,9 @@ struct LiveSandbox {
     /// subscribe BEFORE dialing and treat any bump as connection
     /// death.
     vsock_epoch: tokio::sync::watch::Sender<u64>,
+    /// When this process booted or restored the VM; `None` for a VM
+    /// reattached from an earlier host-agent process.
+    started_at: Option<std::time::Instant>,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -1654,6 +1681,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped: false,
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
 
@@ -2739,6 +2767,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready_rx,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: Some(std::time::Instant::now()),
             },
         );
         if let Some(pid) = fc_pid {
@@ -2905,7 +2934,9 @@ impl FirecrackerBackend {
             .get(&sandbox_id)
             .map(|live| live.vsock_epoch.subscribe());
         match epoch {
-            Some(epoch) => Box::pin(EpochSeveredStream::new(stream, epoch)),
+            Some(epoch) => {
+                Box::pin(EpochSeveredStream::new(stream, epoch).labelled(sandbox_id, channel))
+            }
             None => {
                 tracing::debug!(
                     %sandbox_id,
@@ -3591,6 +3622,7 @@ impl FirecrackerBackend {
                 agentd_slot_swapped,
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: Some(std::time::Instant::now()),
             },
         );
         if let Some(pid) = fc_pid {
@@ -6114,7 +6146,11 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(())
     }
 
-    #[tracing::instrument(name = "fc.start_agent", skip_all, fields(sandbox_id = %id))]
+    #[tracing::instrument(
+        name = "fc.start_agent",
+        skip_all,
+        fields(sandbox_id = %id, since_vm_start_ms = tracing::field::Empty)
+    )]
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -6144,9 +6180,12 @@ impl SandboxBackend for FirecrackerBackend {
         // dial). Shared with the base-snapshot
         // capture via `wait_agent_ready`.
         self.wait_agent_ready(id).await?;
-        let t_ready = phase_start.elapsed().as_millis() as u64;
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            if let Some(started_at) = live.started_at {
+                tracing::Span::current()
+                    .record("since_vm_start_ms", started_at.elapsed().as_millis() as u64);
+            }
             live.state.vsock_uds_path.clone()
         };
 
@@ -6271,15 +6310,6 @@ impl SandboxBackend for FirecrackerBackend {
         let resp: engram_agentd::WireResponse = loop {
             attempt += 1;
             let span = tracing::info_span!("fc.spawn_harness", attempt);
-            // Per-attempt, not per-round-trip: reset at the top of each
-            // iteration so `connect_ms` below measures THIS attempt's
-            // CONNECT leg only. A single Instant hoisted above the loop
-            // would accumulate prior attempts' full connect+write+read
-            // plus their 50 ms backoff sleeps into later attempts'
-            // `connect_ms`, corrupting the sub-leg split the ADR 0045 C1
-            // diagnosis below relies on (a slow CONNECT reading as a
-            // starved guest that was actually just a late retry).
-            let t_attempt = std::time::Instant::now();
             // Cap this attempt at whatever remains of the total budget, so
             // the loop's wall-clock can never exceed SPAWN_TOTAL_BUDGET
             // (and thus stays under the caller's gRPC deadline). A hung
@@ -6297,24 +6327,19 @@ impl SandboxBackend for FirecrackerBackend {
             }
             let attempt_timeout = remaining.min(SPAWN_ATTEMPT_TIMEOUT);
             let inner = async {
-                let mut conn = Self::connect_fc_vsock(
-                    &self.sandboxes,
-                    id,
-                    &vsock_uds_path,
-                    ENGRAM_AGENTD_PORT,
+                // A slow connect means the guest does not accept (vCPUs
+                // starved or vsock not settled); a slow round trip after a
+                // fast connect means agentd is stuck past accept.
+                let mut conn = tracing::Instrument::instrument(
+                    Self::connect_fc_vsock(
+                        &self.sandboxes,
+                        id,
+                        &vsock_uds_path,
+                        ENGRAM_AGENTD_PORT,
+                    ),
+                    tracing::info_span!("fc.vsock_connect"),
                 )
                 .await?;
-                // ADR 0045 C1 tail diagnosis: split the handshake into
-                // host-visible sub-legs — a slow CONNECT means the guest
-                // isn't accepting (vCPUs starved / vsock not settled); a
-                // slow round-trip after a fast CONNECT means agentd
-                // itself is stuck past accept.
-                tracing::info!(
-                    sandbox_id = %id,
-                    attempt,
-                    connect_ms = t_attempt.elapsed().as_millis() as u64,
-                    "spawn-harness vsock connected",
-                );
                 // Gate the WRITE on the concurrent clock push (see the
                 // `clock_done` note above). Best-effort like the push
                 // itself: a sender dropped without sending (task panic)
@@ -6412,8 +6437,6 @@ impl SandboxBackend for FirecrackerBackend {
                 // `attempt > 1` as "unknown", not "no rotation happened".
                 tracing::info!(
                     sandbox_id = %id,
-                    elapsed_ms = (elapsed * 1000.0) as u64,
-                    wait_ready_ms = t_ready,
                     pid = ?pid,
                     ca_changed = ?ca_changed,
                     attempt,
@@ -6954,6 +6977,16 @@ impl FirecrackerBackend {
 /// Identical sidecar/vmstate/dir contract either way; only the memory
 /// artifact's name + capture type differ.
 impl FirecrackerBackend {
+    #[tracing::instrument(
+        name = "fc.snapshot",
+        skip_all,
+        fields(
+            sandbox_id = %id,
+            snapshot_type = ?snapshot_type,
+            hold,
+            memory_written_bytes = tracing::field::Empty,
+        )
+    )]
     async fn snapshot_with_type(
         &self,
         id: SandboxId,
@@ -7137,10 +7170,17 @@ impl FirecrackerBackend {
         // landed in `dest`. memory.bin dominates (= guest RAM size).
         let mut size_bytes = 0u64;
         for p in [&paths.state_path, &paths.mem_path, &manifest_path] {
-            size_bytes += tokio::fs::metadata(p)
+            let meta = tokio::fs::metadata(p)
                 .await
-                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?
-                .len();
+                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?;
+            if p == &paths.mem_path {
+                // A diff file is sparse: its allocated blocks are the dirty pages.
+                tracing::Span::current().record(
+                    "memory_written_bytes",
+                    std::os::unix::fs::MetadataExt::blocks(&meta) * 512,
+                );
+            }
+            size_bytes += meta.len();
         }
 
         Ok(SnapshotMetadata {
@@ -9140,6 +9180,7 @@ mod tests {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             }
         };
         assert!(be.post_copy_source_view(id).is_none(), "unknown sandbox");
@@ -9209,6 +9250,7 @@ mod tests {
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             }
         };
 
@@ -9335,6 +9377,7 @@ Pss:             8200000 kB
                 #[cfg(target_os = "linux")]
                 parked: false,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
         let mut first = Box::pin(be.wait_agent_ready(id));
@@ -9489,6 +9532,7 @@ Pss:             8200000 kB
                 agentd_slot_swapped: false,
                 agent_ready: tokio::sync::watch::channel(true).1.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
         id
@@ -9611,6 +9655,7 @@ Pss:             8200000 kB
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
             },
         );
 

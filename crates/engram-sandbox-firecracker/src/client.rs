@@ -50,6 +50,7 @@ use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tracing::Instrument as _;
 
 /// Client bound to one Firecracker control socket. Cheap to clone —
 /// the actual HTTP connection is established per-request.
@@ -250,12 +251,18 @@ impl FirecrackerClient {
             snapshot_type,
             vmstate_only: false,
         };
-        let create_res = self.put("/snapshot/create", &body).await;
+        let create_res = self
+            .put("/snapshot/create", &body)
+            .instrument(tracing::info_span!("fc.snapshot_create"))
+            .await;
 
         // Always try to resume, regardless of whether the create
         // succeeded — leaving the VM paused on error is worse than
         // doubling up on the failure path.
-        let resume_res = self.resume().await;
+        let resume_res = self
+            .resume()
+            .instrument(tracing::info_span!("fc.snapshot_resume"))
+            .await;
         guard.disarm();
 
         create_res?;
@@ -283,6 +290,7 @@ impl FirecrackerClient {
                 vmstate_only: false,
             },
         )
+        .instrument(tracing::info_span!("fc.snapshot_create"))
         .await?;
         Ok(SnapshotPaths {
             state_path,
