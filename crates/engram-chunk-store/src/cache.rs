@@ -921,6 +921,10 @@ impl ChunkCache {
     /// correct and is not hashed again (a 16 MiB sha256 costs about
     /// 80 ms on hosts without SHA extensions).
     pub async fn read_resident(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
+        // A miss the index knows of costs no blocking hop.
+        if !self.contains(hash) {
+            return Ok(None);
+        }
         let start = crate::time_source::metrics_now();
         let Some(bytes) = read_if_present(&self.path_for(hash)).await? else {
             // A miss is a failed open, not a latency sample.
