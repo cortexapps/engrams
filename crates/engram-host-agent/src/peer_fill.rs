@@ -432,7 +432,11 @@ async fn pull_shard(
             };
             let len = current.len();
             let body = bytes::Bytes::from(std::mem::take(&mut current));
-            if let Err(e) = cache.put_trusted(hash, body).await {
+            // A restore waits for these chunks.
+            if let Err(e) = cache
+                .put_trusted(hash, body, engram_fill::Class::Prefix)
+                .await
+            {
                 // Local landing failure (ENOSPC…) — not the peer's
                 // fault; skip this chunk (GCS pass covers it) and keep
                 // draining the stream.

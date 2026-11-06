@@ -189,6 +189,18 @@ impl FillEngine {
         &self.inner.admission
     }
 
+    /// A slot for one bulk chunk write to local disk at `class` (a volume
+    /// being staged), shared with the cache's writes; `None` without a
+    /// cache. Hold it until the write returns. A bulk write takes at most
+    /// a `Prefix` slot: the `Demand` slots are for the cache writes a
+    /// faulting vCPU waits for.
+    pub async fn disk_write(&self, class: Class) -> Option<Permit> {
+        match self.store().chunk_cache() {
+            Some(cache) => Some(cache.write_slot(class.max(Class::Prefix)).await),
+            None => None,
+        }
+    }
+
     /// The chunk's bytes. A cache hit is served at once; a miss waits for a
     /// `class` slot, then is fetched, verified and stored by the cache.
     /// Without a cache the engine verifies.
@@ -266,7 +278,7 @@ impl FillEngine {
         match self.store().chunk_cache() {
             Some(cache) => {
                 cache
-                    .get_with_source(hash, || self.fetch_unverified(hash, class, permit))
+                    .get_with_source(hash, class, || self.fetch_unverified(hash, class, permit))
                     .await
             }
             None => self.fetch_verified(hash, class, permit).await,

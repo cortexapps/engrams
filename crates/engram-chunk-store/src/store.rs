@@ -292,7 +292,7 @@ impl ChunkStore {
     /// a later fetch.
     async fn warm_local(&self, hash: ChunkHash, body: Bytes) {
         if let Some(cache) = &self.cache {
-            if let Err(e) = cache.write_local(hash, body).await {
+            if let Err(e) = cache.write_local(hash, body, self.class).await {
                 tracing::debug!(
                     hash = %hash,
                     error = %e,
@@ -327,7 +327,14 @@ impl ChunkStore {
     /// the cache's singleflight would wait on itself.
     pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
         match &self.cache {
-            Some(cache) => cache.get(hash, || self.fetch_admitted(hash, false)).await,
+            Some(cache) => {
+                cache
+                    .get_with_source(hash, self.class, || async {
+                        let bytes = self.fetch_admitted(hash, false).await?;
+                        Ok((bytes, crate::cache::FillSource::BlobStorage))
+                    })
+                    .await
+            }
             None => self.fetch_admitted(hash, true).await,
         }
     }

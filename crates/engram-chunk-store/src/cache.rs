@@ -17,6 +17,12 @@
 //!   single-writer; the pid component is vestigial-but-harmless
 //!   belt-and-braces from the multi-writer era, whose fixed-temp
 //!   collision once cost a prod resume ~92 s of GCS page-faulting.)
+//! - **Write slots**: every chunk write takes a slot from one
+//!   class-ordered [`Admission`] ([`ChunkCache::write_slot`]), shared
+//!   with the volume writes of a restore on the same disk. A bulk memory
+//!   fill (`Hydrate`) so stops dirtying the disk while a restore's disk
+//!   writes (`Prefix`) wait for a slot, instead of halving
+//!   their rate. The `Demand` reserve keeps slots for page faults.
 //! - **Eviction (FIFO by populate time)**: when the cache filesystem is
 //!   fuller than the free-space floor (default: keep ~20% free) — or,
 //!   when total cached bytes exceed the absolute ceiling (disk-derived
@@ -93,6 +99,7 @@ use parking_lot::Mutex;
 use tokio::fs;
 use tokio::sync::oneshot;
 
+use crate::admission::{Admission, Class, Permit};
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::ChunkHash;
 
@@ -614,7 +621,17 @@ struct CacheInner {
     /// running sweep enforces the same budget); the periodic sweep
     /// waits its turn.
     sweep_gate: tokio::sync::Mutex<()>,
+    /// Chunk writes to the cache's disk in flight, granted in class
+    /// order (see [`ChunkCache::write_slot`]).
+    writes: Arc<Admission>,
 }
+
+/// Chunk writes to local disk in flight for classes other than `Demand`,
+/// and the extra slots `Demand` may use. Enough to keep an NVMe busy with
+/// 16 MiB writes; few enough that a write a guest waits for queues behind
+/// at most this many bulk writes.
+const WRITE_SLOTS: usize = 16;
+const WRITE_DEMAND_RESERVE: usize = 8;
 
 /// #1003: the in-memory mirror of the cache directory that budget
 /// sweeps run against. No `PathBuf` per entry — paths derive from the
@@ -683,6 +700,7 @@ impl ChunkCache {
                 co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
+                writes: Admission::fixed("disk_write", WRITE_SLOTS, WRITE_DEMAND_RESERVE),
             }),
         }
     }
@@ -713,6 +731,7 @@ impl ChunkCache {
                 co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
+                writes: Admission::fixed("disk_write", WRITE_SLOTS, WRITE_DEMAND_RESERVE),
             }),
         }
     }
@@ -882,27 +901,15 @@ impl ChunkCache {
         self.index_remove(hash);
     }
 
-    /// Get a chunk's bytes. Local NVMe first; on miss, the
-    /// `fetch` closure is invoked exactly once (singleflight —
-    /// concurrent waiters for the same hash share its result).
-    /// Fetched bytes are written to local NVMe before returning.
-    ///
-    /// The fetcher's return value is what flows back; if it
-    /// errors, the error propagates to all in-flight waiters.
-    ///
-    /// # Why a closure rather than a stored `ChunkStore`
-    ///
-    /// Each call site picks its own source, so callers with
-    /// different stores share one cache without rebinding it.
-    pub async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
+    /// [`Self::get_with_source`] with a cold-tier fetcher, writing at
+    /// `Demand`.
+    #[cfg(test)]
+    pub(crate) async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
     {
-        // Plain closures are the cold tier by definition — the
-        // source-aware sibling below is for tiered (peer-capable)
-        // fetchers (ADR 0095).
-        self.get_with_source(hash, || async move {
+        self.get_with_source(hash, Class::Demand, || async move {
             fetch().await.map(|b| (b, FillSource::BlobStorage))
         })
         .await
@@ -927,14 +934,20 @@ impl ChunkCache {
         Ok(Some(bytes))
     }
 
-    /// [`Self::get`] with a source-aware fetcher: the closure reports
-    /// where the bytes actually came from, so the
-    /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label
-    /// and the fetch histogram's `tier` stay honest when a call site
-    /// composes a peer tier ahead of BlobStorage (ADR 0095). Populate
-    /// semantics are identical — singleflight, sha256
-    /// verify-on-populate, atomic write-through.
-    pub async fn get_with_source<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
+    /// A chunk's bytes. Local NVMe first; on a miss, `fetch` runs once
+    /// (singleflight: concurrent callers for the same hash share its
+    /// result), its bytes are verified (unless they came from a peer),
+    /// written to local NVMe at `class` ([`Self::write_slot`]), then
+    /// returned. The closure reports where the bytes came from, so the
+    /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label and
+    /// the fetch histogram's `tier` stay honest (ADR 0095). If the fetch
+    /// errors, the error reaches every waiter.
+    pub async fn get_with_source<F, Fut>(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        fetch: F,
+    ) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
@@ -1064,7 +1077,7 @@ impl ChunkCache {
                     // isn't cached, so every later read re-fetches from GCS —
                     // which presents exactly as "warming ran but reads still
                     // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    let write_local_ok = match self.write_local(hash, bytes.clone()).await {
+                    let write_local_ok = match self.write_local(hash, bytes.clone(), class).await {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!(
@@ -1222,8 +1235,13 @@ impl ChunkCache {
     /// sweep, for paths that write many chunks back to back. Callers MUST
     /// call [`Self::sweep`] once after the batch (the budget/floor
     /// invariant is per batch, not per write).
-    pub(crate) async fn put_no_evict(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
-        self.store_file(hash, bytes).await
+    pub(crate) async fn put_no_evict(
+        &self,
+        hash: ChunkHash,
+        bytes: Bytes,
+        class: Class,
+    ) -> Result<()> {
+        self.store_file(hash, bytes, class).await
     }
 
     /// One eviction sweep: the batch-closing pair of
@@ -1304,22 +1322,28 @@ impl ChunkCache {
         })
     }
 
-    /// Store a chunk after checking that `bytes` hash to `hash`.
+    /// Store a chunk after checking that `bytes` hash to `hash`, at
+    /// `Background`.
     pub async fn put(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
         check_hash(hash, &bytes)?;
-        self.write_local(hash, bytes).await
+        self.write_local(hash, bytes, Class::Background).await
     }
 
     /// Store a chunk the caller trusts without hashing it (a peer's chunk,
-    /// or one the caller just hashed).
-    pub async fn put_trusted(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
-        self.write_local(hash, bytes).await
+    /// or one the caller just hashed), at `class`.
+    pub async fn put_trusted(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
+        self.write_local(hash, bytes, class).await
     }
 
     /// Store a chunk whose hash the caller guarantees, then run the
     /// debounced budget sweep.
-    pub(crate) async fn write_local(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
-        self.store_file(hash, bytes).await?;
+    pub(crate) async fn write_local(
+        &self,
+        hash: ChunkHash,
+        bytes: Bytes,
+        class: Class,
+    ) -> Result<()> {
+        self.store_file(hash, bytes, class).await?;
 
         // Best-effort eviction sweep, DEBOUNCED to at most once per
         // interval across all writers, and SKIPPED outright if a sweep
@@ -1359,13 +1383,24 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Place the chunk file and index it. A chunk the cache already holds
-    /// is not written again. The directory, the write and the rename run
-    /// in one blocking task, on `bytes` without a copy.
-    async fn store_file(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
+    /// A slot for one chunk write to the cache's disk at `class`, held
+    /// until the write returns. Every chunk write of the cache takes one;
+    /// other bulk chunk writes to the same disk (a volume being staged)
+    /// take one too, so a restore's disk writes go ahead of a bulk memory
+    /// fill's cache writes.
+    pub async fn write_slot(&self, class: Class) -> Permit {
+        self.inner.writes.acquire(class).await
+    }
+
+    /// Place the chunk file and index it, under a write slot at `class`.
+    /// A chunk the cache already holds is not written again. The
+    /// directory, the write and the rename run in one blocking task, on
+    /// `bytes` without a copy.
+    async fn store_file(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
         if self.contains(hash) {
             return Ok(());
         }
+        let _slot = self.write_slot(class).await;
         let target = self.path_for(hash);
         let len = bytes.len() as u64;
         tokio::task::spawn_blocking(move || write_atomic(&target, &bytes))
@@ -3056,7 +3091,7 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a))
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
 
@@ -3104,7 +3139,7 @@ mod tests {
         // `put_no_evict` skips the sweep entirely, modeling "populated,
         // then zero traffic since" (e.g. a host that just restarted).
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a))
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
         assert!(cache.contains(ha), "chunk lands before any sweep runs");
@@ -3144,7 +3179,7 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a))
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
 
@@ -3268,6 +3303,40 @@ mod tests {
         let again = std::fs::metadata(cache.on_disk_path(h)).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(first.ino(), again.ino(), "no rename replaced the file");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_cache_write_waits_behind_a_waiting_demand_write() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let mut held = Vec::new();
+        for _ in 0..WRITE_SLOTS + WRITE_DEMAND_RESERVE {
+            held.push(cache.write_slot(Class::Demand).await);
+        }
+        let body = Bytes::from_static(b"a bulk memory chunk");
+        let h = ChunkHash::of(&body);
+        let bulk = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.put_trusted(h, body, Class::Hydrate).await }
+        });
+        let demand = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.write_slot(Class::Demand).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        held.pop();
+        let demand = tokio::time::timeout(Duration::from_secs(5), demand)
+            .await
+            .expect("the demand write gets the freed slot")
+            .unwrap();
+        assert!(
+            !bulk.is_finished() && !cache.contains(h),
+            "the bulk write waits"
+        );
+
+        drop((held, demand));
+        bulk.await.unwrap().unwrap();
+        assert!(cache.contains(h));
     }
 
     #[tokio::test]
@@ -3505,7 +3574,9 @@ mod tests {
         let body = Bytes::from_static(b"fault-time peer chunk");
         let h = ChunkHash::of(&body);
         let got = cache
-            .get_with_source(h, || async { Ok((body.clone(), FillSource::Peer)) })
+            .get_with_source(h, Class::Demand, || async {
+                Ok((body.clone(), FillSource::Peer))
+            })
             .await
             .unwrap();
         assert_eq!(got, body);
@@ -3513,7 +3584,7 @@ mod tests {
 
         let wrong = ChunkHash::of(b"something else");
         let err = cache
-            .get_with_source(wrong, || async {
+            .get_with_source(wrong, Class::Demand, || async {
                 Ok((Bytes::from_static(b"not that"), FillSource::BlobStorage))
             })
             .await;

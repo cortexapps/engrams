@@ -176,7 +176,7 @@ impl ChunkStore {
                 // chunk is durable in the store regardless.
                 if let Some(cache) = &cache {
                     // `put_chunk` just hashed these bytes.
-                    if let Err(e) = cache.put_trusted(hash, bytes).await {
+                    if let Err(e) = cache.put_trusted(hash, bytes, store.class()).await {
                         tracing::warn!(
                             %hash,
                             error = %e,
@@ -477,7 +477,9 @@ impl ChunkStore {
                     // below, once.
                     Some(cache) => {
                         let hash = crate::manifest::ChunkHash::of(&slice);
-                        cache.put_no_evict(hash, slice.freeze()).await?;
+                        cache
+                            .put_no_evict(hash, slice.freeze(), store.class())
+                            .await?;
                         hash
                     }
                     None => {

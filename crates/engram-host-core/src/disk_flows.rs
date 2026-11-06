@@ -58,9 +58,12 @@ async fn apply_delta(
         let (hash, index) = (c.hash, ChunkIndex(c.offset / chunk_size));
         // One task per chunk, so fetch, hash and write use every core.
         // `read` keeps a miss out of the chunk cache: the volume holds it.
+        // The write takes a disk-write slot, so it goes ahead of the bulk
+        // cache writes of a lower class on the same disk.
         tasks.spawn(async move {
             let _slot = slot;
             let bytes = fill.read(hash, class).await.map_err(store_err)?;
+            let _write = fill.disk_write(class).await;
             volume.write_chunk(index, bytes).await
         });
         while let Some(done) = tasks.try_join_next() {

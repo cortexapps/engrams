@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use engram_chunk_store::cache::ChunkCacheConfig;
-use engram_chunk_store::{ChunkCache, ChunkStore};
+use engram_chunk_store::cache::{ChunkCacheConfig, FillSource};
+use engram_chunk_store::{ChunkCache, ChunkStore, Class};
 use engram_core::traits::BlobStorage;
 use engram_host_agent::substrate_server::SubstrateServer;
 use engram_storage_local::LocalBlobStorage;
@@ -97,10 +97,9 @@ async fn pinned_chunks_survive_populate_pressure() {
     // best-effort by design).
     let s2 = store.clone();
     cache
-        .get(
-            pinned_hash,
-            || async move { s2.get_chunk(pinned_hash).await },
-        )
+        .get_with_source(pinned_hash, Class::Demand, || async move {
+            Ok((s2.get_chunk(pinned_hash).await?, FillSource::BlobStorage))
+        })
         .await
         .unwrap();
     assert!(cache.contains_on_disk(pinned_hash));
@@ -112,7 +111,9 @@ async fn pinned_chunks_survive_populate_pressure() {
         let h = store.put_chunk(&fresh).await.unwrap();
         let store2 = store.clone();
         let _ = cache
-            .get(h, || async move { store2.get_chunk(h).await })
+            .get_with_source(h, Class::Demand, || async move {
+                Ok((store2.get_chunk(h).await?, FillSource::BlobStorage))
+            })
             .await;
     }
     cache.sweep_for_test().await;
