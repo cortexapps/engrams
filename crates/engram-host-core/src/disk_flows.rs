@@ -38,9 +38,11 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
     let chunk_size = volume.chunk_size;
     stream::iter(delta.write.iter().map(Ok))
         .try_for_each_concurrent(CONCURRENCY, |c| async move {
-            let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
+            // The volume keeps these bytes, so a miss is not stored in the
+            // chunk cache: that would double the disk writes.
+            let bytes = store.read_chunk(c.hash).await.map_err(store_err)?;
             volume
-                .write_chunk(ChunkIndex(c.offset / chunk_size), bytes.to_vec())
+                .write_chunk(ChunkIndex(c.offset / chunk_size), bytes)
                 .await
         })
         .await?;
