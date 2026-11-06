@@ -210,13 +210,14 @@ impl Volume {
         bytes: impl AsRef<[u8]> + Send + 'static,
         what: &'static str,
     ) -> io::Result<()> {
-        let aligned = offset.is_multiple_of(DIRECT_ALIGN as u64)
-            && bytes.as_ref().len().is_multiple_of(DIRECT_ALIGN);
+        let len = bytes.as_ref().len();
+        let aligned =
+            offset.is_multiple_of(DIRECT_ALIGN as u64) && len.is_multiple_of(DIRECT_ALIGN);
         let direct = self.direct.as_ref().filter(|_| aligned).map(Arc::clone);
         let file = Arc::clone(&self.file);
         tokio::task::spawn_blocking(move || {
             let bytes = bytes.as_ref();
-            match direct.zip(AlignedBuf::copy_of(bytes)) {
+            match direct.and_then(|d| Some((d, AlignedBuf::copy_of(bytes)?))) {
                 Some((direct, buf)) => direct.write_all_at(buf.as_slice(), offset),
                 None => file.write_all_at(bytes, offset),
             }

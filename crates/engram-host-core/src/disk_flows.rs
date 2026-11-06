@@ -69,7 +69,9 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
             let (f_us, w_us) = (fetch_total.clone(), write_us_total.clone());
             set.spawn(async move {
                 let t = metrics_now();
-                let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
+                // The volume keeps these bytes, so a miss is not stored in
+                // the chunk cache: that would double the disk writes.
+                let bytes = store.read_chunk(c.hash).await.map_err(store_err)?;
                 f_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
                 let t = metrics_now();
                 let written = volume
@@ -94,11 +96,11 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
         stream::iter(delta.write.iter().map(Ok))
             .try_for_each_concurrent(CONCURRENCY, |c| async move {
                 let t = metrics_now();
-                let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
+                let bytes = store.read_chunk(c.hash).await.map_err(store_err)?;
                 fetch_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
                 let t = metrics_now();
                 let written = volume
-                    .write_chunk(ChunkIndex(c.offset / chunk_size), bytes.to_vec())
+                    .write_chunk(ChunkIndex(c.offset / chunk_size), bytes)
                     .await;
                 write_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
                 written

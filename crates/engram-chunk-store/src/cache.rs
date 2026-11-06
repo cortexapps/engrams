@@ -915,6 +915,25 @@ impl ChunkCache {
         .await
     }
 
+    /// The chunk's bytes when its file is in the cache, else `None`.
+    /// Never fetches and never stores. Every populate path verifies the
+    /// hash before its atomic rename, so a present file is whole and
+    /// correct and is not hashed again (a 16 MiB sha256 costs about
+    /// 80 ms on hosts without SHA extensions).
+    pub async fn read_resident(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
+        let start = crate::time_source::metrics_now();
+        let Some(bytes) = read_if_present(&self.path_for(hash)).await? else {
+            // A miss is a failed open, not a latency sample.
+            return Ok(None);
+        };
+        metrics::histogram!("engram_chunk_fetch_seconds", "tier" => "nvme")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("engram_chunk_cache_hits_total", "tier" => "nvme").increment(1);
+        metrics::counter!("engram_chunk_cache_bytes_total", "tier" => "nvme")
+            .increment(bytes.len() as u64);
+        Ok(Some(bytes))
+    }
+
     /// [`Self::get`] with a source-aware fetcher: the closure reports
     /// where the bytes actually came from, so the
     /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label
@@ -929,48 +948,7 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
     {
-        // Fast path: local hit. The cache is content-addressed and every
-        // populate path verifies `bytes == hash` before the atomic write
-        // (`get`'s fetch arm below, and `put`), so a file present at
-        // `path_for(hash)` is known-good. We deliberately do NOT re-hash it
-        // here. ADR 0021: a full sha256 of a 16 MiB chunk is ~80 ms on our
-        // no-SHA-NI (Cascade Lake) hosts, and hot chunks are read many times
-        // per restore — re-verifying on every read would be the dominant
-        // cost. Verify on
-        // populate; trust on read. (Atomic temp+rename means a present file is
-        // never torn; post-write bit-rot is left to PD/local-SSD durability.)
-        let path = self.path_for(hash);
-        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
-        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
-        // `blobstorage` arm (the miss path below), so there was no signal
-        // for "the fast tier got slow" (a saturated NVMe device, ext4
-        // fragmentation, etc). Time the read regardless of hit/miss; a miss
-        // here is a fast negative stat (no file), not a meaningful latency
-        // sample, so only record on a hit.
-        let nvme_read_start = crate::time_source::metrics_now();
-        let nvme_read = read_if_present(&path).await?;
-        if let Some(bytes) = nvme_read {
-            metrics::histogram!(
-                "engram_chunk_fetch_seconds",
-                "tier" => "nvme",
-            )
-            .record(nvme_read_start.elapsed().as_secs_f64());
-            // ADR 0014 M1.15: local NVMe hit. Don't differentiate
-            // singleflight-piggyback from true cache hit here —
-            // the user-visible win is the same.
-            metrics::counter!(
-                "engram_chunk_cache_hits_total",
-                "tier" => "nvme",
-            )
-            .increment(1);
-            // ADR 0019 0d: bytes served per tier. With the hit counter
-            // this gives read volume + the nvme/blob split (per-read
-            // spans would flood the trace; this is the metric).
-            metrics::counter!(
-                "engram_chunk_cache_bytes_total",
-                "tier" => "nvme",
-            )
-            .increment(bytes.len() as u64);
+        if let Some(bytes) = self.read_resident(hash).await? {
             return Ok(bytes);
         }
 
@@ -1009,7 +987,7 @@ impl ChunkCache {
                 // without this, a stale-miss caller that wins leadership
                 // re-fetches a chunk that is already on NVMe (the
                 // `concurrent_clients_collapse_to_one_fetch` flake).
-                if let Some(bytes) = read_if_present(&path).await? {
+                if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
                     let waiters = {
                         let mut inflight = self.inner.inflight.lock();
                         inflight.remove(&hash).unwrap_or_default()

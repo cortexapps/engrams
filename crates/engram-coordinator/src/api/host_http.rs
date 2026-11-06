@@ -507,25 +507,13 @@ pub async fn heartbeat(
     Path(host_id): Path<HostId>,
     Json(hb): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
-    // ADR 0013 self-heal: ensure the host is in this pod's
-    // in-memory registry + the gRPC pool, even if we never saw
-    // the original `/api/hosts/register` POST (e.g. coord pod was
-    // just rolled by helm-deploy; the host already registered
-    // against the previous pod and won't re-register until its
-    // next agent restart). Heartbeat carries `host_addr` so we
-    // don't need a PG lookup; the warm + register are idempotent
-    // on the steady-state path.
+    // This replica dials the host at the address its heartbeat carries:
+    // (re)warm and register when the host is unknown here (this pod
+    // started after the host registered) or its address changed (a
+    // replaced node keeps its host id but not its IP). A host's heartbeats
+    // reach one replica; the others pick up a changed address from the
+    // `hosts` row once their entry passes the TTL (`HostRegistry::backend_for`).
     if let Some(host_addr) = hb.host_addr.as_deref() {
-        // (Re)warm + register when EITHER the host is unknown to this
-        // coord pod (it was rolled by helm-deploy — the original ADR 0013
-        // self-heal), OR its advertised addr changed since we last dialed
-        // it. The latter is ADR 0044 K2 (GAP 1): a DaemonSet pod restart
-        // keeps a STABLE HostId but gets a fresh POD_IP, so `contains` is
-        // still true — without the addr-change arm we'd keep dialing the
-        // dead old IP forever. `warm` is idempotent (a no-op when the addr
-        // is unchanged), and the `register` below re-points the dispatch
-        // backend; `update_state` later in this handler repopulates the
-        // reset HostState from this same heartbeat.
         let known = state.host_registry.contains(host_id);
         let addr_changed =
             state.services.host_pool.current_addr(host_id).as_deref() != Some(host_addr);
