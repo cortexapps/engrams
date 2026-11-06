@@ -20,8 +20,9 @@ use engram_disk_thin::ThinPoolDisk;
 use engram_host_core::disk::{
     clone_bitmap_bytes, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
 };
+use engram_host_core::disk_sources::Served;
 use engram_host_core::session_volumes::{live_name, Source};
-use engram_host_core::{checkpoint, DiskSources, FileDisk, FileSources, SessionVolumes};
+use engram_host_core::{checkpoint, stage, DiskSources, FileDisk, FileSources, SessionVolumes};
 use engram_storage_local::LocalBlobStorage;
 
 const CHUNK: u64 = 65536;
@@ -697,16 +698,34 @@ async fn a_half_made_drive_is_removed_and_made_again() {
 }
 
 /// [`FileSources`] behind a read-only loop device, as the block device a
-/// drive needs.
+/// drive needs, and behind dm-delay when reads must be slow.
 struct LoopSources {
     files: FileSources,
-    loops: Mutex<HashMap<(SandboxId, DiskRole), String>>,
+    delay_ms: Option<u32>,
+    devices: Mutex<HashMap<(SandboxId, DiskRole), LoopSource>>,
+}
+
+struct LoopSource {
+    loop_dev: String,
+    /// The dm-delay device over the loop device.
+    delay: Option<String>,
+}
+
+impl LoopSource {
+    fn path(&self) -> PathBuf {
+        match &self.delay {
+            Some(delay) => Path::new("/dev/mapper").join(delay),
+            None => PathBuf::from(&self.loop_dev),
+        }
+    }
 }
 
 impl LoopSources {
     fn detach_all(&self) {
-        for (_, device) in self.loops.lock().unwrap().drain() {
-            let _ = Command::new("losetup").args(["-d", &device]).output();
+        for (_, source) in self.devices.lock().unwrap().drain() {
+            let _ = Command::new("losetup")
+                .args(["-d", &source.loop_dev])
+                .output();
         }
     }
 }
@@ -721,24 +740,51 @@ impl DiskSources for LoopSources {
         base: Option<(&Volume, ManifestRef)>,
     ) -> std::io::Result<PathBuf> {
         let file = self.files.start(sandbox, role, manifest, base).await?;
-        let device = run(
+        let loop_dev = run(
             "losetup",
             &["--read-only", "--show", "-f", file.to_str().unwrap()],
         );
-        self.loops
-            .lock()
-            .unwrap()
-            .insert((sandbox, role), device.clone());
-        Ok(PathBuf::from(device))
+        let delay = self.delay_ms.map(|ms| {
+            let name = format!("engram-test-delay-{}-{role}", sandbox.as_uuid().simple());
+            let sectors = std::fs::metadata(&file).unwrap().len() / 512;
+            let table = format!("0 {sectors} delay {loop_dev} 0 {ms}");
+            run(
+                "dmsetup",
+                &["create", "--noudevsync", &name, "--table", &table],
+            );
+            run("dmsetup", &["mknodes", &name]);
+            name
+        });
+        let source = LoopSource { loop_dev, delay };
+        let path = source.path();
+        self.devices.lock().unwrap().insert((sandbox, role), source);
+        Ok(path)
     }
 
     async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
         self.files.ensure_alive(sandbox, role).await
     }
 
+    async fn served(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<Served> {
+        let served = self.files.served(sandbox, role).await?;
+        let device = self
+            .devices
+            .lock()
+            .unwrap()
+            .get(&(sandbox, role))
+            .map(LoopSource::path);
+        Ok(Served {
+            device: device.ok_or(ErrorKind::NotFound)?,
+            ..served
+        })
+    }
+
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
-        if let Some(device) = self.loops.lock().unwrap().remove(&(sandbox, role)) {
-            run("losetup", &["-d", &device]);
+        if let Some(source) = self.devices.lock().unwrap().remove(&(sandbox, role)) {
+            if let Some(delay) = &source.delay {
+                run("dmsetup", &["remove", "--noudevsync", delay]);
+            }
+            run("losetup", &["-d", &source.loop_dev]);
         }
         self.files.stop(sandbox, role).await
     }
@@ -748,7 +794,7 @@ impl DiskSources for LoopSources {
     }
 }
 
-/// Every device-mapper device of `sandbox`.
+/// Every device-mapper device of `sandbox`, its source's delay included.
 fn sandbox_devices(sandbox: SandboxId) -> Vec<String> {
     let id = sandbox.as_uuid().simple().to_string();
     run("dmsetup", &["ls"])
@@ -759,21 +805,114 @@ fn sandbox_devices(sandbox: SandboxId) -> Vec<String> {
         .collect()
 }
 
-/// Removes what a failed test left of a sandbox: its devices, in passes
-/// because a drive holds its thins, then the loop devices.
-struct SandboxGuard(SandboxId, Arc<LoopSources>);
+/// Session volumes over the pool with loop-device sources, an image
+/// manifest of `SIZE` pattern bytes, and one sandbox. Dropping it removes
+/// what a failed test left of the sandbox: its devices, in passes because
+/// a drive holds its thins, then the loop devices.
+struct SessionRig {
+    disk: ThinPoolDisk,
+    store: ChunkStore,
+    files: FileDisk,
+    sources: Arc<LoopSources>,
+    volumes: SessionVolumes,
+    bytes: Vec<u8>,
+    image: ManifestRef,
+    sandbox: SandboxId,
+    _dir: tempfile::TempDir,
+}
 
-impl Drop for SandboxGuard {
+impl SessionRig {
+    /// `None`, with a `SKIP:` line, when no pool is named.
+    async fn new(read_delay_ms: Option<u32>) -> Option<Self> {
+        let Ok(pool) = std::env::var("ENGRAM_TEST_THIN_POOL") else {
+            eprintln!("SKIP: ENGRAM_TEST_THIN_POOL is not set");
+            return None;
+        };
+        let disk = ThinPoolDisk::open(&pool, CHUNK, Path::new(NODES))
+            .await
+            .expect("open pool");
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs"))));
+        let files = FileDisk::new(dir.path().join("files"), CHUNK).unwrap();
+        let bytes = pattern(SIZE as usize, 0x2545_F491);
+        let image_file = files
+            .create(&VolumeName::new("image").unwrap(), SIZE)
+            .await
+            .unwrap();
+        image_file.write_range(0, bytes.clone()).await.unwrap();
+        let snap = VolumeName::new("image-snap").unwrap();
+        let (_, manifest) = checkpoint(&files, &store, &image_file, &snap, None)
+            .await
+            .unwrap();
+        let image = ManifestRef::new();
+        store.put_manifest(image, &manifest).await.unwrap();
+        let sources = Arc::new(LoopSources {
+            files: FileSources::new(dir.path().join("sources"), store.clone()).unwrap(),
+            delay_ms: read_delay_ms,
+            devices: Mutex::new(HashMap::new()),
+        });
+        let volumes = SessionVolumes::new(Arc::new(disk.clone()), store.clone())
+            .with_sources(sources.clone());
+        Some(Self {
+            disk,
+            store,
+            files,
+            sources,
+            volumes,
+            bytes,
+            image,
+            sandbox: SandboxId::new(),
+            _dir: dir,
+        })
+    }
+
+    /// The sandbox's root, provisioned lazily from the image.
+    async fn lazy_root(&self) -> Volume {
+        let lazy = Source::LazyFork {
+            manifest: self.image,
+            base: None,
+        };
+        let provisioned = self
+            .volumes
+            .provision(self.sandbox, lazy, None)
+            .await
+            .unwrap();
+        Volume::open(
+            VolumeName::new("probe").unwrap(),
+            &provisioned.root,
+            SIZE,
+            CHUNK,
+        )
+        .unwrap()
+    }
+
+    async fn root_state(&self) -> CloneState {
+        self.disk
+            .clone_state(&live_name(self.sandbox, DiskRole::Root))
+            .await
+            .unwrap()
+    }
+
+    /// Release the sandbox and check that nothing of it is left.
+    async fn release_clean(&self) {
+        self.volumes.release(self.sandbox).await.unwrap();
+        assert_eq!(self.sources.list().await.unwrap(), Vec::new());
+        assert_eq!(self.sources.devices.lock().unwrap().len(), 0);
+        assert_eq!(sandbox_devices(self.sandbox), Vec::<String>::new());
+    }
+}
+
+impl Drop for SessionRig {
     fn drop(&mut self) {
         for _ in 0..4 {
-            for device in sandbox_devices(self.0) {
+            for device in sandbox_devices(self.sandbox) {
                 let _ = Command::new("dmsetup")
                     .args(["remove", "--noudevsync", &device])
                     .output();
                 let _ = std::fs::remove_file(Path::new(NODES).join(&device));
             }
         }
-        self.1.detach_all();
+        self.sources.detach_all();
     }
 }
 
@@ -783,54 +922,12 @@ impl Drop for SandboxGuard {
 #[tokio::test]
 #[ignore]
 async fn a_lazy_session_role_reads_its_manifest_and_releases_clean() {
-    let Ok(pool) = std::env::var("ENGRAM_TEST_THIN_POOL") else {
-        eprintln!("SKIP: ENGRAM_TEST_THIN_POOL is not set");
+    let Some(rig) = SessionRig::new(None).await else {
         return;
     };
-    let disk = ThinPoolDisk::open(&pool, CHUNK, Path::new(NODES))
-        .await
-        .expect("open pool");
-    let dir = tempfile::tempdir().unwrap();
-    let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs"))));
-    let files = FileDisk::new(dir.path().join("files"), CHUNK).unwrap();
-    let bytes = pattern(SIZE as usize, 0x2545_F491);
-    let image_file = files
-        .create(&VolumeName::new("image").unwrap(), SIZE)
-        .await
-        .unwrap();
-    image_file.write_range(0, bytes.clone()).await.unwrap();
-    let snap = VolumeName::new("image-snap").unwrap();
-    let (_, manifest) = checkpoint(&files, &store, &image_file, &snap, None)
-        .await
-        .unwrap();
-    let image = ManifestRef::new();
-    store.put_manifest(image, &manifest).await.unwrap();
-
-    let sources = Arc::new(LoopSources {
-        files: FileSources::new(dir.path().join("sources"), store.clone()).unwrap(),
-        loops: Mutex::new(HashMap::new()),
-    });
-    let volumes = SessionVolumes::new(Arc::new(disk.clone()), store).with_sources(sources.clone());
-    let sandbox = SandboxId::new();
-    let _guard = SandboxGuard(sandbox, sources.clone());
-
-    let lazy = Source::LazyFork {
-        manifest: image,
-        base: None,
-    };
-    let provisioned = volumes.provision(sandbox, lazy, None).await.unwrap();
-    let drive = Volume::open(
-        VolumeName::new("probe").unwrap(),
-        &provisioned.root,
-        SIZE,
-        CHUNK,
-    )
-    .unwrap();
-    assert_eq!(first_difference(&whole(&drive).await, &bytes), None);
-    let state = disk
-        .clone_state(&live_name(sandbox, DiskRole::Root))
-        .await
-        .unwrap();
+    let drive = rig.lazy_root().await;
+    assert_eq!(first_difference(&whole(&drive).await, &rig.bytes), None);
+    let state = rig.root_state().await;
     assert!(
         matches!(
             state,
@@ -842,10 +939,55 @@ async fn a_lazy_session_role_reads_its_manifest_and_releases_clean() {
         "{state:?}"
     );
     drop(drive);
+    rig.release_clean().await;
+}
 
-    volumes.release(sandbox).await.unwrap();
+/// A checkpoint while the drive copies reads through a view over the
+/// snapshot pair and the source: staged again, the published manifest is
+/// exactly what the drive read at the take, guest writes included.
+#[tokio::test]
+#[ignore]
+async fn a_checkpoint_mid_hydration_stages_into_what_the_drive_read() {
+    let Some(rig) = SessionRig::new(Some(30)).await else {
+        return;
+    };
+    let drive = rig.lazy_root().await;
+    let mut expected = rig.bytes.clone();
+    write(&drive, &mut expected, 60 * REGION + 4096, vec![0x44; 4096]).await;
+    write(
+        &drive,
+        &mut expected,
+        5 * REGION,
+        pattern(REGION as usize, 9),
+    )
+    .await;
+    let CloneState::Copying {
+        hydrated_regions, ..
+    } = rig.root_state().await
+    else {
+        panic!("the drive is not copying");
+    };
+    eprintln!("{hydrated_regions} of {REGIONS} regions copied before the take");
+    assert!(hydrated_regions < REGIONS);
 
-    assert_eq!(sources.list().await.unwrap(), Vec::new());
-    assert_eq!(sources.loops.lock().unwrap().len(), 0);
-    assert_eq!(sandbox_devices(sandbox), Vec::<String>::new());
+    let published = rig
+        .volumes
+        .checkpoint(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
+
+    let manifest = rig.store.get_manifest(published).await.unwrap();
+    let staged = stage(
+        &rig.files,
+        &rig.store,
+        &VolumeName::new("staged").unwrap(),
+        &manifest,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_difference(&whole(&staged).await, &expected), None);
+    assert!(matches!(rig.root_state().await, CloneState::Copying { .. }));
+    drop(drive);
+    rig.release_clean().await;
 }

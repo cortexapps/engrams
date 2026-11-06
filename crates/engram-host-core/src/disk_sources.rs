@@ -17,8 +17,17 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
-use crate::disk::{FileDisk, SessionDisk, Volume, VolumeName};
+use crate::disk::{FileDisk, Volume, VolumeName};
 use crate::disk_flows::stage;
+
+/// What a role's source serves, as [`DiskSources::start`] was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Served {
+    pub device: PathBuf,
+    pub manifest: ManifestRef,
+    /// The manifest of the staged base volume, when it had one.
+    pub base: Option<ManifestRef>,
+}
 
 #[async_trait]
 pub trait DiskSources: Send + Sync {
@@ -38,6 +47,9 @@ pub trait DiskSources: Send + Sync {
     /// device when it died. `NotFound` when the role has no source.
     async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()>;
 
+    /// The role's source. `NotFound` when the role has none.
+    async fn served(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Served>;
+
     /// Stop the role's source. No drive or view may read it. A role with
     /// no source is left as it is.
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()>;
@@ -48,7 +60,9 @@ pub trait DiskSources: Send + Sync {
 
 /// Sources as files the manifest is staged into, one per role in one
 /// directory: for [`FileDisk`], whose drives copy their source in full
-/// before they return. A file has no process that can die.
+/// before they return. A file has no process that can die. Beside each
+/// file, `<file>.served` holds the manifest and the base, the file's
+/// existence holds that the source is started.
 pub struct FileSources {
     root: PathBuf,
     store: ChunkStore,
@@ -69,6 +83,15 @@ impl FileSources {
     fn path(&self, sandbox: SandboxId, role: DiskRole) -> PathBuf {
         self.root.join(Self::name(sandbox, role).as_str())
     }
+
+    fn served_path(&self, sandbox: SandboxId, role: DiskRole) -> PathBuf {
+        self.root
+            .join(format!("{}.served", Self::name(sandbox, role)))
+    }
+}
+
+fn invalid(what: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
 #[async_trait]
@@ -79,23 +102,47 @@ impl DiskSources for FileSources {
         sandbox: SandboxId,
         role: DiskRole,
         manifest: ManifestRef,
-        _base: Option<(&Volume, ManifestRef)>,
+        base: Option<(&Volume, ManifestRef)>,
     ) -> io::Result<PathBuf> {
-        let manifest = self
+        let contents = self
             .store
             .get_manifest(manifest)
             .await
             .map_err(io::Error::other)?;
-        let files = FileDisk::new(&self.root, manifest.chunk_size.as_u64())?;
         let name = Self::name(sandbox, role);
-        match stage(&files, &self.store, &name, &manifest, None).await {
-            Ok(volume) => Ok(volume.path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-            Err(e) => {
-                let _ = files.delete(&name).await;
-                Err(e)
-            }
+        if self.path(sandbox, role).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("source {name} already exists"),
+            ));
         }
+        let files = FileDisk::new(&self.root, contents.chunk_size.as_u64())?;
+        let base = base.map_or(String::new(), |(_, m)| format!(" {m}"));
+        std::fs::write(self.served_path(sandbox, role), format!("{manifest}{base}"))?;
+        let staged = stage(&files, &self.store, &name, &contents, None).await;
+        if staged.is_err() {
+            let _ = self.stop(sandbox, role).await;
+        }
+        Ok(staged?.path)
+    }
+
+    async fn served(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Served> {
+        let device = self.path(sandbox, role);
+        std::fs::metadata(&device)?;
+        let text = std::fs::read_to_string(self.served_path(sandbox, role))?;
+        let mut refs = text.split(' ').map(|r| {
+            r.parse::<ManifestRef>()
+                .map_err(|e| invalid(format!("source record {text:?}: {e}")))
+        });
+        let manifest = refs
+            .next()
+            .ok_or_else(|| invalid(format!("source record {text:?} names no manifest")))??;
+        let base = refs.next().transpose()?;
+        Ok(Served {
+            device,
+            manifest,
+            base,
+        })
     }
 
     async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
@@ -103,10 +150,13 @@ impl DiskSources for FileSources {
     }
 
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
-        match std::fs::remove_file(self.path(sandbox, role)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        for path in [self.path(sandbox, role), self.served_path(sandbox, role)] {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     async fn list(&self) -> io::Result<Vec<(SandboxId, DiskRole)>> {
@@ -152,6 +202,14 @@ mod tests {
         assert_eq!(again.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert!(path.exists(), "a refused start keeps the running source");
         sources.ensure_alive(sandbox, role).await.unwrap();
+        assert_eq!(
+            sources.served(sandbox, role).await.unwrap(),
+            Served {
+                device: path.clone(),
+                manifest,
+                base: None,
+            }
+        );
         assert_eq!(sources.list().await.unwrap(), vec![(sandbox, role)]);
 
         sources.stop(sandbox, role).await.unwrap();
@@ -159,5 +217,13 @@ mod tests {
         assert!(sources.list().await.unwrap().is_empty());
         let gone = sources.ensure_alive(sandbox, role).await.unwrap_err();
         assert_eq!(gone.kind(), io::ErrorKind::NotFound);
+        let gone = sources.served(sandbox, role).await.unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("sources"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

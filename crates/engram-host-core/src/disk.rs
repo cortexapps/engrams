@@ -658,6 +658,19 @@ pub trait SessionDisk: Send + Sync {
         Ok(dirty)
     }
 
+    /// Ascending indices of the chunks of `snapshot` that a write can
+    /// have changed since it was made from `origin`, or, with no origin,
+    /// since it was a new volume. A chunk written with the bytes it held
+    /// is listed, so the list does not depend on content. The default
+    /// lists every chunk; a disk that records writes lists fewer.
+    async fn written_chunks(
+        &self,
+        _origin: Option<&Volume>,
+        snapshot: &Volume,
+    ) -> io::Result<Vec<ChunkIndex>> {
+        Ok((0..snapshot.chunk_count()).map(ChunkIndex).collect())
+    }
+
     /// Ascending indices of the chunks that differ between two snapshots
     /// of one origin.
     async fn dirty_chunks(&self, before: &Volume, after: &Volume) -> io::Result<Vec<ChunkIndex>> {

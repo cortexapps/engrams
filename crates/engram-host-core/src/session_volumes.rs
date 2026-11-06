@@ -20,7 +20,10 @@
 //! ```
 //!
 //! A lazy provision makes a cloned role over a source from
-//! [`DiskSources`]; a checkpoint or a move of one is refused.
+//! [`DiskSources`]. A checkpoint of one reads through a view until the
+//! cutover; the first checkpoint after it is a `-ckpt-` volume, and from
+//! then on the role checkpoints as any other. A live move of a cloned
+//! role is refused.
 //!
 //! A checkpoint volume is named after a manifest the chunk store holds,
 //! so the name is written last: a crash leaves a `tmp-` volume, never a
@@ -44,7 +47,9 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
-use crate::disk::{clone_bitmap_bytes, Capacity, Hydration, SessionDisk, Volume, VolumeName};
+use crate::disk::{
+    clone_bitmap_bytes, Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName,
+};
 use crate::disk_flows::{checkpoint_split, stage};
 use crate::disk_sources::DiskSources;
 use crate::image_volumes;
@@ -79,13 +84,25 @@ impl Kind {
         }
     }
 
-    /// The manifest a volume that holds the role's lineage names.
-    fn lineage(self) -> Option<ManifestRef> {
+    /// The manifest a volume that holds the role's lineage names, and
+    /// which kind of holder it is.
+    fn holder(self) -> Option<(ManifestRef, Holder)> {
         match self {
-            Self::Checkpoint(m) | Self::Dest(m) => Some(m),
+            Self::Checkpoint(m) => Some((m, Holder::Checkpoint)),
+            Self::Dest(m) => Some((m, Holder::Dest)),
             Self::Live | Self::Transient | Self::Bitmap | Self::BitmapSnapshot | Self::View => None,
         }
     }
+}
+
+/// The volume that holds a role's lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    /// A complete snapshot.
+    Checkpoint,
+    /// A cloned drive's destination, which is not complete before the
+    /// cutover.
+    Dest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,15 +259,19 @@ fn cloned_roles<'a>(parsed: impl IntoIterator<Item = &'a Parsed>) -> Vec<(Sandbo
     roles
 }
 
-/// The manifest the role's lineage holds: the newest of its checkpoint
-/// volumes and destinations.
-fn lineage_in(names: &[VolumeName], sandbox: SandboxId, role: DiskRole) -> io::Result<ManifestRef> {
+/// The manifest the role's lineage holds and its holder: the newest of
+/// its checkpoint volumes and destinations.
+fn lineage_in(
+    names: &[VolumeName],
+    sandbox: SandboxId,
+    role: DiskRole,
+) -> io::Result<(ManifestRef, Holder)> {
     names
         .iter()
         .filter_map(parse)
         .filter(|p| p.sandbox == sandbox && p.role == role)
-        .filter_map(|p| p.kind.lineage())
-        .max_by_key(|m| m.version)
+        .filter_map(|p| p.kind.holder())
+        .max_by_key(|(m, _)| m.version)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -259,8 +280,25 @@ fn lineage_in(names: &[VolumeName], sandbox: SandboxId, role: DiskRole) -> io::R
         })
 }
 
-/// The refusal of `op` on a cloned role, which this module only
-/// recognizes and removes.
+/// The name of the role's destination.
+fn dest_in(names: &[VolumeName], sandbox: SandboxId, role: DiskRole) -> io::Result<VolumeName> {
+    names
+        .iter()
+        .find(|name| {
+            parse(name).is_some_and(|p| {
+                p.sandbox == sandbox && p.role == role && matches!(p.kind, Kind::Dest(_))
+            })
+        })
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("sandbox {sandbox} has no {role} destination"),
+            )
+        })
+}
+
+/// The refusal of `op` on a cloned role.
 fn cloned_refused(sandbox: SandboxId, role: DiskRole, op: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -321,7 +359,7 @@ pub struct Provisioned {
 }
 
 /// A snapshot taken under the guest pause, not yet published. Dropping
-/// it leaves the transient volume for the next `take`, `pending` or
+/// it leaves the transient volumes for the next `take`, `pending` or
 /// `release` to find.
 #[derive(Debug)]
 pub struct PendingCheckpoint {
@@ -329,6 +367,22 @@ pub struct PendingCheckpoint {
     role: DiskRole,
     snapshot: Volume,
     previous: ManifestRef,
+    shape: Shape,
+}
+
+/// What a pending checkpoint snapshotted, which says how it publishes.
+#[derive(Debug)]
+enum Shape {
+    /// A volume next to the checkpoint volume of `previous`: the upload
+    /// is the difference from that volume.
+    Volume,
+    /// A cloned drive's destination with this bitmap snapshot, taken
+    /// together before the cutover. The destination snapshot reads zeros
+    /// where the drive had not copied, so the upload reads through a view.
+    Hydrating { bitmap: Volume },
+    /// A cloned drive's destination after the cutover, with no complete
+    /// volume of `previous`: the upload hashes every chunk.
+    CutOver,
 }
 
 impl PendingCheckpoint {
@@ -547,12 +601,7 @@ impl SessionVolumes {
         base: Option<ManifestRef>,
         lineage: ManifestRef,
     ) -> io::Result<PathBuf> {
-        let sources = self.sources.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("a lazy {role} disk needs disk sources, which this host does not have"),
-            )
-        })?;
+        let sources = self.sources(role)?;
         let bitmap = self
             .disk
             .create(
@@ -766,8 +815,7 @@ impl SessionVolumes {
     }
 
     /// The lineage of a role whose live name is a volume; `Unsupported`
-    /// for a cloned role, so no `op` snapshots a drive's destination,
-    /// which reads zeros where the drive has not copied.
+    /// for a cloned role, which no `op` handles.
     async fn volume_lineage(
         &self,
         sandbox: SandboxId,
@@ -778,44 +826,120 @@ impl SessionVolumes {
         if cloned_in(&names, sandbox, role) {
             return Err(cloned_refused(sandbox, role, op));
         }
-        lineage_in(&names, sandbox, role)
+        Ok(lineage_in(&names, sandbox, role)?.0)
     }
 
-    /// Under the guest pause: sync the live volume and snapshot it.
+    /// Under the guest pause: sync the live volume and snapshot it. A
+    /// cloned role syncs its drive and snapshots the destination, with
+    /// the bitmap while the drive copies.
     pub async fn take(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<PendingCheckpoint> {
-        let previous = self.volume_lineage(sandbox, role, "checkpoint").await?;
+        let names = self.disk.list().await?;
+        let (previous, holder) = lineage_in(&names, sandbox, role)?;
         let tmp = transient_name(sandbox, role);
-        self.delete_if_present(&tmp).await?;
-        let live = self.live(sandbox, role).await?;
-        let snapshot = checkpoint_split::take(self.disk.as_ref(), &live, &tmp).await?;
-        Ok(PendingCheckpoint {
+        let pending = |snapshot, shape| PendingCheckpoint {
             sandbox,
             role,
             snapshot,
             previous,
-        })
+            shape,
+        };
+        if !cloned_in(&names, sandbox, role) {
+            self.delete_if_present(&tmp).await?;
+            let live = self.live(sandbox, role).await?;
+            let snapshot = checkpoint_split::take(self.disk.as_ref(), &live, &tmp).await?;
+            return Ok(pending(snapshot, Shape::Volume));
+        }
+        let drive_name = live_name(sandbox, role);
+        let cut_over = match (self.disk.clone_state(&drive_name).await?, holder) {
+            (CloneState::Copying { .. }, Holder::Dest) => None,
+            (CloneState::CutOver, Holder::Checkpoint) => Some(Shape::Volume),
+            (CloneState::CutOver, Holder::Dest) => Some(Shape::CutOver),
+            (state, holder) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{drive_name} is {state:?} with its lineage on a {holder:?}"),
+                ))
+            }
+        };
+        self.discard_pair(sandbox, role).await?;
+        let dest = self.disk.open(&dest_in(&names, sandbox, role)?).await?;
+        match cut_over {
+            Some(shape) => {
+                self.disk.open_clone(&drive_name).await?.sync().await?;
+                let snapshot = self.disk.snapshot(&dest, &tmp).await?;
+                Ok(pending(snapshot, shape))
+            }
+            None => {
+                // A suspend waits for the source's reads in flight.
+                self.sources(role)?.ensure_alive(sandbox, role).await?;
+                self.disk.open_clone(&drive_name).await?.sync().await?;
+                let bitmap = self.disk.open(&bitmap_name(sandbox, role)).await?;
+                let (snapshot, bitmap) = self
+                    .disk
+                    .snapshot_clone(
+                        &drive_name,
+                        &dest,
+                        &bitmap,
+                        &tmp,
+                        &bitmap_snapshot_name(sandbox, role),
+                    )
+                    .await?;
+                Ok(pending(snapshot, Shape::Hydrating { bitmap }))
+            }
+        }
     }
 
     /// The checkpoint a `take` left unpublished, found by name: a new
     /// process redrives the publish after a crash. `NotFound` when
-    /// there is none; `Unsupported` when a cloned role has one.
+    /// there is none.
     pub async fn pending(
         &self,
         sandbox: SandboxId,
         role: DiskRole,
     ) -> io::Result<PendingCheckpoint> {
         let names = self.disk.list().await?;
-        let tmp = transient_name(sandbox, role);
-        if names.contains(&tmp) && cloned_in(&names, sandbox, role) {
-            return Err(cloned_refused(sandbox, role, "publish a checkpoint"));
-        }
-        let previous = lineage_in(&names, sandbox, role)?;
-        let snapshot = self.disk.open(&tmp).await?;
+        let (previous, holder) = lineage_in(&names, sandbox, role)?;
+        let snapshot = self.disk.open(&transient_name(sandbox, role)).await?;
+        let shape = match holder {
+            Holder::Checkpoint => Shape::Volume,
+            Holder::Dest => match self.disk.open(&bitmap_snapshot_name(sandbox, role)).await {
+                Ok(bitmap) => Shape::Hydrating { bitmap },
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Shape::CutOver,
+                Err(e) => return Err(e),
+            },
+        };
         Ok(PendingCheckpoint {
             sandbox,
             role,
             snapshot,
             previous,
+            shape,
+        })
+    }
+
+    /// Delete what a cloned role's earlier checkpoint left: the view and
+    /// the snapshot pair.
+    async fn discard_pair(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+        self.remove_view(sandbox, role).await?;
+        self.delete_if_present(&transient_name(sandbox, role))
+            .await?;
+        self.delete_if_present(&bitmap_snapshot_name(sandbox, role))
+            .await
+    }
+
+    async fn remove_view(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+        match self.disk.remove_clone(&view_name(sandbox, role)).await {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    fn sources(&self, role: DiskRole) -> io::Result<&dyn DiskSources> {
+        self.sources.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("a cloned {role} disk needs disk sources, which this host does not have"),
+            )
         })
     }
 
@@ -838,6 +962,7 @@ impl SessionVolumes {
             role,
             snapshot,
             previous,
+            shape: Shape::Volume,
         })
     }
 
@@ -876,27 +1001,40 @@ impl SessionVolumes {
             .await
     }
 
-    /// Outside the pause: upload what changed since the last checkpoint,
-    /// publish the manifest at the lineage's next free version, and make
-    /// the snapshot the sandbox's checkpoint volume.
+    /// Outside the pause: upload what changed since the last checkpoint
+    /// and publish the manifest at the lineage's next free version. The
+    /// snapshot becomes the sandbox's checkpoint volume; a cloned role's
+    /// destination takes the new version's name until the cutover.
     pub async fn publish(&self, pending: PendingCheckpoint) -> io::Result<ManifestRef> {
         let PendingCheckpoint {
             sandbox,
             role,
             snapshot,
             previous,
+            shape,
         } = pending;
         let previous_name = checkpoint_name(sandbox, role, previous);
-        let previous_volume = self.disk.open(&previous_name).await?;
-        let previous_manifest = self.store.get_manifest(previous).await.map_err(store_err)?;
-        let manifest = checkpoint_split::upload(
-            self.disk.as_ref(),
-            &self.store,
-            &snapshot,
-            Some((&previous_volume, &previous_manifest)),
-        )
-        .await?;
-        drop(previous_volume);
+        let manifest = match &shape {
+            Shape::Volume => {
+                let previous_volume = self.disk.open(&previous_name).await?;
+                let previous_manifest =
+                    self.store.get_manifest(previous).await.map_err(store_err)?;
+                checkpoint_split::upload(
+                    self.disk.as_ref(),
+                    &self.store,
+                    &snapshot,
+                    Some((&previous_volume, &previous_manifest)),
+                )
+                .await?
+            }
+            Shape::Hydrating { bitmap } => {
+                self.upload_through_view(sandbox, role, &snapshot, bitmap)
+                    .await?
+            }
+            Shape::CutOver => {
+                checkpoint_split::upload(self.disk.as_ref(), &self.store, &snapshot, None).await?
+            }
+        };
         // The store, not the volume name, says which versions exist: a
         // crash after `put_manifest` and before the rename leaves a
         // version the name never reached.
@@ -916,11 +1054,75 @@ impl SessionVolumes {
             .map_err(store_err)?;
         let tmp = snapshot.name.clone();
         drop(snapshot);
-        self.disk
-            .rename(&tmp, &checkpoint_name(sandbox, role, next))
-            .await?;
-        self.disk.delete(&previous_name).await?;
+        match shape {
+            Shape::Volume => {
+                self.disk
+                    .rename(&tmp, &checkpoint_name(sandbox, role, next))
+                    .await?;
+                self.disk.delete(&previous_name).await?;
+            }
+            Shape::CutOver => {
+                self.disk
+                    .rename(&tmp, &checkpoint_name(sandbox, role, next))
+                    .await?;
+            }
+            // A crash after the rename leaves the pair, which publishes
+            // again under the version after `next`, with the same bytes.
+            Shape::Hydrating { bitmap } => {
+                drop(bitmap);
+                self.disk
+                    .rename(
+                        &dest_name(sandbox, role, previous),
+                        &dest_name(sandbox, role, next),
+                    )
+                    .await?;
+                self.discard_pair(sandbox, role).await?;
+            }
+        }
         Ok(next)
+    }
+
+    /// The source's manifest with every chunk the destination snapshot
+    /// can have written since its origin replaced by what the view over
+    /// the pair reads there. A chunk the destination never wrote is a
+    /// chunk the drive had not copied, which the source serves.
+    async fn upload_through_view(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        snapshot: &Volume,
+        bitmap: &Volume,
+    ) -> io::Result<Manifest> {
+        let sources = self.sources(role)?;
+        sources.ensure_alive(sandbox, role).await?;
+        let served = sources.served(sandbox, role).await?;
+        self.remove_view(sandbox, role).await?;
+        let name = view_name(sandbox, role);
+        let view = self
+            .disk
+            .clone_view(&name, snapshot, bitmap, &served.device)
+            .await?;
+        let uploaded = async {
+            let origin = match served.base {
+                Some(base) => match self.disk.open(&image_volumes::volume_name(base)).await {
+                    Ok(origin) => Some(origin).filter(|o| o.size_bytes == snapshot.size_bytes),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                },
+                None => None,
+            };
+            let written = self.disk.written_chunks(origin.as_ref(), snapshot).await?;
+            let source = self
+                .store
+                .get_manifest(served.manifest)
+                .await
+                .map_err(store_err)?;
+            checkpoint_split::upload_over(&self.store, &view, written, &source).await
+        }
+        .await;
+        drop(view);
+        self.disk.remove_clone(&name).await?;
+        uploaded
     }
 
     /// [`Self::take`] then [`Self::publish`], for a guest that is paused
@@ -930,11 +1132,24 @@ impl SessionVolumes {
         self.publish(pending).await
     }
 
-    /// Delete a pending checkpoint's snapshot without publishing it.
+    /// Delete a pending checkpoint's snapshots without publishing them.
     pub async fn discard(&self, pending: PendingCheckpoint) -> io::Result<()> {
-        let name = pending.snapshot.name.clone();
-        drop(pending);
-        self.disk.delete(&name).await
+        let PendingCheckpoint {
+            sandbox,
+            role,
+            snapshot,
+            shape,
+            ..
+        } = pending;
+        let name = snapshot.name.clone();
+        drop(snapshot);
+        match shape {
+            Shape::Hydrating { bitmap } => {
+                drop(bitmap);
+                self.discard_pair(sandbox, role).await
+            }
+            Shape::Volume | Shape::CutOver => self.disk.delete(&name).await,
+        }
     }
 
     /// Delete the sandbox's drives, its live and transient volumes and
@@ -1038,7 +1253,7 @@ impl SessionVolumes {
             .filter(|(_, p)| within(p.sandbox))
             .collect();
         for (_, p) in &parsed {
-            if let Some(m) = p.kind.lineage() {
+            if let Some((m, _)) = p.kind.holder() {
                 let v = newest.entry((p.sandbox, p.role)).or_insert(0);
                 *v = (*v).max(m.version);
             }
@@ -1160,7 +1375,7 @@ impl SessionVolumes {
         sandbox: SandboxId,
         role: DiskRole,
     ) -> io::Result<ManifestRef> {
-        lineage_in(&self.disk.list().await?, sandbox, role)
+        Ok(lineage_in(&self.disk.list().await?, sandbox, role)?.0)
     }
 
     async fn delete_if_present(&self, name: &VolumeName) -> io::Result<()> {
@@ -1180,7 +1395,7 @@ mod tests {
     use super::*;
     use crate::disk::{ChunkIndex, CloneState, FileDisk, Hydration, CLONE_HEADER_BYTES};
     use crate::disk_flows::checkpoint;
-    use crate::disk_sources::FileSources;
+    use crate::disk_sources::{FileSources, Served};
     use crate::test_support::CountingBlob;
 
     const CHUNK: u64 = 4096;
@@ -2478,10 +2693,8 @@ mod tests {
         );
     }
 
-    /// A capture that took a drive's destination as a checkpoint would
-    /// publish zeros where the drive has not copied.
     #[tokio::test]
-    async fn a_cloned_role_refuses_a_checkpoint_and_a_move() {
+    async fn a_cloned_role_refuses_a_live_move_and_finds_its_pending_pair() {
         let r = rig();
         let sandbox = SandboxId::new();
         let lineage = ManifestRef::new();
@@ -2497,25 +2710,16 @@ mod tests {
         cloned_checkpoint(&r, sandbox, DiskRole::Root, lineage).await;
         let before = names(&r).await;
 
-        let refusals = [
-            r.volumes.take(sandbox, DiskRole::Root).await.unwrap_err(),
-            r.volumes
-                .take_precopy(sandbox, DiskRole::Root)
-                .await
-                .unwrap_err(),
-            r.volumes
-                .pending(sandbox, DiskRole::Root)
-                .await
-                .unwrap_err(),
-            r.volumes
-                .checkpoint(sandbox, DiskRole::Root)
-                .await
-                .unwrap_err(),
-        ];
-        for e in refusals {
-            assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
-        }
+        let refused = r
+            .volumes
+            .take_precopy(sandbox, DiskRole::Root)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "{refused}");
         assert_eq!(names(&r).await, before);
+        let pending = r.volumes.pending(sandbox, DiskRole::Root).await.unwrap();
+        assert!(matches!(pending.shape, Shape::Hydrating { .. }));
+        assert_eq!(pending.previous(), lineage);
     }
 
     #[tokio::test]
@@ -2756,6 +2960,9 @@ mod tests {
             self.log.lock().unwrap().push(format!("alive {role}"));
             self.inner.ensure_alive(sandbox, role).await
         }
+        async fn served(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Served> {
+            self.inner.served(sandbox, role).await
+        }
         async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
             let drive = self
                 .disk
@@ -2805,5 +3012,183 @@ mod tests {
             vec![image_volumes::volume_name(image).as_str().to_string()]
         );
         assert!(volumes.released().is_empty());
+    }
+
+    /// The bytes of `manifest`, staged into a scratch volume.
+    async fn staged_bytes(r: &Rig, manifest: ManifestRef) -> Vec<u8> {
+        let contents = r.store.get_manifest(manifest).await.unwrap();
+        let name = VolumeName::new(format!("check-{}", manifest.version)).unwrap();
+        let volume = stage(r.disk.as_ref(), &r.store, &name, &contents, None)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&volume.path).unwrap();
+        drop(volume);
+        r.disk.delete(&name).await.unwrap();
+        bytes
+    }
+
+    fn next(manifest: ManifestRef) -> ManifestRef {
+        version(manifest, manifest.version + 1)
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_while_hydrating_publishes_what_the_drive_reads() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0, 3]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+        write_half(&p.root, 0, 1, 7).await;
+        write_byte(&p.root, 2, 9).await;
+
+        let published = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+
+        assert_eq!(published, next(p.root_manifest));
+        assert_eq!(
+            staged_bytes(&r, published).await,
+            std::fs::read(&p.root).unwrap()
+        );
+        let names = names(&r).await;
+        assert!(names.contains(&dest_name(sandbox, DiskRole::Root, published).to_string()));
+        for gone in [
+            dest_name(sandbox, DiskRole::Root, p.root_manifest),
+            transient_name(sandbox, DiskRole::Root),
+            bitmap_snapshot_name(sandbox, DiskRole::Root),
+        ] {
+            assert!(!names.contains(&gone.to_string()), "{gone}");
+        }
+        let view = r.disk.open_clone(&view_name(sandbox, DiskRole::Root)).await;
+        assert_eq!(view.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A process death after the take, and one inside the publish that
+    /// left the view, are redriven from the names.
+    #[tokio::test]
+    async fn a_hydrating_checkpoint_cut_after_the_take_publishes_from_pending() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 8).await;
+        drop(r.volumes.take(sandbox, DiskRole::Root).await.unwrap());
+        write_byte(&p.root, 0, 4).await;
+        let tmp = r
+            .disk
+            .open(&transient_name(sandbox, DiskRole::Root))
+            .await
+            .unwrap();
+        let bm = r
+            .disk
+            .open(&bitmap_snapshot_name(sandbox, DiskRole::Root))
+            .await
+            .unwrap();
+        r.disk
+            .clone_view(
+                &view_name(sandbox, DiskRole::Root),
+                &tmp,
+                &bm,
+                Path::new("/dev/null"),
+            )
+            .await
+            .unwrap();
+        drop((tmp, bm));
+
+        let pending = r.volumes.pending(sandbox, DiskRole::Root).await.unwrap();
+        let published = r.volumes.publish(pending).await.unwrap();
+
+        assert_eq!(published, next(p.root_manifest));
+        assert_eq!(
+            staged_bytes(&r, published).await[..CHUNK as usize],
+            vec![1; CHUNK as usize]
+        );
+        assert_eq!(
+            staged_bytes(&r, published).await[CHUNK as usize..],
+            vec![8; CHUNK as usize]
+        );
+        assert_eq!(
+            r.volumes
+                .pending(sandbox, DiskRole::Root)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn after_the_cutover_a_checkpoint_hashes_the_disk_and_the_next_one_diffs() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0, 3]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+        r.disk
+            .cut_over(&live_name(sandbox, DiskRole::Root))
+            .await
+            .unwrap();
+        write_byte(&p.root, 1, 5).await;
+
+        let first = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+
+        assert_eq!(first, next(p.root_manifest));
+        assert_eq!(
+            staged_bytes(&r, first).await,
+            std::fs::read(&p.root).unwrap()
+        );
+        assert_eq!(
+            r.volumes
+                .checkpoint_of(sandbox, DiskRole::Root)
+                .await
+                .unwrap(),
+            first
+        );
+        let names_now = names(&r).await;
+        assert!(names_now.contains(&checkpoint_name(sandbox, DiskRole::Root, first).to_string()));
+        assert!(
+            names_now.contains(&dest_name(sandbox, DiskRole::Root, p.root_manifest).to_string())
+        );
+
+        write_byte(&p.root, 3, 6).await;
+        let pending = r.volumes.take(sandbox, DiskRole::Root).await.unwrap();
+        assert!(
+            matches!(pending.shape, Shape::Volume),
+            "{:?}",
+            pending.shape
+        );
+        assert_eq!(
+            r.volumes.changed_blocks(&pending, CHUNK).await.unwrap(),
+            vec![3]
+        );
+        let second = r.volumes.publish(pending).await.unwrap();
+
+        assert_eq!(second, next(first));
+        assert_eq!(
+            staged_bytes(&r, second).await,
+            std::fs::read(&p.root).unwrap()
+        );
+        assert!(!names(&r)
+            .await
+            .contains(&checkpoint_name(sandbox, DiskRole::Root, first).to_string()));
+
+        r.volumes.release(sandbox).await.unwrap();
+
+        assert_eq!(
+            names(&r).await,
+            vec![
+                image_volumes::volume_name(image).to_string(),
+                checkpoint_name(sandbox, DiskRole::Root, second).to_string(),
+            ]
+        );
+        assert_eq!(r.volumes.released(), vec![sandbox]);
     }
 }

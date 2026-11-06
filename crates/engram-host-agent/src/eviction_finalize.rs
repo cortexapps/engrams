@@ -844,7 +844,8 @@ mod tests {
 
     /// A cloned role's publish renames its destination to the new
     /// version. The redrive answers with that version while nothing is
-    /// pending, and refuses to publish a cloned role's pending pair.
+    /// pending. A pending pair publishes through the role's source, so a
+    /// host without disk sources fails the leg.
     #[tokio::test]
     async fn a_redrive_reads_a_cloned_role_lineage_from_its_destination() {
         use engram_host_core::session_volumes::{bitmap_snapshot_name, dest_name};
@@ -881,8 +882,8 @@ mod tests {
             .await
             .unwrap();
         let Err(SandboxError::Snapshot(message)) = disk_leg_work(&finalizer, &record).await else {
-            panic!("a cloned role's pending checkpoint must not publish");
+            panic!("a cloned role's pair must not publish without its source");
         };
-        assert!(message.contains("cloned drive"), "{message}");
+        assert!(message.contains("disk sources"), "{message}");
     }
 }

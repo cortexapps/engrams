@@ -12,8 +12,8 @@ use crate::dm;
 use crate::parse::{self, CloneTable, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
 use engram_host_core::disk::{
-    check_fresh_bitmap, Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName,
-    CLONE_HEADER_BYTES, CLONE_REGION_BYTES,
+    check_fresh_bitmap, Capacity, ChunkIndex, CloneState, Hydration, SessionDisk, Volume,
+    VolumeName, CLONE_HEADER_BYTES, CLONE_REGION_BYTES,
 };
 
 const SECTOR_BYTES: u64 = 512;
@@ -323,6 +323,55 @@ impl ThinPoolDisk {
         }
     }
 
+    /// A new empty thin with no device, by id.
+    async fn create_thin(&self) -> io::Result<u32> {
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
+            match self
+                .dm
+                .message(&self.pool, &format!("create_thin {id}"))
+                .await
+            {
+                Ok(()) => return Ok(id),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// The `block_bytes` blocks of `volume` in which thins `left` and
+    /// `right` map different pool blocks; `block_bytes` is a multiple of
+    /// the pool's block size.
+    async fn delta(
+        &self,
+        left: u32,
+        right: u32,
+        volume: &Volume,
+        block_bytes: u64,
+    ) -> io::Result<Vec<u64>> {
+        if !block_bytes.is_multiple_of(self.block_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "block size {block_bytes} is not a multiple of the pool's {} bytes",
+                    self.block_bytes
+                ),
+            ));
+        }
+        let pool_blocks = self
+            .with_metadata_snap(dm::thin_delta(&self.metadata_path, left, right))
+            .await?;
+        let per_block = block_bytes / self.block_bytes;
+        let count = engram_host_core::disk::block_count(volume, block_bytes);
+        let mut blocks: Vec<u64> = pool_blocks
+            .into_iter()
+            .map(|block| block / per_block)
+            .filter(|block| *block < count)
+            .collect();
+        blocks.dedup();
+        Ok(blocks)
+    }
+
     /// A clone table over two thins of this pool and `source`.
     async fn clone_table(
         &self,
@@ -569,18 +618,8 @@ fn single_target(targets: &[dm::Target], kind: &str) -> io::Result<String> {
 impl SessionDisk for ThinPoolDisk {
     async fn create(&self, name: &VolumeName, size_bytes: u64) -> io::Result<Volume> {
         let sectors = Self::sectors_of(size_bytes)?;
-        loop {
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
-            match self
-                .dm
-                .message(&self.pool, &format!("create_thin {id}"))
-                .await
-            {
-                Ok(()) => return self.activate(name, id, sectors).await,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        let id = self.create_thin().await?;
+        self.activate(name, id, sectors).await
     }
 
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
@@ -828,28 +867,34 @@ impl SessionDisk for ThinPoolDisk {
     ) -> io::Result<Vec<u64>> {
         engram_host_core::disk::same_origin(before, after)?;
         engram_host_core::disk::blocks_per_chunk(before, block_bytes)?;
-        if !block_bytes.is_multiple_of(self.block_bytes) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "block size {block_bytes} is not a multiple of the pool's {} bytes",
-                    self.block_bytes
-                ),
-            ));
-        }
         let (left, _) = self.thin_of(&before.name).await?;
         let (right, _) = self.thin_of(&after.name).await?;
-        let pool_blocks = self
-            .with_metadata_snap(dm::thin_delta(&self.metadata_path, left.id, right.id))
-            .await?;
-        let per_block = block_bytes / self.block_bytes;
-        let count = engram_host_core::disk::block_count(before, block_bytes);
-        let mut blocks: Vec<u64> = pool_blocks
-            .into_iter()
-            .map(|block| block / per_block)
-            .filter(|block| *block < count)
-            .collect();
-        blocks.dedup();
-        Ok(blocks)
+        self.delta(left.id, right.id, before, block_bytes).await
+    }
+
+    /// The pool blocks the snapshot maps differently from `origin`. With
+    /// no origin, from an empty thin made for the read and deleted after
+    /// it; one a crash leaves is deleted by the next [`Self::open`].
+    async fn written_chunks(
+        &self,
+        origin: Option<&Volume>,
+        snapshot: &Volume,
+    ) -> io::Result<Vec<ChunkIndex>> {
+        if let Some(origin) = origin {
+            return self.dirty_chunks(origin, snapshot).await;
+        }
+        let (right, _) = self.thin_of(&snapshot.name).await?;
+        let empty = self.create_thin().await?;
+        let blocks = self
+            .delta(empty, right.id, snapshot, snapshot.chunk_size)
+            .await;
+        if let Err(error) = self
+            .dm
+            .message(&self.pool, &format!("delete {empty}"))
+            .await
+        {
+            tracing::warn!(pool = %self.pool, id = empty, %error, "empty thin left behind");
+        }
+        Ok(blocks?.into_iter().map(ChunkIndex).collect())
     }
 }
