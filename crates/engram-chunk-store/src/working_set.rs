@@ -74,8 +74,9 @@ impl FirstTouch {
         if !bytes.len().is_multiple_of(ENTRY_BYTES) {
             return None;
         }
-        let entries = bytes
-            .chunks_exact(ENTRY_BYTES)
+        let (entries, _) = bytes.as_chunks::<ENTRY_BYTES>();
+        let entries = entries
+            .iter()
             .map(|e| {
                 let (idx, at) = e.split_at(4);
                 (
@@ -96,12 +97,8 @@ impl FirstTouch {
         if !bytes.len().is_multiple_of(4) {
             return None;
         }
-        Some(
-            bytes
-                .chunks_exact(4)
-                .map(|i| u32::from_le_bytes(i.try_into().expect("4 bytes")))
-                .collect(),
-        )
+        let (indices, _) = bytes.as_chunks::<4>();
+        Some(indices.iter().map(|i| u32::from_le_bytes(*i)).collect())
     }
 }
 
