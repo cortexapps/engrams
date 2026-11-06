@@ -1,6 +1,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -10,13 +13,20 @@ struct State(std::path::PathBuf);
 
 impl State {
     fn new(name: &str) -> Self {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT_STATE_ID: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::var_os("TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-            .join(format!("fixture-state-{}-{name}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            .join(format!(
+                "fixture-state-{}-{name}-{}",
+                std::process::id(),
+                NEXT_STATE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         Self(path)
     }
 }

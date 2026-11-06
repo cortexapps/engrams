@@ -202,6 +202,11 @@ impl Plan {
         self.step(value["marker"].as_str().ok_or("invalid receipt marker")?)?;
         Ok(Some(value))
     }
+    pub fn has_pending_selection(&self, root: &Path, harness: &str, mode: &str) -> Result<bool> {
+        Ok(self
+            .read_receipt(root, harness, mode)?
+            .is_some_and(|value| value["pending"] == true))
+    }
     pub fn resume(&self, root: &Path, harness: &str, mode: &str) -> Result<Step> {
         let value = self
             .read_receipt(root, harness, mode)?

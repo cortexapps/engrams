@@ -338,10 +338,73 @@ fn claude_promptless_plan_resume_requires_exact_pending_private_receipt() {
             assert_eq!(proof(&state)[0]["resultMatchesExpected"], true);
             let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             assert_eq!(receipt["pending"], false);
+        } else if ["missing", "complete"].contains(&case) {
+            // A conversation resume without pending work waits for a new prompt.
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(proof(&state).is_empty());
+            finish(&mut child.0);
         } else {
             wait_for_failure(&mut child.0);
             assert!(proof(&state).is_empty());
         }
+    }
+}
+
+#[test]
+fn claude_plan_resume_reads_a_new_prompt_after_missing_or_completed_selection() {
+    for receipt_state in ["missing", "complete"] {
+        let state = State::new("plan-current-prompt");
+        let plan = json!({"steps":[
+            {"marker":"allowed","tool":"mcp_write_counter","arguments":{"delta":1},"callId":"policy-allowed","resultFormat":"mcp"},
+            {"marker":"plan","tool":"exit_plan_mode","arguments":{"plan":"Run the neutral counter call."},"callId":"policy-plan","resultFormat":"json"}
+        ]});
+        if receipt_state == "complete" {
+            std::fs::write(
+                state.0.join("plan-selection.json"),
+                json!({"planSha256":hash(&plan),"harness":"claude","mode":"write","marker":"allowed","pending":false}).to_string(),
+            )
+            .unwrap();
+        }
+        let expected = json!({"content":[{"type":"text","text":"{\"decision\":\"approve\"}"}]});
+        std::fs::write(
+            state.0.join("native-responses.json"),
+            json!({"policy-plan":{"jsonrpc":"2.0","result":expected}}).to_string(),
+        )
+        .unwrap();
+        let mut command = plan_command(&state, true, &plan, "write");
+        command.args(["--resume", "fixture-session"]);
+        let mut exposed = tools();
+        exposed.as_array_mut().unwrap().push(json!({
+            "name":"exit_plan_mode","description":"Present a plan",
+            "inputSchema":{"type":"object"}
+        }));
+        std::fs::write(state.0.join("exposed-tools.json"), exposed.to_string()).unwrap();
+        let mut child = Fixture(command.spawn().unwrap());
+        let rx = output(&mut child.0);
+        initialize(&mut child.0, &rx, true, exposed);
+        prompt(&mut child.0, true, "[[fixture:plan]]");
+        let selected = call(&rx, true);
+        assert_eq!(selected["id"], "policy-plan");
+        assert_eq!(selected["name"], "mcp__engrams__exit_plan_mode");
+        assert_eq!(selected["input"], plan["steps"][1]["arguments"]);
+        complete(&mut child.0, &rx, true, Value::Null);
+        finish(&mut child.0);
+        let recorded = proof(&state);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["callId"], "policy-plan");
+        assert_eq!(recorded[0]["tool"], "exit_plan_mode");
+        assert_eq!(recorded[0]["planSha256"], hash(&plan));
+        assert_eq!(recorded[0]["resultReceived"], true);
+        assert_eq!(recorded[0]["resultSha256"], hash(&expected));
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(state.0.join("plan-selection.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["marker"], "plan");
+        assert_eq!(receipt["pending"], false);
     }
 }
 

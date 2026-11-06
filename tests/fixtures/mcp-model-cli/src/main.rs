@@ -677,10 +677,14 @@ fn claude(mut cfg: Config) -> Result<()> {
     emit(json!({"type":"system","subtype":"init","session_id":"fixture-session"}))?;
     let input = stdin_lines();
     let mut call_request_id = 3_u64;
-    // A real resumed Claude can re-fire its deferred tool without a new prompt.
-    // Restrict that behavior to the two explicit deferred fixture scenarios.
+    // Deferred calls can re-fire without a prompt. Completed plan selections
+    // wait for the next current prompt when the conversation resumes.
     let mut resumed = ["write", "refire"].contains(&cfg.mode.as_str())
-        && args.iter().any(|arg| arg == "--resume");
+        && args.iter().any(|arg| arg == "--resume")
+        && match &cfg.plan {
+            Some(plan) => plan.has_pending_selection(&cfg.root, "claude", &cfg.mode)?,
+            None => true,
+        };
     loop {
         let no_current_prompt = std::mem::take(&mut resumed);
         let prompt: Value = if no_current_prompt {
