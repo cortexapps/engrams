@@ -8,9 +8,9 @@ use engram_chunk_store::ChunkStore;
 use engram_core::traits::BlobStorage;
 use engram_storage_local::LocalBlobStorage;
 
-/// `materialize_chunked_rootfs` reads the manifest with
-/// `chunk_store.get_manifest`, which reads the object store directly.
-/// When the runtime host's object store does not hold the manifest,
+/// A chunked rootfs is materialized from the manifest that
+/// `chunk_store.get_manifest` reads from the object store. When the
+/// runtime host's object store does not hold the manifest,
 /// `ensure_chunked_manifest_in_blob_storage` reads the bootstrap sidecar
 /// and `put_manifest`s a synthesized manifest first, so the read succeeds.
 #[tokio::test]
