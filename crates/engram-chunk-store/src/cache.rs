@@ -2717,11 +2717,13 @@ mod tests {
         );
         drop(write);
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !cache.contains(h) {
-            assert!(tokio::time::Instant::now() < deadline, "never indexed");
+        for _ in 0..1000 {
+            if cache.contains(h) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        assert!(cache.contains(h), "never indexed");
         assert!(cache.contains_on_disk(h));
     }
 
