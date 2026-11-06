@@ -55,6 +55,11 @@ build_tree() {
         -v "$here/skills:/skills-src:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
+        # The snapshot server below throttles busy clients: a request can
+        # stall with no data or fail with a 5xx. Give up on a silent request
+        # after 30 s and try it again.
+        printf "%s\n" "Acquire::Retries \"5\";" "Acquire::http::Timeout \"30\";" \
+            "Acquire::https::Timeout \"30\";" > /etc/apt/apt.conf.d/80-retries
         apt-get update -qq
         # curl + xz-utils fetch pinned Node for playwright-cli (ADR 0065/0097);
         # util-linux carries setpriv AND flock (the launcher --ensure lock);
