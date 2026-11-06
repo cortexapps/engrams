@@ -2278,6 +2278,8 @@ pub(crate) mod tests {
         pub(crate) session: PlMutex<Session>,
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         binding_epoch: PlMutex<u64>,
+        /// The binding generation whose harness attached last.
+        pub(crate) attached_binding_epoch: PlMutex<u64>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
         /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
@@ -2372,6 +2374,7 @@ pub(crate) mod tests {
                 session: PlMutex::new(session),
                 events: PlMutex::new(Vec::new()),
                 binding_epoch: PlMutex::new(0),
+                attached_binding_epoch: PlMutex::new(0),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
@@ -3400,6 +3403,19 @@ pub(crate) mod tests {
                 );
             }
             Ok(Some((prev, indices)))
+        }
+
+        async fn session_binding_generations(
+            &self,
+            id: SessionId,
+        ) -> Result<(u64, u64), MetaError> {
+            if self.session.lock().id != id {
+                return Err(MetaError::NotFound);
+            }
+            Ok((
+                *self.binding_epoch.lock(),
+                *self.attached_binding_epoch.lock(),
+            ))
         }
 
         async fn rebind_session_guarded(

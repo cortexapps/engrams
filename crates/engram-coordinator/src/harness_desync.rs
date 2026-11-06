@@ -91,16 +91,32 @@ pub async fn run_once(
     redriven
 }
 
+/// Idle re-attaches in a row whose harness never attached. After this
+/// many, only a delivery or an attach of the harness starts a new series.
+const REATTACH_MAX_STREAK: u64 = 6;
+
+/// The `reason` of the Deliver op that an idle re-attach claims.
+const REATTACH: &str = "harness_reattach";
+
+/// The wait after the `streak`-th re-attach of a series before the next
+/// one: the attach grace, doubled for each re-attach after the first.
+fn reattach_spacing(streak: u64) -> std::time::Duration {
+    crate::session_verbs::ATTACH_GRACE * 2u32.pow(streak.saturating_sub(1) as u32)
+}
+
 /// Start a re-attach of the harness of an Active session with nothing to
 /// deliver, detached from the heartbeat: `start_agent` waits for the
-/// guest. Skipped while an attach is in flight (the attach grace) and for
-/// a session with no harness. Returns whether a re-attach started.
+/// guest. Skipped while an attach is in flight, while the series waits
+/// out its spacing or has spent its budget, and for a session with no
+/// harness. The series is read from the session's op rows, so every
+/// replica applies the same spacing. Returns whether a re-attach started.
 async fn reattach_idle_harness(
     state: &SharedState,
     session_id: engram_core::SessionId,
     sandbox_id: SandboxId,
 ) -> bool {
     let now = state.services.clock.now_utc();
+    // A boot or a resume stamps this when its attach starts.
     if let Some(stamp) = state.attach_grace.get(&session_id).map(|e| *e.value()) {
         let grace = chrono::Duration::from_std(crate::session_verbs::ATTACH_GRACE)
             .expect("ATTACH_GRACE fits chrono::Duration");
@@ -115,9 +131,54 @@ async fn reattach_idle_harness(
                 && session.sandbox_id == Some(sandbox_id) => {}
         _ => return false,
     }
+    let Some(streak) = reattach_streak(state, session_id, now).await else {
+        return false;
+    };
     let state = state.clone();
-    tokio::spawn(async move { reattach_under_claim(&state, session_id, sandbox_id, now).await });
+    tokio::spawn(async move { reattach_under_claim(&state, session_id, sandbox_id, streak).await });
     true
+}
+
+/// The number of the next re-attach in the session's series, or `None`
+/// when it must not start now. A series continues while the newest
+/// Deliver op is a re-attach and the harness of the generation it bound
+/// has not attached.
+async fn reattach_streak(
+    state: &SharedState,
+    session_id: engram_core::SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let meta = &state.services.meta;
+    let last = match meta
+        .op_latest_for_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+        .await
+    {
+        Ok(Some(op)) if op.payload.get("reason").and_then(|r| r.as_str()) == Some(REATTACH) => op,
+        Ok(_) => return Some(1),
+        Err(e) => {
+            tracing::debug!(%session_id, error = %e, "harness desync: op read failed; next heartbeat retries");
+            return None;
+        }
+    };
+    match meta.session_binding_generations(session_id).await {
+        Ok((generation, attached)) if attached >= generation => return Some(1),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(%session_id, error = %e, "harness desync: generation read failed; next heartbeat retries");
+            return None;
+        }
+    }
+    let streak = last
+        .payload
+        .get("streak")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1);
+    if streak >= REATTACH_MAX_STREAK {
+        return None;
+    }
+    let spacing = chrono::Duration::from_std(reattach_spacing(streak))
+        .expect("the re-attach spacing fits chrono::Duration");
+    (now.signed_duration_since(last.created_at) >= spacing).then_some(streak + 1)
 }
 
 /// The re-attach under an inline op claim: the session's op lane orders
@@ -126,13 +187,13 @@ async fn reattach_under_claim(
     state: &SharedState,
     session_id: engram_core::SessionId,
     sandbox_id: SandboxId,
-    now: chrono::DateTime<chrono::Utc>,
+    streak: u64,
 ) {
     let claim = match crate::session_ops::OpClaim::try_acquire(
         state,
         session_id,
         engram_core::types::session_op::OpKind::Deliver,
-        serde_json::json!({ "reason": "harness_reattach" }),
+        serde_json::json!({ "reason": REATTACH, "streak": streak }),
     )
     .await
     {
@@ -153,7 +214,9 @@ async fn reattach_under_claim(
     if matches!(result, Ok(true)) {
         // The attach is in flight: a prompt in the next moments defers
         // to it instead of signalling the harness again.
-        state.attach_grace.insert(session_id, now);
+        state
+            .attach_grace
+            .insert(session_id, state.services.clock.now_utc());
         ::metrics::counter!(crate::metrics::HARNESS_DESYNC_REDRIVEN_TOTAL).increment(1);
         tracing::info!(%session_id, %sandbox_id,
             "harness desync repair: re-attached an idle harness");
@@ -319,6 +382,75 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    async fn wait_for_finished_reattach(mini: &crate::state::tests::MiniMeta, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mini
+            .ops
+            .all()
+            .iter()
+            .filter(|o| {
+                o.kind == OpKind::Deliver
+                    && o.state != engram_core::types::session_op::OpState::Running
+            })
+            .count()
+            < n
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the re-attach never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A re-attach whose harness has not attached spaces the next one by
+    /// the session's op rows, not by this replica's memory; an attach of
+    /// the bound generation ends the series.
+    #[tokio::test]
+    async fn a_reattach_series_is_spaced_by_the_op_rows() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let (state, mini, _local) =
+            build_state_for_session(session(SessionState::Active, host_id, sandbox_id));
+        let session_id = mini.session.lock().id;
+        let running: BTreeSet<_> = [sandbox_id].into();
+        let attached = BTreeSet::new();
+
+        assert_eq!(run_once(&state, host_id, &running, &attached).await, 1);
+        wait_for_finished_reattach(&mini, 1).await;
+        let first = mini.ops.all();
+        assert_eq!(first[0].payload["streak"], 1);
+
+        // Another replica has no attach-grace stamp.
+        state.attach_grace.remove(&session_id);
+        assert_eq!(
+            run_once(&state, host_id, &running, &attached).await,
+            0,
+            "the series waits out its spacing"
+        );
+
+        let (generation, _) = state
+            .services
+            .meta
+            .session_binding_generations(session_id)
+            .await
+            .unwrap();
+        *mini.attached_binding_epoch.lock() = generation;
+        assert_eq!(
+            run_once(&state, host_id, &running, &attached).await,
+            1,
+            "an attached generation starts a new series"
+        );
+        wait_for_finished_reattach(&mini, 2).await;
+        assert!(mini.ops.all().iter().all(|o| o.payload["streak"] == 1));
+    }
+
+    #[test]
+    fn the_reattach_spacing_doubles() {
+        assert_eq!(reattach_spacing(1), crate::session_verbs::ATTACH_GRACE);
+        assert_eq!(reattach_spacing(3), crate::session_verbs::ATTACH_GRACE * 4);
     }
 
     /// An attach in flight (a boot, a resume, an earlier repair) and a
