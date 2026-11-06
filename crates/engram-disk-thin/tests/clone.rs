@@ -1118,6 +1118,11 @@ async fn a_hydrated_session_role_cuts_over_and_stops_its_source() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The host-agent stops the source after it releases the capture lock.
+    rig.volumes
+        .stop_source(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
 
     assert_eq!(rig.root_state().await, CloneState::CutOver);
     assert_eq!(first_difference(&whole(&drive).await, &expected), None);
