@@ -436,6 +436,15 @@ impl FillEngine {
     }
 }
 
+/// Chunk-store operations that read chunks (a sparse re-chunk, a
+/// materialize) read through the engine like every other fetch.
+#[async_trait::async_trait]
+impl engram_chunk_store::ChunkSource for FillEngine {
+    async fn chunk(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
+        self.get(hash, class).await
+    }
+}
+
 fn record(
     done: std::result::Result<Result<Bytes>, tokio::task::JoinError>,
     stats: &mut FillStats,

@@ -51,6 +51,7 @@ pub mod reader;
 pub mod region;
 pub mod resolver;
 pub mod snapshot_blob;
+pub mod source;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -69,5 +70,6 @@ pub use manifest::{
     DEFAULT_DISK_CHUNK_SIZE, DEFAULT_MEMORY_CHUNK_SIZE,
 };
 pub use resolver::{BlobStorageResolver, ChunkResolver};
+pub use source::ChunkSource;
 pub use store::ChunkStore;
 pub use working_set::{FirstTouch, TraceRef, WorkingSetTrace};

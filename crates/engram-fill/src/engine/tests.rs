@@ -480,3 +480,31 @@ fn config_refuses_a_zero_or_inverted_limit() {
         assert!(Config::from_vars(vars(bad)).is_err(), "{bad:?}");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_materialize_through_the_engine_reads_the_peer() {
+    let f = fixture();
+    let body = b"materialized from the peer";
+    let hash = put(&f, body).await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default())
+        .with_peer(peer(Some(body), Duration::from_millis(1)));
+    let mut manifest = engram_chunk_store::Manifest::empty(
+        engram_chunk_store::ManifestKind::Disk,
+        body.len() as u64,
+    );
+    manifest
+        .chunks
+        .push(engram_chunk_store::ChunkRef { offset: 0, hash });
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("disk.img");
+
+    engine
+        .store()
+        .materialize_to_file_from(&manifest, &dest, &engine)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+}

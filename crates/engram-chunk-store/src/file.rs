@@ -27,6 +27,7 @@ use crate::buffers::ChunkBuf;
 use crate::cache::ChunkCache;
 use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
+use crate::source::ChunkSource;
 use crate::store::ChunkStore;
 
 /// Dirty chunks the sparse re-chunk (`update_for_dirty_ranges_sparse`)
@@ -294,18 +295,37 @@ impl ChunkStore {
     /// (elided = all-zero) seeds from zeros (it was UFFDIO_ZEROPAGE'd at
     /// the prev capture).
     ///
-    /// Cost: one `get_chunk` per dirty chunk the diff does not cover whole
-    /// (a warm-cache hit for any page the guest faulted or wrote).
+    /// Cost: one `source` read per dirty chunk the diff does not cover
+    /// whole (a warm-cache hit for any page the guest faulted or wrote),
+    /// at the store's class.
+    pub async fn update_for_dirty_ranges_sparse_from(
+        &self,
+        prev: &Manifest,
+        diff_path: &Path,
+        dirty_ranges: &[(u64, u64)],
+        source: Arc<dyn ChunkSource>,
+    ) -> Result<Manifest> {
+        let (manifest, _new) = self
+            .update_for_dirty_ranges_sparse_with_sink(prev, diff_path, dirty_ranges, None, source)
+            .await?;
+        Ok(manifest)
+    }
+
+    /// [`Self::update_for_dirty_ranges_sparse_from`] that reads through
+    /// this store, not a fill engine.
     pub async fn update_for_dirty_ranges_sparse(
         &self,
         prev: &Manifest,
         diff_path: &Path,
         dirty_ranges: &[(u64, u64)],
     ) -> Result<Manifest> {
-        let (manifest, _new) = self
-            .update_for_dirty_ranges_sparse_with_sink(prev, diff_path, dirty_ranges, None)
-            .await?;
-        Ok(manifest)
+        self.update_for_dirty_ranges_sparse_from(
+            prev,
+            diff_path,
+            dirty_ranges,
+            Arc::new(self.clone()),
+        )
+        .await
     }
 
     /// ADR 0045 Phase C1: sink-parameterized flavor. `local_sink = Some(cache)`
@@ -314,7 +334,7 @@ impl ChunkStore {
     /// the migration pause path entirely (the durability catch-up
     /// uploads them later from the returned new-hash set). `None` is
     /// the durable flavor (`put_chunk` to the store), identical to
-    /// [`Self::update_for_dirty_ranges_sparse`].
+    /// [`Self::update_for_dirty_ranges_sparse_from`].
     ///
     /// Returns the next manifest plus the hashes of chunks REBUILT by
     /// this call (the migration transfer/advertise set — carried-over
@@ -325,6 +345,7 @@ impl ChunkStore {
         diff_path: &Path,
         dirty_ranges: &[(u64, u64)],
         local_sink: Option<&crate::cache::ChunkCache>,
+        source: Arc<dyn ChunkSource>,
     ) -> Result<(Manifest, Vec<crate::manifest::ChunkHash>)> {
         use std::collections::BTreeMap;
         use std::collections::BTreeSet;
@@ -423,6 +444,7 @@ impl ChunkStore {
             let claimed = Arc::clone(&claimed);
             let ranges = Arc::clone(&ranges);
             let diff = Arc::clone(&diff);
+            let source = Arc::clone(&source);
             tasks.spawn(async move {
                 let end = offset + want as u64;
                 let first = ranges.partition_point(|&(off, len)| off + len <= offset);
@@ -432,7 +454,7 @@ impl ChunkStore {
                 let slice = match prev_hash {
                     _ if covers(&ranges[first..], offset, end) => ChunkBuf::take(want),
                     Some(prev_hash) => {
-                        let bytes = store.get_chunk(prev_hash).await?;
+                        let bytes = source.chunk(prev_hash, store.class()).await?;
                         let n = bytes.len().min(want);
                         let mut slice = ChunkBuf::take(want);
                         slice[..n].copy_from_slice(&bytes[..n]);
@@ -587,7 +609,14 @@ impl ChunkStore {
     /// Consumers wanting a *fully dense* file (e.g. virtio-blk
     /// disk attachments that don't tolerate holes) can `dd
     /// conv=notrunc` afterward, but most don't need to.
-    pub async fn materialize_to_file(&self, manifest: &Manifest, dest: &Path) -> Result<()> {
+    ///
+    /// Each chunk is read from `source` at the store's class.
+    pub async fn materialize_to_file_from(
+        &self,
+        manifest: &Manifest,
+        dest: &Path,
+        source: &dyn ChunkSource,
+    ) -> Result<()> {
         manifest.validate()?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
@@ -612,7 +641,7 @@ impl ChunkStore {
         file.set_len(manifest.total_bytes).await?;
 
         for entry in &manifest.chunks {
-            let bytes = self.get_chunk(entry.hash).await?;
+            let bytes = source.chunk(entry.hash, self.class()).await?;
             file.seek(SeekFrom::Start(entry.offset)).await?;
             file.write_all(&bytes).await?;
         }
@@ -623,6 +652,12 @@ impl ChunkStore {
         drop(file);
         fs::rename(&temp, dest).await?;
         Ok(())
+    }
+
+    /// [`Self::materialize_to_file_from`] that reads through this store,
+    /// not a fill engine.
+    pub async fn materialize_to_file(&self, manifest: &Manifest, dest: &Path) -> Result<()> {
+        self.materialize_to_file_from(manifest, dest, self).await
     }
 }
 
@@ -1386,7 +1421,13 @@ mod tests {
             0.0,
         );
         let (local, new_hashes) = s
-            .update_for_dirty_ranges_sparse_with_sink(&prev, &diff, &ranges, Some(&cache))
+            .update_for_dirty_ranges_sparse_with_sink(
+                &prev,
+                &diff,
+                &ranges,
+                Some(&cache),
+                Arc::new(s.clone()),
+            )
             .await
             .unwrap();
         let rebuilt_early = new_hashes[0];
