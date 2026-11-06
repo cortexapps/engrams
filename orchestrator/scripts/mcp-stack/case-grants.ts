@@ -98,7 +98,8 @@ export function assertNoProjectedAuthority(
   resultJson: string | undefined,
 ) {
   requireThat(
-    (call.state === "waiting_approval" && call.approvalDecision === "pending") ||
+    (call.state === "waiting_approval" &&
+      call.approvalDecision === "pending") ||
       (call.state === "canceled" &&
         call.approvalDecision === "denied" &&
         !!call.executionId &&
@@ -120,12 +121,22 @@ function projectionState(
   call: { state: string; approvalDecision: string } | undefined,
 ) {
   const state = [
-    "waiting_approval", "authorized", "dispatching", "succeeded", "denied",
-    "failed", "canceled", "outcome_unknown",
-  ].includes(call?.state ?? "") ? call!.state : "other";
+    "waiting_approval",
+    "authorized",
+    "dispatching",
+    "succeeded",
+    "denied",
+    "failed",
+    "canceled",
+    "outcome_unknown",
+  ].includes(call?.state ?? "")
+    ? call!.state
+    : "other";
   const decision = ["", "pending", "approved", "denied"].includes(
     call?.approvalDecision ?? "",
-  ) ? call?.approvalDecision || "empty" : "other";
+  )
+    ? call?.approvalDecision || "empty"
+    : "other";
   return `${state}_${decision}`;
 }
 async function absentCall(
@@ -318,7 +329,7 @@ export const unattendedGrantDriver: CaseDriver = async (input) => {
       suffix: `${harness}-unattended-${automationWrite ? "allow" : "deny"}`,
       protocol: "modern",
       upstreamName: "write_counter",
-      mode: "read",
+      mode: "write",
       caller: "automation",
       automationWrite,
       arguments: { delta: 1 },
@@ -635,7 +646,8 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
       if (
         !(error instanceof RunnerFailure) ||
         error.seam !== "real_pending_call_before_guest_projection"
-      ) throw error;
+      )
+        throw error;
       requireThat(
         false,
         `real_pending_call_before_guest_projection_${projectionState(lastPending)}`,
@@ -775,7 +787,7 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
       suffix: `${harness}-plan-${upstreamName === "read_counter" ? "read" : "write"}`,
       protocol: "modern",
       upstreamName,
-      mode: "read",
+      mode: upstreamName === "read_counter" ? "read" : "write",
       caller: "owner",
       automationWrite: false,
       arguments: upstreamName === "read_counter" ? {} : { delta: 1 },
@@ -850,7 +862,7 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
     suffix: `${harness}-child`,
     protocol: "modern",
     upstreamName: "write_counter",
-    mode: "read",
+    mode: "write",
     caller: "owner",
     automationWrite: false,
     arguments: { delta: 1 },

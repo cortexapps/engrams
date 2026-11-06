@@ -91,7 +91,7 @@ export const killCancelDriver: CaseDriver = async (input) => {
       suffix: `${harness}-control-${control}`,
       protocol: "modern",
       upstreamName: "write_counter",
-      mode: "read",
+      mode: "write",
       caller: "owner",
       automationWrite: false,
       arguments: { delta: 1 },
@@ -125,8 +125,7 @@ export const killCancelDriver: CaseDriver = async (input) => {
     });
     let variantChanged = false;
     let publicationBefore:
-      | Awaited<ReturnType<typeof readOperatorPublication>>
-      | undefined;
+      Awaited<ReturnType<typeof readOperatorPublication>> | undefined;
     try {
       await scenario.fixture.configure({
         reply: "json",
