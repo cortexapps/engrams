@@ -209,10 +209,14 @@ pub(crate) async fn admit_for_rpc(
         other => {
             claim.finish(OpState::Done, None).await;
             match other {
-                Ok(TeleportAdmitOutcome::NoFit) => Err(ApiError::Conflict("no_fit".into())),
-                Ok(TeleportAdmitOutcome::SessionNotActive(_)) => {
-                    Err(ApiError::Conflict("not_active".into()))
-                }
+                Ok(TeleportAdmitOutcome::NoFit) => Err(ApiError::Conflict(
+                    "no_fit: no candidate host has room for the session, or each one \
+                     already receives a move"
+                        .into(),
+                )),
+                Ok(TeleportAdmitOutcome::SessionNotActive(status)) => Err(ApiError::Conflict(
+                    format!("not_active: the session is {}", status.as_str()),
+                )),
                 Ok(TeleportAdmitOutcome::Fenced) => Err(ApiError::Conflict("busy_lane".into())),
                 Err(e) => Err(e),
                 Ok(TeleportAdmitOutcome::Admitted(_)) => unreachable!(),
@@ -358,6 +362,26 @@ async fn rollback_begin(
     )
     .await
 }
+/// What `host_meets_capabilities` found for the capability it named.
+fn capability_status(caps: &engram_core::types::host::HostCapabilities, missing: &str) -> String {
+    let status = match missing.trim_start_matches("live:") {
+        "grpc_self_connect" => &caps.grpc_self_connect,
+        "bundle_stamp" => &caps.bundle_stamp,
+        "base_shm_tmpfs" => &caps.base_shm_tmpfs,
+        "uffd_minor_shmem" => &caps.uffd_minor_shmem,
+        "session_disk" => &caps.session_disk,
+        "backend" => return format!("backend is {}", caps.backend),
+        "fc_snapshot_version" => {
+            return format!(
+                "target reports {}",
+                caps.fc_snapshot_version.as_deref().unwrap_or("none")
+            )
+        }
+        _ => return "no detail".into(),
+    };
+    format!("{status:?}")
+}
+
 /// A dead or retired host, or one whose row was deleted: nothing can
 /// answer for the sandbox any more.
 async fn source_gone(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<bool, ApiError> {
@@ -734,8 +758,8 @@ mod steps {
             needs_live_substrate: live,
             fc_snapshot_version: fc_snapshot_version.clone(),
         };
-        let candidates_for = |caps: crate::placement::CapabilityRequirements| {
-            let context = crate::placement::ScheduleContext {
+        let context_for =
+            |caps: crate::placement::CapabilityRequirements| crate::placement::ScheduleContext {
                 repo: &session.image,
                 image_version: "",
                 snapshot_host: None,
@@ -747,6 +771,8 @@ mod steps {
                 caps,
                 prefer_bundles: &[],
             };
+        let candidates_for = |caps: crate::placement::CapabilityRequirements| {
+            let context = context_for(caps);
             async move {
                 crate::placement::candidates_for(
                     state.services.meta.as_ref(),
@@ -776,14 +802,26 @@ mod steps {
                     Ok(()) => TeleportKind::Snapshot,
                     Err(missing) => {
                         return Err(ApiError::Conflict(format!(
-                            "target_lacks_capability: {missing}"
+                            "target_lacks_capability: {missing} ({})",
+                            capability_status(&host.capabilities, missing)
                         )));
                     }
                 }
             };
-            let candidates = candidates_for(caps_for(kind == TeleportKind::Live)).await?;
+            let caps = caps_for(kind == TeleportKind::Live);
+            let candidates = candidates_for(caps.clone()).await?;
             if !candidates.contains(&target) {
-                return Ok(TeleportAdmitOutcome::NoFit);
+                let reason = crate::placement::exclusion_summary(
+                    std::slice::from_ref(&host),
+                    &context_for(caps),
+                    state.services.clock.now_utc(),
+                    crate::placement::placement_ttl(),
+                )
+                .pop()
+                .map_or_else(String::new, |(_, reason)| reason);
+                return Err(ApiError::Conflict(format!(
+                    "no_fit: target host {target} is not a candidate ({reason})"
+                )));
             }
             (kind, candidates)
         } else {
@@ -1318,6 +1356,24 @@ use crate as coordinator;
 #[cfg(test)]
 #[path = "../tests/support/teleport_scenarios.rs"]
 mod tests;
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use engram_core::types::host::{CapStatus, HostCapabilities};
+
+    #[test]
+    fn a_capability_refusal_carries_the_probe_result() {
+        let caps = HostCapabilities {
+            grpc_self_connect: CapStatus::Failed("connect 127.0.0.1:9101: refused".into()),
+            backend: "vz".into(),
+            ..Default::default()
+        };
+        assert!(capability_status(&caps, "grpc_self_connect").contains("refused"));
+        assert_eq!(capability_status(&caps, "backend"), "backend is vz");
+        assert!(capability_status(&caps, "live:session_disk").contains("Unknown"));
+    }
+}
 
 #[cfg(test)]
 mod attach_tests {
