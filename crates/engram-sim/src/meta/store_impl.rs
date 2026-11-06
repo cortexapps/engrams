@@ -4198,6 +4198,12 @@ impl MetadataStore for SimMetadataStore {
         Ok(Vec::new())
     }
 
+    /// The sim models no capture_jobs table, so no capture is in flight.
+    async fn capturing_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        self.gate()?;
+        Ok(Vec::new())
+    }
+
     async fn claim_enable_jobs(
         &self,
         claimant: &str,

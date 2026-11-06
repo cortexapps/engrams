@@ -7319,6 +7319,32 @@ impl MetadataStore for PostgresStore {
             .collect())
     }
 
+    async fn capturing_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT disk_manifest FROM capture_jobs
+                WHERE stage NOT IN ('done', 'failed')"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(text,)| match text.parse() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(
+                        manifest = %text,
+                        error = %e,
+                        "capturing_disk_manifests: unparseable manifest ref; skipping",
+                    );
+                    None
+                }
+            })
+            .collect())
+    }
+
     async fn hosts_with_live_capture_jobs(
         &self,
     ) -> Result<std::collections::HashSet<HostId>, MetaError> {

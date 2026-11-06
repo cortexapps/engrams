@@ -4257,8 +4257,9 @@ async fn enabled_image_config_update(ctx: &Ctx) {
 }
 
 /// The enable/capture read surface over a store with no such jobs:
-/// `live_enable_work_by_host` is the empty map, while `list_prestaging_refs`
-/// and `capture_assignments_for_host` are empty — and registering or
+/// `live_enable_work_by_host` is the empty map, while
+/// `list_prestaging_refs`, `capturing_disk_manifests` and
+/// `capture_assignments_for_host` are empty — and registering or
 /// heartbeating a host fabricates none of them. (The sim models no
 /// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
 /// stores agree on the empty case, the only one conformance exercises.)
@@ -4270,6 +4271,7 @@ async fn live_enable_work_empty(ctx: &Ctx) {
         .unwrap()
         .is_empty());
     assert!(meta.list_prestaging_refs().await.unwrap().is_empty());
+    assert!(meta.capturing_disk_manifests().await.unwrap().is_empty());
     let host = HostId::new();
     let now = ctx.clock.now_utc();
     assert!(meta

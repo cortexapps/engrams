@@ -751,6 +751,46 @@ async fn capture_assignments_for_host_lists_only_active_rows_for_that_host() {
 
 #[tokio::test]
 #[ignore]
+async fn capturing_disk_manifests_lists_waiting_and_placed_jobs_only() {
+    let Some(meta) = connect().await else { return };
+    let host = seed_host(&meta, 65_536, 64).await;
+    let waiting = meta
+        .insert_capture_job(new_capture_job(
+            seed_enable_job(&meta, "disks-waiting").await,
+        ))
+        .await
+        .expect("insert waiting");
+    let placed = insert_placed(&meta, seed_enable_job(&meta, "disks-placed").await, host).await;
+    let done = insert_placed(&meta, seed_enable_job(&meta, "disks-done").await, host).await;
+    assert!(meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: done.id,
+            epoch: done.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
+            }),
+        })
+        .await
+        .expect("terminal done"));
+
+    let mut disks: Vec<String> = meta
+        .capturing_disk_manifests()
+        .await
+        .expect("capturing disks")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    disks.sort();
+    let mut want = vec![waiting.disk_manifest, placed.disk_manifest];
+    want.sort();
+    assert_eq!(disks, want, "a terminal job's disk is not listed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn hosts_with_live_capture_jobs_reports_active_hosts_only() {
     let Some(meta) = connect().await else { return };
     let live_host = seed_host(&meta, 65_536, 64).await;

@@ -3009,6 +3009,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The disk manifest of every non-terminal capture job, without
+    /// duplicates — the `HeartbeatAck.capturing_disk_manifests` source.
+    /// Hosts stage these as image volumes while the capture runs, so the
+    /// captured disk stages as a delta over them. Read every heartbeat
+    /// tick. Default: empty.
+    async fn capturing_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// Active (non-terminal) job assignments currently on `host` — the
     /// `HeartbeatAck.capture_assignments` source, read every heartbeat
     /// regardless of whether any capture jobs exist fleet-wide.

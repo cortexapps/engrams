@@ -438,6 +438,11 @@ pub struct HeartbeatResponse {
     /// pre-0538 host-agent ignores the field.
     #[serde(default)]
     pub prestage_images: Vec<EnabledImageRef>,
+    /// The disk manifest of every image whose capture is in flight. Hosts
+    /// stage these as image volumes during the capture, so the captured
+    /// disk stages as a delta over them. An older host ignores the field.
+    #[serde(default)]
+    pub capturing_disk_manifests: Vec<engram_core::types::manifest::ManifestRef>,
     /// ADR 0035 §5: the bundle pin set (every generation some
     /// snapshot row references). Drives the host's bundle
     /// prefetch + sweep supervisor. Always present — the host side
@@ -664,7 +669,7 @@ pub async fn heartbeat(
         let _ = crate::harness_desync::run_once(&state, host_id, &running, &attached).await;
     }
 
-    // The enabled and prestaging images and the fleet's host
+    // The enabled, prestaging and capturing images and the fleet's host
     // rows: the same for every host, so read once per replica per
     // FLEET_READS_TTL. NOT best-effort: the host keeps exactly these
     // images' volumes, so an empty set read from a PG failure would make
@@ -1044,6 +1049,7 @@ pub async fn heartbeat(
         revoked_sessions: Vec::new(),
         enabled_images,
         prestage_images,
+        capturing_disk_manifests: fleet.capturing_disk_manifests.clone(),
         live_bundles,
         acked_checkpoints,
         capture_assignments,
@@ -1062,6 +1068,7 @@ const FLEET_READS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 pub struct FleetReads {
     enabled_images: Vec<EnabledImageRef>,
     prestage_images: Vec<EnabledImageRef>,
+    capturing_disk_manifests: Vec<engram_core::types::manifest::ManifestRef>,
     /// `None` when there is no image to seed or the read failed: the acks
     /// then carry no warm peers.
     active_hosts: Option<Vec<HostRecord>>,
@@ -1071,8 +1078,11 @@ impl FleetReads {
     async fn load(
         meta: &dyn engram_core::traits::MetadataStore,
     ) -> Result<Self, engram_core::error::MetaError> {
-        let (enabled, prestaging) =
-            futures::try_join!(meta.list_enabled_images(), meta.list_prestaging_refs())?;
+        let (enabled, prestaging, capturing_disk_manifests) = futures::try_join!(
+            meta.list_enabled_images(),
+            meta.list_prestaging_refs(),
+            meta.capturing_disk_manifests(),
+        )?;
         let enabled_images = enabled_image_refs_from_rows(enabled);
         // A row that fails to deserialize (wire skew mid-roll) is skipped
         // rather than failing every ack.
@@ -1100,6 +1110,7 @@ impl FleetReads {
         Ok(Self {
             enabled_images,
             prestage_images,
+            capturing_disk_manifests,
             active_hosts,
         })
     }
