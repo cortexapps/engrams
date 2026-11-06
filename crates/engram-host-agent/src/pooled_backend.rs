@@ -3845,6 +3845,7 @@ impl SnapshotFinisher {
             chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
+            fs: self.host_fs.as_ref(),
         }
     }
 
@@ -3880,6 +3881,7 @@ impl SnapshotFinisher {
             Some((prev_ref, prev)) => crate::snapshot_post::Memory::Diff {
                 prev_ref,
                 prev: Some(prev),
+                extents: None,
             },
             None => crate::snapshot_post::Memory::Full,
         };
@@ -3895,15 +3897,38 @@ impl SnapshotFinisher {
             aux_bundles: &aux_bundles,
             source: "snapshot_finish",
         });
-        // The state file must reach the disk before the record names this
-        // snapshot; the memory file goes to the chunk store instead.
-        let sync =
-            crate::snapshot_post::sync_capture(&dest, crate::snapshot_post::SyncScope::State);
+        // The capture files reach the disk before the record names this
+        // snapshot: `state.bin` here, the sidecar in the post phase. A
+        // consumed memory file is retired durably, as the chunk store
+        // holds its copy; one the phase did not consume stays the restore
+        // input, so it is synced.
+        let sync = crate::snapshot_post::sync_capture(
+            self.host_fs.as_ref(),
+            &dest,
+            crate::snapshot_post::SyncScope::State,
+        );
         let (post, sync) = tokio::join!(post, sync);
-        let post = post.and_then(|published| {
-            sync.map_err(|e| SandboxError::Snapshot(format!("sync capture files: {e}")))?;
-            Ok(published)
-        });
+        let post = match (post, sync) {
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(SandboxError::Snapshot(format!("sync capture files: {e}"))),
+            (Ok(published), Ok(())) => match &published.memory {
+                Some(memory) => crate::snapshot_post::retire_consumed(
+                    self.host_fs.clone(),
+                    memory.consumed.clone(),
+                )
+                .await
+                .map(|()| published)
+                .map_err(|e| SandboxError::Snapshot(format!("retire memory file: {e}"))),
+                None => crate::snapshot_post::sync_capture(
+                    self.host_fs.as_ref(),
+                    &dest,
+                    crate::snapshot_post::SyncScope::All,
+                )
+                .await
+                .map(|()| published)
+                .map_err(|e| SandboxError::Snapshot(format!("sync capture files: {e}"))),
+            },
+        };
 
         let result = match post {
             Ok(published) => {
@@ -3922,10 +3947,6 @@ impl SnapshotFinisher {
                     metadata.memory_manifest = Some(memory.manifest_ref);
                     epoch_dirty_bytes = memory.dirty_bytes;
                     next_manifest_for_chain = memory.next;
-                    // The chain seeds from the manifest, not this file, and
-                    // a cross-host restore re-materializes it from chunks.
-                    crate::snapshot_post::retire_consumed(self.host_fs.clone(), memory.consumed)
-                        .await;
                 }
                 // ADR 0014 issue #1/#2: record the snapshot_id so a
                 // future commit/abort RPC can clean up the per-snapshot
@@ -4753,7 +4774,7 @@ impl SandboxBackend for PooledBackend {
             .collect();
         unwind.defuse();
         drop(unwind);
-        let record = crate::eviction_finalize::EvictionFinalizeRecord {
+        let mut record = crate::eviction_finalize::EvictionFinalizeRecord {
             snapshot_id,
             session_id,
             sandbox_id: id,
@@ -4770,6 +4791,7 @@ impl SandboxBackend for PooledBackend {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let Some(finalizer) = self.eviction_finalizer() else {
             // Gated above; unreachable in practice (checkpoint_dir just
@@ -4788,19 +4810,10 @@ impl SandboxBackend for PooledBackend {
                 "checkpoint_dir disappeared between the gate check and record construction".into(),
             ));
         };
-        // The record makes the staging dir the redrive's input, so the
-        // capture files reach the disk first.
-        let durable = async {
-            crate::snapshot_post::sync_capture(
-                &dest,
-                crate::snapshot_post::SyncScope::StateAndMemory,
-            )
-            .await?;
-            record
-                .persist(finalizer.fs.as_ref(), &finalizer.finalize_dir())
-                .await
-        };
-        if let Err(e) = durable.await {
+        if let Err(e) = record
+            .persist_captured(finalizer.fs.as_ref(), &finalizer.finalize_dir())
+            .await
+        {
             // Like the `None` arm above, a failure here must not leak the
             // multi-GiB staging dir: the eviction scanner retries ~30 s
             // apart, each attempt with a fresh snapshot_id and `dest`.
@@ -12130,6 +12143,7 @@ mod tests {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         record
             .persist(&engram_host_core::TokioFs, &ckpt_dir.join("finalize"))

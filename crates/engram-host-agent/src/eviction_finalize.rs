@@ -81,6 +81,44 @@ pub struct EvictionFinalizeRecord {
     pub swap_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
+    /// The extents of `memory.diff` after the capture's sync. `None` for
+    /// a Full capture, or for a record from a build that did not record
+    /// them: that diff publishes unchecked.
+    #[serde(default)]
+    pub diff_extents: Option<DiffExtents>,
+}
+
+/// The data extents of a `memory.diff`: the range count and byte sum. A
+/// dirty page that a crash lost before writeback reads as a hole, so a
+/// diff whose extents differ from the ones its capture recorded lost
+/// pages, and publishing it would keep the previous chunk for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffExtents {
+    pub ranges: u64,
+    pub bytes: u64,
+}
+
+impl DiffExtents {
+    pub(crate) fn of(ranges: &[(u64, u64)]) -> Self {
+        Self {
+            ranges: ranges.len() as u64,
+            bytes: ranges.iter().map(|(_, len)| len).sum(),
+        }
+    }
+
+    async fn read(diff: &Path) -> std::io::Result<Self> {
+        let diff = diff.to_path_buf();
+        let ranges = tokio::task::spawn_blocking(move || crate::checkpoint::dirty_ranges(&diff))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(Self::of(&ranges))
+    }
+}
+
+impl std::fmt::Display for DiffExtents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ranges of {} bytes", self.ranges, self.bytes)
+    }
 }
 
 /// A pending checkpoint of one disk and the checkpoint it was taken
@@ -93,6 +131,19 @@ pub struct PendingDisk {
 }
 
 impl EvictionFinalizeRecord {
+    /// Make the staging dir the redrive's input: fsync every capture
+    /// file, record the diff's extents, then persist the record at
+    /// `Captured` into `dir`. No record exists unless the files reached
+    /// the disk first.
+    pub async fn persist_captured(&mut self, fs: &dyn HostFs, dir: &Path) -> std::io::Result<()> {
+        crate::snapshot_post::sync_capture(fs, &self.dest, crate::snapshot_post::SyncScope::All)
+            .await?;
+        if self.chain_prev_ref.is_some() {
+            self.diff_extents = Some(DiffExtents::read(&self.dest.join("memory.diff")).await?);
+        }
+        self.persist(fs, dir).await
+    }
+
     /// Durably persist into `dir` via the shared [`crate::durable_record`]
     /// engine (write `.partial` → fsync → rename → **fsync parent dir**).
     /// This used to be a hand-rolled copy that OMITTED the parent-dir
@@ -247,6 +298,7 @@ impl EvictionFinalizer {
             chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
+            fs: self.fs.as_ref(),
         }
     }
 }
@@ -265,6 +317,7 @@ async fn run_post_phase(
             Some(prev_ref) => Memory::Diff {
                 prev_ref,
                 prev: None,
+                extents: record.diff_extents,
             },
             None => Memory::Full,
         });
@@ -315,8 +368,12 @@ async fn run_post_phase(
             "persist finalize record: {e}"
         )));
     }
+    // The capture's sync covered the memory file, so a failed retire
+    // only leaks it.
     if let Some(path) = consumed {
-        crate::snapshot_post::retire_consumed(f.fs.clone(), path).await;
+        if let Err(e) = crate::snapshot_post::retire_consumed(f.fs.clone(), path).await {
+            tracing::warn!(snapshot_id = %record.snapshot_id, error = %e, "retire of a consumed memory file failed");
+        }
     }
     Ok(())
 }
@@ -505,6 +562,7 @@ mod tests {
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let body = serde_json::to_string(&record).unwrap();
         let bytes = crate::durable_envelope::seal(&record.snapshot_id.to_string(), &body);
@@ -631,6 +689,7 @@ mod tests {
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         }
     }
 
@@ -745,5 +804,360 @@ mod tests {
             panic!("a lost pending checkpoint must fail the disk leg");
         };
         assert!(message.contains("never published"), "{message}");
+    }
+
+    /// Run redrive attempts until the record leaves the loop.
+    async fn redrive_to_the_end(
+        f: &EvictionFinalizer,
+        record: &mut EvictionFinalizeRecord,
+    ) -> FinalizeAttempt {
+        loop {
+            match run_eviction_finalize_attempt(f, record).await {
+                FinalizeAttempt::RetryAfter(_) => continue,
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn checkpoints(f: &EvictionFinalizer) -> Vec<CheckpointRecord> {
+        CheckpointRecord::load_all(&engram_host_core::TokioFs, &f.records_dir()).await
+    }
+
+    /// A sidecar shaped like the FC backend's, without a trailing newline:
+    /// every strict prefix of it is invalid JSON.
+    fn fc_sidecar() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "sandbox_id": "s-old",
+            "format": "fc",
+            "memory_manifest": null,
+        }))
+        .unwrap()
+    }
+
+    /// A capture with a memory file also wrote the sidecar, so a staging
+    /// dir without it lost the file. The redrive fails instead of
+    /// recording a checkpoint whose state and sidecar blobs were never
+    /// uploaded.
+    #[tokio::test]
+    async fn a_redrive_over_a_staging_dir_without_its_sidecar_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::remove_file(dest.join("manifest.json")).unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_zero_length_sidecar_quarantines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("manifest.json"), b"").unwrap();
+        let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+        let failed = EvictionFinalizeRecord::load_all(
+            &engram_host_core::TokioFs,
+            &finalizer.finalize_dir().join("failed"),
+        )
+        .await;
+        assert_eq!(failed.len(), 1);
+        assert!(!dest.exists(), "the quarantine frees the staging dir");
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_sidecar_torn_at_every_offset_never_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("memory.bin"), finalize_memory()).unwrap();
+        let sidecar = fc_sidecar();
+        for end in 0..sidecar.len() {
+            std::fs::write(dest.join("manifest.json"), &sidecar[..end]).unwrap();
+            let mut record = captured_record(sandbox, dest.clone(), FinalizeStage::Captured);
+            let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+            assert!(
+                matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+                "torn at {end}: {outcome:?}"
+            );
+            assert!(checkpoints(&finalizer).await.is_empty(), "torn at {end}");
+        }
+        std::fs::write(dest.join("manifest.json"), &sidecar).unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_redrive_over_a_zero_length_state_bin_never_records_the_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let dest = full_capture_dest(tmp.path());
+        std::fs::write(dest.join("state.bin"), b"").unwrap();
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+
+        let outcome = redrive_to_the_end(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::Quarantined),
+            "{outcome:?}"
+        );
+        assert!(checkpoints(&finalizer).await.is_empty());
+    }
+
+    /// 64 KiB of non-zero bytes: small, so a test can run many passes.
+    fn finalize_memory() -> Vec<u8> {
+        (0..64 * 1024).map(|i| (i % 251 + 1) as u8).collect()
+    }
+
+    // The diff-extents tests need a filesystem that reports holes, as the
+    // ext4 under a Firecracker host does; APFS reports a sparse file as
+    // one extent.
+    #[cfg(target_os = "linux")]
+    const DIFF_LEN: u64 = 4 << 20;
+    #[cfg(target_os = "linux")]
+    const DIRTY: [u64; 2] = [0, 2 << 20];
+
+    /// Write a sparse `memory.diff` of `DIFF_LEN` bytes with 64 KiB of
+    /// dirty pages at each of `dirty`.
+    #[cfg(target_os = "linux")]
+    fn write_diff(path: &Path, dirty: &[u64]) {
+        use std::io::{Seek, SeekFrom, Write};
+        let _ = std::fs::remove_file(path);
+        let mut file = std::fs::File::create(path).unwrap();
+        file.set_len(DIFF_LEN).unwrap();
+        for &offset in dirty {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[0xA5; 64 * 1024]).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    /// A crash before writeback leaves a hole where a dirty page was,
+    /// which reads as a clean page. The capture recorded the diff's
+    /// extents, so the redrive refuses the torn file instead of
+    /// publishing the previous chunk for the lost page.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_redrive_over_a_diff_whose_extents_differ_from_the_record_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxId::new();
+        let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
+        let store = finalizer.chunk_store.clone().unwrap();
+        let prev_path = tmp.path().join("prev.bin");
+        std::fs::write(
+            &prev_path,
+            (0..DIFF_LEN)
+                .map(|i| (i % 251 + 1) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let prev_ref =
+            crate::snapshot_post::chunk_memory_to_store(&store, &prev_path, None, "test")
+                .await
+                .unwrap();
+
+        let dest = tmp.path().join("capture");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("state.bin"), b"vmstate").unwrap();
+        std::fs::write(dest.join("manifest.json"), fc_sidecar()).unwrap();
+        let diff = dest.join("memory.diff");
+        write_diff(&diff, &DIRTY);
+        let mut record = captured_record(sandbox, dest, FinalizeStage::Captured);
+        record.chain_prev_ref = Some(prev_ref);
+        record
+            .persist_captured(&engram_host_core::TokioFs, &finalizer.finalize_dir())
+            .await
+            .unwrap();
+        let recorded = record
+            .diff_extents
+            .expect("a diff capture records its extents");
+
+        write_diff(&diff, &DIRTY[..1]);
+        assert_ne!(DiffExtents::read(&diff).await.unwrap(), recorded);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(
+            matches!(outcome, FinalizeAttempt::RetryAfter(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(record.memory_manifest, None);
+        assert!(checkpoints(&finalizer).await.is_empty());
+
+        write_diff(&diff, &DIRTY);
+        let outcome = run_eviction_finalize_attempt(&finalizer, &mut record).await;
+        assert!(matches!(outcome, FinalizeAttempt::Completed), "{outcome:?}");
+    }
+
+    /// A record from a build that did not record the extents redrives
+    /// as before.
+    #[tokio::test]
+    async fn a_record_without_diff_extents_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = captured_record(
+            SandboxId::new(),
+            tmp.path().join("c"),
+            FinalizeStage::Captured,
+        );
+        let mut body = serde_json::to_value(&record).unwrap();
+        body.as_object_mut().unwrap().remove("diff_extents");
+        let body = serde_json::to_string(&body).unwrap();
+        let id = record.snapshot_id.to_string();
+        std::fs::write(
+            tmp.path().join(format!("{id}.json")),
+            crate::durable_envelope::seal(&id, &body),
+        )
+        .unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].diff_extents, None);
+    }
+
+    /// A [`HostFs`] over the real filesystem that logs each op and can
+    /// fail the sync of one file name.
+    #[derive(Default)]
+    struct LoggingFs {
+        ops: parking_lot::Mutex<Vec<(&'static str, PathBuf)>>,
+        fail_sync_of: Option<&'static str>,
+    }
+
+    impl LoggingFs {
+        fn ops(&self) -> Vec<(&'static str, PathBuf)> {
+            self.ops.lock().clone()
+        }
+        fn log(&self, op: &'static str, path: &Path) {
+            self.ops.lock().push((op, path.to_path_buf()));
+        }
+    }
+
+    #[async_trait]
+    impl HostFs for LoggingFs {
+        async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            self.log("write", path);
+            engram_host_core::TokioFs.write(path, bytes).await
+        }
+        async fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+            self.log("sync_file", path);
+            if self.fail_sync_of.is_some_and(|name| path.ends_with(name)) {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            engram_host_core::TokioFs.sync_file(path).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.log("rename", to);
+            engram_host_core::TokioFs.rename(from, to).await
+        }
+        async fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            self.log("sync_dir", dir);
+            engram_host_core::TokioFs.sync_dir(dir).await
+        }
+        async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            engram_host_core::TokioFs.read(path).await
+        }
+        async fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+            engram_host_core::TokioFs.read_dir(dir).await
+        }
+        async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.log("remove_file", path);
+            engram_host_core::TokioFs.remove_file(path).await
+        }
+        async fn create_dir(&self, dir: &Path) -> std::io::Result<()> {
+            engram_host_core::TokioFs.create_dir(dir).await
+        }
+        async fn remove_dir(&self, dir: &Path) -> std::io::Result<()> {
+            engram_host_core::TokioFs.remove_dir(dir).await
+        }
+    }
+
+    /// Every capture file, the sidecar too, and the staging dir reach the
+    /// disk before the record that names them is written.
+    #[tokio::test]
+    async fn a_captured_record_is_written_only_after_every_capture_file_is_synced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let fs = LoggingFs::default();
+        let mut record = captured_record(SandboxId::new(), dest.clone(), FinalizeStage::Captured);
+        record
+            .persist_captured(&fs, &tmp.path().join("finalize"))
+            .await
+            .unwrap();
+
+        let ops = fs.ops();
+        let first_write = ops.iter().position(|(op, _)| *op == "write").unwrap();
+        let synced: Vec<_> = ops[..first_write]
+            .iter()
+            .filter(|(op, _)| *op == "sync_file")
+            .map(|(_, path)| path.clone())
+            .collect();
+        for name in ["state.bin", "memory.bin", "manifest.json"] {
+            assert!(
+                synced.contains(&dest.join(name)),
+                "{name} synced before the record: {ops:?}"
+            );
+        }
+        assert!(ops[..first_write].contains(&("sync_dir", dest)), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_capture_sync_writes_no_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let fs = LoggingFs {
+            fail_sync_of: Some("memory.bin"),
+            ..Default::default()
+        };
+        let finalize_dir = tmp.path().join("finalize");
+        let mut record = captured_record(SandboxId::new(), dest, FinalizeStage::Captured);
+        assert!(record.persist_captured(&fs, &finalize_dir).await.is_err());
+        assert!(!fs.ops().iter().any(|(op, _)| *op == "write"));
+        assert!(
+            EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, &finalize_dir)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A File restore uses a `memory.bin` it finds in the staging dir. A
+    /// periodic Full capture's memory file is never synced, so its retire
+    /// must be durable before the checkpoint record lands: otherwise a
+    /// crash can bring the file back with holes, and the restore reads
+    /// those holes as zeroed guest memory.
+    #[tokio::test]
+    async fn a_retired_memory_file_is_durably_gone_before_the_retire_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = full_capture_dest(tmp.path());
+        let memory = dest.join("memory.bin");
+        let fs = Arc::new(LoggingFs::default());
+        crate::snapshot_post::retire_consumed(fs.clone(), memory.clone())
+            .await
+            .unwrap();
+
+        assert!(!memory.exists());
+        let ops: Vec<_> = fs
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| *op != "remove_file")
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("rename", dest.join("memory.bin.consumed")),
+                ("sync_dir", dest),
+            ]
+        );
     }
 }

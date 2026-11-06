@@ -888,7 +888,7 @@ impl CosimHost {
         drop(root);
 
         let now = self.clock.now_utc();
-        let record = EvictionFinalizeRecord {
+        let mut record = EvictionFinalizeRecord {
             snapshot_id,
             session_id,
             sandbox_id,
@@ -909,10 +909,11 @@ impl CosimHost {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let finalizer = self.finalizer();
         record
-            .persist(self.fs_seam.as_ref(), &finalizer.finalize_dir())
+            .persist_captured(self.fs_seam.as_ref(), &finalizer.finalize_dir())
             .await
             .map_err(|e| format!("snapshot_begin record persist: {e}"))?;
 

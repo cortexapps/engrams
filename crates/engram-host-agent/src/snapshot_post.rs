@@ -7,6 +7,7 @@
 //! is idempotent, so a caller that failed can run the phase again from
 //! the same staging dir.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
 use engram_core::types::manifest::ManifestRef;
@@ -14,10 +15,10 @@ use engram_core::types::sandbox::AuxBundleRef;
 use engram_core::types::snapshot::DiskRole;
 use engram_core::{SandboxError, SandboxId, SessionId, SnapshotId};
 use engram_host_core::session_volumes::PendingCheckpoint;
-use engram_host_core::SessionVolumes;
+use engram_host_core::{HostFs, SessionVolumes};
 use tracing::Instrument as _;
 
-use crate::eviction_finalize::PendingDisk;
+use crate::eviction_finalize::{DiffExtents, PendingDisk};
 
 /// The stores the post phase writes to.
 pub(crate) struct PostPhase<'a> {
@@ -26,6 +27,7 @@ pub(crate) struct PostPhase<'a> {
     pub chunk_cache: Option<&'a ChunkCache>,
     pub bundle_dir: &'a Path,
     pub bundle_file_ext: &'static str,
+    pub fs: &'a dyn HostFs,
 }
 
 /// The disk checkpoints a capture took.
@@ -42,10 +44,12 @@ pub(crate) enum Disks {
 /// The memory artifact a capture left in the staging dir.
 pub(crate) enum Memory {
     /// `memory.diff` over the chain's previous manifest. `prev` is that
-    /// manifest when the caller has it; otherwise it is fetched.
+    /// manifest when the caller has it; otherwise it is fetched. The
+    /// publish refuses a diff whose extents differ from `extents`.
     Diff {
         prev_ref: ManifestRef,
         prev: Option<Manifest>,
+        extents: Option<DiffExtents>,
     },
     /// `memory.bin`, the whole guest memory. A backend that writes no
     /// memory file (VZ, Process) has no memory manifest.
@@ -116,7 +120,9 @@ impl PostPhase<'_> {
         let state_path = dest.join("state.bin");
         let sidecar_path = dest.join("manifest.json");
         // The blobs need the chunk store and a memory file; a backend
-        // without one (VZ, Process) publishes its disks only.
+        // without one (VZ, Process) publishes its disks only. A capture
+        // with a memory file also wrote `state.bin` and the sidecar, so a
+        // missing or empty one is a lost file, not a backend without it.
         let blob = self
             .chunk_store
             .map(|store| store.blob_storage())
@@ -125,8 +131,9 @@ impl PostPhase<'_> {
             (Some(Memory::Full), Some(_)) if !fs_exists(&dest.join("memory.bin")).await => None,
             (_, blob) => blob,
         };
-        let portable =
-            blob.is_some() && fs_exists(&state_path).await && fs_exists(&sidecar_path).await;
+        if blob.is_some() {
+            check_restore_files(&state_path, &sidecar_path).await?;
+        }
         let state_key = engram_chunk_store::snapshot_blob::state_blob_key(snapshot_id);
         let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot_id);
 
@@ -147,14 +154,19 @@ impl PostPhase<'_> {
                 Some(memory) => {
                     let published = self.publish_memory(dest, memory, source).await?;
                     if let Some(m) = &published {
-                        patch_fc_manifest_memory_ref(&sidecar_path, m.manifest_ref, trace_lineage)
-                            .await?;
+                        patch_fc_manifest_memory_ref(
+                            self.fs,
+                            &sidecar_path,
+                            m.manifest_ref,
+                            trace_lineage,
+                        )
+                        .await?;
                     }
                     (published, Some(start.elapsed().as_secs_f64()))
                 }
                 None => (None, None),
             };
-            if let (true, Some(blob)) = (portable, blob.as_ref()) {
+            if let Some(blob) = blob.as_ref() {
                 engram_chunk_store::snapshot_blob::upload_file(
                     blob.as_ref(),
                     &sidecar_key,
@@ -171,16 +183,10 @@ impl PostPhase<'_> {
                 return Ok(None);
             };
             let start = crate::time_source::metrics_now();
-            if portable {
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path,
-                )
+            engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
                 .instrument(tracing::info_span!("finish.blob_upload"))
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            }
             // A pin nothing can satisfy is worse than a retried capture,
             // so a failed bundle publish fails the phase.
             if !aux_bundles.is_empty() {
@@ -205,7 +211,7 @@ impl PostPhase<'_> {
             root,
             swap,
             memory,
-            blobs: portable.then_some(BlobKeys {
+            blobs: blob.is_some().then_some(BlobKeys {
                 state: state_key,
                 sidecar: sidecar_key,
             }),
@@ -282,7 +288,11 @@ impl PostPhase<'_> {
             return Ok(None);
         };
         match memory {
-            Memory::Diff { prev_ref, prev } => {
+            Memory::Diff {
+                prev_ref,
+                prev,
+                extents,
+            } => {
                 // A diff create always writes `memory.diff`; a missing one
                 // was lost, and publishing without it would drop the
                 // pages its dirty set consumed.
@@ -295,6 +305,17 @@ impl PostPhase<'_> {
                 };
                 let ranges = crate::checkpoint::dirty_ranges(&diff_path)
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                // A page lost in a crash reads as a hole, so it would look
+                // clean and keep the previous chunk.
+                if let Some(expected) = extents {
+                    let found = DiffExtents::of(&ranges);
+                    if found != expected {
+                        return Err(SandboxError::Snapshot(format!(
+                            "memory.diff holds {found} but the capture recorded {expected}: \
+                             the file lost pages"
+                        )));
+                    }
+                }
                 let dirty_bytes: u64 = ranges.iter().map(|(_, len)| *len).sum();
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(&prev, &diff_path, &ranges)
@@ -491,12 +512,16 @@ pub(crate) async fn chunk_memory_to_store(
 /// given, on the FC sidecar JSON. The patch works on the JSON value: the
 /// on-disk shape is the contract with the FC backend, which reads it with
 /// `#[serde(default)]`.
+///
+/// The patched file replaces the old one atomically and durably, so a
+/// crash never leaves a torn sidecar for a redrive or a restore.
 pub(crate) async fn patch_fc_manifest_memory_ref(
+    fs: &dyn HostFs,
     manifest_json: &Path,
     memory_manifest: ManifestRef,
     trace_lineage: Option<SessionId>,
 ) -> Result<(), SandboxError> {
-    let bytes = tokio::fs::read(manifest_json).await.map_err(|e| {
+    let bytes = fs.read(manifest_json).await.map_err(|e| {
         SandboxError::Snapshot(format!(
             "read fc manifest.json {}: {e}",
             manifest_json.display(),
@@ -530,72 +555,112 @@ pub(crate) async fn patch_fc_manifest_memory_ref(
     }
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|e| SandboxError::Snapshot(format!("serialize patched manifest.json: {e}")))?;
-    tokio::fs::write(manifest_json, bytes).await.map_err(|e| {
-        SandboxError::Snapshot(format!(
-            "write patched manifest.json {}: {e}",
-            manifest_json.display(),
-        ))
-    })?;
-    Ok(())
+    crate::durable_record::replace(fs, manifest_json, &bytes)
+        .await
+        .map_err(|e| {
+            SandboxError::Snapshot(format!(
+                "write patched manifest.json {}: {e}",
+                manifest_json.display(),
+            ))
+        })
+}
+
+/// `state.bin` must hold bytes and the sidecar must be a JSON object:
+/// a crash can leave either empty or torn, and the post phase must not
+/// upload such a file as the snapshot's restore input.
+async fn check_restore_files(state: &Path, sidecar: &Path) -> Result<(), SandboxError> {
+    match tokio::fs::metadata(state).await {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => {
+            return Err(SandboxError::Snapshot(format!(
+                "{} is empty",
+                state.display()
+            )))
+        }
+        Err(e) => {
+            return Err(SandboxError::Snapshot(format!(
+                "stat {}: {e}",
+                state.display()
+            )))
+        }
+    }
+    let bytes = tokio::fs::read(sidecar)
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("read {}: {e}", sidecar.display())))?;
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(_)) => Ok(()),
+        Ok(_) => Err(SandboxError::Snapshot(format!(
+            "{} root is not an object",
+            sidecar.display()
+        ))),
+        Err(e) => Err(SandboxError::Snapshot(format!(
+            "parse {}: {e}",
+            sidecar.display()
+        ))),
+    }
 }
 
 /// The capture files that must reach the disk before a durable record
 /// names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncScope {
-    /// `state.bin` only: the memory file is chunked and deleted, so the
-    /// chunk store holds its durable copy.
+    /// `state.bin` only: the memory file is chunked and retired, so the
+    /// chunk store holds its durable copy, and the post phase replaces
+    /// the sidecar durably.
     State,
-    /// `state.bin` and the memory file: a redrive reads the memory file
-    /// back from the staging dir.
-    StateAndMemory,
+    /// Every capture file: a redrive reads them back from the staging dir.
+    All,
 }
 
-/// fdatasync the capture files that exist in `dest`, then the dir. The
-/// FC backend resumes the guest before its files reach the disk
-/// (`SandboxBackend::snapshot`'s contract).
-pub(crate) async fn sync_capture(dest: &Path, scope: SyncScope) -> std::io::Result<()> {
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let names: &[&str] = match scope {
+impl SyncScope {
+    fn files(self) -> &'static [&'static str] {
+        match self {
             SyncScope::State => &["state.bin"],
-            SyncScope::StateAndMemory => &["state.bin", "memory.diff", "memory.bin"],
-        };
-        for name in names {
-            match std::fs::File::open(dest.join(name)) {
-                Ok(file) => file.sync_data()?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            SyncScope::All => &["state.bin", "memory.diff", "memory.bin", "manifest.json"],
         }
-        std::fs::File::open(&dest)?.sync_all()
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    }
 }
 
-/// Delete a consumed memory file off the caller's path: unlinking a
-/// multi-GiB file frees its extents and takes long enough to show. The
-/// rename first makes the file gone under its own name at once, so no
-/// reader of the staging dir finds a file that is about to vanish.
-pub(crate) async fn retire_consumed(
-    fs: std::sync::Arc<dyn engram_host_core::HostFs>,
-    path: PathBuf,
-) {
+/// fsync the capture files that exist in `dest`, then the dir. The FC
+/// backend resumes the guest before its files reach the disk
+/// (`SandboxBackend::snapshot`'s contract).
+pub(crate) async fn sync_capture(
+    fs: &dyn HostFs,
+    dest: &Path,
+    scope: SyncScope,
+) -> std::io::Result<()> {
+    for name in scope.files() {
+        match fs.sync_file(&dest.join(name)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    fs.sync_dir(dest).await
+}
+
+/// Retire a consumed memory file: rename it away and fsync the dir, then
+/// delete it off the caller's path (unlinking a multi-GiB file takes long
+/// enough to show). After `Ok`, a crash cannot bring the file back under
+/// its own name, so no restore can read an un-synced memory file as whole.
+pub(crate) async fn retire_consumed(fs: Arc<dyn HostFs>, path: PathBuf) -> std::io::Result<()> {
     let mut doomed = path.clone().into_os_string();
     doomed.push(".consumed");
     let doomed = PathBuf::from(doomed);
-    if let Err(e) = fs.rename(&path, &doomed).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %path.display(), error = %e, "retire of a consumed memory file failed");
-        }
-        return;
+    match fs.rename(&path, &doomed).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    if let Some(dir) = path.parent() {
+        fs.sync_dir(dir).await?;
     }
     tokio::spawn(async move {
         if let Err(e) = fs.remove_file(&doomed).await {
             tracing::warn!(path = %doomed.display(), error = %e, "delete of a consumed memory file failed");
         }
     });
+    Ok(())
 }
 
 async fn fs_exists(path: &Path) -> bool {
