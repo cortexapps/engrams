@@ -1045,22 +1045,7 @@ impl ChunkCache {
                 // it when it stored it, and each frame carries a CRC32C.
                 let result = match fetched {
                     Ok(bytes) if source == FillSource::Peer => Ok(bytes),
-                    Ok(bytes) => {
-                        let actual = ChunkHash::of(&bytes);
-                        if actual == hash {
-                            Ok(bytes)
-                        } else {
-                            tracing::error!(
-                                hash = %hash,
-                                actual = %actual,
-                                "fetched chunk hash mismatch; refusing to cache or serve",
-                            );
-                            Err(ChunkStoreError::HashMismatch {
-                                expected: hash.to_hex(),
-                                actual: actual.to_hex(),
-                            })
-                        }
-                    }
+                    Ok(bytes) => verify_fetched(hash, &bytes).await.map(|()| bytes),
                     Err(e) => Err(e),
                 };
                 // Persist BEFORE releasing the slot. The ordering is the
@@ -1832,6 +1817,36 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     Ok(res?)
 }
 
+/// Chunks larger than this are hashed on a blocking thread: without SHA
+/// extensions SHA-256 runs at about 200 MB/s, so a larger chunk would hold
+/// a runtime worker (and the fetch timers on it) for over 5 ms.
+const INLINE_HASH_MAX: usize = 1024 * 1024;
+
+/// `Err(HashMismatch)` unless `bytes`, fetched from the object store,
+/// hash to `hash`. A large chunk is hashed off the async worker.
+pub async fn verify_fetched(hash: ChunkHash, bytes: &Bytes) -> Result<()> {
+    let actual = if bytes.len() > INLINE_HASH_MAX {
+        let bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || ChunkHash::of(&bytes))
+            .await
+            .map_err(|e| ChunkStoreError::Internal(format!("hash task: {e}")))?
+    } else {
+        ChunkHash::of(bytes)
+    };
+    if actual != hash {
+        tracing::error!(
+            hash = %hash,
+            actual = %actual,
+            "fetched chunk hash mismatch; refusing to cache or serve",
+        );
+        return Err(ChunkStoreError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(())
+}
+
 /// `Err(HashMismatch)` unless `bytes` hash to `hash`.
 fn check_hash(hash: ChunkHash, bytes: &[u8]) -> Result<()> {
     let actual = ChunkHash::of(bytes);
@@ -2460,6 +2475,21 @@ mod tests {
             !cache.contains_on_disk(h),
             "mismatched fetch must not populate the cache",
         );
+    }
+
+    /// A chunk large enough to hash on a blocking thread is checked the
+    /// same way: good bytes are stored, bad bytes are refused.
+    #[tokio::test]
+    async fn a_large_fetched_chunk_is_verified() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from(vec![5u8; 2 * INLINE_HASH_MAX]);
+        let h = ChunkHash::of(&body);
+        let bad = ChunkHash::of(b"other");
+        let got = cache.get(bad, || async { Ok(body.clone()) }).await;
+        assert!(matches!(got, Err(ChunkStoreError::HashMismatch { .. })));
+        let got = cache.get(h, || async { Ok(body.clone()) }).await.unwrap();
+        assert_eq!(got, body);
+        assert!(cache.contains_on_disk(h) && !cache.contains_on_disk(bad));
     }
 
     #[tokio::test]

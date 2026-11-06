@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use engram_chunk_store::cache::FillSource;
-use engram_chunk_store::{
-    Admission, ChunkHash, ChunkStore, ChunkStoreError, Class, Permit, Result,
-};
+use engram_chunk_store::{Admission, ChunkHash, ChunkStore, Class, Permit, Result};
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -312,13 +310,7 @@ impl FillEngine {
     async fn fetch_verified(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
         let (bytes, source) = self.fetch_unverified(hash, class, permit).await?;
         if source == FillSource::BlobStorage {
-            let actual = ChunkHash::of(&bytes);
-            if actual != hash {
-                return Err(ChunkStoreError::HashMismatch {
-                    expected: hash.to_hex(),
-                    actual: actual.to_hex(),
-                });
-            }
+            engram_chunk_store::cache::verify_fetched(hash, &bytes).await?;
         }
         Ok(bytes)
     }
