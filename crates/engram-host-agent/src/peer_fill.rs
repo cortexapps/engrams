@@ -5,11 +5,13 @@
 //! semantics, resident-only (a peer can never induce a GCS read here),
 //! bounded by a host-global stream semaphore.
 //!
-//! **Pull** ([`pull_chunks_from_peer`] for bulk; [`PeerBinding`] for
-//! the resume fault-time tier): dial a coordinator-hinted sibling,
-//! stream the wanted set over a few fat connections, CRC32C-check each
-//! frame, and land bulk chunks through `ChunkCache::put`, which sha256s
-//! each one before it becomes resident. The pull is a
+//! **Pull** ([`pull_chunks_from_peer`] for bulk; [`PeerFetcher`] as the
+//! fill engine's peer tier): dial a coordinator-hinted sibling, stream
+//! the wanted set over a few fat connections, and reassemble each chunk
+//! from frames that pass their CRC32C and arrive in order, contiguous
+//! from offset 0 up to the `last` frame. Peer bytes are trusted, not
+//! hashed: the peer hashed each chunk when it stored it. Bulk chunks
+//! land through `ChunkCache::put_trusted`. The pull is a
 //! best-effort PRE-PASS: callers re-check residency afterwards and
 //! complete whatever is still missing through the existing verified
 //! GCS path, so a dead/missing/saturated peer degrades to today's
@@ -273,8 +275,8 @@ fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
         .tcp_nodelay(true))
 }
 
-/// Bulk-pull `hashes` from the peer at `addr` into `cache` through the
-/// verifying [`ChunkCache::put`]. Best-effort pre-pass (see module
+/// Bulk-pull `hashes` from the peer at `addr` into `cache` through
+/// [`ChunkCache::put_trusted`]. Best-effort pre-pass (see module
 /// docs): every outcome short of success leaves the caller's GCS
 /// completion pass to pick up the remainder.
 ///
@@ -363,7 +365,8 @@ pub async fn pull_chunks_from_peer(
 }
 
 /// One connection's shard: a single `PeerChunkGet` request, frames
-/// reassembled per item, CRC32C-checked, landed through `ChunkCache::put`.
+/// reassembled per item by [`Reassembly`], landed through
+/// `ChunkCache::put_trusted`.
 async fn pull_shard(
     client: GrpcHostClient,
     scope: PeerChunkScope,
@@ -390,8 +393,7 @@ async fn pull_shard(
             return stats;
         }
     };
-    let mut current: Vec<u8> = Vec::new();
-    let mut current_idx: Option<u32> = None;
+    let mut reassembly = Reassembly::new(hashes.len());
     while let Some(frame) = stream.next().await {
         let frame = match frame {
             Ok(f) => f,
@@ -401,56 +403,106 @@ async fn pull_shard(
                 return stats;
             }
         };
-        if frame.missing {
-            stats.missing += 1;
-            current.clear();
-            current_idx = None;
-            continue;
-        }
-        // CRC every frame BEFORE buffering — corrupt wire bytes must
-        // not land, and a CRC mismatch is a transport fault (peer lost),
-        // not an honest miss.
-        if crc32c::crc32c(&frame.data) != frame.crc32c {
-            tracing::warn!(
-                item_idx = frame.item_idx,
-                "peer pull: frame CRC32C mismatch"
-            );
-            stats.failed = true;
-            return stats;
-        }
-        if current_idx != Some(frame.item_idx) {
-            current_idx = Some(frame.item_idx);
-            current.clear();
-        }
-        current.extend_from_slice(&frame.data);
-        if frame.last {
-            let idx = frame.item_idx as usize;
-            let Some(hash) = hashes.get(idx).copied() else {
-                tracing::warn!(item_idx = frame.item_idx, "peer pull: unknown item index");
+        let (idx, body) = match reassembly.push(frame) {
+            Ok(Assembled::Partial) => continue,
+            Ok(Assembled::Missing(_)) => {
+                stats.missing += 1;
+                continue;
+            }
+            Ok(Assembled::Whole(idx, body)) => (idx, body),
+            Err(e) => {
+                tracing::warn!(error = %e, "peer pull: bad frame");
                 stats.failed = true;
                 return stats;
-            };
-            let len = current.len();
-            let body = bytes::Bytes::from(std::mem::take(&mut current));
-            // A restore waits for these chunks.
-            if let Err(e) = cache
-                .put_trusted(hash, body, engram_fill::Class::Prefix)
-                .await
-            {
-                // Local landing failure (ENOSPC…) — not the peer's
-                // fault; skip this chunk (GCS pass covers it) and keep
-                // draining the stream.
-                tracing::warn!(hash = %hash, error = %e, "peer pull: landing failed");
-            } else {
-                stats.landed += 1;
-                stats.landed_bytes += len as u64;
-                metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
-                metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => "peer").increment(len as u64);
             }
-            current_idx = None;
+        };
+        let hash = hashes[idx];
+        let len = body.len();
+        // A restore waits for these chunks.
+        if let Err(e) = cache
+            .put_trusted(hash, bytes::Bytes::from(body), engram_fill::Class::Prefix)
+            .await
+        {
+            // Local landing failure (ENOSPC…) — not the peer's
+            // fault; skip this chunk (GCS pass covers it) and keep
+            // draining the stream.
+            tracing::warn!(hash = %hash, error = %e, "peer pull: landing failed");
+        } else {
+            stats.landed += 1;
+            stats.landed_bytes += len as u64;
+            metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
+            metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => "peer").increment(len as u64);
         }
     }
     stats
+}
+
+/// What one frame completes in a [`Reassembly`].
+#[derive(Debug, PartialEq)]
+enum Assembled {
+    /// The frame extends an open item.
+    Partial,
+    /// The peer does not hold the item at this index.
+    Missing(usize),
+    /// The item at this index is whole.
+    Whole(usize, Vec<u8>),
+}
+
+/// Reassembles one `PeerChunkGet` stream. The serve side sends one item
+/// at a time, each as frames contiguous from offset 0 that end with a
+/// `last` frame. Any other frame is a failed peer answer: a frame that
+/// fails its CRC32C, names an unknown item, starts a new item before the
+/// open one ends, or does not start where the bytes so far end.
+struct Reassembly {
+    items: usize,
+    open: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+impl Reassembly {
+    fn new(items: usize) -> Self {
+        Self {
+            items,
+            open: None,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, frame: PeerChunkFrame) -> Result<Assembled, String> {
+        let idx = frame.item_idx;
+        if (idx as usize) >= self.items {
+            return Err(format!("unknown item index {idx}"));
+        }
+        if let Some(open) = self.open.filter(|&open| open != idx || frame.missing) {
+            return Err(format!(
+                "item {open} is open when a frame for item {idx} arrives"
+            ));
+        }
+        if frame.missing {
+            return Ok(Assembled::Missing(idx as usize));
+        }
+        if crc32c::crc32c(&frame.data) != frame.crc32c {
+            return Err(format!("item {idx}: frame CRC32C mismatch"));
+        }
+        if frame.offset != self.bytes.len() as u64 {
+            return Err(format!(
+                "item {idx}: frame at offset {} after {} bytes",
+                frame.offset,
+                self.bytes.len()
+            ));
+        }
+        self.bytes.extend_from_slice(&frame.data);
+        if frame.last {
+            self.open = None;
+            Ok(Assembled::Whole(
+                idx as usize,
+                std::mem::take(&mut self.bytes),
+            ))
+        } else {
+            self.open = Some(idx);
+            Ok(Assembled::Partial)
+        }
+    }
 }
 
 /// Parse + validate a `PeerChunkGetRequest`'s hashes (32-byte each).
@@ -475,7 +527,8 @@ type PeerWaiter = tokio::sync::oneshot::Sender<Option<bytes::Bytes>>;
 /// A hinted peer as a fill-engine source. Requests that arrive together go
 /// out as one `PeerChunkGet` stream, several streams at once, and each
 /// chunk goes back to its waiter as its last frame lands. A lost peer
-/// answers `None` at once. The engine verifies the bytes.
+/// answers `None` at once. The bytes are trusted (see the module docs):
+/// neither the fetcher nor the engine hashes them.
 pub struct PeerFetcher {
     addr: String,
     health: Arc<PeerHealth>,
@@ -587,51 +640,106 @@ async fn fetch_batch(
             return;
         }
     };
-    let mut item: Option<u32> = None;
-    let mut bytes: Vec<u8> = Vec::new();
+    let mut reassembly = Reassembly::new(waiters.len());
     while let Some(frame) = stream.next().await {
-        let frame = match frame {
-            Ok(f) => f,
+        let assembled = match frame {
+            Ok(frame) => reassembly.push(frame),
+            Err(e) => Err(e.to_string()),
+        };
+        match assembled {
+            Ok(Assembled::Partial) => {}
+            Ok(Assembled::Missing(idx)) => drop(waiters[idx].take()),
+            Ok(Assembled::Whole(idx, body)) => {
+                if let Some(waiter) = waiters[idx].take() {
+                    let _ = waiter.send(Some(bytes::Bytes::from(body)));
+                    metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
+                }
+            }
             Err(e) => {
                 tracing::warn!(addr, error = %e, "peer fetch: stream failed; peer lost for the window");
                 health.mark_lost(addr);
                 return;
             }
-        };
-        let Some(slot) = waiters.get_mut(frame.item_idx as usize) else {
-            tracing::warn!(
-                addr,
-                item_idx = frame.item_idx,
-                "peer fetch: unknown item index"
-            );
-            return;
-        };
-        if frame.missing {
-            slot.take();
-            item = None;
-            bytes.clear();
-            continue;
         }
-        if crc32c::crc32c(&frame.data) != frame.crc32c {
-            tracing::warn!(
-                addr,
-                item_idx = frame.item_idx,
-                "peer fetch: frame CRC32C mismatch"
-            );
-            return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(item_idx: u32, offset: u64, data: &[u8], last: bool) -> PeerChunkFrame {
+        PeerChunkFrame {
+            item_idx,
+            offset,
+            data: data.to_vec(),
+            last,
+            missing: false,
+            crc32c: crc32c::crc32c(data),
         }
-        if item != Some(frame.item_idx) {
-            item = Some(frame.item_idx);
-            bytes.clear();
+    }
+
+    fn missing(item_idx: u32) -> PeerChunkFrame {
+        PeerChunkFrame {
+            item_idx,
+            missing: true,
+            last: true,
+            ..PeerChunkFrame::default()
         }
-        bytes.extend_from_slice(&frame.data);
-        if frame.last {
-            if let Some(waiter) = slot.take() {
-                let _ = waiter.send(Some(bytes::Bytes::from(std::mem::take(&mut bytes))));
-                metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
-            }
-            item = None;
-            bytes = Vec::new();
-        }
+    }
+
+    #[test]
+    fn in_order_frames_make_whole_items() {
+        let mut r = Reassembly::new(3);
+        assert_eq!(r.push(frame(0, 0, b"ab", false)), Ok(Assembled::Partial));
+        assert_eq!(
+            r.push(frame(0, 2, b"cd", true)),
+            Ok(Assembled::Whole(0, b"abcd".to_vec()))
+        );
+        assert_eq!(r.push(missing(1)), Ok(Assembled::Missing(1)));
+        assert_eq!(
+            r.push(frame(2, 0, b"", true)),
+            Ok(Assembled::Whole(2, Vec::new()))
+        );
+    }
+
+    #[test]
+    fn a_frame_out_of_order_fails_the_answer() {
+        // The second half of item 0 first.
+        let mut r = Reassembly::new(1);
+        assert!(r.push(frame(0, 2, b"cd", true)).is_err());
+
+        // A repeated frame.
+        let mut r = Reassembly::new(1);
+        r.push(frame(0, 0, b"ab", false)).unwrap();
+        assert!(r.push(frame(0, 0, b"ab", true)).is_err());
+
+        // A frame skipped.
+        let mut r = Reassembly::new(1);
+        r.push(frame(0, 0, b"ab", false)).unwrap();
+        assert!(r.push(frame(0, 4, b"ef", true)).is_err());
+    }
+
+    #[test]
+    fn interleaved_items_fail_the_answer() {
+        let mut r = Reassembly::new(2);
+        r.push(frame(0, 0, b"ab", false)).unwrap();
+        assert!(r.push(frame(1, 0, b"xy", true)).is_err());
+
+        let mut r = Reassembly::new(2);
+        r.push(frame(0, 0, b"ab", false)).unwrap();
+        assert!(r.push(missing(0)).is_err());
+    }
+
+    #[test]
+    fn a_bad_crc_or_unknown_item_fails_the_answer() {
+        let mut r = Reassembly::new(1);
+        let mut bad = frame(0, 0, b"ab", true);
+        bad.crc32c ^= 1;
+        assert!(r.push(bad).is_err());
+
+        let mut r = Reassembly::new(1);
+        assert!(r.push(frame(1, 0, b"ab", true)).is_err());
+        assert!(Reassembly::new(1).push(missing(1)).is_err());
     }
 }

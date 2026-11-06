@@ -6,8 +6,9 @@
 //! REQUESTER side (structurally zero GCS involvement for peer-landed
 //! chunks — there is nothing to fall back to, so every assertion about
 //! landed bytes is an assertion about the peer path):
-//!   1. batch pull lands CRC-checked, sha256-verified bytes that serve
-//!      onward at once;
+//!   1. batch pull lands the peer's bytes (each frame CRC32C-checked and
+//!      in order; the bytes themselves trusted, not hashed), and they
+//!      serve onward at once;
 //!   2. a locally-missing hash streams a `missing` marker (peer stays
 //!      healthy);
 //!   3. a stale BaseImage scope is rejected (`scope_reject`), which the
@@ -194,7 +195,7 @@ fn ready_digest(digest: &str) -> Arc<ImageReadiness> {
 const DIGEST: &str = "sha256:feedc0de";
 
 #[tokio::test]
-async fn pull_lands_verified_chunks_that_serve_onward_at_once() {
+async fn pull_lands_chunks_that_serve_onward_at_once() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("engram_host_agent=debug")
         .try_init();
@@ -237,7 +238,7 @@ async fn pull_lands_verified_chunks_that_serve_onward_at_once() {
     );
     assert!(!health.is_lost(&addr));
 
-    // The landing verifies each chunk, so it serves onward at once.
+    // A trusted landing is servable, so each chunk serves onward at once.
     for (h, body) in hashes.iter().zip(&bodies) {
         let bytes = land_cache.read_resident(*h).await.unwrap();
         assert_eq!(bytes.as_deref(), Some(body.as_slice()), "chunk {h}");
