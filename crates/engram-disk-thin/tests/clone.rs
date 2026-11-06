@@ -4,22 +4,30 @@
 //! source is a read-only loop device over a file, behind dm-delay where
 //! a test needs the background copy to take time.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use engram_chunk_store::{ChunkStore, ManifestRef};
+use engram_core::types::ids::SandboxId;
+use engram_core::types::snapshot::DiskRole;
 use engram_disk_thin::ThinPoolDisk;
 use engram_host_core::disk::{
-    CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
+    clone_bitmap_bytes, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
 };
+use engram_host_core::session_volumes::{live_name, Source};
+use engram_host_core::{checkpoint, DiskSources, FileDisk, FileSources, SessionVolumes};
+use engram_storage_local::LocalBlobStorage;
 
 const CHUNK: u64 = 65536;
 const REGION: u64 = CLONE_REGION_BYTES;
 const REGIONS: u64 = 64;
 const SIZE: u64 = REGION * REGIONS;
-const BITMAP: u64 = 4 << 20;
 const HYDRATION_DEADLINE: Duration = Duration::from_secs(60);
 const NODES: &str = "/dev/engram-test";
 
@@ -219,7 +227,7 @@ async fn a_clone_reads_the_source_and_cuts_over_with_a_handle_open() {
         return;
     };
     let dest = rig.volume("dest", SIZE).await;
-    let bitmap = rig.volume("bitmap", BITMAP).await;
+    let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
     let drive = rig.clone_drive(&dest, &bitmap, off(4, 4)).await;
     assert_eq!(
         drive.path,
@@ -311,7 +319,7 @@ async fn a_view_over_snapshots_reads_what_the_guest_saw_mid_hydration() {
         return;
     };
     let dest = rig.volume("dest", SIZE).await;
-    let bitmap = rig.volume("bitmap", BITMAP).await;
+    let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
     let drive = rig.clone_drive(&dest, &bitmap, off(1, 1)).await;
     let mut expected = rig.bytes.clone();
     write(&drive, &mut expected, 3 * REGION + 512, vec![0x11; 4096]).await;
@@ -421,12 +429,12 @@ async fn a_drive_refuses_what_its_state_does_not_allow() {
         return;
     };
     let dest = rig.volume("dest", SIZE).await;
-    let bitmap = rig.volume("bitmap", BITMAP).await;
+    let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
     let big = rig.volume("big", 2 * SIZE).await;
-    let other = rig.volume("other", BITMAP).await;
+    let other = rig.volume("other", clone_bitmap_bytes(SIZE)).await;
     let dest2 = rig.volume("dest2", SIZE).await;
     let small = rig.volume("small", 512).await;
-    let taken = rig.volume("taken", BITMAP).await;
+    let taken = rig.volume("taken", clone_bitmap_bytes(SIZE)).await;
 
     // The source is smaller than the destination: the kernel refuses the
     // table and no device is left.
@@ -577,7 +585,7 @@ async fn a_drive_left_suspended_resumes_when_the_pool_is_opened_again() {
         return;
     };
     let dest = rig.volume("dest", SIZE).await;
-    let bitmap = rig.volume("bitmap", BITMAP).await;
+    let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
     let drive = rig.clone_drive(&dest, &bitmap, off(1, 1)).await;
     rig.disk.enable_hydration(&rig.name("drive")).await.unwrap();
     rig.hydrated(2).await;
@@ -635,7 +643,7 @@ async fn a_half_made_drive_is_removed_and_made_again() {
     };
     for loaded in [false, true] {
         let dest = rig.volume("dest", SIZE).await;
-        let bitmap = rig.volume("bitmap", BITMAP).await;
+        let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
         let device = rig.device(&rig.name("drive"));
         run("dmsetup", &["create", "--noudevsync", "--notable", &device]);
         if loaded {
@@ -669,7 +677,7 @@ async fn a_half_made_drive_is_removed_and_made_again() {
         }
         drop(bitmap);
         rig.disk.delete(&rig.name("bitmap")).await.unwrap();
-        let bitmap = rig.volume("bitmap", BITMAP).await;
+        let bitmap = rig.volume("bitmap", clone_bitmap_bytes(SIZE)).await;
         let drive = rig.clone_drive(&dest, &bitmap, off(4, 4)).await;
         let mut expected = rig.bytes.clone();
         write(&drive, &mut expected, REGION + 512, vec![0xC3; 4096]).await;
@@ -686,4 +694,158 @@ async fn a_half_made_drive_is_removed_and_made_again() {
         rig.disk.delete(&rig.name("dest")).await.unwrap();
     }
     assert_eq!(rig.disk_leftovers(), Vec::<String>::new());
+}
+
+/// [`FileSources`] behind a read-only loop device, as the block device a
+/// drive needs.
+struct LoopSources {
+    files: FileSources,
+    loops: Mutex<HashMap<(SandboxId, DiskRole), String>>,
+}
+
+impl LoopSources {
+    fn detach_all(&self) {
+        for (_, device) in self.loops.lock().unwrap().drain() {
+            let _ = Command::new("losetup").args(["-d", &device]).output();
+        }
+    }
+}
+
+#[async_trait]
+impl DiskSources for LoopSources {
+    async fn start(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        manifest: ManifestRef,
+        base: Option<(&Volume, ManifestRef)>,
+    ) -> std::io::Result<PathBuf> {
+        let file = self.files.start(sandbox, role, manifest, base).await?;
+        let device = run(
+            "losetup",
+            &["--read-only", "--show", "-f", file.to_str().unwrap()],
+        );
+        self.loops
+            .lock()
+            .unwrap()
+            .insert((sandbox, role), device.clone());
+        Ok(PathBuf::from(device))
+    }
+
+    async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+        self.files.ensure_alive(sandbox, role).await
+    }
+
+    async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+        if let Some(device) = self.loops.lock().unwrap().remove(&(sandbox, role)) {
+            run("losetup", &["-d", &device]);
+        }
+        self.files.stop(sandbox, role).await
+    }
+
+    async fn list(&self) -> std::io::Result<Vec<(SandboxId, DiskRole)>> {
+        self.files.list().await
+    }
+}
+
+/// Every device-mapper device of `sandbox`.
+fn sandbox_devices(sandbox: SandboxId) -> Vec<String> {
+    let id = sandbox.as_uuid().simple().to_string();
+    run("dmsetup", &["ls"])
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| name.contains(&id))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Removes what a failed test left of a sandbox: its devices, in passes
+/// because a drive holds its thins, then the loop devices.
+struct SandboxGuard(SandboxId, Arc<LoopSources>);
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        for _ in 0..4 {
+            for device in sandbox_devices(self.0) {
+                let _ = Command::new("dmsetup")
+                    .args(["remove", "--noudevsync", &device])
+                    .output();
+                let _ = std::fs::remove_file(Path::new(NODES).join(&device));
+            }
+        }
+        self.1.detach_all();
+    }
+}
+
+/// A lazy provision boots the role over a drive that reads the manifest
+/// from its source; a release removes the drive, stops the source and
+/// deletes every volume of the sandbox.
+#[tokio::test]
+#[ignore]
+async fn a_lazy_session_role_reads_its_manifest_and_releases_clean() {
+    let Ok(pool) = std::env::var("ENGRAM_TEST_THIN_POOL") else {
+        eprintln!("SKIP: ENGRAM_TEST_THIN_POOL is not set");
+        return;
+    };
+    let disk = ThinPoolDisk::open(&pool, CHUNK, Path::new(NODES))
+        .await
+        .expect("open pool");
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs"))));
+    let files = FileDisk::new(dir.path().join("files"), CHUNK).unwrap();
+    let bytes = pattern(SIZE as usize, 0x2545_F491);
+    let image_file = files
+        .create(&VolumeName::new("image").unwrap(), SIZE)
+        .await
+        .unwrap();
+    image_file.write_range(0, bytes.clone()).await.unwrap();
+    let snap = VolumeName::new("image-snap").unwrap();
+    let (_, manifest) = checkpoint(&files, &store, &image_file, &snap, None)
+        .await
+        .unwrap();
+    let image = ManifestRef::new();
+    store.put_manifest(image, &manifest).await.unwrap();
+
+    let sources = Arc::new(LoopSources {
+        files: FileSources::new(dir.path().join("sources"), store.clone()).unwrap(),
+        loops: Mutex::new(HashMap::new()),
+    });
+    let volumes = SessionVolumes::new(Arc::new(disk.clone()), store).with_sources(sources.clone());
+    let sandbox = SandboxId::new();
+    let _guard = SandboxGuard(sandbox, sources.clone());
+
+    let lazy = Source::LazyFork {
+        manifest: image,
+        base: None,
+    };
+    let provisioned = volumes.provision(sandbox, lazy, None).await.unwrap();
+    let drive = Volume::open(
+        VolumeName::new("probe").unwrap(),
+        &provisioned.root,
+        SIZE,
+        CHUNK,
+    )
+    .unwrap();
+    assert_eq!(first_difference(&whole(&drive).await, &bytes), None);
+    let state = disk
+        .clone_state(&live_name(sandbox, DiskRole::Root))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            state,
+            CloneState::Copying {
+                hydration_enabled: true,
+                ..
+            }
+        ),
+        "{state:?}"
+    );
+    drop(drive);
+
+    volumes.release(sandbox).await.unwrap();
+
+    assert_eq!(sources.list().await.unwrap(), Vec::new());
+    assert_eq!(sources.loops.lock().unwrap().len(), 0);
+    assert_eq!(sandbox_devices(sandbox), Vec::<String>::new());
 }

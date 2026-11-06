@@ -88,6 +88,19 @@ pub const CLONE_REGION_BYTES: u64 = 64 * 1024;
 /// here.
 pub const CLONE_HEADER_BYTES: u64 = 4096;
 
+/// The size of the bitmap volume for a drive of `volume_bytes`. The
+/// kernel stores one bit per region in 4 KiB metadata blocks and writes a
+/// commit to new blocks before it frees the old ones, so the bits count
+/// twice; 1 MiB holds the superblock, the space map and the tree nodes.
+/// It is at least 4 MiB and a whole number of MiB. A thin volume takes
+/// pool space only where the kernel writes, so the margin is free.
+pub fn clone_bitmap_bytes(volume_bytes: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    let bits = volume_bytes.div_ceil(CLONE_REGION_BYTES);
+    let bytes = 2 * bits.div_ceil(8) + MIB;
+    bytes.max(4 * MIB).div_ceil(MIB) * MIB
+}
+
 /// How a cloned drive copies the regions the guest has not written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hydration {
@@ -1068,6 +1081,15 @@ mod tests {
 
     fn name(s: &str) -> VolumeName {
         VolumeName::new(s).expect("valid name")
+    }
+
+    #[test]
+    fn a_bitmap_holds_two_bits_per_region_and_at_least_four_mib() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(clone_bitmap_bytes(4 * MIB), 4 * MIB);
+        assert_eq!(clone_bitmap_bytes(26 << 30), 4 * MIB);
+        // 2^24 regions: 2 MiB of bits, counted twice, and 1 MiB.
+        assert_eq!(clone_bitmap_bytes(1 << 40), 5 * MIB);
     }
 
     #[test]

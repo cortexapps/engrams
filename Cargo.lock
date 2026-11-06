@@ -2573,6 +2573,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "engram-chunk-store",
+ "engram-core",
  "engram-host-core",
  "engram-storage-local",
  "libc",

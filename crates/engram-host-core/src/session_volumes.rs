@@ -19,8 +19,8 @@
 //! tmp-sb-<sandbox>-<role>-view               a drive that reads that checkpoint
 //! ```
 //!
-//! This module recognizes and removes a cloned role but makes none: a
-//! checkpoint or a move of one is refused.
+//! A lazy provision makes a cloned role over a source from
+//! [`DiskSources`]; a checkpoint or a move of one is refused.
 //!
 //! A checkpoint volume is named after a manifest the chunk store holds,
 //! so the name is written last: a crash leaves a `tmp-` volume, never a
@@ -44,8 +44,9 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
 use uuid::Uuid;
 
-use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
+use crate::disk::{clone_bitmap_bytes, Capacity, Hydration, SessionDisk, Volume, VolumeName};
 use crate::disk_flows::{checkpoint_split, stage};
+use crate::disk_sources::DiskSources;
 use crate::image_volumes;
 
 const LIVE_PREFIX: &str = "sb-";
@@ -271,6 +272,10 @@ fn cloned_refused(sandbox: SandboxId, role: DiskRole, op: &str) -> io::Error {
 /// full before the sandbox starts; when `base` names an image staged on
 /// this host, that volume is the origin and only the difference is
 /// written. A manifest that is itself a staged image is snapshotted.
+///
+/// A lazy source makes the role a cloned drive instead: the sandbox
+/// starts at once, reads what is not yet local from a source that serves
+/// the manifest, and the drive copies the rest in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// A manifest many sandboxes share: the volume starts a new lineage
@@ -286,7 +291,24 @@ pub enum Source {
     },
     /// Zeros, in a new lineage.
     Empty { size_bytes: u64 },
+    /// [`Self::Fork`] over a cloned drive.
+    LazyFork {
+        manifest: ManifestRef,
+        base: Option<ManifestRef>,
+    },
+    /// [`Self::Continue`] over a cloned drive.
+    LazyContinue {
+        manifest: ManifestRef,
+        base: Option<ManifestRef>,
+    },
 }
+
+/// The kernel's default copy depth for a cloned drive.
+const LAZY_HYDRATION: Hydration = Hydration {
+    enabled: true,
+    threshold_regions: 1,
+    batch_regions: 1,
+};
 
 /// What `provision` made: the device paths a backend opens and the
 /// lineage each volume checkpoints under.
@@ -342,6 +364,8 @@ pub struct Report {
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
     store: ChunkStore,
+    /// `None` refuses a lazy source.
+    sources: Option<Arc<dyn DiskSources>>,
     /// Released sandboxes whose checkpoint volumes stay, oldest release
     /// first. A sandbox `reconcile` finds with no live volume joins at
     /// the front: its age is unknown, so it goes first.
@@ -353,8 +377,14 @@ impl SessionVolumes {
         Self {
             disk,
             store,
+            sources: None,
             kept: Mutex::new(VecDeque::new()),
         }
+    }
+
+    pub fn with_sources(mut self, sources: Arc<dyn DiskSources>) -> Self {
+        self.sources = Some(sources);
+        self
     }
 
     pub fn disk(&self) -> &dyn SessionDisk {
@@ -400,10 +430,11 @@ impl SessionVolumes {
         provisioned
     }
 
-    /// The checkpoint volume first, under the transient name until its
-    /// manifest is in the store; then the live volume as its snapshot.
-    /// A `Continue` of a checkpoint this host kept for the lineage skips
-    /// the stage; one of a newer manifest stages only the delta onto it.
+    /// Eager: the checkpoint volume first, under the transient name until
+    /// its manifest is in the store; then the live volume as its
+    /// snapshot. A `Continue` of a checkpoint this host kept for the
+    /// lineage skips the stage; one of a newer manifest stages only the
+    /// delta onto it. Lazy: a cloned drive, see [`Self::clone_role`].
     async fn provision_role(
         &self,
         sandbox: SandboxId,
@@ -412,26 +443,22 @@ impl SessionVolumes {
     ) -> io::Result<(PathBuf, ManifestRef)> {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
-        let (checkpoint, lineage) = match source {
+        Ok(match source {
             Source::Fork { manifest, base } => {
                 let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
                 match self.staged(manifest).await {
                     Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
                     None => self.stage_into(&tmp, &wanted, base).await?,
                 };
-                let lineage = ManifestRef::new();
-                self.store
-                    .put_manifest(lineage, &wanted)
-                    .await
-                    .map_err(store_err)?;
-                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
+                let lineage = self.new_lineage(&wanted).await?;
+                let checkpoint = self.commit(&tmp, sandbox, role, lineage).await?;
+                (self.live_over(&checkpoint, sandbox, role).await?, lineage)
             }
             Source::Continue { manifest, base } => {
-                match self.kept(sandbox, role, manifest).await? {
-                    Some((owner, volume, _, held)) if held == manifest => (
-                        self.adopt(owner, volume, sandbox, role, held).await?,
-                        manifest,
-                    ),
+                let checkpoint = match self.kept(sandbox, role, manifest).await? {
+                    Some((owner, volume, _, held)) if held == manifest => {
+                        self.adopt(owner, volume, sandbox, role, held).await?
+                    }
                     kept => {
                         let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
                         match kept {
@@ -449,29 +476,125 @@ impl SessionVolumes {
                             }
                             _ => self.stage_into(&tmp, &wanted, base).await?,
                         };
-                        (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
+                        self.commit(&tmp, sandbox, role, manifest).await?
                     }
-                }
+                };
+                (self.live_over(&checkpoint, sandbox, role).await?, manifest)
             }
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
-                let lineage = ManifestRef::new();
                 let manifest = Manifest {
                     chunk_size: ChunkSize::bytes(volume.chunk_size),
                     ..Manifest::empty(ManifestKind::Disk, size_bytes)
                 };
-                self.store
-                    .put_manifest(lineage, &manifest)
-                    .await
-                    .map_err(store_err)?;
-                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
+                let lineage = self.new_lineage(&manifest).await?;
+                let checkpoint = self.commit(&tmp, sandbox, role, lineage).await?;
+                (self.live_over(&checkpoint, sandbox, role).await?, lineage)
             }
-        };
+            Source::LazyFork { manifest, base } => {
+                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                let lineage = self.new_lineage(&wanted).await?;
+                let drive = self
+                    .clone_role(sandbox, role, manifest, &wanted, base, lineage)
+                    .await?;
+                (drive, lineage)
+            }
+            Source::LazyContinue { manifest, base } => {
+                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                let drive = self
+                    .clone_role(sandbox, role, manifest, &wanted, base, manifest)
+                    .await?;
+                (drive, manifest)
+            }
+        })
+    }
+
+    /// A new lineage that holds a copy of `manifest`.
+    async fn new_lineage(&self, manifest: &Manifest) -> io::Result<ManifestRef> {
+        let lineage = ManifestRef::new();
+        self.store
+            .put_manifest(lineage, manifest)
+            .await
+            .map_err(store_err)?;
+        Ok(lineage)
+    }
+
+    /// The live volume of a role, as a snapshot of its checkpoint.
+    async fn live_over(
+        &self,
+        checkpoint: &Volume,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<PathBuf> {
         let live = self
             .disk
-            .snapshot(&checkpoint, &live_name(sandbox, role))
+            .snapshot(checkpoint, &live_name(sandbox, role))
             .await?;
-        Ok((live.path, lineage))
+        Ok(live.path)
+    }
+
+    /// Make the role a cloned drive that reads `wanted` from a source
+    /// serving `served`, and return the drive's path. The destination is
+    /// a snapshot of the staged volume of `served` or of `base` when this
+    /// host has one, else a new volume; it is named after `lineage`. A
+    /// failure leaves the rest to the caller's purge.
+    async fn clone_role(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        served: ManifestRef,
+        wanted: &Manifest,
+        base: Option<ManifestRef>,
+        lineage: ManifestRef,
+    ) -> io::Result<PathBuf> {
+        let sources = self.sources.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("a lazy {role} disk needs disk sources, which this host does not have"),
+            )
+        })?;
+        let bitmap = self
+            .disk
+            .create(
+                &bitmap_name(sandbox, role),
+                clone_bitmap_bytes(wanted.total_bytes),
+            )
+            .await?;
+        let staged = match self.staged(served).await {
+            Some((volume, _)) => Some((volume, served)),
+            None => match base {
+                Some(image) => self.staged(image).await.map(|(volume, _)| (volume, image)),
+                None => None,
+            },
+        };
+        let name = dest_name(sandbox, role, lineage);
+        let dest = match &staged {
+            Some((origin, _)) if origin.size_bytes != wanted.total_bytes => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "staged volume {} is {} bytes; the {role} disk is {}",
+                        origin.name, origin.size_bytes, wanted.total_bytes
+                    ),
+                ))
+            }
+            Some((origin, _)) => self.disk.snapshot(origin, &name).await?,
+            None => self.disk.create(&name, wanted.total_bytes).await?,
+        };
+        let source = sources
+            .start(sandbox, role, served, staged.as_ref().map(|(v, m)| (v, *m)))
+            .await?;
+        let drive = self
+            .disk
+            .clone_drive(
+                &live_name(sandbox, role),
+                &dest,
+                &bitmap,
+                &source,
+                LAZY_HYDRATION,
+            )
+            .await?;
+        Ok(drive.path)
     }
 
     /// Give the staged transient volume its checkpoint name and delete
@@ -844,8 +967,8 @@ impl SessionVolumes {
             .filter_map(|name| parse(&name).map(|p| (name, p)))
             .filter(|(_, p)| p.sandbox == sandbox)
             .collect();
-        self.remove_drives(cloned_roles(parsed.iter().map(|(_, p)| p)), &mut report)
-            .await;
+        let roles = self.cloned_or_sourced(&parsed, |s| s == sandbox).await?;
+        self.take_down(roles, &mut report).await;
         for (name, _) in parsed {
             match self.disk.delete(&name).await {
                 Ok(()) => report.deleted.push(name),
@@ -920,13 +1043,10 @@ impl SessionVolumes {
                 *v = (*v).max(m.version);
             }
         }
-        let dead = cloned_roles(
-            parsed
-                .iter()
-                .map(|(_, p)| p)
-                .filter(|p| !live.contains(&p.sandbox)),
-        );
-        self.remove_drives(dead, &mut report).await;
+        let dead = self
+            .cloned_or_sourced(&parsed, |s| within(s) && !live.contains(&s))
+            .await?;
+        self.take_down(dead, &mut report).await;
         for (name, p) in parsed {
             let unwanted = match p.kind {
                 Kind::Live
@@ -951,24 +1071,70 @@ impl SessionVolumes {
         Ok(report)
     }
 
-    /// Remove the view and the drive of each cloned role. They hold the
-    /// role's destination, bitmap and checkpoint snapshots, so they go
-    /// before those volumes.
-    async fn remove_drives(&self, roles: Vec<(SandboxId, DiskRole)>, report: &mut Report) {
-        for (sandbox, role) in roles {
-            for name in [view_name(sandbox, role), live_name(sandbox, role)] {
-                match self.disk.remove_clone(&name).await {
-                    Ok(()) => report.deleted.push(name),
-                    // `InvalidInput`: the name is a volume, deleted as one.
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
-                        ) => {}
-                    Err(e) => report.failed.push((name, e)),
+    /// The cloned roles among `parsed` and the roles with a source, of
+    /// the sandboxes `select` picks.
+    async fn cloned_or_sourced(
+        &self,
+        parsed: &[(VolumeName, Parsed)],
+        select: impl Fn(SandboxId) -> bool,
+    ) -> io::Result<Vec<(SandboxId, DiskRole)>> {
+        let mut roles = cloned_roles(parsed.iter().map(|(_, p)| p).filter(|p| select(p.sandbox)));
+        if let Some(sources) = &self.sources {
+            for (sandbox, role) in sources.list().await? {
+                if select(sandbox) && !roles.contains(&(sandbox, role)) {
+                    roles.push((sandbox, role));
                 }
             }
         }
+        Ok(roles)
+    }
+
+    /// Take down each role's drives and source before its volumes go:
+    /// they hold the destination, bitmap and checkpoint snapshots. A
+    /// role whose step fails keeps the steps after it.
+    async fn take_down(&self, roles: Vec<(SandboxId, DiskRole)>, report: &mut Report) {
+        for (sandbox, role) in roles {
+            if let Err(failed) = self.take_down_role(sandbox, role, report).await {
+                report.failed.push(failed);
+            }
+        }
+    }
+
+    /// Recover the source, remove the view and the drive, stop the
+    /// source: no drive is removed over a dead source, and no source
+    /// stops under a drive.
+    async fn take_down_role(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        report: &mut Report,
+    ) -> Result<(), (VolumeName, io::Error)> {
+        let source_err = |e: io::Error| {
+            let what = format!("source of the {role} disk of sandbox {sandbox}: {e}");
+            (live_name(sandbox, role), io::Error::new(e.kind(), what))
+        };
+        if let Some(sources) = &self.sources {
+            match sources.ensure_alive(sandbox, role).await {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(source_err(e)),
+                _ => {}
+            }
+        }
+        for name in [view_name(sandbox, role), live_name(sandbox, role)] {
+            match self.disk.remove_clone(&name).await {
+                Ok(()) => report.deleted.push(name),
+                // `InvalidInput`: the name is a volume, deleted as one.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                    ) => {}
+                Err(e) => return Err((name, e)),
+            }
+        }
+        if let Some(sources) = &self.sources {
+            sources.stop(sandbox, role).await.map_err(source_err)?;
+        }
+        Ok(())
     }
 
     /// The released sandboxes whose kept checkpoints a resume may take.
@@ -1014,6 +1180,7 @@ mod tests {
     use super::*;
     use crate::disk::{ChunkIndex, CloneState, FileDisk, Hydration, CLONE_HEADER_BYTES};
     use crate::disk_flows::checkpoint;
+    use crate::disk_sources::FileSources;
     use crate::test_support::CountingBlob;
 
     const CHUNK: u64 = 4096;
@@ -1023,6 +1190,7 @@ mod tests {
         disk: Arc<dyn SessionDisk>,
         store: ChunkStore,
         volumes: SessionVolumes,
+        sources: Arc<FileSources>,
         blob: Arc<CountingBlob>,
     }
 
@@ -1047,10 +1215,13 @@ mod tests {
             dir.path().join("blobs"),
         )));
         let store = ChunkStore::new(blob.clone());
+        let sources =
+            Arc::new(FileSources::new(dir.path().join("sources"), store.clone()).unwrap());
         Rig {
-            volumes: SessionVolumes::new(disk.clone(), store.clone()),
+            volumes: SessionVolumes::new(disk.clone(), store.clone()).with_sources(sources.clone()),
             disk,
             store,
+            sources,
             blob,
             _dir: dir,
         }
@@ -2439,5 +2610,200 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    /// A manifest of the sandbox's own lineage with chunk `i` holding
+    /// `pattern[i]`, published over a fork of `image`.
+    async fn published(r: &Rig, image: ManifestRef, pattern: &[u8]) -> ManifestRef {
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(sandbox, fork(image), None)
+            .await
+            .unwrap();
+        for (i, byte) in pattern.iter().enumerate() {
+            write_byte(&p.root, i as u64, *byte).await;
+        }
+        let manifest = r.volumes.checkpoint(sandbox, DiskRole::Root).await.unwrap();
+        r.volumes.purge(sandbox).await.unwrap();
+        manifest
+    }
+
+    fn lazy_fork(image: ManifestRef) -> Source {
+        Source::LazyFork {
+            manifest: image,
+            base: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lazy_provision_reads_the_manifest_through_a_drive() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0]).await;
+        let forked = SandboxId::new();
+
+        let p = r
+            .volumes
+            .provision(forked, lazy_fork(image), None)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes_at(&p.root).await, vec![1, 2, 0]);
+        assert_ne!(p.root_manifest, image);
+        assert_eq!(
+            r.store.get_manifest(p.root_manifest).await.unwrap(),
+            r.store.get_manifest(image).await.unwrap()
+        );
+        assert_eq!(
+            r.volumes.path(forked, DiskRole::Root).await.unwrap(),
+            p.root
+        );
+        assert_eq!(
+            r.volumes
+                .checkpoint_of(forked, DiskRole::Root)
+                .await
+                .unwrap(),
+            p.root_manifest
+        );
+        assert_eq!(
+            r.sources.list().await.unwrap(),
+            vec![(forked, DiskRole::Root)]
+        );
+
+        let manifest = published(&r, image, &[1, 9, 0]).await;
+        let continued = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                continued,
+                Source::LazyContinue {
+                    manifest,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9, 0]);
+        assert_eq!(p.root_manifest, manifest);
+        assert!(names(&r).await.contains(
+            &dest_name(continued, DiskRole::Root, manifest)
+                .as_str()
+                .to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_lazy_provision_leaves_nothing_of_the_sandbox() {
+        let r = rig();
+        let image = staged_image(&r, &[1]).await;
+        let only_image = vec![image_volumes::volume_name(image).as_str().to_string()];
+        let sandbox = SandboxId::new();
+        // The swap drive's name is taken, so the swap fails after its
+        // source started.
+        r.disk
+            .create(&live_name(sandbox, DiskRole::Swap), CHUNK)
+            .await
+            .unwrap();
+
+        let err = r
+            .volumes
+            .provision(sandbox, lazy_fork(image), Some(lazy_fork(image)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(names(&r).await, only_image);
+        assert!(r.sources.list().await.unwrap().is_empty());
+        assert_eq!(
+            r.disk
+                .open_clone(&live_name(sandbox, DiskRole::Root))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let without = SessionVolumes::new(r.disk.clone(), r.store.clone());
+        let err = without
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert_eq!(names(&r).await, only_image);
+    }
+
+    /// [`FileSources`] that logs each recovery and stop, and whether the
+    /// role's drive still existed at the stop.
+    struct Watched {
+        inner: FileSources,
+        disk: Arc<dyn SessionDisk>,
+        log: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DiskSources for Watched {
+        async fn start(
+            &self,
+            sandbox: SandboxId,
+            role: DiskRole,
+            manifest: ManifestRef,
+            base: Option<(&Volume, ManifestRef)>,
+        ) -> io::Result<PathBuf> {
+            self.inner.start(sandbox, role, manifest, base).await
+        }
+        async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+            self.log.lock().unwrap().push(format!("alive {role}"));
+            self.inner.ensure_alive(sandbox, role).await
+        }
+        async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+            let drive = self
+                .disk
+                .open_clone(&live_name(sandbox, role))
+                .await
+                .is_ok();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("stop {role} drive={drive}"));
+            self.inner.stop(sandbox, role).await
+        }
+        async fn list(&self) -> io::Result<Vec<(SandboxId, DiskRole)>> {
+            self.inner.list().await
+        }
+    }
+
+    #[tokio::test]
+    async fn release_recovers_the_source_removes_the_drive_then_stops_the_source() {
+        let r = rig();
+        let image = staged_image(&r, &[1]).await;
+        let watched = Arc::new(Watched {
+            inner: FileSources::new(r._dir.path().join("watched"), r.store.clone()).unwrap(),
+            disk: r.disk.clone(),
+            log: Mutex::new(Vec::new()),
+        });
+        let volumes =
+            SessionVolumes::new(r.disk.clone(), r.store.clone()).with_sources(watched.clone());
+        let sandbox = SandboxId::new();
+        volumes
+            .provision(sandbox, lazy_fork(image), None)
+            .await
+            .unwrap();
+
+        volumes.release(sandbox).await.unwrap();
+
+        assert_eq!(
+            *watched.log.lock().unwrap(),
+            vec![
+                "alive root".to_string(),
+                "stop root drive=false".to_string()
+            ]
+        );
+        assert!(watched.inner.list().await.unwrap().is_empty());
+        assert_eq!(
+            names(&r).await,
+            vec![image_volumes::volume_name(image).as_str().to_string()]
+        );
+        assert!(volumes.released().is_empty());
     }
 }

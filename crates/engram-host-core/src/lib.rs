@@ -30,6 +30,7 @@ pub mod checkpoint;
 pub mod coord;
 pub mod disk;
 pub mod disk_flows;
+pub mod disk_sources;
 pub mod finalize;
 pub mod fs;
 pub mod image_volumes;
@@ -45,6 +46,7 @@ pub use disk::{
     VolumeName,
 };
 pub use disk_flows::{checkpoint, checkpoint_split, stage};
+pub use disk_sources::{DiskSources, FileSources};
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
 pub use session_volumes::SessionVolumes;
