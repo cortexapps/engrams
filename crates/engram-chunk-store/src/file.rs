@@ -18,6 +18,7 @@
 //! RAM.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::fs;
@@ -366,24 +367,15 @@ impl ChunkStore {
         // content that moved between offsets re-uploads nothing and,
         // crucially, never re-CREATEs a durable object (each re-CREATE
         // is a mutation that counts against the same ~1/s cap).
-        let claimed: parking_lot::Mutex<std::collections::HashSet<crate::manifest::ChunkHash>> =
-            parking_lot::Mutex::new(prev.chunks.iter().map(|c| c.hash).collect());
+        let claimed: Arc<
+            parking_lot::Mutex<std::collections::HashSet<crate::manifest::ChunkHash>>,
+        > = Arc::new(parking_lot::Mutex::new(
+            prev.chunks.iter().map(|c| c.hash).collect(),
+        ));
 
-        // ADR 0039 item #19: each dirty chunk is independent — its
-        // result depends only on its prev content (fetched by hash,
-        // order-free) and the diff bytes that fall inside it. Drive the
-        // per-chunk get_chunk + overlay + put_chunk concurrently with a
-        // bounded `buffer_unordered`, then fold the results into
-        // `by_offset` after the concurrent phase (so the manifest's
-        // chunk order stays deterministic regardless of completion
-        // order). Replaces the serial loop that cost ~16 ms/chunk and
-        // made evictions O(dirty set) in wall-clock — 1,936 chunks
-        // ≈ 32 s — instead of O(dirty set / concurrency).
-        //
-        // `put_chunk` is content-addressed/idempotent and the diff is
-        // read with per-task `seek+read` on a private file handle, so
-        // concurrent tasks never share mutable I/O state.
-        use futures::stream::{self, StreamExt, TryStreamExt};
+        // Each dirty chunk is independent: its result depends only on its
+        // previous content (by hash) and the diff bytes inside it. Every
+        // task reads the diff through its own file handle.
 
         // Snapshot each dirty chunk's prev hash before spawning so the
         // tasks don't borrow `by_offset`.
@@ -399,116 +391,136 @@ impl ChunkStore {
             })
             .collect();
 
-        let results: Vec<(u64, Option<ChunkRef>)> = stream::iter(work)
-            .map(|(offset, want, prev_hash)| {
-                let store = self.clone();
-                let diff_path = diff_path.to_path_buf();
-                let local_sink = local_sink.cloned();
-                let claimed = &claimed;
-                async move {
-                    let mut slice = vec![0u8; want];
+        // One task per dirty chunk, so reading, hashing and the PUT's TLS
+        // spread over every core; at most SPARSE_RECHUNK_CONCURRENCY run.
+        // Results fold into `by_offset` by offset below, so completion
+        // order does not matter.
+        let mut ranges = dirty_ranges.to_vec();
+        ranges.sort_unstable();
+        let ranges: Arc<[(u64, u64)]> = ranges.into();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut results: Vec<(u64, Option<ChunkRef>)> = Vec::with_capacity(work.len());
+        let joined = |done: std::result::Result<
+            Result<(u64, Option<ChunkRef>)>,
+            tokio::task::JoinError,
+        >| {
+            done.map_err(|e| crate::error::ChunkStoreError::Internal(format!("rechunk task: {e}")))?
+        };
+        for (offset, want, prev_hash) in work {
+            while tasks.len() >= SPARSE_RECHUNK_CONCURRENCY {
+                let done = tasks.join_next().await.expect("tasks is not empty");
+                results.push(joined(done)?);
+            }
+            let store = self.clone();
+            let diff_path = diff_path.to_path_buf();
+            let local_sink = local_sink.cloned();
+            let claimed = Arc::clone(&claimed);
+            let ranges = Arc::clone(&ranges);
+            tasks.spawn(async move {
+                let mut slice = vec![0u8; want];
 
-                    // Seed the chunk from its previous content (warm
-                    // cache) — or zeros if `prev` elided this offset
-                    // (all-zero chunk).
-                    match prev_hash {
-                        Some(prev_hash) => {
-                            let bytes = store.get_chunk(prev_hash).await?;
-                            let n = bytes.len().min(want);
-                            slice[..n].copy_from_slice(&bytes[..n]);
-                            // `slice` was zero-initialized, so a short
-                            // prev chunk already leaves the tail zeroed.
-                        }
-                        None => { /* already zeros */ }
+                // Seed the chunk from its previous content (warm
+                // cache) — or zeros if `prev` elided this offset
+                // (all-zero chunk).
+                match prev_hash {
+                    Some(prev_hash) => {
+                        let bytes = store.get_chunk(prev_hash).await?;
+                        let n = bytes.len().min(want);
+                        slice[..n].copy_from_slice(&bytes[..n]);
+                        // `slice` was zero-initialized, so a short
+                        // prev chunk already leaves the tail zeroed.
                     }
-
-                    // Overlay the diff's dirty bytes that fall in this
-                    // chunk. `dirty_ranges` are the diff's data extents,
-                    // so reads land on real bytes (never a hole). A
-                    // fresh handle per task keeps the seek+read state
-                    // private.
-                    let mut diff = fs::File::open(&diff_path).await.map_err(|e| {
-                        crate::error::ChunkStoreError::Internal(format!(
-                            "open diff {}: {e}",
-                            diff_path.display()
-                        ))
-                    })?;
-                    for &(off, len) in dirty_ranges {
-                        if len == 0 {
-                            continue;
-                        }
-                        let lo = off.max(offset);
-                        let hi = (off + len).min(offset + want as u64);
-                        if lo >= hi {
-                            continue;
-                        }
-                        diff.seek(std::io::SeekFrom::Start(lo)).await?;
-                        diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
-                            .await?;
-                    }
-
-                    if is_all_zero(&slice) {
-                        return Ok::<_, crate::error::ChunkStoreError>((offset, None));
-                    }
-                    let hash = match &local_sink {
-                        // Migration flavor: hash + land in the local
-                        // cache only; no GCS round-trip on the pause
-                        // path. NO per-write eviction sweep (the prod
-                        // canary's 12.6s capture leg was mostly sweep
-                        // readdirs) — the batch-closing sweep runs
-                        // below, once.
-                        Some(cache) => {
-                            let hash = crate::manifest::ChunkHash::of(&slice);
-                            cache.put_no_evict(hash, &slice).await?;
-                            hash
-                        }
-                        None => {
-                            let hash = crate::manifest::ChunkHash::of(&slice);
-                            if prev_hash == Some(hash) {
-                                // Rebuilt to identical content: already
-                                // durable — the parent manifest referencing
-                                // this hash published only after its chunks
-                                // did (ADR 0007), so both the dedup HEAD and
-                                // the PUT are pure waste. KVM dirty tracking
-                                // over-reports (a page rewritten with the
-                                // same bytes is still "dirty"), so this arm
-                                // is common, not exotic. (ADR 0101 A. The
-                                // migration flavor's cache-only chunks are
-                                // owned by its durability catch-up either
-                                // way — this skip doesn't change that.)
-                                metrics::counter!(
-                                    "engram_chunk_put_total",
-                                    "mode" => "sparse", "outcome" => "unchanged"
-                                )
-                                .increment(1);
-                            } else if !claimed.lock().insert(hash) {
-                                // A batch sibling already uploaded (or is
-                                // uploading) this exact content, or a prev
-                                // chunk at another offset already made it
-                                // durable. Either way the PUT would be a
-                                // duplicate mutation of a write-once object
-                                // — the 429 shape above.
-                                metrics::counter!(
-                                    "engram_chunk_put_total",
-                                    "mode" => "sparse", "outcome" => "deduped"
-                                )
-                                .increment(1);
-                            } else {
-                                // Content no prior chunk and no batch
-                                // sibling carries — new to this chain, so
-                                // the dedup HEAD would almost always miss:
-                                // unchecked PUT (ADR 0078 move 5).
-                                store.put_chunk_unchecked_prehashed(hash, &slice).await?;
-                            }
-                            hash
-                        }
-                    };
-                    Ok((offset, Some(ChunkRef { offset, hash })))
+                    None => { /* already zeros */ }
                 }
-            })
-            .buffer_unordered(SPARSE_RECHUNK_CONCURRENCY)
-            .try_collect()
-            .await?;
+
+                // Overlay the diff's dirty bytes that fall in this
+                // chunk. `dirty_ranges` are the diff's data extents,
+                // so reads land on real bytes (never a hole). A
+                // fresh handle per task keeps the seek+read state
+                // private.
+                let mut diff = fs::File::open(&diff_path).await.map_err(|e| {
+                    crate::error::ChunkStoreError::Internal(format!(
+                        "open diff {}: {e}",
+                        diff_path.display()
+                    ))
+                })?;
+                let first = ranges.partition_point(|&(off, len)| off + len <= offset);
+                for &(off, len) in &ranges[first..] {
+                    if off >= offset + want as u64 {
+                        break;
+                    }
+                    if len == 0 {
+                        continue;
+                    }
+                    let lo = off.max(offset);
+                    let hi = (off + len).min(offset + want as u64);
+                    diff.seek(std::io::SeekFrom::Start(lo)).await?;
+                    diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
+                        .await?;
+                }
+
+                if is_all_zero(&slice) {
+                    return Ok::<_, crate::error::ChunkStoreError>((offset, None));
+                }
+                let hash = match &local_sink {
+                    // Migration flavor: hash + land in the local
+                    // cache only; no GCS round-trip on the pause
+                    // path. NO per-write eviction sweep (the prod
+                    // canary's 12.6s capture leg was mostly sweep
+                    // readdirs) — the batch-closing sweep runs
+                    // below, once.
+                    Some(cache) => {
+                        let hash = crate::manifest::ChunkHash::of(&slice);
+                        cache.put_no_evict(hash, &slice).await?;
+                        hash
+                    }
+                    None => {
+                        let hash = crate::manifest::ChunkHash::of(&slice);
+                        if prev_hash == Some(hash) {
+                            // Rebuilt to identical content: already
+                            // durable — the parent manifest referencing
+                            // this hash published only after its chunks
+                            // did (ADR 0007), so both the dedup HEAD and
+                            // the PUT are pure waste. KVM dirty tracking
+                            // over-reports (a page rewritten with the
+                            // same bytes is still "dirty"), so this arm
+                            // is common, not exotic. (ADR 0101 A. The
+                            // migration flavor's cache-only chunks are
+                            // owned by its durability catch-up either
+                            // way — this skip doesn't change that.)
+                            metrics::counter!(
+                                "engram_chunk_put_total",
+                                "mode" => "sparse", "outcome" => "unchanged"
+                            )
+                            .increment(1);
+                        } else if !claimed.lock().insert(hash) {
+                            // A batch sibling already uploaded (or is
+                            // uploading) this exact content, or a prev
+                            // chunk at another offset already made it
+                            // durable. Either way the PUT would be a
+                            // duplicate mutation of a write-once object
+                            // — the 429 shape above.
+                            metrics::counter!(
+                                "engram_chunk_put_total",
+                                "mode" => "sparse", "outcome" => "deduped"
+                            )
+                            .increment(1);
+                        } else {
+                            // Content no prior chunk and no batch
+                            // sibling carries — new to this chain, so
+                            // the dedup HEAD would almost always miss:
+                            // unchecked PUT (ADR 0078 move 5).
+                            store.put_chunk_unchecked_prehashed(hash, &slice).await?;
+                        }
+                        hash
+                    }
+                };
+                Ok((offset, Some(ChunkRef { offset, hash })))
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            results.push(joined(done)?);
+        }
 
         // Fold the (order-independent) results into the carried-over
         // map: a `Some` replaces/inserts the chunk, a `None` (chunk
