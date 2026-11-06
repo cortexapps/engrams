@@ -3737,7 +3737,11 @@ impl SnapshotFinisher {
                 // its prev content (warm chunk cache) + the sparse diff —
                 // no full memfile to read, keep, or overlay.
                 let diff_path = dest.join("memory.diff");
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                // FC's Diff snapshot writes dirty pages at their
+                // guest-physical offsets into a sparse file, so its data
+                // extents are the dirty set.
+                let ranges = std::fs::File::open(&diff_path)
+                    .and_then(|f| engram_host_core::data_extents(&f))
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
                 // ADR 0101 B: the diff's dirty extent sum is the epoch's
                 // rate signal for the adaptive checkpoint controller.
