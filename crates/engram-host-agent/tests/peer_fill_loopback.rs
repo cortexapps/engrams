@@ -404,7 +404,10 @@ async fn peer_fetcher_answers_concurrent_requests_and_misses() {
         assert_eq!(answer.as_deref(), Some(body.as_slice()));
     }
 
-    assert!(fetcher.fetch(ChunkHash::of(b"never seeded")).await.is_none());
+    assert!(fetcher
+        .fetch(ChunkHash::of(b"never seeded"))
+        .await
+        .is_none());
     assert!(!health.is_lost(&addr), "a miss must not mark the peer lost");
 }
 
