@@ -24,7 +24,7 @@ export function makeMcpSessionCompiler(deps: {
     const candidate = compileBoundSessionCandidate(input, {
       launchPolicy: {
         profileId: context.profileId,
-        integrationGrants: context.profileGrants,
+        integrationGrants: parent ? live.profileGrants : context.profileGrants,
       },
       liveAuthority: live,
       requestedGrants: context.grants,

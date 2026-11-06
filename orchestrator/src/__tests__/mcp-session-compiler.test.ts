@@ -4,6 +4,7 @@ import { makeMcpSessionCompiler } from "../mcp/session-compiler.ts";
 import { makeMcpOperatorRuntime } from "../mcp/operator-runtime.ts";
 import { compileSessionBindings } from "../mcp/session-bindings.ts";
 import { restoreBindingSnapshot } from "../mcp/binding-store.ts";
+import { buildLaunchPolicy } from "../rpc/task-create.ts";
 import { bindingAuthority, operatorPublication } from "./mcp-binding-fixture.ts";
 
 const direct: IntegrationPolicyJson = {
@@ -14,9 +15,8 @@ const direct: IntegrationPolicyJson = {
   guest_services: [],
   tunnels: [],
 };
-function fixture() {
-  const live = bindingAuthority();
-  const parent = compileSessionBindings({
+function fixture(live = bindingAuthority()) {
+  let parent = compileSessionBindings({
     launchPolicy: { profileId: live.profileId, integrationGrants: live.profileGrants },
     liveAuthority: live,
     bindingEpoch: 7,
@@ -105,8 +105,90 @@ function fixture() {
       enabled = false;
     },
     reads: () => parentReads,
+    replaceParent: (snapshot: typeof parent) => {
+      parent = snapshot;
+    },
   };
 }
+
+test("child compilation uses the live source profile and the parent's frozen effective request", async () => {
+  const live = bindingAuthority();
+  live.profileGrants[0]!.mcp = {
+    ...live.profileGrants[0]!.mcp!,
+    unrestricted: false,
+    argumentConstraintDocuments: [{ type: "object", properties: { name: { maxLength: 10 } } }],
+  };
+  const f = fixture(live);
+  const root = await f.compile(f.input, {
+    profileId: f.live.profileId,
+    profileGrants: f.live.profileGrants,
+    grants: f.live.profileGrants,
+    directPolicy: direct,
+  });
+  const policy = buildLaunchPolicy(
+    {
+      id: f.live.profileId,
+      name: "Fixture",
+      description: "",
+      icon: "",
+      imageId: "image",
+      harness: "claude",
+      model: null,
+      effort: null,
+      programmaticOnly: false,
+      includeUserTokens: false,
+      envVars: {},
+      skills: [],
+      integrationGrants: f.live.profileGrants,
+      network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+      secrets: [],
+      repos: [],
+      apps: [],
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+      deletedAt: null,
+    },
+    root,
+  );
+  expect(policy.integrationGrants[0]!.mcp!.argumentConstraintDocuments).toHaveLength(2);
+  const parent = restoreBindingSnapshot(root.mcpBindingEnvelope!, root.integrationConnections!);
+  f.replaceParent(parent);
+  const inherited = {
+    ...f.context,
+    profileGrants: policy.integrationGrants,
+    grants: policy.integrationGrants,
+  };
+  const child = await f.compile(f.input, inherited);
+  const snapshot = restoreBindingSnapshot(child.mcpBindingEnvelope!, child.integrationConnections!);
+  expect(snapshot.ancestorAuthorityRefs[0]).toMatchObject({
+    sessionId: "parent",
+    bindingHash: parent.bindingHash,
+    bindingEpoch: 0,
+  });
+  expect(snapshot.immutableBindings[0]!.tools[0]!.grant).toMatchObject({
+    unrestricted: false,
+    automationWrite: false,
+    argumentConstraintDocuments: Array(5).fill(
+      f.live.profileGrants[0]!.mcp!.argumentConstraintDocuments[0],
+    ),
+  });
+  expect(f.reads()).toBe(1);
+  const empty = await f.compile(f.input, { ...inherited, grants: [] });
+  expect(
+    restoreBindingSnapshot(empty.mcpBindingEnvelope!, empty.integrationConnections!)
+      .immutableBindings,
+  ).toHaveLength(0);
+  f.staleParent();
+  await expect(f.compile(f.input, inherited)).rejects.toThrow("parent unavailable");
+  await expect(
+    f.compile(f.input, {
+      profileId: f.live.profileId,
+      profileGrants: policy.integrationGrants,
+      grants: policy.integrationGrants,
+      directPolicy: direct,
+    }),
+  ).rejects.toThrow("MCP profile changed during compilation");
+});
 
 test("actual child compiler freezes native tools and intersects the fresh parent authority", async () => {
   const f = fixture();
