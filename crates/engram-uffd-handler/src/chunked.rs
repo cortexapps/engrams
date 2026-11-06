@@ -223,6 +223,21 @@ impl From<engram_chunk_store::ChunkStoreError> for ChunkedBackendError {
     }
 }
 
+fn read_local_manifest(
+    path: &Path,
+    role: &str,
+) -> Result<engram_chunk_store::Manifest, ChunkedBackendError> {
+    let bytes = std::fs::read(path)?;
+    let m = engram_chunk_store::Manifest::decode(&bytes).map_err(|e| {
+        ChunkedBackendError::InvalidManifest(format!(
+            "parse local {role} manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+    m.validate()?;
+    Ok(m)
+}
+
 impl ChunkedMemoryBackend {
     /// Build from already-loaded canonical + session manifests, the
     /// read-only cache view, the populate channel to the writer, and
@@ -363,34 +378,11 @@ impl ChunkedMemoryBackend {
         // local file too — store-fetching it would 404 (the v+1 manifest
         // is deliberately unpublished until the catch-up).
         let canonical = match session_manifest_json {
-            Some(path) if canonical_ref == session_ref => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local canonical manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                m
-            }
+            Some(path) if canonical_ref == session_ref => read_local_manifest(path, "canonical")?,
             _ => store.get_manifest(canonical_ref).await?,
         };
         let session = match session_manifest_json {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local session manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                let _ = session_ref; // named by ref for logging only
-                m
-            }
+            Some(path) => read_local_manifest(path, "session")?,
             None => store.get_manifest(session_ref).await?,
         };
         // ADR 0075: the handler holds a READ-ONLY view of the shared
