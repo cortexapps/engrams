@@ -2,10 +2,9 @@
 //!
 //! Each host watches the heartbeat-ack's `enabled_images` set and warms each
 //! enabled image's **base-snapshot working set** (disk + memory chunks) onto
-//! local NVMe. Once those chunks are all reachable via `chunk_store.get_chunk()`
-//! (cache-tier hit), the image's `manifest_digest` is added to `ImageReadiness`
-//! — which the heartbeat builder reads on every tick to populate
-//! `Heartbeat.ready_images`. Coord's scheduler gates session placement on hosts
+//! local NVMe. Once those chunks are all in the local chunk cache, the image's
+//! `manifest_digest` is added to `ImageReadiness` — which the heartbeat builder
+//! reads on every tick to populate `Heartbeat.ready_images`. Coord's scheduler gates session placement on hosts
 //! that report the requested image's digest in their ready set; non-ready hosts
 //! surface as HTTP 503 `image_not_ready` to the API caller.
 //!
@@ -1101,7 +1100,9 @@ async fn prefetch_one(
         if let Some(dest) = base_memfile {
             if tokio::fs::metadata(&dest).await.is_err() {
                 chunk_store
-                    .materialize_to_file(&memory_manifest, &dest)
+                    .clone()
+                    .with_class(Class::Background)
+                    .materialize_to_file_from(&memory_manifest, &dest, fill)
                     .await
                     .map_err(|e| {
                         PrefetchError::MemfileMaterialize(format!("{}: {e}", dest.display()))

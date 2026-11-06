@@ -1732,7 +1732,7 @@ impl PooledBackend {
             let finish = post_copy_dest.then(|| crate::postcopy_finish::PostCopyFinish {
                 id: new_id,
                 inner: self.inner.clone(),
-                finisher: self.finisher(),
+                finisher: self.finisher_with_class(Class::Background),
                 source_manifest: metadata.memory_manifest,
                 migration_roles: self.migration_roles.clone(),
                 drained_dests: self.drained_dests.clone(),
@@ -2144,7 +2144,7 @@ impl PooledBackend {
     pub(crate) fn finisher(&self) -> SnapshotFinisher {
         SnapshotFinisher {
             volumes: self.volumes.clone(),
-            chunk_store: self.chunk_store.clone(),
+            chunks: self.fill.clone().map(crate::snapshot_post::Chunks::new),
             chunk_cache: self.chunk_cache.clone(),
             bundle_dir: self.bundle_dir.clone(),
             bundle_file_ext: self.bundle_file_ext(),
@@ -2162,12 +2162,12 @@ impl PooledBackend {
     }
 
     /// A finisher whose chunk transfers are admitted at `class`. The
-    /// periodic checkpoint and the cold-base seed take `Background` (no
-    /// session waits for them); eviction, drain and migration take
-    /// `Prefix` (a session waits for them).
+    /// periodic checkpoint, the cold-base seed and the post-copy chain
+    /// seed take `Background` (no session waits for them); eviction, drain
+    /// and migration take `Prefix` (a session waits for them).
     pub(crate) fn finisher_with_class(&self, class: Class) -> SnapshotFinisher {
         let mut f = self.finisher();
-        f.chunk_store = f.chunk_store.map(|cs| cs.with_class(class));
+        f.chunks = f.chunks.map(|c| c.with_class(class));
         f
     }
 
@@ -2231,7 +2231,7 @@ impl PooledBackend {
         let checkpoint_dir = self.checkpoint_dir.clone()?;
         Some(crate::eviction_finalize::EvictionFinalizer::new(
             self.volumes.clone(),
-            self.chunk_store.clone(),
+            self.fill.clone(),
             self.chunk_cache.clone(),
             self.bundle_dir.clone(),
             self.bundle_file_ext(),
@@ -3568,7 +3568,8 @@ impl PooledBackend {
     /// Write `<src>/memory.bin` from the `memory_manifest` in
     /// `<src>/manifest.json` when the file is absent (a cross-host File
     /// restore). Does nothing when there is no chunk store, no sidecar or
-    /// no memory manifest.
+    /// no memory manifest. The VM waits for the file, so its chunks are
+    /// read at `Demand`.
     async fn materialize_memory_if_missing(
         &self,
         src: &std::path::Path,
@@ -3577,9 +3578,10 @@ impl PooledBackend {
         if fs::metadata(&mem_path).await.is_ok() {
             return Ok(());
         }
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
+        let Some(fill) = self.fill.as_ref() else {
             return Ok(());
         };
+        let chunk_store = fill.store().clone().with_class(Class::Demand);
         let manifest_json = src.join("manifest.json");
         let Ok(bytes) = fs::read(&manifest_json).await else {
             return Ok(());
@@ -3610,7 +3612,7 @@ impl PooledBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("get_manifest {mref}: {e}")))?;
         chunk_store
-            .materialize_to_file(&manifest, &mem_path)
+            .materialize_to_file_from(&manifest, &mem_path, fill)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("materialize memory.bin: {e}")))?;
         tracing::info!(
@@ -3900,7 +3902,7 @@ impl DeferredSnapshot {
 #[derive(Clone)]
 pub(crate) struct SnapshotFinisher {
     volumes: Option<Arc<SessionVolumes>>,
-    chunk_store: Option<ChunkStore>,
+    chunks: Option<crate::snapshot_post::Chunks>,
     chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
     /// The backend's staged-bundle extension, so `publish` opens the
@@ -3933,7 +3935,7 @@ impl SnapshotFinisher {
     fn post_phase(&self) -> crate::snapshot_post::PostPhase<'_> {
         crate::snapshot_post::PostPhase {
             volumes: self.volumes.as_deref(),
-            chunk_store: self.chunk_store.as_ref(),
+            chunks: self.chunks.as_ref(),
             chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
@@ -4273,7 +4275,7 @@ impl SnapshotFinisher {
         id: SandboxId,
         src_ref: engram_core::types::manifest::ManifestRef,
     ) {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
+        let Some(chunk_store) = self.chunks.as_ref().map(|c| &c.store) else {
             return;
         };
         if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
@@ -4331,7 +4333,11 @@ impl SnapshotFinisher {
         source: engram_core::types::manifest::ManifestRef,
         sealed: &Path,
     ) -> Result<engram_core::types::manifest::ManifestRef, String> {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
+        let Some(crate::snapshot_post::Chunks {
+            store: chunk_store,
+            fill,
+        }) = self.chunks.as_ref()
+        else {
             return Err("no chunk store".into());
         };
         if self.checkpoint_dir.is_none() {
@@ -4350,7 +4356,7 @@ impl SnapshotFinisher {
             .await
             .map_err(|e| format!("source manifest {source}: {e}"))?;
         let manifest = chunk_store
-            .update_for_dirty_ranges_sparse(&prev, sealed, &ranges)
+            .update_for_dirty_ranges_sparse_from(&prev, sealed, &ranges, Arc::new(fill.clone()))
             .await
             .map_err(|e| format!("re-chunk sealed chunks: {e}"))?;
         let fork = engram_core::types::manifest::ManifestRef::new();
@@ -4376,7 +4382,7 @@ impl SnapshotFinisher {
     /// capture from the just-published one. ADR 0039 retired the rolling
     /// memfile, so this is the *only* seed. The manifest already describes
     /// the full image in the chunk store, so the next periodic checkpoint
-    /// takes the diff path (`update_for_dirty_ranges_sparse`) instead of a
+    /// takes the diff path (`update_for_dirty_ranges_sparse_from`) instead of a
     /// Full re-read of guest RAM — which under UFFD faults the entire
     /// working set in from the store (the 60 s `PUT /snapshot/create`
     /// hang).
@@ -4391,7 +4397,7 @@ impl SnapshotFinisher {
         id: SandboxId,
         memory_ref: engram_core::types::manifest::ManifestRef,
     ) {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
+        let Some(chunk_store) = self.chunks.as_ref().map(|c| &c.store) else {
             return;
         };
         if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
@@ -9591,7 +9597,9 @@ mod tests {
         assert!(matches!(manifest.kind, ManifestKind::Memory));
         assert_eq!(manifest.total_bytes, bytes.len() as u64);
         let recovered = tmp.path().join("recovered.bin");
-        cs.materialize_to_file(&manifest, &recovered).await.unwrap();
+        cs.materialize_to_file_from(&manifest, &recovered, &cs)
+            .await
+            .unwrap();
         let recovered_bytes = tokio::fs::read(&recovered).await.unwrap();
         assert_eq!(recovered_bytes, bytes, "memory bytes round-trip");
     }
@@ -11773,7 +11781,7 @@ mod tests {
         );
         assert!(pooled.has_checkpoint_stamp(id));
         let recovered = tmp.path().join("recovered.bin");
-        cs.materialize_to_file(&cs.get_manifest(fork).await.unwrap(), &recovered)
+        cs.materialize_to_file_from(&cs.get_manifest(fork).await.unwrap(), &recovered, &cs)
             .await
             .unwrap();
         let memory = std::fs::read(&recovered).unwrap();

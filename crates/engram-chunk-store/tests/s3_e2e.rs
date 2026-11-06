@@ -60,10 +60,10 @@ async fn chunk_a_64mib_file_through_s3_round_trips() {
     assert_eq!(manifest.chunks.len(), 4, "expected 4 × 16 MiB chunks");
     assert_eq!(manifest.total_bytes, data.len() as u64);
 
-    // materialize_to_file should round-trip byte-for-byte.
+    // A materialize should round-trip byte-for-byte.
     let dest = work.path().join("dest.bin");
     store
-        .materialize_to_file(&manifest, &dest)
+        .materialize_to_file_from(&manifest, &dest, &store)
         .await
         .expect("materialize");
     let got = fs::read(&dest).await.unwrap();

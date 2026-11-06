@@ -26,6 +26,7 @@ use engram_chunk_store::error::ChunkStoreError;
 use engram_chunk_store::manifest::{ChunkHash, ChunkRef, Manifest, ManifestKind, ManifestRef};
 use engram_chunk_store::resolver::{BlobStorageResolver, ChunkResolver};
 use engram_chunk_store::store::ChunkStore;
+use engram_chunk_store::{ChunkSource as _, Class};
 use engram_core::error::BlobError;
 use engram_core::traits::BlobStorage;
 use engram_storage_local::LocalBlobStorage;
@@ -119,7 +120,7 @@ async fn flush_put_failure_never_publishes_partial_manifest() {
     assert_eq!(got_ref.version, 1);
     assert_eq!(got, published);
     for cr in &got.chunks {
-        let bytes = clean_store.get_chunk(cr.hash).await.unwrap();
+        let bytes = clean_store.chunk(cr.hash, Class::Prefix).await.unwrap();
         assert_eq!(ChunkHash::of(&bytes), cr.hash, "referenced chunk resolves");
     }
 }
@@ -194,9 +195,12 @@ async fn missing_chunk_on_cold_read_errors_promptly() {
     let missing = cold_m.chunks[0].hash;
 
     // Bounded wait proves promptness (no hang).
-    let result = tokio::time::timeout(Duration::from_secs(5), faulted.get_chunk(missing))
-        .await
-        .expect("get_chunk must return promptly, never hang");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        faulted.chunk(missing, Class::Prefix),
+    )
+    .await
+    .expect("a chunk read must return promptly, never hang");
 
     match result {
         Err(ChunkStoreError::Blob(BlobError::NotFound)) => {}

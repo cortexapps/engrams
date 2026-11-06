@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use engram_chunk_store::cache::{ChunkCacheConfig, FillSource};
-use engram_chunk_store::{ChunkCache, ChunkStore, Class};
+use engram_chunk_store::{ChunkCache, ChunkSource as _, ChunkStore, Class};
 use engram_core::traits::BlobStorage;
 use engram_host_agent::substrate_server::SubstrateServer;
 use engram_storage_local::LocalBlobStorage;
@@ -98,7 +98,10 @@ async fn pinned_chunks_survive_populate_pressure() {
     let s2 = store.clone();
     cache
         .get_with_source(pinned_hash, Class::Demand, || async move {
-            Ok((s2.get_chunk(pinned_hash).await?, FillSource::BlobStorage))
+            Ok((
+                s2.chunk(pinned_hash, Class::Demand).await?,
+                FillSource::BlobStorage,
+            ))
         })
         .await
         .unwrap();
@@ -112,7 +115,10 @@ async fn pinned_chunks_survive_populate_pressure() {
         let store2 = store.clone();
         let _ = cache
             .get_with_source(h, Class::Demand, || async move {
-                Ok((store2.get_chunk(h).await?, FillSource::BlobStorage))
+                Ok((
+                    store2.chunk(h, Class::Demand).await?,
+                    FillSource::BlobStorage,
+                ))
             })
             .await;
     }

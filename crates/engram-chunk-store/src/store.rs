@@ -327,13 +327,13 @@ impl ChunkStore {
     /// `hash`: the cache verifies once before it stores a fetched chunk,
     /// and without a cache the resolver verifies.
     ///
-    /// This path has no hedge and no peer. A host reads through its fill
-    /// engine (`engram-fill`) instead; this is the path for a process
-    /// without one.
+    /// This path has no hedge and no peer. Callers outside this crate
+    /// read through a [`crate::ChunkSource`]: the fill engine on a host,
+    /// the store's own impl in a process without one.
     ///
     /// Never wrap this call in `ChunkCache::get` on the same cache:
     /// the cache's singleflight would wait on itself.
-    pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+    pub(crate) async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
         match &self.cache {
             Some(cache) => {
                 cache

@@ -631,7 +631,13 @@ async fn image_from_store(
     let image = tempfile::tempfile().unwrap();
     image.set_len(manifest.total_bytes).unwrap();
     for c in &manifest.chunks {
-        let bytes = chunk_store.get_chunk(c.hash).await.unwrap();
+        let bytes = engram_chunk_store::ChunkSource::chunk(
+            chunk_store,
+            c.hash,
+            engram_chunk_store::Class::Prefix,
+        )
+        .await
+        .unwrap();
         image.write_all_at(&bytes, c.offset).unwrap();
     }
     let fs = mkext4::reader::Fs::open(&image).unwrap();

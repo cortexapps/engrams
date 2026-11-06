@@ -14,16 +14,44 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
 use engram_core::types::snapshot::DiskRole;
 use engram_core::{SandboxError, SandboxId, SessionId, SnapshotId};
+use engram_fill::{Class, FillEngine};
 use engram_host_core::session_volumes::PendingCheckpoint;
 use engram_host_core::{HostFs, SessionVolumes};
 use tracing::Instrument as _;
 
 use crate::eviction_finalize::{DiffExtents, PendingDisk};
 
+/// A chunk store and the host's fill engine over it. Chunk writes go to
+/// the store at its class; chunk reads go through the engine at the same
+/// class.
+#[derive(Clone)]
+pub(crate) struct Chunks {
+    pub store: ChunkStore,
+    pub fill: FillEngine,
+}
+
+impl Chunks {
+    /// The engine's store, admitted at its default class.
+    pub(crate) fn new(fill: FillEngine) -> Self {
+        Self {
+            store: fill.store().clone(),
+            fill,
+        }
+    }
+
+    /// These chunks with transfers admitted at `class`.
+    pub(crate) fn with_class(self, class: Class) -> Self {
+        Self {
+            store: self.store.with_class(class),
+            fill: self.fill,
+        }
+    }
+}
+
 /// The stores the post phase writes to.
 pub(crate) struct PostPhase<'a> {
     pub volumes: Option<&'a SessionVolumes>,
-    pub chunk_store: Option<&'a ChunkStore>,
+    pub chunks: Option<&'a Chunks>,
     pub chunk_cache: Option<&'a ChunkCache>,
     pub bundle_dir: &'a Path,
     pub bundle_file_ext: &'static str,
@@ -147,8 +175,8 @@ impl PostPhase<'_> {
         let state_path = dest.join("state.bin");
         let sidecar_path = dest.join("manifest.json");
         let blob = self
-            .chunk_store
-            .map(|store| store.blob_storage())
+            .chunks
+            .map(|chunks| chunks.store.blob_storage())
             .filter(|_| blobs);
         if blob.is_some() {
             check_restore_files(&state_path, &sidecar_path).await?;
@@ -326,7 +354,11 @@ impl PostPhase<'_> {
         memory: Memory,
         source: &'static str,
     ) -> Result<Option<PublishedMemory>, SandboxError> {
-        let Some(chunk_store) = self.chunk_store else {
+        let Some(Chunks {
+            store: chunk_store,
+            fill,
+        }) = self.chunks
+        else {
             return Ok(None);
         };
         match memory {
@@ -360,7 +392,12 @@ impl PostPhase<'_> {
                 }
                 let dirty_bytes: u64 = ranges.iter().map(|(_, len)| *len).sum();
                 let next = chunk_store
-                    .update_for_dirty_ranges_sparse(&prev, &diff_path, &ranges)
+                    .update_for_dirty_ranges_sparse_from(
+                        &prev,
+                        &diff_path,
+                        &ranges,
+                        Arc::new(fill.clone()),
+                    )
                     .instrument(tracing::info_span!(
                         "finish.memory_rechunk",
                         dirty_bytes,

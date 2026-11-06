@@ -398,6 +398,8 @@ pub struct CosimHost {
     /// modeled process restart, exactly like the node's disk.
     root: TempDir,
     pub store: ChunkStore,
+    /// The fill engine over `store`, as on a real host.
+    fill: engram_fill::FillEngine,
     /// The REAL session-volume owner over a [`FileDisk`] in the tempdir.
     pub volumes: Arc<SessionVolumes>,
     fs_seam: Arc<dyn HostFs>,
@@ -451,16 +453,15 @@ impl CosimHost {
         // I/O never feeds a decision — see the swarm's I/O-audit verdict.
         let store = ChunkStore::new(blob.clone());
         let disk = FileDisk::new(root.path().join("volumes"), CHUNK_SIZE).expect("file disk");
-        let volumes = Arc::new(SessionVolumes::new(
-            Arc::new(disk),
-            engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
-        ));
+        let fill = engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default());
+        let volumes = Arc::new(SessionVolumes::new(Arc::new(disk), fill.clone()));
         Self {
             host_id,
             clock,
             entropy,
             root,
             store,
+            fill,
             volumes,
             fs_seam: Arc::new(TokioFs),
             view: Arc::new(HostView::default()),
@@ -1022,7 +1023,7 @@ impl CosimHost {
     fn finalizer(&self) -> EvictionFinalizer {
         EvictionFinalizer::new(
             Some(self.volumes.clone()),
-            Some(self.store.clone()),
+            Some(self.fill.clone()),
             None,
             self.bundle_dir(),
             BUNDLE_EXT,

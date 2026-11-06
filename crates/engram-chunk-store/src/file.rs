@@ -8,10 +8,9 @@
 //! (consumers treat absence as zero-fill), keeping sparse images
 //! cheap.
 //!
-//! `materialize_to_file()` is the inverse: take a stored manifest
-//! and reconstruct the original byte sequence on disk. Used by
-//! the macOS adapter (which needs a regular file to feed VZ) and
-//! by tests.
+//! `materialize_to_file_from()` is the inverse: take a stored manifest
+//! and reconstruct the original byte sequence on disk, reading each
+//! chunk from a [`ChunkSource`].
 //!
 //! Both stream (neither holds the whole image in RAM) and stop when
 //! dropped; a dropped `chunk_file` aborts the uploads it has in flight.
@@ -30,7 +29,7 @@ use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHE
 use crate::source::ChunkSource;
 use crate::store::ChunkStore;
 
-/// Dirty chunks the sparse re-chunk (`update_for_dirty_ranges_sparse`)
+/// Dirty chunks the sparse re-chunk (`update_for_dirty_ranges_sparse_from`)
 /// works on at once, each on its own task. Chunk PUTs are
 /// content-addressed and keyed by offset, so their order does not matter.
 /// The store's admission limits the PUTs on the wire; this bounds the
@@ -77,7 +76,7 @@ impl ChunkStore {
     ///
     /// **Skips all-zero blocks.** A 1 GiB sparse file with one
     /// non-zero 16 MiB region produces a manifest with ONE
-    /// `ChunkRef`. On `materialize_to_file()` the holes show up
+    /// `ChunkRef`. On `materialize_to_file_from()` the holes show up
     /// as actual filesystem holes (`SEEK_HOLE` works), so storage
     /// cost downstream is also sparse.
     ///
@@ -309,23 +308,6 @@ impl ChunkStore {
             .update_for_dirty_ranges_sparse_with_sink(prev, diff_path, dirty_ranges, None, source)
             .await?;
         Ok(manifest)
-    }
-
-    /// [`Self::update_for_dirty_ranges_sparse_from`] that reads through
-    /// this store, not a fill engine.
-    pub async fn update_for_dirty_ranges_sparse(
-        &self,
-        prev: &Manifest,
-        diff_path: &Path,
-        dirty_ranges: &[(u64, u64)],
-    ) -> Result<Manifest> {
-        self.update_for_dirty_ranges_sparse_from(
-            prev,
-            diff_path,
-            dirty_ranges,
-            Arc::new(self.clone()),
-        )
-        .await
     }
 
     /// ADR 0045 Phase C1: sink-parameterized flavor. `local_sink = Some(cache)`
@@ -653,23 +635,12 @@ impl ChunkStore {
         fs::rename(&temp, dest).await?;
         Ok(())
     }
-
-    /// [`Self::materialize_to_file_from`] that reads through this store,
-    /// not a fill engine.
-    pub async fn materialize_to_file(&self, manifest: &Manifest, dest: &Path) -> Result<()> {
-        self.materialize_to_file_from(manifest, dest, self).await
-    }
 }
 
-/// Sibling temp path used by `materialize_to_file*` for the
+/// Sibling temp path used by `materialize_to_file_from` for the
 /// write-then-rename atomicity guard. Includes a per-process
 /// random suffix so concurrent materializes against the same
 /// `dest` don't collide on the temp path.
-///
-/// (The outer `materialize_chunked_rootfs` in `pooled_backend`
-/// already serialises concurrent writers via a mutex, but
-/// `materialize_to_file*` is also called directly by tests and
-/// could be called by future code without that mutex.)
 fn temp_for(dest: &Path) -> std::path::PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -935,7 +906,7 @@ mod tests {
         let heads_before = counting.exists_count();
         let puts_before = counting.put_count();
         let next = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, 2 * cs)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(0, 2 * cs)], Arc::new(s.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -990,7 +961,7 @@ mod tests {
 
         let puts_before = counting.put_count();
         let next = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, 2 * cs)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(cs, 2 * cs)], Arc::new(s.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -1007,7 +978,7 @@ mod tests {
             .hash;
         assert_eq!(h1, h2, "both offsets reference the shared chunk");
         let out = dir.path().join("out.bin");
-        s.materialize_to_file(&next, &out).await.unwrap();
+        s.materialize_to_file_from(&next, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), data);
     }
 
@@ -1041,7 +1012,7 @@ mod tests {
 
         let puts_before = counting.put_count();
         let next = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, cs)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(cs, cs)], Arc::new(s.clone()))
             .await
             .unwrap();
         assert_eq!(
@@ -1055,7 +1026,7 @@ mod tests {
             "the moved chunk references the existing durable object",
         );
         let out = dir.path().join("out.bin");
-        s.materialize_to_file(&next, &out).await.unwrap();
+        s.materialize_to_file_from(&next, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), data);
     }
 
@@ -1107,7 +1078,9 @@ mod tests {
         assert_eq!(manifest.total_bytes, data.len() as u64);
 
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file(&manifest, &dest).await.unwrap();
+        s.materialize_to_file_from(&manifest, &dest, &s)
+            .await
+            .unwrap();
         let got = fs::read(&dest).await.unwrap();
         assert_eq!(got, data);
     }
@@ -1152,7 +1125,7 @@ mod tests {
             .await
             .unwrap();
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file(&m, &dest).await.unwrap();
+        s.materialize_to_file_from(&m, &dest, &s).await.unwrap();
         let got = fs::read(&dest).await.unwrap();
         assert_eq!(got.len(), data.len());
         assert_eq!(got, data);
@@ -1177,7 +1150,7 @@ mod tests {
         assert_eq!(m.chunks.len(), 1);
         assert_eq!(m.total_bytes, data.len() as u64);
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file(&m, &dest).await.unwrap();
+        s.materialize_to_file_from(&m, &dest, &s).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
     }
 
@@ -1236,7 +1209,7 @@ mod tests {
             .await
             .unwrap();
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file(&m, &dest).await.unwrap();
+        s.materialize_to_file_from(&m, &dest, &s).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
         // Cache should hold every chunk now.
         for entry in &m.chunks {
@@ -1245,23 +1218,16 @@ mod tests {
     }
 
     /// Atomicity invariant: a failed materialize must NOT leave a
-    /// file at `dest`. Specifically, a previous bug let
-    /// `materialize_to_file` (and _cached) zero-fill via
-    /// `set_len(total_bytes)` before the chunk loop ran; if the
-    /// chunk loop errored, the file was left at full size full of
-    /// zeros, fooling any downstream size-based fast-path check
-    /// (PooledBackend's "already materialized") into clone-ing a
-    /// poisoned rootfs to the guest. After the write-temp-then-
-    /// rename fix, an errored materialize leaves no `dest` at all
-    /// — only a `.partial-*` sibling.
+    /// file at `dest`, only a `.partial-*` sibling. A full-size file of
+    /// zeros at `dest` would pass a size-based "already materialized"
+    /// check and boot a poisoned image.
     #[tokio::test]
     async fn errored_materialize_leaves_no_dest_file() {
         let (s, _d) = store().await;
         let work = tempfile::tempdir().unwrap();
 
         // Reference a chunk hash that was never stored. The
-        // chunk loop's first iteration will hit `get_chunk` and
-        // surface NotFound.
+        // chunk loop's first read surfaces NotFound.
         let phantom = crate::manifest::ChunkHash::of(b"never-stored");
         let bad_manifest = Manifest {
             schema_version: 1,
@@ -1278,7 +1244,10 @@ mod tests {
         };
 
         let dest = work.path().join("rootfs.ext4");
-        assert!(s.materialize_to_file(&bad_manifest, &dest).await.is_err());
+        assert!(s
+            .materialize_to_file_from(&bad_manifest, &dest, &s)
+            .await
+            .is_err());
         assert!(
             !dest.exists(),
             "errored materialize must NOT leave the canonical file behind"
@@ -1357,7 +1326,12 @@ mod tests {
         )
         .await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, cs), (3 * cs, cs)])
+            .update_for_dirty_ranges_sparse_from(
+                &prev,
+                &diff,
+                &[(cs, cs), (3 * cs, cs)],
+                Arc::new(s.clone()),
+            )
             .await
             .unwrap();
 
@@ -1381,7 +1355,7 @@ mod tests {
         assert_eq!(hash_at(&got, 3 * cs), None, "zeroed chunk 3 elided");
 
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 
@@ -1438,7 +1412,7 @@ mod tests {
 
         // Durable flavor = ground truth.
         let durable = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &ranges)
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &ranges, Arc::new(s.clone()))
             .await
             .unwrap();
 
@@ -1507,13 +1481,13 @@ mod tests {
         )
         .await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, cs / 2)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(0, cs / 2)], Arc::new(s.clone()))
             .await
             .unwrap();
 
         assert_eq!(keys(&got), keys(&ground));
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 
@@ -1548,12 +1522,17 @@ mod tests {
         )
         .await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, cs / 2), (cs / 2, cs / 2)])
+            .update_for_dirty_ranges_sparse_from(
+                &prev,
+                &diff,
+                &[(0, cs / 2), (cs / 2, cs / 2)],
+                Arc::new(s.clone()),
+            )
             .await
             .unwrap();
 
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         let mut want = vec![0x11u8; half];
         want.extend(vec![0x22u8; half]);
         want.extend(vec![0xBBu8; cs as usize]);
@@ -1599,13 +1578,13 @@ mod tests {
         let diff = work.path().join("mem.diff");
         write_sparse_diff(&diff, prev.total_bytes, &[(100, vec![0x77u8; 100])]).await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(100, 100)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(100, 100)], Arc::new(s.clone()))
             .await
             .unwrap();
 
         assert_eq!(keys(&got), keys(&ground));
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 
@@ -1643,14 +1622,14 @@ mod tests {
         let diff = work.path().join("mem.diff");
         write_sparse_diff(&diff, 2 * cs + 13, &[(2 * cs, vec![0x99u8; 13])]).await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &[(2 * cs, 13)])
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &[(2 * cs, 13)], Arc::new(s.clone()))
             .await
             .unwrap();
 
         assert_eq!(got.total_bytes, total);
         assert_eq!(keys(&got), keys(&ground));
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 
@@ -1700,7 +1679,7 @@ mod tests {
         }
 
         let dest = work.path().join("dest.bin");
-        s.materialize_to_file(&m, &dest).await.unwrap();
+        s.materialize_to_file_from(&m, &dest, &s).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
     }
 
@@ -1875,7 +1854,7 @@ mod tests {
         let diff = work.path().join("mem.diff");
         write_sparse_diff(&diff, prev.total_bytes, &extents).await;
         let got = s
-            .update_for_dirty_ranges_sparse(&prev, &diff, &ranges)
+            .update_for_dirty_ranges_sparse_from(&prev, &diff, &ranges, Arc::new(s.clone()))
             .await
             .unwrap();
 
@@ -1895,7 +1874,7 @@ mod tests {
         assert_eq!(hash_at(&got, cs), hash_at(&prev, cs));
 
         let out = work.path().join("out.bin");
-        s.materialize_to_file(&got, &out).await.unwrap();
+        s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 }

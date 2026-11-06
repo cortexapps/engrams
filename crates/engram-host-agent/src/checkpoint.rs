@@ -46,10 +46,10 @@ pub struct CheckpointChain {
     /// chain's lifetime, `version` ticking on every checkpoint.
     pub manifest_ref: ManifestRef,
     /// Its full chunk list — the `prev` for the next incremental
-    /// re-chunk. Diffs re-chunk via `update_for_dirty_ranges_sparse`
-    /// (fetch the dirty set's prev chunks from the warm cache + apply
-    /// the sparse diff), so we never materialize guest RAM — or keep a
-    /// full local image — just to checkpoint.
+    /// re-chunk. Diffs re-chunk via `update_for_dirty_ranges_sparse_from`
+    /// (read the dirty set's prev chunks through the fill engine, then
+    /// apply the sparse diff), so we never materialize guest RAM — or keep
+    /// a full local image — just to checkpoint.
     pub manifest: engram_chunk_store::Manifest,
 }
 

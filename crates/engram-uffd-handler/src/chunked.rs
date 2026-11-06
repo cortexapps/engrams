@@ -508,7 +508,13 @@ impl ChunkedMemoryBackend {
             }
         }
         crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Fallback);
-        rt.block_on(self.store.get_chunk(hash)).map_err(Into::into)
+        // A guest waits on this fault.
+        rt.block_on(engram_chunk_store::ChunkSource::chunk(
+            &self.store,
+            hash,
+            engram_chunk_store::Class::Demand,
+        ))
+        .map_err(Into::into)
     }
 
     /// Chunk counts by how a fault would resolve them: canonical,

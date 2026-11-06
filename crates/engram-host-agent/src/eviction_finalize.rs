@@ -20,7 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_chunk_store::{ChunkCache, ChunkStore};
+use engram_chunk_store::ChunkCache;
 use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
@@ -222,7 +222,7 @@ pub trait EvictionSandbox: Send + Sync {
 #[derive(Clone)]
 pub struct EvictionFinalizer {
     pub(crate) volumes: Option<Arc<engram_host_core::SessionVolumes>>,
-    pub(crate) chunk_store: Option<ChunkStore>,
+    pub(crate) chunks: Option<crate::snapshot_post::Chunks>,
     pub(crate) chunk_cache: Option<ChunkCache>,
     pub(crate) bundle_dir: PathBuf,
     pub(crate) bundle_file_ext: &'static str,
@@ -240,7 +240,7 @@ impl EvictionFinalizer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         volumes: Option<Arc<engram_host_core::SessionVolumes>>,
-        chunk_store: Option<ChunkStore>,
+        fill: Option<engram_fill::FillEngine>,
         chunk_cache: Option<ChunkCache>,
         bundle_dir: PathBuf,
         bundle_file_ext: &'static str,
@@ -253,7 +253,7 @@ impl EvictionFinalizer {
     ) -> Self {
         Self {
             volumes,
-            chunk_store,
+            chunks: fill.map(crate::snapshot_post::Chunks::new),
             chunk_cache,
             bundle_dir,
             bundle_file_ext,
@@ -294,7 +294,7 @@ impl EvictionFinalizer {
     fn post_phase(&self) -> crate::snapshot_post::PostPhase<'_> {
         crate::snapshot_post::PostPhase {
             volumes: self.volumes.as_deref(),
-            chunk_store: self.chunk_store.as_ref(),
+            chunks: self.chunks.as_ref(),
             chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
@@ -652,13 +652,13 @@ mod tests {
         sandbox: SandboxId,
         blob: Arc<dyn engram_core::traits::BlobStorage>,
     ) -> (EvictionFinalizer, Arc<engram_host_core::SessionVolumes>) {
-        let store = ChunkStore::new(blob);
+        let fill = engram_fill::FillEngine::new(
+            engram_chunk_store::ChunkStore::new(blob),
+            engram_fill::Config::default(),
+        );
         let disk: Arc<dyn engram_host_core::SessionDisk> =
             Arc::new(engram_host_core::FileDisk::new(tmp.join("volumes"), 64 * 1024).unwrap());
-        let volumes = Arc::new(engram_host_core::SessionVolumes::new(
-            disk,
-            engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
-        ));
+        let volumes = Arc::new(engram_host_core::SessionVolumes::new(disk, fill.clone()));
         volumes
             .provision(
                 sandbox,
@@ -671,7 +671,7 @@ mod tests {
             .unwrap();
         let finalizer = EvictionFinalizer::new(
             Some(volumes.clone()),
-            Some(store),
+            Some(fill),
             None,
             tmp.join("bundles"),
             "bundle",
@@ -786,7 +786,7 @@ mod tests {
             sidecar["memory_manifest"],
             serde_json::to_value(memory).unwrap()
         );
-        let blob = finalizer.chunk_store.as_ref().unwrap().blob_storage();
+        let blob = finalizer.chunks.as_ref().unwrap().store.blob_storage();
         let state_key = engram_chunk_store::snapshot_blob::state_blob_key(record.snapshot_id);
         assert_eq!(&blob.get(&state_key).await.unwrap()[..], b"vmstate");
     }
@@ -1127,7 +1127,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sandbox = SandboxId::new();
         let (finalizer, _volumes) = finalizer_with_a_root(tmp.path(), sandbox).await;
-        let store = finalizer.chunk_store.clone().unwrap();
+        let store = finalizer.chunks.clone().unwrap().store;
         let prev_path = tmp.path().join("prev.bin");
         std::fs::write(
             &prev_path,
