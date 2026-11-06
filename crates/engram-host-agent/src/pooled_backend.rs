@@ -1507,11 +1507,11 @@ impl PooledBackend {
                 size_bytes: mib << 20,
             }),
         };
-        let root = self.restore_path(volumes, id, DiskRole::Root, root).await;
-        let swap = match swap {
-            Some(source) => Some(self.restore_path(volumes, id, DiskRole::Swap, source).await),
-            None => None,
-        };
+        let mut disks = vec![(DiskRole::Root, root)];
+        disks.extend(swap.map(|source| (DiskRole::Swap, source)));
+        let mut chosen = self.restore_paths(volumes, id, &disks).await.into_iter();
+        let root = chosen.next().expect("a source for each disk");
+        let swap = chosen.next();
         let lazy = [Some(root), swap]
             .into_iter()
             .flatten()
@@ -1535,65 +1535,91 @@ impl PooledBackend {
         Ok((disks, lazy))
     }
 
-    /// The source a role restores from: `source`, which is eager, or its
-    /// lazy counterpart (ADR 0127 Decision 1). `off` is always eager;
-    /// `force` is lazy for every role with a manifest; `auto` is lazy when
-    /// the estimate of the eager writes passes the budget, and eager when
-    /// the estimate cannot be read. A host without disk sources is eager.
-    /// `force` and `auto` record the estimate.
-    async fn restore_path(
+    /// The source each disk restores from: its eager source, or the lazy
+    /// counterpart (ADR 0127 Decision 1). `off` is always eager. `force` is
+    /// lazy for each disk whose eager provision would write. `auto` gives
+    /// the disks one budget ([`lazy_disks`]); a disk whose estimate cannot
+    /// be read is eager. A host without disk sources, and a disk of zeros,
+    /// is eager. `force` and `auto` record each estimate.
+    ///
+    /// [`lazy_disks`]: engram_host_core::eager_estimate::lazy_disks
+    async fn restore_paths(
         &self,
         volumes: &SessionVolumes,
         id: SandboxId,
-        role: DiskRole,
-        source: Source,
-    ) -> Source {
+        disks: &[(DiskRole, Source)],
+    ) -> Vec<Source> {
         use crate::config::LazyRestore;
-        if self.lazy_restore == LazyRestore::Off
-            || !volumes.has_sources()
-            || matches!(source, Source::Empty { .. })
-        {
-            return source;
+        let considered = |source: &Source| {
+            self.lazy_restore != LazyRestore::Off
+                && volumes.has_sources()
+                && !matches!(source, Source::Empty { .. })
+        };
+        let mut estimates = Vec::with_capacity(disks.len());
+        for (role, source) in disks {
+            if !considered(source) {
+                estimates.push(None);
+                continue;
+            }
+            estimates.push(match self.eager_estimate(volumes, id, *role, *source).await {
+                Ok(estimate) => Some(estimate),
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, %role, %error, "eager restore estimate failed");
+                    None
+                }
+            });
         }
-        let estimate = match self.eager_estimate(volumes, id, role, source).await {
-            Ok(estimate) => Some(estimate),
-            Err(error) => {
-                tracing::warn!(sandbox_id = %id, %role, %error, "eager restore estimate failed");
-                None
+        let lazy: Vec<bool> = match self.lazy_restore {
+            LazyRestore::Off => vec![false; disks.len()],
+            LazyRestore::Force => disks
+                .iter()
+                .zip(&estimates)
+                .map(|((_, source), e)| considered(source) && e.is_none_or(|e| e.writes()))
+                .collect(),
+            LazyRestore::Auto => {
+                let seconds: Vec<Option<f64>> =
+                    estimates.iter().map(|e| e.map(|e| e.seconds)).collect();
+                engram_host_core::eager_estimate::lazy_disks(&seconds, self.eager_budget.seconds)
             }
         };
-        let lazy = match self.lazy_restore {
-            LazyRestore::Force => true,
-            _ => estimate.is_some_and(|e| e.exceeds(self.eager_budget.seconds)),
-        };
-        let path = if lazy { "lazy" } else { "eager" };
         let span = tracing::Span::current();
-        let (path_field, estimate_field) = match role {
-            DiskRole::Root => ("root_path", "root_estimate_seconds"),
-            DiskRole::Swap => ("swap_path", "swap_estimate_seconds"),
-        };
-        span.record(path_field, path);
-        if let Some(e) = estimate {
-            span.record(estimate_field, e.seconds);
-            metrics::histogram!(crate::metrics::DISK_RESTORE_ESTIMATE_SECONDS, "role" => role.to_string())
-                .record(e.seconds);
-            tracing::info!(
-                sandbox_id = %id,
-                %role,
-                path,
-                estimate_seconds = e.seconds,
-                local_bytes = e.local_bytes,
-                remote_bytes = e.remote_bytes,
-                "disk restore path",
-            );
-        }
-        metrics::counter!(crate::metrics::DISK_RESTORE_TOTAL, "path" => path, "role" => role.to_string())
-            .increment(1);
-        if lazy {
-            source.into_lazy()
-        } else {
-            source
-        }
+        disks
+            .iter()
+            .zip(estimates)
+            .zip(lazy)
+            .map(|((&(role, source), estimate), lazy)| {
+                if !considered(&source) {
+                    return source;
+                }
+                let path = if lazy { "lazy" } else { "eager" };
+                let (path_field, estimate_field) = match role {
+                    DiskRole::Root => ("root_path", "root_estimate_seconds"),
+                    DiskRole::Swap => ("swap_path", "swap_estimate_seconds"),
+                };
+                span.record(path_field, path);
+                if let Some(e) = estimate {
+                    span.record(estimate_field, e.seconds);
+                    metrics::histogram!(crate::metrics::DISK_RESTORE_ESTIMATE_SECONDS, "role" => role.to_string())
+                        .record(e.seconds);
+                    tracing::info!(
+                        sandbox_id = %id,
+                        %role,
+                        path,
+                        estimate_seconds = e.seconds,
+                        local_bytes = e.local_bytes,
+                        remote_bytes = e.remote_bytes,
+                        "disk restore path",
+                    );
+                }
+                metrics::counter!(crate::metrics::DISK_RESTORE_TOTAL, "path" => path, "role" => role.to_string())
+                    .increment(1);
+                if lazy {
+                    source.into_lazy()
+                } else {
+                    source
+                }
+            })
+            .collect()
     }
 
     /// The time an eager provision of `source` writes before the guest
@@ -9272,8 +9298,9 @@ mod tests {
         volumes
     }
 
-    /// `off` restores eagerly, `force` over a source, and `auto` over a
-    /// source only when the estimate passes the budget.
+    /// `off` restores eagerly, `force` over a source when the eager path
+    /// would write, and `auto` over a source only when the estimate passes
+    /// the budget.
     #[tokio::test]
     async fn the_lazy_restore_mode_picks_the_path_of_each_disk() {
         use crate::config::{EagerBudget, LazyRestore};
@@ -9327,6 +9354,23 @@ mod tests {
             assert_eq!(&root[..root_block().len()], &root_block()[..]);
             volumes.purge(id).await.unwrap();
         }
+
+        // A checkpoint this host kept at exactly the manifest is adopted,
+        // which writes nothing, so `force` restores it eagerly.
+        let released = SandboxId::new();
+        let continued = Source::Continue {
+            manifest,
+            base: None,
+        };
+        volumes.provision(released, continued, None).await.unwrap();
+        volumes.release(released).await.unwrap();
+        let pooled = hydrating_backend(&volumes).with_lazy_restore(LazyRestore::Force, over(2.0));
+        let id = SandboxId::new();
+        let (_, lazy) = pooled
+            .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+            .await
+            .unwrap();
+        assert!(!lazy, "an adopted checkpoint restores eagerly under force");
     }
 
     fn hydrating_backend(volumes: &Arc<SessionVolumes>) -> PooledBackend {

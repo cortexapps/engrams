@@ -1,7 +1,8 @@
 //! How long an eager restore of a disk writes before the guest boots
-//! (ADR 0127 Decision 1). The estimate reads manifests only: the chunks
-//! the eager path writes, split by whether the host holds each one
-//! locally, at a rate for each kind.
+//! (ADR 0127 Decision 1), and which disks of a restore boot over a source
+//! instead. The estimate reads manifests only: the chunks the eager path
+//! writes, split by whether the host holds each one locally, at a rate
+//! for each kind.
 
 use engram_chunk_store::{ChunkHash, ChunkStoreError, Manifest};
 
@@ -23,10 +24,35 @@ pub struct Estimate {
 }
 
 impl Estimate {
-    /// The eager restore does not finish within `budget_seconds`.
-    pub fn exceeds(&self, budget_seconds: f64) -> bool {
-        self.seconds > budget_seconds
+    /// The eager restore writes at least one byte.
+    pub fn writes(&self) -> bool {
+        self.local_bytes + self.remote_bytes > 0
     }
+}
+
+/// Which disks of one restore boot over a source, from the estimate of
+/// each. An eager restore writes its disks one after the other, so the
+/// estimates share one budget: every disk is eager when their sum is
+/// within it; otherwise disks are lazy, largest estimate first, until the
+/// sum of the eager ones is within it. A disk with no estimate stays
+/// eager and counts as nothing.
+pub fn lazy_disks(estimates: &[Option<f64>], budget_seconds: f64) -> Vec<bool> {
+    let mut lazy = vec![false; estimates.len()];
+    let mut eager_seconds: f64 = estimates.iter().flatten().sum();
+    let mut largest_first: Vec<(usize, f64)> = estimates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.map(|seconds| (i, seconds)))
+        .collect();
+    largest_first.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (i, seconds) in largest_first {
+        if eager_seconds <= budget_seconds {
+            break;
+        }
+        lazy[i] = true;
+        eager_seconds -= seconds;
+    }
+    lazy
 }
 
 /// The estimate of writing `wanted` onto a volume that holds `base`, or
@@ -123,12 +149,34 @@ mod tests {
     }
 
     #[test]
-    fn an_estimate_equal_to_the_budget_stays_eager() {
-        let e = estimate(&manifest(2000, &[1, 2]), None, |_| false, RATES).unwrap();
-        assert!(!e.exceeds(2.0));
-        assert!(e.exceeds(1.999));
+    fn an_estimate_of_no_chunks_writes_nothing() {
         let nothing = estimate(&manifest(2000, &[]), None, |_| false, RATES).unwrap();
         assert_eq!(nothing.seconds, 0.0);
-        assert!(!nothing.exceeds(0.0));
+        assert!(!nothing.writes());
+        let base = manifest(2000, &[1, 2]);
+        let same = estimate(&base, Some(&base), |_| false, RATES).unwrap();
+        assert!(!same.writes());
+        assert!(estimate(&base, None, |_| false, RATES).unwrap().writes());
+    }
+
+    #[test]
+    fn disks_whose_sum_is_within_the_budget_stay_eager() {
+        assert_eq!(lazy_disks(&[Some(1.5), Some(0.5)], 2.0), vec![false, false]);
+        assert_eq!(lazy_disks(&[Some(2.0)], 2.0), vec![false]);
+        assert_eq!(lazy_disks(&[], 2.0), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn the_largest_disk_goes_lazy_first_until_the_rest_fits() {
+        assert_eq!(lazy_disks(&[Some(1.5), Some(1.0)], 2.0), vec![true, false]);
+        assert_eq!(lazy_disks(&[Some(1.0), Some(1.5)], 2.0), vec![false, true]);
+        assert_eq!(lazy_disks(&[Some(3.0), Some(2.5)], 2.0), vec![true, true]);
+        assert_eq!(lazy_disks(&[Some(0.0), Some(0.1)], 0.0), vec![false, true]);
+    }
+
+    #[test]
+    fn a_disk_with_no_estimate_stays_eager_and_counts_as_nothing() {
+        assert_eq!(lazy_disks(&[None, Some(1.0)], 2.0), vec![false, false]);
+        assert_eq!(lazy_disks(&[None, Some(3.0)], 2.0), vec![false, true]);
     }
 }
