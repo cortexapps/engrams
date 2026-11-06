@@ -42,12 +42,9 @@ pub enum ChunkStoreError {
     /// Local cache I/O failure (writes to NVMe, evictions).
     Cache(std::io::Error),
 
-    /// Origin-tier resolver failure. ADR 0008: when chunks live in
-    /// an OCI registry as Nydus-shaped layers, a Range GET against
-    /// the registry can fail (network, 404 on missing chunk, 416
-    /// on an out-of-bounds range, etc.). The string carries the
-    /// resolver-specific error message; the resolver type
-    /// (`OciChunkResolver`, future variants) chooses what to surface.
+    /// A chunk fetch failed for a reason other than a `BlobStorage`
+    /// error (for example, a fetch task that panicked). The string
+    /// carries the reason.
     Origin(String),
 
     /// Operation hit an internal invariant that shouldn't happen.

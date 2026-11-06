@@ -3331,15 +3331,9 @@ impl PooledBackend {
         self
     }
 
-    /// ADR 0008 Phase 5: attach an `OciClient` to enable the
-    /// chunks-in-OCI fault path. When set together with a chunk
-    /// store, `resolve_rootfs` upgrades chunked-OCI images
-    /// (`CachedImage::is_disk_chunked_oci()`) from BlobStorage-only
-    /// to a tiered `BlobStorage → OCI` fault path with
-    /// write-through fill to BlobStorage. Without this, chunked-OCI
-    /// images degrade to legacy behavior — chunks must live in the
-    /// host's BlobStorage namespace or session-create fails on
-    /// first chunk fault.
+    /// Attach the `OciClient` that `MaterializeImage` pulls with when
+    /// the request carries no registry credentials. Without it, that
+    /// pull is anonymous.
     pub fn with_oci_client(mut self, client: engram_oci::OciClient) -> Self {
         self.oci_client = Some(client);
         self

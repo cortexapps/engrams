@@ -2653,7 +2653,6 @@ name = "engram-host-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "base64 0.23.1",
  "bincode",
  "bytes",
@@ -2693,7 +2692,6 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
- "http",
  "jemalloc_pprof",
  "libc",
  "metrics",

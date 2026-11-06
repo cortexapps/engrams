@@ -9,8 +9,7 @@
 //!    references an un-uploaded chunk; a retry after the fault clears
 //!    converges.
 //! 2. **Truncated get** — a silently short-read chunk is caught by the
-//!    resolver's hash verification (never served as short bytes), and a
-//!    tiered resolver falls through to the next tier.
+//!    resolver's hash verification (never served as short bytes).
 //! 3. **Missing chunk on cold read** — a `NotFound` on a manifest-
 //!    referenced chunk surfaces a typed, retryable error promptly (no hang,
 //!    no panic).
@@ -25,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use engram_chunk_store::error::ChunkStoreError;
 use engram_chunk_store::manifest::{ChunkHash, ChunkRef, Manifest, ManifestKind, ManifestRef};
-use engram_chunk_store::resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
+use engram_chunk_store::resolver::{BlobStorageResolver, ChunkResolver};
 use engram_chunk_store::store::ChunkStore;
 use engram_core::error::BlobError;
 use engram_core::traits::BlobStorage;
@@ -125,7 +124,7 @@ async fn flush_put_failure_never_publishes_partial_manifest() {
     }
 }
 
-/// Property 2a: a silently truncated get (short read, no error) is caught by
+/// Property 2: a silently truncated get (short read, no error) is caught by
 /// the resolver's hash verification — it errors `HashMismatch` rather than
 /// serving short bytes.
 #[tokio::test]
@@ -155,40 +154,6 @@ async fn truncated_get_is_caught_by_resolver_hash_check() {
         other => panic!("expected HashMismatch on a short read, got {other:?}"),
     }
     assert_eq!(counters.gets_truncated(), 1);
-}
-
-/// Property 2b: a `TieredChunkResolver` whose primary tier returns a
-/// truncated (hash-mismatched) chunk falls through to the next tier and
-/// serves the correct bytes.
-#[tokio::test]
-async fn tiered_resolver_falls_through_past_truncated_tier() {
-    let dir = tempfile::tempdir().unwrap();
-    let backing: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-
-    let body = Bytes::from_static(b"correct bytes served by the fallback tier");
-    let hash = ChunkHash::of(&body);
-    backing
-        .put(&hash.storage_key(), body.clone())
-        .await
-        .unwrap();
-
-    // Tier 0 reads through a truncating wrapper over the SAME backing; tier 1
-    // reads it cleanly.
-    let plan = FaultPlan::new().with_get(GetFault {
-        key: KeyMatch::Exact(hash.storage_key()),
-        when: When::Always,
-        kind: GetFaultKind::TruncateCleanEof { after_bytes: 4 },
-    });
-    let (faulty, _c) = FaultyBlobStorage::arc(backing.clone(), plan);
-    let tier0: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(faulty));
-    let tier1: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(backing.clone()));
-
-    let tiered = TieredChunkResolver::new(vec![tier0, tier1], None);
-    let got = tiered
-        .fetch_chunk(hash)
-        .await
-        .expect("tiered resolver must fall through the truncated tier");
-    assert_eq!(got, body, "fallback tier served the correct, full chunk");
 }
 
 /// Property 3: a `NotFound` on a manifest-referenced chunk during a cold

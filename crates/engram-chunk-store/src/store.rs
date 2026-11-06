@@ -18,20 +18,15 @@
 //! chunks. (The local NVMe cache has its own free-floor eviction —
 //! see `cache::ChunkCache`.)
 //!
-//! The local NVMe cache (`cache::ChunkCache`) is consumed by adapters,
-//! and — when wired in via [`ChunkStore::with_chunk_cache`] — is also a
-//! **write-through** tier for `put_chunk`: a chunk written durably to
-//! `BlobStorage` is additionally populated into the local cache, so the
-//! host that *produced* it reads it back locally (μs) instead of
-//! re-fetching from the blob store (~110 ms) on the next resume. This is
-//! symmetric with the read side (`TieredChunkResolver`'s populate-on-miss)
-//! and closes the asymmetry that made idle-eviction capture ship the
-//! divergent memory chunks to GCS while discarding the local copy the host
-//! already had (so every resume re-paged its working set from GCS). GETs go
-//! through the configured `ChunkResolver` (ADR 0008); the default resolver
-//! wraps `BlobStorage` directly, and for chunked-OCI images the host-agent
-//! installs a `TieredChunkResolver` (`BlobStorage → OCI`) via
-//! [`ChunkStore::with_resolver`].
+//! The local NVMe cache (`cache::ChunkCache`), when wired in via
+//! [`ChunkStore::with_chunk_cache`], is the tier every read checks first
+//! and a **write-through** tier for `put_chunk`: a chunk written durably to
+//! `BlobStorage` is also populated into the local cache, so the host that
+//! *produced* it reads it back locally (μs) instead of re-fetching it from
+//! the blob store (~110 ms) on the next resume. A read the cache misses
+//! goes through the configured `ChunkResolver`, which by default reads
+//! `BlobStorage` directly. On a host, the fill engine (`engram-fill`)
+//! admits and schedules those reads.
 
 use std::sync::Arc;
 
@@ -51,9 +46,9 @@ pub struct ChunkStore {
     /// Durable write target for chunks, manifests, and traces —
     /// `BlobStorage`. Always written (the durability tier).
     inner: Arc<dyn BlobStorage>,
-    /// Read path for chunks. Defaults to a `BlobStorageResolver`
-    /// over `inner`; production may swap in a tiered resolver
-    /// (see ADR 0008 Phase 2 — `TieredChunkResolver`).
+    /// Read path for chunks the cache does not hold. A
+    /// `BlobStorageResolver` over `inner` unless replaced with
+    /// [`Self::with_resolver`].
     resolver: Arc<dyn ChunkResolver>,
     /// The local tier. When set (host-agent), `get_chunk` reads it
     /// before the resolver and a miss or a `put_chunk` populates it.
@@ -78,8 +73,7 @@ impl ChunkStore {
     /// `--mode=all` use `engram-storage-local::LocalBlobStorage`.
     ///
     /// Chunk reads default to `BlobStorageResolver` over the same
-    /// blob; use [`Self::with_resolver`] to swap in a tiered
-    /// resolver for ADR 0008's OCI-fallback path.
+    /// blob.
     pub fn new(blob: Arc<dyn BlobStorage>) -> Self {
         let resolver: Arc<dyn ChunkResolver> = Arc::new(BlobStorageResolver::new(blob.clone()));
         Self {
@@ -121,11 +115,9 @@ impl ChunkStore {
         self
     }
 
-    /// Replace the chunk-fetch resolver. The host-agent installs a
-    /// `TieredChunkResolver` here for chunked-OCI images — it falls
-    /// through `BlobStorage → OCI` with opportunistic write-through fill
-    /// on miss. The global host `ChunkStore` keeps the default
-    /// `BlobStorageResolver` (pre-ADR-0008 behavior).
+    /// Replace the chunk-fetch resolver. Production keeps the default
+    /// `BlobStorageResolver`; tests install a resolver that counts or
+    /// delays reads.
     pub fn with_resolver(mut self, resolver: Arc<dyn ChunkResolver>) -> Self {
         self.resolver = resolver;
         self
@@ -373,10 +365,9 @@ impl ChunkStore {
             .await
     }
 
-    /// Existence check for a chunk. Routed through the resolver,
-    /// so "exists" means "reachable through any tier" in the
-    /// tiered world. With the default `BlobStorageResolver` this
-    /// is equivalent to a `BlobStorage::exists` call.
+    /// Existence check for a chunk, routed through the resolver.
+    /// With the default `BlobStorageResolver` this is a
+    /// `BlobStorage::exists` call.
     pub async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
         self.resolver.chunk_exists(hash).await
     }
@@ -730,7 +721,7 @@ mod tests {
         assert!(s.get_trace(r).await.unwrap().is_none());
     }
 
-    // ---- ADR 0008 Phase 1: ChunkResolver indirection ----
+    // ---- ChunkResolver indirection ----
 
     /// `with_resolver` swaps the chunk-fetch path. A custom resolver
     /// that returns a sentinel ChunkHash for any request lets us

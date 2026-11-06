@@ -513,17 +513,9 @@ fn resolve_free_floor_pct(root: &Path) -> f64 {
 ///
 /// The cache is **backend-agnostic**: it does not own a
 /// `ChunkStore` reference. Every `get` call takes an async
-/// fetcher closure that runs on local-NVMe miss. Callers pick
-/// the right backend per call — `ChunkStore::get_chunk`, a
-/// `TieredChunkResolver`, a direct `BlobStorage::get`, whatever
-/// makes sense at the call site.
-///
-/// This decoupling was lifted out of the pre-ADR-0008 shape,
-/// where `ChunkCache` pinned a `ChunkStore` at construction.
-/// That made the cache silently incompatible with per-session
-/// upgrades (the chunked-OCI tiered resolver) — the caller's
-/// upgraded store was passed in but ignored. Closure-based
-/// fetcher eliminates the whole class of bug.
+/// fetcher closure that runs on local-NVMe miss, so the caller
+/// chooses the source (on a host, the fill engine's object-store
+/// fetch).
 #[derive(Clone)]
 pub struct ChunkCache {
     inner: Arc<CacheInner>,
@@ -897,10 +889,8 @@ impl ChunkCache {
     ///
     /// # Why a closure rather than a stored `ChunkStore`
     ///
-    /// Each call site picks its own backend. `materialize_*`
-    /// against a per-session tiered resolver and the UFFD
-    /// handler against the global store can coexist behind the
-    /// same cache without any rebind dance.
+    /// Each call site picks its own source, so callers with
+    /// different stores share one cache without rebinding it.
     pub async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,

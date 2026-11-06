@@ -25,17 +25,15 @@
 //! roll. The base-snapshot chunks live in the GCS chunk store (flushed at
 //! enable), so this path is GCS-backed, not registry-backed.
 //!
-//! Storage tier model (for the per-chunk `get_chunk` walk on the supervisor's
-//! `ChunkStore`, which uses the default `BlobStorageResolver`):
+//! Storage tier model:
 //!   - Tier 1: local NVMe `ChunkCache` (canonical "ready" inventory; a hit
 //!     here = chunk is local + counts toward readiness).
-//!   - Tier 2: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
-//!     snapshot's chunks are flushed at enable. This is the hot tier here.
+//!   - Tier 2: a peer host that holds the chunks (a best-effort pre-pass).
+//!   - Tier 3: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
+//!     snapshot's chunks are flushed at enable.
 //!
-//! (The OCI-fallback `TieredChunkResolver` is installed only on the
-//! host-agent's per-restore chunked-OCI store, not on this supervisor's
-//! store.) `chunk_store.get_chunk(hash)` resolves NVMe → BlobStorage, so the
-//! prefetch driver is just an eager loop over the base snapshot's chunk hashes.
+//! The prefetch driver fills the base snapshot's chunk hashes through the
+//! host's `FillEngine` at `Class::Background`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
