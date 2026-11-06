@@ -29,6 +29,12 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 2400.0, 3600.0, 7200.0,
     ];
 
+    // Restore estimates and provision times sit around the eager budget
+    // (seconds) and reach minutes for a full disk.
+    let restore_buckets = &[
+        0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+    ];
+
     let mut builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -59,6 +65,17 @@ pub fn init(addr: SocketAddr) {
     let probe_buckets = &[
         0.0002, 0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0, 5.0,
     ];
+    for name in [
+        DISK_RESTORE_ESTIMATE_SECONDS,
+        DISK_RESTORE_PROVISION_SECONDS,
+    ] {
+        builder = builder
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(name.to_string()),
+                restore_buckets,
+            )
+            .expect("install restore histogram buckets");
+    }
     builder = builder
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(TOKIO_SCHED_DELAY_SECONDS.to_string()),
@@ -477,6 +494,17 @@ pub const DISK_HYDRATION_SECONDS: &str = "engram_disk_hydration_seconds";
 /// `done`, `checkpoint_in_flight` (waits for the publish), `copying`
 /// (regions left), `error` (tried again on the next tick).
 pub const DISK_CUTOVERS_TOTAL: &str = "engram_disk_cutovers_total";
+
+/// Counter (ADR 0127 Decision 1). Disk restores by `path` (`eager`,
+/// `lazy`) and `role` (`root`, `swap`), while the lazy-restore mode is
+/// `force` or `auto`.
+pub const DISK_RESTORE_TOTAL: &str = "engram_disk_restore_total";
+/// Histogram (ADR 0127 Decision 1). The estimate, in seconds, of an eager
+/// restore's writes for one disk, by `role`.
+pub const DISK_RESTORE_ESTIMATE_SECONDS: &str = "engram_disk_restore_estimate_seconds";
+/// Histogram. Seconds a restore spends provisioning its disks, by `path`:
+/// `lazy` when any disk boots over a source, else `eager`.
+pub const DISK_RESTORE_PROVISION_SECONDS: &str = "engram_disk_restore_provision_seconds";
 
 /// Histogram (ADR 0116 C1). Observed-minus-expected delay of a 100 ms
 /// heartbeat tick on the host-agent's main tokio runtime — the

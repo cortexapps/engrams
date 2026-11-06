@@ -31,6 +31,7 @@ pub mod coord;
 pub mod disk;
 pub mod disk_flows;
 pub mod disk_sources;
+pub mod eager_estimate;
 pub mod finalize;
 pub mod fs;
 pub mod image_volumes;

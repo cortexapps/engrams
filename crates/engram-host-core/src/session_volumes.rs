@@ -387,6 +387,40 @@ pub enum Source {
     },
 }
 
+impl Source {
+    /// The lazy counterpart: a fork or a continue over a cloned drive.
+    /// Zeros stay zeros.
+    pub fn into_lazy(self) -> Self {
+        match self {
+            Self::Fork { manifest, base } => Self::LazyFork { manifest, base },
+            Self::Continue { manifest, base } => Self::LazyContinue { manifest, base },
+            other => other,
+        }
+    }
+}
+
+/// The writes of an eager provision: `wanted`, as its difference from
+/// `base` when the provision starts from a volume that holds it.
+#[derive(Clone, Debug)]
+pub struct EagerPlan {
+    pub wanted: Manifest,
+    pub base: Option<Manifest>,
+}
+
+/// Where an eager provision starts.
+enum Origin {
+    /// The staged image volume that holds `wanted`, to snapshot.
+    Staged { volume: Volume, wanted: Manifest },
+    /// The checkpoint `owner` kept at the manifest, to adopt.
+    Kept { owner: SandboxId, volume: Volume },
+    /// `wanted` staged into a new volume, onto `base` (a volume and the
+    /// manifest it holds) when there is one.
+    Stage {
+        wanted: Manifest,
+        base: Option<(Volume, Manifest)>,
+    },
+}
+
 /// The kernel's default copy depth for a cloned drive.
 const LAZY_HYDRATION: Hydration = Hydration {
     enabled: true,
@@ -591,42 +625,33 @@ impl SessionVolumes {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
         Ok(match source {
-            Source::Fork { manifest, base } => {
-                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
-                match self.staged(manifest).await {
-                    Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
-                    None => self.stage_into(&tmp, &wanted, base).await?,
+            Source::Fork { manifest, base } | Source::Continue { manifest, base } => {
+                let continues = matches!(source, Source::Continue { .. });
+                let wanted = match self
+                    .eager_origin(sandbox, role, manifest, base, continues)
+                    .await?
+                {
+                    Origin::Kept { owner, volume } => {
+                        let checkpoint = self.adopt(owner, volume, sandbox, role, manifest).await?;
+                        return Ok((self.live_over(&checkpoint, sandbox, role).await?, manifest));
+                    }
+                    Origin::Staged { volume, wanted } => {
+                        self.disk.snapshot(&volume, &tmp).await?;
+                        wanted
+                    }
+                    Origin::Stage { wanted, base } => {
+                        let base = base.as_ref().map(|(volume, held)| (volume, held));
+                        stage(self.disk.as_ref(), &self.store, &tmp, &wanted, base).await?;
+                        wanted
+                    }
                 };
-                let lineage = self.new_lineage(&wanted).await?;
+                let lineage = if continues {
+                    manifest
+                } else {
+                    self.new_lineage(&wanted).await?
+                };
                 let checkpoint = self.commit(&tmp, sandbox, role, lineage).await?;
                 (self.live_over(&checkpoint, sandbox, role).await?, lineage)
-            }
-            Source::Continue { manifest, base } => {
-                let checkpoint = match self.kept(sandbox, role, manifest).await? {
-                    Some((owner, volume, _, held)) if held == manifest => {
-                        self.adopt(owner, volume, sandbox, role, held).await?
-                    }
-                    kept => {
-                        let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
-                        match kept {
-                            Some((_, volume, held_manifest, _))
-                                if volume.size_bytes == wanted.total_bytes =>
-                            {
-                                stage(
-                                    self.disk.as_ref(),
-                                    &self.store,
-                                    &tmp,
-                                    &wanted,
-                                    Some((&volume, &held_manifest)),
-                                )
-                                .await?
-                            }
-                            _ => self.stage_into(&tmp, &wanted, base).await?,
-                        };
-                        self.commit(&tmp, sandbox, role, manifest).await?
-                    }
-                };
-                (self.live_over(&checkpoint, sandbox, role).await?, manifest)
             }
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
@@ -654,6 +679,84 @@ impl SessionVolumes {
                 (drive, manifest)
             }
         })
+    }
+
+    /// Where an eager provision of `manifest` starts. A fork snapshots the
+    /// staged image of the manifest when this host has it; a continue
+    /// adopts the checkpoint this host kept at the manifest, or stages the
+    /// difference onto a kept checkpoint of the lineage. Otherwise the
+    /// manifest is staged onto the staged image of `base`, or in full.
+    async fn eager_origin(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        manifest: ManifestRef,
+        base: Option<ManifestRef>,
+        continues: bool,
+    ) -> io::Result<Origin> {
+        let kept = if continues {
+            self.kept(sandbox, role, manifest).await?
+        } else {
+            if let Some((volume, wanted)) = self.staged(manifest).await {
+                return Ok(Origin::Staged { volume, wanted });
+            }
+            None
+        };
+        let kept = match kept {
+            Some((owner, volume, _, held)) if held == manifest => {
+                return Ok(Origin::Kept { owner, volume })
+            }
+            kept => kept,
+        };
+        let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+        let base = match kept {
+            Some((_, volume, held_manifest, _)) if volume.size_bytes == wanted.total_bytes => {
+                Some((volume, held_manifest))
+            }
+            _ => match base {
+                Some(image) => self.staged(image).await,
+                None => None,
+            },
+        };
+        Ok(Origin::Stage { wanted, base })
+    }
+
+    /// What an eager provision of `source` would write, read from the
+    /// manifests and the volume names only. `None` when it writes nothing:
+    /// it snapshots a staged image, adopts a kept checkpoint, or makes
+    /// zeros. A lazy source is planned as its eager counterpart.
+    pub async fn eager_plan(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        source: Source,
+    ) -> io::Result<Option<EagerPlan>> {
+        let (manifest, base, continues) = match source {
+            Source::Fork { manifest, base } | Source::LazyFork { manifest, base } => {
+                (manifest, base, false)
+            }
+            Source::Continue { manifest, base } | Source::LazyContinue { manifest, base } => {
+                (manifest, base, true)
+            }
+            Source::Empty { .. } => return Ok(None),
+        };
+        Ok(
+            match self
+                .eager_origin(sandbox, role, manifest, base, continues)
+                .await?
+            {
+                Origin::Stage { wanted, base } => Some(EagerPlan {
+                    wanted,
+                    base: base.map(|(_, held)| held),
+                }),
+                Origin::Staged { .. } | Origin::Kept { .. } => None,
+            },
+        )
+    }
+
+    /// The sources a lazy provision needs are configured.
+    pub fn has_sources(&self) -> bool {
+        self.sources.is_some()
     }
 
     /// A new lineage that holds a copy of `manifest`.
@@ -823,28 +926,6 @@ impl SessionVolumes {
             .rename(&checkpoint_name(owner, role, held), &name)
             .await?;
         self.disk.open(&name).await
-    }
-
-    /// Write `wanted` into a new volume `name`, from the staged volume of
-    /// `base` when this host has it.
-    async fn stage_into(
-        &self,
-        name: &VolumeName,
-        wanted: &Manifest,
-        base: Option<ManifestRef>,
-    ) -> io::Result<Volume> {
-        let base = match base {
-            Some(image) => self.staged(image).await,
-            None => None,
-        };
-        stage(
-            self.disk.as_ref(),
-            &self.store,
-            name,
-            wanted,
-            base.as_ref().map(|(v, m)| (v, m)),
-        )
-        .await
     }
 
     /// The staged volume of an image and its manifest, when this host
@@ -3785,6 +3866,68 @@ mod tests {
                 checkpoint_name(sandbox, DiskRole::Root, first).to_string(),
             ]
         );
+    }
+
+    /// The plan of an eager provision names the volume the provision
+    /// would start from, so it lists exactly the chunks it would write.
+    #[tokio::test]
+    async fn an_eager_plan_starts_where_the_provision_would() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2, 0]).await;
+        let sandbox = SandboxId::new();
+        let plan = |source| r.volumes.eager_plan(sandbox, DiskRole::Root, source);
+        let image_manifest = r.store.get_manifest(image).await.unwrap();
+
+        assert!(plan(fork(image)).await.unwrap().is_none());
+        let empty = plan(Source::Empty { size_bytes: CHUNK }).await;
+        assert!(empty.unwrap().is_none());
+        let manifest = published(&r, image, &[1, 9, 0]).await;
+        let wanted = r.store.get_manifest(manifest).await.unwrap();
+        for (source, base) in [
+            (
+                Source::Fork {
+                    manifest,
+                    base: None,
+                },
+                None,
+            ),
+            (
+                Source::LazyContinue {
+                    manifest,
+                    base: Some(image),
+                },
+                Some(&image_manifest),
+            ),
+        ] {
+            let p = plan(source).await.unwrap().unwrap();
+            assert_eq!(p.wanted, wanted);
+            assert_eq!(p.base.as_ref(), base);
+        }
+
+        // A released sandbox keeps its checkpoint of the lineage: a resume
+        // at that version adopts it, one at a newer version stages onto it.
+        let continued = |manifest| Source::Continue {
+            manifest,
+            base: Some(image),
+        };
+        r.volumes
+            .provision(sandbox, continued(manifest), None)
+            .await
+            .unwrap();
+        r.volumes.release(sandbox).await.unwrap();
+        let resumed = SandboxId::new();
+        let plan = r
+            .volumes
+            .eager_plan(resumed, DiskRole::Root, continued(manifest));
+        assert!(plan.await.unwrap().is_none());
+        let newer = next(manifest);
+        r.store.put_manifest(newer, &image_manifest).await.unwrap();
+        let plan = r
+            .volumes
+            .eager_plan(resumed, DiskRole::Root, continued(newer));
+        let plan = plan.await.unwrap().unwrap();
+        assert_eq!(plan.wanted, image_manifest);
+        assert_eq!(plan.base, Some(wanted));
     }
 
     /// [`FileSources`] whose recovery always fails.

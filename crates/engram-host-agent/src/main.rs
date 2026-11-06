@@ -69,6 +69,21 @@ struct Cli {
     #[arg(long, env = "ENGRAM_LAZY_RESTORE", default_value = "off")]
     lazy_restore: engram_host_agent::config::LazyRestore,
 
+    /// In `auto` mode, the longest an eager restore of a disk may write,
+    /// in seconds, before the restore boots over a source instead.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_BUDGET_SECS", default_value_t = engram_host_agent::config::EagerBudget::default().seconds, value_parser = non_negative)]
+    lazy_restore_budget_secs: f64,
+
+    /// In `auto` mode, the rate in MB/s (10^6 bytes) at which an eager
+    /// restore writes chunks it fetches from the chunk store.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_REMOTE_MBPS", default_value_t = engram_host_agent::config::EagerBudget::default().rates.remote / 1e6, value_parser = positive)]
+    lazy_restore_remote_mbps: f64,
+
+    /// In `auto` mode, the rate in MB/s (10^6 bytes) at which an eager
+    /// restore writes chunks the host's chunk cache holds.
+    #[arg(long, env = "ENGRAM_LAZY_RESTORE_LOCAL_MBPS", default_value_t = engram_host_agent::config::EagerBudget::default().rates.local / 1e6, value_parser = positive)]
+    lazy_restore_local_mbps: f64,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -329,6 +344,13 @@ async fn main() -> Result<(), HostAgentError> {
             BackendChoice::Vz => "vz".to_string(),
         },
         lazy_restore: cli.lazy_restore,
+        eager_budget: engram_host_agent::config::EagerBudget {
+            seconds: cli.lazy_restore_budget_secs,
+            rates: engram_host_core::eager_estimate::Rates {
+                local: cli.lazy_restore_local_mbps * 1e6,
+                remote: cli.lazy_restore_remote_mbps * 1e6,
+            },
+        },
         ..HostAgentConfig::default()
     };
 
@@ -765,6 +787,22 @@ async fn main() -> Result<(), HostAgentError> {
         }
     }
     agent.run().await
+}
+
+/// A number above zero, for a rate.
+fn positive(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(n) if n > 0.0 && n.is_finite() => Ok(n),
+        _ => Err(format!("`{text}` is not a number above zero")),
+    }
+}
+
+/// A number of zero or more, for a budget.
+fn non_negative(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(n) if n >= 0.0 && n.is_finite() => Ok(n),
+        _ => Err(format!("`{text}` is not a number of zero or more")),
+    }
 }
 
 /// The sources lazy restores read from (ADR 0127): a process per source

@@ -344,7 +344,9 @@ impl HostAgent {
                 // from ever engaging the chain or the periodic driver
                 // below — VZ has no guest-memory snapshot, so a
                 // checkpoint there is just a wasteful VM pause.
-                p = p.with_hydration_interval(self.cfg.hydration_interval);
+                p = p
+                    .with_hydration_interval(self.cfg.hydration_interval)
+                    .with_lazy_restore(self.cfg.lazy_restore, self.cfg.eager_budget);
                 let checkpoints_supported = self.sandbox.supports_diff_checkpoints();
                 if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));

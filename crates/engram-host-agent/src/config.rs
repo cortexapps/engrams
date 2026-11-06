@@ -52,9 +52,31 @@ pub struct HostAgentConfig {
     pub backend_name: String,
     /// When a restore boots before its disk is complete (ADR 0127).
     pub lazy_restore: LazyRestore,
+    /// What `auto` allows an eager restore to write.
+    pub eager_budget: EagerBudget,
     /// How often a sandbox's hydration task checks whether its disks
     /// are copied and can be cut over.
     pub hydration_interval: Duration,
+}
+
+/// The longest an eager restore of a disk may write before `auto` boots
+/// it over a source, and the write rates its estimate uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EagerBudget {
+    pub seconds: f64,
+    pub rates: engram_host_core::eager_estimate::Rates,
+}
+
+impl Default for EagerBudget {
+    fn default() -> Self {
+        Self {
+            seconds: 2.0,
+            rates: engram_host_core::eager_estimate::Rates {
+                local: 800e6,
+                remote: 200e6,
+            },
+        }
+    }
 }
 
 /// When a restore boots over a source before its disk is complete.
@@ -102,6 +124,7 @@ impl Default for HostAgentConfig {
             migrate_peer_listen_addr: None,
             backend_name: "process".to_string(),
             lazy_restore: LazyRestore::Off,
+            eager_budget: EagerBudget::default(),
             hydration_interval: crate::hydration::DEFAULT_INTERVAL,
         }
     }

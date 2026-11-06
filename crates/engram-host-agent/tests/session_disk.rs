@@ -25,7 +25,8 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit,
 use engram_core::types::snapshot::DiskRole;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_host_core::disk::{Capacity, CloneState, Hydration, SessionDisk, Volume, VolumeName};
-use engram_host_core::SessionVolumes;
+use engram_host_core::disk_sources::Served;
+use engram_host_core::{DiskSources, SessionVolumes};
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
@@ -238,6 +239,156 @@ async fn a_host_agent_restart_keeps_the_guest_and_every_write() {
     )
     .await;
     generation_b.destroy(sandbox).await.expect("destroy");
+}
+
+/// With lazy restore forced, a restore boots over a source: the guest
+/// reads the checkpoint's bytes at once, the disk cuts over in the
+/// background, and the source goes with the cutover.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker; bakes a rootfs and boots microVMs"]
+async fn a_forced_lazy_restore_boots_over_a_source_and_cuts_over() {
+    let Some(rig) = Rig::gate().await else { return };
+    let disk = common::session_disk(rig.work.path()).await;
+    let (eager, _) = rig.pooled(disk.clone());
+    let sandbox = SandboxId::new();
+    eager
+        .create(sandbox, rig.spec().await)
+        .await
+        .expect("create");
+    eager.bind_session(engram_core::SessionId::new(), sandbox);
+    let sum = exec(
+        &eager,
+        sandbox,
+        "head -c 1048576 /dev/urandom > /root/data && sync \
+         && sha256sum /root/data | cut -d' ' -f1",
+    )
+    .await;
+    let checkpoint = eager.checkpoint_sandbox(sandbox).await.expect("checkpoint");
+    eager.destroy(sandbox).await.expect("destroy");
+
+    let sources = Arc::new(LoopSources {
+        files: engram_host_core::FileSources::new(
+            rig.work.path().join("sources"),
+            rig.chunk_store.clone(),
+        )
+        .expect("file sources"),
+        loops: std::sync::Mutex::new(HashMap::new()),
+    });
+    let (lazy, volumes) = rig.pooled_with(
+        disk,
+        Some(sources.clone()),
+        engram_host_agent::config::LazyRestore::Force,
+    );
+    let resumed = SandboxId::new();
+    lazy.restore(resumed, checkpoint, None)
+        .await
+        .expect("lazy restore");
+    let drive = engram_host_core::session_volumes::live_name(resumed, DiskRole::Root);
+    assert!(
+        volumes.disk().clone_state(&drive).await.is_ok(),
+        "the root is a cloned drive"
+    );
+    let again = exec(&lazy, resumed, "sha256sum /root/data | cut -d' ' -f1").await;
+    assert_eq!(again.trim(), sum.trim(), "the guest reads the checkpoint");
+
+    let cut = common::poll_until_async(Duration::from_secs(60), Duration::from_millis(100), || {
+        let lazy = lazy.clone();
+        async move { lazy.hydrating().is_empty() }
+    })
+    .await;
+    assert!(cut, "the disk cuts over");
+    assert_eq!(
+        volumes.disk().clone_state(&drive).await.expect("drive"),
+        CloneState::CutOver
+    );
+    assert!(sources.list().await.expect("sources").is_empty());
+    assert!(
+        sources.loops.lock().unwrap().is_empty(),
+        "no loop device is left"
+    );
+    let after = exec(&lazy, resumed, "sha256sum /root/data | cut -d' ' -f1").await;
+    assert_eq!(after.trim(), sum.trim());
+    lazy.destroy(resumed).await.expect("destroy resumed");
+}
+
+/// [`engram_host_core::FileSources`] behind a read-only loop device, the
+/// block device a drive over the pool needs. Over sparse files the file
+/// itself is the source.
+struct LoopSources {
+    files: engram_host_core::FileSources,
+    loops: std::sync::Mutex<HashMap<(SandboxId, DiskRole), String>>,
+}
+
+fn over_pool() -> bool {
+    std::env::var_os("ENGRAM_TEST_THIN_POOL").is_some()
+}
+
+#[async_trait]
+impl DiskSources for LoopSources {
+    async fn start(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        manifest: engram_chunk_store::ManifestRef,
+        base: Option<(&Volume, engram_chunk_store::ManifestRef)>,
+    ) -> std::io::Result<PathBuf> {
+        let file = self.files.start(sandbox, role, manifest, base).await?;
+        if !over_pool() {
+            return Ok(file);
+        }
+        let out = std::process::Command::new("losetup")
+            .args(["--read-only", "--show", "-f"])
+            .arg(&file)
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "losetup: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let device = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        self.loops
+            .lock()
+            .unwrap()
+            .insert((sandbox, role), device.clone());
+        Ok(PathBuf::from(device))
+    }
+
+    async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+        self.files.ensure_alive(sandbox, role).await
+    }
+
+    async fn served(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<Served> {
+        let served = self.files.served(sandbox, role).await?;
+        match self.loops.lock().unwrap().get(&(sandbox, role)) {
+            Some(device) => Ok(Served {
+                device: PathBuf::from(device),
+                ..served
+            }),
+            None => Ok(served),
+        }
+    }
+
+    async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+        let device = self.loops.lock().unwrap().remove(&(sandbox, role));
+        if let Some(device) = device {
+            let out = std::process::Command::new("losetup")
+                .args(["-d", &device])
+                .output()?;
+            if !out.status.success() {
+                self.loops.lock().unwrap().insert((sandbox, role), device);
+                return Err(std::io::Error::other(format!(
+                    "losetup -d: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )));
+            }
+        }
+        self.files.stop(sandbox, role).await
+    }
+
+    async fn list(&self) -> std::io::Result<Vec<(SandboxId, DiskRole)>> {
+        self.files.list().await
+    }
 }
 
 /// A guest command that runs `script` detached from the exec. The guest's
@@ -456,13 +607,29 @@ impl Rig {
 
     /// A backend over `disk`, with the volumes it owns.
     fn pooled(&self, disk: Arc<dyn SessionDisk>) -> (Arc<PooledBackend>, Arc<SessionVolumes>) {
-        let volumes = Arc::new(SessionVolumes::new(disk, self.chunk_store.clone()));
+        self.pooled_with(disk, None, engram_host_agent::config::LazyRestore::Off)
+    }
+
+    /// [`Self::pooled`] with disk sources and a lazy-restore mode.
+    fn pooled_with(
+        &self,
+        disk: Arc<dyn SessionDisk>,
+        sources: Option<Arc<dyn DiskSources>>,
+        lazy_restore: engram_host_agent::config::LazyRestore,
+    ) -> (Arc<PooledBackend>, Arc<SessionVolumes>) {
+        let mut volumes = SessionVolumes::new(disk, self.chunk_store.clone());
+        if let Some(sources) = sources {
+            volumes = volumes.with_sources(sources);
+        }
+        let volumes = Arc::new(volumes);
         let inner = Arc::new(FirecrackerBackend::new(self.work.path(), self.cfg.clone()));
         let pooled = Arc::new(
             PooledBackend::new(inner)
                 .with_chunk_store(self.chunk_store.clone())
                 .with_session_volumes(volumes.clone())
-                .with_checkpoint_dir(self.work.path().join("checkpoints")),
+                .with_checkpoint_dir(self.work.path().join("checkpoints"))
+                .with_lazy_restore(lazy_restore, Default::default())
+                .with_hydration_interval(Duration::from_millis(100)),
         );
         pooled.set_self_ref(&pooled);
         (pooled, volumes)
