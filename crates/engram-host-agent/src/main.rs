@@ -567,9 +567,9 @@ async fn main() -> Result<(), HostAgentError> {
                 "--thin-pool {pool} needs Linux device-mapper"
             )));
         }
-        // A file-backed snapshot copies the whole volume while the guest
-        // is paused: fine for a macOS dev box, a frozen guest on a
-        // Firecracker host.
+        // A file-backed snapshot copies the volume's data while the guest
+        // is paused: fine for a macOS dev box (an APFS clone), a long
+        // freeze on a Firecracker host.
         #[cfg(target_os = "linux")]
         None if matches!(cli.sandbox_backend, BackendChoice::Firecracker) => {
             return Err(HostAgentError::Config(
