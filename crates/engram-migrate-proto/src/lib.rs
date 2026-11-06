@@ -53,24 +53,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// Protocol version carried in `Hello`/`HelloAck`. Bump on any
 /// wire-incompatible change; the server rejects mismatches loudly.
 ///
-/// v2: `Page.lz4` — payloads ship lz4-block-compressed when that is
-/// smaller, and `sha256` covers the WIRE bytes. The measured per-fault
-/// cost on the no-SHA-NI fleet was ~6.7 ms, dominated by the 512 KiB
-/// transfer + double sha256 — compression cuts all three.
+/// v2: `Page.lz4` — a payload may ship lz4-block-compressed, and the
+/// integrity hash covers the WIRE bytes.
 ///
 /// v3: `Hello.purpose` — connections identify as Fault or Drain. The
 /// source skips the AltSource classify hash on fault connections: a
 /// demote there ADDS a dest-side cache/GCS fetch (strictly worse
-/// latency than shipping the resident bytes), and the classify sha256
-/// of the raw 512 KiB was ~1 ms of the per-fault constant on the
-/// no-SHA-NI fleet. Drain connections keep the demote (it saves wire
-/// and the drain is latency-insensitive).
+/// latency than shipping the resident bytes). Drain connections keep
+/// the demote (it saves wire and the drain is latency-insensitive).
 ///
-/// v4: `Page.hash` is blake3 (was sha256) — measured 1.63 ms/serve in
-/// the encode leg, ~1.2 ms of it soft sha256 of the compressed wire
-/// bytes (no SHA-NI on the fleet); blake3 is cryptographic at
-/// ~1–2 GB/s in software. `AltSource.durable_sha256` STAYS sha256 —
-/// that is the chunk-store's content address, not wire integrity.
+/// v4: `Page.hash` is blake3 (was sha256). `AltSource.durable_sha256`
+/// STAYS sha256 — that is the chunk-store's content address, not wire
+/// integrity.
 ///
 /// v5: remove the unused by-hash request and reply.
 /// v6: ordered fault windows and fault-around installation accounting.
@@ -232,8 +226,10 @@ pub enum FromSource {
         req_id: u64,
         chunk_offset: u64,
         /// WIRE bytes: lz4-block-compressed (size-prepended) when
-        /// `lz4`, raw otherwise (the source ships whichever is
-        /// smaller — incompressible chunks go raw).
+        /// `lz4`, raw otherwise. `serde_bytes` encodes the same bincode
+        /// bytes as a plain `Vec<u8>` (u64 length, then the bytes) in one
+        /// copy instead of one call per byte.
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         /// [`wire_hash`] over the WIRE bytes — verify BEFORE
         /// decompressing.

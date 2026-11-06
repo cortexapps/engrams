@@ -17,6 +17,7 @@ bincode.workspace = true
 blake3.workspace = true
 lz4_flex.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
