@@ -143,7 +143,8 @@ impl ChunkStore {
         //   immediately from the channel, so wall-clock is
         //   ~max(scan, upload) with no drain stalls. Resident RAM stays
         //   bounded: in-flight puts × chunk_size, plus the channel's
-        //   byte budget, plus one read block.
+        //   byte budget, plus the scan threads' read blocks
+        //   (RECHUNK_READ_BUDGET_BYTES).
         //
         // Stats attribution: consumer time blocked on the reader with
         // NOTHING in flight = scan-bound (`scan_seconds`); consumer time
@@ -651,17 +652,21 @@ fn is_all_zero(buf: &[u8]) -> bool {
     buf.iter().all(|&b| b == 0)
 }
 
-/// Target size of one sequential read in [`read_nonzero_chunks`].
-/// Large enough that the kernel's readahead pipeline stays engaged on a
-/// network PD (where per-request latency, not bandwidth, capped the old
-/// chunk-at-a-time scan at ~45 MB/s); small enough that one in-flight
-/// block plus the channel backlog stays tens-of-MiB resident.
+/// Target size of one sequential read in [`read_nonzero_chunks`] (at
+/// least one chunk). Large enough that the kernel's readahead pipeline
+/// stays engaged on a network PD, where per-request latency, not
+/// bandwidth, capped a chunk-at-a-time scan at ~45 MB/s.
 const RECHUNK_READ_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The read blocks of all scan threads together: each thread holds one
+/// block, so a chunk size above `RECHUNK_READ_BLOCK_BYTES` gets fewer
+/// threads.
+const RECHUNK_READ_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Byte budget for chunks queued between the reader and the consumer —
 /// the pipeline's read-ahead, ON TOP of the in-flight flush window
 /// (`SPARSE_RECHUNK_CONCURRENCY` chunks, pre-existing ADR 0039
-/// behavior) and one read block. An item-count bound alone would let
+/// behavior) and the read blocks. An item-count bound alone would let
 /// 16 MiB DISK chunks (rootfs materialization) queue ~1 GiB per
 /// operation and OOM the host-agent under concurrent materializes;
 /// deriving the capacity from bytes keeps the added buffering flat
@@ -694,13 +699,15 @@ fn covers(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
     false
 }
 
-/// Threads that read and zero-scan a file in [`read_nonzero_chunks`].
-const SCAN_THREADS: usize = 8;
+/// The most threads that read and zero-scan a file in
+/// [`read_nonzero_chunks`].
+const SCAN_THREADS: u64 = 8;
 
 /// Send every chunk of `file` that is not all zeros, as `(offset, bytes)`.
-/// [`SCAN_THREADS`] threads each read every `SCAN_THREADS`-th block with
-/// positional reads, so the read and the zero scan use several cores; the
-/// chunks arrive out of offset order. A short file sends one error.
+/// Up to [`SCAN_THREADS`] threads, as many as [`RECHUNK_READ_BUDGET_BYTES`]
+/// of blocks allow, each read every n-th block with positional reads, so
+/// the read and the zero scan use several cores; the chunks arrive out of
+/// offset order. A short file sends one error.
 fn read_nonzero_chunks(
     file: std::fs::File,
     total_bytes: u64,
@@ -711,6 +718,7 @@ fn read_nonzero_chunks(
     let chunks_per_block = (RECHUNK_READ_BLOCK_BYTES / chunk_size).max(1);
     let block_bytes = chunks_per_block * chunk_size;
     let blocks = total_bytes.div_ceil(block_bytes);
+    let scanners = (RECHUNK_READ_BUDGET_BYTES / block_bytes).clamp(1, SCAN_THREADS);
     let failed = std::sync::atomic::AtomicBool::new(false);
     let scan = |first: u64| {
         let mut buf = vec![0u8; block_bytes as usize];
@@ -757,11 +765,11 @@ fn read_nonzero_chunks(
                 }
                 pos += len;
             }
-            block += SCAN_THREADS as u64;
+            block += scanners;
         }
     };
     std::thread::scope(|threads| {
-        for first in 0..(SCAN_THREADS as u64).min(blocks) {
+        for first in 0..scanners.min(blocks) {
             threads.spawn(move || scan(first));
         }
     });
