@@ -384,8 +384,89 @@ async fn build_app_state(
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
+        state.op_finished.clone(),
     ));
     state
+}
+
+/// An op that ends through the shared store reaches the other replica's
+/// `op_finished` channel by the store's NOTIFY, for both a finish and a
+/// cancel. The RPCs that wait for an op to end wake on this.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn ended_op_wakes_the_other_replica() {
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let database_url = db.url.clone();
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
+    let coord_a = build_app_state(meta.clone(), &database_url).await;
+    let mut ended = coord_a.op_finished.subscribe();
+
+    let new_session = || async {
+        meta.create_session(SessionSpec {
+            image: "ha-op-finished-test:warm-test".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+        })
+        .await
+        .expect("create session")
+    };
+    let claim = |sid| {
+        let meta = meta.clone();
+        async move {
+            match meta
+                .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "coord-b")
+                .await
+                .expect("enqueue")
+            {
+                EnqueueOutcome::Claimed(op) => op,
+                other => panic!("a fresh session's first op is claimed, got {other:?}"),
+            }
+        }
+    };
+
+    // coord-A's LISTEN may not be up yet, and a NOTIFY sent before it is
+    // lost: finish fresh ops until one id arrives.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let running = loop {
+        let sid = new_session().await;
+        let op = claim(sid).await;
+        assert!(meta
+            .op_finish(op.id, op.epoch.unwrap(), OpState::Done, None)
+            .await
+            .unwrap());
+        match tokio::time::timeout(Duration::from_millis(300), ended.recv()).await {
+            Ok(id) => {
+                assert_eq!(id.unwrap(), op.id, "the id is the op that ended");
+                break claim(sid).await;
+            }
+            Err(_) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "coord-A never received an op-finished id within 10s",
+            ),
+        }
+    };
+
+    let EnqueueOutcome::Queued(queued) = meta
+        .op_enqueue_and_claim(
+            running.session_id,
+            OpKind::Resume,
+            serde_json::json!({}),
+            None,
+            "coord-b",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("an op behind a running op queues")
+    };
+    assert!(meta.op_cancel_by_id(queued.id).await.unwrap());
+    let id = tokio::time::timeout(Duration::from_secs(2), ended.recv())
+        .await
+        .expect("the cancel's id arrives")
+        .unwrap();
+    assert_eq!(id, queued.id);
 }
 
 #[tokio::test]

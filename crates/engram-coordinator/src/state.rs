@@ -868,6 +868,9 @@ pub enum RunInterruptCause {
 /// event (ADR 0123 C4): one type on both sides of the wire.
 pub use engram_host_agent::harness::EventDelivery;
 
+/// Buffered [`AppState::op_finished`] ids per waiter before it lags.
+const OP_FINISHED_CAPACITY: usize = 1024;
+
 pub struct AppState {
     pub cfg: CoordinatorConfig,
     pub services: Services,
@@ -916,6 +919,10 @@ pub struct AppState {
     pub attach_grace: Arc<DashMap<SessionId, chrono::DateTime<chrono::Utc>>>,
     /// ADR 0079: wakes the session-op executor on `pg_notify('session_ops', …)`.
     pub session_ops_wake: Arc<tokio::sync::Notify>,
+    /// Ids of ops that reached a terminal state: sent by this replica's
+    /// executor and by `pg_listener` for every replica's op. A lagged or
+    /// lost id is safe: the waiters also re-read the op row on a timer.
+    pub op_finished: tokio::sync::broadcast::Sender<i64>,
     /// Bound address of the harness TCP listener (set by `lib::run`
     /// once the listener has accepted a port from the OS — `127.0.0.1:0`
     /// becomes e.g. `127.0.0.1:54123`). The session-create handler
@@ -1034,6 +1041,7 @@ impl AppState {
             outbox_wake,
             attach_grace: Arc::new(DashMap::new()),
             session_ops_wake: Arc::new(tokio::sync::Notify::new()),
+            op_finished: tokio::sync::broadcast::channel(OP_FINISHED_CAPACITY).0,
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),

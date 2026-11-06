@@ -1611,52 +1611,51 @@ pub(crate) async fn delete_session_core(
     )
     .await
     .map_err(|e| ApiError::Internal(format!("destroy enqueue failed: {e}")))?;
-    // `Duplicate` = a prior DELETE already enqueued/ran the destroy (the
-    // burned idempotency key) — observe the session row alone.
+    // `Duplicate` = a prior DELETE's destroy op is still queued or running
+    // (the keyed row) — observe that op.
     let op_id = match outcome {
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
-        EnqueueOutcome::Duplicate => None,
+        EnqueueOutcome::Duplicate => state
+            .services
+            .meta
+            .op_latest_for_kind(id, OpKind::Destroy)
+            .await
+            .ok()
+            .flatten()
+            .map(|op| op.id),
     };
 
-    let deadline = state.services.clock.now_mono() + DESTROY_OBSERVE_TIMEOUT;
-    loop {
-        // The terminal flip is the user-visible outcome; it lands before
-        // the (best-effort, can-take-seconds) sandbox destroy finishes.
-        match state.services.meta.get_session(id).await {
-            Ok(s) if s.status.is_terminal() => return Ok(()),
-            Ok(_) => {}
-            // Row hard-deleted (FK cascade) — idempotent 204.
-            Err(engram_core::MetaError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        if let Some(op_id) = op_id {
-            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
-                match op.state {
-                    OpState::Done => return Ok(()),
-                    OpState::Failed => {
-                        return Err(ApiError::Internal(format!(
-                            "session teardown failed: {}",
-                            op.error.as_deref().unwrap_or("destroy op failed")
-                        )));
-                    }
-                    OpState::Cancelled => {
-                        return Err(ApiError::Conflict(
-                            "session teardown was cancelled; retry the delete".into(),
-                        ));
-                    }
-                    OpState::Queued | OpState::Running => {}
-                }
+    crate::session_ops::observe_op(
+        state,
+        op_id,
+        DESTROY_OBSERVE_TIMEOUT,
+        "session teardown in flight (destroy op enqueued behind an in-flight op); retry \
+         shortly",
+        |op| async move {
+            // The terminal flip is the user-visible outcome; it lands before
+            // the (best-effort, can-take-seconds) sandbox destroy finishes.
+            match state.services.meta.get_session(id).await {
+                Ok(s) if s.status.is_terminal() => return Ok(Some(())),
+                Ok(_) => {}
+                // Row hard-deleted (FK cascade) — idempotent 204.
+                Err(engram_core::MetaError::NotFound) => return Ok(Some(())),
+                Err(e) => return Err(e.into()),
             }
-        }
-        if state.services.clock.now_mono() >= deadline {
-            return Err(ApiError::Conflict(
-                "session teardown in flight (destroy op enqueued behind an in-flight \
-                 op); retry shortly"
-                    .into(),
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+            let Some(op) = op else { return Ok(None) };
+            match op.state {
+                OpState::Done => Ok(Some(())),
+                OpState::Failed => Err(ApiError::Internal(format!(
+                    "session teardown failed: {}",
+                    op.error.as_deref().unwrap_or("destroy op failed")
+                ))),
+                OpState::Cancelled => Err(ApiError::Conflict(
+                    "session teardown was cancelled; retry the delete".into(),
+                )),
+                OpState::Queued | OpState::Running => Ok(None),
+            }
+        },
+    )
+    .await
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,

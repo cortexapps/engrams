@@ -39,9 +39,6 @@ use crate::state::{RecoveryCause, SessionEvent, SharedState};
 /// the caller's synchronous answer.
 const OP_OBSERVE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Poll cadence for the bounded observe.
-const OP_OBSERVE_POLL: Duration = Duration::from_millis(250);
-
 /// ADR 0016 §A.1.7 fallback: synthesize an unspecified-IP
 /// `SessionEgressPolicy`. Used only when
 /// `build_resume_egress_policy` returns `None` (no manifest bundle,
@@ -489,8 +486,8 @@ pub(crate) async fn enqueue_and_observe_resume_for(
     observe_resume_op(state, id, op_id, timeout).await
 }
 
-/// The observe half: poll the op row (and the session status, which can
-/// settle Active before the row read) until terminal or the bound.
+/// The observe half: settle on the op row, or on the session status alone
+/// when there is no row to read.
 async fn observe_resume_op(
     state: &SharedState,
     id: SessionId,
@@ -498,52 +495,41 @@ async fn observe_resume_op(
     timeout: Duration,
 ) -> Result<ObservedResume, ApiError> {
     use engram_core::types::session_op::OpState;
-    let deadline = state.services.clock.now_mono() + timeout;
-    loop {
-        if let Some(op_id) = op_id {
-            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
-                match op.state {
-                    OpState::Done => {
-                        // Done = Active, already-Active, or the honest
-                        // harness-failed park at Created.
-                        let session = state.services.meta.get_session(id).await?;
-                        return match session.status {
-                            SessionState::Active => Ok(ObservedResume::Active),
-                            SessionState::Created => Ok(ObservedResume::CreatedHarnessFailed),
-                            other => Err(ApiError::Conflict(format!(
-                                "resume op completed but the session is {} — a concurrent \
-                                 op moved it; retry",
-                                other.as_str()
-                            ))),
-                        };
-                    }
-                    OpState::Failed => {
-                        return Err(api_error_from_op_failure(
-                            op.error.as_deref().unwrap_or("resume failed"),
-                        ));
-                    }
-                    OpState::Cancelled => {
-                        return Err(ApiError::Conflict(
-                            "resume was cancelled; retry if still needed".into(),
-                        ));
-                    }
-                    OpState::Queued | OpState::Running => {}
-                }
+    crate::session_ops::observe_op(
+        state,
+        op_id,
+        timeout,
+        "resume in flight (op enqueued); retry shortly",
+        |op| async move {
+            let Some(op) = op else {
+                let session = state.services.meta.get_session(id).await?;
+                return Ok(
+                    (session.status == SessionState::Active).then_some(ObservedResume::Active)
+                );
+            };
+            match op.state {
+                // Done = Active, already-Active, or the honest
+                // harness-failed park at Created.
+                OpState::Done => match state.services.meta.get_session(id).await?.status {
+                    SessionState::Active => Ok(Some(ObservedResume::Active)),
+                    SessionState::Created => Ok(Some(ObservedResume::CreatedHarnessFailed)),
+                    other => Err(ApiError::Conflict(format!(
+                        "resume op completed but the session is {} — a concurrent \
+                         op moved it; retry",
+                        other.as_str()
+                    ))),
+                },
+                OpState::Failed => Err(api_error_from_op_failure(
+                    op.error.as_deref().unwrap_or("resume failed"),
+                )),
+                OpState::Cancelled => Err(ApiError::Conflict(
+                    "resume was cancelled; retry if still needed".into(),
+                )),
+                OpState::Queued | OpState::Running => Ok(None),
             }
-        } else {
-            // No row to watch (Duplicate) — settle on the status alone.
-            let session = state.services.meta.get_session(id).await?;
-            if session.status == SessionState::Active {
-                return Ok(ObservedResume::Active);
-            }
-        }
-        if state.services.clock.now_mono() >= deadline {
-            return Err(ApiError::Conflict(
-                "resume in flight (op enqueued); retry shortly".into(),
-            ));
-        }
-        tokio::time::sleep(OP_OBSERVE_POLL).await;
-    }
+        },
+    )
+    .await
 }
 
 /// Auto-resume an `Idle` session if needed, before routing an
@@ -2192,60 +2178,48 @@ pub(crate) async fn enqueue_and_observe_evict(
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
         EnqueueOutcome::Duplicate => None,
     };
-    let deadline = state.services.clock.now_mono() + OP_OBSERVE_TIMEOUT;
-    loop {
-        // Status settles first (mark_idle / the park bookkeeping land
-        // before the op row finishes).
-        let session = state.services.meta.get_session(id).await?;
-        match session.status {
-            SessionState::Idle => return Ok(ObservedEvict::Idle),
-            // ADR 0101 C: park lands at the real `Parked` state (the old
-            // `Evicting && park_rung == 2` compound is retired).
-            SessionState::Parked => return Ok(ObservedEvict::ParkedPaused),
-            _ => {}
-        }
-        if let Some(op_id) = op_id {
-            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
-                match op.state {
-                    OpState::Failed => {
-                        return Err(api_error_from_op_failure(
-                            op.error.as_deref().unwrap_or("evict failed"),
-                        ));
-                    }
-                    OpState::Cancelled => {
-                        return Err(ApiError::Conflict(
-                            "eviction was cancelled (the user returned); session stays live".into(),
-                        ));
-                    }
-                    // ADR 0101 C (engrams review, #836): a full evict's
-                    // op finishes at capture time with the session
-                    // honestly still `Evicting` — that IS success (the
-                    // pre-C Idle flip promised exactly the same
-                    // durability: crash-durable finalize inputs). The
-                    // reconcile settles Idle when the row lands. Done in
-                    // any OTHER state = the verb's re-entry guard
-                    // skipped (a concurrent op moved the session first).
-                    OpState::Done => {
-                        if session.status == SessionState::Evicting {
-                            return Ok(ObservedEvict::EvictedSettling);
-                        }
-                        return Err(ApiError::Conflict(format!(
-                            "evict op completed as a no-op; session is {} — retry if still \
-                             intended",
-                            session.status.as_str()
-                        )));
-                    }
-                    OpState::Queued | OpState::Running => {}
-                }
+    crate::session_ops::observe_op(
+        state,
+        op_id,
+        OP_OBSERVE_TIMEOUT,
+        "eviction in flight (op enqueued); retry shortly",
+        |op| async move {
+            // Status settles first (mark_idle / the park bookkeeping land
+            // before the op row finishes).
+            let session = state.services.meta.get_session(id).await?;
+            match session.status {
+                SessionState::Idle => return Ok(Some(ObservedEvict::Idle)),
+                // ADR 0101 C: park lands at the real `Parked` state.
+                SessionState::Parked => return Ok(Some(ObservedEvict::ParkedPaused)),
+                _ => {}
             }
-        }
-        if state.services.clock.now_mono() >= deadline {
-            return Err(ApiError::Conflict(
-                "eviction in flight (op enqueued); retry shortly".into(),
-            ));
-        }
-        tokio::time::sleep(OP_OBSERVE_POLL).await;
-    }
+            let Some(op) = op else { return Ok(None) };
+            match op.state {
+                OpState::Failed => Err(api_error_from_op_failure(
+                    op.error.as_deref().unwrap_or("evict failed"),
+                )),
+                OpState::Cancelled => Err(ApiError::Conflict(
+                    "eviction was cancelled (the user returned); session stays live".into(),
+                )),
+                // ADR 0101 C (#836): a full evict's op finishes at capture
+                // time with the session still `Evicting` — that IS success
+                // (crash-durable finalize inputs); the reconcile settles
+                // Idle when the row lands. Done in any OTHER state = the
+                // verb's re-entry guard skipped (a concurrent op moved the
+                // session first).
+                OpState::Done if session.status == SessionState::Evicting => {
+                    Ok(Some(ObservedEvict::EvictedSettling))
+                }
+                OpState::Done => Err(ApiError::Conflict(format!(
+                    "evict op completed as a no-op; session is {} — retry if still \
+                     intended",
+                    session.status.as_str()
+                ))),
+                OpState::Queued | OpState::Running => Ok(None),
+            }
+        },
+    )
+    .await
 }
 
 /// ADR 0009 Phase 2: HEAD-verify the chunked manifests are durable
@@ -2741,6 +2715,63 @@ mod evicting_gate_tests {
         // and NOT transitioned.
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Evicting);
+    }
+
+    /// Seeds a running Resume op owned by another replica on an Active
+    /// session, starts the observe, and ends the op in the store 10 ms after
+    /// the start, announcing its id on `op_finished` when `announce`.
+    /// Returns the observe result and its time on the paused clock.
+    async fn observe_op_ended_elsewhere(
+        announce: bool,
+    ) -> (Result<ObservedResume, ApiError>, Duration) {
+        use engram_core::types::session_op::{OpKind, OpState};
+        let id = SessionId::new();
+        let mut session = evicting_session(id);
+        session.status = SessionState::Active;
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
+        let op = mini.ops.seed_running(id, OpKind::Resume);
+
+        let started = tokio::time::Instant::now();
+        let observer = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                observe_resume_op(&state, id, Some(op.id), Duration::from_secs(30)).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(mini
+            .ops
+            .finish(op.id, op.epoch.unwrap(), OpState::Done, None));
+        if announce {
+            // What `pg_listener` does with the other replica's NOTIFY.
+            state.op_finished.send(op.id).unwrap();
+        }
+        let result = observer.await.unwrap();
+        (result, started.elapsed())
+    }
+
+    /// An op that another replica ends wakes the observe on its op-finished
+    /// id, not on the fallback poll.
+    #[tokio::test(start_paused = true)]
+    async fn observe_wakes_on_op_finished_id() {
+        let (result, took) = observe_op_ended_elsewhere(true).await;
+        assert_eq!(result.unwrap(), ObservedResume::Active);
+        assert!(
+            took < crate::session_ops::OP_OBSERVE_FALLBACK_POLL,
+            "the op-finished id must end the wait, took {took:?}",
+        );
+    }
+
+    /// With no op-finished id (a lost NOTIFY), the fallback poll still
+    /// sees the ended op.
+    #[tokio::test(start_paused = true)]
+    async fn observe_falls_back_to_polling_without_an_id() {
+        let (result, took) = observe_op_ended_elsewhere(false).await;
+        assert_eq!(result.unwrap(), ObservedResume::Active);
+        assert!(
+            took >= crate::session_ops::OP_OBSERVE_FALLBACK_POLL,
+            "only the fallback poll can end this wait, took {took:?}",
+        );
     }
 
     /// ADR 0079 ordering-by-log (the ADR 0039 hold's successor): a
