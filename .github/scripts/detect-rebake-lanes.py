@@ -158,6 +158,10 @@ E2E_BINS = {
     "engram-egress-proxyd",
 }
 
+# Crates whose root tests run on the Firecracker root lane but are not
+# in the e2e closure: the ublk disk source (ADR 0127).
+FC_ROOT_TEST_CRATES = {"engram-disk-source"}
+
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
 BINARY_COMMON = ["Cargo.lock", "Cargo.toml",
@@ -440,6 +444,7 @@ def main():
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
+    fc_root_closure = release_closure(meta, FC_ROOT_TEST_CRATES)
     cli = release_closure(meta, CLI_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
@@ -567,7 +572,12 @@ def main():
     # fixtures and mount bundles via the sandbox crates already in the closure;
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
-    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork or any_path(changed, FC_POOL_PATHS)
+    test_fc = (
+        ci_self
+        or bool(cc & (e2e_closure | fc_root_closure))
+        or fc_fork
+        or any_path(changed, FC_POOL_PATHS)
+    )
     # web / orchestrator: their own sources or the protos they codegen from.
     # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)

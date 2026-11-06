@@ -1185,6 +1185,25 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
+      # ADR 0127: the disk source against the kernel's ublk driver. The
+      # driver is in the distribution's extra modules; a runner that cannot
+      # load it fails the lane, as a missing pool does.
+      - name: ublk disk-source tests (root)
+        env:
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          if ! sudo modprobe ublk_drv; then
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          fi
+          test -c /dev/ublk-control
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-disk-source \
+            --test ublk_device \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+
       # Root-required tests: proxy_e2e provisions a TAP device and runs
       # the full guest→TAP→REDIRECT→proxy→upstream chain, snapshot_net
       # asserts that snapshot/restore re-provisions the per-VM TAP + /30
