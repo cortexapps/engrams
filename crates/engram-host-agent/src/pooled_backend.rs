@@ -3181,7 +3181,7 @@ impl PooledBackend {
                         max_interval,
                         cfg.target_epoch_bytes,
                     ),
-                    None => max_interval,
+                    None => cfg.first_interval.min(max_interval),
                 };
                 (now_ms - last >= due_after.as_millis() as i64).then_some((id, *e.value()))
             })
@@ -3845,7 +3845,7 @@ impl SnapshotFinisher {
                 // successful capture (any flavor; that's what the dirty
                 // set accumulated over). Without a previous stamp there
                 // is no epoch and no sample: the controller keeps the
-                // backstop cadence.
+                // first epoch.
                 if let Some(prev_ms) = prev_ms.filter(|p| *p > 0 && *p <= now_ms) {
                     let epoch = std::time::Duration::from_millis((now_ms - prev_ms) as u64);
                     self.checkpoint_pacing.insert(
@@ -6678,8 +6678,8 @@ mod tests {
     /// the pure controller (`next_epoch_after`) is tested in
     /// `checkpoint.rs`; this pins the map-driven wiring around it: a
     /// dirt-heavy sample earns the floor cadence, a trickle keeps the
-    /// backstop, a sample-less sandbox keeps the backstop, and a fresh
-    /// capture is never due.
+    /// backstop, a sample-less sandbox takes the short first epoch, and a
+    /// fresh capture is never due.
     #[tokio::test]
     async fn adaptive_candidates_honor_pacing_and_backstop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6690,6 +6690,7 @@ mod tests {
             interval: Some(std::time::Duration::from_secs(600)),
             min_interval: std::time::Duration::from_secs(30),
             target_epoch_bytes: 256 * 1024 * 1024,
+            first_interval: std::time::Duration::from_secs(120),
         };
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6718,9 +6719,10 @@ mod tests {
         let busy_fresh = bind(10, Some(sample(Some(2 * cfg.target_epoch_bytes))));
         // A trickle (1 KiB/epoch) → backstop cadence: not due at 40s.
         let idle_trickle = bind(40, Some(sample(Some(1024))));
-        // No pacing sample → backstop: not due at 40s, due at 700s.
+        // No pacing sample → the first epoch (120s): not due at 40s, due
+        // at 130s.
         let unsampled_fresh = bind(40, None);
-        let unsampled_old = bind(700, None);
+        let unsampled_old = bind(130, None);
 
         let due: std::collections::HashSet<SandboxId> = pooled
             .checkpoint_candidates_adaptive(&cfg)
@@ -6738,9 +6740,12 @@ mod tests {
         );
         assert!(
             !due.contains(&unsampled_fresh),
-            "no rate signal keeps the backstop"
+            "the first epoch is not over at 40s"
         );
-        assert!(due.contains(&unsampled_old), "the backstop still fires");
+        assert!(
+            due.contains(&unsampled_old),
+            "the first epoch ends before the backstop"
+        );
     }
 
     /// ADR 0091 probe gate (engrams review, #835 round 2): one probe
@@ -12115,6 +12120,7 @@ mod tests {
             interval: Some(std::time::Duration::from_secs(600)),
             min_interval: std::time::Duration::from_secs(30),
             target_epoch_bytes: 256 * 1024 * 1024,
+            first_interval: std::time::Duration::from_secs(120),
         };
         assert!(pooled.last_snapshot_unix_ms.contains_key(&restored));
         assert!(
