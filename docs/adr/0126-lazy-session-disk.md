@@ -1,0 +1,308 @@
+# ADR 0126: The lazy session disk — a restore boots before its disk is complete
+
+- Status: Proposed
+- Date: 2026-11-06
+- Amends: ADR 0125 (the kernel-owned session disk), its Resume
+  lifecycle ("the dirty chunks are written before the VM starts;
+  nothing is faulted lazily from the chunk store on the disk path") and
+  its Tradeoff "staging precedes the first boot on a node … there is no
+  lazy fallback". Every other decision of ADR 0125 stands.
+- Related: ADR 0007 (chunk store), ADR 0036 (image readiness and
+  prestage), ADR 0039 / 0092 (lazy memory), ADR 0044 K2 (VM processes
+  outlive the host-agent pod), ADR 0079 / 0116 (ownership), ADR 0098 /
+  0099 (simulation and invariants), ADR 0123 (teleport).
+
+## Terms
+
+- **Source**: a read-only block device whose bytes are one published
+  disk manifest (ADR 0007). It holds no writes.
+- **Source process**: the userspace process that serves one source
+  through ublk. One per sandbox while that sandbox copies.
+- **dm-clone**: a device-mapper target that presents a writable copy of
+  a read-only source device. Reads of a region it has not copied go to
+  the source; writes go to the destination; a background task copies
+  the remaining regions. A **region** is its unit of copy (64 KiB here,
+  the pool's block size). Its **bitmap** records the copied regions, on
+  a metadata device.
+- **Hydration**: the background copy, from the source into the
+  destination, until every region is copied.
+- **Cutover**: replacing the dm-clone table with a `linear` table onto
+  the destination, under a device-mapper suspend. The device node and
+  every open handle stay valid.
+- **Eager restore**: ADR 0125's restore. Write every chunk the volume
+  needs, then boot.
+- **Lazy restore**: this ADR's restore. Boot over dm-clone, then hydrate.
+
+## Summary, in plain English
+
+ADR 0125 made the kernel the only owner of a session disk. It also made
+a restore write the whole disk before the guest boots, unless the host
+already holds the session's base image version. In production that is
+the usual case, not the rare one: images are baked often, hosts stage
+only the enabled version, and most idle sessions point at an older
+version. A restore of such a session writes the full disk from the
+chunk store inside the restore deadline. On a busy or new host it does
+not finish, each retry starts again from zero, and the session becomes
+dead after the retry limit.
+
+The target for every session operation is under 10 seconds in the worst
+case. No eager design meets that: a 26 GiB root disk at 1 GB/s is 26
+seconds before any contention. Time to boot must not grow with disk
+size.
+
+After this change, a restore that cannot finish eagerly in about two
+seconds boots over dm-clone at once. The guest reads uncopied regions
+through a read-only source and writes into a thin volume as before.
+Hydration copies the rest in the background. When it ends, the device
+is cut over to a plain thin volume and the session is exactly an ADR
+0125 session. The only userspace process in the path serves read-only
+data, holds no writes, and exists only while its sandbox copies.
+
+## Context
+
+### What failed
+
+The first production deploy of ADR 0125 had three properties that
+combined:
+
+1. A restore with no staged base for the session's image version wrote
+   every chunk of the root and swap disks before boot. For a large
+   development image that is tens of GiB.
+2. The restore ran inside the restore RPC deadline (240 s). The deadline
+   cancels the host's work, so a retry starts the copy again. Memory
+   prefetch that the failed attempt spawned kept running.
+3. The host that took the restore was new and was still staging images
+   and bundles. It pulled far less than its network and disk could
+   carry, and its chunk cache evicted chunks under the combined load.
+
+Each cause can be fixed. None of the fixes gives a time to boot that is
+independent of disk size.
+
+### What ADR 0125 protects
+
+ADR 0125's lesson: "a process that restarts several times a week must
+not own a resource whose lifetime is a session." Its incident table has
+three classes:
+
+| Class | Failure | Root |
+|---|---|---|
+| Durability | acknowledged writes lost on a restart | userspace held write state |
+| Liveness | a healthy VM killed after a failed reconfigure | the kernel device was bound to the old process, and recovery reacted |
+| Event channel | a recovery event reached the coordinator before the recovery finished | a side channel beside ownership |
+
+A lazy disk must not bring any of the three back. The design below
+addresses each one explicitly.
+
+### What the kernel can do (spike, 2026-11-05)
+
+A spike on the Linux dev VM (kernel 6.8) measured dm-clone with a dm-thin
+destination over a read-only source behind dm-delay, 2 GiB, region 64
+KiB. Every sample includes about 4–5 ms of tool overhead.
+
+| Measure | 80 ms source | 1 ms source |
+|---|---|---|
+| create to first read | 175 ms | 12 ms |
+| read of an uncopied region | 91 ms | 3.4 ms |
+| second read of the same region (reads do not copy) | 85 ms | 3.0 ms |
+| 4 KiB write to an uncopied region (copy, then write) | 95 ms | 6.4 ms |
+| 64 KiB write to an uncopied region (no copy) | 5.3 ms | 5.4 ms |
+| 4 KiB write to a copied region | 4.8 ms | 4.7 ms |
+| 4 KiB write + fsync, dm-clone / plain thin | 11.3 / 8.2 ms | 10.9 / 8.1 ms |
+| hydration of 2 GiB | 49.6 s (41 MiB/s) | 6.2 s (332 MiB/s) |
+| cutover to linear with a handle open | 6.4 ms | 5.9 ms |
+| destination equals source plus every write | pass | pass |
+
+`ublk_drv` loads on the same kernel from the distribution's extra
+modules. The production node image is still to be checked for `dm_clone`
+and `ublk_drv` (Rollout step 0).
+
+## Decision
+
+1. **A restore picks eager or lazy before it starts, and can fall back
+   to lazy.** The host computes the bytes the volume needs from the
+   manifests (`Manifest::delta_from` against the staged base when one
+   exists) and splits them into local bytes (a staged volume or the
+   chunk cache holds them) and remote bytes. The estimate is
+   `local / local_rate + remote / remote_rate` with conservative
+   per-host rates. At or under the eager budget (2 s), the restore is
+   eager. Over it, the restore is lazy. An eager restore that passes
+   its budget continues as a lazy restore over the partly written
+   volume: the eager path writes exactly the manifest's bytes, so
+   hydration rewrites those regions with identical data and the result
+   is the same volume. A wrong estimate costs time, never data. Every
+   restore records the path, the estimate and the actual time.
+2. **A lazy restore boots over dm-clone.** The destination is a thin
+   volume: a snapshot of the staged base when there is one, otherwise a
+   fresh volume. The bitmap is on a small thin volume of its own. The
+   source is a ublk device. The guest's drive is the dm-clone device,
+   made under `/dev/engram/` as ADR 0125 makes every drive. The guest
+   boots as soon as the table is loaded.
+3. **The source is read-only and stateless.** It serves one manifest.
+   For each read it uses the first tier that holds the chunk: a staged
+   volume whose chunk has the same hash, the chunk cache, a peer, then
+   a ranged read from the chunk store followed by a fill of the whole
+   chunk. Guest reads go before hydration reads. The source holds no
+   writes; every byte it can serve is in the chunk store. Its state is
+   a function of the manifest id.
+4. **One source process per copying sandbox, outside the host-agent.**
+   The host-agent starts it, moves it to the node's cgroup as it does
+   the Firecracker processes (ADR 0044 K2), and
+   records it in `sandbox.json`. It exits after the cutover. A
+   host-agent restart does not touch it. A new build of the source
+   applies to new copies only, so the source is never upgraded in
+   place.
+5. **A source failure stalls reads; it never ends a session.** The ublk
+   device uses user recovery with reissue: when the process dies the
+   kernel keeps the device and queues its I/O, and a new process
+   attaches and the kernel reissues what was in flight. The host-agent
+   restarts a dead source from `sandbox.json`. No code path kills,
+   evicts or rewinds a VM because its source failed.
+6. **Hydration belongs to the sandbox.** It is a host-owned job tied to
+   the sandbox's lifetime: destroyed with the sandbox, resumed after a
+   host-agent restart from the bitmap (which the kernel owns), never
+   restarted from zero. The restore RPC returns when the VM runs, not
+   when hydration ends. Memory prefetch is tied to the sandbox the same
+   way.
+7. **Cutover is the only exit.** When the bitmap shows every region
+   copied, the host-agent suspends the device, loads a `linear` table
+   onto the destination, resumes it, stops the source process, and
+   deletes the bitmap volume. The session is then an ADR 0125 session
+   in every respect.
+8. **A checkpoint during hydration is correct without waiting.** Under
+   the pause the checkpoint snapshots the destination and the bitmap
+   volume. A destination snapshot reads zeros in regions not yet
+   copied, so the upload never reads it directly. It reads through a
+   view: a second dm-clone table over the two snapshots and the same
+   source, with hydration off, which the kernel composes exactly as the
+   guest saw it. The upload hashes every 16 MiB window in which the
+   destination snapshot maps any block, and publishes the windows whose
+   hash differs from the source manifest; every other window is the
+   source manifest's chunk. Copied windows hash equal to the source, so
+   they cost a read and a hash, not an upload. The view and both
+   snapshots are deleted once the manifest is durable.
+9. **The heartbeat carries a fact, not an event.** Per sandbox: whether
+   it is hydrating. A host roll waits, within a bound, until no sandbox
+   on the host is hydrating; past the bound it rolls and the sources
+   survive it (Decision 4).
+10. **Disk readiness stops gating placement.** A host that has not
+    staged an image can take a session of that image: the first session
+    is a lazy restore from the image manifest. Staging continues in the
+    background and later sessions are eager. Memory readiness (ADR 0092)
+    is unchanged.
+
+## Design
+
+### Objects on a node
+
+```text
+/dev/engram/engram-pool.sb-<sandbox>-root          the guest's drive: dm-clone while hydrating, then linear
+/dev/engram/engram-pool.sb-<sandbox>-root-dest     the destination thin volume
+/dev/engram/engram-pool.sb-<sandbox>-root-bitmap   the dm-clone metadata thin volume
+/dev/ublkbN                                        the source, one per hydrating role
+<work_dir>/<sandbox>/sandbox.json                  the volume names, the source manifest, the source process
+```
+
+Swap follows root: a role whose manifest is not local restores lazily
+the same way.
+
+### Lifecycles
+
+**Lazy restore.** Create the destination and bitmap volumes. Start the
+source process for the manifest and wait for its ublk device. Load the
+dm-clone table (region 128 sectors, hydration enabled, threshold and
+batch sized from the measured source rate). Record everything in
+`sandbox.json`. Start Firecracker on the dm-clone device.
+
+**Hydration.** The kernel copies. The host-agent reads the bitmap
+counters from `dmsetup status` on each heartbeat and starts the cutover
+when they are complete.
+
+**Host-agent restart.** Read `sandbox.json`. For a hydrating sandbox,
+confirm the dm-clone device and the source process. Restart the source
+if it is gone (Decision 5). Nothing is copied again.
+
+**Checkpoint, evict, destroy.** As ADR 0125, with Decision 8 for the
+upload. Destroy also stops the source and deletes the bitmap.
+
+**Teleport target.** The target boots on a lazy source for the moved
+checkpoint instead of staging it first. The three-tier block move of
+ADR 0123 is unchanged for the blocks the source wrote after the
+checkpoint.
+
+### Placement
+
+The pool floor (ADR 0125) stays a hard gate. A lazy restore from an
+image with no staged base cannot share blocks with a base, so it
+consumes the volume's full size as it hydrates; placement counts the
+manifest's non-zero bytes against the floor for a lazy restore.
+
+## Tradeoffs
+
+- **A userspace process is in the read path while a sandbox
+  hydrates.** It is read-only and bounded in time, and its failure mode
+  is a read stall. It is not in the write path at any time.
+- **First reads during hydration cost the source's latency.** A GCS
+  miss is tens of milliseconds for a ranged read. The page cache, the
+  restored guest memory, the chunk cache and the read priority keep
+  this to the first touch of each chunk.
+- **A partial write into an uncopied region waits for one region
+  copy.** Measured at one source read. A whole-region write does not
+  wait.
+- **An fsync during hydration commits the bitmap.** Measured at about 3
+  ms more than a plain thin volume.
+- **A lazy restore without a staged base uses the full volume in the
+  pool.** It shares no blocks. An eager restore over a staged base
+  shares them, which is one reason the eager path stays.
+- **Two restore paths.** Decision 1 decides between them from manifests
+  before the restore, and the fallback makes a wrong decision safe. A
+  later change can unify them if seeding the bitmap from the base proves
+  sound.
+- **dm-clone is less used than dm-thin.** It has been in mainline Linux
+  since 5.4. The tests below cut every step, and the production node
+  image is checked before any code depends on it.
+
+## Testing
+
+- **Unit (`engram-disk-source`):** the source serves a manifest's exact
+  bytes for every offset and length; tier order; guest reads ahead of
+  hydration reads; a zero chunk reads as zeros without a fetch.
+- **dm-thin root lane (KVM runners, `ci.yml`):** the spike's checks as a
+  test: reads, partial and whole-region writes, hydration, cutover with
+  a handle open, and destination equals source plus every write. Cut at
+  every step of the lazy restore and the cutover, then converge on the
+  next pass to the same bytes. Kill the source mid-hydration; the reads
+  stall and complete after recovery with no error.
+- **Firecracker integration (KVM runners, `ci.yml`):** resume from a
+  manifest with no staged base: the guest runs in seconds and its disk
+  is correct; a checkpoint during hydration reproduces through `stage`;
+  a host-agent restart during hydration loses no write and copies
+  nothing again. Each sized to its property.
+- **Decision 1:** the estimate picks eager for a small diff over a
+  staged base and lazy for an unstaged image; a forced fallback from
+  eager to lazy produces the same bytes.
+- **Simulation (engram-sim):** the heartbeat's hydrating fact; the
+  invariant that no source failure produces an eviction or a rewind.
+- **Production evidence for acceptance:** a resume of an idle session on
+  an image version no host stages, on a new host, boots in under 10 s;
+  restore-deadline failures at zero for a week.
+
+## Rollout
+
+Each step is one PR and retires what it replaces.
+
+0. **Gate.** Check the production node image for `dm_clone` and
+   `ublk_drv` with user recovery. If either is missing, this ADR is
+   revised before any further step. Turn on host-agent tracing in
+   production so restores can be measured.
+1. **The source.** The `engram-disk-source` crate and binary: the ublk
+   server over a manifest, with its tests.
+2. **dm-clone in `engram-disk-thin`.** `SessionDisk` gains the clone,
+   status and cutover operations, `FileDisk` gains their file
+   equivalents for macOS and the simulator, with the root-lane tests.
+3. **Lazy restore.** Decision 1 and the lazy path in
+   `provision_for_restore`; hydration and cutover owned by the sandbox;
+   the restore RPC returns at boot; memory prefetch tied to the sandbox.
+4. **Placement and teleport.** Decision 10, the pool accounting for
+   lazy restores, and the teleport target.
+5. **Accept.** Write the facts into the DESIGN.md "Session disk" page
+   and flip this ADR.
