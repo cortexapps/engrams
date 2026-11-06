@@ -462,7 +462,9 @@ impl ThinPoolDisk {
         .await;
         let resumed = suspended.resume().await;
         if let Err(e) = taken.and(resumed) {
-            for snap in made {
+            // The destination snapshot goes first: one left without its
+            // bitmap snapshot is refused, never read as a whole disk.
+            for snap in made.into_iter().rev() {
                 let name = snap.name.clone();
                 drop(snap);
                 if let Err(error) = self.delete(&name).await {

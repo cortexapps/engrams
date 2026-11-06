@@ -21,6 +21,7 @@ use engram_host_core::disk::{
     clone_bitmap_bytes, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
 };
 use engram_host_core::disk_sources::Served;
+use engram_host_core::image_volumes;
 use engram_host_core::session_volumes::{live_name, Source};
 use engram_host_core::{checkpoint, stage, DiskSources, FileDisk, FileSources, SessionVolumes};
 use engram_storage_local::LocalBlobStorage;
@@ -721,13 +722,42 @@ impl LoopSource {
 }
 
 impl LoopSources {
+    /// The devices, also after a test panicked while it held them.
+    fn devices(&self) -> std::sync::MutexGuard<'_, HashMap<(SandboxId, DiskRole), LoopSource>> {
+        self.devices.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn detach_all(&self) {
-        for (_, source) in self.devices.lock().unwrap().drain() {
+        let sources: Vec<LoopSource> = self.devices().drain().map(|(_, s)| s).collect();
+        for source in sources {
+            if let Some(delay) = &source.delay {
+                let _ = remove_dm(delay);
+            }
             let _ = Command::new("losetup")
                 .args(["-d", &source.loop_dev])
                 .output();
         }
     }
+}
+
+/// Remove a device-mapper device, waiting a bounded time for a holder
+/// that goes by itself, such as a udev probe of a new device.
+fn remove_dm(name: &str) -> std::io::Result<()> {
+    let mut stderr = String::new();
+    for _ in 0..10 {
+        let output = Command::new("dmsetup")
+            .args(["remove", "--retry", "--noudevsync", name])
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(std::io::Error::new(
+        ErrorKind::ResourceBusy,
+        format!("dmsetup remove {name}: {stderr}"),
+    ))
 }
 
 #[async_trait]
@@ -757,7 +787,7 @@ impl DiskSources for LoopSources {
         });
         let source = LoopSource { loop_dev, delay };
         let path = source.path();
-        self.devices.lock().unwrap().insert((sandbox, role), source);
+        self.devices().insert((sandbox, role), source);
         Ok(path)
     }
 
@@ -767,12 +797,7 @@ impl DiskSources for LoopSources {
 
     async fn served(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<Served> {
         let served = self.files.served(sandbox, role).await?;
-        let device = self
-            .devices
-            .lock()
-            .unwrap()
-            .get(&(sandbox, role))
-            .map(LoopSource::path);
+        let device = self.devices().get(&(sandbox, role)).map(LoopSource::path);
         Ok(Served {
             device: device.ok_or(ErrorKind::NotFound)?,
             ..served
@@ -780,11 +805,24 @@ impl DiskSources for LoopSources {
     }
 
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
-        if let Some(source) = self.devices.lock().unwrap().remove(&(sandbox, role)) {
+        let source = self.devices().remove(&(sandbox, role));
+        if let Some(source) = source {
             if let Some(delay) = &source.delay {
-                run("dmsetup", &["remove", "--noudevsync", delay]);
+                if let Err(e) = remove_dm(delay) {
+                    self.devices().insert((sandbox, role), source);
+                    return Err(e);
+                }
             }
-            run("losetup", &["-d", &source.loop_dev]);
+            let detached = Command::new("losetup")
+                .args(["-d", &source.loop_dev])
+                .output()?;
+            if !detached.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "losetup -d {}: {}",
+                    source.loop_dev,
+                    String::from_utf8_lossy(&detached.stderr)
+                )));
+            }
         }
         self.files.stop(sandbox, role).await
     }
@@ -794,9 +832,10 @@ impl DiskSources for LoopSources {
     }
 }
 
-/// Every device-mapper device of `sandbox`, its source's delay included.
-fn sandbox_devices(sandbox: SandboxId) -> Vec<String> {
-    let id = sandbox.as_uuid().simple().to_string();
+/// Every device-mapper device whose name holds `id`: a sandbox's with
+/// its source's delay, or an image's.
+fn devices_naming(id: impl std::fmt::Display) -> Vec<String> {
+    let id = id.to_string();
     run("dmsetup", &["ls"])
         .lines()
         .filter_map(|line| line.split_whitespace().next())
@@ -807,8 +846,8 @@ fn sandbox_devices(sandbox: SandboxId) -> Vec<String> {
 
 /// Session volumes over the pool with loop-device sources, an image
 /// manifest of `SIZE` pattern bytes, and one sandbox. Dropping it removes
-/// what a failed test left of the sandbox: its devices, in passes because
-/// a drive holds its thins, then the loop devices.
+/// what a failed test left of the sandbox and the image: their devices,
+/// in passes because a drive holds its thins, then the loop devices.
 struct SessionRig {
     disk: ThinPoolDisk,
     store: ChunkStore,
@@ -835,17 +874,7 @@ impl SessionRig {
         let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blobs"))));
         let files = FileDisk::new(dir.path().join("files"), CHUNK).unwrap();
         let bytes = pattern(SIZE as usize, 0x2545_F491);
-        let image_file = files
-            .create(&VolumeName::new("image").unwrap(), SIZE)
-            .await
-            .unwrap();
-        image_file.write_range(0, bytes.clone()).await.unwrap();
-        let snap = VolumeName::new("image-snap").unwrap();
-        let (_, manifest) = checkpoint(&files, &store, &image_file, &snap, None)
-            .await
-            .unwrap();
-        let image = ManifestRef::new();
-        store.put_manifest(image, &manifest).await.unwrap();
+        let image = publish(&files, &store, "image", &bytes).await;
         let sources = Arc::new(LoopSources {
             files: FileSources::new(dir.path().join("sources"), store.clone()).unwrap(),
             delay_ms: read_delay_ms,
@@ -868,13 +897,18 @@ impl SessionRig {
 
     /// The sandbox's root, provisioned lazily from the image.
     async fn lazy_root(&self) -> Volume {
-        let lazy = Source::LazyFork {
+        self.root(Source::LazyFork {
             manifest: self.image,
             base: None,
-        };
+        })
+        .await
+    }
+
+    /// The sandbox's root, provisioned from `source`.
+    async fn root(&self, source: Source) -> Volume {
         let provisioned = self
             .volumes
-            .provision(self.sandbox, lazy, None)
+            .provision(self.sandbox, source, None)
             .await
             .unwrap();
         Volume::open(
@@ -897,23 +931,61 @@ impl SessionRig {
     async fn release_clean(&self) {
         self.volumes.release(self.sandbox).await.unwrap();
         assert_eq!(self.sources.list().await.unwrap(), Vec::new());
-        assert_eq!(self.sources.devices.lock().unwrap().len(), 0);
-        assert_eq!(sandbox_devices(self.sandbox), Vec::<String>::new());
+        assert_eq!(self.sources.devices().len(), 0);
+        assert_eq!(
+            devices_naming(self.sandbox.as_uuid().simple()),
+            Vec::<String>::new()
+        );
     }
 }
 
 impl Drop for SessionRig {
     fn drop(&mut self) {
+        let ids = [
+            self.sandbox.as_uuid().simple().to_string(),
+            self.image.manifest_id.simple().to_string(),
+        ];
         for _ in 0..4 {
-            for device in sandbox_devices(self.sandbox) {
+            for device in ids.iter().flat_map(devices_naming) {
                 let _ = Command::new("dmsetup")
-                    .args(["remove", "--noudevsync", &device])
+                    .args(["remove", "--retry", "--noudevsync", &device])
                     .output();
                 let _ = std::fs::remove_file(Path::new(NODES).join(&device));
             }
         }
         self.sources.detach_all();
     }
+}
+
+/// Publish `bytes` as a disk manifest, through a file volume `name`.
+async fn publish(files: &FileDisk, store: &ChunkStore, name: &str, bytes: &[u8]) -> ManifestRef {
+    let volume = files
+        .create(&VolumeName::new(name).unwrap(), bytes.len() as u64)
+        .await
+        .unwrap();
+    volume.write_range(0, bytes.to_vec()).await.unwrap();
+    let snap = VolumeName::new(format!("{name}-snap")).unwrap();
+    let (_, manifest) = checkpoint(files, store, &volume, &snap, None)
+        .await
+        .unwrap();
+    let published = ManifestRef::new();
+    store.put_manifest(published, &manifest).await.unwrap();
+    published
+}
+
+/// The manifest's bytes, staged into a file volume `name`.
+async fn staged_bytes(files: &FileDisk, store: &ChunkStore, name: &str, m: ManifestRef) -> Vec<u8> {
+    let manifest = store.get_manifest(m).await.unwrap();
+    let staged = stage(
+        files,
+        store,
+        &VolumeName::new(name).unwrap(),
+        &manifest,
+        None,
+    )
+    .await
+    .unwrap();
+    whole(&staged).await
 }
 
 /// A lazy provision boots the role over a drive that reads the manifest
@@ -976,18 +1048,72 @@ async fn a_checkpoint_mid_hydration_stages_into_what_the_drive_read() {
         .await
         .unwrap();
 
-    let manifest = rig.store.get_manifest(published).await.unwrap();
-    let staged = stage(
-        &rig.files,
-        &rig.store,
-        &VolumeName::new("staged").unwrap(),
-        &manifest,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(first_difference(&whole(&staged).await, &expected), None);
+    let staged = staged_bytes(&rig.files, &rig.store, "staged", published).await;
+    assert_eq!(first_difference(&staged, &expected), None);
     assert!(matches!(rig.root_state().await, CloneState::Copying { .. }));
     drop(drive);
     rig.release_clean().await;
+}
+
+/// Over a staged base the destination is a snapshot of the image
+/// volume. A chunk the destination never wrote is the source's, also
+/// where the base differs; a chunk the guest wrote with the base's own
+/// bytes is the guest's, although its content equals the origin's.
+#[tokio::test]
+#[ignore]
+async fn a_checkpoint_over_a_staged_base_stages_into_what_the_drive_read() {
+    let Some(rig) = SessionRig::new(Some(50)).await else {
+        return;
+    };
+    let image_volume = image_volumes::volume_name(rig.image);
+    let base = rig.store.get_manifest(rig.image).await.unwrap();
+    drop(
+        stage(&rig.disk, &rig.store, &image_volume, &base, None)
+            .await
+            .unwrap(),
+    );
+    let mut wanted = rig.bytes.clone();
+    let late = (40 * REGION) as usize;
+    wanted[late..].copy_from_slice(&pattern(SIZE as usize - late, 0x1357_9BDF));
+    let manifest = publish(&rig.files, &rig.store, "continued", &wanted).await;
+
+    let drive = rig
+        .root(Source::LazyContinue {
+            manifest,
+            base: Some(rig.image),
+        })
+        .await;
+    let mut expected = wanted.clone();
+    let region = (50 * REGION) as usize..(51 * REGION) as usize;
+    write(
+        &drive,
+        &mut expected,
+        50 * REGION,
+        rig.bytes[region].to_vec(),
+    )
+    .await;
+    let CloneState::Copying {
+        hydrated_regions, ..
+    } = rig.root_state().await
+    else {
+        panic!("the drive is not copying");
+    };
+    eprintln!("{hydrated_regions} of {REGIONS} regions copied before the take");
+    assert!(hydrated_regions < 40);
+
+    let published = rig
+        .volumes
+        .checkpoint(rig.sandbox, DiskRole::Root)
+        .await
+        .unwrap();
+
+    let staged = staged_bytes(&rig.files, &rig.store, "staged", published).await;
+    assert_eq!(first_difference(&staged, &expected), None);
+    drop(drive);
+    rig.release_clean().await;
+    rig.disk.delete(&image_volume).await.unwrap();
+    assert_eq!(
+        devices_naming(rig.image.manifest_id.simple()),
+        Vec::<String>::new()
+    );
 }

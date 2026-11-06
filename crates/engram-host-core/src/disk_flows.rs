@@ -17,7 +17,7 @@ fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
 }
 
-fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
+pub(crate) fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
     if volume.chunk_size != manifest.chunk_size.as_u64()
         || volume.size_bytes != manifest.total_bytes
     {
@@ -151,6 +151,7 @@ pub mod checkpoint_split {
         indices: Vec<ChunkIndex>,
         base: &Manifest,
     ) -> io::Result<Manifest> {
+        shape_matches(from, base)?;
         let chunk_size = from.chunk_size;
         let results: Vec<(u64, Option<ChunkRef>)> = stream::iter(indices.into_iter().map(Ok))
             .map_ok(|index| async move {

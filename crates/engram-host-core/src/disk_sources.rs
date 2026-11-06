@@ -51,7 +51,10 @@ pub trait DiskSources: Send + Sync {
     async fn served(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Served>;
 
     /// Stop the role's source. No drive or view may read it. A role with
-    /// no source is left as it is.
+    /// no source is left as it is. The device can stay held for a moment
+    /// after the last drive over it is removed (a udev probe, for one);
+    /// `stop` waits a bounded time for that, then fails with
+    /// `ResourceBusy`.
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()>;
 
     /// Every role that has a source.
