@@ -463,7 +463,11 @@ impl ChunkedMemoryBackend {
     ///    writer past the client's reply timeout): the object store
     ///    directly, hash-verified, kept in memory and never written to
     ///    the cache. Each fault thread waits on at most one such fetch,
-    ///    so the fault threads bound the fan-out.
+    ///    so the fault threads bound the fan-out. It is the only fetch
+    ///    outside the fill engine, and it runs only while no engine can
+    ///    answer: a handler with no writer at startup (bake and test
+    ///    runs) and a writer that is gone mid-run (a guest keeps running
+    ///    through the roll).
     ///
     /// Synchronous: the fault and producer threads call it, never a
     /// runtime worker. `rt` runs the object-store fetch of step 3.
