@@ -211,12 +211,19 @@ estimate in Decision 1.
    deletes the bitmap volume. The session is then an ADR 0125 session
    in every respect.
 8. **A checkpoint during hydration is correct without waiting.** Under
-   the pause the checkpoint snapshots the destination and the bitmap
-   volume. A destination snapshot reads zeros in regions not yet
+   the pause the checkpoint syncs the drive, which commits the bitmap
+   with every region the guest wrote. It then suspends the drive, which
+   stops the background copy, snapshots the bitmap volume and the
+   destination, and resumes the drive. The copy does not stop for the
+   guest pause, so without the suspend the bitmap snapshot could record
+   a region that the destination snapshot does not hold. A destination
+   snapshot reads zeros in regions not yet
    copied, so the upload never reads it directly. It reads through a
    view: a second dm-clone table over the two snapshots and the same
-   source, with hydration off, which the kernel composes exactly as the
-   guest saw it. The upload hashes every 16 MiB window in which the
+   source, with hydration off and loaded read-only, which the kernel
+   composes exactly as the guest saw it. The dm-thin root lane proves
+   this on kernel 6.8 with the copy running and guest writes before and
+   after the snapshots. The upload hashes every 16 MiB window in which the
    destination snapshot maps any block, and publishes the windows whose
    hash differs from the source manifest; every other window is the
    source manifest's chunk. Copied windows hash equal to the source, so
@@ -240,12 +247,20 @@ estimate in Decision 1.
 /dev/engram/engram-pool.sb-<sandbox>-root          the guest's drive: dm-clone while hydrating, then linear
 /dev/engram/engram-pool.sb-<sandbox>-root-dest     the destination thin volume
 /dev/engram/engram-pool.sb-<sandbox>-root-bitmap   the dm-clone metadata thin volume
+/dev/engram/engram-pool.<view>                     a checkpoint's read-only view, while it uploads
 /dev/ublkbN                                        the source, one per hydrating role
 <work_dir>/<sandbox>/sandbox.json                  the volume names, the source manifest, the source process
 ```
 
 Swap follows root: a role whose manifest is not local restores lazily
 the same way.
+
+`SessionDisk` carries the drive operations: `clone_drive`,
+`open_clone`, `clone_state`, `enable_hydration`, `cut_over`,
+`snapshot_clone`, `clone_view` and `remove_clone`. `FileDisk` (macOS and
+the simulator) has no dm-clone. It hydrates eagerly: `clone_drive`
+copies the source into the destination before it returns, so a drive
+is hydrated from the start and `cut_over` only records the state.
 
 ### Lifecycles
 
