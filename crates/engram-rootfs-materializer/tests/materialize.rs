@@ -327,34 +327,8 @@ async fn unknown_layer_media_type_fails_loud_before_any_download() {
 }
 
 // ---------------------------------------------------------------
-// Full pipeline: determinism + scratch discipline (needs mke2fs).
+// Full pipeline: determinism + scratch discipline.
 // ---------------------------------------------------------------
-
-/// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1 (the same >=1.47.1 e2fsprogs determinism
-/// gate). Older/missing mke2fs → skip with a note, never flake.
-fn deterministic_mke2fs_available() -> Option<String> {
-    let on_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
-        .unwrap_or(false);
-    if !on_path {
-        return None;
-    }
-    let out = std::process::Command::new("mke2fs")
-        .arg("-V")
-        .output()
-        .ok()?;
-    // `mke2fs -V` prints e.g. "mke2fs 1.47.2 (1-Jan-2025)" to stderr.
-    let text = String::from_utf8_lossy(&out.stderr).into_owned();
-    let ver = text.split_whitespace().find_map(|tok| {
-        let mut it = tok.split('.');
-        let a: u32 = it.next()?.parse().ok()?;
-        let b: u32 = it.next()?.parse().ok()?;
-        let c: u32 = it.next()?.parse().ok()?;
-        Some((a, b, c))
-    });
-    matches!(ver, Some(v) if v >= (1, 47, 1)).then_some(text)
-}
 
 fn materializer() -> Materializer {
     Materializer::new(
@@ -373,14 +347,6 @@ fn materializer() -> Materializer {
 /// every run scrubs its scratch, success or not.
 #[tokio::test]
 async fn materialize_is_deterministic_and_scrubs_scratch() {
-    let Some(ver) = deterministic_mke2fs_available() else {
-        eprintln!(
-            "mke2fs missing or < 1.47.1 (no SOURCE_DATE_EPOCH); skipping determinism test \
-             (use the flake-pinned mke2fs: `nix develop`)"
-        );
-        return;
-    };
-    eprintln!("using {}", ver.trim());
 
     let fx = publish_fixture(None).await;
     let store_dir = tempfile::tempdir().unwrap();
