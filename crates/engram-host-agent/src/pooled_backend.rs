@@ -2638,6 +2638,14 @@ impl PooledBackend {
             }
         };
         let dest = self.inner.snapshot_path_for(metadata.id);
+        // The create returned in this process, so its files are all
+        // there: Firecracker writes `state.bin` with the guest memory,
+        // VZ and Process write neither. A failed stat counts as memory, so
+        // the post phase fails on the files instead of skipping them.
+        let writes_memory = !matches!(
+            tokio::fs::try_exists(dest.join("state.bin")).await,
+            Ok(false)
+        );
         // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
         // the guest back running. The guard rides into `SnapshotCapture`
         // (still armed) so the cancellation gap in `snapshot_begin` and
@@ -2650,6 +2658,7 @@ impl PooledBackend {
                 dest,
                 chain_prev,
                 paused_at,
+                writes_memory,
                 unwind,
             },
         ))
@@ -3822,6 +3831,8 @@ pub(crate) struct SnapshotCapture {
         engram_chunk_store::Manifest,
     )>,
     paused_at: chrono::DateTime<chrono::Utc>,
+    /// The backend wrote guest memory and its restore files.
+    writes_memory: bool,
     /// Owns the pending disk checkpoints and resumes the guest if this
     /// capture is dropped before the finisher takes it over.
     unwind: CaptureUnwind,
@@ -3946,6 +3957,7 @@ impl SnapshotFinisher {
             dest,
             chain_prev,
             paused_at,
+            writes_memory,
             mut unwind,
         } = cap;
         let flavor = if chain_prev.is_some() { "diff" } else { "full" };
@@ -3958,22 +3970,25 @@ impl SnapshotFinisher {
         // the session_events coherence cursor from it.
         metadata.paused_at = Some(paused_at);
         let had_chain = chain_prev.is_some();
+        // Only a chain-seeded backend takes a diff, so a diff always has
+        // memory.
         let memory = match chain_prev {
-            Some((prev_ref, prev)) => crate::snapshot_post::Memory::Diff {
+            Some((prev_ref, prev)) => Some(crate::snapshot_post::Memory::Diff {
                 prev_ref,
                 prev: Some(prev),
                 extents: None,
-            },
-            None => crate::snapshot_post::Memory::Full,
+            }),
+            None => writes_memory.then_some(crate::snapshot_post::Memory::Full),
         };
+        let blobs = memory.is_some();
         let aux_bundles = metadata.aux_bundles.clone();
         let phase = self.post_phase();
         let post = phase.run(crate::snapshot_post::Work {
             snapshot_id: metadata.id,
             dest: &dest,
             disks: Some(crate::snapshot_post::Disks::Held(pending)),
-            memory: Some(memory),
-            blobs: true,
+            memory,
+            blobs,
             trace_lineage: self.session_bindings.get(&id).map(|e| *e),
             aux_bundles: &aux_bundles,
             source: "snapshot_finish",
@@ -4832,11 +4847,14 @@ impl SandboxBackend for PooledBackend {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
 
+        // The gate above admits only a backend that writes guest memory,
+        // and the finalize always publishes it.
         let SnapshotCapture {
             metadata,
             dest,
             chain_prev,
             paused_at,
+            writes_memory: _,
             mut unwind,
         } = cap;
         let snapshot_id = metadata.id;

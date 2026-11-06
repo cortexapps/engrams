@@ -51,8 +51,9 @@ pub(crate) enum Memory {
         prev: Option<Manifest>,
         extents: Option<DiffExtents>,
     },
-    /// `memory.bin`, the whole guest memory. A backend that writes no
-    /// memory file (VZ, Process) has no memory manifest.
+    /// `memory.bin`, the whole guest memory. A missing file is a lost
+    /// file: a caller whose backend writes no guest memory passes no
+    /// `Memory`.
     Full,
 }
 
@@ -72,13 +73,32 @@ pub(crate) struct Work<'w> {
 }
 
 /// What one run published.
-#[derive(Default)]
 pub(crate) struct Published {
     pub root: Option<ManifestRef>,
     pub swap: Option<ManifestRef>,
     pub memory: Option<PublishedMemory>,
     pub blobs: Option<BlobKeys>,
+}
+
+/// Each leg's own result from one run.
+pub(crate) struct Ran {
+    pub disks: Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError>,
+    pub memory: Result<Option<PublishedMemory>, SandboxError>,
+    pub blobs: Result<Option<BlobKeys>, SandboxError>,
     pub seconds: LegSeconds,
+}
+
+impl Ran {
+    /// What the run published, or the first leg error.
+    pub(crate) fn into_published(self) -> Result<Published, SandboxError> {
+        let (root, swap) = self.disks?;
+        Ok(Published {
+            root,
+            swap,
+            memory: self.memory?,
+            blobs: self.blobs?,
+        })
+    }
 }
 
 pub(crate) struct PublishedMemory {
@@ -98,7 +118,6 @@ pub(crate) struct BlobKeys {
 }
 
 /// Wall-clock of each leg that ran.
-#[derive(Default)]
 pub(crate) struct LegSeconds {
     pub disk: Option<f64>,
     pub memory: Option<f64>,
@@ -106,7 +125,15 @@ pub(crate) struct LegSeconds {
 }
 
 impl PostPhase<'_> {
+    /// Run every leg; fail if any leg failed.
     pub(crate) async fn run(&self, work: Work<'_>) -> Result<Published, SandboxError> {
+        self.run_legs(work).await?.into_published()
+    }
+
+    /// Run every leg and return each leg's own result, so a caller can
+    /// keep what one leg published when another leg failed. `Err` means
+    /// that no leg ran.
+    pub(crate) async fn run_legs(&self, work: Work<'_>) -> Result<Ran, SandboxError> {
         let Work {
             snapshot_id,
             dest,
@@ -119,25 +146,10 @@ impl PostPhase<'_> {
         } = work;
         let state_path = dest.join("state.bin");
         let sidecar_path = dest.join("manifest.json");
-        // Only a backend that writes guest memory (Firecracker) writes
-        // `state.bin`. A full capture with neither file is a backend
-        // without memory (VZ, Process): it publishes its disks only. One
-        // with `state.bin` and no `memory.bin` lost its memory. A capture
-        // with memory also wrote the sidecar, so a missing or empty
-        // restore file is a lost file.
-        let memoryless =
-            matches!(memory, Some(Memory::Full)) && !fs_exists(&dest.join("memory.bin")).await;
-        if memoryless && fs_exists(&state_path).await {
-            return Err(SandboxError::Snapshot(format!(
-                "{} has state.bin but no memory.bin",
-                dest.display()
-            )));
-        }
-        let memory = memory.filter(|_| !memoryless);
         let blob = self
             .chunk_store
             .map(|store| store.blob_storage())
-            .filter(|_| blobs && !memoryless);
+            .filter(|_| blobs);
         if blob.is_some() {
             check_restore_files(&state_path, &sidecar_path).await?;
         }
@@ -146,82 +158,105 @@ impl PostPhase<'_> {
 
         let disk_leg = async {
             let Some(disks) = disks else {
-                return Ok((None, None, None));
+                return (Ok((None, None)), None);
             };
             let start = crate::time_source::metrics_now();
-            let (root, swap) = self
+            let published = self
                 .publish_disks(disks)
                 .instrument(tracing::info_span!("finish.disk_publish"))
-                .await?;
-            Ok::<_, SandboxError>((root, swap, Some(start.elapsed().as_secs_f64())))
+                .await;
+            (published, Some(start.elapsed().as_secs_f64()))
         };
+        // The sidecar upload follows the memory publish, which patches
+        // the sidecar. Its result belongs to the blobs.
         let memory_leg = async {
             let start = crate::time_source::metrics_now();
             let (published, memory_seconds) = match memory {
                 Some(memory) => {
-                    let published = self.publish_memory(dest, memory, source).await?;
-                    if let Some(m) = &published {
-                        patch_fc_manifest_memory_ref(
-                            self.fs,
-                            &sidecar_path,
-                            m.manifest_ref,
-                            trace_lineage,
-                        )
-                        .await?;
+                    let published = async {
+                        let published = self.publish_memory(dest, memory, source).await?;
+                        if let Some(m) = &published {
+                            patch_fc_manifest_memory_ref(
+                                self.fs,
+                                &sidecar_path,
+                                m.manifest_ref,
+                                trace_lineage,
+                            )
+                            .await?;
+                        }
+                        Ok::<_, SandboxError>(published)
                     }
+                    .await;
                     (published, Some(start.elapsed().as_secs_f64()))
                 }
-                None => (None, None),
+                None => (Ok(None), None),
             };
-            if let Some(blob) = blob.as_ref() {
-                engram_chunk_store::snapshot_blob::upload_file(
+            let sidecar = match (&published, blob.as_ref()) {
+                (Err(_), _) | (_, None) => Ok(()),
+                (Ok(_), Some(blob)) => engram_chunk_store::snapshot_blob::upload_file(
                     blob.as_ref(),
                     &sidecar_key,
                     &sidecar_path,
                 )
                 .instrument(tracing::info_span!("finish.sidecar_upload"))
                 .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
-            }
-            Ok::<_, SandboxError>((published, memory_seconds))
+                .map(drop)
+                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}"))),
+            };
+            (published, memory_seconds, sidecar)
         };
         let state_leg = async {
             let Some(blob) = blob.as_ref() else {
-                return Ok(None);
+                return (Ok(()), None);
             };
             let start = crate::time_source::metrics_now();
-            engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
+            let uploaded = async {
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &state_key,
+                    &state_path,
+                )
                 .instrument(tracing::info_span!("finish.blob_upload"))
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            // A pin nothing can satisfy is worse than a retried capture,
-            // so a failed bundle publish fails the phase.
-            if !aux_bundles.is_empty() {
-                crate::bundles::BundleStore::new(
-                    blob.clone(),
-                    self.bundle_dir.to_path_buf(),
-                    self.bundle_file_ext,
-                )
-                .publish(aux_bundles)
-                .instrument(tracing::info_span!("finish.bundle_publish"))
-                .await?;
+                // A pin nothing can satisfy is worse than a retried
+                // capture, so a failed bundle publish fails the phase.
+                if !aux_bundles.is_empty() {
+                    crate::bundles::BundleStore::new(
+                        blob.clone(),
+                        self.bundle_dir.to_path_buf(),
+                        self.bundle_file_ext,
+                    )
+                    .publish(aux_bundles)
+                    .instrument(tracing::info_span!("finish.bundle_publish"))
+                    .await?;
+                }
+                Ok::<_, SandboxError>(())
             }
-            Ok::<_, SandboxError>(Some(start.elapsed().as_secs_f64()))
+            .await;
+            (uploaded, Some(start.elapsed().as_secs_f64()))
         };
         // `join!`, not `try_join!`: a failed leg must not cancel a disk
         // publish half way, which would leak its pending checkpoints.
-        let (disk, memory, state) = tokio::join!(disk_leg, memory_leg, state_leg);
-        let (root, swap, disk_seconds) = disk?;
-        let (memory, memory_seconds) = memory?;
-        let state_seconds = state?;
-        Ok(Published {
-            root,
-            swap,
+        let ((disks, disk_seconds), (memory, memory_seconds, sidecar), (state, state_seconds)) =
+            tokio::join!(disk_leg, memory_leg, state_leg);
+        let blobs = match blob {
+            None => Ok(None),
+            Some(_) => match (&memory, state, sidecar) {
+                (Err(_), _, _) => Err(SandboxError::Snapshot(
+                    "the sidecar was not uploaded: the memory publish failed".into(),
+                )),
+                (Ok(_), Err(e), _) | (Ok(_), Ok(()), Err(e)) => Err(e),
+                (Ok(_), Ok(()), Ok(())) => Ok(Some(BlobKeys {
+                    state: state_key,
+                    sidecar: sidecar_key,
+                })),
+            },
+        };
+        Ok(Ran {
+            disks,
             memory,
-            blobs: blob.is_some().then_some(BlobKeys {
-                state: state_key,
-                sidecar: sidecar_key,
-            }),
+            blobs,
             seconds: LegSeconds {
                 disk: disk_seconds,
                 memory: memory_seconds,
@@ -625,9 +660,10 @@ impl SyncScope {
     }
 }
 
-/// fsync the capture files that exist in `dest`, then the dir. The FC
-/// backend resumes the guest before its files reach the disk
-/// (`SandboxBackend::snapshot`'s contract).
+/// fsync the capture files that exist in `dest`, then the dir, then its
+/// parent, which holds the new dir's own entry. The FC backend resumes
+/// the guest before its files reach the disk (`SandboxBackend::snapshot`'s
+/// contract).
 pub(crate) async fn sync_capture(
     fs: &dyn HostFs,
     dest: &Path,
@@ -640,7 +676,11 @@ pub(crate) async fn sync_capture(
             Err(e) => return Err(e),
         }
     }
-    fs.sync_dir(dest).await
+    fs.sync_dir(dest).await?;
+    match dest.parent() {
+        Some(parent) => fs.sync_dir(parent).await,
+        None => Ok(()),
+    }
 }
 
 /// Retire a consumed memory file: rename it away and fsync the dir, then
@@ -665,8 +705,4 @@ pub(crate) async fn retire_consumed(fs: Arc<dyn HostFs>, path: PathBuf) -> std::
         }
     });
     Ok(())
-}
-
-async fn fs_exists(path: &Path) -> bool {
-    tokio::fs::metadata(path).await.is_ok()
 }
