@@ -455,3 +455,28 @@ async fn an_upload_through_the_engine_store_takes_an_engine_slot() {
     upload.await.unwrap().unwrap();
     assert_eq!(engine.admission().in_flight(), 0);
 }
+
+#[test]
+fn config_refuses_a_zero_or_inverted_limit() {
+    let vars = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    let cfg = Config::from_vars(vars(&[("ENGRAM_FILL_IN_FLIGHT", "32")])).unwrap();
+    assert_eq!((cfg.in_flight, cfg.max_in_flight), (32, 32));
+    for bad in [
+        &[("ENGRAM_FILL_IN_FLIGHT", "0")][..],
+        &[
+            ("ENGRAM_FILL_IN_FLIGHT", "64"),
+            ("ENGRAM_FILL_IN_FLIGHT_MAX", "32"),
+        ][..],
+        &[("ENGRAM_FILL_IN_FLIGHT_MAX", "8")][..],
+        &[("ENGRAM_FILL_HEDGE_MS", "soon")][..],
+    ] {
+        assert!(Config::from_vars(vars(bad)).is_err(), "{bad:?}");
+    }
+}

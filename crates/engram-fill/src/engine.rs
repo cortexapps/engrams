@@ -54,33 +54,42 @@ impl Config {
     /// `ENGRAM_FILL_HEDGE_MS` (0 = off) read when set.
     /// `ENGRAM_FILL_IN_FLIGHT` sets the start and the ceiling, so the
     /// limit only backs off from it; `ENGRAM_FILL_IN_FLIGHT_MAX` then
-    /// raises the ceiling. A set value that does not parse is an error.
+    /// raises the ceiling. A set value that does not parse is an error,
+    /// and so is an in-flight count of 0 or a ceiling below the start.
     pub fn from_env() -> std::result::Result<Self, String> {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> std::result::Result<Self, String> {
+        let get = |name: &str| -> std::result::Result<Option<usize>, String> {
+            var(name)
+                .map(|v| v.parse().map_err(|e| format!("{name}={v:?}: {e}")))
+                .transpose()
+        };
         let mut cfg = Self::default();
-        if let Some(v) = env_usize("ENGRAM_FILL_IN_FLIGHT")? {
+        if let Some(v) = get("ENGRAM_FILL_IN_FLIGHT")? {
             cfg.in_flight = v;
             cfg.max_in_flight = v;
         }
-        if let Some(v) = env_usize("ENGRAM_FILL_IN_FLIGHT_MAX")? {
+        if let Some(v) = get("ENGRAM_FILL_IN_FLIGHT_MAX")? {
             cfg.max_in_flight = v;
         }
-        if let Some(v) = env_usize("ENGRAM_FILL_DEMAND_RESERVE")? {
+        if let Some(v) = get("ENGRAM_FILL_DEMAND_RESERVE")? {
             cfg.demand_reserve = v;
         }
-        if let Some(ms) = env_usize("ENGRAM_FILL_HEDGE_MS")? {
+        if let Some(ms) = get("ENGRAM_FILL_HEDGE_MS")? {
             cfg.hedge_after = (ms > 0).then(|| Duration::from_millis(ms as u64));
         }
+        if cfg.in_flight == 0 {
+            return Err("ENGRAM_FILL_IN_FLIGHT must be at least 1".into());
+        }
+        if cfg.max_in_flight < cfg.in_flight {
+            return Err(format!(
+                "ENGRAM_FILL_IN_FLIGHT_MAX={} is below the in-flight start {}",
+                cfg.max_in_flight, cfg.in_flight
+            ));
+        }
         Ok(cfg)
-    }
-}
-
-fn env_usize(name: &str) -> std::result::Result<Option<usize>, String> {
-    match std::env::var(name) {
-        Ok(v) => v
-            .parse()
-            .map(Some)
-            .map_err(|e| format!("{name}={v:?}: {e}")),
-        Err(_) => Ok(None),
     }
 }
 
