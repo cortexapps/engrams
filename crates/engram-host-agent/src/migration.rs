@@ -175,6 +175,26 @@ impl MigrationRegistry {
             .map(|(_, e)| e)
     }
 
+    /// [`Self::remove_validated`], but only while `state.bin` has not left
+    /// this host. The fetch path raises `state_served` under the shard
+    /// lock it found the export with, so a racing fetch either finds no
+    /// export or makes this return [`UnservedRemoval::Served`].
+    pub fn remove_unserved(&self, sandbox_id: SandboxId, export_id: &str) -> UnservedRemoval {
+        let mut served = false;
+        let removed = self.by_sandbox.remove_if(&sandbox_id, |_, e| {
+            if !constant_time_str_eq(&e.export_id, export_id) {
+                return false;
+            }
+            served = e.state_served.load(Ordering::SeqCst);
+            !served
+        });
+        match removed {
+            Some((_, export)) => UnservedRemoval::Removed(export),
+            None if served => UnservedRemoval::Served,
+            None => UnservedRemoval::Missing,
+        }
+    }
+
     /// The open export's id for a sandbox (the TTL sweep's handle).
     pub fn export_id_of(&self, sandbox_id: SandboxId) -> Option<String> {
         self.by_sandbox
@@ -256,6 +276,16 @@ impl MigrationRegistry {
             .map(|x| format!("{x:02x}"))
             .collect()
     }
+}
+
+/// What [`MigrationRegistry::remove_unserved`] found.
+pub enum UnservedRemoval {
+    /// The state never left this host; the caller owns the export.
+    Removed(MigrationExport),
+    /// A destination fetched the state; the export stays open.
+    Served,
+    /// No open export matches the sandbox and export id.
+    Missing,
 }
 
 /// ADR 0045: what the TTL sweep should do with an expired export,

@@ -28,12 +28,17 @@ pub struct ScriptedHost {
     pub resume_not_found: AtomicBool,
     /// `migration_abort` answers NotFound: the export is already consumed.
     pub abort_not_found: AtomicBool,
+    /// A destination fetched the paused state from this source.
+    pub state_served: AtomicBool,
+    /// The host predates `migration_abort_unserved`.
+    pub abort_unserved_unsupported: AtomicBool,
     pub destroy_fails: AtomicBool,
     pub spawn_fails: AtomicBool,
     pub captures: AtomicUsize,
     pub restores: AtomicUsize,
     pub resumes: AtomicUsize,
     pub aborts: AtomicUsize,
+    pub unserved_aborts: AtomicUsize,
     pub destroys: AtomicUsize,
     pub spawns: AtomicUsize,
     pub binds: AtomicUsize,
@@ -56,12 +61,15 @@ impl ScriptedHost {
             resume_fails: AtomicBool::new(false),
             resume_not_found: AtomicBool::new(false),
             abort_not_found: AtomicBool::new(false),
+            state_served: AtomicBool::new(false),
+            abort_unserved_unsupported: AtomicBool::new(false),
             destroy_fails: AtomicBool::new(false),
             spawn_fails: AtomicBool::new(false),
             captures: AtomicUsize::new(0),
             restores: AtomicUsize::new(0),
             resumes: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
+            unserved_aborts: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
             spawns: AtomicUsize::new(0),
             binds: AtomicUsize::new(0),
@@ -321,6 +329,23 @@ impl HostClient for ScriptedHost {
         } else {
             Ok(())
         }
+    }
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        self.unserved_aborts.fetch_add(1, Ordering::SeqCst);
+        if self.abort_unserved_unsupported.load(Ordering::SeqCst) {
+            return Err(SandboxError::InvalidSpec(
+                "this host doesn't support `migration_abort_unserved`".into(),
+            ));
+        }
+        if self.state_served.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.migration_abort(id, export, fence).await.map(|()| true)
     }
     fn harness_dial(&self) -> HarnessDial {
         HarnessDial::Vsock

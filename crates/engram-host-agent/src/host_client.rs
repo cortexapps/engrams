@@ -236,6 +236,15 @@ impl HostClient for LocalHostClient {
         self.sandbox.migration_abort(id, export_id).await
     }
 
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        self.sandbox.migration_abort_unserved(id, export_id).await
+    }
+
     async fn commit_snapshot(
         &self,
         id: SandboxId,

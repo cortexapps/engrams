@@ -461,6 +461,22 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// [`Self::migration_abort`], but only while no destination has fetched
+    /// the paused state. `Ok(true)`: the export is gone, no destination can
+    /// load the state, and the guest is resumed (a later `resume` finishes
+    /// a resume that failed). `Ok(false)`: the state was served, so a
+    /// destination can be running it; the export stays open and the guest
+    /// stays paused.
+    async fn migration_abort_unserved(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+    ) -> Result<bool, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_abort_unserved`".into(),
+        ))
+    }
+
     /// ADR 0028 Fix A: diff-flavored sibling of [`Self::snapshot`].
     /// Same snapshot-dir + sidecar + vmstate contract, but the memory
     /// artifact is `memory.diff` — a sparse file holding ONLY the

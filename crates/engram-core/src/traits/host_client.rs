@@ -283,6 +283,18 @@ pub trait HostClient: Send + Sync {
             "this host doesn't support `migration_abort`".into(),
         ))
     }
+
+    /// See `SandboxBackend::migration_abort_unserved`.
+    async fn migration_abort_unserved(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_abort_unserved`".into(),
+        ))
+    }
     /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
     /// pipeline has fully succeeded. See `SandboxBackend::commit_snapshot`
     /// for the contract. Default impl returns Ok so HostClients backed by

@@ -469,6 +469,79 @@ async fn refused_memory_image_rolls_back_live_move(rig: Rig) {
 }
 scenario!(refused_memory_image_rolls_back_live_move);
 
+/// A destination that fails before it fetched the paused state cannot run
+/// the guest, so the source aborts its export and keeps the session.
+async fn dest_failure_before_the_state_is_served_resumes_the_source(rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.dest.restores.load(Ordering::SeqCst), 1, "no retry");
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Active);
+    assert_eq!(session.host_id, Some(rig.row.source_host_id));
+    assert_eq!(session.sandbox_id, Some(rig.source.sandbox));
+    let meta = &rig.state.services.meta;
+    assert!(meta
+        .sandbox_tombstones_for_host(rig.row.source_host_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let events = meta
+        .list_session_events_since(rig.row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let terminal: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].payload["outcome"], "aborted");
+}
+scenario!(dest_failure_before_the_state_is_served_resumes_the_source);
+
+/// After its retries, a destination failure the source cannot rule out
+/// as a running guest settles the session Dead and entombs the source.
+async fn dest_failure_without_unserved_proof_is_dead(mut rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Retry(_)));
+    assert_eq!(rig.phase().await, Some(TeleportPhase::Captured));
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 0);
+    rig.op.attempts = 4;
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Dead);
+    assert_eq!(
+        rig.state
+            .services
+            .meta
+            .sandbox_tombstones_for_host(rig.row.source_host_id)
+            .await
+            .unwrap(),
+        vec![rig.source.sandbox]
+    );
+}
+
+async fn served_state_dest_failure_is_dead(rig: Rig) {
+    rig.source.state_served.store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(served_state_dest_failure_is_dead);
+
+async fn source_without_the_served_answer_is_dead(rig: Rig) {
+    rig.source
+        .abort_unserved_unsupported
+        .store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(source_without_the_served_answer_is_dead);
+
 /// A consumed export (an earlier abort passed its point of no return) is
 /// not a resumed guest: the rollback still needs the resume ack before it
 /// declares Active.

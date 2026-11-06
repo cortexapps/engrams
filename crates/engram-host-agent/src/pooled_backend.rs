@@ -5543,6 +5543,29 @@ impl SandboxBackend for PooledBackend {
         self.abort_migration_export(export).await
     }
 
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<bool, SandboxError> {
+        use crate::migration::UnservedRemoval;
+        let export = match self.migrations.remove_unserved(id, export_id) {
+            UnservedRemoval::Removed(export) => export,
+            UnservedRemoval::Served => return Ok(false),
+            UnservedRemoval::Missing => return Err(SandboxError::NotFound),
+        };
+        if let Some(peer) = self.migrate_peer_server() {
+            peer.remove(export_id);
+        }
+        // The answer is final once the export is gone: no destination can
+        // load the state. A failed resume is left to the caller's rollback,
+        // whose `resume` is idempotent.
+        if let Err(error) = self.abort_migration_export(export).await {
+            tracing::warn!(sandbox_id = %id, %error, "unserved migration abort did not finish");
+        }
+        Ok(true)
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         // ADR 0014 issue #1/#2: caller's downstream pipeline
         // (record_snapshot → destroy → mark Idle) succeeded; the
@@ -9010,6 +9033,54 @@ mod tests {
         let gone = volumes.pending(id, DiskRole::Root).await.unwrap_err();
         assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(volumes.roles(id).await.unwrap(), vec![DiskRole::Root]);
+    }
+
+    /// An abort that requires an unserved state resumes the guest only
+    /// while no destination has fetched `state.bin`; after a fetch it
+    /// leaves the export open and the guest paused.
+    #[tokio::test]
+    async fn migration_abort_unserved_refuses_after_the_state_is_fetched() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
+
+        let served = SandboxId::new();
+        let dir = tmp.path().join("served");
+        let export_id = open_export(&pooled, served, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        assert!(!pooled
+            .migration_abort_unserved(served, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(pooled.migrations.export_id_of(served), Some(export_id));
+        assert!(dir.exists());
+
+        let unserved = SandboxId::new();
+        let dir = tmp.path().join("unserved");
+        let export_id = open_export(&pooled, unserved, dir.clone()).await;
+        assert!(matches!(
+            pooled.migration_abort_unserved(unserved, "other").await,
+            Err(SandboxError::NotFound)
+        ));
+        assert!(pooled
+            .migration_abort_unserved(unserved, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(*resumes.lock(), vec![unserved]);
+        assert!(pooled.migrations.export_id_of(unserved).is_none());
+        assert!(!dir.exists());
     }
 
     /// ADR 0007 / Phase 5: snapshot wrap chunks an FC-style

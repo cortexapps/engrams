@@ -543,9 +543,36 @@ mod steps {
                     .await?;
                 rollback_begin(ctx, row, e.to_string()).await
             }
-            Err(e) if ctx.op.attempts <= 3 => Ok(Some(OpOutcome::Retry(e.to_string()))),
-            Err(e) => fail_move(ctx, row, &format!("dest_lost_after_blackout: {e}"), false).await,
+            Err(e) => match abort_unserved(ctx, row).await {
+                Ok(true) => rollback_begin(ctx, row, e.to_string()).await,
+                Err(SandboxError::NotFound) => {
+                    rollback_begin(ctx, row, "live_export_lost".into()).await
+                }
+                // The state was served, so the destination can run it, or
+                // the source cannot say: resuming the source could fork the
+                // guest.
+                Ok(false) | Err(_) if ctx.op.attempts <= 3 => {
+                    Ok(Some(OpOutcome::Retry(e.to_string())))
+                }
+                Ok(false) | Err(_) => {
+                    fail_move(ctx, row, &format!("dest_lost_after_blackout: {e}"), false).await
+                }
+            },
         }
+    }
+    /// Abort the export on the source if no destination fetched its
+    /// state. A host without the RPC answers an error, never `Ok(true)`.
+    async fn abort_unserved(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<bool, SandboxError> {
+        ctx.state
+            .host_registry
+            .backend_for(row.source_host_id)
+            .await?
+            .migration_abort_unserved(
+                row.source_sandbox_id,
+                row.export_id.as_deref().expect("live export"),
+                ctx.fence(),
+            )
+            .await
     }
     async fn destination_gone(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<bool, ApiError> {
         Ok(ctx
