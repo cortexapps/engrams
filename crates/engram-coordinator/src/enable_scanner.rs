@@ -202,7 +202,7 @@ impl EnableScannerConfig {
 /// Mirrors [`crate::teleport::spawn`].
 pub fn spawn(cfg: EnableScannerConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(cfg.poll_interval);
+        let mut tick = engram_core::periodic(cfg.poll_interval);
         // Skip the first immediate tick — coord just started, give
         // hosts a beat to heartbeat in before capture-host picking.
         tick.tick().await;
@@ -785,7 +785,7 @@ async fn advance_one(
         let interval = cfg.progress_interval;
         let claimant = claimant.to_string();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
+            let mut tick = engram_core::periodic(interval);
             tick.tick().await;
             loop {
                 tick.tick().await;

@@ -479,10 +479,9 @@ pub const TOKIO_SCHED_DELAY_SECONDS: &str = "engram_tokio_sched_delay_seconds";
 pub fn spawn_sched_delay_probe() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const TICK: std::time::Duration = std::time::Duration::from_millis(100);
-        let mut interval = tokio::time::interval(TICK);
+        let mut interval = engram_core::periodic(TICK);
         // Delay (not Burst): after a stall we want ONE honest large
         // sample, not a flurry of zero-delay catch-up ticks diluting it.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // arms the schedule
         let mut last = crate::time_source::metrics_now();
         loop {

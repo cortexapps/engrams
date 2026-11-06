@@ -169,8 +169,7 @@ pub fn init() {
     }
     sync_now(); // correct immediately on boot / first restore
     tokio::spawn(async {
-        let mut tick = tokio::time::interval(TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(TICK);
         loop {
             tick.tick().await;
             sync_now();

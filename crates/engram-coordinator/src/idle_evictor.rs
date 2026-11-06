@@ -1018,7 +1018,7 @@ pub fn spawn_eviction_scanner(
     state: SharedState,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(cfg.poll_interval);
+        let mut tick = engram_core::periodic(cfg.poll_interval);
         loop {
             tick.tick().await;
             if let Err(e) = scanner_run_once(&state).await {

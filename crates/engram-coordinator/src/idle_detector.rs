@@ -129,8 +129,7 @@ pub enum IdleKind {
 
 pub fn spawn(cfg: IdleDetectorConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(cfg.poll_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(cfg.poll_interval);
         // Skip the first immediate tick — right after a deploy the
         // event-append path may still be settling, and the shortest
         // TTL is minutes.
