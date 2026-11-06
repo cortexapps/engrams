@@ -691,69 +691,77 @@ fn covers(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
     false
 }
 
-/// Blocking-side reader for [`ChunkStore::chunk_file_into`]: stream the
-/// first `total_bytes` of `file` in large sequential reads (a multiple
-/// of `chunk_size`), split each block into `chunk_size` pieces,
-/// zero-check on this thread, and send the non-zero `(offset, bytes)`
-/// chunks (each a copy in a pooled buffer — the shared read block is
-/// reused, and per-chunk copies keep a mostly-zero block from pinning its
-/// whole buffer in the channel). Terminates when the consumer drops the
-/// receiver (upload error / caller cancelled): `blocking_send` fails
-/// and the thread exits. A short read before `total_bytes` is an error
-/// (the staged snapshot files this scans are immutable and
-/// fully-written).
+/// Threads that read and zero-scan a file in [`read_nonzero_chunks`].
+const SCAN_THREADS: usize = 8;
+
+/// Send every chunk of `file` that is not all zeros, as `(offset, bytes)`.
+/// [`SCAN_THREADS`] threads each read every `SCAN_THREADS`-th block with
+/// positional reads, so the read and the zero scan use several cores; the
+/// chunks arrive out of offset order. A short file sends one error.
 fn read_nonzero_chunks(
-    mut file: std::fs::File,
+    file: std::fs::File,
     total_bytes: u64,
     chunk_size: u64,
     tx: &tokio::sync::mpsc::Sender<std::io::Result<(u64, Bytes)>>,
 ) {
-    use std::io::Read;
+    use std::os::unix::fs::FileExt;
     let chunks_per_block = (RECHUNK_READ_BLOCK_BYTES / chunk_size).max(1);
     let block_bytes = chunks_per_block * chunk_size;
-    let mut buf = vec![0u8; block_bytes as usize];
-    let mut offset: u64 = 0;
-    while offset < total_bytes {
-        let want = block_bytes.min(total_bytes - offset) as usize;
-        let mut filled = 0usize;
-        while filled < want {
-            match file.read(&mut buf[filled..want]) {
-                Ok(0) => {
-                    let _ = tx.blocking_send(Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "file truncated at {} of {total_bytes} bytes",
-                            offset + filled as u64
-                        ),
-                    )));
-                    return;
-                }
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
-            }
-        }
-        let mut pos = 0usize;
-        while pos < want {
-            let len = (chunk_size as usize).min(want - pos);
-            let slice = &buf[pos..pos + len];
-            if !is_all_zero(slice) {
-                let mut chunk = ChunkBuf::take(len);
-                chunk.copy_from_slice(slice);
-                if tx
-                    .blocking_send(Ok((offset + pos as u64, chunk.freeze())))
-                    .is_err()
-                {
-                    return;
+    let blocks = total_bytes.div_ceil(block_bytes);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let scan = |first: u64| {
+        let mut buf = vec![0u8; block_bytes as usize];
+        let mut block = first;
+        while block < blocks && !failed.load(std::sync::atomic::Ordering::Relaxed) {
+            let offset = block * block_bytes;
+            let want = block_bytes.min(total_bytes - offset) as usize;
+            let mut filled = 0usize;
+            while filled < want {
+                match file.read_at(&mut buf[filled..want], offset + filled as u64) {
+                    Ok(0) => {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.blocking_send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "file truncated at {} of {total_bytes} bytes",
+                                offset + filled as u64
+                            ),
+                        )));
+                        return;
+                    }
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
                 }
             }
-            pos += len;
+            let mut pos = 0usize;
+            while pos < want {
+                let len = (chunk_size as usize).min(want - pos);
+                let slice = &buf[pos..pos + len];
+                if !is_all_zero(slice) {
+                    let mut chunk = ChunkBuf::take(len);
+                    chunk.copy_from_slice(slice);
+                    if tx
+                        .blocking_send(Ok((offset + pos as u64, chunk.freeze())))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                pos += len;
+            }
+            block += SCAN_THREADS as u64;
         }
-        offset += want as u64;
-    }
+    };
+    std::thread::scope(|threads| {
+        for first in 0..(SCAN_THREADS as u64).min(blocks) {
+            threads.spawn(move || scan(first));
+        }
+    });
 }
 
 #[cfg(test)]
