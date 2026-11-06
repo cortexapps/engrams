@@ -299,9 +299,15 @@ fn reads_stall_across_a_crash_and_complete_after_recovery() {
 fn a_stop_ends_a_read_that_cannot_be_served() {
     ublk_or_skip!();
     let disk = publish();
-    // Chunk 3 is gone from the store, so a read of it tries again forever.
-    let lost = ChunkHash::of(&chunk_bytes(3));
-    std::fs::remove_file(disk.store_root.join("blobs").join(lost.storage_key())).unwrap();
+    // A directory where chunk 3's blob should be: the store fails to read
+    // it without reporting the chunk absent, so a read of it tries again
+    // until the server stops.
+    let blob = disk
+        .store_root
+        .join("blobs")
+        .join(ChunkHash::of(&chunk_bytes(3)).storage_key());
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::create_dir(&blob).unwrap();
     let source = start(&disk, None);
     let path = source.path.clone();
     let reader = std::thread::spawn(move || {
@@ -325,6 +331,29 @@ fn a_stop_ends_a_read_that_cannot_be_served() {
         Some(libc::EIO),
         "unexpected error {err}"
     );
+}
+
+#[test]
+#[ignore]
+fn a_chunk_the_store_does_not_hold_fails_its_read() {
+    ublk_or_skip!();
+    let disk = publish();
+    let lost = ChunkHash::of(&chunk_bytes(3));
+    std::fs::remove_file(disk.store_root.join("blobs").join(lost.storage_key())).unwrap();
+    let source = start(&disk, None);
+    let mut buf = Aligned::new(READ);
+    let err = open_direct(&source.path)
+        .read_exact_at(buf.as_mut(), 3 * CHUNK)
+        .expect_err("a read of lost data fails");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EIO),
+        "unexpected error {err}"
+    );
+    open_direct(&source.path)
+        .read_exact_at(buf.as_mut(), 0)
+        .expect("a read of data the store holds still succeeds");
+    source.stop();
 }
 
 fn source_path(dev_id: u32) -> PathBuf {
