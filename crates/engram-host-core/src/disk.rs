@@ -460,8 +460,84 @@ pub trait SessionDisk: Send + Sync {
     }
 }
 
+/// The data extents of `file` as `(offset, len)` ranges, from
+/// `SEEK_DATA`/`SEEK_HOLE`. Holes read as zeros and are not listed. A
+/// filesystem may coalesce extents, which only widens a range.
+#[allow(unsafe_code)]
+pub fn data_extents(file: &File) -> io::Result<Vec<(u64, u64)>> {
+    let len = file.metadata()?.len() as i64;
+    let fd = file.as_raw_fd();
+    let mut ranges = Vec::new();
+    let mut off: i64 = 0;
+    while off < len {
+        // SAFETY: `fd` is a valid open descriptor owned by `file`.
+        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
+        if data < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                break; // no data after `off`
+            }
+            return Err(err);
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        let hole = if hole < 0 { len } else { hole };
+        ranges.push((data as u64, (hole - data) as u64));
+        off = hole;
+    }
+    Ok(ranges)
+}
+
+/// Copy `from` to the new file `to`, with the same length and holes: only
+/// the data extents are copied. A plain copy on a filesystem without
+/// reflinks writes every hole as zeros, so it costs the logical size.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
+    let src = File::open(from)?;
+    let dst = File::create_new(to)?;
+    let copied = (|| {
+        dst.set_len(src.metadata()?.len())?;
+        for (start, len) in data_extents(&src)? {
+            let mut done = 0;
+            while done < len {
+                let (mut i, mut o) = ((start + done) as i64, (start + done) as i64);
+                // SAFETY: both descriptors are open for the call, and the
+                // offsets are locals the kernel updates.
+                let n = unsafe {
+                    libc::copy_file_range(
+                        src.as_raw_fd(),
+                        &mut i,
+                        dst.as_raw_fd(),
+                        &mut o,
+                        (len - done) as usize,
+                        0,
+                    )
+                };
+                match n {
+                    n if n < 0 => return Err(io::Error::last_os_error()),
+                    0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    n => done += n as u64,
+                }
+            }
+        }
+        Ok(())
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
+/// Copy `from` to the new file `to`: a clone on APFS.
+#[cfg(not(target_os = "linux"))]
+fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::copy(from, to).map(|_| ())
+}
+
 /// Volumes as sparse files in one directory: the macOS implementation
-/// (`fs::copy` is a clone on APFS) and the Linux one without a thin pool.
+/// (a snapshot is an APFS clone) and the Linux one without a thin pool
+/// (a snapshot copies the data extents).
 #[derive(Clone, Debug)]
 pub struct FileDisk {
     root: PathBuf,
@@ -502,7 +578,7 @@ impl SessionDisk for FileDisk {
             ));
         }
         let (from, to) = (origin.path.clone(), path.clone());
-        tokio::task::spawn_blocking(move || std::fs::copy(from, to))
+        tokio::task::spawn_blocking(move || copy_sparse(&from, &to))
             .await
             .map_err(|e| io::Error::other(format!("snapshot task: {e}")))??;
         Volume::open(name.clone(), &path, origin.size_bytes, origin.chunk_size)
@@ -564,6 +640,41 @@ mod tests {
 
     fn name(s: &str) -> VolumeName {
         VolumeName::new(s).expect("valid name")
+    }
+
+    /// A snapshot keeps the origin's holes: it allocates about the data,
+    /// not the logical size, and reads back the same bytes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_snapshot_copies_only_the_data_extents() {
+        use std::os::unix::fs::MetadataExt;
+        let (_dir, disk) = disk();
+        const SIZE: u64 = 64 << 20;
+        let origin = disk.create(&name("origin"), SIZE).await.unwrap();
+        let data = vec![0xa5u8; 8192];
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&origin.path)
+            .unwrap()
+            .write_all_at(&data, 32 << 20)
+            .unwrap();
+        let snap = disk.snapshot(&origin, &name("snap")).await.unwrap();
+        let meta = std::fs::metadata(&snap.path).unwrap();
+        assert_eq!(meta.len(), SIZE);
+        assert!(
+            meta.blocks() * 512 < 1 << 20,
+            "{} bytes allocated",
+            meta.blocks() * 512
+        );
+        let file = File::open(&snap.path).unwrap();
+        let mut back = vec![0u8; data.len()];
+        file.read_exact_at(&mut back, 32 << 20).unwrap();
+        assert_eq!(back, data);
+        let extent_bytes: u64 = data_extents(&file).unwrap().iter().map(|(_, n)| n).sum();
+        assert!(
+            extent_bytes < 1 << 20,
+            "{extent_bytes} bytes of data extents"
+        );
     }
 
     #[test]

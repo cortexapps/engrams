@@ -361,7 +361,11 @@ async fn memory_leg_work(
                         "eviction finalize: get chain-prev manifest {prev_ref}: {e}"
                     ))
                 })?;
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                // FC's Diff snapshot writes dirty pages at their
+                // guest-physical offsets into a sparse file, so its data
+                // extents are the dirty set.
+                let ranges = std::fs::File::open(&diff_path)
+                    .and_then(|f| engram_host_core::data_extents(&f))
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(&prev_manifest, &diff_path, &ranges)

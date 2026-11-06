@@ -5,7 +5,6 @@
 //! the pieces around `PooledBackend::checkpoint_sandbox` (which owns
 //! the capture pipeline itself):
 //!
-//! - the sparse-file utility the diff path rides (`dirty_ranges`),
 //! - the per-sandbox checkpoint chain state ([`CheckpointChain`]),
 //! - the durable, self-describing per-checkpoint record
 //!   ([`CheckpointRecord`] — written the moment the upload finishes,
@@ -358,37 +357,6 @@ impl ChainHeadStore {
             .epoch
             .load(std::sync::atomic::Ordering::SeqCst)
     }
-}
-
-/// Walk `diff`'s data extents (`SEEK_DATA`/`SEEK_HOLE`) and return
-/// them as `(offset, len)` ranges. FC's Diff snapshot writes dirty
-/// pages at their guest-physical offsets into an otherwise-sparse
-/// file, so the extents ARE the dirty set (page-granular, possibly
-/// coalesced by the filesystem — coalescing only ever widens, which
-/// is safe for the incremental re-chunk).
-pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
-    use std::os::unix::io::AsRawFd;
-
-    let src = std::fs::File::open(diff)?;
-    let len = src.metadata()?.len() as i64;
-    let fd = src.as_raw_fd();
-    let mut ranges = Vec::new();
-    let mut off: i64 = 0;
-    while off < len {
-        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
-        if data < 0 {
-            let errno = std::io::Error::last_os_error();
-            if errno.raw_os_error() == Some(libc::ENXIO) {
-                break; // no more data extents
-            }
-            return Err(errno);
-        }
-        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        let hole = if hole < 0 { len } else { hole };
-        ranges.push((data as u64, (hole - data) as u64));
-        off = hole;
-    }
-    Ok(ranges)
 }
 
 /// Config for the periodic driver.
