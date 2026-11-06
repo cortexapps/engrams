@@ -98,7 +98,7 @@ impl GcsBlobStorage {
         // with the feature enabled rather than trusting this number.
         let http = engram_tls::client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(pool_max_idle())
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .http1_only()
@@ -353,6 +353,18 @@ impl BlobStorage for GcsBlobStorage {
         };
         Ok(ListPage { keys, next })
     }
+}
+
+/// `ENGRAM_GCS_POOL_MAX_IDLE`: idle connections kept per host (default 64).
+/// Read once.
+fn pool_max_idle() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ENGRAM_GCS_POOL_MAX_IDLE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(64)
+    })
 }
 
 #[cfg(test)]

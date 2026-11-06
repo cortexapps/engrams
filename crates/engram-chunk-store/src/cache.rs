@@ -1064,6 +1064,11 @@ impl ChunkCache {
                 // file — that's what moves the 16 MiB sha256 off the hot per-read
                 // path (ADR 0021).
                 let result = match fetched {
+                    Ok(bytes) if !verify_on_fetch() => {
+                        VERIFY_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::counter!("engram_chunk_verify_skipped_total").increment(1);
+                        Ok(bytes)
+                    }
                     Ok(bytes) => {
                         let actual = ChunkHash::of(&bytes);
                         if actual == hash {
@@ -1230,38 +1235,101 @@ impl ChunkCache {
         hashes: Vec<ChunkHash>,
         concurrency: usize,
         fetch: F,
+        on_done: impl FnMut(usize) + Send,
+    ) -> Result<()>
+    where
+        F: Fn(ChunkHash) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
+    {
+        self.prefetch_chunks_parallel_with(hashes, concurrency, fetch, on_done, prefetch_spawn())
+            .await
+    }
+
+    /// [`Self::prefetch_chunks_parallel`]. With `spawn`, each chunk's fetch
+    /// is its own task, so TLS, parsing and hashing spread over the
+    /// runtime's workers; without, every fetch is polled by the caller's
+    /// task. Either way at most `concurrency` are in flight, the first
+    /// error returns (the rest are dropped or aborted), and finished
+    /// chunks stay cached.
+    async fn prefetch_chunks_parallel_with<F, Fut>(
+        &self,
+        hashes: Vec<ChunkHash>,
+        concurrency: usize,
+        fetch: F,
         mut on_done: impl FnMut(usize) + Send,
+        spawn: bool,
     ) -> Result<()>
     where
         F: Fn(ChunkHash) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
     {
         use futures::stream::{FuturesUnordered, StreamExt};
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-        let spawn_one = |h: ChunkHash, cache: ChunkCache, fetcher: F| -> Task {
-            Box::pin(async move { cache.prefetch(h, || fetcher(h)).await })
+        let started = crate::time_source::metrics_now();
+        let chunks = hashes.len();
+        let fetched_bytes = Arc::new(AtomicU64::new(0));
+        let skipped_before = VERIFY_SKIPPED.load(Relaxed);
+        let task_for = |h: ChunkHash| -> Task {
+            let cache = self.clone();
+            let fetcher = fetch.clone();
+            let fetched_bytes = Arc::clone(&fetched_bytes);
+            Box::pin(async move {
+                cache
+                    .prefetch(h, || async move {
+                        let bytes = fetcher(h).await?;
+                        fetched_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                        Ok(bytes)
+                    })
+                    .await
+            })
         };
 
         let max_in_flight = concurrency.max(1);
-        let mut in_flight: FuturesUnordered<Task> = FuturesUnordered::new();
         let mut iter = hashes.into_iter();
-        // Seed the pipeline.
-        for _ in 0..max_in_flight {
-            match iter.next() {
-                Some(h) => in_flight.push(spawn_one(h, self.clone(), fetch.clone())),
-                None => break,
-            }
-        }
-        // Drain + refill: each completion lets us start one more.
         let mut done = 0;
-        while let Some(result) = in_flight.next().await {
-            result?;
-            done += 1;
-            on_done(done);
-            if let Some(h) = iter.next() {
-                in_flight.push(spawn_one(h, self.clone(), fetch.clone()));
+        if spawn {
+            let mut in_flight = tokio::task::JoinSet::new();
+            for h in iter.by_ref().take(max_in_flight) {
+                in_flight.spawn(task_for(h));
+            }
+            while let Some(joined) = in_flight.join_next().await {
+                joined.map_err(|e| {
+                    ChunkStoreError::Cache(std::io::Error::other(format!("prefetch task: {e}")))
+                })??;
+                done += 1;
+                on_done(done);
+                if let Some(h) = iter.next() {
+                    in_flight.spawn(task_for(h));
+                }
+            }
+        } else {
+            let mut in_flight: FuturesUnordered<Task> = FuturesUnordered::new();
+            for h in iter.by_ref().take(max_in_flight) {
+                in_flight.push(task_for(h));
+            }
+            // Drain + refill: each completion lets us start one more.
+            while let Some(result) = in_flight.next().await {
+                result?;
+                done += 1;
+                on_done(done);
+                if let Some(h) = iter.next() {
+                    in_flight.push(task_for(h));
+                }
             }
         }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let bytes = fetched_bytes.load(Relaxed);
+        tracing::info!(
+            chunks,
+            fetched_bytes = bytes,
+            elapsed_ms,
+            mb_per_s = bytes as f64 / 1e6 / (elapsed_ms.max(1) as f64 / 1e3),
+            concurrency = max_in_flight,
+            spawn,
+            verify_skipped = VERIFY_SKIPPED.load(Relaxed) - skipped_before,
+            "chunk prefetch complete"
+        );
         Ok(())
     }
 
@@ -2308,6 +2376,33 @@ fn clone_result(r: &Result<Bytes>) -> Result<Bytes> {
     }
 }
 
+/// `ENGRAM_PREFETCH_SPAWN=1`: one task per prefetched chunk (default off).
+/// Read once.
+fn prefetch_spawn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("ENGRAM_PREFETCH_SPAWN").as_deref(), Ok("1")))
+}
+
+/// `ENGRAM_CHUNK_VERIFY_ON_FETCH=0` skips the sha256 check of fetched
+/// chunks. Measurement only; never a production setting. Default on.
+/// Read once.
+fn verify_on_fetch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("ENGRAM_CHUNK_VERIFY_ON_FETCH").as_deref(),
+            Ok("0")
+        );
+        if !on {
+            tracing::warn!("ENGRAM_CHUNK_VERIFY_ON_FETCH=0: fetched chunks are NOT hash-checked");
+        }
+        on
+    })
+}
+
+/// Fetched chunks stored without the hash check (process total).
+static VERIFY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2351,6 +2446,42 @@ mod tests {
     /// don't care about the fetcher's identity.
     async fn cache_get_from(cache: &ChunkCache, store: &ChunkStore, h: ChunkHash) -> Result<Bytes> {
         cache.get(h, || store.get_chunk(h)).await
+    }
+
+    /// The spawned mode (`ENGRAM_PREFETCH_SPAWN=1`) warms the same set and
+    /// fetches each distinct hash once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefetch_chunks_parallel_spawned_warms_all_listed_hashes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        let mut hashes = Vec::with_capacity(17);
+        for i in 0..16u8 {
+            hashes.push(store.put_chunk(&vec![i; 4 * 1024]).await.unwrap());
+        }
+        hashes.push(hashes[0]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (store_clone, calls_clone) = (store.clone(), calls.clone());
+        let mut done = 0;
+        cache
+            .prefetch_chunks_parallel_with(
+                hashes.clone(),
+                4,
+                move |h| {
+                    let (s, c) = (store_clone.clone(), calls_clone.clone());
+                    async move {
+                        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        s.get_chunk(h).await
+                    }
+                },
+                |n| done = n,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(done, hashes.len());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 16);
+        for h in &hashes {
+            assert!(cache.contains(*h).await);
+        }
     }
 
     /// ADR 0014 M1.13: parallel prefetch of a chunk set. Verifies
