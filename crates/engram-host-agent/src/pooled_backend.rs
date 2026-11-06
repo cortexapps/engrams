@@ -120,6 +120,45 @@ mod item_assembler_tests {
     }
 }
 
+/// Land `want` from the snapshot's hinted peers into the chunk cache,
+/// skipping chunks already resident. Best-effort.
+async fn pull_from_peers(
+    cache: &ChunkCache,
+    health: &Arc<crate::peer_fill::PeerHealth>,
+    metadata: &SnapshotMetadata,
+    want: Vec<engram_chunk_store::manifest::ChunkHash>,
+) {
+    let mut seen = std::collections::HashSet::with_capacity(want.len());
+    let mut missing: Vec<_> = want
+        .into_iter()
+        .filter(|h| seen.insert(*h) && !cache.contains_on_disk(*h))
+        .collect();
+    let scope = engram_protocol::grpc_client::PeerChunkScope::Snapshot(metadata.id);
+    let started = crate::time_source::metrics_now();
+    for addr in metadata.peer_hints.iter().take(2) {
+        if missing.is_empty() {
+            return;
+        }
+        let stats =
+            crate::peer_fill::pull_chunks_from_peer(addr, scope.clone(), &missing, cache, health)
+                .await;
+        tracing::info!(
+            snapshot_id = %metadata.id,
+            peer = %addr,
+            landed = stats.landed,
+            missing_on_peer = stats.missing,
+            failed = stats.failed,
+            of = missing.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer pull window complete",
+        );
+        if !stats.failed {
+            return;
+        }
+        missing.retain(|h| !cache.contains_on_disk(*h));
+    }
+}
+
 /// The sidecar's `trace_lineage_id`: the session whose traces this
 /// snapshot's restores read.
 async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
@@ -1456,8 +1495,22 @@ impl PooledBackend {
         if let (true, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
             let session = read_trace_lineage(&src).await;
             let md = metadata.clone();
+            let peer = self
+                .chunk_cache
+                .clone()
+                .filter(|_| !md.peer_hints.is_empty());
+            let health = self.peer_health.clone();
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
+                    // A hinted peer holds the session's chunks on local
+                    // disk; take memory from it first, then the store
+                    // fills whatever it did not have.
+                    if let (Some(cache), Some(r)) = (peer, md.memory_manifest) {
+                        if let Ok(m) = fill.store().get_manifest(r).await {
+                            let want = m.chunks.iter().map(|c| c.hash).collect();
+                            pull_from_peers(&cache, &health, &md, want).await;
+                        }
+                    }
                     if let Err(e) =
                         Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate, session).await
                     {
@@ -2468,102 +2521,39 @@ impl PooledBackend {
         }
     }
 
-    /// ADR 0095: the peer-hinted resume pre-pass — land this snapshot's
-    /// locally-missing chunk set (memory + disk session manifests,
-    /// `contains_on_disk`-filtered, which also elides the pinned image
-    /// base) from the hinted sibling before the guest resumes. Wholly
-    /// best-effort: any shortfall simply leaves those chunks to the
-    /// fault path, which resolves local → GCS exactly as before this
-    /// ADR. No hot-first rider here — the coordinator has no
-    /// working-set trace for an ordinary resume (the per-host traces
-    /// are dest-local and this dest never ran the session), so
-    /// manifest order stands, memory first (the wake-up set lives
-    /// there).
+    /// ADR 0095, a peer-hinted resume: before the guest resumes, land
+    /// from the hinted sibling what the boot needs at once, the disk
+    /// manifest's chunks and the session's first-touch memory prefix. The
+    /// rest of memory follows in the background (`restore_with`). Wholly
+    /// best-effort: a shortfall leaves those chunks to the store.
     async fn peer_resume_prepass(&self, metadata: &SnapshotMetadata) {
-        use engram_protocol::grpc_client::PeerChunkScope;
         let (Some(store), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
         else {
             return;
         };
-        // ADR 0101 A: fetch the two manifests concurrently; `want` still
-        // extends memory-first (the wake-up set lives there — see the
-        // no-hot-first note above).
-        async fn fetch_manifest(
-            store: engram_chunk_store::ChunkStore,
-            manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
-        ) -> Result<
-            Option<engram_chunk_store::manifest::Manifest>,
-            (
-                engram_core::types::manifest::ManifestRef,
-                engram_chunk_store::ChunkStoreError,
-            ),
-        > {
-            match manifest_ref {
-                None => Ok(None),
-                Some(r) => store.get_manifest(r).await.map(Some).map_err(|e| (r, e)),
+        let mut want = Vec::new();
+        if let Some(r) = metadata.disk_manifest {
+            match store.get_manifest(r).await {
+                Ok(m) => want.extend(m.chunks.iter().map(|c| c.hash)),
+                Err(e) => tracing::warn!(manifest = %r, error = %e, "peer pre-pass: disk manifest"),
             }
         }
-        let (mem_res, disk_res) = tokio::join!(
-            fetch_manifest(store.clone(), metadata.memory_manifest),
-            fetch_manifest(store.clone(), metadata.disk_manifest)
-        );
-        let mut want: Vec<engram_chunk_store::manifest::ChunkHash> = Vec::new();
-        for res in [mem_res, disk_res] {
-            match res {
-                Ok(Some(m)) => want.extend(m.chunks.iter().map(|c| c.hash)),
-                Ok(None) => {}
-                Err((manifest_ref, e)) => {
-                    tracing::warn!(
-                        ?manifest_ref,
-                        error = %e,
-                        "peer resume pre-pass: manifest load failed; skipping tier",
-                    );
-                    return;
-                }
+        // The sidecar names the session whose prefix this is.
+        let src = self.inner.snapshot_path_for(metadata.id);
+        let _ = materialize_state_if_missing(
+            store.blob_storage().as_ref(),
+            &src,
+            metadata.state_blob_key.as_deref(),
+            metadata.sidecar_blob_key.as_deref(),
+        )
+        .await;
+        if let (Some(session), Some(r)) = (read_trace_lineage(&src).await, metadata.memory_manifest)
+        {
+            if let Ok(m) = store.get_manifest(r).await {
+                want.extend(first_touch_hashes(&store, session, &m).await);
             }
         }
-        let mut missing = Vec::with_capacity(want.len());
-        let mut seen = std::collections::HashSet::with_capacity(want.len());
-        for h in want {
-            if seen.insert(h) && !cache.contains_on_disk(h) {
-                missing.push(h);
-            }
-        }
-        if missing.is_empty() {
-            return; // affinity-host resume: everything already local
-        }
-        let scope = PeerChunkScope::Snapshot(metadata.id);
-        let total = missing.len();
-        let started = crate::time_source::metrics_now();
-        for addr in metadata.peer_hints.iter().take(2) {
-            let stats = crate::peer_fill::pull_chunks_from_peer(
-                addr,
-                scope.clone(),
-                &missing,
-                &cache,
-                &self.peer_health,
-            )
-            .await;
-            tracing::info!(
-                snapshot_id = %metadata.id,
-                peer = %addr,
-                landed = stats.landed,
-                landed_bytes = stats.landed_bytes,
-                missing_on_peer = stats.missing,
-                failed = stats.failed,
-                backpressure = stats.backpressure,
-                of = total,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "peer resume pre-pass window complete (ADR 0095)",
-            );
-            if !stats.failed {
-                return;
-            }
-            missing.retain(|h| !cache.contains_on_disk(*h));
-            if missing.is_empty() {
-                return;
-            }
-        }
+        pull_from_peers(&cache, &self.peer_health, metadata, want).await;
     }
 
     /// ADR 0045 C2 (destination): stage the presetup's restore package
