@@ -322,6 +322,18 @@ impl ChunkStore {
         }
     }
 
+    /// [`Self::get_chunk`] for a reader that keeps the bytes itself: a
+    /// cache hit is served, a miss goes to the resolver and is not
+    /// stored.
+    pub async fn read_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.read_resident(hash).await? {
+                return Ok(bytes);
+            }
+        }
+        self.resolver.fetch_chunk(hash).await
+    }
+
     /// Make `hash` resident in the local cache; nothing to do without
     /// one.
     pub async fn prefetch_chunk(&self, hash: ChunkHash) -> Result<()> {
@@ -811,6 +823,43 @@ mod tests {
 
         assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
         assert_eq!(counting.get_count(), 1, "a hit makes no blob GET");
+    }
+
+    /// `read_chunk` serves a resident chunk without a blob call, and a
+    /// miss reaches blob storage without filling the cache.
+    #[tokio::test]
+    async fn read_chunk_serves_hits_and_does_not_store_misses() {
+        let (s, counting, cache, _d) = counting_store_with_cache().await;
+        let body = b"kept by the reader, not by the cache";
+        let h = ChunkHash::of(body);
+        counting
+            .put(&h.storage_key(), Bytes::copy_from_slice(body))
+            .await
+            .unwrap();
+
+        assert_eq!(&s.read_chunk(h).await.unwrap()[..], body);
+        assert_eq!(counting.get_count(), 1, "the miss reaches blob storage");
+        assert!(!cache.contains_on_disk(h), "a miss is not stored");
+
+        s.get_chunk(h).await.unwrap();
+        assert_eq!(counting.get_count(), 2);
+        assert_eq!(&s.read_chunk(h).await.unwrap()[..], body);
+        assert_eq!(counting.get_count(), 2, "a hit makes no blob GET");
+    }
+
+    /// A miss through `read_chunk` still checks the content hash.
+    #[tokio::test]
+    async fn read_chunk_rejects_bytes_that_do_not_match_the_hash() {
+        let (s, counting, _cache, _d) = counting_store_with_cache().await;
+        let h = ChunkHash::of(b"the bytes the manifest names");
+        counting
+            .put(&h.storage_key(), Bytes::from_static(b"other bytes"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.read_chunk(h).await,
+            Err(ChunkStoreError::HashMismatch { .. })
+        ));
     }
 
     /// ADR 0078 move 4: the `exists()` dedup short-circuit must STILL
