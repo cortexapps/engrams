@@ -469,7 +469,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 /// empty set for one tick; next tick recovers).
 pub fn spawn_in_proc(state: SharedState, tick: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tick);
+        let mut interval = engram_core::periodic(tick);
         // Skip the immediate-fire first tick so a coord that's just
         // bound the local backend doesn't insta-strike a session
         // whose create() is mid-flight.

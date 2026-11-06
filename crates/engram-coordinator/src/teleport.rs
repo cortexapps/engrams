@@ -31,8 +31,7 @@ impl Default for TeleportConfig {
 }
 pub fn spawn(cfg: TeleportConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(cfg.poll_interval);
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timer = engram_core::periodic(cfg.poll_interval);
         loop {
             timer.tick().await;
             if let Err(e) = run_once(&cfg, &state).await {

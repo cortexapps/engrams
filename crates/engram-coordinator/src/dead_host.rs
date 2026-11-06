@@ -154,7 +154,7 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
         // Same claimant identity convention as the enable scanner: the
         // pod hostname, falling back for local/dev runs.
         let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
-        let mut tick = tokio::time::interval(cfg.poll_interval);
+        let mut tick = engram_core::periodic(cfg.poll_interval);
         // Skip the immediate first tick — the coordinator just
         // started and no host's lease has had time to expire.
         tick.tick().await;

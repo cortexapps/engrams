@@ -520,8 +520,7 @@ pub fn spawn_checkpoint_driver(
         // backstop); the fast quantum exists so a busy sandbox's short
         // epoch is honored. The candidate scan is a pure in-RAM map
         // walk — waking it every `min_interval` costs nothing.
-        let mut tick = tokio::time::interval(cfg.min_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(cfg.min_interval);
         // Skip the immediate first tick: freshly-created sandboxes get
         // their seed checkpoint later, by which point agentd is up (and
         // the capture path's wait_agent_ready gate covers stragglers).

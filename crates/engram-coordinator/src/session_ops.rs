@@ -461,8 +461,7 @@ impl OpClaim {
         let op_id = self.op.id;
         let epoch = self.epoch;
         let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(20));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(Duration::from_secs(20));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
@@ -565,8 +564,7 @@ impl Drop for OpClaimHeartbeat {
 fn spawn_op_heartbeat(state: &SharedState, op_id: i64, epoch: i64) -> OpHeartbeat {
     let state = state.clone();
     let handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(OP_HEARTBEAT_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(OP_HEARTBEAT_INTERVAL);
         tick.tick().await; // consume the immediate first tick
         loop {
             tick.tick().await;

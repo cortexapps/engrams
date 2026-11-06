@@ -181,8 +181,7 @@ pub fn spawn(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let dir = dir?;
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SWEEP_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = engram_core::periodic(SWEEP_INTERVAL);
         loop {
             tick.tick().await;
             let d = dir.clone();

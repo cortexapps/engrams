@@ -36,7 +36,7 @@ impl SessionShellPin {
         stamp(&state, session_id, PIN_TTL).await;
         let renew_state = state.clone();
         let renew = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(RENEW_EVERY);
+            let mut tick = engram_core::periodic(RENEW_EVERY);
             tick.tick().await; // the constructor already stamped
             loop {
                 tick.tick().await;

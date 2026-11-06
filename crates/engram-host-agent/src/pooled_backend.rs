@@ -608,7 +608,7 @@ fn spawn_leg_keepalive(
 ) -> AbortTaskOnDrop {
     AbortTaskOnDrop(tokio::spawn(async move {
         let mut interval =
-            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+            engram_core::periodic(crate::warm_progress::capture_keepalive_secs_from_env());
         interval.tick().await; // consume the immediate first tick
         loop {
             interval.tick().await;
@@ -1034,7 +1034,7 @@ impl PooledBackend {
         let mut last_detail: Option<String> = None;
 
         let mut keepalive =
-            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+            engram_core::periodic(crate::warm_progress::capture_keepalive_secs_from_env());
         keepalive.tick().await; // consume the immediate first tick
 
         let send_progress =

@@ -396,8 +396,7 @@ impl HostAgent {
                     ));
                 let host_id_for_ttl = host_id;
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut tick = engram_core::periodic(std::time::Duration::from_secs(30));
                     loop {
                         tick.tick().await;
                         for (sandbox_id, session, export_id) in
@@ -490,8 +489,7 @@ impl HostAgent {
                     use crate::teardown_reconcile::{reconcile_once, RECONCILE_INTERVAL};
                     let mut first_seen: std::collections::HashMap<SandboxId, std::time::Duration> =
                         std::collections::HashMap::new();
-                    let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut tick = engram_core::periodic(RECONCILE_INTERVAL);
                     // The age gate's monotonic origin. The sim passes its
                     // own mark at the reconcile_once seam; this wrapper is
                     // prod-only.
@@ -556,8 +554,7 @@ impl HostAgent {
                         tokio::spawn(async move {
                             use engram_core::traits::sandbox::SandboxBackend as _;
                             let mut tick =
-                                tokio::time::interval(std::time::Duration::from_secs(30));
-                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                engram_core::periodic(std::time::Duration::from_secs(30));
                             loop {
                                 tick.tick().await;
                                 // Issue #216 Gap 3: NEVER destroy on a
@@ -1208,8 +1205,7 @@ impl HostAgent {
             // the supervisors can tell "no images" from "not told yet".
             let mut enabled_acked = false;
             let heartbeat_task = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(heartbeat_interval);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut tick = engram_core::periodic(heartbeat_interval);
                 // Observed disk/mem/cpu for the fleet view. Holds the
                 // prior `/proc/stat` sample so CPU is a true interval
                 // delta; the first tick reports cpu_pct=0.

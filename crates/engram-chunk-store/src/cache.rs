@@ -1603,8 +1603,7 @@ impl ChunkCache {
                 tracing::debug!("chunk cache periodic sweeper disabled (interval=0)");
                 return;
             }
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = engram_core::periodic(interval);
             // Consume the immediate t=0 tick without sweeping — see the
             // doc comment above. Every tick after this one is spaced a
             // full `interval` apart, so the first real sweep lands at
