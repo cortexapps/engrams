@@ -201,7 +201,7 @@ impl ChunkStore {
                      inflight: &mut tokio::task::JoinSet<_>| {
             stats.chunks_uploaded += 1;
             stats.bytes_uploaded += bytes.len() as u64;
-            *scanned_hi = offset + bytes.len() as u64;
+            *scanned_hi = (*scanned_hi).max(offset + bytes.len() as u64);
             // Its own task, so the SHA-256 and the PUT's TLS use every core.
             inflight.spawn(put_one(offset, bytes));
         };
@@ -245,10 +245,9 @@ impl ChunkStore {
                 completed += 1;
                 if completed.is_multiple_of(SPARSE_RECHUNK_CONCURRENCY as u64) {
                     if let Some(report) = progress {
-                        // The issued high-water lags the reader's scan
-                        // position by the channel depth — still a
-                        // monotone fraction of windows_total (the
-                        // reader sends in offset order).
+                        // The highest offset issued so far. The scan
+                        // threads send out of offset order, so it lags
+                        // the scan, but it never goes back.
                         report(
                             scanned_hi.div_ceil(chunk_size).min(windows_total),
                             windows_total,
