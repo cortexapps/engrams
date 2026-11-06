@@ -534,6 +534,40 @@ async fn served_state_dest_failure_is_dead(rig: Rig) {
 }
 scenario!(served_state_dest_failure_is_dead);
 
+/// A source that lost its export (a host-agent restart) cannot prove the
+/// state was never served.
+async fn source_without_the_export_is_dead(rig: Rig) {
+    rig.source
+        .abort_unserved_not_found
+        .store(true, Ordering::SeqCst);
+    dest_failure_without_unserved_proof_is_dead(rig).await;
+}
+scenario!(source_without_the_export_is_dead);
+
+/// The unserved abort removed the export but its in-place resume failed:
+/// the rollback's abort finds no export and finishes with a resume.
+async fn unserved_abort_with_a_failed_resume_completes_in_rollback(rig: Rig) {
+    rig.make_live().await;
+    rig.dest.restore_fails.store(true, Ordering::SeqCst);
+    rig.source.resume_fails.store(true, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::RetryAfter(_, _)));
+    assert_eq!(rig.phase().await, Some(TeleportPhase::RollingBack));
+    assert_eq!(rig.source.unserved_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.resumes.load(Ordering::SeqCst), 1);
+    assert_eq!(meta_session(&rig).await.status, SessionState::Evacuating);
+    rig.source.resume_fails.store(false, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.dest.restores.load(Ordering::SeqCst), 1, "no retry");
+    assert_eq!(rig.source.resumes.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.phase().await, None);
+    let session = meta_session(&rig).await;
+    assert_eq!(session.status, SessionState::Active);
+    assert_eq!(session.sandbox_id, Some(rig.source.sandbox));
+}
+scenario!(unserved_abort_with_a_failed_resume_completes_in_rollback);
+
 async fn source_without_the_served_answer_is_dead(rig: Rig) {
     rig.source
         .abort_unserved_unsupported

@@ -545,12 +545,10 @@ mod steps {
             }
             Err(e) => match abort_unserved(ctx, row).await {
                 Ok(true) => rollback_begin(ctx, row, e.to_string()).await,
-                Err(SandboxError::NotFound) => {
-                    rollback_begin(ctx, row, "live_export_lost".into()).await
-                }
                 // The state was served, so the destination can run it, or
-                // the source cannot say: resuming the source could fork the
-                // guest.
+                // the source cannot say. A missing export is no answer: the
+                // export registry does not survive a host-agent restart.
+                // Resuming the source could fork the guest.
                 Ok(false) | Err(_) if ctx.op.attempts <= 3 => {
                     Ok(Some(OpOutcome::Retry(e.to_string())))
                 }
