@@ -2522,6 +2522,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "workspace-hack",
 ]
 
