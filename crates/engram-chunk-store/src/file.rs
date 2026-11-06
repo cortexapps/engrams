@@ -29,17 +29,12 @@ use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
 use crate::store::ChunkStore;
 
-/// ADR 0039 item #19: bounded concurrency for the per-chunk GCS I/O in
-/// the sparse re-chunk path (`update_for_dirty_ranges_sparse`).
-/// Chunk puts are content-addressed/idempotent and keyed by offset, so
-/// they're order-independent — we fan them out instead of awaiting one
-/// at a time (~16 ms/chunk serial). ADR 0101 A: raised 32 → 96 — prod
-/// showed a 62k-range memory diff spending ~95 s here, gated purely on
-/// per-object round-trip rounds (`upload_budget_wait` ≈ 0, NIC idle at
-/// 512 KiB chunks). 96 matches the host-global `UploadBudget`'s default
-/// permit count, which stays the cross-workload arbiter; GCS object-write
-/// rate limits are per object name, not per bucket, so distinct-chunk
-/// fan-out at this width is safe.
+/// Dirty chunks the sparse re-chunk (`update_for_dirty_ranges_sparse`)
+/// works on at once, each on its own task. Chunk PUTs are
+/// content-addressed and keyed by offset, so their order does not matter.
+/// The store's admission limits the PUTs on the wire; this bounds the
+/// chunks held in memory. GCS object-write rate limits are per object
+/// name, so distinct chunks at this width are safe.
 const SPARSE_RECHUNK_CONCURRENCY: usize = 96;
 
 /// Where the wall-clock of a [`ChunkStore::chunk_file_into`] run went.
@@ -70,8 +65,8 @@ pub struct ChunkFileStats {
 
 /// Uploads in flight in `chunk_file`'s read→upload pipeline; each runs on
 /// its own task and a finished one's slot refills at once. Peak buffered
-/// RAM is this × chunk_size (1 GiB at 16 MiB disk chunks); the host-wide
-/// UploadBudget shares the wire with other uploads.
+/// RAM is this × chunk_size (1 GiB at 16 MiB disk chunks); the store's
+/// admission shares the wire with every other transfer on the host.
 const CHUNK_UPLOAD_CONCURRENCY: usize = 64;
 
 impl ChunkStore {
@@ -173,7 +168,7 @@ impl ChunkStore {
             let store = self.clone();
             let cache = cache.cloned();
             async move {
-                let hash = store.put_chunk(&bytes).await?;
+                let hash = store.put_chunk_bytes(bytes.clone()).await?;
                 // ADR 0039 (sticky-everywhere): write-through so the
                 // capturing host keeps its chunk on local NVMe and never
                 // re-fetches its own write from GCS. Best-effort — the
@@ -510,7 +505,9 @@ impl ChunkStore {
                             // sibling carries — new to this chain, so
                             // the dedup HEAD would almost always miss:
                             // unchecked PUT (ADR 0078 move 5).
-                            store.put_chunk_unchecked_prehashed(hash, &slice).await?;
+                            store
+                                .put_chunk_unchecked_prehashed(hash, Bytes::from(slice))
+                                .await?;
                         }
                         hash
                     }

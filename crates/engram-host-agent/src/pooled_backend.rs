@@ -2019,17 +2019,13 @@ impl PooledBackend {
         }
     }
 
-    /// ADR 0116 C3: a finisher whose chunk PUTs draw from `class`.
-    /// The periodic checkpoint and the cold-base seed take
-    /// `Background` (bulk work nobody is blocked on — the 2026-08-12
-    /// storm producer); eviction, drain, and migration keep the
-    /// `Foreground` default (a session is waiting on them).
-    pub(crate) fn finisher_with_class(
-        &self,
-        class: engram_chunk_store::UploadClass,
-    ) -> SnapshotFinisher {
+    /// A finisher whose chunk transfers are admitted at `class`. The
+    /// periodic checkpoint and the cold-base seed take `Background` (no
+    /// session waits for them); eviction, drain and migration take
+    /// `Prefix` (a session waits for them).
+    pub(crate) fn finisher_with_class(&self, class: Class) -> SnapshotFinisher {
         let mut f = self.finisher();
-        f.chunk_store = f.chunk_store.map(|cs| cs.with_upload_class(class));
+        f.chunk_store = f.chunk_store.map(|cs| cs.with_class(class));
         f
     }
 
@@ -2061,10 +2057,8 @@ impl PooledBackend {
             .capture_phase(id, CaptureUser::DeferredSnapshot)
             .await?;
         self.spawn_trace_publish(id);
-        // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
-        // canonical background bulk producer — nested-capped so it can
-        // never own the whole wire.
-        let finisher = self.finisher_with_class(engram_chunk_store::UploadClass::Background);
+        // The cold-base seed's multi-GiB upload: no session waits for it.
+        let finisher = self.finisher_with_class(Class::Background);
         Ok(DeferredSnapshot {
             handle: tokio::spawn(async move {
                 let _guard = capture_guard;
@@ -3212,10 +3206,9 @@ impl PooledBackend {
         let metadata = self
             .snapshot_with_class(
                 id,
-                // ADR 0116 C3: the periodic re-chunk is the upload storm
-                // producer — background class, so foreground uploads go
-                // first.
-                engram_chunk_store::UploadClass::Background,
+                // No session waits for a periodic checkpoint: its uploads
+                // yield to every other transfer on the host.
+                Class::Background,
                 CaptureUser::PeriodicCheckpoint,
             )
             .await?;
@@ -3227,7 +3220,7 @@ impl PooledBackend {
     pub(crate) async fn snapshot_with_class(
         &self,
         id: SandboxId,
-        class: engram_chunk_store::UploadClass,
+        class: Class,
         user: CaptureUser,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let (_capture_guard, cap) = self.capture_phase(id, user).await?;
@@ -4811,7 +4804,7 @@ impl SandboxBackend for PooledBackend {
         }
         let (_guard, cap) = self.capture_phase(id, CaptureUser::HeldCapture).await?;
         let metadata = self
-            .finisher_with_class(engram_chunk_store::UploadClass::Foreground)
+            .finisher_with_class(Class::Prefix)
             .finish(id, cap)
             .await?;
         self.held_snapshots.insert(id, metadata.clone());
@@ -4819,13 +4812,9 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // Foreground captures serve a waiting session.
-        self.snapshot_with_class(
-            id,
-            engram_chunk_store::UploadClass::Foreground,
-            CaptureUser::SnapshotRpc,
-        )
-        .await
+        // A Snapshot RPC serves a waiting session.
+        self.snapshot_with_class(id, Class::Prefix, CaptureUser::SnapshotRpc)
+            .await
     }
 
     /// The eviction flavor: capture, re-pause the guest (it is being
@@ -6582,11 +6571,8 @@ impl SandboxBackend for PooledBackend {
                 "this host has no chunk store wired; cannot materialize images".into(),
             ));
         };
-        // ADR 0116 C3: enable-flow chunking (64-wide over a multi-GiB
-        // flatten) is bulk background work — nested-capped so it never
-        // owns the whole wire.
-        let chunk_store =
-            chunk_store.with_upload_class(engram_chunk_store::UploadClass::Background);
+        // Enable-flow chunking is bulk work no session waits for.
+        let chunk_store = chunk_store.with_class(Class::Background);
         // ≤1 concurrent materialize per host: an image pull + flatten +
         // pack saturates NVMe/network; queueing a second behind it
         // just serializes with extra memory pressure. `try_lock` (not

@@ -310,3 +310,25 @@ async fn a_registered_peer_serves_its_manifest_until_the_registration_drops() {
         .unwrap();
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn an_upload_through_the_engine_store_takes_an_engine_slot() {
+    let f = fixture();
+    let cfg = Config {
+        in_flight: 1,
+        max_in_flight: 1,
+        demand_reserve: 0,
+        ..Config::default()
+    };
+    let engine = engine_over(&f, counting(&f, None), cfg);
+    let held = engine.admission().acquire(Class::Hydrate).await;
+
+    let store = engine.store().clone();
+    let upload = tokio::spawn(async move { store.put_chunk(b"an upload").await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!upload.is_finished(), "the upload waits for the held slot");
+
+    drop(held);
+    upload.await.unwrap().unwrap();
+    assert_eq!(engine.admission().in_flight(), 0);
+}

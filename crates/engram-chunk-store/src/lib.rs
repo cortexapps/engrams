@@ -39,8 +39,8 @@
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev
 //! - `engram-rootfs-materializer` — chunks bake/materialize outputs
 
+pub mod admission;
 pub mod bootstrap;
-pub mod budget;
 pub mod cache;
 pub mod error;
 pub mod file;
@@ -56,8 +56,8 @@ pub(crate) mod test_support;
 mod time_source;
 pub mod working_set;
 
+pub use admission::{Admission, Class, Permit};
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
-pub use budget::{UploadBudget, UploadClass};
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;

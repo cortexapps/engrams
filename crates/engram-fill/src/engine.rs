@@ -4,21 +4,25 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use engram_chunk_store::cache::FillSource;
-use engram_chunk_store::{ChunkHash, ChunkStore, Result};
+use engram_chunk_store::{
+    Admission, ChunkHash, ChunkStore, ChunkStoreError, Class, Permit, Result,
+};
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::admission::{Admission, Permit};
-use crate::{Class, PeerSource};
+use crate::PeerSource;
 
 /// Engine limits. The defaults come from dev-cluster runs: 64 fetches in
 /// flight reached about 1 GB/s of 512 KiB chunks from GCS, and GCS GET p95
 /// was about 50 ms with a tail of 1–10 s on about 0.3 % of GETs.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Store fetches in flight for every class except `Demand`.
+    /// Store transfers (GETs and PUTs) in flight at start, for every class
+    /// except `Demand`. The limit then follows the measured throughput.
     pub in_flight: usize,
+    /// The highest the limit goes.
+    pub max_in_flight: usize,
     /// Extra slots only `Demand` may use.
     pub demand_reserve: usize,
     /// A `Demand` fetch still running after this gets a second request; the
@@ -30,10 +34,14 @@ pub struct Config {
     pub peer_race_after: Duration,
 }
 
+/// The lowest the adaptive limit goes.
+const MIN_IN_FLIGHT: usize = 8;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             in_flight: 64,
+            max_in_flight: 256,
             demand_reserve: 16,
             hedge_after: Some(Duration::from_millis(200)),
             peer_race_after: Duration::from_millis(20),
@@ -43,12 +51,19 @@ impl Default for Config {
 
 impl Config {
     /// [`Config::default`], with `ENGRAM_FILL_IN_FLIGHT`,
-    /// `ENGRAM_FILL_DEMAND_RESERVE` and `ENGRAM_FILL_HEDGE_MS` (0 = off)
-    /// read when set. A set value that does not parse is an error.
+    /// `ENGRAM_FILL_IN_FLIGHT_MAX`, `ENGRAM_FILL_DEMAND_RESERVE` and
+    /// `ENGRAM_FILL_HEDGE_MS` (0 = off) read when set.
+    /// `ENGRAM_FILL_IN_FLIGHT` sets the start and the ceiling, so the
+    /// limit only backs off from it; `ENGRAM_FILL_IN_FLIGHT_MAX` then
+    /// raises the ceiling. A set value that does not parse is an error.
     pub fn from_env() -> std::result::Result<Self, String> {
         let mut cfg = Self::default();
         if let Some(v) = env_usize("ENGRAM_FILL_IN_FLIGHT")? {
             cfg.in_flight = v;
+            cfg.max_in_flight = v;
+        }
+        if let Some(v) = env_usize("ENGRAM_FILL_IN_FLIGHT_MAX")? {
+            cfg.max_in_flight = v;
         }
         if let Some(v) = env_usize("ENGRAM_FILL_DEMAND_RESERVE")? {
             cfg.demand_reserve = v;
@@ -81,8 +96,10 @@ pub struct FillStats {
     pub duplicate: usize,
 }
 
-/// The host's one path from the object store to the chunk cache. Cheap to
-/// clone.
+/// The host's one path between the object store and the chunk cache. It
+/// admits every store transfer of the host: its own fetches, and the PUTs
+/// and GETs of every clone of [`Self::store`], which carries its
+/// admission. Cheap to clone.
 #[derive(Clone)]
 pub struct FillEngine {
     inner: Arc<Inner>,
@@ -113,11 +130,21 @@ impl Drop for PeerRegistration {
 }
 
 impl FillEngine {
+    /// An engine over `store`. The engine's store is `store` with the
+    /// engine's admission: use [`Self::store`] (not `store`) for every
+    /// upload on the host.
     pub fn new(store: ChunkStore, cfg: Config) -> Self {
+        let admission = Admission::adaptive(
+            "store",
+            cfg.in_flight,
+            MIN_IN_FLIGHT.min(cfg.in_flight),
+            cfg.max_in_flight,
+            cfg.demand_reserve,
+        );
         Self {
             inner: Arc::new(Inner {
-                store,
-                admission: Admission::new(cfg.in_flight, cfg.demand_reserve),
+                store: store.with_admission(Arc::clone(&admission)),
+                admission,
                 hedge_after: cfg.hedge_after,
                 peer_race_after: cfg.peer_race_after,
                 peers: Mutex::new(HashMap::new()),
@@ -164,7 +191,7 @@ impl FillEngine {
 
     /// The chunk's bytes. A cache hit is served at once; a miss waits for a
     /// `class` slot, then is fetched, verified and stored by the cache.
-    /// Without a cache the resolver verifies.
+    /// Without a cache the engine verifies.
     pub async fn get(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
         if let Some(cache) = self.store().chunk_cache() {
             if let Some(bytes) = cache.read_resident(hash).await? {
@@ -179,18 +206,14 @@ impl FillEngine {
     /// write): a cache hit is served, a miss is fetched and verified but
     /// not stored in the cache, so the bytes are written to disk once.
     pub async fn read(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
-        let store = self.store();
-        if let Some(cache) = store.chunk_cache() {
+        if let Some(cache) = self.store().chunk_cache() {
             if let Some(bytes) = cache.read_resident(hash).await? {
                 return Ok(bytes);
             }
         }
-        let _permit = self.inner.admission.acquire(class).await;
+        let permit = self.inner.admission.acquire(class).await;
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
-        match self.peer_answer(hash).await {
-            Some(bytes) => Ok(bytes),
-            None => store.resolver().fetch_chunk(hash).await,
-        }
+        self.fetch_verified(hash, class, permit).await
     }
 
     /// Make every chunk in `hashes` resident in the cache at `class`, each
@@ -215,8 +238,13 @@ impl FillEngine {
                 stats.resident += 1;
                 continue;
             }
-            // Waiting here, not in the task, keeps the fetch order and
-            // spawns no more tasks than there are slots.
+            // A fetch frees its slot before its cache write, so the slots
+            // alone do not bound the chunks this call holds in memory.
+            while tasks.len() >= self.inner.admission.limit() {
+                let done = tasks.join_next().await.expect("tasks is not empty");
+                record(done, &mut stats, &mut first_err);
+            }
+            // Waiting here, not in the task, keeps the fetch order.
             let permit = self.inner.admission.acquire(class).await;
             let engine = self.clone();
             tasks.spawn(async move { engine.fetch_admitted(hash, class, permit).await });
@@ -234,20 +262,30 @@ impl FillEngine {
     }
 
     async fn fetch_admitted(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
-        let _permit = permit;
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
-        let store = self.store();
-        match store.chunk_cache() {
+        match self.store().chunk_cache() {
             Some(cache) => {
                 cache
-                    .get_with_source(hash, || self.fetch_unverified(hash, class))
+                    .get_with_source(hash, || self.fetch_unverified(hash, class, permit))
                     .await
             }
-            None => match self.peer_answer(hash).await {
-                Some(bytes) => Ok(bytes),
-                None => store.resolver().fetch_chunk(hash).await,
-            },
+            None => self.fetch_verified(hash, class, permit).await,
         }
+    }
+
+    /// [`Self::fetch_unverified`], with the store's bytes hashed here.
+    async fn fetch_verified(&self, hash: ChunkHash, class: Class, permit: Permit) -> Result<Bytes> {
+        let (bytes, source) = self.fetch_unverified(hash, class, permit).await?;
+        if source == FillSource::BlobStorage {
+            let actual = ChunkHash::of(&bytes);
+            if actual != hash {
+                return Err(ChunkStoreError::HashMismatch {
+                    expected: hash.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+        }
+        Ok(bytes)
     }
 
     /// The peer's answer, when this view has a peer and the peer has the
@@ -256,10 +294,28 @@ impl FillEngine {
         self.peer.as_ref()?.fetch(hash).await
     }
 
+    /// [`Self::fetch_tiers`] under `permit`, which is freed when the bytes
+    /// are in hand (before the cache writes them). A store answer reports
+    /// its outcome to the adaptive limit; a peer answer does not.
+    async fn fetch_unverified(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        permit: Permit,
+    ) -> Result<(Bytes, FillSource)> {
+        let got = self.fetch_tiers(hash, class).await;
+        match &got {
+            Ok((bytes, FillSource::BlobStorage)) => permit.done(bytes.len() as u64),
+            Ok((_, FillSource::Peer)) => drop(permit),
+            Err(e) => permit.finish(Err(e)),
+        }
+        got
+    }
+
     /// The peer (when this view has one), then the store. A `Demand`
     /// fetch races the store against a peer that has not answered after
-    /// `peer_race_after`. The cache hashes what came from the store.
-    async fn fetch_unverified(&self, hash: ChunkHash, class: Class) -> Result<(Bytes, FillSource)> {
+    /// `peer_race_after`. The caller hashes what came from the store.
+    async fn fetch_tiers(&self, hash: ChunkHash, class: Class) -> Result<(Bytes, FillSource)> {
         let from_store = |engine: &Self| {
             let engine = engine.clone();
             async move {

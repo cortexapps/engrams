@@ -182,7 +182,10 @@ pub mod checkpoint_split {
                 if is_zero_chunk(&bytes) {
                     return Ok::<_, io::Error>((offset, None));
                 }
-                let hash = store.put_chunk(&bytes).await.map_err(store_err)?;
+                let hash = store
+                    .put_chunk_bytes(bytes.into())
+                    .await
+                    .map_err(store_err)?;
                 Ok((offset, Some(ChunkRef { offset, hash })))
             });
         }

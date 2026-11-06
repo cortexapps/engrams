@@ -1412,6 +1412,7 @@ mod tests {
             store.clone(),
             engram_fill::Config {
                 in_flight: 1,
+                max_in_flight: 1,
                 demand_reserve: 0,
                 ..engram_fill::Config::default()
             },

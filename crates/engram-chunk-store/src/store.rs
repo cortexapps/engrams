@@ -25,8 +25,9 @@
 //! *produced* it reads it back locally (μs) instead of re-fetching it from
 //! the blob store (~110 ms) on the next resume. A read the cache misses
 //! goes through the configured `ChunkResolver`, which by default reads
-//! `BlobStorage` directly. On a host, the fill engine (`engram-fill`)
-//! admits and schedules those reads.
+//! `BlobStorage` directly. On a host, the store carries the fill engine's
+//! (`engram-fill`) [`Admission`]: every chunk GET past the cache and every
+//! chunk PUT body takes a permit from it, in class order.
 
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ use bytes::Bytes;
 use engram_core::traits::BlobStorage;
 use uuid::Uuid;
 
+use crate::admission::{Admission, Class, Permit};
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::{ChunkHash, Manifest, ManifestRef};
 use crate::resolver::{BlobStorageResolver, ChunkResolver};
@@ -54,17 +56,12 @@ pub struct ChunkStore {
     /// before the resolver and a miss or a `put_chunk` populates it.
     /// `None` on the coordinator, where every read goes to `inner`.
     cache: Option<crate::cache::ChunkCache>,
-    /// Optional host-global upload budget (ADR 0088 addendum): every
-    /// chunk PUT body acquires one permit, so concurrent bulk-upload
-    /// workloads (materialize / memory seed / disk flush) share the
-    /// NIC instead of stacking on it. `None` (coordinator, tests) =
-    /// unbudgeted, unchanged.
-    upload_budget: Option<crate::budget::UploadBudget>,
-    /// ADR 0116 C3: which arbitration class this store's PUTs draw
-    /// from. `Foreground` by default; bulk producers (checkpoint
-    /// re-chunk, materialize, base capture) clone a `Background` store
-    /// via [`Self::with_upload_class`].
-    upload_class: crate::budget::UploadClass,
+    /// The host's transfer admission (the fill engine's). When set, every
+    /// chunk PUT body and every chunk GET past the cache takes a permit
+    /// at `class`. `None` (coordinator, tests) admits everything.
+    admission: Option<Arc<Admission>>,
+    /// The class this store's transfers are admitted at.
+    class: Class,
 }
 
 impl ChunkStore {
@@ -80,29 +77,39 @@ impl ChunkStore {
             inner: blob,
             resolver,
             cache: None,
-            upload_budget: None,
-            upload_class: crate::budget::UploadClass::Foreground,
+            admission: None,
+            class: Class::Prefix,
         }
     }
 
-    /// Wire the host-global [`UploadBudget`](crate::budget::UploadBudget):
-    /// every chunk PUT body (checked and unchecked) acquires one permit
-    /// after the dedup HEAD short-circuit — deduped puts, HEADs, and
-    /// manifest/trace PUTs consume nothing. Pass the SAME budget clone
-    /// to every store on the host.
-    pub fn with_upload_budget(mut self, budget: crate::budget::UploadBudget) -> Self {
-        self.upload_budget = Some(budget);
+    /// Admit chunk transfers through `admission`: each chunk PUT body
+    /// (after the dedup HEAD) and each chunk GET the cache misses takes a
+    /// permit. HEADs and manifest or trace transfers take none. The fill
+    /// engine wires its own admission here, so the host's uploads and
+    /// downloads share one limit.
+    pub fn with_admission(mut self, admission: Arc<Admission>) -> Self {
+        self.admission = Some(admission);
         self
     }
 
-    /// ADR 0116 C3: a clone of this store whose PUTs draw from `class`.
-    /// The bulk producers (checkpoint re-chunk, materialize/enable
-    /// chunking, base capture) take a `Background` clone at their entry
-    /// point; everything else stays `Foreground`. Same blob, resolver,
-    /// cache, and budget — only the arbitration class differs.
-    pub fn with_upload_class(mut self, class: crate::budget::UploadClass) -> Self {
-        self.upload_class = class;
+    /// A clone of this store whose transfers are admitted at `class`
+    /// (default [`Class::Prefix`]: a session waits for them). Periodic
+    /// checkpoints and image staging take [`Class::Background`].
+    pub fn with_class(mut self, class: Class) -> Self {
+        self.class = class;
         self
+    }
+
+    /// The class this store's transfers are admitted at.
+    pub fn class(&self) -> Class {
+        self.class
+    }
+
+    async fn admit(&self) -> Option<Permit> {
+        match &self.admission {
+            Some(a) => Some(a.acquire(self.class).await),
+            None => None,
+        }
     }
 
     /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as the
@@ -156,39 +163,21 @@ impl ChunkStore {
     /// re-warm the producing host's cache, or every future resume on
     /// that host re-fetches from GCS what it already uploaded.
     pub async fn put_chunk(&self, body: &[u8]) -> Result<ChunkHash> {
-        let hash = ChunkHash::of(body);
+        self.put_chunk_bytes(Bytes::copy_from_slice(body)).await
+    }
+
+    /// [`Self::put_chunk`] for bytes the caller owns: no copy.
+    pub async fn put_chunk_bytes(&self, body: Bytes) -> Result<ChunkHash> {
+        let hash = ChunkHash::of(&body);
         let key = hash.storage_key();
-        // Idempotency: if the chunk already exists, skip the PUT.
-        // For S3/GCS this is a HEAD round-trip; for local fs it's
-        // a stat. Both cheap relative to a multi-MB PUT.
+        // For S3/GCS this is a HEAD round-trip; for local fs it's a stat.
         if self.inner.exists(&key).await? {
-            // ADR 0078 move 4: warm the local cache even on the dedup
-            // short-circuit. The chunk is durable in `inner`; if it is
-            // remotely present but locally evicted, this is the only
-            // thing that re-warms it on the producing host.
             self.warm_local(hash, body).await;
             metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "deduped")
                 .increment(1);
             return Ok(hash);
         }
-        let bytes = Bytes::copy_from_slice(body);
-        let put_result = {
-            // Budget the PUT body only — the HEAD above and the local
-            // warm below stay unbudgeted.
-            let _permit = match &self.upload_budget {
-                Some(b) => Some(b.acquire(self.upload_class).await),
-                None => None,
-            };
-            self.inner.put(&key, bytes).await
-        };
-        match put_result {
-            Ok(_) => {
-                metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "uploaded")
-                    .increment(1);
-                tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
-            }
-            Err(e) => self.resolve_failed_put(hash, &key, "checked", e).await?,
-        }
+        self.put_body(hash, &key, body.clone(), "checked").await?;
         self.warm_local(hash, body).await;
         Ok(hash)
     }
@@ -207,39 +196,53 @@ impl ChunkStore {
     /// the dedup HEAD saves re-uploading tens of GiB on a re-bake.
     pub async fn put_chunk_unchecked(&self, body: &[u8]) -> Result<ChunkHash> {
         let hash = ChunkHash::of(body);
-        self.put_chunk_unchecked_prehashed(hash, body).await?;
+        self.put_chunk_unchecked_prehashed(hash, Bytes::copy_from_slice(body))
+            .await?;
         Ok(hash)
     }
 
-    /// [`Self::put_chunk_unchecked`] for callers that already computed
-    /// the hash (the sparse re-chunk hashes first to decide its
-    /// unchanged-skip) — avoids a second SHA-256 pass over the body.
-    /// `pub(crate)`: external callers go through `put_chunk_unchecked`,
-    /// whose returned hash doubles as their verification value.
+    /// [`Self::put_chunk_unchecked`] for a caller that already hashed
+    /// `body` (the sparse re-chunk hashes first to decide its
+    /// unchanged-skip). The caller guarantees `hash` is its hash.
     pub(crate) async fn put_chunk_unchecked_prehashed(
         &self,
         hash: ChunkHash,
-        body: &[u8],
+        body: Bytes,
     ) -> Result<()> {
         let key = hash.storage_key();
-        let bytes = Bytes::copy_from_slice(body);
-        let put_result = {
-            let _permit = match &self.upload_budget {
-                Some(b) => Some(b.acquire(self.upload_class).await),
-                None => None,
-            };
-            self.inner.put(&key, bytes).await
-        };
-        match put_result {
-            Ok(_) => {
-                metrics::counter!("engram_chunk_put_total", "mode" => "unchecked", "outcome" => "uploaded")
-                    .increment(1);
-                tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT (unchecked)");
-            }
-            Err(e) => self.resolve_failed_put(hash, &key, "unchecked", e).await?,
-        }
+        self.put_body(hash, &key, body.clone(), "unchecked").await?;
         self.warm_local(hash, body).await;
         Ok(())
+    }
+
+    /// One chunk body PUT, under one admission permit.
+    async fn put_body(
+        &self,
+        hash: ChunkHash,
+        key: &str,
+        body: Bytes,
+        mode: &'static str,
+    ) -> Result<()> {
+        let len = body.len() as u64;
+        let permit = self.admit().await;
+        let put = self.inner.put(key, body).await;
+        match put {
+            Ok(_) => {
+                if let Some(p) = permit {
+                    p.done(len);
+                }
+                metrics::counter!("engram_chunk_put_total", "mode" => mode, "outcome" => "uploaded")
+                    .increment(1);
+                tracing::trace!(hash = %hash, bytes = len, mode, "chunk PUT");
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(p) = permit {
+                    p.failed();
+                }
+                self.resolve_failed_put(hash, key, mode, e).await
+            }
+        }
     }
 
     /// Last resort for a failed chunk PUT: chunk keys are
@@ -281,22 +284,15 @@ impl ChunkStore {
     }
 
     /// Write-through the local cache (if wired): the host that produced
-    /// this chunk should read it back locally (μs) rather than re-fetch
-    /// it from the blob store (~110 ms) on the next resume — symmetric
-    /// with the read path's populate-on-miss. `write_local` runs the
-    /// cache's *debounced* budget sweep, so a burst of write-throughs
-    /// (e.g. an idle-eviction re-chunk) enforces the free-space floor at
-    /// most once per interval — it does NOT skip eviction the way
-    /// `put_no_evict` would, which on a disk-pressured host could overshoot
-    /// the floor. LRU then retains these fresh chunks and evicts stale
-    /// ones, exactly the set we want warm for the resume. `hash` is
-    /// pre-computed by the caller, so `write_local` skips a redundant
-    /// re-hash. Best-effort: the chunk is already durable in `inner`, so
-    /// a cache write failure is a missed optimization, never incorrect
-    /// (reads fall back to the blob store).
-    async fn warm_local(&self, hash: ChunkHash, body: &[u8]) {
+    /// this chunk reads it back locally on the next resume instead of
+    /// fetching it from the blob store. `write_local` runs the cache's
+    /// debounced budget sweep, so a burst of write-throughs enforces the
+    /// free-space floor at most once per interval. Best-effort: the chunk
+    /// is already durable in `inner`, so a failed cache write only costs
+    /// a later fetch.
+    async fn warm_local(&self, hash: ChunkHash, body: Bytes) {
         if let Some(cache) = &self.cache {
-            if let Err(e) = cache.write_local(hash, body).await {
+            if let Err(e) = cache.write_local(hash, &body).await {
                 tracing::debug!(
                     hash = %hash,
                     error = %e,
@@ -305,6 +301,21 @@ impl ChunkStore {
                 );
             }
         }
+    }
+
+    /// One resolver fetch, under one admission permit. `verify` asks the
+    /// resolver to check the hash (the caller stores nothing that would).
+    async fn fetch_admitted(&self, hash: ChunkHash, verify: bool) -> Result<Bytes> {
+        let permit = self.admit().await;
+        let got = if verify {
+            self.resolver.fetch_chunk(hash).await
+        } else {
+            self.resolver.fetch_chunk_unverified(hash).await
+        };
+        if let Some(p) = permit {
+            p.finish(got.as_ref().map(|b| b.len() as u64));
+        }
+        got
     }
 
     /// A chunk's bytes: from the local cache when one is wired and
@@ -316,12 +327,8 @@ impl ChunkStore {
     /// the cache's singleflight would wait on itself.
     pub async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
         match &self.cache {
-            Some(cache) => {
-                cache
-                    .get(hash, || self.resolver.fetch_chunk_unverified(hash))
-                    .await
-            }
-            None => self.resolver.fetch_chunk(hash).await,
+            Some(cache) => cache.get(hash, || self.fetch_admitted(hash, false)).await,
+            None => self.fetch_admitted(hash, true).await,
         }
     }
 
@@ -334,35 +341,7 @@ impl ChunkStore {
                 return Ok(bytes);
             }
         }
-        self.resolver.fetch_chunk(hash).await
-    }
-
-    /// Make `hash` resident in the local cache; nothing to do without
-    /// one.
-    pub async fn prefetch_chunk(&self, hash: ChunkHash) -> Result<()> {
-        match &self.cache {
-            Some(cache) => {
-                cache
-                    .prefetch(hash, || self.resolver.fetch_chunk_unverified(hash))
-                    .await
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// [`Self::prefetch_chunk`] for a whole set, at most `concurrency`
-    /// fetches at a time.
-    pub async fn prefetch_chunks(&self, hashes: Vec<ChunkHash>, concurrency: usize) -> Result<()> {
-        let Some(cache) = &self.cache else {
-            return Ok(());
-        };
-        let resolver = self.resolver.clone();
-        cache
-            .prefetch_chunks_parallel(hashes, concurrency, move |hash| {
-                let resolver = resolver.clone();
-                async move { resolver.fetch_chunk_unverified(hash).await }
-            })
-            .await
+        self.fetch_admitted(hash, true).await
     }
 
     /// Existence check for a chunk, routed through the resolver.
@@ -547,29 +526,57 @@ mod tests {
         (ChunkStore::new(blob), dir)
     }
 
-    /// ADR 0088 addendum: the dedup short-circuit must not consume an
-    /// upload-budget permit — a fully-deduped re-bake (the 40s prod
-    /// case) must never queue behind other workloads' PUT traffic.
+    /// The dedup short-circuit takes no permit: a fully deduped re-bake
+    /// never queues behind other transfers.
     #[tokio::test]
     async fn deduped_put_consumes_no_permit() {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-        let budget = crate::budget::UploadBudget::new(1);
-        let s = ChunkStore::new(blob).with_upload_budget(budget.clone());
+        let admission = Admission::fixed("test", 1, 0);
+        let s = ChunkStore::new(blob).with_admission(admission.clone());
 
-        // First put uploads (consumes + releases the only permit).
-        let body = b"budgeted-chunk";
+        let body = b"admitted-chunk";
         s.put_chunk(body).await.unwrap();
+        assert_eq!(admission.in_flight(), 0, "the upload released its permit");
 
-        // Hold the only permit hostage; the deduped re-put must still
-        // return promptly via the exists() short-circuit.
-        let _hostage = budget.acquire(crate::budget::UploadClass::Foreground).await;
+        let _hostage = admission.acquire(Class::Demand).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), s.put_chunk(body))
             .await
-            .expect("deduped put must not wait on the budget")
+            .expect("deduped put must not wait for a permit")
             .unwrap();
     }
 
+    /// A Background upload waits while a Prefix transfer waits for the
+    /// same admission: uploads and downloads share one class order.
+    #[tokio::test]
+    async fn a_background_upload_waits_behind_a_waiting_prefix_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let admission = Admission::fixed("test", 1, 0);
+        let store = ChunkStore::new(blob).with_admission(admission.clone());
+        let held = admission.acquire(Class::Hydrate).await;
+
+        let background = store.clone().with_class(Class::Background);
+        let upload = tokio::spawn(async move { background.put_chunk(b"bulk").await });
+        tokio::task::yield_now().await;
+        let prefix = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(Class::Prefix).await }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let prefix = tokio::time::timeout(std::time::Duration::from_secs(5), prefix)
+            .await
+            .expect("prefix granted")
+            .unwrap();
+        assert!(
+            !upload.is_finished(),
+            "the upload waits for the prefix slot"
+        );
+        drop(prefix);
+        upload.await.unwrap().unwrap();
+    }
     /// A store with a wired local write-through cache (the host-agent shape),
     /// returning a handle to the same cache so tests can assert residency.
     async fn store_with_cache() -> (ChunkStore, ChunkCache, tempfile::TempDir) {

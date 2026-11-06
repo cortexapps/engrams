@@ -30,10 +30,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::manifest::{ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind};
 use crate::store::ChunkStore;
 
-/// Upload width, matching `chunk_file_into`'s pipeline: enough to
-/// hide per-PUT latency, small enough that the host-global
-/// [`UploadBudget`](crate::budget::UploadBudget) stays the arbiter
-/// under concurrent workloads.
+/// Uploads in flight from one region run, matching `chunk_file_into`'s
+/// pipeline. The store's admission (the fill engine's, on a host) limits
+/// the PUTs on the wire across every workload.
 const REGION_UPLOAD_CONCURRENCY: usize = 64;
 
 /// Completed chunks in flight from the sync producer to the async
