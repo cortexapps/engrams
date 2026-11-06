@@ -122,6 +122,29 @@ struct PendingPresetup {
     hot_chunks: Vec<[u8; 32]>,
 }
 
+/// The per-sandbox capture locks. Take `serial` before `quiesce`.
+#[derive(Default)]
+struct CaptureGate {
+    /// The capture lock: serializes captures, held through the post phase.
+    serial: Arc<tokio::sync::Mutex<()>>,
+    /// Held by a capture from before its pause until its guest resumes,
+    /// and by `start_agent` (ADR 0123 D4: a `SpawnHarness`, which arms
+    /// swap, never straddles a pause). The post phase reads only what the
+    /// pause froze — the disk snapshots, the FC staging files, the chain
+    /// head cloned under `serial` — so it runs without this lock.
+    quiesce: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl CaptureGate {
+    async fn serialize(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.serial.clone().lock_owned().await
+    }
+
+    async fn quiesce(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.quiesce.clone().lock_owned().await
+    }
+}
+
 /// The unwind guard for a capture's window between the guest `pause`
 /// and the moment a finisher, a finalize record, or an export owns the
 /// captured state. A `?` return or a dropped handler future inside that
@@ -348,9 +371,7 @@ pub struct PooledBackend {
     /// Per-sandbox rolling chain state. Present once the first (Full)
     /// checkpoint completed; every later capture is a diff against it.
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
-    /// Serializes captures per sandbox: a periodic checkpoint never
-    /// interleaves with an eviction snapshot.
-    capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    capture_gates: Arc<DashMap<SandboxId, Arc<CaptureGate>>>,
     /// `sandbox_id → snapshot_id` of an in-flight, durably persisted
     /// eviction finalize job (issue #529). Makes `snapshot_begin`
     /// idempotent under an eviction-scanner retry storm, and keeps
@@ -1497,7 +1518,7 @@ impl PooledBackend {
             checkpoint_dir: None,
             chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
-            capture_locks: Arc::new(DashMap::new()),
+            capture_gates: Arc::new(DashMap::new()),
             pending_finalizes: Arc::new(DashMap::new()),
             self_ref: Arc::new(std::sync::OnceLock::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
@@ -1692,32 +1713,16 @@ impl PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
     }
 
-    /// The per-sandbox capture serialization lock (periodic
-    /// checkpoint vs eviction/drain/SIGTERM snapshot).
-    fn capture_lock(&self, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
-        self.capture_locks
-            .entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    fn capture_gate(&self, id: SandboxId) -> Arc<CaptureGate> {
+        self.capture_gates.entry(id).or_default().clone()
     }
 
-    /// ADR 0038 B1: is a capture (eviction / evac / drain / a prior
-    /// checkpoint) currently holding this sandbox's capture lock? The
-    /// periodic checkpoint driver probes this and SKIPS the tick when
-    /// it returns true — a best-effort checkpoint must never *queue*
-    /// behind another capture, which is how one slow/hung capture
-    /// gridlocks the fleet (52–151 s dark `host.snapshot` waits).
-    /// `try_lock` is the probe: a held lock
-    /// means a capture is in flight.
-    ///
-    /// A benign sub-ms race remains — a capture can start between this
-    /// probe and `snapshot()`'s own blocking acquire, in which case the
-    /// periodic tick queues behind that *one* fresh capture rather than
-    /// skipping. That's harmless: the gridlock we're killing is queuing
-    /// behind a HUNG capture, which the probe catches (try_lock fails)
-    /// and skips outright; the next tick retries regardless.
+    /// ADR 0038 B1: whether a capture or a harness spawn holds this
+    /// sandbox's gate. Callers that must not queue behind either (the
+    /// periodic driver, the external pause) skip on `true`.
     pub fn capture_in_flight(&self, id: SandboxId) -> bool {
-        self.capture_lock(id).try_lock().is_err()
+        let gate = self.capture_gate(id);
+        gate.serial.try_lock().is_err() || gate.quiesce.try_lock().is_err()
     }
 
     /// 2026-08-03 `chain_poisoned` alert: refuse to START any new capture
@@ -1752,15 +1757,15 @@ impl PooledBackend {
         // Snapshot the lock set; the quiesce flag guarantees no NEW
         // capture can begin, so entries added after this point are
         // uncontended.
-        let locks: Vec<(SandboxId, Arc<tokio::sync::Mutex<()>>)> = self
-            .capture_locks
+        let gates: Vec<(SandboxId, Arc<CaptureGate>)> = self
+            .capture_gates
             .iter()
             .map(|e| (*e.key(), Arc::clone(e.value())))
             .collect();
         let mut stragglers = 0usize;
-        for (id, lock) in locks {
+        for (id, gate) in gates {
             let remaining = deadline.saturating_sub(start.elapsed());
-            match tokio::time::timeout(remaining, lock.lock()).await {
+            match tokio::time::timeout(remaining, gate.serialize()).await {
                 // Acquiring proves no capture holds the lock; release
                 // immediately (the quiesce flag keeps it that way).
                 Ok(_guard) => {}
@@ -1953,10 +1958,10 @@ impl PooledBackend {
                 .pending_finalizes
                 .insert(record.sandbox_id, record.snapshot_id);
             metrics::counter!(crate::metrics::EVICTION_FINALIZE_REDRIVEN_TOTAL).increment(1);
-            let capture_lock = self.capture_lock(record.sandbox_id);
+            let gate = self.capture_gate(record.sandbox_id);
             let f = finalizer.clone();
             tokio::spawn(async move {
-                let guard = capture_lock.lock_owned().await;
+                let guard = gate.serialize().await;
                 crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
             });
         }
@@ -2029,23 +2034,20 @@ impl PooledBackend {
         });
     }
 
-    /// ADR 0045 D5: pause + drain + FC capture. Returns the held capture
-    /// lock (the caller decides whether the post phase runs inline or in
-    /// a background task — the lock must span it either way, so a
-    /// concurrent periodic checkpoint's `capture_in_flight` try_lock
-    /// keeps skipping until the upload completes) and the capture
-    /// artifacts the post phase consumes.
+    /// ADR 0045 D5: pause + drain + FC capture. Returns the capture lock,
+    /// which the post phase must hold wherever it runs, and the artifacts
+    /// the post phase consumes. The quiesce guard ends on return.
     async fn capture_phase(
         &self,
         id: SandboxId,
         hold: bool,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
-        let capture_lock = self.capture_lock(id);
+        let gate = self.capture_gate(id);
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
         // B1 periodic checkpoints skip rather than queue, so a long tail
         // here is an eviction/drain blocked on an in-flight capture.
         let lock_wait = crate::time_source::metrics_now();
-        let capture_guard = capture_lock.lock_owned().await;
+        let capture_guard = gate.serialize().await;
         if self.held_snapshots.contains_key(&id)
             || self.migration_role(id) == Some(crate::migration::MigrationRole::HeldSource)
         {
@@ -2156,6 +2158,7 @@ impl PooledBackend {
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
 
+        let _quiesce = gate.quiesce().await;
         // The pause instant is the coherence cut for memory, disk, and
         // the event log: the coordinator resolves the session_events
         // cursor against it.
@@ -2901,8 +2904,7 @@ impl PooledBackend {
             // invalidates + creates (bitmap reset) → seed stale head"
             // would rebuild exactly the corrupt diff this protocol
             // exists to prevent.
-            let lock = self.capture_lock(id);
-            let _guard = lock.lock_owned().await;
+            let _guard = self.capture_gate(id).serialize().await;
             if self.checkpoint_chains.contains_key(&id) {
                 continue;
             }
@@ -4831,11 +4833,8 @@ impl SandboxBackend for PooledBackend {
         self.pending_finalizes.insert(id, snapshot_id);
 
         tokio::spawn(async move {
-            // The capture lock rides into the task: periodic checkpoints
-            // stay locked out until the finalize completes (chain
-            // bookkeeping is not concurrent-safe per sandbox) — same
-            // guarantee the pre-#529 shape gave, now held for the whole
-            // (re-drivable) job instead of just one process's attempt.
+            // Chain bookkeeping is not concurrent-safe per sandbox, so the
+            // capture lock spans the whole finalize job.
             crate::eviction_finalize::run_eviction_finalize(finalizer, record, capture_guard).await;
         });
         Ok(snapshot_id)
@@ -5051,7 +5050,9 @@ impl SandboxBackend for PooledBackend {
             }
 
             // Checkpoint fence: held for the export's lifetime.
-            let capture_guard = self.capture_lock(id).lock_owned().await;
+            let gate = self.capture_gate(id);
+            let capture_guard = gate.serialize().await;
+            let _quiesce = gate.quiesce().await;
 
             // Blackout leg 1: pause. (PR 10 decomposition.)
             let t_pause = crate::time_source::metrics_now();
@@ -5799,7 +5800,7 @@ impl SandboxBackend for PooledBackend {
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
                 let checkpoint_chains = self.checkpoint_chains.clone();
                 let chain_heads = self.chain_heads.clone();
-                let capture_locks = self.capture_locks.clone();
+                let capture_gates = self.capture_gates.clone();
                 let migration_roles = self.migration_roles.clone();
                 let drained_dests = self.drained_dests.clone();
                 let volumes = self.volumes.clone();
@@ -5863,7 +5864,7 @@ impl SandboxBackend for PooledBackend {
                     if let Some(store) = &chain_heads {
                         store.remove_best_effort(id);
                     }
-                    let _ = capture_locks.remove(&id);
+                    let _ = capture_gates.remove(&id);
                     result.map_err(Arc::new)
                 })
             })
@@ -5872,9 +5873,7 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
-        let _capture_guard = self.capture_lock(id).lock_owned().await;
-        // This also waits for the checkpoint post phase. Capture and swap
-        // arming must be exclusive; the wait is bounded by the capture.
+        let _quiesce = self.capture_gate(id).quiesce().await;
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
         // before the backend sees it. Each backend rides it into the
@@ -6758,7 +6757,7 @@ mod tests {
         let id = SandboxId::new();
 
         // A capture in flight that outlives the deadline is a straggler.
-        let guard = pooled.capture_lock(id).lock_owned().await;
+        let guard = pooled.capture_gate(id).serialize().await;
         let stragglers = pooled
             .drain_captures_for_shutdown(std::time::Duration::from_millis(50))
             .await;
@@ -8615,7 +8614,7 @@ mod tests {
         std::fs::write(export_dir.join("state.bin"), b"state").unwrap();
         let id = SandboxId::new();
         let volumes = volumes_with_a_root(tmp.path(), id).await;
-        let guard = pooled.capture_lock(id).lock_owned().await;
+        let guard = pooled.capture_gate(id).serialize().await;
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: "hot-export".into(),
             sandbox_id: id,
@@ -11277,7 +11276,7 @@ mod tests {
         let id = inner.id;
         pooled.bind_session(SessionId::new(), id);
         pooled.last_snapshot_unix_ms.insert(id, 1);
-        let _lock = pooled.capture_lock(id);
+        let _gate = pooled.capture_gate(id);
         let mut first = Box::pin(pooled.destroy(id));
         assert!(futures::poll!(&mut first).is_pending());
         inner.entered.notified().await;
@@ -11291,7 +11290,7 @@ mod tests {
         assert!(pooled.list().await.unwrap().is_empty());
         assert!(!pooled.session_bindings.contains_key(&id));
         assert!(!pooled.last_snapshot_unix_ms.contains_key(&id));
-        assert!(!pooled.capture_locks.contains_key(&id));
+        assert!(!pooled.capture_gates.contains_key(&id));
     }
 
     #[tokio::test]
@@ -11333,11 +11332,19 @@ mod tests {
         );
     }
 
+    /// ADR 0123 D4: `start_agent` waits while the capture holds the guest
+    /// paused, and runs while the post phase still holds the capture lock.
     #[tokio::test]
-    async fn start_agent_waits_for_capture_and_post_phase() {
+    async fn start_agent_waits_for_the_pause_but_not_the_post_phase() {
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
         let pooled = PooledBackend::new(inner.clone());
+        let spawn = pooled.capture_gate(inner.id).quiesce().await;
+        assert!(
+            pooled.capture_in_flight(inner.id),
+            "a harness spawn defers the periodic checkpoint"
+        );
+        drop(spawn);
         let mut capture = Box::pin(pooled.capture_phase(inner.id, false));
         assert!(futures::poll!(&mut capture).is_pending());
         let agent = AgentSpec {
@@ -11352,11 +11359,15 @@ mod tests {
         assert_eq!(*inner.calls.lock(), vec!["snapshot"]);
         release.send(()).unwrap();
         let (guard, cap) = capture.await.unwrap();
-        assert!(futures::poll!(&mut start).is_pending());
-        drop(cap);
-        drop(guard);
         start.await.unwrap();
         assert_eq!(*inner.calls.lock(), vec!["snapshot", "start_agent"]);
+        assert!(
+            pooled.capture_in_flight(inner.id),
+            "the post phase still serializes captures"
+        );
+        drop(cap);
+        drop(guard);
+        assert!(!pooled.capture_in_flight(inner.id));
     }
 
     /// An open export for `id` whose local directory exists on disk.
@@ -11372,7 +11383,7 @@ mod tests {
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
-            capture_guard: pooled.capture_lock(id).lock_owned().await,
+            capture_guard: pooled.capture_gate(id).serialize().await,
         }));
         export_id
     }
@@ -11414,9 +11425,7 @@ mod tests {
         assert_eq!(*inner.calls.lock(), vec!["resume", "role"]);
         assert!(!dir.exists());
         assert!(pooled.migrations.export_id_of(id).is_none());
-        assert!(
-            !pooled.capture_locks.contains_key(&id) || pooled.capture_lock(id).try_lock().is_ok()
-        );
+        assert!(!pooled.capture_gates.contains_key(&id) || !pooled.capture_in_flight(id));
         // The in-memory fence is down: this process no longer treats the
         // guest as a frozen source.
         assert_eq!(pooled.migration_role(id), None);
