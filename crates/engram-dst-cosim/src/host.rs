@@ -906,6 +906,7 @@ impl CosimHost {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            traceparent: None,
         };
         let finalizer = self.finalizer();
         record

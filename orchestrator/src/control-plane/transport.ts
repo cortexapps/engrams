@@ -21,6 +21,7 @@ import { config } from "../config.ts";
 import { makeLeaseStore } from "../listeners/lease-store.ts";
 import { makeListenerWakeInterceptor } from "../listeners/wake-interceptor.ts";
 import { log } from "../log.ts";
+import { tracingInterceptor } from "../telemetry/connect.ts";
 
 // Machine identity (ADR §5): one trusted caller, one static credential.
 export const bearerInterceptor: Interceptor = (next) => (req) => {
@@ -50,7 +51,7 @@ export function makeTransport(
 
   return createGrpcTransport({
     baseUrl,
-    interceptors: [interceptor, ...extraInterceptors],
+    interceptors: [tracingInterceptor, interceptor, ...extraInterceptors],
     // ADR §9.4: detect half-open connections so leases don't ghost.
     // These are top-level options from Http2SessionOptions (not under nodeOptions).
     pingIntervalMs: 20_000,

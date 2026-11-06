@@ -70,6 +70,9 @@ data:
   {{- with .Values.orchestrator.githubAppLogin }}
   GITHUB_APP_LOGIN: {{ . | quote }}
   {{- end }}
+  {{- with .Values.orchestrator.otel.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
   ORCHESTRATOR_AUTH_MODE: {{ $authMode | quote }}
   {{- if eq $authMode "oauth" }}
   ORCHESTRATOR_OAUTH_ISSUER: {{ $auth.oauth.issuer | quote }}

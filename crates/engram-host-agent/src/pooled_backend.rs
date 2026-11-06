@@ -4784,6 +4784,7 @@ impl SandboxBackend for PooledBackend {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            traceparent: engram_telemetry::current_traceparent(),
         };
         let Some(finalizer) = self.eviction_finalizer() else {
             // Gated above; unreachable in practice (checkpoint_dir just
@@ -11871,6 +11872,7 @@ mod tests {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            traceparent: None,
         };
         record
             .persist(&engram_host_core::TokioFs, &ckpt_dir.join("finalize"))

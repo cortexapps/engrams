@@ -40,6 +40,7 @@ export interface OtlpSpanEvent {
 
 /** proto `opentelemetry.proto.trace.v1.Span.SpanKind`. */
 export const SPAN_KIND_INTERNAL = 1;
+export const SPAN_KIND_SERVER = 2;
 export const SPAN_KIND_CLIENT = 3;
 
 /** proto `opentelemetry.proto.trace.v1.Status.StatusCode`. */
@@ -120,6 +121,7 @@ export function msToUnixNano(ms: number): string {
 export function buildExportRequest(
   resourceAttributes: OtlpAttribute[],
   spans: OtlpSpan[],
+  scope = "engrams-session-telemetry",
 ): ExportTraceServiceRequest {
   return {
     resourceSpans: [
@@ -127,7 +129,7 @@ export function buildExportRequest(
         resource: { attributes: resourceAttributes },
         scopeSpans: [
           {
-            scope: { name: "engrams-session-telemetry" },
+            scope: { name: scope },
             spans,
           },
         ],

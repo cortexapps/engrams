@@ -6,6 +6,7 @@ import { sessions } from "../control-plane/client.ts";
 import { getDb } from "../db/client.ts";
 import { task, taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
+import { tracer } from "../telemetry/trace.ts";
 import {
   completeRegisteredToolCall,
   isProtocolErrorResult,
@@ -55,6 +56,14 @@ export interface ToolExecInput {
   argsJson?: string;
 }
 
+function toolSpanAttributes(input: ToolExecInput) {
+  return {
+    "session.id": input.sessionId,
+    "tool.call_id": input.toolCallId,
+    "tool.name": input.toolName,
+  };
+}
+
 export type ToolExecutionOutcome =
   | { kind: "deferred" }
   | { kind: "submit"; result: unknown };
@@ -99,7 +108,16 @@ export async function resolveToolContext(
 }
 
 /** Resolve, gate, validate, and invoke a handled tool. No DBOS APIs live here. */
-export async function executeToolCall(
+export function executeToolCall(
+  input: ToolExecInput,
+  deps: ToolExecDeps,
+): Promise<ToolExecutionOutcome> {
+  return tracer.inSpan("tool.execute", { attributes: toolSpanAttributes(input) }, () =>
+    executeToolCallImpl(input, deps),
+  );
+}
+
+async function executeToolCallImpl(
   input: ToolExecInput,
   deps: ToolExecDeps,
 ): Promise<ToolExecutionOutcome> {
@@ -216,7 +234,17 @@ function alreadyCompleted(error: unknown): boolean {
 
 /** Submit a synchronous execution result, accepting coordinator duplicate
  * completion as success during workflow replay. */
-export async function submitToolExecution(
+export function submitToolExecution(
+  input: ToolExecInput,
+  outcome: ToolExecutionOutcome,
+  deps: ToolExecDeps,
+): Promise<void> {
+  return tracer.inSpan("tool.submit", { attributes: toolSpanAttributes(input) }, () =>
+    submitToolExecutionImpl(input, outcome, deps),
+  );
+}
+
+async function submitToolExecutionImpl(
   input: ToolExecInput,
   outcome: ToolExecutionOutcome,
   deps: ToolExecDeps,

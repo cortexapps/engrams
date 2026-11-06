@@ -166,6 +166,23 @@ pub fn current_traceparent() -> Option<String> {
     ))
 }
 
+/// The server span for one inbound gRPC request, a child of the caller's
+/// trace when the request carries a W3C `traceparent`. Every span the
+/// handler opens nests under it, so one seam joins a whole service to the
+/// caller's trace.
+pub fn grpc_server_span(path: &str, traceparent: Option<&str>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "grpc.server",
+        otel.name = %path,
+        otel.kind = "server",
+        rpc.method = %path,
+    );
+    if let Some(tp) = traceparent {
+        set_parent_from_traceparent(&span, tp);
+    }
+    span
+}
+
 /// Parse an inbound W3C `traceparent` and set it as the parent of the
 /// given span, linking this process's spans to the upstream trace. No-op
 /// on a malformed/empty header.
@@ -187,5 +204,48 @@ pub fn set_parent_from_traceparent(span: &tracing::Span, traceparent: &str) {
     // would turn "traces stopped stitching" into an invisible symptom.
     if let Err(e) = span.set_parent(parent_cx) {
         tracing::debug!(error = %e, "set parent from traceparent");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    #[test]
+    fn a_grpc_server_span_is_a_child_of_the_callers_traceparent() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let span = grpc_server_span("/engram.app.v1.SessionService/SendPrompt", Some(caller));
+            let _entered = span.enter();
+            let child = tracing::info_span!("handler");
+            let _child = child.enter();
+            let tp = current_traceparent().expect("a span context");
+            assert!(
+                tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+                "the handler's span is not in the caller's trace: {tp}"
+            );
+            let parent = span.context().span().span_context().trace_id().to_string();
+            assert_eq!(parent, "4bf92f3577b34da6a3ce929d0e0e4736");
+        });
+    }
+
+    #[test]
+    fn a_grpc_server_span_without_a_traceparent_starts_a_trace() {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = grpc_server_span("/engram.app.v1.FleetService/ListHosts", None);
+            let _entered = span.enter();
+            assert!(current_traceparent().is_some());
+        });
     }
 }

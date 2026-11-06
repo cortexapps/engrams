@@ -28,6 +28,7 @@ pub use engram_host_core::FinalizeStage;
 use engram_host_core::{plan_finalize_retry, FinalizeRetry, HostFs};
 use engram_protocol::heartbeat::CheckpointKind;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::checkpoint::CheckpointRecord;
 
@@ -80,6 +81,11 @@ pub struct EvictionFinalizeRecord {
     pub swap_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
+    /// W3C trace context of the request that began the eviction. Each
+    /// finalize attempt's span is its child, so the trace covers the work
+    /// after `snapshot_begin` returns. `None` when tracing is off.
+    #[serde(default)]
+    pub traceparent: Option<String>,
 }
 
 /// A pending checkpoint of one disk and the checkpoint it was taken
@@ -243,6 +249,17 @@ async fn disk_leg_work(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
 ) -> Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError> {
+    let span = tracing::info_span!(
+        "host.evict_finalize.disk",
+        pending_disks = record.disk_pending.len(),
+    );
+    disk_leg(f, record).instrument(span).await
+}
+
+async fn disk_leg(
+    f: &EvictionFinalizer,
+    record: &EvictionFinalizeRecord,
+) -> Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError> {
     let start = crate::time_source::metrics_now();
     let mut root_manifest = None;
     let mut swap_manifest = None;
@@ -345,6 +362,26 @@ async fn memory_leg_work(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
 ) -> Result<(Option<ManifestRef>, Option<PathBuf>), SandboxError> {
+    let span = tracing::info_span!(
+        "host.evict_finalize.memory",
+        capture = if record.chain_prev_ref.is_some() {
+            "diff"
+        } else {
+            "full"
+        },
+        dirty_ranges = tracing::field::Empty,
+        dirty_bytes = tracing::field::Empty,
+        memory_bytes = tracing::field::Empty,
+        manifest_chunks = tracing::field::Empty,
+    );
+    memory_leg(f, record).instrument(span).await
+}
+
+async fn memory_leg(
+    f: &EvictionFinalizer,
+    record: &EvictionFinalizeRecord,
+) -> Result<(Option<ManifestRef>, Option<PathBuf>), SandboxError> {
+    let span = tracing::Span::current();
     let start = crate::time_source::metrics_now();
     let mut consumed: Option<PathBuf> = None;
     let mut memory_manifest: Option<ManifestRef> = None;
@@ -359,10 +396,16 @@ async fn memory_leg_work(
                 })?;
                 let ranges = crate::checkpoint::dirty_ranges(&diff_path)
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                span.record("dirty_ranges", ranges.len());
+                span.record(
+                    "dirty_bytes",
+                    ranges.iter().map(|(_, len)| len).sum::<u64>(),
+                );
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(&prev_manifest, &diff_path, &ranges)
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
+                span.record("manifest_chunks", next.chunks.len());
                 let next_ref = prev_ref.next_version();
                 let published_ref = publish_manifest_collision_safe(chunk_store, next_ref, &next)
                     .await
@@ -378,7 +421,8 @@ async fn memory_leg_work(
             }
         } else {
             let mem_path = record.dest.join("memory.bin");
-            if tokio::fs::metadata(&mem_path).await.is_ok() {
+            if let Ok(meta) = tokio::fs::metadata(&mem_path).await {
+                span.record("memory_bytes", meta.len());
                 let mref = crate::pooled_backend::chunk_memory_to_store(
                     chunk_store,
                     &mem_path,
@@ -415,14 +459,28 @@ async fn run_blobs_leg(
     if record.stage != FinalizeStage::MemoryChunked {
         return Ok(());
     }
+    let span = tracing::info_span!(
+        "host.evict_finalize.blobs",
+        state_bytes = tracing::field::Empty,
+        aux_bundles = record.aux_bundles.len(),
+    );
+    blobs_leg(f, record).instrument(span).await
+}
+
+async fn blobs_leg(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+) -> Result<(), SandboxError> {
     let start = crate::time_source::metrics_now();
     if let Some(chunk_store) = f.chunk_store.as_ref() {
         let blob = chunk_store.blob_storage();
         let state_path = record.dest.join("state.bin");
         let sidecar_path = record.dest.join("manifest.json");
-        if tokio::fs::metadata(&state_path).await.is_ok()
-            && tokio::fs::metadata(&sidecar_path).await.is_ok()
-        {
+        if let (Ok(state), Ok(_)) = (
+            tokio::fs::metadata(&state_path).await,
+            tokio::fs::metadata(&sidecar_path).await,
+        ) {
+            tracing::Span::current().record("state_bytes", state.len());
             let state_key = engram_chunk_store::snapshot_blob::state_blob_key(record.snapshot_id);
             let sidecar_key =
                 engram_chunk_store::snapshot_blob::sidecar_blob_key(record.snapshot_id);
@@ -473,6 +531,7 @@ async fn run_terminal(
         return Ok(());
     }
     let start = crate::time_source::metrics_now();
+    let record_span = tracing::info_span!("host.evict_finalize.checkpoint_record");
     let checkpoint = CheckpointRecord {
         snapshot_id: record.snapshot_id,
         session_id: record.session_id,
@@ -489,6 +548,7 @@ async fn run_terminal(
     };
     checkpoint
         .persist(f.fs.as_ref(), &f.records_dir())
+        .instrument(record_span)
         .await
         .map_err(|e| SandboxError::Snapshot(format!("persist eviction-final checkpoint: {e}")))?;
 
@@ -496,7 +556,12 @@ async fn run_terminal(
     f.pending_finalizes.remove(&record.sandbox_id);
     metrics::counter!(crate::metrics::EVICTION_FINALIZE_COMPLETED_TOTAL).increment(1);
 
-    match f.destroyer.destroy(record.sandbox_id).await {
+    let destroyed = f
+        .destroyer
+        .destroy(record.sandbox_id)
+        .instrument(tracing::info_span!("host.evict_finalize.destroy"))
+        .await;
+    match destroyed {
         Ok(()) => {}
         Err(SandboxError::NotFound) => {
             // Already gone (a prior attempt's destroy, the teardown
@@ -619,6 +684,34 @@ pub async fn run_eviction_finalize_attempt(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> FinalizeAttempt {
+    let span = tracing::info_span!(
+        "host.evict_finalize",
+        snapshot_id = %record.snapshot_id,
+        session_id = %record.session_id,
+        sandbox_id = %record.sandbox_id,
+        stage = ?record.stage,
+        attempt = record.attempts + 1,
+        outcome = tracing::field::Empty,
+    );
+    if let Some(tp) = record.traceparent.as_deref() {
+        engram_telemetry::set_parent_from_traceparent(&span, tp);
+    }
+    let outcome = finalize_attempt(f, record).instrument(span.clone()).await;
+    span.record(
+        "outcome",
+        match outcome {
+            FinalizeAttempt::Completed => "completed",
+            FinalizeAttempt::RetryAfter(_) => "retry",
+            FinalizeAttempt::Quarantined => "quarantined",
+        },
+    );
+    outcome
+}
+
+async fn finalize_attempt(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+) -> FinalizeAttempt {
     match run_eviction_finalize_once(f, record).await {
         Ok(()) => FinalizeAttempt::Completed,
         Err(e) => {
@@ -711,6 +804,7 @@ mod tests {
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            traceparent: None,
         };
         let body = serde_json::to_string(&record).unwrap();
         let bytes = crate::durable_envelope::seal(&record.snapshot_id.to_string(), &body);
@@ -728,6 +822,35 @@ mod tests {
         let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].disk_pending, record.disk_pending);
+    }
+
+    /// A record from the previous build has no `traceparent`; it loads
+    /// with `None`, and a new record keeps the field across a reload.
+    #[tokio::test]
+    async fn a_record_without_a_traceparent_loads_and_a_new_one_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record = record_for(SandboxId::new(), Vec::new());
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("traceparent");
+        let bytes =
+            crate::durable_envelope::seal(&record.snapshot_id.to_string(), &old.to_string());
+        std::fs::write(
+            tmp.path().join(format!("{}.json", record.snapshot_id)),
+            &bytes,
+        )
+        .unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].traceparent, None);
+
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        record.traceparent = Some(tp.into());
+        record
+            .persist(&engram_host_core::TokioFs, tmp.path())
+            .await
+            .unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
+        assert_eq!(loaded[0].traceparent.as_deref(), Some(tp));
     }
 
     struct NoDestroy;
@@ -795,6 +918,7 @@ mod tests {
             disk_manifest: None,
             swap_manifest: None,
             memory_manifest: None,
+            traceparent: None,
         }
     }
 

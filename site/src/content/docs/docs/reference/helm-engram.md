@@ -94,7 +94,7 @@ at boot.
 | `upgradeDrain` | The job that runs before an upgrade whose host agents cannot adopt the VMs running now: whether it runs and its time budget. It runs the coordinator image. See [Upgrade engrams](../../guides/upgrade/#when-a-release-changes-how-hosts-run-vms). |
 | `probes`, `drainSeconds`, `terminationGracePeriodSeconds` | Liveness on `/healthz`, readiness on `/readyz`, and how long a replica drains before it stops. |
 | `web` | The dashboard: image, Ingress, and the annotations that attach a managed certificate. |
-| `orchestrator` | The orchestrator: image, its Secret with the session-signing key, `auth` (see [Sign-in](#sign-in)), the public URL, and integration settings. |
+| `orchestrator` | The orchestrator: image, its Secret with the session-signing key, `auth` (see [Sign-in](#sign-in)), the public URL, integration settings, and `otel.endpoint`, an OTLP/HTTP collector for its request traces. Those traces continue into the coordinator's. |
 
 ## Upgrades
 

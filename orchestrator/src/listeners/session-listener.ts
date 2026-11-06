@@ -15,8 +15,22 @@ import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
 import type { CursorStore } from "./cursor-store.ts";
 import type { LeaseStore } from "./lease-store.ts";
+import { nowMs, tracer } from "../telemetry/trace.ts";
 
 const log = rootLog.child({ component: "session-listener" });
+
+/** Milliseconds since the coordinator stamped the event (`at`), or undefined
+ * when the payload carries no timestamp. */
+export function eventAgeMs(payloadJson: string): number | undefined {
+  try {
+    const at = (JSON.parse(payloadJson) as { at?: unknown } | null)?.at;
+    if (typeof at !== "string") return undefined;
+    const stamped = Date.parse(at);
+    return Number.isNaN(stamped) ? undefined : Math.round(nowMs() - stamped);
+  } catch {
+    return undefined;
+  }
+}
 const DEFAULT_QUEUE_CAPACITY = 1_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 30_000;
@@ -785,7 +799,19 @@ export class SessionListener {
         // A bigint return overrides the commit (a buffering consumer's held
         // floor — see SessionConsumer.handle); void keeps the default.
         const returned = state.consumer.interestedIn(event.kind)
-          ? await state.consumer.handle(event, this.#context)
+          ? await tracer.inSpan(
+              "listener.consume",
+              {
+                attributes: {
+                  "session.id": this.#deps.sessionId,
+                  "listener.consumer": state.consumer.name,
+                  "event.kind": event.kind,
+                  "event.idx": String(event.idx),
+                  "event.age_ms": tracer.enabled ? eventAgeMs(event.payloadJson) : undefined,
+                },
+              },
+              () => state.consumer.handle(event, this.#context),
+            )
           : undefined;
         const commit = typeof returned === "bigint" ? returned : event.idx;
         if (commit > state.cursor) {

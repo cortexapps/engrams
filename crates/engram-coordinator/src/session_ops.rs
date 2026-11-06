@@ -24,6 +24,7 @@ use engram_core::types::SessionState;
 use engram_core::SessionId;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
+use tracing::Instrument;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -857,18 +858,29 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // below pace an op's next claim by its OWN attempt's elapsed time
     // in addition to the backoff — see the pacing note at the arms.
     let attempt_started = state.services.clock.now_utc();
+    // One span per op attempt. `op.queued_ms` is the time from enqueue to
+    // this attempt: the wait behind the session's earlier ops, plus any
+    // backoff. The ops this op drives (host RPCs) nest under it.
+    let op_span = tracing::info_span!(
+        "session.op",
+        otel.name = %format!("op.{}", op.kind.as_str()),
+        session_id = %op.session_id,
+        op.id = op.id,
+        op.kind = op.kind.as_str(),
+        op.attempts = op.attempts,
+        op.queued_ms = (attempt_started - op.created_at).num_milliseconds(),
+    );
+    let dispatch = crate::session_verbs::dispatch(&ctx).instrument(op_span);
     let outcome = match op_deadline(op.kind) {
-        Some(deadline) => {
-            match tokio::time::timeout(deadline, crate::session_verbs::dispatch(&ctx)).await {
-                Ok(outcome) => outcome,
-                Err(_) => OpOutcome::Retry(format!(
-                    "op exceeded wall-clock deadline {deadline:?} at step {:?} (executor alive \
+        Some(deadline) => match tokio::time::timeout(deadline, dispatch).await {
+            Ok(outcome) => outcome,
+            Err(_) => OpOutcome::Retry(format!(
+                "op exceeded wall-clock deadline {deadline:?} at step {:?} (executor alive \
                      but wedged); requeued with backoff",
-                    op.step.as_deref().unwrap_or("<start>"),
-                )),
-            }
-        }
-        None => crate::session_verbs::dispatch(&ctx).await,
+                op.step.as_deref().unwrap_or("<start>"),
+            )),
+        },
+        None => dispatch.await,
     };
     drop(heartbeat);
     let meta = &state.services.meta;

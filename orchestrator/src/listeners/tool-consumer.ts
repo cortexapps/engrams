@@ -10,6 +10,7 @@ import { makePendingToolCallStore, type PendingToolCallStore } from "../tools/pe
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolExecInput } from "../tools/exec.ts";
 import { toolExecWorkflow } from "../workflows/tool-exec.ts";
+import { tracer } from "../telemetry/trace.ts";
 import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "tool-consumer" });
@@ -201,9 +202,14 @@ export function makeProductionToolConsumer(): SessionConsumer {
     registry: productionTools,
     pendingCalls,
     now: () => new Date(),
-    startWorkflow: async (input, workflowId) => {
-      await DBOS.startWorkflow(toolExecWorkflow, { workflowID: workflowId })(input);
-    },
+    startWorkflow: (input, workflowId) =>
+      tracer.inSpan(
+        "tool_exec.start",
+        { attributes: { "session.id": input.sessionId, "tool.name": input.toolName } },
+        async () => {
+          await DBOS.startWorkflow(toolExecWorkflow, { workflowID: workflowId })(input);
+        },
+      ),
     sessionIsOwnerless: async (sessionId) => {
       const rows = await getDb()
         .select({ createdByUserId: taskTable.createdByUserId })
