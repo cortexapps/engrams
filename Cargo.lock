@@ -2728,7 +2728,6 @@ dependencies = [
  "engram-core",
  "engram-fill",
  "engram-storage-local",
- "futures",
  "libc",
  "serde",
  "serde_json",

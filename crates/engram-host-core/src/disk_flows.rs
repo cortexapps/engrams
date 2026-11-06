@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use engram_chunk_store::{ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind};
 use engram_fill::{Class, FillEngine};
-use futures::stream::{self, TryStreamExt};
 
 use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
 
@@ -167,8 +166,17 @@ pub mod checkpoint_split {
         };
 
         let chunk_size = snapshot.chunk_size;
-        let results: Vec<(u64, Option<ChunkRef>)> = stream::iter(indices.into_iter().map(Ok))
-            .map_ok(|index| async move {
+        // One task per chunk, so the 16 MiB read, the zero check, the
+        // SHA-256 and the PUT's TLS spread over every core.
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut results: Vec<(u64, Option<ChunkRef>)> = Vec::with_capacity(indices.len());
+        for index in indices {
+            while tasks.len() >= CONCURRENCY {
+                let done = tasks.join_next().await.expect("tasks is not empty");
+                results.push(done.map_err(io::Error::other)??);
+            }
+            let (snapshot, store) = (snapshot.clone(), store.clone());
+            tasks.spawn(async move {
                 let offset = index.0 * chunk_size;
                 let bytes = snapshot.read_chunk(index).await?;
                 if is_zero_chunk(&bytes) {
@@ -176,10 +184,11 @@ pub mod checkpoint_split {
                 }
                 let hash = store.put_chunk(&bytes).await.map_err(store_err)?;
                 Ok((offset, Some(ChunkRef { offset, hash })))
-            })
-            .try_buffer_unordered(CONCURRENCY)
-            .try_collect()
-            .await?;
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            results.push(done.map_err(io::Error::other)??);
+        }
 
         let mut delta = ManifestDelta::default();
         for (offset, written) in results {

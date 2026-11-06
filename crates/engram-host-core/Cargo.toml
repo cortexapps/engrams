@@ -22,7 +22,6 @@ chrono.workspace = true
 engram-chunk-store.workspace = true
 engram-fill.workspace = true
 engram-core.workspace = true
-futures.workspace = true
 libc = "0.2"
 serde.workspace = true
 tokio.workspace = true
