@@ -37,25 +37,51 @@ use crate::image_cache::{CachedImage, ImageCache};
 const DEFAULT_MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 
 /// Measurement knobs for the cold-restore memory prefetch, read once:
-/// `ENGRAM_MEMORY_PREFETCH_MODE` ∈ {`full` (default), `off`} (`off` skips
-/// the background warm of a lazy restore; faults then fetch on demand) and
-/// `ENGRAM_MEMORY_PREFETCH_CONCURRENCY` (default 32).
+/// `ENGRAM_MEMORY_PREFETCH_MODE` ∈ {`full` (default), `off`, `prefix`}
+/// (`off` skips the background warm of a lazy restore; faults then fetch
+/// on demand; `prefix` first warms the chunks of the session's recorded
+/// fault order, then the rest as `full`),
+/// `ENGRAM_MEMORY_PREFETCH_CONCURRENCY` (default 32) and
+/// `ENGRAM_MEMORY_PREFIX_LIMIT` (default 0 = the whole fault order).
 #[derive(Clone, Copy)]
 struct MemoryPrefetchConfig {
-    background: bool,
+    mode: MemoryPrefetchMode,
     concurrency: usize,
+    prefix_limit: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MemoryPrefetchMode {
+    Full,
+    Off,
+    Prefix,
+}
+
+/// The first-touch chunk order a handler writes beside its trace, and
+/// its blob key under the session's trace lineage.
+const FAULT_ORDER_FILE: &str = "fault-order.txt";
+fn fault_order_key(lineage: uuid::Uuid) -> String {
+    format!("traces/{lineage}/fault-order.v1")
 }
 
 fn memory_prefetch_config() -> MemoryPrefetchConfig {
     static CONFIG: std::sync::OnceLock<MemoryPrefetchConfig> = std::sync::OnceLock::new();
     *CONFIG.get_or_init(|| {
-        let background = match std::env::var("ENGRAM_MEMORY_PREFETCH_MODE") {
-            Ok(s) if s.eq_ignore_ascii_case("off") => false,
+        let mode = match std::env::var("ENGRAM_MEMORY_PREFETCH_MODE") {
+            Ok(s) if s.eq_ignore_ascii_case("off") => MemoryPrefetchMode::Off,
+            Ok(s) if s.eq_ignore_ascii_case("prefix") => MemoryPrefetchMode::Prefix,
             Ok(s) if !s.trim().is_empty() && !s.eq_ignore_ascii_case("full") => {
                 tracing::warn!(value = %s, "unrecognised ENGRAM_MEMORY_PREFETCH_MODE; defaulting to full");
-                true
+                MemoryPrefetchMode::Full
             }
-            _ => true,
+            _ => MemoryPrefetchMode::Full,
+        };
+        let prefix_limit = match std::env::var("ENGRAM_MEMORY_PREFIX_LIMIT") {
+            Ok(s) => s.trim().parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(value = %s, "unrecognised ENGRAM_MEMORY_PREFIX_LIMIT; using 0 (no limit)");
+                0
+            }),
+            Err(_) => 0,
         };
         let concurrency = match std::env::var("ENGRAM_MEMORY_PREFETCH_CONCURRENCY") {
             Ok(s) => match s.trim().parse::<usize>() {
@@ -68,8 +94,9 @@ fn memory_prefetch_config() -> MemoryPrefetchConfig {
             Err(_) => DEFAULT_MEMORY_PREFETCH_CONCURRENCY,
         };
         MemoryPrefetchConfig {
-            background,
+            mode,
             concurrency,
+            prefix_limit,
         }
     })
 }
@@ -109,6 +136,16 @@ struct SidecarSwap {
     /// The captured guest was a base capture: its swap was never a
     /// session's state, so a fresh device is the right one.
     base_capture: bool,
+}
+
+/// The sidecar's `trace_lineage_id`, when present.
+async fn read_sidecar_trace_lineage(src: &Path) -> Option<uuid::Uuid> {
+    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("trace_lineage_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
 }
 
 async fn read_sidecar_swap(src: &Path) -> Result<SidecarSwap, SandboxError> {
@@ -1311,24 +1348,8 @@ impl PooledBackend {
                     "chunked restore memory chunk prefetch failed; falling back to serial fault path",
                 );
             }
-        } else if let Some(cs) = self
-            .chunk_store
-            .clone()
-            .filter(|_| memory_prefetch_config().background)
-        {
-            let md = metadata.clone();
-            tokio::spawn(tracing::Instrument::instrument(
-                async move {
-                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
-                        tracing::warn!(
-                            error = %e,
-                            snapshot_id = %md.id,
-                            "background memory prefetch failed; UFFD faults serve on-demand",
-                        );
-                    }
-                },
-                tracing::info_span!("restore.prefetch_memory_bg"),
-            ));
+        } else if memory_prefetch_config().mode == MemoryPrefetchMode::Full {
+            self.spawn_memory_prefetch(&metadata, None);
         }
 
         let src = self.inner.snapshot_path_for(metadata.id);
@@ -1354,6 +1375,12 @@ impl PooledBackend {
                     "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
                 );
             }
+        }
+        // The prefix needs the sidecar's trace lineage, so it starts
+        // once the sidecar is local.
+        if memory_is_lazy && memory_prefetch_config().mode == MemoryPrefetchMode::Prefix {
+            let lineage = read_sidecar_trace_lineage(&src).await;
+            self.spawn_memory_prefetch(&metadata, Some(lineage));
         }
 
         let disks = match self.volumes.as_ref() {
@@ -1465,6 +1492,141 @@ impl PooledBackend {
             }
         }
         restore
+    }
+
+    /// Warm the memory chunks of a lazy restore in the background.
+    /// `prefix` = `Some(lineage)` warms the lineage's recorded fault
+    /// order first.
+    fn spawn_memory_prefetch(
+        &self,
+        metadata: &SnapshotMetadata,
+        prefix: Option<Option<uuid::Uuid>>,
+    ) {
+        let Some(cs) = self.chunk_store.clone() else {
+            return;
+        };
+        let md = metadata.clone();
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                if let Some(lineage) = prefix {
+                    if let Err(e) = Self::prefetch_memory_prefix(&cs, &md, lineage).await {
+                        tracing::warn!(error = %e, snapshot_id = %md.id, "memory prefix prefetch failed");
+                    }
+                }
+                if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
+                    tracing::warn!(
+                        error = %e,
+                        snapshot_id = %md.id,
+                        "background memory prefetch failed; UFFD faults serve on-demand",
+                    );
+                }
+            },
+            tracing::info_span!("restore.prefetch_memory_bg"),
+        ));
+    }
+
+    /// Warm the session chunks at the positions the lineage's last life
+    /// faulted first, in that order. Zero positions and positions where
+    /// the session holds the base image's chunk are skipped: the image
+    /// prefetch already holds every base chunk on this host.
+    async fn prefetch_memory_prefix(
+        chunk_store: &ChunkStore,
+        metadata: &SnapshotMetadata,
+        lineage: Option<uuid::Uuid>,
+    ) -> Result<(), SandboxError> {
+        let started = crate::time_source::metrics_now();
+        let (Some(mref), Some(lineage)) = (metadata.memory_manifest, lineage) else {
+            tracing::info!(
+                has_lineage = lineage.is_some(),
+                "memory prefix: no manifest or lineage; skipped"
+            );
+            return Ok(());
+        };
+        let key = fault_order_key(lineage);
+        let order = match chunk_store.blob_storage().get(&key).await {
+            Ok(bytes) => bytes,
+            Err(engram_core::BlobError::NotFound) => {
+                tracing::info!(key, "memory prefix: no fault order recorded yet; skipped");
+                return Ok(());
+            }
+            Err(e) => return Err(SandboxError::Snapshot(format!("get {key}: {e}"))),
+        };
+        let manifest = chunk_store
+            .get_manifest(mref)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("prefix get_manifest {mref}: {e}")))?;
+        let base: std::collections::HashMap<u64, engram_chunk_store::ChunkHash> =
+            match metadata.base_memory_manifest {
+                Some(b) => match chunk_store.get_manifest(b).await {
+                    Ok(m) => m.chunks.iter().map(|c| (c.offset, c.hash)).collect(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "memory prefix: base manifest unavailable");
+                        Default::default()
+                    }
+                },
+                None => Default::default(),
+            };
+        let session: std::collections::HashMap<u64, engram_chunk_store::ChunkHash> =
+            manifest.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+        let chunk_size = manifest.chunk_size.as_u64();
+        let limit = match memory_prefetch_config().prefix_limit {
+            0 => usize::MAX,
+            n => n,
+        };
+        let (mut indices, mut zero, mut canonical, mut unparsed) = (0usize, 0usize, 0usize, 0usize);
+        let mut seen = std::collections::HashSet::new();
+        let mut prefix = Vec::new();
+        for line in String::from_utf8_lossy(&order).lines().take(limit) {
+            let Ok(idx) = line.trim().parse::<u32>() else {
+                unparsed += 1;
+                continue;
+            };
+            indices += 1;
+            let offset = u64::from(idx) * chunk_size;
+            match session.get(&offset) {
+                None => zero += 1,
+                Some(h) if base.get(&offset) == Some(h) => canonical += 1,
+                Some(h) => {
+                    if seen.insert(*h) {
+                        prefix.push(*h);
+                    }
+                }
+            }
+        }
+        let resolved = prefix.len();
+        tracing::info!(
+            key,
+            indices,
+            resolved,
+            zero,
+            canonical,
+            unparsed,
+            limit = memory_prefetch_config().prefix_limit,
+            resolve_ms = started.elapsed().as_millis() as u64,
+            "memory prefix resolved"
+        );
+        let concurrency = memory_prefetch_config().concurrency;
+        chunk_store
+            .prefetch_chunks_with_progress(prefix, concurrency, |done| {
+                if done % 2048 == 0 {
+                    tracing::info!(
+                        done,
+                        resolved,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "memory prefix progress"
+                    );
+                }
+            })
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("prefix prefetch: {e}")))?;
+        tracing::info!(
+            resolved,
+            bytes = resolved as u64 * chunk_size,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            concurrency,
+            "memory prefix prefetched"
+        );
+        Ok(())
     }
 
     /// Provision a restored sandbox's disks from the snapshot's manifests.
@@ -2022,6 +2184,26 @@ impl PooledBackend {
         let Some(chunk_store) = self.chunk_store.clone() else {
             return;
         };
+        // Read now: an eviction tears the jail down right after capture.
+        let fault_order = trace_path
+            .parent()
+            .and_then(|dir| std::fs::read(dir.join(FAULT_ORDER_FILE)).ok())
+            .filter(|b| !b.is_empty());
+        if let Some(order) = fault_order {
+            let blob = chunk_store.blob_storage().clone();
+            let key = fault_order_key(session_id.as_uuid());
+            tokio::spawn(async move {
+                let len = order.len();
+                match blob.put(&key, bytes::Bytes::from(order)).await {
+                    Ok(_) => {
+                        tracing::info!(sandbox_id = %id, key, bytes = len, "published fault order")
+                    }
+                    Err(e) => {
+                        tracing::warn!(sandbox_id = %id, key, error = %e, "publish fault order failed")
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             let bytes = match tokio::fs::read(&trace_path).await {
                 Ok(b) => b,
