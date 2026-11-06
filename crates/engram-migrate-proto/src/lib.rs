@@ -232,8 +232,10 @@ pub enum FromSource {
         req_id: u64,
         chunk_offset: u64,
         /// WIRE bytes: lz4-block-compressed (size-prepended) when
-        /// `lz4`, raw otherwise (the source ships whichever is
-        /// smaller — incompressible chunks go raw).
+        /// `lz4`, raw otherwise. `serde_bytes` encodes the same bincode
+        /// bytes as a plain `Vec<u8>` (u64 length, then the bytes) in one
+        /// copy instead of one call per byte.
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         /// [`wire_hash`] over the WIRE bytes — verify BEFORE
         /// decompressing.
