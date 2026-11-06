@@ -32,18 +32,43 @@ use crate::image_cache::{CachedImage, ImageCache};
 
 /// Rebuilds `migration_fetch` items from their frames. Frames of one item
 /// arrive in order and back to back; the last carries the item's hash.
-#[derive(Default)]
+/// Each requested item arrives once.
 struct ItemAssembler {
     item: Option<u32>,
     bytes: Vec<u8>,
+    /// Indexed by item: the item arrived whole.
+    arrived: Vec<bool>,
 }
 
 impl ItemAssembler {
+    fn new(requested: usize) -> Self {
+        Self {
+            item: None,
+            bytes: Vec::new(),
+            arrived: vec![false; requested],
+        }
+    }
+
     /// Add `frame`; on an item's last frame, return its index and bytes.
     fn push(
         &mut self,
         frame: engram_core::types::snapshot::MigrationFrame,
     ) -> Result<Option<(u32, Vec<u8>)>, SandboxError> {
+        match self.arrived.get(frame.item_idx as usize) {
+            Some(false) => {}
+            Some(true) => {
+                return Err(SandboxError::Snapshot(format!(
+                    "migration fetch: item {} arrived twice",
+                    frame.item_idx
+                )))
+            }
+            None => {
+                return Err(SandboxError::Snapshot(format!(
+                    "migration fetch: item {} was not requested",
+                    frame.item_idx
+                )))
+            }
+        }
         if self.item.is_some_and(|i| i != frame.item_idx) || frame.offset != self.bytes.len() as u64
         {
             return Err(SandboxError::Snapshot(format!(
@@ -67,7 +92,26 @@ impl ItemAssembler {
                 )));
             }
         }
+        self.arrived[frame.item_idx as usize] = true;
         Ok(Some((frame.item_idx, bytes)))
+    }
+
+    /// At the end of the stream: every requested item arrived whole. A
+    /// stream that ends early must not read as a complete fetch.
+    fn finish(&self) -> Result<(), SandboxError> {
+        if let Some(item) = self.item {
+            return Err(SandboxError::Snapshot(format!(
+                "migration fetch: the stream ended inside item {item}"
+            )));
+        }
+        let missing = self.arrived.iter().filter(|arrived| !**arrived).count();
+        if missing > 0 {
+            return Err(SandboxError::Snapshot(format!(
+                "migration fetch: the stream ended with {missing} of {} items missing",
+                self.arrived.len()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -89,31 +133,51 @@ mod item_assembler_tests {
 
     #[test]
     fn an_item_is_returned_whole_on_its_last_frame() {
-        let mut a = ItemAssembler::default();
+        let mut a = ItemAssembler::new(2);
         assert!(a.push(frame(0, 0, b"ab", None)).unwrap().is_none());
         let (idx, bytes) = a.push(frame(0, 2, b"cd", Some(b"abcd"))).unwrap().unwrap();
         assert_eq!((idx, bytes.as_slice()), (0, &b"abcd"[..]));
         let (idx, _) = a.push(frame(1, 0, b"x", Some(b"x"))).unwrap().unwrap();
         assert_eq!(idx, 1);
+        a.finish().unwrap();
     }
 
     #[test]
     fn a_gap_a_mix_of_items_or_a_bad_hash_is_refused() {
-        let mut gap = ItemAssembler::default();
+        let mut gap = ItemAssembler::new(1);
         gap.push(frame(0, 0, b"ab", None)).unwrap();
         assert!(gap.push(frame(0, 3, b"d", Some(b"abd"))).is_err());
 
-        let mut mixed = ItemAssembler::default();
+        let mut mixed = ItemAssembler::new(2);
         mixed.push(frame(0, 0, b"ab", None)).unwrap();
         assert!(mixed.push(frame(1, 2, b"cd", Some(b"abcd"))).is_err());
 
-        let mut bad = ItemAssembler::default();
+        let mut bad = ItemAssembler::new(1);
         assert!(bad.push(frame(0, 0, b"ab", Some(b"other"))).is_err());
     }
 
     #[test]
+    fn an_unrequested_or_repeated_item_is_refused() {
+        let mut a = ItemAssembler::new(1);
+        assert!(a.push(frame(1, 0, b"x", Some(b"x"))).is_err());
+        a.push(frame(0, 0, b"x", Some(b"x"))).unwrap();
+        assert!(a.push(frame(0, 0, b"x", Some(b"x"))).is_err());
+    }
+
+    #[test]
+    fn a_stream_that_ends_early_is_refused() {
+        let mut half = ItemAssembler::new(1);
+        half.push(frame(0, 0, b"ab", None)).unwrap();
+        assert!(half.finish().is_err());
+
+        let mut short = ItemAssembler::new(2);
+        short.push(frame(0, 0, b"x", Some(b"x"))).unwrap();
+        assert!(short.finish().is_err());
+    }
+
+    #[test]
     fn an_item_from_a_source_without_hashes_is_accepted() {
-        let mut a = ItemAssembler::default();
+        let mut a = ItemAssembler::new(1);
         let mut f = frame(0, 0, b"ab", Some(b"ab"));
         f.item_hash = None;
         assert!(a.push(f).unwrap().is_some());
@@ -2952,17 +3016,14 @@ impl PooledBackend {
         // Contiguous blocks land in one write of up to this many bytes.
         const MAX_RUN: usize = 4 * 1024 * 1024;
         let mut stream = source.migration_fetch(export_id, items).await?;
-        let mut items = ItemAssembler::default();
+        let mut items = ItemAssembler::new(batch.len());
         let mut run: Option<(u64, Vec<u8>)> = None;
         while let Some(frame) = stream.next().await {
             let Some((idx, bytes)) = items.push(frame?)? else {
                 continue;
             };
-            let Some(index) = batch.get(idx as usize) else {
-                return Err(SandboxError::Snapshot(
-                    "migration fetch: unexpected item index".into(),
-                ));
-            };
+            // The assembler returns only requested items.
+            let index = batch[idx as usize];
             let start = index * MIGRATION_DISK_BLOCK_BYTES;
             let want = MIGRATION_DISK_BLOCK_BYTES.min(volume.size_bytes.saturating_sub(start));
             if bytes.len() as u64 != want {
@@ -2987,7 +3048,7 @@ impl PooledBackend {
         if let Some((run_start, buf)) = run {
             Self::write_disk_run(volume, run_start, buf).await?;
         }
-        Ok(())
+        items.finish()
     }
 
     async fn write_disk_run(
@@ -3030,7 +3091,7 @@ impl PooledBackend {
             .migration_fetch(export_id, item_specs.to_vec())
             .await?;
         use futures::StreamExt;
-        let mut items = ItemAssembler::default();
+        let mut items = ItemAssembler::new(item_specs.len());
         while let Some(frame) = stream.next().await {
             if let Some((idx, current)) = items.push(frame?)? {
                 let name = match item_specs.get(idx as usize) {
@@ -3047,7 +3108,7 @@ impl PooledBackend {
                     .map_err(|e| SandboxError::Snapshot(format!("write {name}: {e}")))?;
             }
         }
-        Ok(())
+        items.finish()
     }
 
     /// ADR 0045: expired migration exports for the TTL sweep —
