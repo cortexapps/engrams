@@ -237,10 +237,14 @@ impl ChunkStore {
                 Ok(())
             }
             Err(e) => {
-                if let Some(p) = permit {
+                let overload = crate::admission::is_overload(&e);
+                let resolved = self.resolve_failed_put(hash, key, mode, e).await;
+                // A PUT that another writer's object rescues moved no
+                // bytes but is no sign of overload.
+                if let (Some(p), Err(_), true) = (permit, &resolved, overload) {
                     p.failed();
                 }
-                self.resolve_failed_put(hash, key, mode, e).await
+                resolved
             }
         }
     }

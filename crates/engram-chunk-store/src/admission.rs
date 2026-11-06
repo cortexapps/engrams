@@ -88,17 +88,22 @@ impl Permit {
     }
 
     /// Report a store transfer: the bytes it moved, or its error. Only an
-    /// error that can mean overload (a store or link error, a timeout)
-    /// counts as a failure; a missing object or a bad hash does not.
+    /// error that can mean overload ([`is_overload`]) counts as a failure.
     pub fn finish(self, outcome: std::result::Result<u64, &crate::ChunkStoreError>) {
-        use crate::ChunkStoreError as E;
-        use engram_core::error::BlobError as B;
         match outcome {
             Ok(bytes) => self.done(bytes),
-            Err(E::Blob(B::Sdk(_) | B::Io(_) | B::Protocol(_))) => self.failed(),
+            Err(crate::ChunkStoreError::Blob(e)) if is_overload(e) => self.failed(),
             Err(_) => {}
         }
     }
+}
+
+/// Whether a store error can mean the link or the store is overloaded:
+/// an SDK, I/O or protocol error (a timeout arrives as an SDK error). A
+/// missing object or a bad configuration cannot.
+pub(crate) fn is_overload(e: &engram_core::error::BlobError) -> bool {
+    use engram_core::error::BlobError as B;
+    matches!(e, B::Sdk(_) | B::Io(_) | B::Protocol(_))
 }
 
 impl Admission {
@@ -268,8 +273,9 @@ const SETTLE_WINDOWS: u32 = 4;
 /// the constraint), it raises the limit as long as throughput grows, and
 /// undoes an increase that did not pay. An error, or a throughput drop at
 /// an unchanged limit (the latency of each transfer grew), cuts the limit
-/// by a quarter. A window with no waiters says nothing about capacity and
-/// changes nothing.
+/// by a quarter, then holds it for [`SETTLE_WINDOWS`] windows: a burst of
+/// errors cuts it once. A window with no waiters says nothing about
+/// capacity and changes nothing.
 struct Tuner {
     min: usize,
     max: usize,
@@ -326,7 +332,9 @@ impl Tuner {
         w.completions += 1;
         w.failed |= failed;
         let elapsed = now.saturating_duration_since(w.started);
-        if !w.failed {
+        // A failure closes the window at once, except while the limit
+        // settles after a cut: then it waits for a full window.
+        if !(w.failed && self.settle == 0) {
             if elapsed > STALE {
                 // A window this long spans idle time: its rate is no
                 // measure of capacity.
@@ -348,6 +356,10 @@ impl Tuner {
 
     fn decide(&mut self, limit: usize, rate: f64, failed: bool, saturated: bool) -> usize {
         let step = std::mem::replace(&mut self.last_step, Step::Hold);
+        if failed && self.settle > 0 {
+            self.settle -= 1;
+            return limit;
+        }
         if failed {
             return self.lower(limit / 4, limit);
         }
@@ -520,6 +532,26 @@ mod tests {
     fn an_error_cuts_the_limit_by_a_quarter() {
         let mut link = Link::new(64, 4, 256);
         assert_eq!(link.window(64e6, true, true), 48);
+    }
+
+    #[test]
+    fn a_burst_of_errors_cuts_the_limit_once() {
+        let mut link = Link::new(64, 4, 256);
+        for _ in 0..10 {
+            if let Some(l) = link.tuner.record(link.limit, 0, true, link.now) {
+                link.limit = l;
+            }
+        }
+        assert_eq!(link.limit, 48);
+    }
+
+    #[test]
+    fn errors_that_go_on_cut_again_after_the_limit_settles() {
+        let mut link = Link::new(64, 4, 256);
+        let limits: Vec<usize> = (0..=SETTLE_WINDOWS + 1)
+            .map(|_| link.window(64e6, true, true))
+            .collect();
+        assert_eq!(limits, [48, 48, 48, 48, 48, 36]);
     }
 
     #[test]
