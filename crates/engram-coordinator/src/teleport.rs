@@ -17,6 +17,11 @@ use engram_core::{HostId, SandboxError, SessionId};
 use std::time::Duration;
 use tracing::Instrument as _;
 
+/// How long one release attempt waits for the destination's memory
+/// drain, and how long the op then gives the session lane back.
+const RELEASE_DRAIN_SLICE: Duration = Duration::from_secs(1);
+const RELEASE_POLL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug)]
 pub struct TeleportConfig {
     pub poll_interval: Duration,
@@ -1198,14 +1203,28 @@ mod steps {
                 .host_registry
                 .backend_for(row.dest_host_id)
                 .await?;
-            match dest
-                .migration_drain_wait(row.dest_sandbox_id.expect("attached destination"))
-                .await?
-            {
-                engram_core::types::snapshot::DrainOutcome::Done { .. } => {}
-                engram_core::types::snapshot::DrainOutcome::PeerLost { .. } => {
-                    return fail_move(ctx, row, "peer_lost", true).await
+            // The session is Active on the destination while its memory
+            // drains. Each attempt waits for the drain only for a short
+            // slice and then gives the lane back, so the session's other
+            // ops (a prompt) run between slices.
+            let drained = tokio::time::timeout(
+                RELEASE_DRAIN_SLICE,
+                dest.migration_drain_wait(row.dest_sandbox_id.expect("attached destination")),
+            )
+            .await;
+            match drained {
+                Err(_) => {
+                    return Ok(Some(OpOutcome::RetryAfter(
+                        RELEASE_POLL,
+                        "waiting for the post-copy drain".into(),
+                    )))
                 }
+                Ok(outcome) => match outcome? {
+                    engram_core::types::snapshot::DrainOutcome::Done { .. } => {}
+                    engram_core::types::snapshot::DrainOutcome::PeerLost { .. } => {
+                        return fail_move(ctx, row, "peer_lost", true).await
+                    }
+                },
             }
             if !source_gone(ctx, row).await? {
                 match ctx
@@ -1567,6 +1586,60 @@ mod attach_tests {
             meta.session_binding_generations(sid).await.unwrap(),
             (generation, generation)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_gives_the_lane_back_while_the_drain_runs() {
+        let rig = committed().await;
+        let meta = &rig.state.services.meta;
+        let row = meta
+            .open_teleport_for_session(rig.row.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (generation, _) = meta
+            .session_binding_generations(row.session_id)
+            .await
+            .unwrap();
+        meta.settle_harness_generation(
+            row.session_id,
+            generation,
+            &[],
+            rig.state.services.clock.now_utc(),
+        )
+        .await
+        .unwrap();
+        let ctx = OpCtx {
+            state: &rig.state,
+            op: &rig.op,
+            epoch: rig.op.epoch.unwrap(),
+        };
+        assert!(steps::attach(&ctx, &row).await.unwrap().is_none());
+        let attached = meta
+            .open_teleport_for_session(row.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attached.phase, TeleportPhase::Attached);
+        assert_eq!(
+            meta.get_session(row.session_id).await.unwrap().status,
+            SessionState::Active
+        );
+
+        rig.dest.drain_pending.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            steps::release(&ctx, &attached).await.unwrap(),
+            Some(OpOutcome::RetryAfter(delay, _)) if delay == RELEASE_POLL
+        ));
+        assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 0);
+
+        rig.dest.drain_pending.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            steps::release(&ctx, &attached).await.unwrap(),
+            Some(OpOutcome::Done)
+        ));
+        assert_eq!(rig.source.destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.phase().await, None);
     }
 
     #[tokio::test]
