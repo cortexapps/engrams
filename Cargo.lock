@@ -2507,6 +2507,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-fill"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-chunk-store",
+ "engram-core",
+ "engram-storage-local",
+ "metrics",
+ "parking_lot 0.13.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-git-dev"
 version = "0.1.0"
 dependencies = [

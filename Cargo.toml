@@ -11,6 +11,7 @@ members = [
     "crates/engram-host-operator",
     "crates/engram-upgrade-drain",
     "crates/engram-chunk-store",
+    "crates/engram-fill",
     "crates/engram-rootfs-materializer",
     "crates/engram-publish-builtin-harness",
     "crates/engram-agentd",
@@ -162,6 +163,7 @@ engram-app-client = { path = "crates/engram-app-client" }
 engram-cli = { path = "crates/engram-cli" }
 engram-tui = { path = "crates/engram-tui" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
+engram-fill = { path = "crates/engram-fill" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 
 # async / runtime

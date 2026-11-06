@@ -1,0 +1,26 @@
+[package]
+name = "engram-fill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The host's chunk fill engine: every chunk fetch on a host, in priority order, one task per chunk."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-chunk-store.workspace = true
+bytes.workspace = true
+metrics.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+async-trait.workspace = true
+engram-core.workspace = true
+engram-storage-local.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
