@@ -1166,6 +1166,16 @@ jobs:
       - name: Node-prep pool states (root)
         run: sudo sh scripts/thin-pool-states-test.sh
 
+      - name: kernel block features (report)
+        run: |
+          uname -r
+          sudo dmsetup targets
+          ls /dev/ublk-control 2>&1 || true
+          for f in /proc/config.gz "/boot/config-$(uname -r)"; do
+            [ -r "$f" ] && { zcat -f "$f" | grep -E 'CONFIG_(DM_CLONE|DM_DELAY|BLK_DEV_UBLK)=' || true; }
+          done
+          grep -E 'dm-clone|dm-delay|ublk' "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null || true
+
       # The disk over the pool, its cloned drives over a loop-device
       # source (dm-delay slows the copy where a test needs it), then the
       # session disk under a real guest over the same pool (`session_disk`
@@ -1175,11 +1185,15 @@ jobs:
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
         run: |
-          if ! sudo modprobe -a dm_clone dm_delay; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
-            sudo modprobe -a dm_clone dm_delay
-          fi
+          # A target built into the kernel has no module, so the check is
+          # the kernel's target list, not modprobe.
+          for t in clone delay; do
+            sudo dmsetup targets | grep -q "^$t " || sudo modprobe "dm_$t" || true
+          done
+          for t in clone delay; do
+            sudo dmsetup targets | grep -q "^$t " \
+              || { echo "FATAL: kernel $(uname -r) has no dm-$t target" >&2; exit 1; }
+          done
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
@@ -1198,15 +1212,13 @@ jobs:
       # driver is in the distribution's extra modules; a runner that cannot
       # load it fails the lane, as a missing pool does.
       - name: ublk disk-source tests (root)
+        if: ${{ !cancelled() }}
         env:
           ENGRAM_TEST_UBLK: "1"
         run: |
-          if ! sudo modprobe ublk_drv; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
-            sudo modprobe ublk_drv
-          fi
-          test -c /dev/ublk-control
+          sudo modprobe ublk_drv || true
+          test -c /dev/ublk-control \
+            || { echo "FATAL: kernel $(uname -r) has no ublk driver" >&2; exit 1; }
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-source \
             --test ublk_device \
