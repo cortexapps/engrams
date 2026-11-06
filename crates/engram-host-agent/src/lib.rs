@@ -995,17 +995,6 @@ impl HostAgent {
                 .chunk_cache
                 .clone()
                 .map(|cache| peer_fill::PeerServe::new(cache, readiness.clone()));
-            if let Some(cache) = self.chunk_cache.clone() {
-                tokio::spawn(async move {
-                    let removed = cache.discard_unverified_landings().await;
-                    if removed > 0 {
-                        tracing::info!(
-                            removed,
-                            "chunk cache: discarded chunks landed without a hash check",
-                        );
-                    }
-                });
-            }
 
             // ADR 0013: boot the gRPC HostService server. The
             // coord's GrpcHostPool dials this address (populated

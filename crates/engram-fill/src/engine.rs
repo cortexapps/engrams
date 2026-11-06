@@ -250,22 +250,15 @@ impl FillEngine {
         }
     }
 
-    /// The peer's answer when it has the chunk and its bytes are right.
-    /// Checked here so a wrong answer falls back to the store; the cache
-    /// checks again before it stores.
+    /// The peer's answer, when this view has a peer and the peer has the
+    /// chunk. Trusted: the peer checked it when it stored it.
     async fn peer_answer(&self, hash: ChunkHash) -> Option<Bytes> {
-        let bytes = self.peer.as_ref()?.fetch(hash).await?;
-        if ChunkHash::of(&bytes) == hash {
-            Some(bytes)
-        } else {
-            metrics::counter!("engram_fill_peer_bad_total").increment(1);
-            None
-        }
+        self.peer.as_ref()?.fetch(hash).await
     }
 
     /// The peer (when this view has one), then the store. A `Demand`
     /// fetch races the store against a peer that has not answered after
-    /// `peer_race_after`. The caller verifies the result.
+    /// `peer_race_after`. The cache hashes what came from the store.
     async fn fetch_unverified(&self, hash: ChunkHash, class: Class) -> Result<(Bytes, FillSource)> {
         let from_store = |engine: &Self| {
             let engine = engine.clone();

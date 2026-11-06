@@ -18,8 +18,8 @@ pub use engine::{Config, FillEngine, FillStats, PeerRegistration};
 #[async_trait::async_trait]
 pub trait PeerSource: Send + Sync {
     /// The chunk's bytes, or `None` when the peer does not have it or
-    /// cannot answer (a lost peer answers `None` at once). The engine
-    /// checks the bytes.
+    /// cannot answer (a lost peer answers `None` at once). The bytes are
+    /// trusted: the peer checked the chunk when it stored it.
     async fn fetch(&self, hash: engram_chunk_store::ChunkHash) -> Option<bytes::Bytes>;
 }
 

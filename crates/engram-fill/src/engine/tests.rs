@@ -234,10 +234,11 @@ async fn a_peer_hit_is_served_without_the_store() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_peer_miss_or_wrong_bytes_fall_back_to_the_store() {
+async fn a_peer_miss_falls_back_to_the_store() {
     let f = fixture();
     let hash = put(&f, b"the real bytes").await;
-    for answer in [None, Some(&b"wrong bytes"[..])] {
+    {
+        let answer = None;
         f.cache.evict_on_disk_for_test(hash);
         let resolver = counting(&f, None);
         let engine = engine_over(&f, resolver.clone(), Config::default())

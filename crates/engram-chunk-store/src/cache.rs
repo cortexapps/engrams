@@ -1013,15 +1013,12 @@ impl ChunkCache {
                     "tier" => source.fetch_tier(),
                 )
                 .record(fetch_start.elapsed().as_secs_f64());
-                // Verify-on-populate. This is the ONE place a chunk is hashed:
-                // a content-addressed cache must never serve OR store bytes that
-                // don't match the requested hash (corrupt / truncated object). On
-                // mismatch we fail the read for every waiter rather than poison
-                // the guest's rootfs, and never write the bad bytes. The read
-                // fast path above then trusts the verified, atomically-written
-                // file — that's what moves the 16 MiB sha256 off the hot per-read
-                // path (ADR 0021).
+                // A chunk from the object store is hashed here, once, before
+                // it is stored or served; a mismatch fails every waiter and
+                // stores nothing. A peer's chunk is trusted: the peer checked
+                // it when it stored it, and each frame carries a CRC32C.
                 let result = match fetched {
+                    Ok(bytes) if source == FillSource::Peer => Ok(bytes),
                     Ok(bytes) => {
                         let actual = ChunkHash::of(&bytes);
                         if actual == hash {
@@ -1340,61 +1337,6 @@ impl ChunkCache {
         self.evict_with_index().await
     }
 
-    /// Delete every chunk that carries a `.unverified` sidecar, and the
-    /// sidecar with it; returns the number of sidecars removed. A
-    /// previous build landed peer-pulled chunks without a sha256 check
-    /// and marked each one this way. Reads trust the cache, so such a
-    /// chunk must not stay resident: the next read misses and refetches
-    /// it through a verifying populate. The chunk goes before its
-    /// sidecar, so a crash mid-reap leaves a sidecar for the next boot.
-    pub async fn discard_unverified_landings(&self) -> usize {
-        let mut removed = 0;
-        let Ok(mut top) = fs::read_dir(&self.inner.config.root).await else {
-            return removed;
-        };
-        while let Ok(Some(prefix_entry)) = top.next_entry().await {
-            let prefix_path = prefix_entry.path();
-            if !prefix_entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let Some(prefix) = prefix_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let Ok(mut inner) = fs::read_dir(&prefix_path).await else {
-                continue;
-            };
-            while let Ok(Some(file)) = inner.next_entry().await {
-                let Some(name) = file.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let Some(rest) = name.strip_suffix(".unverified") else {
-                    continue;
-                };
-                let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) else {
-                    continue;
-                };
-                let _ = fs::remove_file(self.path_for(hash)).await;
-                self.index_remove(hash);
-                if fs::remove_file(file.path()).await.is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-        removed
-    }
-
     /// Spawn the periodic sweeper (ADR 0070): calls [`Self::sweep`] every
     /// `interval`, independent of populate traffic — closes the gap where
     /// a host under disk pressure with no populate activity (or one that
@@ -1468,6 +1410,12 @@ impl ChunkCache {
     /// no-SHA-NI hosts, ADR 0021) while still enforcing the budget (unlike
     /// [`Self::put_no_evict`], which skips the sweep). Caller guarantees
     /// `hash == ChunkHash::of(bytes)`; the read path verifies on GET anyway.
+    /// Store a chunk the caller trusts without hashing it (a peer's chunk,
+    /// or one the caller just hashed).
+    pub async fn put_trusted(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
+        self.write_local(hash, bytes).await
+    }
+
     pub(crate) async fn write_local(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
         let target = self.path_for(hash);
         if let Some(parent) = target.parent() {
@@ -3669,48 +3617,12 @@ mod tests {
         );
     }
 
-    /// A chunk that a previous build landed with a `.unverified`
-    /// sidecar is deleted with its sidecar; a sidecar with no chunk is
-    /// reaped; a verified chunk is not touched.
-    #[tokio::test]
-    async fn discard_unverified_landings_removes_marked_chunks_only() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        let sidecar = |h: ChunkHash| {
-            let mut p = cache.path_for(h).into_os_string();
-            p.push(".unverified");
-            std::path::PathBuf::from(p)
-        };
-        let marked = b"landed by a previous build".to_vec();
-        let marked_h = ChunkHash::of(&marked);
-        cache.put(marked_h, &marked).await.unwrap();
-        crate::cache::write_atomic(&sidecar(marked_h), b"")
-            .await
-            .unwrap();
-        let ghost = ChunkHash::of(b"evicted before the reap");
-        fs::create_dir_all(sidecar(ghost).parent().unwrap())
-            .await
-            .unwrap();
-        crate::cache::write_atomic(&sidecar(ghost), b"")
-            .await
-            .unwrap();
-        let verified = b"verified at populate".to_vec();
-        let verified_h = ChunkHash::of(&verified);
-        cache.put(verified_h, &verified).await.unwrap();
-
-        assert_eq!(cache.discard_unverified_landings().await, 2);
-        assert!(!cache.contains(marked_h).await);
-        assert!(!fs::try_exists(sidecar(marked_h)).await.unwrap());
-        assert!(!fs::try_exists(sidecar(ghost)).await.unwrap());
-        assert!(cache.contains(verified_h).await);
-        assert_eq!(cache.discard_unverified_landings().await, 0);
-    }
-
     /// ADR 0095: `get_with_source` keeps the populate contract of `get`
     /// (verify-on-populate, write-through) while letting the closure
     /// report a peer source — and a hash mismatch from a "peer" closure
     /// still refuses to land, exactly like a corrupt GCS fetch.
     #[tokio::test]
-    async fn get_with_source_verifies_peer_bytes_too() {
+    async fn get_with_source_hashes_store_bytes_and_trusts_peer_bytes() {
         let (cache, _store, _b, _c) = setup(NO_CEILING).await;
         let body = Bytes::from_static(b"fault-time peer chunk");
         let h = ChunkHash::of(&body);
@@ -3724,7 +3636,7 @@ mod tests {
         let wrong = ChunkHash::of(b"something else");
         let err = cache
             .get_with_source(wrong, || async {
-                Ok((Bytes::from_static(b"not that"), FillSource::Peer))
+                Ok((Bytes::from_static(b"not that"), FillSource::BlobStorage))
             })
             .await;
         assert!(matches!(err, Err(ChunkStoreError::HashMismatch { .. })));

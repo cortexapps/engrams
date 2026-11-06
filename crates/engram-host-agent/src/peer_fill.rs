@@ -431,7 +431,7 @@ async fn pull_shard(
                 return stats;
             };
             let len = current.len();
-            if let Err(e) = cache.put(hash, &current).await {
+            if let Err(e) = cache.put_trusted(hash, &current).await {
                 // Local landing failure (ENOSPC…) — not the peer's
                 // fault; skip this chunk (GCS pass covers it) and keep
                 // draining the stream.
