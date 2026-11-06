@@ -349,8 +349,9 @@ pub struct PooledBackend {
     /// checkpoint completed; every later capture is a diff against it.
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     /// Serializes captures per sandbox: a periodic checkpoint never
-    /// interleaves with an eviction snapshot.
-    capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    /// interleaves with an eviction snapshot, and a disk cutover never
+    /// runs between a checkpoint's take and its publish.
+    capture_locks: Arc<CaptureLocks>,
     /// `sandbox_id → snapshot_id` of an in-flight, durably persisted
     /// eviction finalize job (issue #529). Makes `snapshot_begin`
     /// idempotent under an eviction-scanner retry storm, and keeps
@@ -377,6 +378,8 @@ pub struct PooledBackend {
     drained_dests: Arc<DashMap<SandboxId, engram_core::types::snapshot::DrainOutcome>>,
     /// Optional hint polling stops as soon as the memory drain terminates.
     hint_pollers: Arc<DashMap<SandboxId, AbortTaskOnDrop>>,
+    /// The task of each sandbox whose disks still copy from a source.
+    hydrations: Arc<crate::hydration::Hydrations>,
     /// The SIGTERM capture quiesce: raised once, never lowered.
     /// `capture_phase` refuses under the capture lock before anything is
     /// consumed, so a capture never walks into the runtime teardown.
@@ -520,17 +523,25 @@ fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind)
         .increment(1);
 }
 
-/// Abort the wrapped task on drop, including hint polling after DrainDone.
-/// A leg wrapped by
-/// [`spawn_leg_keepalive`] stops resending stale progress the moment
-/// the guard goes out of scope — on every path, including an early
-/// `?`-return, since `Drop` runs during unwind too.
-struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+/// Aborts the wrapped task when dropped, on every path: an early
+/// `?`-return and an unwind drop it too.
+pub(crate) struct AbortTaskOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// The capture lock of each sandbox.
+pub(crate) type CaptureLocks = DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>;
+
+/// The sandbox's capture lock, made on first use.
+pub(crate) fn capture_lock_in(locks: &CaptureLocks, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
+    locks
+        .entry(id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Observe the local handler independently of the coordinator's drain-wait RPC.
@@ -1507,6 +1518,7 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             drained_dests: Arc::new(DashMap::new()),
             hint_pollers: Arc::new(DashMap::new()),
+            hydrations: crate::hydration::Hydrations::new(crate::hydration::DEFAULT_INTERVAL),
             captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
@@ -1521,6 +1533,74 @@ impl PooledBackend {
 
     pub fn session_volumes(&self) -> Option<&Arc<SessionVolumes>> {
         self.volumes.as_ref()
+    }
+
+    /// How often a sandbox's hydration task looks at its disks.
+    pub fn with_hydration_interval(mut self, interval: std::time::Duration) -> Self {
+        self.hydrations = crate::hydration::Hydrations::new(interval);
+        self
+    }
+
+    /// Start the task that cuts the sandbox's cloned disks over to their
+    /// destinations once they are copied, unless it has one. A restore
+    /// that boots over a source arms it once the VM runs.
+    pub fn arm_hydration(&self, id: SandboxId) {
+        if let Some(volumes) = &self.volumes {
+            self.hydrations
+                .arm(id, volumes.clone(), self.capture_locks.clone());
+        }
+    }
+
+    /// Arm the hydration of every live sandbox with a disk that still
+    /// copies or whose cutover has steps left. Run once at startup, after
+    /// the sources are recovered and the volumes reconciled.
+    pub async fn rearm_hydrations(&self) {
+        if self.volumes.is_none() {
+            return;
+        }
+        let live = match self.inner.list().await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(%error, "hydration re-arm skipped: cannot list sandboxes");
+                return;
+            }
+        };
+        for id in live {
+            if self.hydrates(id).await {
+                self.arm_hydration(id);
+            }
+        }
+    }
+
+    /// The sandbox has a disk left to cut over. A disk whose state cannot
+    /// be read counts: the task tries again and logs why.
+    async fn hydrates(&self, id: SandboxId) -> bool {
+        let Some(volumes) = &self.volumes else {
+            return false;
+        };
+        let roles = match volumes.roles(id).await {
+            Ok(roles) => roles,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %id, %error, "hydration re-arm: cannot list the disks");
+                return true;
+            }
+        };
+        for role in roles {
+            match volumes.hydration(id, role).await {
+                Ok(None) => {}
+                Ok(Some(_)) => return true,
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, %role, %error, "hydration re-arm: cannot read the disk");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The sandboxes with a hydration task, for the heartbeat.
+    pub fn hydrating(&self) -> Vec<SandboxId> {
+        self.hydrations.sandboxes()
     }
 
     fn volumes(&self) -> Result<&Arc<SessionVolumes>, SandboxError> {
@@ -1673,10 +1753,7 @@ impl PooledBackend {
     /// The per-sandbox capture serialization lock (periodic
     /// checkpoint vs eviction/drain/SIGTERM snapshot).
     fn capture_lock(&self, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
-        self.capture_locks
-            .entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        capture_lock_in(&self.capture_locks, id)
     }
 
     /// ADR 0038 B1: is a capture (eviction / evac / drain / a prior
@@ -5743,6 +5820,7 @@ impl SandboxBackend for PooledBackend {
         // A held source forgets its swap policy and metadata with the VM.
         self.held_snapshots.remove(&id);
         self.hint_pollers.remove(&id);
+        self.hydrations.disarm(id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
@@ -8978,6 +9056,127 @@ mod tests {
         assert!(
             seal.upgrade().is_none(),
             "nothing holds the precopy snapshot after destroy"
+        );
+    }
+
+    /// Session volumes over a file-backed disk with file sources, and a
+    /// root `id` restored lazily from a published manifest. `FileDisk`
+    /// copies the whole source at the restore, so the root is hydrated.
+    async fn volumes_with_a_lazy_root(tmp: &std::path::Path, id: SandboxId) -> Arc<SessionVolumes> {
+        use engram_chunk_store::ChunkStore;
+        use engram_storage_local::LocalBlobStorage;
+        let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(tmp.join("blob"))));
+        let disk: Arc<dyn engram_host_core::SessionDisk> = Arc::new(
+            engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
+                .unwrap(),
+        );
+        let sources = Arc::new(
+            engram_host_core::FileSources::new(tmp.join("sources"), store.clone()).unwrap(),
+        );
+        let volumes = Arc::new(SessionVolumes::new(disk, store).with_sources(sources));
+        let published = SandboxId::new();
+        volumes
+            .provision(
+                published,
+                Source::Empty {
+                    size_bytes: 2 * MIGRATION_DISK_BLOCK_BYTES,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let manifest = volumes.checkpoint(published, DiskRole::Root).await.unwrap();
+        volumes.purge(published).await.unwrap();
+        volumes
+            .provision(
+                id,
+                Source::LazyFork {
+                    manifest,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        volumes
+    }
+
+    fn hydrating_backend(volumes: &Arc<SessionVolumes>) -> PooledBackend {
+        PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone())
+        .with_hydration_interval(std::time::Duration::from_millis(1))
+    }
+
+    /// A drive cut over before a crash, with its bitmap and source left,
+    /// needs the task on re-arm: it finishes the cutover and ends. A
+    /// sandbox without a cloned disk needs none.
+    #[tokio::test]
+    async fn a_rearmed_hydration_finishes_a_cutover_cut_short_and_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_lazy_root(tmp.path(), id).await;
+        volumes
+            .disk()
+            .cut_over(&engram_host_core::session_volumes::live_name(
+                id,
+                DiskRole::Root,
+            ))
+            .await
+            .unwrap();
+        let plain = SandboxId::new();
+        volumes
+            .provision(
+                plain,
+                Source::Empty {
+                    size_bytes: MIGRATION_DISK_BLOCK_BYTES,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let pooled = hydrating_backend(&volumes);
+        assert!(pooled.hydrates(id).await);
+        assert!(!pooled.hydrates(plain).await);
+
+        pooled.arm_hydration(id);
+        pooled.arm_hydration(id);
+        assert_eq!(pooled.hydrating(), vec![id]);
+        for _ in 0..500 {
+            if pooled.hydrating().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        assert!(pooled.hydrating().is_empty());
+        assert_eq!(volumes.hydration(id, DiskRole::Root).await.unwrap(), None);
+        assert!(!pooled.hydrates(id).await);
+    }
+
+    /// A cutover waits while a checkpoint pair exists, so the task keeps
+    /// running; destroy stops it with the sandbox.
+    #[tokio::test]
+    async fn destroy_stops_the_hydration_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_lazy_root(tmp.path(), id).await;
+        drop(volumes.take(id, DiskRole::Root).await.unwrap());
+        let pooled = hydrating_backend(&volumes);
+
+        pooled.arm_hydration(id);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(pooled.hydrating(), vec![id]);
+        pooled.destroy(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(pooled.hydrating().is_empty());
+        assert!(volumes.roles(id).await.unwrap().is_empty());
+        assert!(
+            !pooled.capture_locks.contains_key(&id),
+            "a stopped task takes no capture lock"
         );
     }
 

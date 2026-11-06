@@ -41,6 +41,7 @@ pub fn init(addr: SocketAddr) {
         SNAPSHOT_CREATE_SECONDS,
         SNAPSHOT_FINISH_SECONDS,
         EVICTION_FINALIZE_STAGE_SECONDS,
+        DISK_HYDRATION_SECONDS,
     ] {
         builder = builder
             .set_buckets_for_metric(
@@ -464,6 +465,18 @@ pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_r
 /// running VM's next checkpoint needs. Alert on sustained increase.
 pub const BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL: &str =
     "engram_bundle_startup_publish_failures_total";
+
+/// Gauge (ADR 0127). Sandboxes with a hydration task: their disks still
+/// copy from a source, or their cutover has steps left.
+pub const DISK_HYDRATING_SANDBOXES: &str = "engram_disk_hydrating_sandboxes";
+/// Histogram (ADR 0127). Seconds from the start of a sandbox's hydration
+/// task to the cutover of its last disk. A task that a host-agent restart
+/// starts again counts from the restart.
+pub const DISK_HYDRATION_SECONDS: &str = "engram_disk_hydration_seconds";
+/// Counter (ADR 0127). Cutover attempts of a hydrated disk, by `outcome`:
+/// `done`, `checkpoint_in_flight` (waits for the publish), `copying`
+/// (regions left), `error` (tried again on the next tick).
+pub const DISK_CUTOVERS_TOTAL: &str = "engram_disk_cutovers_total";
 
 /// Histogram (ADR 0116 C1). Observed-minus-expected delay of a 100 ms
 /// heartbeat tick on the host-agent's main tokio runtime — the

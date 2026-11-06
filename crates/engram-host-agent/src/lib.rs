@@ -88,6 +88,7 @@ pub use host_client::LocalHostClient;
 #[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
+mod hydration;
 pub mod idle_evictor;
 pub mod image_cache;
 pub mod image_prefetch;
@@ -343,6 +344,7 @@ impl HostAgent {
                 // from ever engaging the chain or the periodic driver
                 // below — VZ has no guest-memory snapshot, so a
                 // checkpoint there is just a wasteful VM pause.
+                p = p.with_hydration_interval(self.cfg.hydration_interval);
                 let checkpoints_supported = self.sandbox.supports_diff_checkpoints();
                 if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
@@ -367,6 +369,7 @@ impl HostAgent {
                     disk_source::recover_all(sources.as_ref()).await;
                 }
                 arc.reconcile_volumes().await;
+                arc.rearm_hydrations().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -1458,6 +1461,7 @@ impl HostAgent {
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
+                        hydrating: pooled_for_heartbeat.hydrating(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
