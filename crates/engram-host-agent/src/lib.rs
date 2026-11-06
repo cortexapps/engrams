@@ -116,8 +116,11 @@ pub struct HostAgent {
     /// without one; `None` is for in-process tests and the VZ/Process
     /// backends, whose guests have no internet-facing network.
     pub egress: Option<Arc<egress::HostEgress>>,
-    /// `None` keeps the OCI-pulled `rootfs.ext4` path.
+    /// `None` keeps the OCI-pulled `rootfs.ext4` path. Always
+    /// `fill.store()` when set.
     pub chunk_store: Option<ChunkStore>,
+    /// The host's chunk fill engine, over `chunk_store`.
+    pub fill: Option<engram_fill::FillEngine>,
     /// Per-host OCI image cache. `None` means sessions must arrive with
     /// `spec.rootfs_source` set (the dev-only path).
     pub image_cache: Option<ImageCache>,
@@ -150,6 +153,7 @@ impl HostAgent {
             cloud,
             egress: None,
             chunk_store: None,
+            fill: None,
             image_cache: None,
             chunk_cache: None,
             fc_for_reattach: None,
@@ -164,8 +168,17 @@ impl HostAgent {
         self
     }
 
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore) -> Self {
-        self.chunk_store = Some(chunk_store);
+    /// [`Self::with_fill`] with an engine of default limits.
+    pub fn with_chunk_store(self, chunk_store: ChunkStore) -> Self {
+        self.with_fill(engram_fill::FillEngine::new(
+            chunk_store,
+            engram_fill::Config::default(),
+        ))
+    }
+
+    pub fn with_fill(mut self, fill: engram_fill::FillEngine) -> Self {
+        self.chunk_store = Some(fill.store().clone());
+        self.fill = Some(fill);
         self
     }
 
@@ -299,7 +312,9 @@ impl HostAgent {
                             engram_host_core::SessionVolumes::new(disk, cs.clone()),
                         ));
                     }
-                    p = p.with_chunk_store(cs);
+                    if let Some(fill) = self.fill.clone() {
+                        p = p.with_fill(fill);
+                    }
                     // ADR 0080 §C: the MaterializeImage scratch root —
                     // gated on the chunk store because a materialize
                     // without one has nowhere durable to land. Same
@@ -1060,9 +1075,9 @@ impl HostAgent {
             // derive both from the same pure gate rather than letting
             // `enabled_images_tx.is_some()` implicitly stand in for it.
             let stages_images =
-                stages_images_gate(self.chunk_store.is_some(), self.chunk_cache.is_some());
-            let enabled_images_tx = match (self.chunk_store.clone(), self.chunk_cache.clone()) {
-                (Some(chunk_store), Some(chunk_cache)) => {
+                stages_images_gate(self.fill.is_some(), self.chunk_cache.is_some());
+            let enabled_images_tx = match (self.fill.clone(), self.chunk_cache.clone()) {
+                (Some(fill), Some(chunk_cache)) => {
                     // ADR 0022 Option A / ADR 0092: a fresh create always
                     // restores on the File backend, so the supervisor
                     // materializes each enabled image's contiguous
@@ -1078,7 +1093,7 @@ impl HostAgent {
                         Some(resolver)
                     };
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
-                        chunk_store.clone(),
+                        fill.clone(),
                         chunk_cache,
                         readiness.clone(),
                         base_memfile_dir,
@@ -1086,7 +1101,7 @@ impl HostAgent {
                         self.base_shm_protected.clone(),
                     );
                     if let Some(disk) = self.session_disk.clone() {
-                        image_volumes::spawn(disk, chunk_store, tx.subscribe());
+                        image_volumes::spawn(disk, fill.store().clone(), tx.subscribe());
                     }
                     Some(tx)
                 }

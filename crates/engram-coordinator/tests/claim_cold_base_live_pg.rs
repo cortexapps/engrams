@@ -299,7 +299,6 @@ async fn hit_with_a_verified_present_candidate() {
         state_blob_key: None,
         sidecar_blob_key: None,
         rootfs_blob_key: None,
-        working_set_blob_key: None,
         aux_bundles: vec![],
         paused_at: None,
         peer_hints: Vec::new(),

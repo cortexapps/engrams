@@ -189,7 +189,6 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         state_blob_key: metadata.state_blob_key.clone(),
         sidecar_blob_key: metadata.sidecar_blob_key.clone(),
         rootfs_blob_key: metadata.rootfs_blob_key.clone(),
-        working_set_blob_key: metadata.working_set_blob_key.clone(),
         aux_bundles: metadata.aux_bundles.clone(),
         paused_at: metadata.paused_at,
         peer_hints: Vec::new(),

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_chunk_store::{ChunkCache, ChunkStore};
+use engram_fill::{Class, FillEngine};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::endpoints::GuestEndpoints;
@@ -28,15 +29,6 @@ use tracing::Instrument as _;
 use crate::capture_lock::{CaptureGate, CaptureUser};
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageCache};
-
-/// ADR 0039 item #19: bounded concurrency for the cold-restore memory
-/// chunk prefetch. Raised from 8 — single-stream GCS ~80 MB/s on the
-/// prod n2-standard-8 hosts left ~90 % of the 10 Gbps line rate idle
-/// while a cold resume blocked 66.5 s on this prefetch (traced). 32
-/// (~2.5 GB/s aggregate) saturates closer to line rate without tripping
-/// GCS per-object rate limits. Mirrors the re-chunk/upload bound so the
-/// save and load paths use the same fleet-tuned fan-out.
-const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
@@ -310,8 +302,10 @@ pub struct PooledBackend {
     /// most one probe per sandbox regardless of the driver's tick rate.
     dead_probe_inflight: Arc<DashMap<SandboxId, ()>>,
     /// The chunk store that holds disk and memory manifests. `None`
-    /// disables chunked snapshots.
+    /// disables chunked snapshots. Always `fill.store()` when set.
     chunk_store: Option<ChunkStore>,
+    /// The host's chunk fill engine, over `chunk_store`.
+    fill: Option<FillEngine>,
     /// Peer health for the resume peer-fill arm (ADR 0095): a lost peer
     /// is skipped across every resume on this host for the lost window.
     peer_health: std::sync::Arc<crate::peer_fill::PeerHealth>,
@@ -1257,36 +1251,39 @@ impl PooledBackend {
                 .join("migration-session-manifest.json")
                 .exists();
 
-        // A non-lazy restore reads the warmed cache serially below, so
-        // the prefetch stays on the critical path; a lazy restore faults
-        // after `inner.restore`, so warming runs in the background.
-        if !memory_is_lazy {
-            let prefetched_chunks = tracing::Instrument::instrument(
-                self.prefetch_memory_chunks(&metadata),
+        // A File restore reads the whole memory before the VM starts, so
+        // the prefetch is on the critical path; a lazy restore faults
+        // after `inner.restore`, so the rest of memory fills behind the
+        // faults at a lower class.
+        if let Some(fill) = self.fill.clone() {
+            if memory_is_lazy {
+                let md = metadata.clone();
+                tokio::spawn(tracing::Instrument::instrument(
+                    async move {
+                        if let Err(e) =
+                            Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                snapshot_id = %md.id,
+                                "background memory prefetch failed; faults fetch on demand",
+                            );
+                        }
+                    },
+                    tracing::info_span!("restore.prefetch_memory_bg"),
+                ));
+            } else if let Err(e) = tracing::Instrument::instrument(
+                Self::prefetch_memory_chunks(&fill, &metadata, Class::Demand),
                 tracing::info_span!("restore.prefetch_memory"),
             )
-            .await;
-            if let Err(e) = prefetched_chunks.as_ref() {
+            .await
+            {
                 tracing::warn!(
                     error = %e,
                     snapshot_id = %metadata.id,
-                    "chunked restore memory chunk prefetch failed; falling back to serial fault path",
+                    "memory prefetch failed; the materialize fetches serially",
                 );
             }
-        } else if let Some(cs) = self.chunk_store.clone() {
-            let md = metadata.clone();
-            tokio::spawn(tracing::Instrument::instrument(
-                async move {
-                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &md).await {
-                        tracing::warn!(
-                            error = %e,
-                            snapshot_id = %md.id,
-                            "background memory prefetch failed; UFFD faults serve on-demand",
-                        );
-                    }
-                },
-                tracing::info_span!("restore.prefetch_memory_bg"),
-            ));
         }
 
         let src = self.inner.snapshot_path_for(metadata.id);
@@ -1489,6 +1486,7 @@ impl PooledBackend {
             unreachable_guests: Arc::new(DashMap::new()),
             dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
+            fill: None,
             peer_health: crate::peer_fill::PeerHealth::new(),
             bundle_dir,
             chunk_cache: None,
@@ -3098,9 +3096,15 @@ impl PooledBackend {
         self.finisher_with_class(class).finish(id, cap).await
     }
 
-    /// Attach the chunk store that holds disk and memory manifests.
-    pub fn with_chunk_store(mut self, chunk_store: ChunkStore) -> Self {
-        self.chunk_store = Some(chunk_store);
+    /// [`Self::with_fill`] with an engine of default limits.
+    pub fn with_chunk_store(self, chunk_store: ChunkStore) -> Self {
+        self.with_fill(FillEngine::new(chunk_store, engram_fill::Config::default()))
+    }
+
+    /// Attach the host's fill engine and the chunk store under it.
+    pub fn with_fill(mut self, fill: FillEngine) -> Self {
+        self.chunk_store = Some(fill.store().clone());
+        self.fill = Some(fill);
         self
     }
 
@@ -3207,143 +3211,34 @@ impl PooledBackend {
         self
     }
 
-    /// Materialise `<src>/memory.bin` from the FC sidecar JSON's
-    /// `memory_manifest` (if both the manifest exists in the
-    /// chunk store and the local file is absent). Used by
-    /// `restore()` to bootstrap cross-host transfers — the
-    /// snapshot directory may carry only `state.bin` +
-    /// `manifest.json` when staged by the coord; this fills in
-    /// the memory file from the chunked durability tier.
-    ///
-    /// Returns early-Ok on every common skip condition (no chunk
-    /// store wired, sidecar absent, memory_manifest unset, file
-    /// already present). Failures bubble; callers can log + fall
-    /// through to inner.restore which will surface a clearer
-    /// "memory.bin missing" error.
-    /// ADR 0014 M1.13: parallel prefetch the memory manifest's
-    /// chunks into the local NVMe chunk cache. Idempotent (no-op
-    /// when the cache is already warm) and best-effort (errors
-    /// degrade to the serial fault path inside materialize_to_file).
-    ///
-    /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
-    /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
-    /// the prior bound of 8 (~640 MB/s) left most of the 10 Gbps line
-    /// rate idle while the cold resume waited 66.5 s on this prefetch
-    /// (traced). 32 (~2.5 GB/s aggregate) saturates closer to line rate
-    /// without tripping GCS per-object rate limits, shrinking the
-    /// cold-cache refill that gates resume. (ADR 0039 item #19 also
-    /// flags moving this prefetch off the resume critical path entirely
-    /// — see the design note; that's the higher-risk follow-up.)
+    /// Make the memory manifest's chunks resident in the chunk cache at
+    /// `class`. Best-effort for the caller: a failure leaves the faults
+    /// (or the serial materialize) to fetch on demand.
     async fn prefetch_memory_chunks(
-        &self,
+        fill: &FillEngine,
         metadata: &SnapshotMetadata,
-    ) -> Result<usize, SandboxError> {
-        match self.chunk_store.as_ref() {
-            Some(cs) => Self::prefetch_memory_chunks_inner(cs, metadata).await,
-            None => Ok(0),
-        }
-    }
-
-    /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
-    /// already-resolved store (by ref) so it can run either inline
-    /// (`await`, on a NON-LAZY File restore where the serial
-    /// `materialize_memory_if_missing` reads the warmed cache) or inside a
-    /// spawned background task (ADR 0043 P1, any lazy UFFD restore — the warmed
-    /// chunks are consumed only by the handler's later lazy faults, so warming
-    /// need not block restore).
-    async fn prefetch_memory_chunks_inner(
-        chunk_store: &ChunkStore,
-        metadata: &SnapshotMetadata,
-    ) -> Result<usize, SandboxError> {
+        class: Class,
+    ) -> Result<engram_fill::FillStats, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
-            return Ok(0);
+            return Ok(engram_fill::FillStats::default());
         };
-        // ADR 0014 M1.14: if the snapshot has a published working-
-        // set trace, narrow the prefetch to those chunks only —
-        // typically a small subset of the full manifest (~5-15
-        // chunks vs ~30+). Shrinks cold-cache refill from ~2 s to
-        // ~500 ms in the best case. Fallback to full-manifest
-        // prefetch (M1.13 behavior) when the trace isn't present,
-        // unreachable, or empty.
-        let hashes_to_prefetch: Vec<_> = match metadata.working_set_blob_key.as_deref() {
-            Some(ws_key) => match Self::fetch_working_set_chunks(chunk_store, ws_key).await {
-                Ok(chunks) if !chunks.is_empty() => {
-                    tracing::debug!(
-                        ws_key,
-                        chunk_count = chunks.len(),
-                        "chunked restore prefetch narrowed to working set",
-                    );
-                    chunks
-                }
-                Ok(_) => {
-                    tracing::debug!(
-                        ws_key,
-                        "chunked restore prefetch: working set empty, falling back to full manifest",
-                    );
-                    let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
-                        SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
-                    })?;
-                    manifest.chunks.iter().map(|c| c.hash).collect()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        ws_key,
-                        error = %e,
-                        "chunked restore prefetch: working set fetch failed, falling back to full manifest",
-                    );
-                    let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
-                        SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
-                    })?;
-                    manifest.chunks.iter().map(|c| c.hash).collect()
-                }
-            },
-            None => {
-                let manifest = chunk_store.get_manifest(mref).await.map_err(|e| {
-                    SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
-                })?;
-                manifest.chunks.iter().map(|c| c.hash).collect()
-            }
-        };
-        let chunk_count = hashes_to_prefetch.len();
-        chunk_store
-            .prefetch_chunks(hashes_to_prefetch, MEMORY_PREFETCH_CONCURRENCY)
+        let manifest = fill
+            .store()
+            .get_manifest(mref)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks: {e}")))?;
-        tracing::debug!(
-            manifest = %mref,
-            chunk_count,
-            "chunked restore: memory chunks prefetched into NVMe",
-        );
-        Ok(chunk_count)
+            .map_err(|e| SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}")))?;
+        let stats = fill
+            .fill(manifest.chunks.iter().map(|c| c.hash).collect(), class)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("memory prefetch: {e}")))?;
+        tracing::debug!(manifest = %mref, ?stats, "memory chunks resident");
+        Ok(stats)
     }
 
-    /// ADR 0014 M1.14: load a working_set.json from BlobStorage and
-    /// return its chunk hashes. Used by `prefetch_memory_chunks`
-    /// to narrow the parallel prefetch to the chunks the kernel
-    /// actually touches on warm-restore. Returns `Ok(vec![])` when
-    /// the blob is missing (older bakes that pre-date M1.14) so
-    /// the caller falls back to full-manifest prefetch.
-    async fn fetch_working_set_chunks(
-        chunk_store: &ChunkStore,
-        ws_key: &str,
-    ) -> Result<Vec<engram_chunk_store::manifest::ChunkHash>, SandboxError> {
-        let blob = chunk_store.blob_storage();
-        let bytes = match blob.get(ws_key).await {
-            Ok(b) => b,
-            Err(engram_core::BlobError::NotFound) => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(SandboxError::Snapshot(format!(
-                    "fetch working-set blob {ws_key}: {e}"
-                )))
-            }
-        };
-        let trace: engram_chunk_store::working_set::WorkingSetTrace =
-            serde_json::from_slice(&bytes).map_err(|e| {
-                SandboxError::Snapshot(format!("parse working-set trace {ws_key}: {e}"))
-            })?;
-        Ok(trace.chunks)
-    }
-
+    /// Write `<src>/memory.bin` from the `memory_manifest` in
+    /// `<src>/manifest.json` when the file is absent (a cross-host File
+    /// restore). Does nothing when there is no chunk store, no sidecar or
+    /// no memory manifest.
     async fn materialize_memory_if_missing(
         &self,
         src: &std::path::Path,
@@ -7309,7 +7204,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -7805,7 +7699,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -7948,7 +7841,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -8133,7 +8025,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -8189,7 +8080,6 @@ mod tests {
                 state_blob_key: None,
                 sidecar_blob_key: None,
                 rootfs_blob_key: None,
-                working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
                 peer_hints: Vec::new(),
@@ -9389,7 +9279,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -9536,7 +9425,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -9684,7 +9572,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -9936,7 +9823,6 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
             peer_hints: Vec::new(),
@@ -10076,7 +9962,6 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
             peer_hints: Vec::new(),
@@ -11005,7 +10890,6 @@ mod tests {
                     state_blob_key: None,
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
-                    working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
                     peer_hints: Vec::new(),
@@ -11585,7 +11469,6 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             aux_bundles: Vec::new(),
             paused_at: None,
             peer_hints: Vec::new(),
@@ -11718,7 +11601,6 @@ mod tests {
                 state_blob_key: None,
                 sidecar_blob_key: None,
                 rootfs_blob_key: None,
-                working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
                 peer_hints: Vec::new(),

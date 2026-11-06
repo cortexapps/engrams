@@ -34,6 +34,7 @@ engram-host-core.workspace = true
 engram-disk-thin.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-fill.workspace = true
 engram-substrate-proto.workspace = true
 engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true

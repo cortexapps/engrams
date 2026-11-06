@@ -7162,7 +7162,6 @@ impl FirecrackerBackend {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             // ADR 0035: pin the bundle generations this VM's device
             // model references — the live spec reflects any fresh-create
             // swap, so this is what `load_snapshot` will reopen on the
@@ -7708,7 +7707,6 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
             peer_hints: Vec::new(),
@@ -7874,7 +7872,6 @@ mod tests {
             state_blob_key: None,
             sidecar_blob_key: None,
             rootfs_blob_key: None,
-            working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
             peer_hints: Vec::new(),

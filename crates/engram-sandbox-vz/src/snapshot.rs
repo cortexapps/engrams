@@ -128,7 +128,6 @@ pub(crate) async fn build_metadata(
         state_blob_key: None,
         sidecar_blob_key: None,
         rootfs_blob_key: None,
-        working_set_blob_key: None,
         aux_bundles: vec![],
         // Issue #529: VZ never routes through `PooledBackend::snapshot_begin`
         // (it gates on `supports_diff_checkpoints`, InvalidSpec → composed

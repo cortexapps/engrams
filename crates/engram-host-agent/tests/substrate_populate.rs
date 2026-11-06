@@ -36,7 +36,8 @@ fn fixture(
     }
     let cache = ChunkCache::new(cfg);
     let store = Arc::new(ChunkStore::new(blob).with_chunk_cache(cache.clone()));
-    let server = SubstrateServer::new(cache.clone(), store.clone(), dir.join("shm"));
+    let fill = engram_fill::FillEngine::new((*store).clone(), engram_fill::Config::default());
+    let server = SubstrateServer::new(cache.clone(), fill, dir.join("shm"));
     (server, cache, store)
 }
 

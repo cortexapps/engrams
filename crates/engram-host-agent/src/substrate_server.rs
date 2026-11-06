@@ -18,16 +18,16 @@
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore};
+use engram_chunk_store::{ChunkCache, ChunkHash};
+use engram_fill::{Class, FillEngine};
 use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION};
 
 /// Everything a connection needs to answer requests.
 #[derive(Clone)]
 pub struct SubstrateServer {
     cache: ChunkCache,
-    store: Arc<ChunkStore>,
+    fill: FillEngine,
     /// The uffd base-shm dir; `HelloAck.tmpfs_ok` is a live statfs of
     /// this path (TMPFS_MAGIC), closing the handler-side half of the
     /// post-roll "register memory … userfaultfd … System error" window.
@@ -38,10 +38,10 @@ pub struct SubstrateServer {
 }
 
 impl SubstrateServer {
-    pub fn new(cache: ChunkCache, store: Arc<ChunkStore>, uffd_base_dir: PathBuf) -> Self {
+    pub fn new(cache: ChunkCache, fill: FillEngine, uffd_base_dir: PathBuf) -> Self {
         Self {
             cache,
-            store,
+            fill,
             uffd_base_dir,
             rt: tokio::runtime::Handle::current(),
         }
@@ -137,7 +137,7 @@ impl SubstrateServer {
                     // those chunks are resident + peer-served.
                     if conn_pins.is_empty() {
                         if let Some(mref) = session_manifest {
-                            match self.rt.block_on(self.store.get_manifest(mref)) {
+                            match self.rt.block_on(self.fill.store().get_manifest(mref)) {
                                 Ok(manifest) => {
                                     for chunk in &manifest.chunks {
                                         self.cache.pin(chunk.hash);
@@ -172,7 +172,7 @@ impl SubstrateServer {
     fn populate(&self, stream: &mut UnixStream, hash: ChunkHash) -> std::io::Result<()> {
         self.cache.pin(hash);
         let already = self.cache.contains_on_disk(hash);
-        let fetched = self.rt.block_on(self.store.get_chunk(hash));
+        let fetched = self.rt.block_on(self.fill.get(hash, Class::Demand));
         let outcome = match fetched {
             Ok(_bytes) => {
                 let path = self.cache.on_disk_path(hash);
@@ -258,6 +258,8 @@ fn dir_is_tmpfs(_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engram_chunk_store::ChunkStore;
+    use std::sync::Arc;
     use engram_core::traits::BlobStorage;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -317,7 +319,8 @@ mod tests {
             .expect("seed chunk");
         // Reset the counter — the seed's write-through may have read.
         blob.gets.store(0, Ordering::SeqCst);
-        let server = SubstrateServer::new(cache, store, dir.join("shm"));
+        let fill = FillEngine::new((*store).clone(), engram_fill::Config::default());
+        let server = SubstrateServer::new(cache, fill, dir.join("shm"));
         (server, blob, hash)
     }
 

@@ -629,6 +629,12 @@ async fn main() -> Result<(), HostAgentError> {
     let chunk_store = engram_chunk_store::ChunkStore::new(blob)
         .with_chunk_cache(chunk_cache.clone())
         .with_upload_budget(upload_budget);
+    // The one fill engine on this host: every chunk fetch below goes
+    // through it, so they share one class-ordered in-flight limit.
+    let fill = engram_fill::FillEngine::new(
+        chunk_store.clone(),
+        engram_fill::Config::from_env().map_err(HostAgentError::Config)?,
+    );
 
     // ADR 0075: spawn the substrate populate server now both halves
     // exist. The uffd base dir mirrors the FC config default (env
@@ -641,7 +647,7 @@ async fn main() -> Result<(), HostAgentError> {
         BackendChoice::Firecracker => Some(
             engram_host_agent::substrate_server::SubstrateServer::new(
                 chunk_cache.clone(),
-                std::sync::Arc::new(chunk_store.clone()),
+                fill.clone(),
                 engram_sandbox_firecracker::uffd_base_dir_from_env()
                     .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
             )
@@ -687,7 +693,7 @@ async fn main() -> Result<(), HostAgentError> {
     let observe_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
-        .with_chunk_store(chunk_store)
+        .with_fill(fill)
         .with_chunk_cache(chunk_cache)
         .with_session_disk(session_disk)
         .with_image_cache(image_cache)
