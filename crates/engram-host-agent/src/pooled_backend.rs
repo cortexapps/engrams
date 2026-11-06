@@ -1253,12 +1253,8 @@ impl PooledBackend {
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         let new_id = id;
-        let post_copy_dest = self.postcopy_dests.contains_key(&metadata.id)
-            || self
-                .inner
-                .snapshot_path_for(metadata.id)
-                .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
-                .exists();
+        let post_copy_dest =
+            self.is_post_copy_dest(metadata.id, &self.inner.snapshot_path_for(metadata.id));
         // Memory is served lazily (UFFD faults / peer) for a substrate
         // base-create, a UFFD resume, and every staged migration restore;
         // a File-mode restore needs a contiguous `memory.bin`. One
@@ -1460,8 +1456,17 @@ impl PooledBackend {
         restore
     }
 
+    /// The restore of `snapshot` from its folder `dir` is the destination
+    /// of a live move.
+    fn is_post_copy_dest(&self, snapshot: engram_core::SnapshotId, dir: &Path) -> bool {
+        self.postcopy_dests.contains_key(&snapshot)
+            || dir
+                .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
+                .exists()
+    }
+
     /// Provision a restored sandbox's disks from the snapshot's manifests,
-    /// each eagerly or over a source as [`Self::restore_path`] picks.
+    /// each eagerly or over a source as [`Self::restore_paths`] picks.
     /// Returns the disks and whether any boots over a source.
     async fn provision_for_restore(
         &self,
@@ -1509,7 +1514,11 @@ impl PooledBackend {
         };
         let mut disks = vec![(DiskRole::Root, root)];
         disks.extend(swap.map(|source| (DiskRole::Swap, source)));
-        let mut chosen = self.restore_paths(volumes, id, &disks).await.into_iter();
+        let move_dest = self.is_post_copy_dest(metadata.id, src);
+        let mut chosen = self
+            .restore_paths(volumes, id, &disks, move_dest)
+            .await
+            .into_iter();
         let root = chosen.next().expect("a source for each disk");
         let swap = chosen.next();
         let lazy = [Some(root), swap]
@@ -1542,16 +1551,24 @@ impl PooledBackend {
     /// be read is eager. A host that cannot start a source, and a disk of zeros,
     /// is eager. `force` and `auto` record each estimate.
     ///
+    /// A live move's destination (`move_dest`) is eager in every mode: the
+    /// move writes the source's later blocks into the live volumes before
+    /// the guest boots, and a drive that still copies cannot open as a
+    /// volume. Every other restore writes its disks only through the guest,
+    /// so it can be lazy.
+    ///
     /// [`lazy_disks`]: engram_host_core::eager_estimate::lazy_disks
     async fn restore_paths(
         &self,
         volumes: &SessionVolumes,
         id: SandboxId,
         disks: &[(DiskRole, Source)],
+        move_dest: bool,
     ) -> Vec<Source> {
         use crate::config::LazyRestore;
         let considered = |source: &Source| {
             self.lazy_restore != LazyRestore::Off
+                && !move_dest
                 && volumes.can_start_sources()
                 && !matches!(source, Source::Empty { .. })
         };
@@ -9363,6 +9380,37 @@ mod tests {
             .await
             .unwrap();
         assert!(!lazy, "an adopted checkpoint restores eagerly under force");
+    }
+
+    /// A live move's destination restores eagerly under `force`: the move
+    /// writes into its live volumes before the guest boots.
+    #[tokio::test]
+    async fn a_move_destination_restores_eagerly_under_force() {
+        use crate::config::{EagerBudget, LazyRestore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (volumes, manifest) = volumes_with_sources(tmp.path()).await;
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
+        std::fs::write(
+            src.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
+            b"{}",
+        )
+        .unwrap();
+        let pooled = hydrating_backend(&volumes).with_lazy_restore(
+            LazyRestore::Force,
+            EagerBudget {
+                seconds: 0.0,
+                ..EagerBudget::default()
+            },
+        );
+        let id = SandboxId::new();
+
+        let (_, lazy) = pooled
+            .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+            .await
+            .unwrap();
+
+        assert!(!lazy);
+        assert!(volumes.live(id, DiskRole::Root).await.is_ok());
     }
 
     /// A snapshot folder and metadata for a restore of a root disk from
