@@ -512,6 +512,14 @@ pub trait SandboxBackend: Send + Sync {
         false
     }
 
+    /// Whether a capture (`snapshot`, `snapshot_diff`, `snapshot_hold`)
+    /// writes guest memory with its restore files: `state.bin`, the memory
+    /// file and the `manifest.json` sidecar. Firecracker does, with or
+    /// without dirty tracking; VZ and Process capture disk only. A caller
+    /// publishes the memory exactly when this holds, and a capture that
+    /// claims memory but left no memory file fails.
+    fn captures_guest_memory(&self) -> bool;
+
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
     /// success. Used by [`crate::traits::host_client`]-side

@@ -2638,14 +2638,6 @@ impl PooledBackend {
             }
         };
         let dest = self.inner.snapshot_path_for(metadata.id);
-        // The create returned in this process, so its files are all
-        // there: Firecracker writes `state.bin` with the guest memory,
-        // VZ and Process write neither. A failed stat counts as memory, so
-        // the post phase fails on the files instead of skipping them.
-        let writes_memory = !matches!(
-            tokio::fs::try_exists(dest.join("state.bin")).await,
-            Ok(false)
-        );
         // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
         // the guest back running. The guard rides into `SnapshotCapture`
         // (still armed) so the cancellation gap in `snapshot_begin` and
@@ -2658,7 +2650,7 @@ impl PooledBackend {
                 dest,
                 chain_prev,
                 paused_at,
-                writes_memory,
+                writes_memory: self.inner.captures_guest_memory(),
                 unwind,
             },
         ))
@@ -3833,7 +3825,8 @@ pub(crate) struct SnapshotCapture {
         engram_chunk_store::Manifest,
     )>,
     paused_at: chrono::DateTime<chrono::Utc>,
-    /// The backend wrote guest memory and its restore files.
+    /// The backend's captures write guest memory and its restore files
+    /// ([`SandboxBackend::captures_guest_memory`]).
     writes_memory: bool,
     /// Owns the pending disk checkpoints and resumes the guest if this
     /// capture is dropped before the finisher takes it over.
@@ -4615,6 +4608,9 @@ fn emit_prefault_metrics(outcome: PrefaultOutcome) {
 
 #[async_trait]
 impl SandboxBackend for PooledBackend {
+    fn captures_guest_memory(&self) -> bool {
+        self.inner.captures_guest_memory()
+    }
     // Capability methods proxy to the wrapped backend — the pool is
     // a thin caching layer; whatever Process / VZ / FC reports
     // about itself is what callers see.
@@ -4823,10 +4819,13 @@ impl SandboxBackend for PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
-        if !self.inner.supports_diff_checkpoints() || self.checkpoint_dir.is_none() {
+        if !self.inner.supports_diff_checkpoints()
+            || !self.inner.captures_guest_memory()
+            || self.checkpoint_dir.is_none()
+        {
             return Err(SandboxError::InvalidSpec(
-                "host-durable eviction finalize requires diff-checkpoint support and a wired \
-                 checkpoint_dir"
+                "host-durable eviction finalize requires diff-checkpoint support, guest memory \
+                 captures and a wired checkpoint_dir"
                     .into(),
             ));
         }
@@ -4853,8 +4852,8 @@ impl SandboxBackend for PooledBackend {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
 
-        // The gate above admits only a backend that writes guest memory,
-        // and the finalize always publishes it.
+        // The gate above admits only a backend whose captures write guest
+        // memory, and the finalize always publishes it.
         let SnapshotCapture {
             metadata,
             dest,
@@ -7259,6 +7258,9 @@ mod tests {
         struct DeadGuest(Arc<std::sync::atomic::AtomicBool>);
         #[async_trait]
         impl SandboxBackend for DeadGuest {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7344,6 +7346,9 @@ mod tests {
         struct SlowBootMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for SlowBootMock {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7474,6 +7479,9 @@ mod tests {
         struct EarlySignalKillMock;
         #[async_trait]
         impl SandboxBackend for EarlySignalKillMock {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7577,6 +7585,9 @@ mod tests {
         struct SilentAfterStartMock;
         #[async_trait]
         impl SandboxBackend for SilentAfterStartMock {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7701,6 +7712,9 @@ mod tests {
         struct ChattyStuckStageMock;
         #[async_trait]
         impl SandboxBackend for ChattyStuckStageMock {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7829,6 +7843,9 @@ mod tests {
         struct NoiseThenLineMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for NoiseThenLineMock {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -7975,6 +7992,9 @@ mod tests {
         struct TwoStageMock(Arc<Probe>);
         #[async_trait]
         impl SandboxBackend for TwoStageMock {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Ok(())
             }
@@ -8163,6 +8183,9 @@ mod tests {
 
         #[async_trait]
         impl SandboxBackend for ColdBaseMock {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 self.create_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -9045,6 +9068,9 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for ResumeSpy {
+        fn captures_guest_memory(&self) -> bool {
+            false
+        }
         fn post_copy_source_view(
             &self,
             _: SandboxId,
@@ -9474,6 +9500,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -9631,6 +9660,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for FakeFcBackend {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -9779,6 +9811,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for AssertingInner {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -9986,6 +10021,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for CapturingInner {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -10172,6 +10210,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for StagedInner {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -10309,6 +10350,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for Capturing {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
                 *self.captured.lock() = Some(spec);
                 Ok(())
@@ -10481,6 +10525,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for SpyInner {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -10723,6 +10770,9 @@ mod tests {
         struct NoopInner;
         #[async_trait]
         impl SandboxBackend for NoopInner {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -10957,6 +11007,9 @@ mod tests {
         struct FixedListInner(Vec<SandboxId>);
         #[async_trait]
         impl SandboxBackend for FixedListInner {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -11101,6 +11154,9 @@ mod tests {
         }
         #[async_trait]
         impl SandboxBackend for LifecycleInner {
+            fn captures_guest_memory(&self) -> bool {
+                true
+            }
             async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
                 Err(SandboxError::InvalidSpec("unused".into()))
             }
@@ -11426,6 +11482,9 @@ mod tests {
 
     #[async_trait]
     impl SandboxBackend for CustodyBackend {
+        fn captures_guest_memory(&self) -> bool {
+            false
+        }
         async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Ok(())
         }
@@ -11956,6 +12015,9 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for FakeCaptureBackend {
+        fn captures_guest_memory(&self) -> bool {
+            true
+        }
         async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
@@ -12467,6 +12529,83 @@ mod tests {
         );
     }
 
+    /// [`FakeCaptureBackend`] whose captures lose `lost` from the staging
+    /// dir before they return.
+    struct LosesFiles {
+        inner: FakeCaptureBackend,
+        lost: &'static [&'static str],
+    }
+    #[async_trait]
+    impl SandboxBackend for LosesFiles {
+        fn captures_guest_memory(&self) -> bool {
+            true
+        }
+        async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn restore(
+            &self,
+            _: SandboxId,
+            _: SnapshotMetadata,
+            _: Option<engram_core::types::sandbox::SessionDisks>,
+        ) -> Result<(), SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            let metadata = self.inner.snapshot(id).await?;
+            for name in self.lost {
+                std::fs::remove_file(self.inner.dir_for(metadata.id).join(name)).unwrap();
+            }
+            Ok(metadata)
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+    }
+
+    /// A capture from a backend whose captures hold guest memory fails
+    /// when it left no memory, whichever restore file is gone: the
+    /// snapshot must not publish the disks alone as a resumable capture.
+    #[tokio::test]
+    async fn a_memory_capture_that_lost_its_files_fails() {
+        for lost in [&["memory.bin"][..], &["state.bin", "memory.bin"][..]] {
+            let tmp = tempfile::tempdir().unwrap();
+            let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+                engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+            );
+            let inner: Arc<dyn SandboxBackend> = Arc::new(LosesFiles {
+                inner: FakeCaptureBackend {
+                    payload: finalize_payload(),
+                    staging_root: tmp.path().join("fc-snaps"),
+                    destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+                },
+                lost,
+            });
+            let pooled = PooledBackend::new(inner).with_chunk_store(ChunkStore::new(blob));
+            let err = pooled
+                .snapshot(SandboxId::new())
+                .await
+                .expect_err("a memory capture without its memory must fail");
+            assert!(
+                matches!(err, SandboxError::Snapshot(_)),
+                "lost {lost:?}: {err:?}"
+            );
+        }
+    }
+
     // ─── durable chain-head record (survivor rehydrate after a pod roll) ───
 
     fn chain_head_file(checkpoint_dir: &Path, id: SandboxId) -> PathBuf {
@@ -12542,6 +12681,9 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for SurvivorListBackend {
+        fn captures_guest_memory(&self) -> bool {
+            self.inner.captures_guest_memory()
+        }
         async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
@@ -12752,6 +12894,9 @@ mod tests {
 
         #[async_trait]
         impl SandboxBackend for BalloonMock {
+            fn captures_guest_memory(&self) -> bool {
+                false
+            }
             async fn balloon_reclaim(
                 &self,
                 _: SandboxId,
@@ -12910,6 +13055,9 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for HoldBackend {
+        fn captures_guest_memory(&self) -> bool {
+            self.inner.captures_guest_memory()
+        }
         async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
             self.inner.create(id, spec).await
         }

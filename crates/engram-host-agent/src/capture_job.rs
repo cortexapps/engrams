@@ -694,6 +694,9 @@ mod tests {
 
     #[async_trait]
     impl SandboxBackend for MockBackend {
+        fn captures_guest_memory(&self) -> bool {
+            false
+        }
         async fn create(&self, _: SandboxId, _: SandboxSpec) -> Result<(), SandboxError> {
             self.create_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())

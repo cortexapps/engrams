@@ -367,6 +367,9 @@ impl ProcessBackend {
 
 #[async_trait]
 impl SandboxBackend for ProcessBackend {
+    fn captures_guest_memory(&self) -> bool {
+        false
+    }
     fn harness_dial(&self) -> engram_core::traits::HarnessDial {
         // Harness exec'd as a host subprocess; dials TCP loopback
         // back to the coord-side harness listener.

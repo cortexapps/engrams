@@ -4923,6 +4923,10 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
 
 #[async_trait]
 impl SandboxBackend for FirecrackerBackend {
+    /// Every capture writes `state.bin` and the guest memory.
+    fn captures_guest_memory(&self) -> bool {
+        true
+    }
     async fn create(&self, sandbox_id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
 
