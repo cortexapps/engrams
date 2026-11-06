@@ -1983,17 +1983,12 @@ async fn read_if_present(path: &Path) -> Result<Option<Bytes>> {
     .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
 }
 
-/// `Result<Bytes>` isn't `Clone` because `ChunkStoreError` carries
-/// non-cloneable variants (io::Error, serde_json::Error). The
-/// singleflight broadcast wants to send the same outcome to N
-/// waiters; we hand each one a fresh result by mirroring the
-/// success bytes or by re-projecting the error as `Internal`
-/// (waiters don't need the original cause chain; the first
-/// fetcher does).
+/// The leader's outcome for one singleflight waiter. The error keeps its
+/// variant, so a waiter can tell a missing chunk from a failed fetch.
 fn clone_result(r: &Result<Bytes>) -> Result<Bytes> {
     match r {
         Ok(bytes) => Ok(bytes.clone()),
-        Err(e) => Err(ChunkStoreError::Internal(format!("singleflight: {e}"))),
+        Err(e) => Err(e.duplicate()),
     }
 }
 
@@ -2589,6 +2584,52 @@ mod tests {
                 .unwrap()
                 .expect("waiter should recover the bytes");
             assert_eq!(&bytes[..], body);
+        }
+    }
+
+    /// A waiter on a leader whose chunk is missing gets `NotFound`, not
+    /// a generic error.
+    #[tokio::test]
+    async fn a_waiter_sees_the_leaders_error_kind() {
+        use std::time::Duration;
+        let (cache, _store, _b, _c) = setup(1024 * 1024).await;
+        let h = ChunkHash::of(b"never stored");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let leader = {
+            let cache = cache.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                cache
+                    .get(h, move || async move {
+                        gate.notified().await;
+                        Err(ChunkStoreError::Blob(
+                            engram_core::error::BlobError::NotFound,
+                        ))
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiter = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get(h, || async { unreachable!("the waiter joins the leader") })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+
+        for task in [leader, waiter] {
+            let err = task.await.unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)
+                ),
+                "{err:?}"
+            );
         }
     }
 
