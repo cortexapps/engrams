@@ -138,6 +138,16 @@ far below their limits, which is the same single-core bound. A fetch
 path that spreads this work across cores is a precondition for any
 estimate in Decision 1.
 
+With one task per fetch, the same profile moves the limit off the
+network. Memory chunks then arrive at about 1 GB/s, and the disk diff
+is bound by writes: of 64 fetches in flight, on average 3 wait on the
+store and the rest wait on direct writes into the thin volume. The
+memory prefetch writes its chunks to the chunk cache on the same disk,
+so a faster memory stream makes the disk diff slower (about 130 MB/s
+into the volume while both run). The rates in Decision 1 are therefore
+write rates of the host's disk while a memory restore runs, not
+network rates, and the estimate counts the bytes of both streams.
+
 ## Decision
 
 1. **A restore picks eager or lazy before it starts, and can fall back
