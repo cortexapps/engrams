@@ -18,6 +18,10 @@
  *     `engrams auth login` stores after the device-flow exchange. Revocation
  *     deletes ONLY the key row — the owner is a human.
  *
+ * A revoke also drops the key's cached session on this replica. Other
+ * replicas stop accepting the key when their cache entry expires (a few
+ * seconds; see auth/api-key-cache.ts).
+ *
  * The @better-auth/api-key plugin resolves a valid keyed request into a
  * (mock) session for the owning user, so every existing seam (CASL ability,
  * policy map, `createdByUserId` ownership) works unchanged for both shapes.
@@ -36,7 +40,7 @@ import { and, eq, like, notExists } from "drizzle-orm";
 import { ApiKeyService } from "../gen/engram/app/v1/api_key_pb.ts";
 import type { ApiKeyMeta } from "../gen/engram/app/v1/api_key_pb.ts";
 import { auth } from "../auth/better-auth.ts";
-import { getSessionFromHeaders } from "../auth/session.ts";
+import { apiKeySessions, getSessionFromHeaders } from "../auth/session.ts";
 import { requireAdmin } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import { apikey, user } from "../db/schema.ts";
@@ -315,6 +319,7 @@ export function registerApiKeys(router: ConnectRouter, deps?: ApiKeyDeps): void 
         // User-owned CLI key: the owner is a HUMAN — delete only the key row.
         await backend().deleteKeyRow(req.id);
       }
+      apiKeySessions.forgetKey(req.id);
       return { revoked: true };
     },
 
@@ -349,6 +354,7 @@ export function registerApiKeys(router: ConnectRouter, deps?: ApiKeyDeps): void 
       // response stays idempotent for logout retries.
       if (!found || found.referenceId !== caller.id) return { revoked: false };
       await backend().deleteKeyRow(req.id); // never the user — the owner is a human
+      apiKeySessions.forgetKey(req.id);
       return { revoked: true };
     },
 
