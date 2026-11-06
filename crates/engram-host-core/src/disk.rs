@@ -152,17 +152,21 @@ impl Volume {
     }
 
     /// Write chunk `index` in full; `bytes` must be exactly its length.
-    pub async fn write_chunk(&self, index: ChunkIndex, bytes: Vec<u8>) -> io::Result<()> {
+    pub async fn write_chunk(
+        &self,
+        index: ChunkIndex,
+        bytes: impl AsRef<[u8]> + Send + 'static,
+    ) -> io::Result<()> {
         let offset = self.offset_of(index)?;
         let len = self.chunk_len(index)?;
-        if bytes.len() != len {
+        if bytes.as_ref().len() != len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "chunk {} of volume {} is {len} bytes, got {}",
                     index.0,
                     self.name,
-                    bytes.len()
+                    bytes.as_ref().len()
                 ),
             ));
         }
@@ -200,14 +204,22 @@ impl Volume {
 
     /// Write through the direct handle when `offset` and the length are
     /// aligned for it, otherwise through the page cache.
-    async fn write_at(&self, offset: u64, bytes: Vec<u8>, what: &'static str) -> io::Result<()> {
-        let aligned =
-            offset.is_multiple_of(DIRECT_ALIGN as u64) && bytes.len().is_multiple_of(DIRECT_ALIGN);
+    async fn write_at(
+        &self,
+        offset: u64,
+        bytes: impl AsRef<[u8]> + Send + 'static,
+        what: &'static str,
+    ) -> io::Result<()> {
+        let aligned = offset.is_multiple_of(DIRECT_ALIGN as u64)
+            && bytes.as_ref().len().is_multiple_of(DIRECT_ALIGN);
         let direct = self.direct.as_ref().filter(|_| aligned).map(Arc::clone);
         let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || match direct.zip(AlignedBuf::copy_of(&bytes)) {
-            Some((direct, buf)) => direct.write_all_at(buf.as_slice(), offset),
-            None => file.write_all_at(&bytes, offset),
+        tokio::task::spawn_blocking(move || {
+            let bytes = bytes.as_ref();
+            match direct.zip(AlignedBuf::copy_of(bytes)) {
+                Some((direct, buf)) => direct.write_all_at(buf.as_slice(), offset),
+                None => file.write_all_at(bytes, offset),
+            }
         })
         .await
         .map_err(|e| io::Error::other(format!("{what} task: {e}")))?

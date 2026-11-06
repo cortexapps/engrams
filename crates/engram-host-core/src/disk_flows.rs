@@ -18,6 +18,13 @@ fn metrics_now() -> std::time::Instant {
     std::time::Instant::now()
 }
 
+/// `ENGRAM_PREFETCH_SPAWN=1` also runs the disk delta on one task per
+/// chunk (default off). Read once.
+fn spawn_delta() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("ENGRAM_PREFETCH_SPAWN").as_deref(), Ok("1")))
+}
+
 fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
 }
@@ -49,23 +56,67 @@ async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta)
     let fetch_us = AtomicU64::new(0);
     let write_us = AtomicU64::new(0);
     let (fetch_us, write_us) = (&fetch_us, &write_us);
-    stream::iter(delta.write.iter().map(Ok))
-        .try_for_each_concurrent(CONCURRENCY, |c| async move {
-            let t = metrics_now();
-            let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
-            fetch_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
-            let t = metrics_now();
-            let written = volume
-                .write_chunk(ChunkIndex(c.offset / chunk_size), bytes.to_vec())
-                .await;
-            write_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
-            written
-        })
-        .await?;
+    if spawn_delta() {
+        // One task per chunk so fetch, hash and write spread over the
+        // runtime's workers; at most CONCURRENCY in flight.
+        let volume = volume.clone();
+        let fetch_total = std::sync::Arc::new(AtomicU64::new(0));
+        let write_us_total = std::sync::Arc::new(AtomicU64::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        let mut chunks = delta.write.iter().cloned();
+        let spawn = |set: &mut tokio::task::JoinSet<io::Result<()>>, c: ChunkRef| {
+            let (store, volume) = (store.clone(), volume.clone());
+            let (f_us, w_us) = (fetch_total.clone(), write_us_total.clone());
+            set.spawn(async move {
+                let t = metrics_now();
+                let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
+                f_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                let t = metrics_now();
+                let written = volume
+                    .write_chunk(ChunkIndex(c.offset / chunk_size), bytes)
+                    .await;
+                w_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                written
+            });
+        };
+        for c in chunks.by_ref().take(CONCURRENCY) {
+            spawn(&mut set, c);
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.map_err(io::Error::other)??;
+            if let Some(c) = chunks.next() {
+                spawn(&mut set, c);
+            }
+        }
+        fetch_us.fetch_add(fetch_total.load(Relaxed), Relaxed);
+        write_us.fetch_add(write_us_total.load(Relaxed), Relaxed);
+    } else {
+        stream::iter(delta.write.iter().map(Ok))
+            .try_for_each_concurrent(CONCURRENCY, |c| async move {
+                let t = metrics_now();
+                let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
+                fetch_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                let t = metrics_now();
+                let written = volume
+                    .write_chunk(ChunkIndex(c.offset / chunk_size), bytes.to_vec())
+                    .await;
+                write_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                written
+            })
+            .await?;
+    }
     let fetch_write_elapsed_ms = started.elapsed().as_millis() as u64;
     let t = metrics_now();
-    for offset in &delta.zero {
-        volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
+    if spawn_delta() {
+        stream::iter(delta.zero.iter().map(Ok))
+            .try_for_each_concurrent(CONCURRENCY, |offset| {
+                volume.zero_chunk(ChunkIndex(offset / chunk_size))
+            })
+            .await?;
+    } else {
+        for offset in &delta.zero {
+            volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
+        }
     }
     tracing::info!(
         volume = %volume.name,
@@ -186,19 +237,38 @@ pub mod checkpoint_split {
         };
 
         let chunk_size = snapshot.chunk_size;
-        let results: Vec<(u64, Option<ChunkRef>)> = stream::iter(indices.into_iter().map(Ok))
-            .map_ok(|index| async move {
-                let offset = index.0 * chunk_size;
-                let bytes = snapshot.read_chunk(index).await?;
-                if is_zero_chunk(&bytes) {
-                    return Ok::<_, io::Error>((offset, None));
+        let one = |index: ChunkIndex, snapshot: Volume, store: ChunkStore| async move {
+            let offset = index.0 * chunk_size;
+            let bytes = snapshot.read_chunk(index).await?;
+            if is_zero_chunk(&bytes) {
+                return Ok::<_, io::Error>((offset, None));
+            }
+            let hash = store.put_chunk(&bytes).await.map_err(store_err)?;
+            Ok((offset, Some(ChunkRef { offset, hash })))
+        };
+        let results: Vec<(u64, Option<ChunkRef>)> = if spawn_delta() {
+            // One task per chunk: read, hash, encrypt and PUT spread over
+            // the runtime's workers; at most CONCURRENCY in flight.
+            let mut out = Vec::with_capacity(indices.len());
+            let mut set = tokio::task::JoinSet::new();
+            let mut rest = indices.into_iter();
+            for index in rest.by_ref().take(CONCURRENCY) {
+                set.spawn(one(index, snapshot.clone(), store.clone()));
+            }
+            while let Some(joined) = set.join_next().await {
+                out.push(joined.map_err(io::Error::other)??);
+                if let Some(index) = rest.next() {
+                    set.spawn(one(index, snapshot.clone(), store.clone()));
                 }
-                let hash = store.put_chunk(&bytes).await.map_err(store_err)?;
-                Ok((offset, Some(ChunkRef { offset, hash })))
-            })
-            .try_buffer_unordered(CONCURRENCY)
-            .try_collect()
-            .await?;
+            }
+            out
+        } else {
+            stream::iter(indices.into_iter().map(Ok))
+                .map_ok(|index| one(index, snapshot.clone(), store.clone()))
+                .try_buffer_unordered(CONCURRENCY)
+                .try_collect()
+                .await?
+        };
 
         let mut delta = ManifestDelta::default();
         for (offset, written) in results {
