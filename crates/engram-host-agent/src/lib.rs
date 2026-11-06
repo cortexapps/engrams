@@ -1215,6 +1215,9 @@ impl HostAgent {
             // The first ack always notifies, even when the set is empty, so
             // the supervisors can tell "no images" from "not told yet".
             let mut enabled_acked = false;
+            // The last capturing set a coordinator sent. An ack without the
+            // field (a failed read, or an older coordinator) keeps it.
+            let mut capturing_disks = Vec::new();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = engram_core::periodic(heartbeat_interval);
                 // Observed disk/mem/cpu for the fleet view. Holds the
@@ -1463,11 +1466,12 @@ impl HostAgent {
                                     &resp.prestage_images,
                                 );
                                 let first = !std::mem::replace(&mut enabled_acked, true);
+                                if let Some(capturing) = resp.capturing_disk_manifests {
+                                    capturing_disks = capturing;
+                                }
                                 if let Some(disks_tx) = image_disks_tx.as_ref() {
-                                    let disks = image_volumes::desired_disks(
-                                        &union,
-                                        &resp.capturing_disk_manifests,
-                                    );
+                                    let disks =
+                                        image_volumes::desired_disks(&union, &capturing_disks);
                                     disks_tx.send_if_modified(|cur| {
                                         let changed = first || *cur != disks;
                                         *cur = disks;

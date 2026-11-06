@@ -440,9 +440,10 @@ pub struct HeartbeatResponse {
     pub prestage_images: Vec<EnabledImageRef>,
     /// The disk manifest of every image whose capture is in flight. Hosts
     /// stage these as image volumes during the capture, so the captured
-    /// disk stages as a delta over them. An older host ignores the field.
-    #[serde(default)]
-    pub capturing_disk_manifests: Vec<engram_core::types::manifest::ManifestRef>,
+    /// disk stages as a delta over them. Absent when the read failed: the
+    /// host keeps the set it has. An older host ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capturing_disk_manifests: Option<Vec<engram_core::types::manifest::ManifestRef>>,
     /// ADR 0035 §5: the bundle pin set (every generation some
     /// snapshot row references). Drives the host's bundle
     /// prefetch + sweep supervisor. Always present — the host side
@@ -671,9 +672,10 @@ pub async fn heartbeat(
 
     // The enabled, prestaging and capturing images and the fleet's host
     // rows: the same for every host, so read once per replica per
-    // FLEET_READS_TTL. NOT best-effort: the host keeps exactly these
-    // images' volumes, so an empty set read from a PG failure would make
-    // it delete them.
+    // FLEET_READS_TTL. A failed enabled or prestaging read withholds the
+    // ack: the host keeps exactly these images' volumes, so an empty set
+    // would make it delete them. Every other ack field is idempotent and
+    // rides the next heartbeat.
     //
     // ADR 0035 §5: the bundle pin set. NOT best-effort either — an empty
     // set is an instruction to sweep. ADR 0035 amendment D2 ordering
@@ -1068,25 +1070,30 @@ const FLEET_READS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 pub struct FleetReads {
     enabled_images: Vec<EnabledImageRef>,
     prestage_images: Vec<EnabledImageRef>,
-    capturing_disk_manifests: Vec<engram_core::types::manifest::ManifestRef>,
-    /// `None` when there is no image to seed or the read failed: the acks
-    /// then carry no warm peers.
+    /// `None` when the read failed: the host then keeps the capturing set
+    /// it has.
+    capturing_disk_manifests: Option<Vec<engram_core::types::manifest::ManifestRef>>,
+    /// `None` when the read failed: the acks then carry no warm peers.
     active_hosts: Option<Vec<HostRecord>>,
 }
 
 impl FleetReads {
+    /// A failed enabled or prestaging read fails the load: the host keeps
+    /// exactly the images of those sets, and the wire has no "unknown" for
+    /// them. The capturing set and the host rows are optional on the ack.
     async fn load(
         meta: &dyn engram_core::traits::MetadataStore,
     ) -> Result<Self, engram_core::error::MetaError> {
-        let (enabled, prestaging, capturing_disk_manifests) = futures::try_join!(
+        let (enabled, prestaging, capturing, active_hosts) = tokio::join!(
             meta.list_enabled_images(),
             meta.list_prestaging_refs(),
             meta.capturing_disk_manifests(),
-        )?;
-        let enabled_images = enabled_image_refs_from_rows(enabled);
+            meta.list_active_hosts(),
+        );
+        let enabled_images = enabled_image_refs_from_rows(enabled?);
         // A row that fails to deserialize (wire skew mid-roll) is skipped
         // rather than failing every ack.
-        let prestage_images: Vec<EnabledImageRef> = prestaging
+        let prestage_images: Vec<EnabledImageRef> = prestaging?
             .into_iter()
             .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
                 Ok(r) => Some(r),
@@ -1096,17 +1103,16 @@ impl FleetReads {
                 }
             })
             .collect();
-        let active_hosts = if enabled_images.is_empty() && prestage_images.is_empty() {
-            None
-        } else {
-            match meta.list_active_hosts().await {
-                Ok(hosts) => Some(hosts),
-                Err(e) => {
-                    tracing::debug!(error = %e, "list_active_hosts failed; no warm peers this tick");
-                    None
-                }
-            }
-        };
+        let capturing_disk_manifests = capturing
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "capturing_disk_manifests failed; the ack omits the set");
+            })
+            .ok();
+        let active_hosts = active_hosts
+            .inspect_err(|e| {
+                tracing::debug!(error = %e, "list_active_hosts failed; no warm peers this tick");
+            })
+            .ok();
         Ok(Self {
             enabled_images,
             prestage_images,
@@ -1116,29 +1122,54 @@ impl FleetReads {
     }
 }
 
+type FleetLoad = futures::future::Shared<
+    futures::future::BoxFuture<
+        'static,
+        Result<std::sync::Arc<FleetReads>, std::sync::Arc<engram_core::error::MetaError>>,
+    >,
+>;
+
 /// One replica's [`FleetReads`], kept for [`FLEET_READS_TTL`] on the
-/// injected monotonic clock. Heartbeats that arrive during a read wait
-/// for it instead of reading again. A failed read is returned, not kept.
+/// injected monotonic clock from the start of the read. Every heartbeat
+/// that arrives during a read gets that read's result, success or error.
+/// A failed read is not kept: the next heartbeat after it reads again.
 #[derive(Default)]
 pub struct FleetReadCache {
-    slot: tokio::sync::Mutex<Option<(std::time::Duration, std::sync::Arc<FleetReads>)>>,
+    slot: parking_lot::Mutex<Option<(std::time::Duration, FleetLoad)>>,
 }
 
 impl FleetReadCache {
     async fn get(
         &self,
         state: &crate::state::AppState,
-    ) -> Result<std::sync::Arc<FleetReads>, engram_core::error::MetaError> {
-        let mut slot = self.slot.lock().await;
-        let now = state.services.clock.now_mono();
-        if let Some((read_at, reads)) = slot.as_ref() {
-            if now.saturating_sub(*read_at) < FLEET_READS_TTL {
-                return Ok(reads.clone());
+    ) -> Result<std::sync::Arc<FleetReads>, std::sync::Arc<engram_core::error::MetaError>> {
+        use futures::FutureExt;
+        let load = {
+            let mut slot = self.slot.lock();
+            let now = state.services.clock.now_mono();
+            match slot.as_ref() {
+                Some((started, load))
+                    if now.saturating_sub(*started) < FLEET_READS_TTL
+                        && !matches!(load.peek(), Some(Err(_))) =>
+                {
+                    load.clone()
+                }
+                _ => {
+                    let meta = state.services.meta.clone();
+                    let load = async move {
+                        FleetReads::load(meta.as_ref())
+                            .await
+                            .map(std::sync::Arc::new)
+                            .map_err(std::sync::Arc::new)
+                    }
+                    .boxed()
+                    .shared();
+                    *slot = Some((now, load.clone()));
+                    load
+                }
             }
-        }
-        let reads = std::sync::Arc::new(FleetReads::load(state.services.meta.as_ref()).await?);
-        *slot = Some((now, reads.clone()));
-        Ok(reads)
+        };
+        load.await
     }
 }
 

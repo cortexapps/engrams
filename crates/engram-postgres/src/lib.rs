@@ -7368,20 +7368,17 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(text,)| match text.parse() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!(
-                        manifest = %text,
-                        error = %e,
-                        "capturing_disk_manifests: unparseable manifest ref; skipping",
-                    );
-                    None
-                }
+        // Hosts keep exactly the volumes this set names, so a row that
+        // does not parse fails the read instead of dropping its volume.
+        rows.into_iter()
+            .map(|(text,)| {
+                text.parse().map_err(|e| {
+                    MetaError::Serialization(format!(
+                        "capture_jobs.disk_manifest {text:?} does not parse: {e}"
+                    ))
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn hosts_with_live_capture_jobs(
