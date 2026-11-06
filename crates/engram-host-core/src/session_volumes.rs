@@ -37,8 +37,9 @@
 //! storage. [`SessionVolumes::reap`] deletes kept checkpoints, oldest
 //! release first, when the pool needs the space.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +51,7 @@ use uuid::Uuid;
 
 use crate::disk::{
     clone_bitmap_bytes, Capacity, ChunkIndex, CloneState, Hydration, SessionDisk, Volume,
-    VolumeName,
+    VolumeName, CLONE_REGION_BYTES,
 };
 use crate::disk_flows::{checkpoint_split, shape_matches, stage};
 use crate::disk_sources::DiskSources;
@@ -399,6 +400,48 @@ impl Source {
     }
 }
 
+/// The byte ranges of a cloned drive whose destination already holds
+/// `wanted` there, from the manifests alone. `origin` is the manifest the
+/// destination holds (a snapshot of a staged volume), `None` for a new
+/// volume, which reads as zeros. A chunk qualifies when both list the
+/// same hash or neither lists it. Each run of such chunks is rounded
+/// inward to whole regions, the unit a skip marks.
+fn hydration_skips(wanted: &Manifest, origin: Option<&Manifest>) -> io::Result<Vec<Range<u64>>> {
+    let zeros = Manifest {
+        chunk_size: wanted.chunk_size,
+        ..Manifest::empty(ManifestKind::Disk, wanted.total_bytes)
+    };
+    let delta = wanted
+        .delta_from(origin.unwrap_or(&zeros))
+        .map_err(store_err)?;
+    let differs: HashSet<u64> = delta
+        .write
+        .iter()
+        .map(|c| c.offset)
+        .chain(delta.zero)
+        .collect();
+    let chunk = wanted.chunk_size.as_u64();
+    let mut runs: Vec<Range<u64>> = Vec::new();
+    for offset in (0..wanted.expected_chunk_count()).map(|i| i * chunk) {
+        if differs.contains(&offset) {
+            continue;
+        }
+        let end = (offset + chunk).min(wanted.total_bytes);
+        match runs.last_mut() {
+            Some(run) if run.end == offset => run.end = end,
+            _ => runs.push(offset..end),
+        }
+    }
+    Ok(runs
+        .into_iter()
+        .map(|run| {
+            run.start.next_multiple_of(CLONE_REGION_BYTES)
+                ..run.end / CLONE_REGION_BYTES * CLONE_REGION_BYTES
+        })
+        .filter(|run| run.start < run.end)
+        .collect())
+}
+
 /// The writes of an eager provision: `wanted`, as its difference from
 /// `base` when the provision starts from a volume that holds it.
 #[derive(Clone, Debug)]
@@ -421,9 +464,10 @@ enum Origin {
     },
 }
 
-/// The kernel's default copy depth for a cloned drive.
+/// The kernel's default copy depth for a cloned drive. The drive is made
+/// with hydration off, so it copies nothing before its skips are marked.
 const LAZY_HYDRATION: Hydration = Hydration {
-    enabled: true,
+    enabled: false,
     threshold_regions: 1,
     batch_regions: 1,
 };
@@ -786,8 +830,12 @@ impl SessionVolumes {
     /// Make the role a cloned drive that reads `wanted` from a source
     /// serving `served`, and return the drive's path. The destination is
     /// a snapshot of the staged volume of `served` or of `base` when this
-    /// host has one, else a new volume; it is named after `lineage`. A
-    /// failure leaves the rest to the caller's purge.
+    /// host has one, else a new volume; it is named after `lineage`.
+    /// Hydration skips the regions the destination already holds as
+    /// `wanted` ([`hydration_skips`]). A checkpoint takes the source
+    /// manifest's chunk wherever the destination was not written, which
+    /// there is the destination's bytes. A failure leaves the rest to the
+    /// caller's purge.
     async fn clone_role(
         &self,
         sandbox: SandboxId,
@@ -806,32 +854,39 @@ impl SessionVolumes {
             )
             .await?;
         let staged = match self.staged(served).await {
-            Some((volume, _)) => Some((volume, served)),
+            Some((volume, held)) => Some((volume, served, held)),
             None => match base {
-                Some(image) => self.staged(image).await.map(|(volume, _)| (volume, image)),
+                Some(image) => self
+                    .staged(image)
+                    .await
+                    .map(|(volume, held)| (volume, image, held)),
                 None => None,
             },
         };
         let name = dest_name(sandbox, role, lineage);
         let dest = match &staged {
-            Some((origin, _)) => self.disk.snapshot(origin, &name).await?,
+            Some((origin, _, _)) => self.disk.snapshot(origin, &name).await?,
             None => self.disk.create(&name, wanted.total_bytes).await?,
         };
         shape_matches(&dest, wanted)?;
+        let skips = hydration_skips(wanted, staged.as_ref().map(|(_, _, held)| held))?;
         let source = sources
-            .start(sandbox, role, served, staged.as_ref().map(|(v, m)| (v, *m)))
-            .await?;
-        let drive = self
-            .disk
-            .clone_drive(
-                &live_name(sandbox, role),
-                &dest,
-                &bitmap,
-                &source,
-                LAZY_HYDRATION,
+            .start(
+                sandbox,
+                role,
+                served,
+                staged.as_ref().map(|(volume, image, _)| (volume, *image)),
             )
             .await?;
-        Ok(drive.path)
+        let drive = live_name(sandbox, role);
+        let path = self
+            .disk
+            .clone_drive(&drive, &dest, &bitmap, &source, LAZY_HYDRATION)
+            .await?
+            .path;
+        self.disk.skip_hydration(&drive, &skips).await?;
+        self.disk.enable_hydration(&drive).await?;
+        Ok(path)
     }
 
     /// Give the staged transient volume its checkpoint name and delete
@@ -1920,6 +1975,13 @@ mod tests {
         async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
             self.0.clone_state(drive).await
         }
+        async fn skip_hydration(
+            &self,
+            drive: &VolumeName,
+            ranges: &[Range<u64>],
+        ) -> io::Result<()> {
+            self.0.skip_hydration(drive, ranges).await
+        }
         async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
             self.0.enable_hydration(drive).await
         }
@@ -2049,6 +2111,87 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A disk manifest of `total` bytes in 16 MiB chunks; `hashes[i]`
+    /// lists chunk `i` with that hash byte, `None` leaves it a hole.
+    fn manifest_of(total: u64, hashes: &[Option<u8>]) -> Manifest {
+        const MIB16: u64 = 16 << 20;
+        Manifest {
+            chunk_size: ChunkSize::bytes(MIB16),
+            chunks: hashes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, hash)| {
+                    hash.map(|h| engram_chunk_store::ChunkRef {
+                        offset: i as u64 * MIB16,
+                        hash: engram_chunk_store::ChunkHash::from_bytes([h; 32]),
+                    })
+                })
+                .collect(),
+            ..Manifest::empty(ManifestKind::Disk, total)
+        }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn a_new_destination_skips_the_chunks_the_manifest_does_not_list() {
+        let wanted = manifest_of(64 * MIB, &[None, Some(1), None, None]);
+        assert_eq!(
+            hydration_skips(&wanted, None).unwrap(),
+            vec![0..16 * MIB, 32 * MIB..64 * MIB]
+        );
+        let full = manifest_of(32 * MIB, &[Some(1), Some(2)]);
+        assert_eq!(hydration_skips(&full, None).unwrap(), vec![]);
+        let empty = manifest_of(32 * MIB, &[]);
+        assert_eq!(hydration_skips(&empty, None).unwrap(), vec![0..32 * MIB]);
+    }
+
+    #[test]
+    fn a_base_snapshot_skips_the_chunks_equal_to_the_base() {
+        // Equal, different, a hole in both, listed only in the base,
+        // listed only in the wanted manifest, equal.
+        let base = manifest_of(96 * MIB, &[Some(1), Some(2), None, Some(4), None, Some(6)]);
+        let wanted = manifest_of(96 * MIB, &[Some(1), Some(9), None, None, Some(5), Some(6)]);
+        assert_eq!(
+            hydration_skips(&wanted, Some(&base)).unwrap(),
+            vec![0..16 * MIB, 32 * MIB..48 * MIB, 80 * MIB..96 * MIB]
+        );
+        assert_eq!(
+            hydration_skips(&wanted, Some(&wanted)).unwrap(),
+            vec![0..96 * MIB]
+        );
+        let other_size = manifest_of(80 * MIB, &[Some(1)]);
+        assert!(hydration_skips(&wanted, Some(&other_size)).is_err());
+    }
+
+    #[test]
+    fn a_short_last_chunk_is_skipped_up_to_its_last_whole_region() {
+        let region = CLONE_REGION_BYTES;
+        let total = 32 * MIB + 3 * region + 512;
+        let wanted = manifest_of(total, &[Some(1), None, None]);
+        assert_eq!(
+            hydration_skips(&wanted, None).unwrap(),
+            vec![16 * MIB..32 * MIB + 3 * region]
+        );
+        // A chunk smaller than a region: only regions whose every chunk
+        // qualifies are skipped.
+        let small = Manifest {
+            chunk_size: ChunkSize::bytes(region / 4),
+            chunks: [1u64, 9]
+                .iter()
+                .map(|i| engram_chunk_store::ChunkRef {
+                    offset: i * region / 4,
+                    hash: engram_chunk_store::ChunkHash::from_bytes([1; 32]),
+                })
+                .collect(),
+            ..Manifest::empty(ManifestKind::Disk, 4 * region)
+        };
+        assert_eq!(
+            hydration_skips(&small, None).unwrap(),
+            vec![region..2 * region, 3 * region..4 * region]
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -425,6 +426,31 @@ pub async fn check_fresh_bitmap(bitmap: &Volume) -> io::Result<()> {
     Ok(())
 }
 
+/// The ranges of a [`SessionDisk::skip_hydration`] on a drive of
+/// `drive_bytes`, checked and with adjacent ranges joined. Empty ranges
+/// are dropped.
+pub fn skip_ranges(ranges: &[Range<u64>], drive_bytes: u64) -> io::Result<Vec<Range<u64>>> {
+    let mut joined: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges.iter().filter(|r| !r.is_empty()) {
+        let aligned = range.start.is_multiple_of(CLONE_REGION_BYTES)
+            && range.end.is_multiple_of(CLONE_REGION_BYTES);
+        let after_last = joined.last().is_none_or(|last| last.end <= range.start);
+        if !aligned || range.end > drive_bytes || !after_last {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "skip range {range:?} is not region-aligned, ascending and inside {drive_bytes} bytes"
+                ),
+            ));
+        }
+        match joined.last_mut() {
+            Some(last) if last.end == range.start => last.end = range.end,
+            _ => joined.push(range.clone()),
+        }
+    }
+    Ok(joined)
+}
+
 /// Two volumes are snapshots of one origin when their shapes match.
 pub fn same_origin(before: &Volume, after: &Volume) -> io::Result<()> {
     if before.size_bytes != after.size_bytes || before.chunk_size != after.chunk_size {
@@ -471,17 +497,7 @@ pub fn is_zero_chunk(bytes: &[u8]) -> bool {
 pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     if file.metadata()?.file_type().is_block_device() {
-        // _IO(0x12, 119); argument is [start, length] in bytes.
-        const BLKDISCARD: libc::Ioctl = 0x1277;
-        let range: [u64; 2] = [offset, length];
-        // SAFETY: the kernel copies the two-element range in and writes
-        // nothing back. The fd is owned by `file` for the whole call.
-        let result = unsafe { libc::ioctl(file.as_raw_fd(), BLKDISCARD, range.as_ptr()) };
-        return if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        };
+        return discard(file, offset, length);
     }
     // SAFETY: fallocate takes its arguments by value and writes nothing
     // back. The fd is owned by `file` for the whole call; the range was
@@ -494,6 +510,25 @@ pub fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
             length as libc::off_t,
         )
     };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `BLKDISCARD` of `length` bytes at `offset` on a block device opened
+/// for writing. What a discard means is the device's: a dm-thin volume
+/// unmaps the range, a dm-clone drive marks it copied.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn discard(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    // _IO(0x12, 119); argument is [start, length] in bytes.
+    const BLKDISCARD: libc::Ioctl = 0x1277;
+    let range: [u64; 2] = [offset, length];
+    // SAFETY: the kernel copies the two-element range in and writes
+    // nothing back. The fd is owned by `file` for the whole call.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), BLKDISCARD, range.as_ptr()) };
     if result == 0 {
         Ok(())
     } else {
@@ -584,6 +619,15 @@ pub trait SessionDisk: Send + Sync {
     /// A view reports the regions copied when its snapshots were taken,
     /// with hydration off.
     async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState>;
+
+    /// Record the byte `ranges` of a drive as copied without copying
+    /// them, so hydration never writes them. The caller states that the
+    /// destination already holds the source's bytes there; the guest
+    /// must not run yet. A range the disk cannot mark is copied as
+    /// usual, so a skip never changes what the drive reads. `ranges` are ascending, do not overlap, and start and
+    /// end on [`CLONE_REGION_BYTES`] inside the drive (`InvalidInput`
+    /// otherwise). `InvalidInput` after the cutover and on a view.
+    async fn skip_hydration(&self, drive: &VolumeName, ranges: &[Range<u64>]) -> io::Result<()>;
 
     /// Start the background copy of a drive made with hydration off.
     /// `InvalidInput` after the cutover and on a view.
@@ -1005,6 +1049,13 @@ impl SessionDisk for FileDisk {
                 hydration_enabled: kind == FileDrive::Copying,
             },
         })
+    }
+
+    /// The drive is copied in full at `clone_drive`, so there is nothing
+    /// to skip; the ranges are only checked.
+    async fn skip_hydration(&self, drive: &VolumeName, ranges: &[Range<u64>]) -> io::Result<()> {
+        self.copying(drive)?;
+        skip_ranges(ranges, std::fs::metadata(self.drive_path(drive))?.len()).map(drop)
     }
 
     async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
@@ -1437,6 +1488,63 @@ mod tests {
         assert_eq!(whole(&dest_snap).await, expected);
     }
 
+    #[test]
+    fn skip_ranges_join_adjacent_ranges_and_refuse_bad_ones() {
+        let r = REGION;
+        assert_eq!(
+            skip_ranges(&[0..r, r..2 * r, 2 * r..2 * r, 3 * r..4 * r], DRIVE).unwrap(),
+            vec![0..2 * r, 3 * r..4 * r]
+        );
+        assert_eq!(skip_ranges(&[], DRIVE).unwrap(), vec![]);
+        for bad in [
+            vec![0..r, r..r + 512],
+            vec![0..r, r + 512..2 * r],
+            vec![0..r, r..DRIVE + r],
+            vec![r..2 * r, 0..r],
+            vec![0..2 * r, r..3 * r],
+        ] {
+            assert_eq!(
+                skip_ranges(&bad, DRIVE).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_skip_changes_no_byte_and_is_refused_after_the_cutover() {
+        let (dir, disk) = disk();
+        let (source, expected) = source_file(dir.path());
+        let dest = disk.create(&name("dest"), DRIVE).await.unwrap();
+        let bitmap = disk.create(&name("bitmap"), REGION).await.unwrap();
+        let drive = disk
+            .clone_drive(&name("drive"), &dest, &bitmap, &source, hydration())
+            .await
+            .unwrap();
+
+        disk.skip_hydration(&name("drive"), &[0..REGION, 2 * REGION..DRIVE])
+            .await
+            .unwrap();
+        assert_eq!(whole(&drive).await, expected);
+        assert_eq!(
+            disk.skip_hydration(&name("drive"), &[0..REGION, REGION..REGION + 512])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        disk.enable_hydration(&name("drive")).await.unwrap();
+        disk.cut_over(&name("drive")).await.unwrap();
+        assert_eq!(
+            disk.skip_hydration(&name("drive"), &[0..REGION, REGION..2 * REGION])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     #[tokio::test]
     async fn a_file_clone_refuses_a_short_source_and_a_taken_name() {
         let (dir, disk) = disk();
@@ -1550,6 +1658,14 @@ mod tests {
         async fn clone_state(&self, drive: &VolumeName) -> io::Result<CloneState> {
             self.gate("clone_state")?;
             self.inner.clone_state(drive).await
+        }
+        async fn skip_hydration(
+            &self,
+            drive: &VolumeName,
+            ranges: &[Range<u64>],
+        ) -> io::Result<()> {
+            self.gate("skip_hydration")?;
+            self.inner.skip_hydration(drive, ranges).await
         }
         async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {
             self.gate("enable_hydration")?;

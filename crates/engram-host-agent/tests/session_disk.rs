@@ -487,6 +487,14 @@ impl SessionDisk for CountingDisk {
     async fn clone_state(&self, drive: &VolumeName) -> std::io::Result<CloneState> {
         self.inner.clone_state(drive).await
     }
+    async fn skip_hydration(
+        &self,
+        drive: &VolumeName,
+        ranges: &[std::ops::Range<u64>],
+    ) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.skip_hydration(drive, ranges).await
+    }
     async fn enable_hydration(&self, drive: &VolumeName) -> std::io::Result<()> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.inner.enable_hydration(drive).await

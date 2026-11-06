@@ -1,8 +1,10 @@
 //! The disk over the ioctl layer; Linux only.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,8 +14,8 @@ use crate::dm;
 use crate::parse::{self, CloneTable, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
 use engram_host_core::disk::{
-    check_fresh_bitmap, Capacity, ChunkIndex, CloneState, Hydration, SessionDisk, Volume,
-    VolumeName, CLONE_HEADER_BYTES, CLONE_REGION_BYTES,
+    check_fresh_bitmap, discard, skip_ranges, Capacity, ChunkIndex, CloneState, Hydration,
+    SessionDisk, Volume, VolumeName, CLONE_HEADER_BYTES, CLONE_REGION_BYTES,
 };
 
 const SECTOR_BYTES: u64 = 512;
@@ -777,6 +779,38 @@ impl SessionDisk for ThinPoolDisk {
             Drive::CutOver { .. } => Ok(CloneState::CutOver),
             Drive::Copying { .. } | Drive::View { .. } => self.clone_status(drive).await,
         }
+    }
+
+    /// One `BLKDISCARD` per joined range on the drive, then a flush. What
+    /// this relies on in `drivers/md/dm-clone-target.c` (6.8 and 6.12):
+    /// - A discard marks every region it covers whole as copied and
+    ///   copies nothing (`process_deferred_discards`). With
+    ///   `no_discard_passdown` the bio then completes without reaching
+    ///   the destination (`complete_discard_bio`). Regions it covers in
+    ///   part are left as they are (`bio_region_range` rounds inward).
+    /// - Neither path checks whether hydration is on. With the metadata
+    ///   read-only, or a failed metadata update, the discard completes
+    ///   without an error and marks nothing; those regions are copied.
+    /// - The marks are in memory until a commit: a flush or a suspend
+    ///   commits them, as it commits copied regions. A region unmarked
+    ///   by a crash is copied, which writes the same bytes again.
+    /// - Without passdown the drive takes discards up to its own limit,
+    ///   region-aligned, and the block layer splits a larger range at
+    ///   region boundaries, so a range needs no split here.
+    async fn skip_hydration(&self, drive: &VolumeName, ranges: &[Range<u64>]) -> io::Result<()> {
+        let _held = self.lock_drive(drive).await;
+        let (_, sectors) = self.copying_drive(drive).await?;
+        let ranges = skip_ranges(ranges, sectors * SECTOR_BYTES)?;
+        let node = self.node(drive).await?;
+        tokio::task::spawn_blocking(move || {
+            let file = File::options().write(true).open(node)?;
+            for range in ranges {
+                discard(&file, range.start, range.end - range.start)?;
+            }
+            file.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn enable_hydration(&self, drive: &VolumeName) -> io::Result<()> {

@@ -125,12 +125,14 @@ pub struct CloneTable {
 impl CloneTable {
     /// The params a table load takes. The kernel reads `no_hydration`
     /// only at load; afterwards the `enable_hydration` message turns it
-    /// on.
+    /// on. `no_discard_passdown` keeps a discard, which marks regions
+    /// copied, from reaching the destination: its blocks stay as they
+    /// are.
     pub fn params(&self, hydration: Hydration) -> String {
         let features = if hydration.enabled {
-            "0"
+            "1 no_discard_passdown"
         } else {
-            "1 no_hydration"
+            "2 no_hydration no_discard_passdown"
         };
         format!(
             "{} {} {} {} {features} 4 hydration_threshold {} hydration_batch_size {}",
@@ -384,8 +386,7 @@ mod tests {
     }
 
     /// `dmsetup table` of a clone made with hydration off, kernel 6.8.
-    const CLONE_TABLE: &str =
-        "252:2 252:1 7:4 128 1 no_hydration 4 hydration_threshold 2 hydration_batch_size 3";
+    const CLONE_TABLE: &str = "252:2 252:1 7:4 128 2 no_hydration no_discard_passdown 4 hydration_threshold 2 hydration_batch_size 3";
 
     #[test]
     fn clone_params_format_what_the_kernel_reads_back() {
@@ -406,7 +407,7 @@ mod tests {
                 enabled: true,
                 ..off
             }),
-            "252:2 252:1 7:4 128 0 4 hydration_threshold 2 hydration_batch_size 3"
+            "252:2 252:1 7:4 128 1 no_discard_passdown 4 hydration_threshold 2 hydration_batch_size 3"
         );
         assert_eq!(clone_table(CLONE_TABLE).unwrap(), table);
         assert!(clone_table("252:2 252:1 7:4").is_err());
@@ -451,6 +452,23 @@ mod tests {
                 hydration_enabled: true
             }
         );
+        // The kernel emits `no_hydration` before `no_discard_passdown`.
+        for (features, enabled) in [
+            ("2 no_hydration no_discard_passdown", false),
+            ("1 no_discard_passdown", true),
+        ] {
+            let status = format!(
+                "8 6/1024 128 5/64 0 {features} 4 hydration_threshold 2 hydration_batch_size 3 rw"
+            );
+            assert_eq!(
+                clone_status(&status).unwrap(),
+                CloneState::Copying {
+                    hydrated_regions: 5,
+                    total_regions: 64,
+                    hydration_enabled: enabled
+                }
+            );
+        }
     }
 
     #[test]

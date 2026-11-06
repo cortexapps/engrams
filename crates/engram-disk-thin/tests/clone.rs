@@ -18,11 +18,12 @@ use engram_core::types::ids::SandboxId;
 use engram_core::types::snapshot::DiskRole;
 use engram_disk_thin::ThinPoolDisk;
 use engram_host_core::disk::{
-    clone_bitmap_bytes, CloneState, Hydration, SessionDisk, Volume, VolumeName, CLONE_REGION_BYTES,
+    clone_bitmap_bytes, ChunkIndex, CloneState, Hydration, SessionDisk, Volume, VolumeName,
+    CLONE_REGION_BYTES,
 };
 use engram_host_core::disk_sources::Served;
 use engram_host_core::image_volumes;
-use engram_host_core::session_volumes::{live_name, Cutover, Source, Waiting};
+use engram_host_core::session_volumes::{dest_name, live_name, Cutover, Source, Waiting};
 use engram_host_core::{checkpoint, stage, DiskSources, FileDisk, FileSources, SessionVolumes};
 use engram_storage_local::LocalBlobStorage;
 
@@ -923,6 +924,34 @@ impl SessionRig {
         .unwrap()
     }
 
+    /// The pool's used data bytes.
+    async fn pool_used(&self) -> u64 {
+        let capacity = self.disk.capacity().await.unwrap();
+        capacity.data_total_bytes - capacity.data_free_bytes
+    }
+
+    /// The regions the root drive has copied.
+    async fn root_hydrated(&self) -> u64 {
+        match self.root_state().await {
+            CloneState::Copying {
+                hydrated_regions, ..
+            } => hydrated_regions,
+            state => panic!("the drive is {state:?}"),
+        }
+    }
+
+    /// Poll until the root drive has copied every region.
+    async fn root_hydrated_in_full(&self) {
+        let deadline = tokio::time::Instant::now() + HYDRATION_DEADLINE;
+        while !self.root_state().await.is_hydrated() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not hydrated in {HYDRATION_DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn root_state(&self) -> CloneState {
         self.disk
             .clone_state(&live_name(self.sandbox, DiskRole::Root))
@@ -1121,6 +1150,119 @@ async fn a_hydrated_session_role_cuts_over_and_stops_its_source() {
     );
 }
 
+/// Over a new destination, hydration copies only the chunks the manifest
+/// lists: the zero regions are marked copied before the drive starts, the
+/// destination maps the listed chunks alone, and the drive reads the
+/// manifest's bytes.
+#[tokio::test]
+#[ignore]
+async fn a_lazy_role_over_a_new_volume_copies_only_the_listed_chunks() {
+    let Some(rig) = SessionRig::new(None).await else {
+        return;
+    };
+    let listed = [3u64, 20, 21, 50];
+    let mut bytes = vec![0u8; SIZE as usize];
+    for (i, chunk) in listed.iter().enumerate() {
+        let at = (chunk * CHUNK) as usize;
+        bytes[at..at + CHUNK as usize].copy_from_slice(&pattern(CHUNK as usize, i as u32 + 1));
+    }
+    let manifest = publish(&rig.files, &rig.store, "sparse", &bytes).await;
+    let used_before = rig.pool_used().await;
+
+    let provisioned = rig
+        .volumes
+        .provision(
+            rig.sandbox,
+            Source::LazyContinue {
+                manifest,
+                base: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let skipped = (SIZE - listed.len() as u64 * CHUNK) / REGION;
+    assert!(rig.root_hydrated().await >= skipped);
+    rig.root_hydrated_in_full().await;
+    let drive = Volume::open(
+        VolumeName::new("probe").unwrap(),
+        &provisioned.root,
+        SIZE,
+        CHUNK,
+    )
+    .unwrap();
+    drive.sync().await.unwrap();
+    assert_eq!(first_difference(&whole(&drive).await, &bytes), None);
+
+    let dest = rig
+        .disk
+        .open(&dest_name(rig.sandbox, DiskRole::Root, manifest))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.disk.written_chunks(None, &dest).await.unwrap(),
+        listed.map(ChunkIndex).to_vec()
+    );
+    let grown = rig.pool_used().await - used_before;
+    eprintln!("the pool grew by {grown} bytes");
+    assert!(grown < SIZE / 4, "the pool grew by {grown} bytes");
+    drop((drive, dest));
+    rig.release_clean().await;
+}
+
+/// Over a staged base, hydration copies only the chunks that differ from
+/// the base: the destination keeps sharing every other block with the
+/// image volume, and the drive reads the wanted bytes. A discard that
+/// reached the destination would unmap those blocks and read zeros.
+#[tokio::test]
+#[ignore]
+async fn a_lazy_role_over_a_staged_base_copies_only_what_differs() {
+    let Some(rig) = SessionRig::new(None).await else {
+        return;
+    };
+    let image_volume = image_volumes::volume_name(rig.image);
+    let base = rig.store.get_manifest(rig.image).await.unwrap();
+    let staged = stage(&rig.disk, &rig.store, &image_volume, &base, None)
+        .await
+        .unwrap();
+    let changed = [7u64, 8, 33];
+    let mut wanted = rig.bytes.clone();
+    for (i, chunk) in changed.iter().enumerate() {
+        let at = (chunk * CHUNK) as usize;
+        wanted[at..at + CHUNK as usize].copy_from_slice(&pattern(CHUNK as usize, 0x77 + i as u32));
+    }
+    let manifest = publish(&rig.files, &rig.store, "continued", &wanted).await;
+    let used_before = rig.pool_used().await;
+
+    let drive = rig
+        .root(Source::LazyContinue {
+            manifest,
+            base: Some(rig.image),
+        })
+        .await;
+    let skipped = (SIZE - changed.len() as u64 * CHUNK) / REGION;
+    assert!(rig.root_hydrated().await >= skipped);
+    rig.root_hydrated_in_full().await;
+    drive.sync().await.unwrap();
+    assert_eq!(first_difference(&whole(&drive).await, &wanted), None);
+
+    let dest = rig
+        .disk
+        .open(&dest_name(rig.sandbox, DiskRole::Root, manifest))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.disk.written_chunks(Some(&staged), &dest).await.unwrap(),
+        changed.map(ChunkIndex).to_vec()
+    );
+    let grown = rig.pool_used().await - used_before;
+    eprintln!("the pool grew by {grown} bytes");
+    assert!(grown < SIZE / 4, "the pool grew by {grown} bytes");
+    drop((drive, dest, staged));
+    rig.release_clean().await;
+    rig.disk.delete(&image_volume).await.unwrap();
+}
+
 /// Over a staged base the destination is a snapshot of the image
 /// volume. A chunk the destination never wrote is the source's, also
 /// where the base differs; a chunk the guest wrote with the base's own
@@ -1165,7 +1307,7 @@ async fn a_checkpoint_over_a_staged_base_stages_into_what_the_drive_read() {
         panic!("the drive is not copying");
     };
     eprintln!("{hydrated_regions} of {REGIONS} regions copied before the take");
-    assert!(hydrated_regions < 40);
+    assert!((40..REGIONS).contains(&hydrated_regions));
 
     let published = rig
         .volumes
