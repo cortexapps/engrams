@@ -430,7 +430,15 @@ Each step is one PR and retires what it replaces.
    A host-agent flag (`off`, `force`, `auto`; off by default) turns it
    on. The build that first understands the lazy volume names ships
    before the flag is on anywhere, so a rollback never meets a lazy
-   sandbox that it cannot see.
+   sandbox that it cannot see. A rollback to a build without source
+   support while sandboxes still hydrate removes their drives without
+   first recovering a dead source, which is the case Decision 5 says
+   can block the node; turn the flag off and let hydration finish
+   before such a rollback.
+
+   The chunk selection of Decision 8 depends on a guest that cannot
+   discard. Firecracker gives the guest no discard today; a change that
+   gives it one changes this design first.
 4. **Placement and teleport.** Decision 10, the pool accounting for
    lazy restores, and the teleport target.
 5. **Accept.** Write the facts into the DESIGN.md "Session disk" page
