@@ -672,6 +672,9 @@ const DELIVER_ROW_MAX_ATTEMPTS: i32 = 20;
 /// loop by construction.
 const EVICT_MAX_ATTEMPTS: i32 = 20;
 
+/// How often a deferred evict checks whether the session's move closed.
+const EVICT_TELEPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
@@ -694,6 +697,21 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // A move owns the session until its row closes: a capture cannot run
+    // on a destination that still drains its memory from the source.
+    match ctx
+        .state
+        .services
+        .meta
+        .open_teleport_for_session(ctx.op.session_id)
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return OpOutcome::RetryAfter(EVICT_TELEPORT_WAIT, "a move is in flight".into())
+        }
+        Err(e) => return OpOutcome::Retry(format!("open_teleport_for_session: {e}")),
+    }
     let started = ctx.state.services.clock.now_mono();
     match crate::idle_evictor::run_evict_pipeline(ctx, target, allow_park, nominated).await {
         Ok(crate::idle_evictor::EvictOutcome::Evacuated) => {

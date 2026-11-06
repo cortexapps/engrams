@@ -280,15 +280,20 @@ async fn drive_inner(ctx: &OpCtx<'_>) -> Result<OpOutcome, ApiError> {
             return Ok(OpOutcome::Done);
         }
         let session = ctx.state.services.meta.get_session(row.session_id).await?;
-        // A crash can occur between the fenced settle and the terminal row CAS.
+        // Another op (a destroy, the dead-host sweep, a capture) can end
+        // or settle the session between two attempts of this op. Neither
+        // side of the move is then bound, so the move fails and both
+        // sandboxes go.
         if session.sandbox_id.is_none()
-            && matches!(session.status, SessionState::Idle | SessionState::Dead)
+            && (session.status.is_terminal() || session.status == SessionState::Idle)
         {
-            let error = match row.phase {
-                TeleportPhase::RollingBack => "source_lost_during_rollback",
-                TeleportPhase::Attached => "peer_lost",
+            let error = match (session.status, row.phase) {
+                (SessionState::Completed | SessionState::Failed, _) => "session_ended",
+                (_, TeleportPhase::RollingBack) => "source_lost_during_rollback",
+                (_, TeleportPhase::Attached) => "peer_lost",
                 _ => "dest_lost_after_blackout",
             };
+            steps::destroy_destination(ctx, &row).await?;
             ctx.state
                 .services
                 .meta
@@ -298,7 +303,7 @@ async fn drive_inner(ctx: &OpCtx<'_>) -> Result<OpOutcome, ApiError> {
                     TeleportSettle {
                         error: error.into(),
                         session: None,
-                        entomb_source: false,
+                        entomb_source: true,
                     },
                 )
                 .await?;
@@ -645,7 +650,10 @@ mod steps {
             .await?
             .is_none_or(|h| matches!(h.status, HostStatus::Dead | HostStatus::Retired)))
     }
-    async fn destroy_destination(ctx: &OpCtx<'_>, row: &TeleportRow) -> Result<(), ApiError> {
+    pub(super) async fn destroy_destination(
+        ctx: &OpCtx<'_>,
+        row: &TeleportRow,
+    ) -> Result<(), ApiError> {
         if let Some(sandbox) = row.dest_sandbox_id {
             if !destination_gone(ctx, row).await? {
                 match ctx

@@ -840,3 +840,130 @@ async fn live_peer_lost_fails_to_idle_with_durable_row(rig: Rig) {
     assert_eq!(terminal[0].payload["error"], "peer_lost");
 }
 scenario!(live_peer_lost_fails_to_idle_with_durable_row);
+
+/// Park the move at `Attached` with the post-copy drain still running and
+/// give the lane back, as the executor does between drain slices.
+async fn attached_mid_drain(rig: &Rig) {
+    rig.make_live().await;
+    rig.dest.drain_pending.store(true, Ordering::SeqCst);
+    let out = rig.drive().await;
+    assert!(matches!(out, OpOutcome::RetryAfter(..)), "{out:?}");
+    assert_eq!(rig.phase().await, Some(TeleportPhase::Attached));
+    assert!(rig
+        .state
+        .services
+        .meta
+        .op_requeue_wait(
+            rig.op.id,
+            rig.op.epoch.unwrap(),
+            std::time::Duration::from_secs(60),
+            "waiting for the post-copy drain",
+        )
+        .await
+        .unwrap());
+}
+
+/// Enqueue `kind` behind the waiting teleport op and claim it.
+async fn claim_next(
+    rig: &Rig,
+    kind: engram_core::types::session_op::OpKind,
+    payload: serde_json::Value,
+) -> engram_core::types::session_op::SessionOp {
+    let meta = &rig.state.services.meta;
+    meta.op_enqueue_and_claim(rig.row.session_id, kind, payload, None, "test")
+        .await
+        .unwrap();
+    let op = meta
+        .op_claim_head(rig.row.session_id, "test")
+        .await
+        .unwrap()
+        .expect("the new op is due");
+    assert_eq!(op.kind, kind);
+    op
+}
+
+async fn dispatch(rig: &Rig, op: &engram_core::types::session_op::SessionOp) -> OpOutcome {
+    coordinator::session_verbs::dispatch(&coordinator::session_ops::OpCtx {
+        state: &rig.state,
+        op,
+        epoch: op.epoch.unwrap(),
+    })
+    .await
+}
+
+async fn destroy_mid_drain_settles_the_move(rig: Rig) {
+    use engram_core::types::session_op::{OpKind, OpState};
+    attached_mid_drain(&rig).await;
+    let meta = &rig.state.services.meta;
+    let destroy = claim_next(&rig, OpKind::Destroy, serde_json::json!({})).await;
+    assert!(matches!(dispatch(&rig, &destroy).await, OpOutcome::Done));
+    assert!(meta
+        .op_finish(destroy.id, destroy.epoch.unwrap(), OpState::Done, None)
+        .await
+        .unwrap());
+    assert_eq!(
+        meta.get_session(rig.row.session_id).await.unwrap().status,
+        SessionState::Completed
+    );
+
+    rig.clock.advance(std::time::Duration::from_secs(61));
+    let teleport = meta
+        .op_claim_head(rig.row.session_id, "test")
+        .await
+        .unwrap()
+        .expect("the teleport op is due");
+    assert_eq!(teleport.kind, OpKind::Teleport);
+    assert_eq!(
+        teleport.attempts, rig.op.attempts,
+        "a wait spends no attempt"
+    );
+    assert!(matches!(dispatch(&rig, &teleport).await, OpOutcome::Done));
+    assert_eq!(rig.phase().await, None);
+    assert_eq!(
+        meta.get_session(rig.row.session_id).await.unwrap().status,
+        SessionState::Completed
+    );
+    assert_eq!(
+        meta.sandbox_tombstones_for_host(rig.row.source_host_id)
+            .await
+            .unwrap(),
+        vec![rig.source.sandbox]
+    );
+    let events = meta
+        .list_session_events_since(rig.row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].payload["error"], "session_ended");
+}
+scenario!(destroy_mid_drain_settles_the_move);
+
+async fn evict_mid_drain_waits_for_the_move(rig: Rig) {
+    use engram_core::types::session_op::OpKind;
+    attached_mid_drain(&rig).await;
+    let evict = claim_next(
+        &rig,
+        OpKind::Evict,
+        serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
+    )
+    .await;
+    assert!(matches!(
+        dispatch(&rig, &evict).await,
+        OpOutcome::RetryAfter(..)
+    ));
+    assert_eq!(rig.dest.captures.load(Ordering::SeqCst), 0);
+    let s = rig
+        .state
+        .services
+        .meta
+        .get_session(rig.row.session_id)
+        .await
+        .unwrap();
+    assert_eq!(s.status, SessionState::Active);
+    assert_eq!(s.sandbox_id, Some(rig.dest.sandbox));
+}
+scenario!(evict_mid_drain_waits_for_the_move);
