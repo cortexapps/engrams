@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind};
+use crate::manifest::{ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind};
 use crate::store::ChunkStore;
 
 /// Upload width, matching `chunk_file_into`'s pipeline: enough to
@@ -276,7 +276,7 @@ impl ChunkStore {
                     // stays near the cap instead of queueing sends.
                     biased;
                     Some(result) = inflight.next(), if !inflight.is_empty() => {
-                        let (offset, hash) = result?;
+                        let (offset, hash) = joined(result)?;
                         chunks.push(ChunkRef { offset, hash });
                         done += 1;
                         if done.is_multiple_of(32) { report(done); }
@@ -287,10 +287,12 @@ impl ChunkStore {
                                 stats.chunks_uploaded += 1;
                                 stats.bytes_uploaded += body.len() as u64;
                                 let store = store.clone();
-                                inflight.push(async move {
+                                // Its own task, so the SHA-256 and the PUT's
+                                // TLS use every core.
+                                inflight.push(tokio::spawn(async move {
                                     let hash = store.put_chunk(&body).await?;
                                     crate::Result::Ok((offset, hash))
-                                });
+                                }));
                             }
                             Some(Completed::Zero) => {
                                 stats.chunks_elided += 1;
@@ -303,7 +305,7 @@ impl ChunkStore {
                 }
             }
             while let Some(result) = inflight.next().await {
-                let (offset, hash) = result?;
+                let (offset, hash) = joined(result)?;
                 chunks.push(ChunkRef { offset, hash });
                 done += 1;
             }
@@ -316,6 +318,14 @@ impl ChunkStore {
         });
         (chunker, uploader)
     }
+}
+
+/// An upload task's result, with a panic or cancel as an error.
+fn joined(
+    result: Result<crate::Result<(u64, ChunkHash)>, tokio::task::JoinError>,
+) -> crate::Result<(u64, ChunkHash)> {
+    result
+        .map_err(|e| crate::error::ChunkStoreError::Internal(format!("chunk upload task: {e}")))?
 }
 
 #[cfg(test)]
