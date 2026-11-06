@@ -308,7 +308,54 @@ struct PendingPresetup {
     sidecar_json: Vec<u8>,
     idle_marked: bool,
     hot_chunks: Vec<[u8; 32]>,
+    /// What the destination's fetch poller has asked for. It asks for
+    /// the precopy once its disks are provisioned, and for `state.bin`
+    /// once the precopy has landed, so the capture pauses the guest
+    /// only then.
+    dest: Arc<DestProgress>,
 }
+
+/// Two one-way latches the capture waits on.
+#[derive(Default)]
+struct DestProgress {
+    contacted: Latch,
+    ready: Latch,
+}
+
+#[derive(Default)]
+struct Latch {
+    set: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Latch {
+    fn set(&self) {
+        if !self.set.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// `true` when the latch is set within `bound`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn wait(&self, bound: std::time::Duration) -> bool {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.set.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        tokio::time::timeout(bound, notified).await.is_ok()
+    }
+}
+
+/// How long a live capture waits for a destination to ask for anything,
+/// and then for it to ask for `state.bin`, before it pauses the guest
+/// anyway. A destination that never gets ready fails its restore; the
+/// coordinator then aborts to the source.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DEST_CONTACT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DEST_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The unwind guard for a capture's window between the guest `pause`
 /// and the moment a finisher, a finalize record, or an export owns the
@@ -886,6 +933,7 @@ impl PooledBackend {
             sidecar_json: sidecar_json.clone(),
             idle_marked: false,
             hot_chunks: self.read_hot_chunks(id),
+            dest: Arc::default(),
         };
         self.pending_presetups.insert(id, pending.clone());
         Ok(engram_core::types::snapshot::MigrationPresetupOut {
@@ -2856,8 +2904,9 @@ impl PooledBackend {
     ) -> Result<(), SandboxError> {
         use futures::stream::FuturesUnordered;
         use futures::StreamExt;
-        const BATCH: usize = 64;
-        const IN_FLIGHT: usize = 4;
+        // 16 MiB per request at the 64 KiB block size.
+        const BATCH: usize = 256;
+        const IN_FLIGHT: usize = 8;
         let mut in_flight = FuturesUnordered::new();
         let mut failed = None;
         for batch in blocks.chunks(BATCH) {
@@ -2900,8 +2949,11 @@ impl PooledBackend {
             .iter()
             .map(|index| MigrationItem::DiskBlockAt(role, *index))
             .collect();
+        // Contiguous blocks land in one write of up to this many bytes.
+        const MAX_RUN: usize = 4 * 1024 * 1024;
         let mut stream = source.migration_fetch(export_id, items).await?;
         let mut items = ItemAssembler::default();
+        let mut run: Option<(u64, Vec<u8>)> = None;
         while let Some(frame) = stream.next().await {
             let Some((idx, bytes)) = items.push(frame?)? else {
                 continue;
@@ -2919,11 +2971,34 @@ impl PooledBackend {
                     bytes.len()
                 )));
             }
-            volume.write_range(start, bytes).await.map_err(|e| {
-                SandboxError::Snapshot(format!("write sealed disk block {index}: {e}"))
-            })?;
+            match &mut run {
+                Some((run_start, buf))
+                    if *run_start + buf.len() as u64 == start && buf.len() < MAX_RUN =>
+                {
+                    buf.extend_from_slice(&bytes);
+                }
+                _ => {
+                    if let Some((run_start, buf)) = run.replace((start, bytes)) {
+                        Self::write_disk_run(volume, run_start, buf).await?;
+                    }
+                }
+            }
+        }
+        if let Some((run_start, buf)) = run {
+            Self::write_disk_run(volume, run_start, buf).await?;
         }
         Ok(())
+    }
+
+    async fn write_disk_run(
+        volume: &Volume,
+        start: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), SandboxError> {
+        let len = bytes.len();
+        volume.write_range(start, bytes).await.map_err(|e| {
+            SandboxError::Snapshot(format!("write sealed disk range {start}+{len}: {e}"))
+        })
     }
 
     /// Dial a migration source's gRPC endpoint.
@@ -4910,6 +4985,25 @@ impl SandboxBackend for PooledBackend {
         #[cfg(target_os = "linux")]
         {
             use engram_core::types::snapshot::PostCopyCaptureOut;
+            // The guest runs while the destination provisions its disks
+            // and pulls the precopy; the pause holds only what follows.
+            let dest = self
+                .pending_presetups
+                .get(&id)
+                .filter(|p| p.export_id == export_id)
+                .map(|p| p.dest.clone());
+            if let Some(dest) = dest {
+                let started = crate::time_source::metrics_now();
+                let ready = dest.contacted.wait(DEST_CONTACT_WAIT).await
+                    && dest.ready.wait(DEST_READY_WAIT).await;
+                tracing::info!(
+                    sandbox_id = %id,
+                    export_id,
+                    ready,
+                    dest_wait_ms = started.elapsed().as_millis() as u64,
+                    "post-copy capture waited for the destination",
+                );
+            }
             // Issue #222: remove *only* if the export id matches. A plain
             // `remove(&id).filter(...)` evicts the entry unconditionally and
             // only then discards the returned value on mismatch — so a stale
@@ -5345,6 +5439,10 @@ impl SandboxBackend for PooledBackend {
                 else {
                     return Err(SandboxError::NotFound);
                 };
+                presetup.dest.contacted.set();
+                if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
+                    presetup.dest.ready.set();
+                }
                 (None, Default::default(), presetup.precopy.clone())
             }
         };
@@ -8686,6 +8784,51 @@ mod tests {
         assert!(pooled.pending_presetups.is_empty());
     }
 
+    /// A live capture pauses the source only once the destination is
+    /// ready: the destination's first fetch marks it contacted, and its
+    /// first `state.bin` request (after its precopy landed) marks it ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_presetup_learns_when_the_destination_is_ready_for_the_pause() {
+        use engram_core::types::snapshot::MigrationItem;
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner);
+        let id = SandboxId::new();
+        let dest: Arc<DestProgress> = Arc::default();
+        pooled.pending_presetups.insert(
+            id,
+            PendingPresetup {
+                export_id: "E1".into(),
+                peer_token: "tok".into(),
+                chain_ref: engram_core::types::manifest::ManifestRef::new(),
+                disk_manifest_ref: None,
+                swap_manifest_ref: None,
+                precopy: Default::default(),
+                sidecar_json: Vec::new(),
+                idle_marked: false,
+                hot_chunks: Vec::new(),
+                dest: dest.clone(),
+            },
+        );
+        assert!(!dest.contacted.wait(DEST_CONTACT_WAIT).await);
+        let _ = pooled
+            .migration_fetch("E1", vec![MigrationItem::DiskPrecopyInfo(DiskRole::Root)])
+            .await;
+        assert!(dest.contacted.wait(DEST_CONTACT_WAIT).await);
+        assert!(!dest.ready.wait(std::time::Duration::from_millis(10)).await);
+        let waiter = tokio::spawn({
+            let dest = dest.clone();
+            async move { dest.ready.wait(DEST_READY_WAIT).await }
+        });
+        tokio::task::yield_now().await;
+        let _ = pooled
+            .migration_fetch("E1", vec![MigrationItem::StateBin])
+            .await;
+        assert!(waiter.await.unwrap());
+    }
+
     /// Issue #222: `migration_capture_postcopy` must remove the pending
     /// presetup ONLY when the export id matches. Presetups are
     /// last-write-wins (a coordinator retry re-mints a new export under
@@ -8697,8 +8840,10 @@ mod tests {
     /// Regression for the pre-fix `remove(&id).filter(...)`, which evicted
     /// the entry unconditionally and then discarded it on mismatch,
     /// dooming the legitimate capture to "no matching presetup".
+    // Paused: the legitimate capture first waits out the bound for a
+    // destination that never asks.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn capture_postcopy_export_mismatch_leaves_live_presetup_intact() {
         let tmp = tempfile::tempdir().unwrap();
         let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
@@ -8721,6 +8866,7 @@ mod tests {
                 sidecar_json: Vec::new(),
                 idle_marked: false,
                 hot_chunks: Vec::new(),
+                dest: Arc::default(),
             },
         );
 
@@ -9000,6 +9146,7 @@ mod tests {
                 sidecar_json: Vec::new(),
                 idle_marked: false,
                 hot_chunks: Vec::new(),
+                dest: Arc::default(),
             },
         );
 
