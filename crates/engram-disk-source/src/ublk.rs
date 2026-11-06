@@ -3,7 +3,8 @@
 //! The device is created with user recovery and reissue. When the
 //! process dies, the kernel keeps `/dev/ublkbN`, holds its I/O, and
 //! gives the requests in flight again to the next process that recovers
-//! it. Only a normal stop deletes the device.
+//! it. Only a normal stop, or [`delete_unserved`] for a device no process
+//! serves, deletes the device.
 //!
 //! Each queue thread runs one task per tag on a local executor driven by
 //! the queue's io_uring. A read runs on the tokio runtime, and the tag's
@@ -385,4 +386,62 @@ async fn read_on_runtime(t: &Tag<'_>, offset: u64, len: usize, done: &Arc<EventF
             }
         }
     }
+}
+
+/// Delete device `dev_id` when no process serves it.
+///
+/// The kernel rules (drivers/block/ublk_drv.c) this relies on:
+/// - A stop or delete of a LIVE device first quiesces its queue and waits
+///   for the requests in flight. With no server to finish them, it waits
+///   until the node reboots. So a LIVE device is refused.
+/// - A DEAD device has no disk left: its server stopped it and did not
+///   delete it. A delete only removes the control node.
+/// - A QUIESCED device is one whose server died (user recovery). A delete
+///   marks its queues to abort, so each request it holds fails with an
+///   I/O error, and the delete does not wait. It is deleted only with
+///   `quiesced`, for a caller that knows nothing reads the device.
+///
+/// A device whose recorded server process still runs is refused: that
+/// server can be in the middle of a recovery.
+pub fn delete_unserved(dev_id: u32, quiesced: bool) -> io::Result<()> {
+    let id = i32::try_from(dev_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("device id {dev_id} is out of range"),
+        )
+    })?;
+    let ctrl =
+        UblkCtrl::new_simple(id).map_err(|e| ublk_err(&format!("open device {dev_id}"), e))?;
+    let info = ctrl.dev_info();
+    let state = u32::from(info.state);
+    let allowed = state == sys::UBLK_S_DEV_DEAD || (quiesced && state == sys::UBLK_S_DEV_QUIESCED);
+    if !allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("device {dev_id} is in state {state}; it is not deleted"),
+        ));
+    }
+    if info.ublksrv_pid > 0 && server_runs(info.ublksrv_pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "device {dev_id}: its server process {} still runs; it is not deleted",
+                info.ublksrv_pid
+            ),
+        ));
+    }
+    check(&format!("delete device {dev_id}"), ctrl.del_dev())?;
+    Ok(())
+}
+
+/// Whether `pid` is a live (not zombie) engram-disk-source process.
+fn server_runs(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((comm, rest)) = stat.split_once(" (").and_then(|(_, r)| r.rsplit_once(") ")) else {
+        return false;
+    };
+    // The kernel keeps the first 15 bytes of the name.
+    comm == &"engram-disk-source"[..15] && !rest.starts_with('Z')
 }

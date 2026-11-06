@@ -3,7 +3,8 @@
 //! is a function of its arguments and the blob-store environment
 //! (`ENGRAM_BLOB_BACKEND` and the backend's settings), so a new process
 //! with the same arguments and `--recover` takes over a device whose
-//! process died.
+//! process died. `engram-disk-source delete` removes a device that no
+//! process serves.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,6 +27,21 @@ enum Command {
     /// Create (or recover) the device, print "<device path> <device id>"
     /// on one line when it serves I/O, and serve until SIGTERM or SIGINT.
     Serve(ServeArgs),
+    /// Delete a device that no process serves: one its server stopped and
+    /// did not delete, or, with --quiesced, one whose server died. A device
+    /// that a process serves is never deleted.
+    Delete(DeleteArgs),
+}
+
+#[derive(Args)]
+struct DeleteArgs {
+    /// The device id.
+    #[arg(long)]
+    device: u32,
+    /// Also delete a device whose server died. Each read the device holds
+    /// fails, so use it only when nothing reads the device.
+    #[arg(long)]
+    quiesced: bool,
 }
 
 #[derive(Args)]
@@ -64,8 +80,11 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let Command::Serve(args) = Cli::parse().command;
-    match serve(args) {
+    let result = match Cli::parse().command {
+        Command::Serve(args) => serve(args),
+        Command::Delete(args) => delete(args),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("engram-disk-source: {e}");
@@ -76,10 +95,25 @@ fn main() -> ExitCode {
 
 #[cfg(not(target_os = "linux"))]
 fn serve(_args: ServeArgs) -> std::io::Result<()> {
+    unsupported()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn delete(_args: DeleteArgs) -> std::io::Result<()> {
+    unsupported()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported() -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "ublk block devices need Linux",
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn delete(args: DeleteArgs) -> std::io::Result<()> {
+    engram_disk_source::ublk::delete_unserved(args.device, args.quiesced)
 }
 
 #[cfg(target_os = "linux")]

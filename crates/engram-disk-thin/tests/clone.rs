@@ -762,6 +762,9 @@ fn remove_dm(name: &str) -> std::io::Result<()> {
 
 #[async_trait]
 impl DiskSources for LoopSources {
+    fn can_start(&self) -> bool {
+        true
+    }
     async fn start(
         &self,
         sandbox: SandboxId,

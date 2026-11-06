@@ -325,6 +325,9 @@ fn over_pool() -> bool {
 
 #[async_trait]
 impl DiskSources for LoopSources {
+    fn can_start(&self) -> bool {
+        true
+    }
     async fn start(
         &self,
         sandbox: SandboxId,

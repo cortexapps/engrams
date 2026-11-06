@@ -754,9 +754,9 @@ impl SessionVolumes {
         )
     }
 
-    /// The sources a lazy provision needs are configured.
-    pub fn has_sources(&self) -> bool {
-        self.sources.is_some()
+    /// A lazy provision can start the source it needs.
+    pub fn can_start_sources(&self) -> bool {
+        self.sources.as_ref().is_some_and(|s| s.can_start())
     }
 
     /// A new lineage that holds a copy of `manifest`.
@@ -1460,9 +1460,11 @@ impl SessionVolumes {
     }
 
     /// Cut a hydrated cloned role over to its destination, then delete
-    /// its bitmap and stop its source. The caller serializes this with
-    /// the role's checkpoints, from `take` to `publish`. A crash at any
-    /// step leaves a state the next call finishes. `InvalidInput` when
+    /// its bitmap. The caller serializes this with the role's
+    /// checkpoints, from `take` to `publish`, and then stops the source
+    /// with [`Self::stop_source`] outside that lock. A crash at any step
+    /// leaves a state the next call finishes: [`Self::hydration`] reports
+    /// `Ready` while the bitmap or the source is left. `InvalidInput` when
     /// the role is not cloned.
     pub async fn cut_over(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Cutover> {
         let names = self.disk.list().await?;
@@ -1480,7 +1482,10 @@ impl SessionVolumes {
             return Ok(Cutover::Waiting(Waiting::Checkpoint));
         }
         if progress.is_some() {
-            // A suspend waits for the source's reads in flight.
+            // A suspend waits for the source's reads in flight. The caller
+            // recovers a dead source before it takes the lock (through
+            // `hydration`), so this check is cheap unless the source died
+            // since.
             self.sources(role)?
                 .ensure_alive(sandbox, role)
                 .await
@@ -1488,13 +1493,35 @@ impl SessionVolumes {
             self.disk.cut_over(&live_name(sandbox, role)).await?;
         }
         self.delete_if_present(&bitmap_name(sandbox, role)).await?;
-        if let Some(sources) = &self.sources {
-            sources
-                .stop(sandbox, role)
-                .await
-                .map_err(|e| source_err(sandbox, role, e))?;
-        }
         Ok(Cutover::Done)
+    }
+
+    /// Stop the source of a role that is cut over. No drive reads it: the
+    /// live drive is linear, and a checkpoint of a cut-over role makes no
+    /// view. `InvalidInput` while the drive copies or a view exists. A
+    /// role with no source is left as it is.
+    pub async fn stop_source(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+        let Some(sources) = &self.sources else {
+            return Ok(());
+        };
+        let names = self.disk.list().await?;
+        let copies =
+            cloned_in(&names, sandbox, role) && self.clone_progress(sandbox, role).await?.is_some();
+        let viewed = match self.disk.clone_state(&view_name(sandbox, role)).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        if copies || viewed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a drive of the {role} disk of sandbox {sandbox} still reads its source"),
+            ));
+        }
+        sources
+            .stop(sandbox, role)
+            .await
+            .map_err(|e| source_err(sandbox, role, e))
     }
 
     /// The regions the role's drive has copied; `None` once it is cut
@@ -3346,6 +3373,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DiskSources for Watched {
+        fn can_start(&self) -> bool {
+            true
+        }
         async fn start(
             &self,
             sandbox: SandboxId,
@@ -3734,6 +3764,12 @@ mod tests {
                 .unwrap();
         }
         let published = r.volumes.publish(pending).await.unwrap();
+        let err = r
+            .volumes
+            .stop_source(sandbox, DiskRole::Root)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "the drive copies");
 
         assert_eq!(
             r.volumes.cut_over(sandbox, DiskRole::Root).await.unwrap(),
@@ -3743,6 +3779,16 @@ mod tests {
             r.disk.clone_state(&drive).await.unwrap(),
             CloneState::CutOver
         );
+        // The source stops outside the cutover, which leaves it.
+        assert!(sourced(&r, sandbox).await);
+        assert_eq!(
+            r.volumes.hydration(sandbox, DiskRole::Root).await.unwrap(),
+            Some(Hydrating::Ready)
+        );
+        r.volumes
+            .stop_source(sandbox, DiskRole::Root)
+            .await
+            .unwrap();
         assert!(!sourced(&r, sandbox).await);
         assert!(!names(&r)
             .await
@@ -3805,6 +3851,7 @@ mod tests {
             r.volumes.cut_over(whole, DiskRole::Root).await.unwrap(),
             Cutover::Done
         );
+        r.volumes.stop_source(whole, DiskRole::Root).await.unwrap();
         assert!(!sourced(&r, whole).await);
         assert_eq!(
             r.volumes.hydration(whole, DiskRole::Root).await.unwrap(),
@@ -3935,6 +3982,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DiskSources for DeadSources {
+        fn can_start(&self) -> bool {
+            true
+        }
         async fn start(
             &self,
             sandbox: SandboxId,

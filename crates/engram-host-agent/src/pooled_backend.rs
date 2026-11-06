@@ -1539,7 +1539,7 @@ impl PooledBackend {
     /// counterpart (ADR 0127 Decision 1). `off` is always eager. `force` is
     /// lazy for each disk whose eager provision would write. `auto` gives
     /// the disks one budget ([`lazy_disks`]); a disk whose estimate cannot
-    /// be read is eager. A host without disk sources, and a disk of zeros,
+    /// be read is eager. A host that cannot start a source, and a disk of zeros,
     /// is eager. `force` and `auto` record each estimate.
     ///
     /// [`lazy_disks`]: engram_host_core::eager_estimate::lazy_disks
@@ -1552,7 +1552,7 @@ impl PooledBackend {
         use crate::config::LazyRestore;
         let considered = |source: &Source| {
             self.lazy_restore != LazyRestore::Off
-                && volumes.has_sources()
+                && volumes.can_start_sources()
                 && !matches!(source, Source::Empty { .. })
         };
         let mut estimates = Vec::with_capacity(disks.len());
@@ -9249,6 +9249,17 @@ mod tests {
         Arc<SessionVolumes>,
         engram_core::types::manifest::ManifestRef,
     ) {
+        volumes_with_these_sources(tmp, true).await
+    }
+
+    /// [`volumes_with_sources`] whose sources start only when `can_start`.
+    async fn volumes_with_these_sources(
+        tmp: &std::path::Path,
+        can_start: bool,
+    ) -> (
+        Arc<SessionVolumes>,
+        engram_core::types::manifest::ManifestRef,
+    ) {
         use engram_chunk_store::ChunkStore;
         use engram_storage_local::LocalBlobStorage;
         let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(tmp.join("blob"))));
@@ -9256,9 +9267,12 @@ mod tests {
             engram_host_core::FileDisk::new(tmp.join("volumes"), MIGRATION_DISK_BLOCK_BYTES)
                 .unwrap(),
         );
-        let sources = Arc::new(
-            engram_host_core::FileSources::new(tmp.join("sources"), store.clone()).unwrap(),
-        );
+        let files = engram_host_core::FileSources::new(tmp.join("sources"), store.clone()).unwrap();
+        let sources: Arc<dyn engram_host_core::DiskSources> = if can_start {
+            Arc::new(files)
+        } else {
+            Arc::new(NoStart(files))
+        };
         let volumes = Arc::new(SessionVolumes::new(disk, store).with_sources(sources));
         let published = SandboxId::new();
         volumes
@@ -9306,29 +9320,7 @@ mod tests {
         use crate::config::{EagerBudget, LazyRestore};
         let tmp = tempfile::tempdir().unwrap();
         let (volumes, manifest) = volumes_with_sources(tmp.path()).await;
-        let src = tmp.path().join("snapshot");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("manifest.json"), br#"{"spec":{}}"#).unwrap();
-        let metadata = SnapshotMetadata {
-            id: engram_core::SnapshotId::new(),
-            size_bytes: 4096,
-            created_at: chrono::Utc::now(),
-            image_version: "image:1".into(),
-            swap_manifest: None,
-            disk_manifest: Some(manifest),
-            memory_manifest: None,
-            base_memory_manifest: None,
-            base_disk_manifest: None,
-            migration_source: None,
-            source_sandbox_id: None,
-            state_blob_key: None,
-            sidecar_blob_key: None,
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-            aux_bundles: vec![],
-            paused_at: None,
-            peer_hints: Vec::new(),
-        };
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
         let over = |seconds| EagerBudget {
             seconds,
             ..EagerBudget::default()
@@ -9371,6 +9363,101 @@ mod tests {
             .await
             .unwrap();
         assert!(!lazy, "an adopted checkpoint restores eagerly under force");
+    }
+
+    /// A snapshot folder and metadata for a restore of a root disk from
+    /// `manifest`, with no swap and no memory.
+    fn root_only_snapshot(
+        tmp: &std::path::Path,
+        manifest: engram_core::types::manifest::ManifestRef,
+    ) -> (std::path::PathBuf, SnapshotMetadata) {
+        let src = tmp.join("snapshot");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("manifest.json"), br#"{"spec":{}}"#).unwrap();
+        let metadata = SnapshotMetadata {
+            id: engram_core::SnapshotId::new(),
+            size_bytes: 4096,
+            created_at: chrono::Utc::now(),
+            image_version: "image:1".into(),
+            swap_manifest: None,
+            disk_manifest: Some(manifest),
+            memory_manifest: None,
+            base_memory_manifest: None,
+            base_disk_manifest: None,
+            migration_source: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+            aux_bundles: vec![],
+            paused_at: None,
+            peer_hints: Vec::new(),
+        };
+        (src, metadata)
+    }
+
+    /// File sources on a host that cannot start one, as a host without
+    /// the ublk driver.
+    struct NoStart(engram_host_core::FileSources);
+
+    #[async_trait::async_trait]
+    impl engram_host_core::DiskSources for NoStart {
+        fn can_start(&self) -> bool {
+            false
+        }
+        async fn start(
+            &self,
+            _: SandboxId,
+            _: DiskRole,
+            _: engram_core::types::manifest::ManifestRef,
+            _: Option<(
+                &engram_host_core::Volume,
+                engram_core::types::manifest::ManifestRef,
+            )>,
+        ) -> std::io::Result<std::path::PathBuf> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+        async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+            self.0.ensure_alive(sandbox, role).await
+        }
+        async fn served(
+            &self,
+            sandbox: SandboxId,
+            role: DiskRole,
+        ) -> std::io::Result<engram_host_core::disk_sources::Served> {
+            self.0.served(sandbox, role).await
+        }
+        async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> std::io::Result<()> {
+            self.0.stop(sandbox, role).await
+        }
+        async fn list(&self) -> std::io::Result<Vec<(SandboxId, DiskRole)>> {
+            self.0.list().await
+        }
+    }
+
+    /// A host that cannot start a source restores eagerly in every mode,
+    /// where a lazy restore would fail.
+    #[tokio::test]
+    async fn a_host_that_cannot_start_a_source_restores_eagerly() {
+        use crate::config::{EagerBudget, LazyRestore};
+        let tmp = tempfile::tempdir().unwrap();
+        let (volumes, manifest) = volumes_with_these_sources(tmp.path(), false).await;
+        let (src, metadata) = root_only_snapshot(tmp.path(), manifest);
+        let budget = EagerBudget {
+            seconds: 0.0,
+            ..EagerBudget::default()
+        };
+        for mode in [LazyRestore::Force, LazyRestore::Auto] {
+            let pooled = hydrating_backend(&volumes).with_lazy_restore(mode, budget);
+            let id = SandboxId::new();
+            let (_, lazy) = pooled
+                .provision_for_restore(&volumes, id, &metadata, &src, false, false)
+                .await
+                .unwrap();
+            assert!(!lazy, "{mode:?}");
+            volumes.purge(id).await.unwrap();
+        }
     }
 
     fn hydrating_backend(volumes: &Arc<SessionVolumes>) -> PooledBackend {

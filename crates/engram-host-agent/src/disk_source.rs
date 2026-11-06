@@ -9,14 +9,20 @@
 //! died is started again on the same device with `--recover`; the kernel
 //! holds the device's I/O until then.
 //!
-//! A ublk device stopped or deleted with a request that no server will
-//! finish blocks in the kernel until the node reboots. So only a SIGTERM
-//! to a serving process deletes a device (the server fails the reads it
-//! cannot serve, then deletes the device), a recovery that fails ends
-//! with SIGKILL, which keeps the device for the next recovery, and a stop
-//! recovers a dead source first.
+//! A ublk device stopped or deleted while it is LIVE, with a request that
+//! no server will finish, blocks in the kernel until the node reboots. So
+//! a SIGTERM to a serving process deletes a device (the server fails the
+//! reads it cannot serve, then deletes the device), a recovery that fails
+//! ends with SIGKILL, which keeps the device for the next recovery, and a
+//! stop recovers a dead source first. Only a device that no process
+//! serves is deleted from outside, by `engram-disk-source delete`, which
+//! refuses a LIVE device.
+//!
+//! Each start, recovery and stop runs in a task of its own, so a caller
+//! that is dropped cannot leave a process without a record.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -38,6 +44,8 @@ use crate::durable_record;
 
 const WHAT: &str = "disk source record";
 const POLL: Duration = Duration::from_millis(20);
+/// How many sources the startup recovery starts at once.
+const RECOVER_AT_ONCE: usize = 4;
 
 /// How [`ProcessSources`] runs its processes.
 #[derive(Clone, Debug)]
@@ -55,7 +63,8 @@ pub struct ProcessSourcesConfig {
     pub depth: u16,
     /// How long a process may take to report its device.
     pub ready_timeout: Duration,
-    /// How long a process may take to exit after a signal.
+    /// How long a process may take to exit after a signal, and a delete
+    /// may take.
     pub stop_timeout: Duration,
 }
 
@@ -74,7 +83,9 @@ impl ProcessSourcesConfig {
     }
 }
 
-/// One source process, as its durable record holds it.
+/// One source process, as its durable record holds it. Two builds read
+/// it during a roll: a field added later is `#[serde(default)]`, and an
+/// older build ignores a field it does not know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRecord {
     pub sandbox: SandboxId,
@@ -85,6 +96,7 @@ pub struct SourceRecord {
     /// reused pid is never taken for the source.
     pub start_time: u64,
     /// `None` until the process reports its device.
+    #[serde(default)]
     pub device: Option<Device>,
     /// A recovery must give the device its own queue count and depth.
     pub queues: u16,
@@ -102,7 +114,9 @@ pub struct Device {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServeArgs {
     pub manifest: ManifestRef,
+    #[serde(default)]
     pub base: Option<Base>,
+    #[serde(default)]
     pub cache_root: Option<PathBuf>,
 }
 
@@ -122,10 +136,18 @@ pub trait Probe: Send + Sync {
     fn device_exists(&self, id: u32) -> bool;
     /// Whether the ublk driver is loaded.
     fn driver_loaded(&self) -> bool;
+    /// Every ublk device id the kernel has.
+    fn devices(&self) -> Vec<u32>;
+    /// Every running `engram-disk-source` process, with its start time.
+    fn source_processes(&self) -> Vec<(u32, u64)>;
 }
 
 /// [`Probe`] over `/proc` and sysfs.
 pub struct KernelProbe;
+
+/// The control nodes of the ublk devices; one lives from a device's add
+/// to its delete.
+const UBLK_CHAR_CLASS: &str = "/sys/class/ublk-char";
 
 impl Probe for KernelProbe {
     fn start_time(&self, pid: u32) -> Option<u64> {
@@ -139,12 +161,39 @@ impl Probe for KernelProbe {
     }
 
     fn device_exists(&self, id: u32) -> bool {
-        // The control node lives from the device's add to its delete.
-        Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
+        Path::new(UBLK_CHAR_CLASS)
+            .join(format!("ublkc{id}"))
+            .exists()
     }
 
     fn driver_loaded(&self) -> bool {
         Path::new("/dev/ublk-control").exists()
+    }
+
+    fn devices(&self) -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir(UBLK_CHAR_CLASS) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.strip_prefix("ublkc")?.parse().ok())
+            .collect()
+    }
+
+    fn source_processes(&self) -> Vec<(u32, u64)> {
+        use engram_sandbox_firecracker::sandbox_manifest::read_proc_comm;
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| {
+                // The kernel keeps the first 15 bytes of the name.
+                read_proc_comm(pid).is_some_and(|comm| comm == "engram-disk-source"[..15])
+            })
+            .filter_map(|pid| Some((pid, self.start_time(pid)?)))
+            .collect()
     }
 }
 
@@ -173,8 +222,20 @@ fn health(device: Option<Device>, alive: bool, device_lost: bool) -> Health {
     }
 }
 
+/// Run `op` in a task of its own, so a caller that is dropped cannot stop
+/// it between a spawn and the record of the process.
+async fn detached<T: Send + 'static>(
+    op: impl Future<Output = io::Result<T>> + Send + 'static,
+) -> io::Result<T> {
+    tokio::spawn(op).await.map_err(io::Error::other)?
+}
+
 /// [`DiskSources`] as `engram-disk-source` processes, one per role.
-pub struct ProcessSources {
+pub struct ProcessSources(Arc<Sources>);
+
+/// The state and steps of [`ProcessSources`], shared with the tasks that
+/// run each step.
+struct Sources {
     cfg: ProcessSourcesConfig,
     dir: PathBuf,
     fs: Arc<dyn HostFs>,
@@ -197,17 +258,42 @@ impl ProcessSources {
         probe: Arc<dyn Probe>,
     ) -> Self {
         let dir = cfg.work_dir.join("disk-sources");
-        Self {
+        Self(Arc::new(Sources {
             cfg,
             dir,
             fs,
             probe,
             locks: Default::default(),
-        }
+        }))
     }
 
     /// Whether this host can start a source; the reason when it cannot.
     pub fn check_driver(&self) -> io::Result<()> {
+        self.0.check_driver()
+    }
+
+    /// Every record on this host.
+    pub async fn records(&self) -> Vec<SourceRecord> {
+        self.0.records().await
+    }
+
+    /// Log every source process and ublk device that no record names, and
+    /// delete each such device that no process serves. Run once at
+    /// startup, before anything starts a source. A device a running
+    /// process serves is never deleted. A device whose server died is
+    /// deleted only when every record file could be read: no drive is
+    /// made over a device before its record names it, so such a device
+    /// has no reader.
+    pub async fn sweep_unrecorded(&self) {
+        let sources = self.0.clone();
+        if let Err(error) = detached(async move { sources.sweep_unrecorded().await }).await {
+            tracing::warn!(%error, "disk source sweep failed");
+        }
+    }
+}
+
+impl Sources {
+    fn check_driver(&self) -> io::Result<()> {
         if self.probe.driver_loaded() {
             return Ok(());
         }
@@ -249,9 +335,19 @@ impl ProcessSources {
         durable_record::persist(self.fs.as_ref(), &self.dir, id, record, WHAT).await
     }
 
-    /// Every record on this host.
-    pub async fn records(&self) -> Vec<SourceRecord> {
+    async fn records(&self) -> Vec<SourceRecord> {
         durable_record::load_all(self.fs.as_ref(), &self.dir, WHAT).await
+    }
+
+    /// How many record files there are, readable or not.
+    async fn record_files(&self) -> usize {
+        match self.fs.read_dir(&self.dir).await {
+            Ok(paths) => paths
+                .iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .count(),
+            Err(_) => 0,
+        }
     }
 
     async fn health(&self, record: &SourceRecord) -> Health {
@@ -376,6 +472,34 @@ impl ProcessSources {
         }
     }
 
+    /// Delete device `id`, which no process serves, with
+    /// `engram-disk-source delete`. `quiesced` also deletes a device whose
+    /// server died; the binary refuses a device that a process serves.
+    async fn delete_device(&self, id: u32, quiesced: bool) -> io::Result<()> {
+        let mut cmd = tokio::process::Command::new(&self.cfg.bin);
+        cmd.arg("delete").arg("--device").arg(id.to_string());
+        if quiesced {
+            cmd.arg("--quiesced");
+        }
+        cmd.stdin(Stdio::null()).kill_on_drop(true);
+        let output = tokio::time::timeout(self.cfg.stop_timeout, cmd.output())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the delete of device {id} did not finish"),
+                )
+            })??;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "delete device {id}: {} ({})",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            output.status
+        )))
+    }
+
     /// Send `signal` to the process if it is still the recorded one.
     fn signal(&self, pid: u32, start_time: u64, signal: nix::sys::signal::Signal) {
         if self.probe.start_time(pid) != Some(start_time) {
@@ -494,44 +618,20 @@ impl ProcessSources {
             Health::Gone(Some(device)) => format!("its device {device} is gone"),
             Health::Gone(None) => "it exited before it reported a device".to_string(),
         };
+        tracing::warn!(%sandbox, %role, reason = %gone, "disk source record removed");
         self.clean_up(sandbox, role).await?;
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("disk source {id}: {gone}"),
         ))
     }
-}
 
-fn parse_ready(line: &str) -> io::Result<Device> {
-    let parsed = line.trim().split_once(' ').and_then(|(path, id)| {
-        Some(Device {
-            id: id.parse().ok()?,
-            path: PathBuf::from(path),
-        })
-    });
-    parsed.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("disk source ready line {line:?} is not \"<device path> <device id>\""),
-        )
-    })
-}
-
-fn no_source(sandbox: SandboxId, role: DiskRole) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("the {role} disk of sandbox {sandbox} has no source"),
-    )
-}
-
-#[async_trait]
-impl DiskSources for ProcessSources {
     async fn start(
         &self,
         sandbox: SandboxId,
         role: DiskRole,
         manifest: ManifestRef,
-        base: Option<(&Volume, ManifestRef)>,
+        base: Option<Base>,
     ) -> io::Result<PathBuf> {
         self.check_driver()?;
         let _guard = self.lock((sandbox, role)).await;
@@ -543,10 +643,7 @@ impl DiskSources for ProcessSources {
         }
         let args = ServeArgs {
             manifest,
-            base: base.map(|(volume, manifest)| Base {
-                volume: volume.path.clone(),
-                manifest,
-            }),
+            base,
             cache_root: self.cfg.cache_root.clone(),
         };
         let shape = (self.cfg.queues, self.cfg.depth);
@@ -594,8 +691,151 @@ impl DiskSources for ProcessSources {
         self.revive(record).await.map(drop)
     }
 
+    async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+        let _guard = self.lock((sandbox, role)).await;
+        let Some(record) = self.load(sandbox, role).await? else {
+            return Ok(());
+        };
+        let device = match self.revive(record).await {
+            Ok((record, device)) => {
+                if !self.terminate(record.pid, record.start_time).await {
+                    return Err(io::Error::other(format!(
+                        "disk source {} (pid {}) does not exit",
+                        Self::id(sandbox, role),
+                        record.pid
+                    )));
+                }
+                device
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            // The kernel refuses a recovery of a device that its server
+            // stopped and did not delete. With no process left, a delete
+            // is the one way to remove it.
+            Err(e) => match self.load(sandbox, role).await? {
+                Some(SourceRecord {
+                    pid,
+                    start_time,
+                    device: Some(device),
+                    ..
+                }) if self.probe.start_time(pid) != Some(start_time) => {
+                    tracing::warn!(%sandbox, %role, device = device.id, error = %e,
+                        "disk source cannot be recovered; deleting its device");
+                    device
+                }
+                _ => return Err(e),
+            },
+        };
+        if self.probe.device_exists(device.id) {
+            // The caller removed every drive over the device, so nothing
+            // reads it: a device whose server died may go too.
+            if let Err(e) = self.delete_device(device.id, true).await {
+                tracing::warn!(%sandbox, %role, device = device.id, error = %e,
+                    "device of a stopped disk source not deleted");
+            }
+        }
+        if self.probe.device_exists(device.id) {
+            // The record stays, so the next stop tries again.
+            return Err(io::Error::other(format!(
+                "device {} of disk source {} stays after its process exited",
+                device.id,
+                Self::id(sandbox, role)
+            )));
+        }
+        self.clean_up(sandbox, role).await
+    }
+
+    async fn sweep_unrecorded(&self) -> io::Result<()> {
+        let records = self.records().await;
+        if !self.probe.driver_loaded() {
+            if !records.is_empty() {
+                tracing::error!(
+                    records = records.len(),
+                    "disk source records exist, but the ublk driver is not loaded; their \
+                     sources cannot serve"
+                );
+            }
+            return Ok(());
+        }
+        let readable = self.record_files().await == records.len();
+        let processes: HashSet<(u32, u64)> =
+            records.iter().map(|r| (r.pid, r.start_time)).collect();
+        for (pid, start_time) in self.probe.source_processes() {
+            if !processes.contains(&(pid, start_time)) {
+                tracing::warn!(pid, "a disk source process runs that no record names");
+            }
+        }
+        let devices: HashSet<u32> = records
+            .iter()
+            .filter_map(|r| r.device.as_ref().map(|d| d.id))
+            .collect();
+        for id in self.probe.devices() {
+            if devices.contains(&id) {
+                continue;
+            }
+            match self.delete_device(id, readable).await {
+                Ok(()) => tracing::warn!(device = id, "deleted a ublk device that no record names"),
+                Err(error) => tracing::warn!(
+                    device = id,
+                    %error,
+                    "a ublk device that no record names stays"
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_ready(line: &str) -> io::Result<Device> {
+    let parsed = line.trim().split_once(' ').and_then(|(path, id)| {
+        Some(Device {
+            id: id.parse().ok()?,
+            path: PathBuf::from(path),
+        })
+    });
+    parsed.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("disk source ready line {line:?} is not \"<device path> <device id>\""),
+        )
+    })
+}
+
+fn no_source(sandbox: SandboxId, role: DiskRole) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("the {role} disk of sandbox {sandbox} has no source"),
+    )
+}
+
+#[async_trait]
+impl DiskSources for ProcessSources {
+    fn can_start(&self) -> bool {
+        self.0.probe.driver_loaded()
+    }
+
+    async fn start(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+        manifest: ManifestRef,
+        base: Option<(&Volume, ManifestRef)>,
+    ) -> io::Result<PathBuf> {
+        let base = base.map(|(volume, manifest)| Base {
+            volume: volume.path.clone(),
+            manifest,
+        });
+        let sources = self.0.clone();
+        detached(async move { sources.start(sandbox, role, manifest, base).await }).await
+    }
+
+    async fn ensure_alive(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
+        let sources = self.0.clone();
+        detached(async move { sources.ensure_alive(sandbox, role).await }).await
+    }
+
     async fn served(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Served> {
         let record = self
+            .0
             .load(sandbox, role)
             .await?
             .ok_or_else(|| no_source(sandbox, role))?;
@@ -608,35 +848,13 @@ impl DiskSources for ProcessSources {
     }
 
     async fn stop(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<()> {
-        let _guard = self.lock((sandbox, role)).await;
-        let Some(record) = self.load(sandbox, role).await? else {
-            return Ok(());
-        };
-        let (record, device) = match self.revive(record).await {
-            Ok(serving) => serving,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        if !self.terminate(record.pid, record.start_time).await {
-            return Err(io::Error::other(format!(
-                "disk source {} (pid {}) does not exit",
-                Self::id(sandbox, role),
-                record.pid
-            )));
-        }
-        if self.probe.device_exists(device.id) {
-            // The next stop recovers the device and stops it again.
-            return Err(io::Error::other(format!(
-                "device {} of disk source {} stays after its process exited",
-                device.id,
-                Self::id(sandbox, role)
-            )));
-        }
-        self.clean_up(sandbox, role).await
+        let sources = self.0.clone();
+        detached(async move { sources.stop(sandbox, role).await }).await
     }
 
     async fn list(&self) -> io::Result<Vec<(SandboxId, DiskRole)>> {
         Ok(self
+            .0
             .records()
             .await
             .into_iter()
@@ -647,8 +865,10 @@ impl DiskSources for ProcessSources {
 
 /// Make every recorded source serve, after the pool opens and before the
 /// volume reconcile, which removes drives: a drive over a dead source
-/// cannot be removed.
+/// cannot be removed. A few recoveries run at once, so sources that each
+/// take the full ready timeout do not add up.
 pub async fn recover_all(sources: &dyn DiskSources) {
+    use futures::StreamExt;
     let roles = match sources.list().await {
         Ok(roles) => roles,
         Err(error) => {
@@ -656,17 +876,19 @@ pub async fn recover_all(sources: &dyn DiskSources) {
             return;
         }
     };
-    for (sandbox, role) in roles {
-        match sources.ensure_alive(sandbox, role).await {
-            Ok(()) => tracing::debug!(%sandbox, %role, "disk source serves"),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                tracing::info!(%sandbox, %role, %error, "disk source removed");
+    futures::stream::iter(roles)
+        .for_each_concurrent(RECOVER_AT_ONCE, |(sandbox, role)| async move {
+            match sources.ensure_alive(sandbox, role).await {
+                Ok(()) => tracing::debug!(%sandbox, %role, "disk source serves"),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    tracing::info!(%sandbox, %role, %error, "disk source removed");
+                }
+                Err(error) => {
+                    tracing::error!(%sandbox, %role, %error, "disk source recovery failed");
+                }
             }
-            Err(error) => {
-                tracing::error!(%sandbox, %role, %error, "disk source recovery failed");
-            }
-        }
-    }
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -676,18 +898,18 @@ mod tests {
     //! (`tests/disk_source_ublk.rs`). Crash states follow ADR 0099 H5: each
     //! post-crash file state is built directly.
 
-    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     use super::*;
 
-    /// Processes run unless the test says otherwise; devices exist only
-    /// when the test adds them.
-    #[derive(Default)]
+    /// Processes run unless the test says otherwise. A device exists while
+    /// a file of its id is in `devices`, which the fake binary's `delete`
+    /// removes.
     struct FakeProbe {
         start_times: Mutex<HashMap<u32, Option<u64>>>,
-        devices: Mutex<HashSet<u32>>,
+        devices: PathBuf,
+        processes: Mutex<Vec<(u32, u64)>>,
         no_driver: bool,
     }
 
@@ -700,10 +922,19 @@ mod tests {
             nix::sys::signal::kill(pid, None).is_ok().then_some(1)
         }
         fn device_exists(&self, id: u32) -> bool {
-            self.devices.lock().unwrap().contains(&id)
+            self.devices.join(id.to_string()).exists()
         }
         fn driver_loaded(&self) -> bool {
             !self.no_driver
+        }
+        fn devices(&self) -> Vec<u32> {
+            std::fs::read_dir(&self.devices)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        }
+        fn source_processes(&self) -> Vec<(u32, u64)> {
+            self.processes.lock().unwrap().clone()
         }
     }
 
@@ -713,19 +944,32 @@ mod tests {
         sources: ProcessSources,
     }
 
-    /// `script` is the body of the fake binary; `$ARGS` names a file it
-    /// may write its arguments to.
-    fn rig(script: &str, probe: FakeProbe) -> Rig {
+    /// `script` is the body of the fake binary. `$ARGS` names a file that
+    /// `serve` writes its arguments to, `$DELETES` one that `delete`
+    /// appends its arguments to, and `$DEVS` the fake's device folder.
+    fn rig(script: &str, no_driver: bool) -> Rig {
         let dir = tempfile::tempdir().unwrap();
+        let devices = dir.path().join("devices");
+        std::fs::create_dir(&devices).unwrap();
         let bin = dir.path().join("fake-disk-source");
-        let args = dir.path().join("args");
-        let body = script.replace("$ARGS", &args.display().to_string());
+        let body = script
+            .replace("$ARGS", &dir.path().join("args").display().to_string())
+            .replace(
+                "$DELETES",
+                &dir.path().join("deletes").display().to_string(),
+            )
+            .replace("$DEVS", &devices.display().to_string());
         std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cfg = ProcessSourcesConfig::new(bin, dir.path());
         cfg.ready_timeout = Duration::from_secs(10);
         cfg.stop_timeout = Duration::from_secs(5);
-        let probe = Arc::new(probe);
+        let probe = Arc::new(FakeProbe {
+            start_times: Default::default(),
+            devices,
+            processes: Default::default(),
+            no_driver,
+        });
         let sources = ProcessSources::with_probe(cfg, Arc::new(TokioFs), probe.clone());
         Rig {
             dir,
@@ -734,17 +978,38 @@ mod tests {
         }
     }
 
-    const SERVES: &str = "echo \"$@\" > $ARGS\necho /dev/ublkb7 7\nexec sleep 60";
+    const DELETES: &str =
+        "if [ \"$1\" = delete ]; then echo \"$@\" >> $DELETES; rm -f $DEVS/$3; exit 0; fi";
+    const DELETE_REFUSED: &str =
+        "if [ \"$1\" = delete ]; then echo \"$@\" >> $DELETES; echo refused >&2; exit 1; fi";
+    const RECOVERY_REFUSED: &str = "case \"$*\" in *--recover*) exit 1;; esac";
+    const SERVE: &str = "echo \"$@\" > $ARGS\necho /dev/ublkb7 7\nexec sleep 60";
+
+    fn serves() -> String {
+        format!("{DELETES}\n{SERVE}")
+    }
 
     impl Rig {
         fn args(&self) -> Option<String> {
             std::fs::read_to_string(self.dir.path().join("args")).ok()
         }
+        fn deletes(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.path().join("deletes")).ok()
+        }
         fn record_path(&self, sandbox: SandboxId, role: DiskRole) -> PathBuf {
-            durable_record::record_path(&self.sources.dir, ProcessSources::id(sandbox, role))
+            durable_record::record_path(&self.sources.0.dir, Sources::id(sandbox, role))
         }
         fn mark_dead(&self, pid: u32) {
             self.probe.start_times.lock().unwrap().insert(pid, None);
+        }
+        fn mark_alive(&self, pid: u32) {
+            self.probe.start_times.lock().unwrap().insert(pid, Some(1));
+        }
+        fn add_device(&self, id: u32) {
+            std::fs::write(self.probe.devices.join(id.to_string()), b"").unwrap();
+        }
+        async fn persist(&self, record: &SourceRecord) {
+            self.sources.0.persist(record).await.unwrap();
         }
     }
 
@@ -790,12 +1055,33 @@ mod tests {
         assert_eq!(health(None, false, false), Health::Gone(None));
     }
 
+    /// The build before a field was added wrote no such field, and the
+    /// build after it writes one this build does not know.
+    #[test]
+    fn a_record_reads_across_one_release_in_both_directions() {
+        let rec = record(SandboxId::new(), DiskRole::Root, 9, None);
+        let mut json = serde_json::to_value(&rec).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("device");
+        fields["args"].as_object_mut().unwrap().remove("cache_root");
+        fields.insert("a_later_field".into(), serde_json::json!(1));
+        let read: SourceRecord = serde_json::from_value(json).unwrap();
+        let expected = SourceRecord {
+            args: ServeArgs {
+                cache_root: None,
+                ..rec.args.clone()
+            },
+            ..rec
+        };
+        assert_eq!(read, expected);
+    }
+
     #[tokio::test]
     async fn a_record_round_trips_and_names_what_the_source_serves() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Swap);
         let rec = record(sandbox, role, 4242, Some(5));
-        r.sources.persist(&rec).await.unwrap();
+        r.persist(&rec).await;
 
         assert_eq!(r.sources.records().await, vec![rec.clone()]);
         assert_eq!(r.sources.list().await.unwrap(), vec![(sandbox, role)]);
@@ -811,17 +1097,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_torn_record_is_an_error_for_its_role_and_skipped_in_the_list() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (torn, sibling) = (SandboxId::new(), SandboxId::new());
         let role = DiskRole::Root;
-        r.sources
-            .persist(&record(sibling, role, 1, Some(1)))
-            .await
-            .unwrap();
-        r.sources
-            .persist(&record(torn, role, 2, Some(2)))
-            .await
-            .unwrap();
+        r.persist(&record(sibling, role, 1, Some(1))).await;
+        r.persist(&record(torn, role, 2, Some(2))).await;
         let path = r.record_path(torn, role);
         let full = std::fs::read(&path).unwrap();
         for offset in 0..full.len() {
@@ -846,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_record_is_no_source() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         assert!(r.sources.list().await.unwrap().is_empty());
         for err in [
@@ -860,29 +1140,29 @@ mod tests {
 
     #[tokio::test]
     async fn garbage_siblings_are_not_records() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         let rec = record(sandbox, role, 1, Some(1));
-        r.sources.persist(&rec).await.unwrap();
-        let dir = &r.sources.dir;
+        r.persist(&rec).await;
+        let dir = &r.sources.0.dir;
         // A crash before the rename, a log, and junk.
         let other = record(SandboxId::new(), role, 2, Some(2));
-        let other_id = ProcessSources::id(other.sandbox, role);
+        let other_id = Sources::id(other.sandbox, role);
         let sealed =
             crate::durable_envelope::seal(&other_id, &serde_json::to_string(&other).unwrap());
         std::fs::write(dir.join(format!("{other_id}.json.partial")), sealed).unwrap();
-        std::fs::write(r.sources.log_path(sandbox, role), b"x").unwrap();
+        std::fs::write(r.sources.0.log_path(sandbox, role), b"x").unwrap();
         std::fs::write(dir.join("junk.json"), b"\x00\xff not json").unwrap();
         assert_eq!(r.sources.records().await, vec![rec]);
     }
 
     #[tokio::test]
     async fn a_live_source_is_left_alone() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         let rec = record(sandbox, role, 4242, Some(5));
-        r.probe.start_times.lock().unwrap().insert(4242, Some(1));
-        r.sources.persist(&rec).await.unwrap();
+        r.mark_alive(4242);
+        r.persist(&rec).await;
         r.sources.ensure_alive(sandbox, role).await.unwrap();
         assert_eq!(r.args(), None, "nothing was started");
         assert_eq!(r.sources.records().await, vec![rec]);
@@ -894,13 +1174,13 @@ mod tests {
     #[tokio::test]
     async fn a_gone_or_reused_pid_is_recovered_on_the_same_device() {
         for reused in [false, true] {
-            let r = rig(SERVES, FakeProbe::default());
+            let r = rig(&serves(), false);
             let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
             let rec = record(sandbox, role, 4242, Some(7));
             let time = if reused { Some(99) } else { None };
             r.probe.start_times.lock().unwrap().insert(4242, time);
-            r.probe.devices.lock().unwrap().insert(7);
-            r.sources.persist(&rec).await.unwrap();
+            r.add_device(7);
+            r.persist(&rec).await;
 
             r.sources.ensure_alive(sandbox, role).await.unwrap();
 
@@ -928,13 +1208,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_whose_device_is_gone_is_removed() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         r.mark_dead(4242);
-        r.sources
-            .persist(&record(sandbox, role, 4242, Some(7)))
-            .await
-            .unwrap();
+        r.persist(&record(sandbox, role, 4242, Some(7))).await;
         let err = r.sources.ensure_alive(sandbox, role).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(r.sources.records().await.is_empty());
@@ -946,18 +1223,15 @@ mod tests {
     /// finish; a recovery would attach to the other source's device.
     #[tokio::test]
     async fn a_device_id_another_source_holds_is_not_recovered() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let role = DiskRole::Root;
         let (stale, owner) = (SandboxId::new(), SandboxId::new());
         r.mark_dead(4242);
-        r.probe.start_times.lock().unwrap().insert(4343, Some(1));
-        r.probe.devices.lock().unwrap().insert(7);
-        r.sources
-            .persist(&record(stale, role, 4242, Some(7)))
-            .await
-            .unwrap();
+        r.mark_alive(4343);
+        r.add_device(7);
+        r.persist(&record(stale, role, 4242, Some(7))).await;
         let held = record(owner, role, 4343, Some(7));
-        r.sources.persist(&held).await.unwrap();
+        r.persist(&held).await;
 
         let err = r.sources.ensure_alive(stale, role).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -967,13 +1241,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_start_that_never_reported_a_device_is_removed() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         r.mark_dead(4242);
-        r.sources
-            .persist(&record(sandbox, role, 4242, None))
-            .await
-            .unwrap();
+        r.persist(&record(sandbox, role, 4242, None)).await;
         let err = r.sources.ensure_alive(sandbox, role).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(r.sources.records().await.is_empty());
@@ -981,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_records_the_device_and_stop_removes_every_trace() {
-        let r = rig(SERVES, FakeProbe::default());
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         let manifest = ManifestRef::new();
         let path = r
@@ -1004,34 +1275,67 @@ mod tests {
         r.sources.stop(sandbox, role).await.unwrap();
         assert!(r.probe.start_time(rec.pid).is_none(), "the process exited");
         assert!(r.sources.records().await.is_empty());
-        assert!(!r.sources.log_path(sandbox, role).exists());
+        assert!(!r.sources.0.log_path(sandbox, role).exists());
+        assert_eq!(r.deletes(), None, "no delete was needed");
         r.sources.stop(sandbox, role).await.unwrap();
     }
 
+    /// The server's own delete failed after it stopped the device: the
+    /// stop deletes the device without a server.
     #[tokio::test]
-    async fn a_stop_that_leaves_the_device_keeps_the_record() {
-        let r = rig(SERVES, FakeProbe::default());
+    async fn a_device_left_by_its_server_is_deleted_by_the_stop() {
+        let r = rig(&serves(), false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         r.sources
             .start(sandbox, role, ManifestRef::new(), None)
             .await
             .unwrap();
-        r.probe.devices.lock().unwrap().insert(7);
+        r.add_device(7);
+        r.sources.stop(sandbox, role).await.unwrap();
+        assert_eq!(r.deletes().unwrap().trim(), "delete --device 7 --quiesced");
+        assert!(!r.probe.device_exists(7));
+        assert!(r.sources.records().await.is_empty());
+    }
+
+    /// The kernel refuses a recovery of a device its server stopped and did
+    /// not delete; the stop deletes it instead of failing forever.
+    #[tokio::test]
+    async fn a_device_that_cannot_be_recovered_is_deleted_by_the_stop() {
+        let r = rig(&format!("{DELETES}\n{RECOVERY_REFUSED}\n{SERVE}"), false);
+        let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
+        r.mark_dead(4242);
+        r.add_device(7);
+        r.persist(&record(sandbox, role, 4242, Some(7))).await;
+        r.sources.ensure_alive(sandbox, role).await.unwrap_err();
+        r.sources.stop(sandbox, role).await.unwrap();
+        assert_eq!(r.deletes().unwrap().trim(), "delete --device 7 --quiesced");
+        assert!(r.sources.records().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stop_whose_delete_is_refused_keeps_the_record() {
+        let r = rig(&format!("{DELETE_REFUSED}\n{SERVE}"), false);
+        let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
+        r.sources
+            .start(sandbox, role, ManifestRef::new(), None)
+            .await
+            .unwrap();
+        r.add_device(7);
         let err = r.sources.stop(sandbox, role).await.unwrap_err();
         assert!(err.to_string().contains("stays"), "{err}");
         assert_eq!(r.sources.list().await.unwrap(), vec![(sandbox, role)]);
-        // The next stop recovers the device, then stops it.
+        // The next stop recovers the device first, then stops it.
         std::fs::remove_file(r.dir.path().join("args")).unwrap();
         r.sources.stop(sandbox, role).await.unwrap_err();
         assert!(r.args().unwrap().contains("--recover 7"));
-        r.probe.devices.lock().unwrap().clear();
+        std::fs::remove_file(r.probe.devices.join("7")).unwrap();
         r.sources.stop(sandbox, role).await.unwrap();
         assert!(r.sources.records().await.is_empty());
     }
 
     #[tokio::test]
     async fn a_start_that_does_not_serve_leaves_nothing() {
-        let r = rig("exit 3", FakeProbe::default());
+        let r = rig("exit 3", false);
         let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
         r.sources
             .start(sandbox, role, ManifestRef::new(), None)
@@ -1040,13 +1344,30 @@ mod tests {
         assert!(r.sources.records().await.is_empty());
     }
 
+    /// A caller dropped while the start waits for the ready line leaves a
+    /// source that its record names, never a process without one.
+    #[tokio::test]
+    async fn a_dropped_start_finishes_in_its_own_task() {
+        let r = rig(&format!("{DELETES}\nsleep 1\n{SERVE}"), false);
+        let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
+        let start = r.sources.start(sandbox, role, ManifestRef::new(), None);
+        let cut = tokio::time::timeout(Duration::from_millis(200), start).await;
+        assert!(cut.is_err(), "the caller gave up");
+        for _ in 0..200 {
+            if r.sources.records().await.iter().any(|r| r.device.is_some()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rec = r.sources.records().await.pop().unwrap();
+        assert_eq!(rec.device.map(|d| d.id), Some(7));
+        r.sources.stop(sandbox, role).await.unwrap();
+    }
+
     #[tokio::test]
     async fn no_driver_no_start() {
-        let probe = FakeProbe {
-            no_driver: true,
-            ..Default::default()
-        };
-        let r = rig(SERVES, probe);
+        let r = rig(&serves(), true);
+        assert!(!r.sources.can_start());
         let err = r
             .sources
             .start(SandboxId::new(), DiskRole::Root, ManifestRef::new(), None)
@@ -1055,5 +1376,34 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("/dev/ublk-control"), "{err}");
         assert_eq!(r.args(), None);
+    }
+
+    /// The sweep deletes devices that no record names and that no process
+    /// serves; the binary refuses a device a process serves.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_unrecorded_devices() {
+        let r = rig(&serves(), false);
+        let (sandbox, role) = (SandboxId::new(), DiskRole::Root);
+        r.mark_alive(4242);
+        r.persist(&record(sandbox, role, 4242, Some(3))).await;
+        r.add_device(3);
+        r.add_device(8);
+        r.probe.processes.lock().unwrap().push((5151, 1));
+        r.sources.sweep_unrecorded().await;
+        assert_eq!(r.deletes().unwrap().trim(), "delete --device 8 --quiesced");
+        assert!(r.probe.device_exists(3), "a recorded device stays");
+        assert!(!r.probe.device_exists(8));
+    }
+
+    /// A record file that cannot be read may name a device that a drive
+    /// reads; the sweep then deletes only devices whose server stopped them.
+    #[tokio::test]
+    async fn an_unreadable_record_limits_the_sweep_to_stopped_devices() {
+        let r = rig(&serves(), false);
+        std::fs::create_dir_all(&r.sources.0.dir).unwrap();
+        std::fs::write(r.sources.0.dir.join("torn.json"), b"{").unwrap();
+        r.add_device(8);
+        r.sources.sweep_unrecorded().await;
+        assert_eq!(r.deletes().unwrap().trim(), "delete --device 8");
     }
 }

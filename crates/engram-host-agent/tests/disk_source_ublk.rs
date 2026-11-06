@@ -1,7 +1,8 @@
 //! `ProcessSources` against the kernel's ublk driver, as root: a source
 //! killed while a read waits on its device is recovered by `ensure_alive`,
 //! the read completes with the manifest's bytes, and a stop leaves no
-//! process and no device.
+//! process and no device; the startup sweep deletes a device that no
+//! record names and no process serves.
 //!
 //! `ENGRAM_TEST_UBLK=1` and `ENGRAM_DISK_SOURCE_BIN` (a built
 //! `engram-disk-source`) run it; unset, it skips. The driver must be loaded.
@@ -85,20 +86,28 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-#[test]
-#[ignore = "requires root and the ublk driver"]
-fn a_killed_source_is_recovered_under_a_waiting_read_and_a_stop_leaves_nothing() {
+struct Rig {
+    work: tempfile::TempDir,
+    rt: tokio::runtime::Runtime,
+    cfg: ProcessSourcesConfig,
+    manifest: ManifestRef,
+    expected: Vec<u8>,
+}
+
+/// A published disk and a source config, or `None` when the lane's
+/// variables are not set.
+fn rig() -> Option<Rig> {
     if std::env::var_os("ENGRAM_TEST_UBLK").is_none() {
         eprintln!("SKIP: ENGRAM_TEST_UBLK is not set");
-        return;
+        return None;
     }
     let Some(bin) = std::env::var_os("ENGRAM_DISK_SOURCE_BIN").map(PathBuf::from) else {
         eprintln!("SKIP: ENGRAM_DISK_SOURCE_BIN is not set");
-        return;
+        return None;
     };
     let work = tempfile::tempdir().unwrap();
     // The source reads the blob store from the environment it inherits.
-    // nextest runs this test in a process of its own, before any other
+    // nextest runs each test in a process of its own, before any other
     // thread starts.
     std::env::set_var("ENGRAM_BLOB_BACKEND", "local");
     std::env::set_var("ENGRAM_LOCAL_PATH", work.path());
@@ -107,6 +116,68 @@ fn a_killed_source_is_recovered_under_a_waiting_read_and_a_stop_leaves_nothing()
     let mut cfg = ProcessSourcesConfig::new(bin, work.path());
     cfg.queues = 1;
     cfg.depth = 8;
+    Some(Rig {
+        work,
+        rt,
+        cfg,
+        manifest,
+        expected,
+    })
+}
+
+/// A host-agent that died before it recorded a source leaves a device
+/// that no record names. When its server has died too, the startup sweep
+/// deletes it.
+#[test]
+#[ignore = "requires root and the ublk driver"]
+fn the_sweep_deletes_a_device_no_record_names() {
+    let Some(r) = rig() else { return };
+    let sources = ProcessSources::new(r.cfg.clone());
+    let sandbox = SandboxId::new();
+    r.rt.block_on(sources.start(sandbox, DiskRole::Root, r.manifest, None))
+        .unwrap();
+    let rec = r.rt.block_on(sources.records()).pop().unwrap();
+    let device = rec.device.unwrap();
+    kill(Pid::from_raw(rec.pid as i32), Signal::SIGKILL).unwrap();
+    let probe = KernelProbe;
+    while probe.start_time(rec.pid) == Some(rec.start_time) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(
+        r.work
+            .path()
+            .join("disk-sources")
+            .join(format!("{sandbox}-root.json")),
+    )
+    .unwrap();
+
+    // The kernel quiesces the device once it sees the server's queues go.
+    for _ in 0..100 {
+        r.rt.block_on(sources.sweep_unrecorded());
+        if !probe.device_exists(device.id) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !probe.device_exists(device.id),
+        "the sweep deleted the device"
+    );
+}
+
+#[test]
+#[ignore = "requires root and the ublk driver"]
+fn a_killed_source_is_recovered_under_a_waiting_read_and_a_stop_leaves_nothing() {
+    let Some(Rig {
+        work: _work,
+        rt,
+        cfg,
+        manifest,
+        expected,
+    }) = rig()
+    else {
+        return;
+    };
     let sources = ProcessSources::new(cfg);
     let sandbox = SandboxId::new();
     let path = rt

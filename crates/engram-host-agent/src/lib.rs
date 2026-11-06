@@ -131,8 +131,8 @@ pub struct HostAgent {
     /// Where image and session volumes live. `None` keeps readiness on
     /// the chunk cache alone and leaves the disks to the backend.
     pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
-    /// The sources lazy restores read from (ADR 0127). `None` when lazy
-    /// restore is off.
+    /// The sources lazy restores read from (ADR 0127), whatever the lazy
+    /// restore mode. `None` only in tests.
     pub disk_sources: Option<Arc<dyn engram_host_core::DiskSources>>,
     /// This host's stable id, stamped on snapshot trace hints and passed
     /// to the UFFD handler. `None` generates one at run time.

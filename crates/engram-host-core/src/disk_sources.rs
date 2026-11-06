@@ -31,6 +31,11 @@ pub struct Served {
 
 #[async_trait]
 pub trait DiskSources: Send + Sync {
+    /// Whether [`Self::start`] can work on this host now. A host that
+    /// cannot start a source still recovers, serves and stops the
+    /// sources it has.
+    fn can_start(&self) -> bool;
+
     /// Start a source of `role` that serves `manifest`, and return its
     /// device path. `base`, a staged volume and the manifest it holds,
     /// serves the chunks it shares with `manifest`. `AlreadyExists` when
@@ -99,6 +104,10 @@ fn invalid(what: String) -> io::Error {
 
 #[async_trait]
 impl DiskSources for FileSources {
+    fn can_start(&self) -> bool {
+        true
+    }
+
     /// Reads every chunk from the store; `base` saves nothing here.
     async fn start(
         &self,

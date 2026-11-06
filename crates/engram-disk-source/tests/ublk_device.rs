@@ -430,6 +430,42 @@ fn a_chunk_the_store_does_not_hold_fails_its_read() {
     source.stop();
 }
 
+/// Run `engram-disk-source delete`; whether it succeeded.
+fn delete(dev_id: u32, quiesced: bool) -> bool {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram-disk-source"));
+    cmd.args(["delete", "--device", &dev_id.to_string()]);
+    if quiesced {
+        cmd.arg("--quiesced");
+    }
+    cmd.status().unwrap().success()
+}
+
+#[test]
+#[ignore]
+fn delete_refuses_a_served_device_and_removes_one_whose_server_died() {
+    ublk_or_skip!();
+    let disk = publish();
+    let source = start(&disk, None);
+    let dev_id = source.dev_id;
+    assert!(!delete(dev_id, true), "a served device is refused");
+    let mut crashed = source.crash(&disk);
+    assert!(
+        !delete(dev_id, false),
+        "a device whose server died needs --quiesced"
+    );
+    // The kernel quiesces the device once it sees the server's queues go.
+    let deleted = (0..100).any(|_| {
+        delete(dev_id, true) || {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(deleted, "a device whose server died is deleted");
+    assert!(!PathBuf::from(format!("/sys/class/ublk-char/ublkc{dev_id}")).exists());
+    // Nothing is left to recover.
+    crashed.dev_id = None;
+}
+
 fn source_path(dev_id: u32) -> PathBuf {
     PathBuf::from(format!("/dev/ublkb{dev_id}"))
 }
