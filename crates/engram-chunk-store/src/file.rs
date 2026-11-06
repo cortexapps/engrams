@@ -13,9 +13,8 @@
 //! the macOS adapter (which needs a regular file to feed VZ) and
 //! by tests.
 //!
-//! Both are cancel-safe (caller's drop just aborts the next
-//! chunk's work) and stream — never load the whole image into
-//! RAM.
+//! Both stream (neither holds the whole image in RAM) and stop when
+//! dropped; a dropped `chunk_file` aborts the uploads it has in flight.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -151,8 +150,6 @@ impl ChunkStore {
         // awaiting a put completion = upload-bound (`flush_seconds`).
         // Mixed phases attribute to the side actually being waited on,
         // preserving the which-side-dominates diagnostic.
-        use futures::stream::{FuturesUnordered, StreamExt};
-
         let mut stats = ChunkFileStats {
             bytes_scanned: total_bytes,
             ..Default::default()
@@ -190,7 +187,9 @@ impl ChunkStore {
             }
         };
 
-        let mut inflight = FuturesUnordered::new();
+        // A JoinSet, so an early return or a drop aborts the uploads in
+        // flight for a manifest that is never built.
+        let mut inflight = tokio::task::JoinSet::new();
         let mut refs: Vec<ChunkRef> = Vec::new();
         let mut done_reading = false;
         let mut scanned_hi: u64 = 0;
@@ -199,12 +198,12 @@ impl ChunkStore {
                      bytes: Bytes,
                      stats: &mut ChunkFileStats,
                      scanned_hi: &mut u64,
-                     inflight: &mut FuturesUnordered<_>| {
+                     inflight: &mut tokio::task::JoinSet<_>| {
             stats.chunks_uploaded += 1;
             stats.bytes_uploaded += bytes.len() as u64;
             *scanned_hi = offset + bytes.len() as u64;
             // Its own task, so the SHA-256 and the PUT's TLS use every core.
-            inflight.push(tokio::spawn(put_one(offset, bytes)));
+            inflight.spawn(put_one(offset, bytes));
         };
         while !done_reading || !inflight.is_empty() {
             // Top up the in-flight set without blocking.
@@ -238,7 +237,7 @@ impl ChunkStore {
             } else {
                 // Await one completion; its slot refills next iteration.
                 let flush_start = crate::time_source::metrics_now();
-                let done_put = inflight.next().await.expect("non-empty inflight");
+                let done_put = inflight.join_next().await.expect("non-empty inflight");
                 stats.flush_seconds += flush_start.elapsed().as_secs_f64();
                 refs.push(done_put.map_err(|e| {
                     crate::error::ChunkStoreError::Internal(format!("chunk upload task: {e}"))

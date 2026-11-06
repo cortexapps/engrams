@@ -25,8 +25,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
-use futures::stream::{FuturesUnordered, StreamExt};
-
 use crate::manifest::{ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind};
 use crate::store::ChunkStore;
 
@@ -262,7 +260,8 @@ impl ChunkStore {
         let uploader = tokio::spawn(async move {
             let mut stats = RegionChunkStats::default();
             let mut chunks: Vec<ChunkRef> = Vec::new();
-            let mut inflight = FuturesUnordered::new();
+            // A JoinSet, so an upload error aborts the other uploads.
+            let mut inflight = tokio::task::JoinSet::new();
             let mut done: u64 = 0;
             let report = |done: u64| {
                 if let Some(p) = &progress {
@@ -274,7 +273,7 @@ impl ChunkStore {
                     // Bias toward draining completions so `inflight`
                     // stays near the cap instead of queueing sends.
                     biased;
-                    Some(result) = inflight.next(), if !inflight.is_empty() => {
+                    Some(result) = inflight.join_next(), if !inflight.is_empty() => {
                         let (offset, hash) = joined(result)?;
                         chunks.push(ChunkRef { offset, hash });
                         done += 1;
@@ -288,10 +287,10 @@ impl ChunkStore {
                                 let store = store.clone();
                                 // Its own task, so the SHA-256 and the PUT's
                                 // TLS use every core.
-                                inflight.push(tokio::spawn(async move {
+                                inflight.spawn(async move {
                                     let hash = store.put_chunk(&body).await?;
                                     crate::Result::Ok((offset, hash))
-                                }));
+                                });
                             }
                             Some(Completed::Zero) => {
                                 stats.chunks_elided += 1;
@@ -303,7 +302,7 @@ impl ChunkStore {
                     }
                 }
             }
-            while let Some(result) = inflight.next().await {
+            while let Some(result) = inflight.join_next().await {
                 let (offset, hash) = joined(result)?;
                 chunks.push(ChunkRef { offset, hash });
                 done += 1;
