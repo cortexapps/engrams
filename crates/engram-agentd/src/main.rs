@@ -14,7 +14,7 @@
 //!
 //! On SIGTERM/SIGINT the accept loop stops taking new connections;
 //! in-flight execs continue until they exit naturally (no
-//! graceful-cancel today — Phase 3 work alongside `SendCtrlAltDel`).
+//! graceful cancel).
 
 use std::path::PathBuf;
 use std::process::ExitCode;

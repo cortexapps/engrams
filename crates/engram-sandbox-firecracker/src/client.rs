@@ -13,7 +13,7 @@
 //! | `PUT`   | `/drives/{id}`             | attach rootfs / scratch disks     |
 //! | `PUT`   | `/network-interfaces/{id}` | attach TAP                        |
 //! | `PUT`   | `/vsock`                   | attach virtio-vsock               |
-//! | `PUT`   | `/actions`                 | `InstanceStart`, `SendCtrlAltDel` |
+//! | `PUT`   | `/actions`                 | `InstanceStart`                   |
 //! | `PATCH` | `/vm`                      | `Paused` / `Resumed` (snapshots)  |
 //! | `PUT`   | `/snapshot/create`         | take a Full or Diff snapshot      |
 //! | `PUT`   | `/snapshot/load`           | resume from snapshot (with UFFD)  |
@@ -182,7 +182,7 @@ impl FirecrackerClient {
         self.put(&path, iface).await
     }
 
-    /// `PUT /actions` — `InstanceStart`, `SendCtrlAltDel`, etc.
+    /// `PUT /actions` — `InstanceStart`.
     pub async fn put_action(&self, action: ActionType) -> Result<(), SandboxError> {
         let body = ActionBody {
             action_type: action,
@@ -785,8 +785,6 @@ struct VmStatePatch {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum ActionType {
     InstanceStart,
-    FlushMetrics,
-    SendCtrlAltDel,
 }
 
 #[derive(Debug, Serialize)]
@@ -1169,14 +1167,10 @@ mod tests {
 
     #[test]
     fn action_type_serializes_pascal_case() {
-        // Firecracker expects exactly these strings.
+        // Firecracker expects exactly this string.
         assert_eq!(
             serde_json::to_string(&ActionType::InstanceStart).unwrap(),
             "\"InstanceStart\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ActionType::SendCtrlAltDel).unwrap(),
-            "\"SendCtrlAltDel\""
         );
     }
 

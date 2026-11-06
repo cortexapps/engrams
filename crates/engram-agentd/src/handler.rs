@@ -195,13 +195,8 @@ where
         }
         WireRequest::Shutdown => {
             // Acknowledge and close the connection. The agent
-            // process keeps running — the host pairs this verb
-            // with `PUT /actions SendCtrlAltDel` on Firecracker
-            // to actually stop the VM (the SendCtrlAltDel piece
-            // is in Phase 6's deferred list). For now, Shutdown
-            // is the agent-side handshake that says "I've
-            // flushed any in-flight work and you can power me
-            // down whenever".
+            // process keeps running; the host stops the VM with
+            // SIGKILL and does not wait for the guest.
             write_msg(&mut writer, &WireResponse::ShutdownAck).await?;
             return Ok(());
         }

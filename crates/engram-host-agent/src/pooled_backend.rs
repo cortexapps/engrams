@@ -346,6 +346,9 @@ pub struct PooledBackend {
     /// records awaiting coordinator ack) and `finalize/`. `None`
     /// disables checkpoint chains: `snapshot()` stays pure-Full.
     checkpoint_dir: Option<PathBuf>,
+    /// Signalled after each checkpoint record lands in `records/`, so the
+    /// heartbeat advertises it at once instead of on the next period.
+    checkpoint_recorded: Arc<tokio::sync::Notify>,
     /// Durable mirror of the chain heads for survivor rehydrate after a
     /// pod roll. `Some` iff `checkpoint_dir` is `Some`.
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
@@ -1497,6 +1500,7 @@ impl PooledBackend {
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
+            checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
             chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_gates: Arc::new(DashMap::new()),
@@ -1786,6 +1790,7 @@ impl PooledBackend {
             checkpoint_pacing: self.checkpoint_pacing.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
+            checkpoint_recorded: self.checkpoint_recorded.clone(),
             chain_heads: self.chain_heads.clone(),
             session_bindings: self.session_bindings.clone(),
             clock: self.clock.clone(),
@@ -1873,6 +1878,7 @@ impl PooledBackend {
             self.bundle_dir.clone(),
             self.bundle_file_ext(),
             checkpoint_dir,
+            self.checkpoint_recorded.clone(),
             self.pending_finalizes.clone(),
             Arc::new(PooledDestroyer {
                 self_ref: self.self_ref.clone(),
@@ -2881,6 +2887,11 @@ impl PooledBackend {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
+    /// Signalled after each record lands in `checkpoint_records_dir()`.
+    pub fn checkpoint_recorded(&self) -> Arc<tokio::sync::Notify> {
+        self.checkpoint_recorded.clone()
+    }
+
     /// Test-only view of a sandbox's in-RAM chain head.
     #[cfg(test)]
     pub(crate) fn chain_head_for_test(
@@ -3673,6 +3684,7 @@ pub(crate) struct SnapshotFinisher {
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     checkpoint_dir: Option<PathBuf>,
+    checkpoint_recorded: Arc<tokio::sync::Notify>,
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
     clock: Arc<dyn engram_core::traits::Clock>,
@@ -4113,17 +4125,18 @@ impl SnapshotFinisher {
             // (it uses `snapshot_begin`, not `snapshot()`).
             kind: engram_protocol::heartbeat::CheckpointKind::Periodic,
         };
-        if let Err(e) = record
+        match record
             .persist(&engram_host_core::TokioFs, &records_dir)
             .await
         {
-            tracing::warn!(
+            Ok(()) => self.checkpoint_recorded.notify_one(),
+            Err(e) => tracing::warn!(
                 sandbox_id = %id,
                 snapshot_id = %metadata.id,
                 error = %e,
                 "durable checkpoint record write failed; PG row (if the caller's \
                  pipeline survives) is the only reference",
-            );
+            ),
         }
     }
 
@@ -11873,12 +11886,19 @@ mod tests {
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         pooled.session_bindings.insert(sandbox_id, session_id);
+        let checkpoint_recorded = pooled.checkpoint_recorded();
 
         let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
 
         let records_dir = ckpt_dir.join("records");
         let record_path = records_dir.join(format!("{snapshot_id}.json"));
-        wait_for("eviction-final checkpoint record", || record_path.exists()).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            checkpoint_recorded.notified(),
+        )
+        .await
+        .expect("the eviction-final record signals the heartbeat");
+        assert!(record_path.exists(), "the signal follows the record write");
 
         let bytes = tokio::fs::read(&record_path).await.unwrap();
         // R5: records are sealed in a content-hash envelope keyed on their id.
