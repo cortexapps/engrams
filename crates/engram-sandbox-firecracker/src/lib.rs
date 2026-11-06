@@ -473,6 +473,11 @@ async fn read_base_shm_ack(
 /// (Sealed/DrainProgress/DrainDone/PeerLost), bound in the jail dir.
 pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
 
+/// The peer-mode handler's record of the chunks the source supplied,
+/// in the jail dir beside [`UFFD_CONTROL_SOCK_FILE`]. It exists under
+/// this name only once the drain is done.
+pub const POST_COPY_SEALED_FILE: &str = "postcopy-sealed.bin";
+
 /// ADR 0045 C2: the marker the destination's prestage writes into the
 /// snapshot dir to arm a POST-COPY restore (peer-mode handler spawn,
 /// state.bin appears late via the fetch poller).
@@ -2247,6 +2252,8 @@ impl FirecrackerBackend {
             cmd.arg("--peer-export-id").arg(&peer.export_id);
             cmd.arg("--control-sock")
                 .arg(jail_dir.join(UFFD_CONTROL_SOCK_FILE));
+            cmd.arg("--sealed-output")
+                .arg(jail_dir.join(POST_COPY_SEALED_FILE));
             // Token via env: argv leaks on /proc/*/cmdline.
             cmd.env("ENGRAM_PEER_TOKEN", &peer.peer_token);
         }

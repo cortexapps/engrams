@@ -422,6 +422,84 @@ enum Claim {
     Done,
 }
 
+/// Drain connections for a large drain.
+const DRAIN_CONNS: usize = 3;
+/// A drain of this many chunks or fewer uses one connection.
+const DRAIN_SPLIT_MIN_CHUNKS: usize = 64;
+/// Requests each drain connection keeps on the wire.
+const PIPELINE_DEPTH: usize = 8;
+/// Requests each drain connection keeps on the wire while a guest fault
+/// is in flight or finished within [`FAULT_RECENT`].
+const FAULT_SHARE_DEPTH: usize = 2;
+const FAULT_RECENT: Duration = Duration::from_millis(2);
+/// How long a fault (or the drain) waits for another request's install
+/// of the same chunk before it asks for the chunk itself.
+const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
+
+/// The work list the drain connections share.
+struct DrainShared {
+    /// `(offset, forced)`: a forced chunk is requested even when another
+    /// request holds it.
+    todo: Mutex<std::collections::VecDeque<(u64, bool)>>,
+    /// Chunks skipped because another request held them.
+    deferred: Mutex<Vec<u64>>,
+    failed: AtomicBool,
+    /// Distinct from fault-connection request ids in logs.
+    next_req: std::sync::atomic::AtomicU64,
+    resolved: std::sync::atomic::AtomicUsize,
+    total: usize,
+    pulled: std::sync::atomic::AtomicU64,
+    alt_sourced: std::sync::atomic::AtomicU64,
+    zero_chunks: std::sync::atomic::AtomicU64,
+}
+
+impl DrainShared {
+    fn new(todo: Vec<u64>) -> Self {
+        Self {
+            total: todo.len(),
+            todo: Mutex::new(todo.into_iter().map(|o| (o, false)).collect()),
+            deferred: Mutex::new(Vec::new()),
+            failed: AtomicBool::new(false),
+            next_req: std::sync::atomic::AtomicU64::new(1_000_000),
+            resolved: std::sync::atomic::AtomicUsize::new(0),
+            pulled: std::sync::atomic::AtomicU64::new(0),
+            alt_sourced: std::sync::atomic::AtomicU64::new(0),
+            zero_chunks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn pop(&self) -> Option<(u64, bool)> {
+        self.todo.lock().expect("drain queue poisoned").pop_front()
+    }
+
+    fn defer(&self, offset: u64) {
+        self.deferred
+            .lock()
+            .expect("drain queue poisoned")
+            .push(offset);
+    }
+
+    fn force(&self, offset: u64) {
+        self.todo
+            .lock()
+            .expect("drain queue poisoned")
+            .push_front((offset, true));
+    }
+
+    /// Count one chunk as installed, and report progress every 256.
+    fn resolved(&self, rt: &Runtime) {
+        let n = self.resolved.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(256) {
+            if let Some(control) = rt.control.as_ref() {
+                control.report(engram_migrate_proto::HandlerControl::DrainProgress {
+                    pulled: self.pulled.load(Ordering::Relaxed),
+                    remaining: self.total.saturating_sub(n) as u64,
+                });
+            }
+        }
+    }
+}
+
 /// One bounded prefetch slot. Requests are never queued behind a window.
 struct FaultWindow {
     progress: Arc<WindowProgress>,
@@ -536,6 +614,16 @@ pub struct Runtime {
     /// task pulls the rest in the background. `None` ⇒ everything
     /// above is independent of the source.
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
+    /// Peer mode: one flag per chunk, set while a request for the chunk
+    /// is on the wire (drain, fault window, or direct demand). The drain
+    /// skips a requested chunk and a fault waits for its install, so a
+    /// chunk is asked for once. Empty outside peer mode.
+    peer_requested: Vec<AtomicBool>,
+    /// How long a fault or the drain waits for another request's install
+    /// of a chunk before it asks for the chunk itself.
+    peer_requested_wait: Duration,
+    /// Peer mode: where every peer-supplied chunk is recorded.
+    sealed_out: Option<crate::peer::SealedOutput>,
     fault_window: Mutex<Option<FaultWindow>>,
     fault_around_chunks: usize,
     fault_around_chunks_installed: std::sync::atomic::AtomicU64,
@@ -627,6 +715,9 @@ impl Runtime {
             base_shm,
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
+            peer_requested: Vec::new(),
+            peer_requested_wait: PEER_REQUESTED_WAIT,
+            sealed_out: None,
             fault_window: Mutex::new(None),
             fault_around_chunks: crate::peer::DEFAULT_FAULT_AROUND_CHUNKS,
             fault_around_chunks_installed: std::sync::atomic::AtomicU64::new(0),
@@ -644,8 +735,67 @@ impl Runtime {
         peer: std::sync::Arc<crate::peer::PeerSession>,
         control: Option<std::sync::Arc<crate::peer::ControlTx>>,
     ) {
+        let chunk_count = self
+            .installed
+            .lock()
+            .expect("installed bitmap poisoned")
+            .len();
+        self.peer_requested = (0..chunk_count).map(|_| AtomicBool::new(false)).collect();
         self.peer = Some(peer);
         self.control = control;
+    }
+
+    /// Peer mode: record every peer-supplied chunk in `out`.
+    pub fn set_sealed_output(&mut self, out: crate::peer::SealedOutput) {
+        self.sealed_out = Some(out);
+    }
+
+    /// Mark `chunk_idx` requested. `false` when a request is already out.
+    fn try_request(&self, chunk_idx: usize) -> bool {
+        self.peer_requested
+            .get(chunk_idx)
+            .is_some_and(|f| !f.swap(true, Ordering::AcqRel))
+    }
+
+    fn is_requested(&self, chunk_idx: usize) -> bool {
+        self.peer_requested
+            .get(chunk_idx)
+            .is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    /// Clear the request flag and wake faults that wait on the chunk.
+    fn clear_request(&self, chunk_idx: usize) {
+        if let Some(flag) = self.peer_requested.get(chunk_idx) {
+            if flag.swap(false, Ordering::AcqRel) {
+                let _installed = self.installed.lock().expect("installed bitmap poisoned");
+                self.install_cv.notify_all();
+            }
+        }
+    }
+
+    /// Wait up to `peer_requested_wait` for a requested chunk to install.
+    /// `true` when it is installed; `false` when the request ended
+    /// without an install, or the bound passed.
+    fn await_requested(&self, chunk_idx: usize) -> bool {
+        let deadline = std::time::Instant::now() + self.peer_requested_wait;
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        loop {
+            if installed.get(chunk_idx) == Some(&ChunkState::Installed) {
+                return true;
+            }
+            if !self.is_requested(chunk_idx) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            installed = self
+                .install_cv
+                .wait_timeout(installed, remaining)
+                .expect("installed bitmap poisoned")
+                .0;
+        }
     }
 
     /// ADR 0014 M1.14: configure periodic trace_output dumping. The
@@ -1472,11 +1622,21 @@ impl Runtime {
         self.install_claimed_peer_page(offset, bytes)
     }
 
+    /// Every peer install passes here. The chunk is recorded before it
+    /// is marked installed, so once every sealed chunk is installed the
+    /// sealed output is complete.
     fn install_claimed_peer_page(
         &self,
         offset: u64,
         bytes: Option<Bytes>,
     ) -> Result<bool, HandlerError> {
+        if let Some(out) = &self.sealed_out {
+            let len = self
+                .backend
+                .chunk_size()
+                .min(self.backend.total_bytes().saturating_sub(offset));
+            out.record(offset, bytes.as_deref(), len);
+        }
         match bytes {
             Some(bytes) => self.install_claimed_chunk_at(offset, bytes, false),
             None => self.install_claimed_zero_at(offset, false),
@@ -1699,8 +1859,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Only the requested chunk holds fault priority. A busy prefetch slot
-    /// drops new speculative work; every demand uses the fault connection.
+    /// Only the requested chunk holds fault priority. A chunk already on
+    /// the wire (drain or window) is awaited, not asked for again. A busy
+    /// prefetch slot drops new speculative work; every other demand uses
+    /// the fault connection.
     fn serve_fault_window(
         self: &Arc<Self>,
         peer: &Arc<crate::peer::PeerSession>,
@@ -1708,28 +1870,55 @@ impl Runtime {
         fault_offset: u64,
     ) -> Result<(), HandlerError> {
         use crate::peer::PEER_READ_TIMEOUT;
+        let chunk_size = self.backend.chunk_size();
+        let fault_idx = (fault_offset / chunk_size) as usize;
         let mut slot = self.fault_window.lock().expect("window slot poisoned");
         if slot.as_ref().is_some_and(|job| job.thread.is_finished()) {
             slot.take().unwrap().stop();
         }
-        if self.is_drain_done()
-            || self.chunk_installed((fault_offset / self.backend.chunk_size()) as usize)
-        {
+        if self.is_drain_done() || self.chunk_installed(fault_idx) {
             return Ok(());
+        }
+        if self.is_requested(fault_idx) {
+            drop(slot);
+            let _fault = peer.begin_fault();
+            if self.await_requested(fault_idx) {
+                return Ok(());
+            }
+            slot = self.fault_window.lock().expect("window slot poisoned");
         }
         if slot.is_some() {
             drop(slot);
             // Overlapping demands also bypass the worker. Install claims
             // deduplicate its later response without waiting for the suffix.
-            let page = peer
-                .need_at(fault_offset)
-                .map_err(|e| HandlerError::PeerLost(e.to_string()))?;
-            return self.install_window_page(fault_offset, page);
+            let owned = self.try_request(fault_idx);
+            let page = peer.need_at(fault_offset);
+            let installed = page
+                .map_err(|e| HandlerError::PeerLost(e.to_string()))
+                .and_then(|page| self.install_window_page(fault_offset, page));
+            if owned {
+                self.clear_request(fault_idx);
+            }
+            return installed;
         }
         if peer.is_lost() {
             return Err(HandlerError::PeerLost("peer already marked lost".into()));
         }
         let _fault = peer.begin_fault();
+        // The window asks only for chunks no other request holds; the
+        // faulting chunk is always asked for.
+        let mut owned = Vec::with_capacity(offsets.len());
+        let offsets: Vec<u64> = offsets
+            .into_iter()
+            .filter(|offset| {
+                let idx = (offset / chunk_size) as usize;
+                let mine = self.try_request(idx);
+                if mine {
+                    owned.push(idx);
+                }
+                mine || *offset == fault_offset
+            })
+            .collect();
         let progress = Arc::new(WindowProgress::new());
         let worker_progress = progress.clone();
         let runtime = Arc::downgrade(self);
@@ -1806,8 +1995,22 @@ impl Runtime {
                             connected,
                         )
                         .map_err(|e| e.to_string())??;
+                    // Every response was read: the connection is idle and
+                    // can serve the next window. Unregister it first, so a
+                    // later stop() of this window cannot shut it down.
+                    let mut socket = worker_progress.socket.lock().expect("window poisoned");
+                    if !worker_progress.stopped() {
+                        *socket = None;
+                        drop(socket);
+                        worker_peer.return_prefetch_conn(conn);
+                    }
                     Ok(())
                 })();
+                if let Some(rt) = runtime.upgrade() {
+                    for idx in owned {
+                        rt.clear_request(idx);
+                    }
+                }
                 if let Err(error) = result {
                     if let Some(rt) = runtime.upgrade() {
                         let message = engram_migrate_proto::HandlerControl::PeerLost {
@@ -1888,12 +2091,17 @@ impl Runtime {
 
     /// ADR 0045 C2: the background drain — pull every sealed chunk the
     /// fault path hasn't already served, over the drain's OWN
-    /// connection, pipelined. Runs FIRST on the producer thread (before
+    /// connections, pipelined. Runs FIRST on the producer thread (before
     /// the trace prefault and the eager sweep): sealed content exists
     /// only in the paused source, so draining it is what releases the
     /// source — and it makes the later sweep/prefault trivially safe
     /// (by the time they run, every sealed chunk is installed, so their
     /// stale `resolve()` view can never be installed over divergence).
+    ///
+    /// A large drain runs on [`DRAIN_CONNS`] connections; the source
+    /// serves each connection on its own thread. A chunk that a fault
+    /// already requested is skipped until that request ends; it is asked
+    /// for again only if it is still not installed then.
     ///
     /// `AltSource` responses demote inline to the class-2 path (fetch
     /// via cache/store + private install). Install errors are real
@@ -1913,13 +2121,7 @@ impl Runtime {
         hot: &mut Option<WorkingSetTrace>,
         hint: &mut impl FnMut() -> Option<WorkingSetTrace>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
-        use crate::peer::{DrainStats, PeerPage};
-
-        const PIPELINE_DEPTH: usize = 8;
-        // Per-request (retryable, `Error{req_id: Some}`) drain failures get
-        // a bounded same-conn retry before the drain gives up (issue #227 b).
-        const DRAIN_REQUEST_RETRIES: u32 = 3;
-        const DRAIN_REQUEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+        use crate::peer::DrainStats;
 
         let chunk_size = self.backend.chunk_size();
         let seal = peer.seal();
@@ -1927,7 +2129,6 @@ impl Runtime {
         let mut conn = peer
             .open_extra_conn()
             .map_err(|e| HandlerError::PeerLost(format!("drain conn: {e}")))?;
-        let next_req = std::sync::atomic::AtomicU64::new(1_000_000); // distinct from fault-conn ids in logs
 
         // Pending sealed chunk offsets, skipping anything already
         // installed by a racing fault. HOT-FIRST: the source's
@@ -1959,83 +2160,180 @@ impl Runtime {
         if hot_leading > 0 {
             tracing::info!(hot_leading, total = todo.len(), "drain ordered hot-first");
         }
-        let total_sealed = todo.len();
+        let extra_conns = if todo.len() > DRAIN_SPLIT_MIN_CHUNKS {
+            DRAIN_CONNS - 1
+        } else {
+            0
+        };
+        let shared = DrainShared::new(todo);
 
+        let mut apply_hint = || {
+            let Some(trace) = hint() else { return };
+            let mut todo = shared.todo.lock().expect("drain queue poisoned");
+            stats.hot_hint_received |= !trace.chunks.is_empty() && !todo.is_empty();
+            let mut rank = std::collections::HashMap::new();
+            for hash in &trace.chunks {
+                for offset in self.backend.session_positions_of(*hash) {
+                    let next = rank.len();
+                    rank.entry(offset).or_insert(next);
+                }
+            }
+            stats.hot_leading += todo
+                .iter()
+                .filter(|(o, _)| {
+                    rank.contains_key(o) && !self.chunk_installed((*o / chunk_size) as usize)
+                })
+                .count() as u64;
+            todo.make_contiguous()
+                .sort_by_key(|(o, _)| rank.get(o).copied().unwrap_or(usize::MAX));
+            // The source already merged handler and idle hints in priority
+            // order. Keep all hashes, including unsealed chunks, for the
+            // post-drain prefault. Never wait for another hint.
+            *hot = Some(trace);
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..extra_conns)
+                .map(|_| {
+                    scope.spawn(|| -> Result<(), HandlerError> {
+                        // An extra connection only adds throughput: the
+                        // first connection drains alone without it.
+                        let mut conn = match peer.open_extra_conn() {
+                            Ok(conn) => conn,
+                            Err(error) => {
+                                tracing::warn!(%error, "extra drain connection failed");
+                                return Ok(());
+                            }
+                        };
+                        self.drain_conn(peer, &shared, &mut conn, &mut || {})
+                    })
+                })
+                .collect();
+            let mut result = self.drain_conn(peer, &shared, &mut conn, &mut apply_hint);
+            for worker in workers {
+                let joined = worker.join().unwrap_or_else(|_| {
+                    Err(HandlerError::PeerLost("drain worker panicked".into()))
+                });
+                if result.is_ok() {
+                    result = joined;
+                }
+            }
+            result
+        })?;
+
+        stats.pulled = shared.pulled.load(Ordering::Relaxed);
+        stats.alt_sourced = shared.alt_sourced.load(Ordering::Relaxed);
+        stats.zero_chunks = shared.zero_chunks.load(Ordering::Relaxed);
+        let _ = crate::peer::send_drain_done(&mut conn, stats);
+        Ok(stats)
+    }
+
+    /// One drain connection: pipeline requests from the shared queue and
+    /// install the responses, until the queue and the deferred set are
+    /// empty or another connection failed. `tick` runs once per response.
+    fn drain_conn(
+        &self,
+        peer: &crate::peer::PeerSession,
+        shared: &DrainShared,
+        conn: &mut std::net::TcpStream,
+        tick: &mut dyn FnMut(),
+    ) -> Result<(), HandlerError> {
+        let result = self.drain_conn_inner(peer, shared, conn, tick);
+        if result.is_err() {
+            shared.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn drain_conn_inner(
+        &self,
+        peer: &crate::peer::PeerSession,
+        shared: &DrainShared,
+        conn: &mut std::net::TcpStream,
+        tick: &mut dyn FnMut(),
+    ) -> Result<(), HandlerError> {
+        use crate::peer::PeerPage;
+        // Per-request (retryable, `Error{req_id: Some}`) drain failures get
+        // a bounded same-conn retry before the drain gives up (issue #227 b).
+        const DRAIN_REQUEST_RETRIES: u32 = 3;
+        const DRAIN_REQUEST_BACKOFF: Duration = Duration::from_millis(50);
+
+        let chunk_size = self.backend.chunk_size();
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
-        let mut todo: std::collections::VecDeque<_> = todo.into();
-        // Issue #227 (b): offsets the source answered with a per-request
-        // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
-        // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
-        // SAME pipeline (preserving strict request/response FIFO order on
-        // the wire — never a side-band read) rather than rewinding the
-        // whole drain. `attempts[offset]` bounds the retries.
+                                                                                        // Issue #227 (b): offsets the source answered with a per-request
+                                                                                        // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
+                                                                                        // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
+                                                                                        // SAME pipeline (preserving strict request/response FIFO order on
+                                                                                        // the wire — never a side-band read) rather than rewinding the
+                                                                                        // whole drain. `attempts[offset]` bounds the retries. Their
+                                                                                        // request flags stay set until the chunk is installed.
         let mut retry: std::collections::VecDeque<u64> = Default::default();
         let mut attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        let mut processed = 0usize;
+        let abandon = |in_flight: &std::collections::VecDeque<(u64, u64)>,
+                       retry: &std::collections::VecDeque<u64>| {
+            for offset in in_flight.iter().map(|(_, o)| o).chain(retry.iter()) {
+                self.clear_request((offset / chunk_size) as usize);
+            }
+        };
         loop {
-            if let Some(trace) = hint() {
-                stats.hot_hint_received |= !trace.chunks.is_empty() && !todo.is_empty();
-                let mut rank = std::collections::HashMap::new();
-                for hash in &trace.chunks {
-                    for offset in self.backend.session_positions_of(*hash) {
-                        let next = rank.len();
-                        rank.entry(offset).or_insert(next);
-                    }
-                }
-                stats.hot_leading += todo
-                    .iter()
-                    .filter(|o| {
-                        rank.contains_key(o) && !self.chunk_installed((**o / chunk_size) as usize)
-                    })
-                    .count() as u64;
-                todo.make_contiguous()
-                    .sort_by_key(|o| rank.get(o).copied().unwrap_or(usize::MAX));
-                // The source already merged handler and idle hints in priority
-                // order. Keep all hashes, including unsealed chunks, for the
-                // post-drain prefault. Never wait for another hint.
-                *hot = Some(trace);
+            if shared.failed.load(Ordering::SeqCst) {
+                abandon(&in_flight, &retry);
+                return Ok(());
             }
-            // Fill the pipeline — but YIELD to guest faults. A fault
-            // request queuing behind the drain's in-flight bulk bytes
-            // was the measured ~7 ms/fault (vs ~1 ms on a quiet wire);
-            // during a post-resume fault storm the guest's stall
-            // matters and the drain's finish time does not (it only
-            // delays the source release). Parking REFILLS only: the
-            // up-to-8 outstanding responses flush in a few ms, then
-            // the wire belongs to the fault path until it goes quiet.
-            while peer.fault_active_within(std::time::Duration::from_millis(2)) {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            while in_flight.len() < PIPELINE_DEPTH {
-                // Drain re-queued (per-request-failed) offsets first, then
-                // the fresh todo list.
-                let offset = match retry.pop_front() {
-                    Some(o) => o,
-                    None => match todo.pop_front() {
-                        Some(o) => o,
+            tick();
+            // Yield most of the wire to guest faults: a fault request
+            // that queues behind bulk drain bytes stalls a vCPU, while
+            // the drain's finish time only delays the source release.
+            let depth = if peer.fault_active_within(FAULT_RECENT) {
+                FAULT_SHARE_DEPTH
+            } else {
+                PIPELINE_DEPTH
+            };
+            while in_flight.len() < depth {
+                let (offset, forced) = match retry.pop_front() {
+                    Some(o) => (o, true),
+                    None => match shared.pop() {
+                        Some(next) => next,
                         None => break,
                     },
                 };
-                if self.chunk_installed((offset / chunk_size) as usize) {
-                    processed += 1;
+                let idx = (offset / chunk_size) as usize;
+                if self.chunk_installed(idx) {
+                    shared.resolved(self);
                     continue;
                 }
-                let req_id = next_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                engram_migrate_proto::write_frame(
-                    &mut conn,
+                if !self.try_request(idx) && !forced {
+                    shared.defer(offset);
+                    continue;
+                }
+                let req_id = shared.next_req.fetch_add(1, Ordering::Relaxed);
+                if let Err(e) = engram_migrate_proto::write_frame(
+                    &mut *conn,
                     &engram_migrate_proto::ToSource::NeedAt {
                         req_id,
                         chunk_offset: offset,
                     },
-                )
-                .map_err(|e| HandlerError::PeerLost(format!("drain write: {e}")))?;
+                ) {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain write: {e}")));
+                }
                 in_flight.push_back((req_id, offset));
             }
             let Some((req_id, offset)) = in_flight.pop_front() else {
-                break; // pipeline empty and iterator exhausted
+                if retry.is_empty() && !self.settle_deferred(shared) {
+                    return Ok(());
+                }
+                continue;
             };
-            let resp = engram_migrate_proto::read_frame(&mut conn)
-                .map_err(|e| HandlerError::PeerLost(format!("drain read: {e}")))?;
+            let idx = (offset / chunk_size) as usize;
+            let resp = match engram_migrate_proto::read_frame(&mut *conn) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain read: {e}")));
+                }
+            };
             // Issue #227 (b): a per-request server error (`Error{req_id:
             // Some}`) is NOT migration-fatal — the conn keeps serving. Bound-
             // retry THAT chunk via the re-queue (FIFO-safe) instead of
@@ -2047,6 +2345,8 @@ impl Runtime {
                     let n = attempts.entry(offset).or_insert(0);
                     *n += 1;
                     if *n > DRAIN_REQUEST_RETRIES {
+                        self.clear_request(idx);
+                        abandon(&in_flight, &retry);
                         return Err(HandlerError::PeerLost(format!(
                             "drain per-request retries exhausted at offset {offset:#x}: {msg}"
                         )));
@@ -2061,65 +2361,47 @@ impl Runtime {
                     retry.push_back(offset);
                     continue;
                 }
-                Err(e) => return Err(HandlerError::PeerLost(format!("drain decode: {e}"))),
+                Err(e) => {
+                    self.clear_request(idx);
+                    abandon(&in_flight, &retry);
+                    return Err(HandlerError::PeerLost(format!("drain decode: {e}")));
+                }
             };
-            match page {
-                PeerPage::Bytes(bytes) => {
-                    self.install_chunk_at(offset, bytes.into(), false)?;
-                    stats.pulled += 1;
-                }
-                PeerPage::Zero => {
-                    self.install_zero_at(offset, false)?;
-                    stats.zero_chunks += 1;
-                }
-                PeerPage::AltSource(_durable) => {
-                    // Class-2 demote: serve through the normal resolve
-                    // arms (private install; the shared base is never
-                    // written with session-addressed content here).
-                    match self.backend.resolve(offset) {
-                        Some(ResolvedPage::Chunk { hash }) => {
-                            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                            self.install_chunk_at(offset, bytes, false)?;
-                        }
-                        Some(ResolvedPage::Canonical { canonical_offset }) => {
-                            match self.backend.canonical_chunk_hash(canonical_offset) {
-                                Some(hash) => {
-                                    let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                                    self.install_chunk_at(offset, bytes, false)?;
-                                }
-                                None => {
-                                    self.install_zero_at(offset, false)?;
-                                }
-                            }
-                        }
-                        Some(ResolvedPage::Zero { .. }) => {
-                            // Session omits this offset → private zero
-                            // page (the shared base is never written
-                            // with session-addressed content here).
-                            self.install_zero_at(offset, false)?;
-                        }
-                        None => {
-                            return Err(HandlerError::PeerLost(format!(
-                                "AltSource demote for unresolvable offset {offset:#x}"
-                            )));
-                        }
-                    }
-                    stats.alt_sourced += 1;
-                }
+            let counter = match &page {
+                PeerPage::Bytes(_) => &shared.pulled,
+                PeerPage::Zero => &shared.zero_chunks,
+                PeerPage::AltSource(_) => &shared.alt_sourced,
+            };
+            let installed = Self::prepare_peer_page(&self.backend, &self.handle, offset, page)
+                .and_then(|bytes| self.install_prepared_peer_page(offset, bytes));
+            self.clear_request(idx);
+            if let Err(e) = installed {
+                abandon(&in_flight, &retry);
+                return Err(e);
             }
-            processed += 1;
-            if processed.is_multiple_of(256) {
-                if let Some(control) = self.control.as_ref() {
-                    control.report(engram_migrate_proto::HandlerControl::DrainProgress {
-                        pulled: stats.pulled,
-                        remaining: (total_sealed - processed) as u64,
-                    });
-                }
+            counter.fetch_add(1, Ordering::Relaxed);
+            shared.resolved(self);
+        }
+    }
+
+    /// Wait for the chunks other requests held, and queue the ones still
+    /// not installed for a request of their own. `false` when nothing
+    /// was deferred.
+    fn settle_deferred(&self, shared: &DrainShared) -> bool {
+        let deferred = std::mem::take(&mut *shared.deferred.lock().expect("drain queue poisoned"));
+        if deferred.is_empty() {
+            return false;
+        }
+        let chunk_size = self.backend.chunk_size();
+        for offset in deferred {
+            let idx = (offset / chunk_size) as usize;
+            if self.chunk_installed(idx) || self.await_requested(idx) {
+                shared.resolved(self);
+            } else {
+                shared.force(offset);
             }
         }
-
-        let _ = crate::peer::send_drain_done(&mut conn, stats);
-        Ok(stats)
+        true
     }
 
     /// `UFFDIO_WAKE` the specified page. Used when the chunk this
@@ -2175,6 +2457,9 @@ pub struct RunListenerOpts {
         std::sync::Arc<crate::peer::PeerSession>,
         Option<std::sync::Arc<crate::peer::ControlTx>>,
     )>,
+    /// Peer mode: record every peer-supplied chunk here (see
+    /// [`crate::peer::SealedOutput`]).
+    pub sealed_output: Option<PathBuf>,
 }
 
 pub fn run_listener(
@@ -2191,6 +2476,7 @@ pub fn run_listener(
         trace_output,
         base_shm,
         peer,
+        sealed_output,
     } = opts;
     let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
@@ -2216,6 +2502,14 @@ pub fn run_listener(
     }
     if let Some((session, control)) = peer {
         rt.set_peer(session, control);
+        if let Some(path) = sealed_output {
+            match crate::peer::SealedOutput::create(path) {
+                Ok(out) => rt.set_sealed_output(out),
+                Err(error) => {
+                    tracing::warn!(%error, "sealed output unavailable; the first checkpoint is Full")
+                }
+            }
+        }
     }
     // ADR 0043 P1: run the working-set prefault as a BACKGROUND producer
     // concurrent with the fault loop, instead of blocking resume on it.
@@ -2277,6 +2571,11 @@ pub fn run_listener(
                             // path must already know not to dial the peer by
                             // the time that frame is observed.
                             rt.mark_drain_done();
+                            // Every sealed chunk is installed, so the
+                            // sealed output is complete.
+                            if let Some(out) = rt.sealed_out.as_ref() {
+                                out.finish();
+                            }
                             let fault_around_chunks_installed = rt
                                 .fault_around_chunks_installed
                                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -4337,6 +4636,80 @@ mod tests {
         );
         // SAFETY: all chunks are installed, and the fault worker has joined.
         assert_eq!(unsafe { std::ptr::read((base + 4096) as *const u8) }, 0xCD);
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    /// A chunk another request holds is not asked for again by the drain,
+    /// and every peer install lands in the sealed output, which gets its
+    /// final name only when the caller finishes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skips_a_requested_chunk_and_records_the_sealed_output() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession, SealedOutput,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let addr = fake_source(vec![0, 1, 2, 3], move |req, offset| {
+            log.lock().unwrap().push(offset);
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let peer = Arc::new(peer);
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("sealed.bin");
+        {
+            let rt = Arc::get_mut(&mut rt).unwrap();
+            rt.set_peer(peer.clone(), None);
+            rt.set_sealed_output(SealedOutput::create(out_path.clone()).unwrap());
+            // Long enough that the drain waits for this test's install.
+            rt.peer_requested_wait = Duration::from_secs(10);
+        }
+        // A fault window holds chunk 1.
+        assert!(rt.try_request(1));
+        let drain_rt = rt.clone();
+        let drain_peer = peer.clone();
+        let drain = std::thread::spawn(move || drain_rt.drain_from_peer(&drain_peer, None));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ![0, 2, 3].iter().all(|i| rt.chunk_installed(*i)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not install"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(rt
+            .install_prepared_peer_page(4096, Some(Bytes::from(vec![0x5A; 4096])))
+            .unwrap());
+        rt.clear_request(1);
+        let stats = drain.join().unwrap().unwrap();
+        assert_eq!(stats.pulled, 3);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            vec![0, 8192, 12288],
+            "the held chunk was asked for again"
+        );
+        assert!(!out_path.exists(), "an unfinished set has no final name");
+        rt.sealed_out.as_ref().unwrap().finish();
+        let sealed = std::fs::read(&out_path).unwrap();
+        assert_eq!(sealed.len(), 16384);
+        assert!(sealed[..4096].iter().all(|b| *b == 0xAB));
+        assert!(sealed[4096..8192].iter().all(|b| *b == 0x5A));
+        assert!(sealed[8192..].iter().all(|b| *b == 0xAB));
+        let base = rt.mappings[0].base_host_virt_addr;
+        // SAFETY: the drain has joined and no fault is in flight.
         unsafe {
             libc::munmap(base as *mut _, 16384);
         }

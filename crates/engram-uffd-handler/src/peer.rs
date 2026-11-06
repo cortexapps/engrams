@@ -172,6 +172,70 @@ pub struct DrainStats {
     pub zero_chunks: u64,
 }
 
+/// The bytes the peer supplied for each sealed chunk, written at the
+/// chunk's session offset before the chunk is installed. After the
+/// drain, the file holds the guest's memory at load for every sealed
+/// chunk; the host-agent publishes those ranges over the source's chain
+/// manifest, and the destination's first checkpoint diffs against the
+/// result. Writes go to `<path>.partial`; only [`SealedOutput::finish`]
+/// gives the file its final name, so a reader never sees a partial set.
+#[derive(Debug)]
+pub struct SealedOutput {
+    file: std::fs::File,
+    partial: PathBuf,
+    path: PathBuf,
+    /// Latched by the first failed write. A failed set is never
+    /// finished, so the host-agent takes a Full checkpoint instead.
+    failed: AtomicBool,
+}
+
+impl SealedOutput {
+    pub fn create(path: PathBuf) -> std::io::Result<Self> {
+        let mut partial = path.clone().into_os_string();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::File::create(&partial)?;
+        Ok(Self {
+            file,
+            partial,
+            path,
+            failed: AtomicBool::new(false),
+        })
+    }
+
+    /// Record one chunk: `bytes`, or `len` zero bytes for a zero chunk.
+    pub fn record(&self, offset: u64, bytes: Option<&[u8]>, len: u64) {
+        use std::os::unix::fs::FileExt as _;
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let zeros;
+        let data = match bytes {
+            Some(bytes) => bytes,
+            None => {
+                zeros = vec![0u8; len as usize];
+                &zeros
+            }
+        };
+        if let Err(error) = self.file.write_all_at(data, offset) {
+            tracing::warn!(%error, offset, "sealed output write failed; the first checkpoint is Full");
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Give a complete set its final name. Call only after every sealed
+    /// chunk is installed.
+    pub fn finish(&self) {
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(error) = std::fs::rename(&self.partial, &self.path) {
+            tracing::warn!(%error, "sealed output rename failed; the first checkpoint is Full");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PeerSession {
     addr: String,
@@ -184,6 +248,11 @@ pub struct PeerSession {
     /// (the fault loop is single-threaded); the mutex also covers the
     /// reconnect-swap.
     fault_conn: Mutex<TcpStream>,
+    /// Idle fault-window connections. A window takes one instead of
+    /// dialing (Hello, HelloAck, Seal) and gives it back when it ends
+    /// cleanly.
+    #[cfg(target_os = "linux")]
+    window_conns: Mutex<Vec<TcpStream>>,
     next_req: AtomicU64,
     lost: AtomicBool,
     /// Fault-path accounting (restore-tail attribution): how many
@@ -193,10 +262,9 @@ pub struct PeerSession {
     fault_us: AtomicU64,
     fault_max_us: AtomicU64,
     /// Fault-priority gate for the drain: guest faults in flight +
-    /// the µs-since-`epoch` stamp of the last fault completion. The
-    /// drain parks while a fault is active-or-recent so the fault
-    /// never queues behind the drain's bulk bytes on the wire (the
-    /// measured ~7 ms/fault was exactly that queueing).
+    /// the µs-since-`epoch` stamp of the last fault completion. While a
+    /// fault is active or recent, each drain connection keeps fewer
+    /// requests on the wire, so a fault queues behind little bulk data.
     faults_inflight: AtomicU64,
     last_fault_us: AtomicU64,
     epoch: std::time::Instant,
@@ -219,6 +287,19 @@ fn apply_peer_sockopts(stream: &TcpStream) -> std::io::Result<()> {
     // stays the owner.
     socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
     Ok(())
+}
+
+/// True when an idle connection has neither unread bytes nor an EOF:
+/// the source answers only requests, so anything readable on an idle
+/// connection means it is closed or out of step.
+#[cfg(target_os = "linux")]
+fn conn_is_open(conn: &TcpStream) -> bool {
+    if conn.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let idle = matches!(conn.peek(&mut byte), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    conn.set_nonblocking(false).is_ok() && idle
 }
 
 /// Dial + `Hello` + `HelloAck` + `Seal` on a fresh connection,
@@ -376,6 +457,8 @@ impl PeerSession {
             chunk_size: expect_chunk_size,
             expected_total: expect_total_bytes,
             fault_conn: Mutex::new(stream),
+            #[cfg(target_os = "linux")]
+            window_conns: Mutex::new(Vec::new()),
             next_req: AtomicU64::new(1),
             lost: AtomicBool::new(false),
             fault_count: AtomicU64::new(0),
@@ -397,7 +480,7 @@ impl PeerSession {
     }
 
     /// True while a guest fault is in flight or one completed within
-    /// `window` — the drain's park condition.
+    /// `window` — the drain then keeps fewer requests out.
     pub fn fault_active_within(&self, window: std::time::Duration) -> bool {
         if self.faults_inflight.load(Ordering::Relaxed) > 0 {
             return true;
@@ -450,12 +533,31 @@ impl PeerSession {
     }
 
     /// Fault windows use their own connection; the source permits multiple
-    /// Fault connections per export. This does not hold the drain priority gate.
+    /// Fault connections per export. An idle pooled connection is used
+    /// first; a closed one is dropped. This does not hold the drain
+    /// priority gate.
     #[cfg(target_os = "linux")]
     pub(crate) fn open_prefetch_conn(
         &self,
         connected: impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
     ) -> Result<TcpStream, PeerError> {
+        loop {
+            let Some(conn) = self
+                .window_conns
+                .lock()
+                .expect("window conns poisoned")
+                .pop()
+            else {
+                break;
+            };
+            if !conn_is_open(&conn) {
+                continue;
+            }
+            if !connected(None)? || !connected(Some(&conn))? {
+                return Err(PeerError::Lost("connection canceled".into()));
+            }
+            return Ok(conn);
+        }
         dial_with_socket(
             &self.addr,
             &self.export_id,
@@ -466,6 +568,17 @@ impl PeerSession {
             connected,
         )
         .map(|(stream, _)| stream)
+    }
+
+    /// Give a fault-window connection back after a window that read
+    /// every response it asked for.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn return_prefetch_conn(&self, conn: TcpStream) {
+        const MAX_IDLE_WINDOW_CONNS: usize = 4;
+        let mut idle = self.window_conns.lock().expect("window conns poisoned");
+        if idle.len() < MAX_IDLE_WINDOW_CONNS {
+            idle.push(conn);
+        }
     }
 
     /// Run a one-chunk demand window on the fault connection.
@@ -604,7 +717,7 @@ impl PeerSession {
 
 impl PeerSession {
     /// Fault-scope guard: counts the fault, marks it in-flight (the
-    /// drain's park condition), and on drop — every return path —
+    /// drain's share gate), and on drop — every return path —
     /// accumulates the elapsed wall, tracks the max, and stamps the
     /// completion time for the drain's recent-fault window.
     pub(crate) fn begin_fault(&self) -> impl Drop + '_ {
