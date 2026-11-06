@@ -870,9 +870,18 @@ impl CosimHost {
         tokio::fs::create_dir_all(&dest)
             .await
             .map_err(|e| format!("snapshot_begin staging dir: {e}"))?;
-        tokio::fs::write(dest.join("state.bin"), b"cosim fc state")
-            .await
-            .map_err(|e| format!("snapshot_begin state.bin: {e}"))?;
+        // The files a Firecracker full capture leaves: the finalize's
+        // memory leg chunks `memory.bin` and patches the `manifest.json`
+        // sidecar, and its blob leg uploads both with `state.bin`.
+        for (name, body) in [
+            ("state.bin", &b"cosim fc state"[..]),
+            ("memory.bin", &b"cosim guest memory"[..]),
+            ("manifest.json", &br#"{"format":"fc"}"#[..]),
+        ] {
+            tokio::fs::write(dest.join(name), body)
+                .await
+                .map_err(|e| format!("snapshot_begin {name}: {e}"))?;
+        }
 
         // The checkpoint taken under the pause: the transient volume the
         // finalize publishes by name.
