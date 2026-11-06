@@ -116,9 +116,12 @@ struct Inner {
     /// Peers by session manifest id, for fetches that know only which
     /// manifest they serve (a page fault), each with the id of the
     /// registration that put it there.
-    peers: Mutex<HashMap<Uuid, (u64, Arc<dyn PeerSource>)>>,
+    peers: Mutex<HashMap<Uuid, Registered>>,
     next_registration: AtomicU64,
 }
+
+/// A registered peer and the id of its registration.
+type Registered = (u64, Arc<dyn PeerSource>);
 
 /// Keeps a peer registered; dropping it unregisters the peer, unless a
 /// later registration for the same manifest replaced it.
