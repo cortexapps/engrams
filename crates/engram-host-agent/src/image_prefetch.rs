@@ -1415,7 +1415,7 @@ mod tests {
             engram_fill::Config {
                 in_flight: 1,
                 demand_reserve: 0,
-                hedge_after: None,
+                ..engram_fill::Config::default()
             },
         );
         let held = futures::executor::block_on(fill.admission().acquire(Class::Demand));

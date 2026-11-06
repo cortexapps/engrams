@@ -530,6 +530,9 @@ pub struct PooledBackend {
     /// When each sandbox's harness first attached (Unix ms). The
     /// first-touch prefix a capture publishes ends here.
     attached_at_ms: Arc<DashMap<SandboxId, i64>>,
+    /// A restored sandbox's hinted peer, registered with the fill engine
+    /// for its memory manifest until the sandbox goes.
+    peer_registrations: Arc<DashMap<SandboxId, engram_fill::PeerRegistration>>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1495,22 +1498,27 @@ impl PooledBackend {
         if let (true, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
             let session = read_trace_lineage(&src).await;
             let md = metadata.clone();
-            let peer = self
-                .chunk_cache
-                .clone()
-                .filter(|_| !md.peer_hints.is_empty());
-            let health = self.peer_health.clone();
+            // A hinted peer holds the session's chunks on local disk: every
+            // memory fetch of this restore (faults through the substrate,
+            // the prefix, the rest) asks it before the store.
+            let fill = match (md.peer_hints.first(), md.memory_manifest) {
+                (Some(addr), Some(memory)) => {
+                    let peer: Arc<dyn engram_fill::PeerSource> =
+                        crate::peer_fill::PeerFetcher::spawn(
+                            addr.clone(),
+                            engram_protocol::grpc_client::PeerChunkScope::Snapshot(md.id),
+                            self.peer_health.clone(),
+                        );
+                    self.peer_registrations.insert(
+                        id,
+                        fill.register_peer(memory.manifest_id, Arc::clone(&peer)),
+                    );
+                    fill.with_peer(peer)
+                }
+                _ => fill,
+            };
             tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    // A hinted peer holds the session's chunks on local
-                    // disk; take memory from it first, then the store
-                    // fills whatever it did not have.
-                    if let (Some(cache), Some(r)) = (peer, md.memory_manifest) {
-                        if let Ok(m) = fill.store().get_manifest(r).await {
-                            let want = m.chunks.iter().map(|c| c.hash).collect();
-                            pull_from_peers(&cache, &health, &md, want).await;
-                        }
-                    }
                     if let Err(e) =
                         Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate, session).await
                     {
@@ -1711,6 +1719,7 @@ impl PooledBackend {
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             attached_at_ms: Arc::new(DashMap::new()),
+            peer_registrations: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
             checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
@@ -2521,39 +2530,26 @@ impl PooledBackend {
         }
     }
 
-    /// ADR 0095, a peer-hinted resume: before the guest resumes, land
-    /// from the hinted sibling what the boot needs at once, the disk
-    /// manifest's chunks and the session's first-touch memory prefix. The
-    /// rest of memory follows in the background (`restore_with`). Wholly
-    /// best-effort: a shortfall leaves those chunks to the store.
+    /// ADR 0095, a peer-hinted resume: the disk is staged before the guest
+    /// boots, so its chunks come from the hinted sibling in bulk first.
+    /// Memory goes through the fill engine with the peer as a tier
+    /// (`restore_with`). Best-effort: a shortfall leaves those chunks to
+    /// the store.
     async fn peer_resume_prepass(&self, metadata: &SnapshotMetadata) {
-        let (Some(store), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
-        else {
+        let (Some(store), Some(cache), Some(r)) = (
+            self.chunk_store.clone(),
+            self.chunk_cache.clone(),
+            metadata.disk_manifest,
+        ) else {
             return;
         };
-        let mut want = Vec::new();
-        if let Some(r) = metadata.disk_manifest {
-            match store.get_manifest(r).await {
-                Ok(m) => want.extend(m.chunks.iter().map(|c| c.hash)),
-                Err(e) => tracing::warn!(manifest = %r, error = %e, "peer pre-pass: disk manifest"),
+        match store.get_manifest(r).await {
+            Ok(m) => {
+                let want = m.chunks.iter().map(|c| c.hash).collect();
+                pull_from_peers(&cache, &self.peer_health, metadata, want).await;
             }
+            Err(e) => tracing::warn!(manifest = %r, error = %e, "peer pre-pass: disk manifest"),
         }
-        // The sidecar names the session whose prefix this is.
-        let src = self.inner.snapshot_path_for(metadata.id);
-        let _ = materialize_state_if_missing(
-            store.blob_storage().as_ref(),
-            &src,
-            metadata.state_blob_key.as_deref(),
-            metadata.sidecar_blob_key.as_deref(),
-        )
-        .await;
-        if let (Some(session), Some(r)) = (read_trace_lineage(&src).await, metadata.memory_manifest)
-        {
-            if let Ok(m) = store.get_manifest(r).await {
-                want.extend(first_touch_hashes(&store, session, &m).await);
-            }
-        }
-        pull_from_peers(&cache, &self.peer_health, metadata, want).await;
     }
 
     /// ADR 0045 C2 (destination): stage the presetup's restore package
@@ -5932,6 +5928,7 @@ impl SandboxBackend for PooledBackend {
                 let inner = self.inner.clone();
                 let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
                 let attached_at_ms = self.attached_at_ms.clone();
+                let peer_registrations = self.peer_registrations.clone();
                 let checkpoint_pacing = self.checkpoint_pacing.clone();
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
                 let checkpoint_chains = self.checkpoint_chains.clone();
@@ -5992,6 +5989,7 @@ impl SandboxBackend for PooledBackend {
                     }
                     let _ = last_snapshot_unix_ms.remove(&id);
                     let _ = attached_at_ms.remove(&id);
+                    let _ = peer_registrations.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
                     let _ = dead_probe_inflight.remove(&id);
                     // Durable checkpoint records survive destroy: an eviction's

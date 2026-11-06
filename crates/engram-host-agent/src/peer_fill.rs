@@ -440,7 +440,7 @@ async fn pull_shard(
                 return stats;
             };
             let len = current.len();
-            if let Err(e) = cache.put_unverified_no_evict(hash, &current).await {
+            if let Err(e) = cache.put(hash, &current).await {
                 // Local landing failure (ENOSPC…) — not the peer's
                 // fault; skip this chunk (GCS pass covers it) and keep
                 // draining the stream.
@@ -468,4 +468,175 @@ pub fn parse_request_hashes(req: &PeerChunkGetRequest) -> Result<Vec<ChunkHash>,
                 .map_err(|_| format!("bad chunk hash length {} (want 32)", raw.len()))
         })
         .collect()
+}
+
+/// Chunks asked of one [`PeerFetcher`] stream together, at most.
+const PEER_BATCH: usize = 64;
+/// [`PeerFetcher`] streams in flight to one peer.
+const PEER_BATCHES_IN_FLIGHT: usize = 8;
+
+type PeerWaiter = tokio::sync::oneshot::Sender<Option<bytes::Bytes>>;
+
+/// A hinted peer as a fill-engine source. Requests that arrive together go
+/// out as one `PeerChunkGet` stream, several streams at once, and each
+/// chunk goes back to its waiter as its last frame lands. A lost peer
+/// answers `None` at once. The engine verifies the bytes.
+pub struct PeerFetcher {
+    addr: String,
+    health: Arc<PeerHealth>,
+    requests: tokio::sync::mpsc::UnboundedSender<(ChunkHash, PeerWaiter)>,
+}
+
+impl PeerFetcher {
+    /// Start the fetcher's batching task. It ends when the fetcher drops.
+    pub fn spawn(addr: String, scope: PeerChunkScope, health: Arc<PeerHealth>) -> Arc<Self> {
+        let (requests, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(batch_requests(addr.clone(), scope, health.clone(), rx));
+        Arc::new(Self {
+            addr,
+            health,
+            requests,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl engram_fill::PeerSource for PeerFetcher {
+    async fn fetch(&self, hash: ChunkHash) -> Option<bytes::Bytes> {
+        if self.health.is_lost(&self.addr) {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.requests.send((hash, tx)).ok()?;
+        rx.await.ok().flatten()
+    }
+}
+
+async fn batch_requests(
+    addr: String,
+    scope: PeerChunkScope,
+    health: Arc<PeerHealth>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(ChunkHash, PeerWaiter)>,
+) {
+    let in_flight = Arc::new(Semaphore::new(PEER_BATCHES_IN_FLIGHT));
+    let mut client: Option<GrpcHostClient> = None;
+    while let Some(first) = rx.recv().await {
+        let slot = Arc::clone(&in_flight)
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        // Everything that queued while the last batch waited for a slot
+        // goes in this one.
+        let mut batch = vec![first];
+        while batch.len() < PEER_BATCH {
+            match rx.try_recv() {
+                Ok(request) => batch.push(request),
+                Err(_) => break,
+            }
+        }
+        if health.is_lost(&addr) {
+            continue; // dropping the waiters answers None
+        }
+        let connected = match client.clone() {
+            Some(c) => c,
+            None => match peer_endpoint(&addr) {
+                Ok(endpoint) => match endpoint.connect().await {
+                    Ok(channel) => {
+                        let c = GrpcHostClient::new(channel);
+                        client = Some(c.clone());
+                        c
+                    }
+                    Err(e) => {
+                        tracing::warn!(%addr, error = %e, "peer fetch: dial failed; peer lost for the window");
+                        health.mark_lost(&addr);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(%addr, error = %e, "peer fetch: bad endpoint");
+                    health.mark_lost(&addr);
+                    continue;
+                }
+            },
+        };
+        let (scope, health, addr) = (scope.clone(), health.clone(), addr.clone());
+        tokio::spawn(async move {
+            let _slot = slot;
+            fetch_batch(connected, scope, batch, &health, &addr).await;
+        });
+    }
+}
+
+/// One `PeerChunkGet` stream for `batch`. A chunk the peer sends whole is
+/// answered with its bytes; a missing chunk, and every chunk still open
+/// when the stream fails, is answered `None` (its waiter is dropped).
+async fn fetch_batch(
+    client: GrpcHostClient,
+    scope: PeerChunkScope,
+    batch: Vec<(ChunkHash, PeerWaiter)>,
+    health: &PeerHealth,
+    addr: &str,
+) {
+    use futures::StreamExt;
+    let wire: Vec<[u8; 32]> = batch.iter().map(|(h, _)| *h.as_bytes()).collect();
+    let mut waiters: Vec<Option<PeerWaiter>> = batch.into_iter().map(|(_, w)| Some(w)).collect();
+    let mut stream = match client.peer_chunk_get(wire, scope).await {
+        Ok(s) => s,
+        Err(engram_core::SandboxError::LimitExceeded(_)) => {
+            metrics::counter!("engram_peer_pull_total", "outcome" => "backpressure").increment(1);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(addr, error = %e, "peer fetch: stream open failed; peer lost for the window");
+            health.mark_lost(addr);
+            return;
+        }
+    };
+    let mut item: Option<u32> = None;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(addr, error = %e, "peer fetch: stream failed; peer lost for the window");
+                health.mark_lost(addr);
+                return;
+            }
+        };
+        let Some(slot) = waiters.get_mut(frame.item_idx as usize) else {
+            tracing::warn!(
+                addr,
+                item_idx = frame.item_idx,
+                "peer fetch: unknown item index"
+            );
+            return;
+        };
+        if frame.missing {
+            slot.take();
+            item = None;
+            bytes.clear();
+            continue;
+        }
+        if crc32c::crc32c(&frame.data) != frame.crc32c {
+            tracing::warn!(
+                addr,
+                item_idx = frame.item_idx,
+                "peer fetch: frame CRC32C mismatch"
+            );
+            return;
+        }
+        if item != Some(frame.item_idx) {
+            item = Some(frame.item_idx);
+            bytes.clear();
+        }
+        bytes.extend_from_slice(&frame.data);
+        if frame.last {
+            if let Some(waiter) = slot.take() {
+                let _ = waiter.send(Some(bytes::Bytes::from(std::mem::take(&mut bytes))));
+                metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
+            }
+            item = None;
+            bytes = Vec::new();
+        }
+    }
 }

@@ -191,7 +191,7 @@ fn ready_digest(digest: &str) -> Arc<ImageReadiness> {
 const DIGEST: &str = "sha256:feedc0de";
 
 #[tokio::test]
-async fn pull_lands_scrubs_and_opens_the_serve_gate() {
+async fn pull_lands_verified_chunks_that_serve_onward_at_once() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("engram_host_agent=debug")
         .try_init();
@@ -234,42 +234,10 @@ async fn pull_lands_scrubs_and_opens_the_serve_gate() {
     );
     assert!(!health.is_lost(&addr));
 
+    // The landing verifies each chunk, so it serves onward at once.
     for (h, body) in hashes.iter().zip(&bodies) {
-        // Landed + locally readable...
-        assert!(land_cache.contains(*h).await, "chunk {h} not resident");
-        // ...but unverified-origin: NOT servable onward pre-scrub (the
-        // one-hop containment property).
-        assert!(
-            land_cache
-                .read_verified_for_serve(*h)
-                .await
-                .unwrap()
-                .is_none(),
-            "peer-landed chunk {h} served onward before scrub"
-        );
-        let _ = body;
-    }
-
-    // Scrubber drains the backlog; every chunk becomes servable and
-    // byte-identical to the source.
-    let _scrubber = land_cache.spawn_scrubber(u64::MAX);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    'outer: loop {
-        for (h, body) in hashes.iter().zip(&bodies) {
-            match land_cache.read_verified_for_serve(*h).await.unwrap() {
-                Some(bytes) if bytes.as_ref() == body.as_slice() => {}
-                Some(_) => panic!("scrubbed chunk {h} has wrong bytes"),
-                None => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "scrub did not drain within 5s"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue 'outer;
-                }
-            }
-        }
-        break;
+        let bytes = land_cache.read_verified_for_serve(*h).await.unwrap();
+        assert_eq!(bytes.as_deref(), Some(body.as_slice()), "chunk {h}");
     }
 }
 

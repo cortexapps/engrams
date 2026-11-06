@@ -193,3 +193,119 @@ async fn read_verifies_and_leaves_the_cache_alone() {
     assert!(!f.cache.contains_on_disk(good));
     assert!(engine.read(bad, Class::Demand).await.is_err());
 }
+
+/// A peer that answers after `delay` with `answer`.
+struct FakePeer {
+    answer: Option<Bytes>,
+    delay: Duration,
+    asked: AtomicUsize,
+}
+
+#[async_trait]
+impl crate::PeerSource for FakePeer {
+    async fn fetch(&self, _hash: ChunkHash) -> Option<Bytes> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.answer.clone()
+    }
+}
+
+fn peer(answer: Option<&'static [u8]>, delay: Duration) -> Arc<FakePeer> {
+    Arc::new(FakePeer {
+        answer: answer.map(Bytes::from_static),
+        delay,
+        asked: AtomicUsize::new(0),
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_hit_is_served_without_the_store() {
+    let f = fixture();
+    let hash = put(&f, b"on the peer").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default())
+        .with_peer(peer(Some(b"on the peer"), Duration::from_millis(1)));
+
+    for class in [Class::Demand, Class::Hydrate] {
+        f.cache.evict_on_disk_for_test(hash);
+        assert_eq!(&engine.get(hash, class).await.unwrap()[..], b"on the peer");
+    }
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_miss_or_wrong_bytes_fall_back_to_the_store() {
+    let f = fixture();
+    let hash = put(&f, b"the real bytes").await;
+    for answer in [None, Some(&b"wrong bytes"[..])] {
+        f.cache.evict_on_disk_for_test(hash);
+        let resolver = counting(&f, None);
+        let engine = engine_over(&f, resolver.clone(), Config::default())
+            .with_peer(peer(answer, Duration::from_millis(1)));
+        assert_eq!(
+            &engine.get(hash, Class::Hydrate).await.unwrap()[..],
+            b"the real bytes"
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert!(f.cache.contains_on_disk(hash));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_peer_loses_a_demand_race_to_the_store() {
+    let f = fixture();
+    let hash = put(&f, b"faulted").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default())
+        .with_peer(peer(Some(b"faulted"), Duration::from_secs(30)));
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        &engine.get(hash, Class::Demand).await.unwrap()[..],
+        b"faulted"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_store_waits_for_a_slow_peer_in_a_demand_race() {
+    let f = fixture();
+    let hash = ChunkHash::of(b"only on the peer");
+    let engine = engine_over(&f, counting(&f, None), Config::default())
+        .with_peer(peer(Some(b"only on the peer"), Duration::from_secs(2)));
+
+    assert_eq!(
+        &engine.get(hash, Class::Demand).await.unwrap()[..],
+        b"only on the peer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_registered_peer_serves_its_manifest_until_the_registration_drops() {
+    let f = fixture();
+    let hash = put(&f, b"registered").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+    let manifest = uuid::Uuid::from_u128(7);
+    let registration = engine.register_peer(
+        manifest,
+        peer(Some(b"registered"), Duration::from_millis(1)),
+    );
+
+    engine
+        .for_manifest(manifest)
+        .get(hash, Class::Demand)
+        .await
+        .unwrap();
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+
+    drop(registration);
+    f.cache.evict_on_disk_for_test(hash);
+    engine
+        .for_manifest(manifest)
+        .get(hash, Class::Demand)
+        .await
+        .unwrap();
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+}

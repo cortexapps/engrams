@@ -1,13 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use engram_chunk_store::cache::FillSource;
 use engram_chunk_store::{ChunkHash, ChunkStore, Result};
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::admission::{Admission, Permit};
-use crate::Class;
+use crate::{Class, PeerSource};
 
 /// Engine limits. The defaults come from dev-cluster runs: 64 fetches in
 /// flight reached about 1 GB/s of 512 KiB chunks from GCS, and GCS GET p95
@@ -21,6 +24,10 @@ pub struct Config {
     /// A `Demand` fetch still running after this gets a second request; the
     /// first answer wins. `None` turns hedging off.
     pub hedge_after: Option<Duration>,
+    /// With a peer, a `Demand` fetch the peer has not answered after this
+    /// also asks the store; the first correct answer wins. A peer hit on
+    /// the LAN takes about 1-2 ms.
+    pub peer_race_after: Duration,
 }
 
 impl Default for Config {
@@ -29,6 +36,7 @@ impl Default for Config {
             in_flight: 64,
             demand_reserve: 16,
             hedge_after: Some(Duration::from_millis(200)),
+            peer_race_after: Duration::from_millis(20),
         }
     }
 }
@@ -78,12 +86,30 @@ pub struct FillStats {
 #[derive(Clone)]
 pub struct FillEngine {
     inner: Arc<Inner>,
+    /// Asked before the store, when this view of the engine has one.
+    peer: Option<Arc<dyn PeerSource>>,
 }
 
 struct Inner {
     store: ChunkStore,
     admission: Arc<Admission>,
     hedge_after: Option<Duration>,
+    peer_race_after: Duration,
+    /// Peers by session manifest id, for fetches that know only which
+    /// manifest they serve (a page fault).
+    peers: Mutex<HashMap<Uuid, Arc<dyn PeerSource>>>,
+}
+
+/// Keeps a peer registered; dropping it unregisters the peer.
+pub struct PeerRegistration {
+    inner: Arc<Inner>,
+    manifest: Uuid,
+}
+
+impl Drop for PeerRegistration {
+    fn drop(&mut self) {
+        self.inner.peers.lock().remove(&self.manifest);
+    }
 }
 
 impl FillEngine {
@@ -93,7 +119,38 @@ impl FillEngine {
                 store,
                 admission: Admission::new(cfg.in_flight, cfg.demand_reserve),
                 hedge_after: cfg.hedge_after,
+                peer_race_after: cfg.peer_race_after,
+                peers: Mutex::new(HashMap::new()),
             }),
+            peer: None,
+        }
+    }
+
+    /// This engine (same limits, same cache) with `peer` asked before the
+    /// store.
+    pub fn with_peer(&self, peer: Arc<dyn PeerSource>) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            peer: Some(peer),
+        }
+    }
+
+    /// Make `peer` the source for fetches of session `manifest`
+    /// ([`Self::for_manifest`]) while the registration lives.
+    pub fn register_peer(&self, manifest: Uuid, peer: Arc<dyn PeerSource>) -> PeerRegistration {
+        self.inner.peers.lock().insert(manifest, peer);
+        PeerRegistration {
+            inner: Arc::clone(&self.inner),
+            manifest,
+        }
+    }
+
+    /// This engine with the peer registered for `manifest`, if any.
+    pub fn for_manifest(&self, manifest: Uuid) -> Self {
+        let peer = self.inner.peers.lock().get(&manifest).cloned();
+        Self {
+            inner: Arc::clone(&self.inner),
+            peer,
         }
     }
 
@@ -130,7 +187,10 @@ impl FillEngine {
         }
         let _permit = self.inner.admission.acquire(class).await;
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
-        store.resolver().fetch_chunk(hash).await
+        match self.peer_answer(hash).await {
+            Some(bytes) => Ok(bytes),
+            None => store.resolver().fetch_chunk(hash).await,
+        }
     }
 
     /// Make every chunk in `hashes` resident in the cache at `class`, each
@@ -178,13 +238,82 @@ impl FillEngine {
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
         let store = self.store();
         match store.chunk_cache() {
-            Some(cache) => cache.get(hash, || self.fetch_unverified(hash, class)).await,
-            None => store.resolver().fetch_chunk(hash).await,
+            Some(cache) => {
+                cache
+                    .get_with_source(hash, || self.fetch_unverified(hash, class))
+                    .await
+            }
+            None => match self.peer_answer(hash).await {
+                Some(bytes) => Ok(bytes),
+                None => store.resolver().fetch_chunk(hash).await,
+            },
+        }
+    }
+
+    /// The peer's answer when it has the chunk and its bytes are right.
+    /// Checked here so a wrong answer falls back to the store; the cache
+    /// checks again before it stores.
+    async fn peer_answer(&self, hash: ChunkHash) -> Option<Bytes> {
+        let bytes = self.peer.as_ref()?.fetch(hash).await?;
+        if ChunkHash::of(&bytes) == hash {
+            Some(bytes)
+        } else {
+            metrics::counter!("engram_fill_peer_bad_total").increment(1);
+            None
+        }
+    }
+
+    /// The peer (when this view has one), then the store. A `Demand`
+    /// fetch races the store against a peer that has not answered after
+    /// `peer_race_after`. The caller verifies the result.
+    async fn fetch_unverified(&self, hash: ChunkHash, class: Class) -> Result<(Bytes, FillSource)> {
+        let from_store = |engine: &Self| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .fetch_store(hash, class)
+                    .await
+                    .map(|b| (b, FillSource::BlobStorage))
+            }
+        };
+        if self.peer.is_none() {
+            return from_store(self).await;
+        }
+        let peer = self.peer_answer(hash);
+        tokio::pin!(peer);
+        if class != Class::Demand {
+            return match peer.await {
+                Some(b) => Ok((b, FillSource::Peer)),
+                None => from_store(self).await,
+            };
+        }
+        tokio::select! {
+            got = &mut peer => return match got {
+                Some(b) => Ok((b, FillSource::Peer)),
+                None => from_store(self).await,
+            },
+            () = tokio::time::sleep(self.inner.peer_race_after) => {}
+        }
+        metrics::counter!("engram_fill_peer_race_total").increment(1);
+        let store = from_store(self);
+        tokio::pin!(store);
+        tokio::select! {
+            got = &mut peer => match got {
+                Some(b) => Ok((b, FillSource::Peer)),
+                None => store.await,
+            },
+            got = &mut store => match got {
+                Ok(b) => Ok(b),
+                Err(e) => match peer.await {
+                    Some(b) => Ok((b, FillSource::Peer)),
+                    None => Err(e),
+                },
+            },
         }
     }
 
     /// One store fetch, hedged for `Demand`. The caller verifies.
-    async fn fetch_unverified(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
+    async fn fetch_store(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
         let resolver = self.store().resolver();
         let hedge_after = match (class, self.inner.hedge_after) {
             (Class::Demand, Some(d)) => d,

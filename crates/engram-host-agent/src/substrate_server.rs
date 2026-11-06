@@ -100,6 +100,9 @@ impl SubstrateServer {
         stream: &mut UnixStream,
         conn_pins: &mut Vec<ChunkHash>,
     ) -> std::io::Result<()> {
+        // A restore with a hinted peer registers it for its session
+        // manifest; the faults on this connection then ask it first.
+        let mut conn_fill = self.fill.clone();
         loop {
             let msg: ToWriter = match engram_substrate_proto::read_frame(stream) {
                 Ok(m) => m,
@@ -128,6 +131,9 @@ impl SubstrateServer {
                     // staged-ness); the host-agent answers the two live
                     // probes it CAN answer honestly.
                     let _ = canonical_manifest;
+                    if let Some(mref) = session_manifest {
+                        conn_fill = self.fill.for_manifest(mref.manifest_id);
+                    }
                     // ADR 0075 phase 2: pin the session manifest's
                     // divergent chunks for this connection's lifetime,
                     // so the single evictor can never unlink them out
@@ -160,7 +166,9 @@ impl SubstrateServer {
                     };
                     engram_substrate_proto::write_frame(stream, &ack)
                 }
-                ToWriter::Populate { hash } => self.populate(stream, ChunkHash::from_bytes(hash)),
+                ToWriter::Populate { hash } => {
+                    self.populate(stream, &conn_fill, ChunkHash::from_bytes(hash))
+                }
             };
             res?;
         }
@@ -169,10 +177,15 @@ impl SubstrateServer {
     /// The pin-around-open sequence (ADR 0075): the pin holds the
     /// single evictor off between populate and open; the fd makes a
     /// post-reply unlink harmless.
-    fn populate(&self, stream: &mut UnixStream, hash: ChunkHash) -> std::io::Result<()> {
+    fn populate(
+        &self,
+        stream: &mut UnixStream,
+        fill: &FillEngine,
+        hash: ChunkHash,
+    ) -> std::io::Result<()> {
         self.cache.pin(hash);
         let already = self.cache.contains_on_disk(hash);
-        let fetched = self.rt.block_on(self.fill.get(hash, Class::Demand));
+        let fetched = self.rt.block_on(fill.get(hash, Class::Demand));
         let outcome = match fetched {
             Ok(_bytes) => {
                 let path = self.cache.on_disk_path(hash);

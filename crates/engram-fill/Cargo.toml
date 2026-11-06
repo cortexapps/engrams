@@ -10,12 +10,14 @@ description = "The host's chunk fill engine: every chunk fetch on a host, in pri
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 engram-chunk-store.workspace = true
 bytes.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tracing.workspace = true
+uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]

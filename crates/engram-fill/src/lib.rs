@@ -11,7 +11,17 @@ mod admission;
 mod engine;
 
 pub use admission::{Admission, Permit};
-pub use engine::{Config, FillEngine, FillStats};
+pub use engine::{Config, FillEngine, FillStats, PeerRegistration};
+
+/// A host that holds a session's chunks on local disk: the tier between
+/// this host's cache and the object store.
+#[async_trait::async_trait]
+pub trait PeerSource: Send + Sync {
+    /// The chunk's bytes, or `None` when the peer does not have it or
+    /// cannot answer (a lost peer answers `None` at once). The engine
+    /// checks the bytes.
+    async fn fetch(&self, hash: engram_chunk_store::ChunkHash) -> Option<bytes::Bytes>;
+}
 
 /// Why a chunk is fetched. A fetch of a higher class is never granted after
 /// a waiting fetch of a lower class; fetches already in flight are not
