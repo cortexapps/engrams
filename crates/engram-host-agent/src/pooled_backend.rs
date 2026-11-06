@@ -30,6 +30,71 @@ use crate::capture_lock::{CaptureGate, CaptureUser};
 use crate::egress::HostEgress;
 use crate::image_cache::{CachedImage, ImageCache};
 
+/// The sidecar's `trace_lineage_id`: the session whose traces this
+/// snapshot's restores read.
+async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
+    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    serde_json::from_value(value.get("trace_lineage_id")?.clone()).ok()
+}
+
+/// The session's published first-touch prefix as this manifest's chunk
+/// hashes, in order. Positions the manifest leaves out are zero pages and
+/// need no fetch.
+async fn first_touch_hashes(
+    store: &ChunkStore,
+    session: SessionId,
+    manifest: &engram_chunk_store::Manifest,
+) -> Vec<engram_chunk_store::ChunkHash> {
+    let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
+    let indices = match store.blob_storage().get(&key).await {
+        Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
+        Err(engram_core::BlobError::NotFound) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(%session, error = %e, "first-touch prefix unreadable");
+            return Vec::new();
+        }
+    };
+    let chunk_size = manifest.chunk_size.as_u64();
+    let by_offset: std::collections::HashMap<u64, engram_chunk_store::ChunkHash> =
+        manifest.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+    indices
+        .into_iter()
+        .filter_map(|i| by_offset.get(&(u64::from(i) * chunk_size)).copied())
+        .collect()
+}
+
+/// With no attach time (a host-agent restart lost it), the published
+/// prefix ends this long after the first fault.
+const FIRST_TOUCH_FALLBACK_MS: i64 = 15_000;
+
+/// Publish the chunks the sandbox touched before its harness attached, for
+/// the session's next restore to fetch first. Best-effort.
+async fn publish_first_touch(
+    store: &ChunkStore,
+    session: SessionId,
+    file: &Path,
+    attached_at: Option<i64>,
+) {
+    let Ok(bytes) = tokio::fs::read(file).await else {
+        return;
+    };
+    let Some(record) = engram_chunk_store::FirstTouch::decode(&bytes) else {
+        tracing::debug!(file = %file.display(), "first-touch record torn; not published");
+        return;
+    };
+    let Some(&(_, first)) = record.entries.first() else {
+        return;
+    };
+    let prefix = record.until(attached_at.unwrap_or(first + FIRST_TOUCH_FALLBACK_MS));
+    let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
+    let body = engram_chunk_store::FirstTouch::encode_indices(&prefix);
+    match store.blob_storage().put(&key, body.into()).await {
+        Ok(_) => tracing::info!(%session, chunks = prefix.len(), "published first-touch prefix"),
+        Err(e) => tracing::warn!(%session, error = %e, "publish first-touch prefix failed"),
+    }
+}
+
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
 ///
@@ -333,6 +398,9 @@ pub struct PooledBackend {
     /// manifest: its last successful capture, or the chain seed of its
     /// restore. A sandbox without a stamp is due for a checkpoint.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    /// When each sandbox's harness first attached (Unix ms). The
+    /// first-touch prefix a capture publishes ends here.
+    attached_at_ms: Arc<DashMap<SandboxId, i64>>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1251,29 +1319,13 @@ impl PooledBackend {
                 .join("migration-session-manifest.json")
                 .exists();
 
-        // A File restore reads the whole memory before the VM starts, so
-        // the prefetch is on the critical path; a lazy restore faults
-        // after `inner.restore`, so the rest of memory fills behind the
-        // faults at a lower class.
-        if let Some(fill) = self.fill.clone() {
-            if memory_is_lazy {
-                let md = metadata.clone();
-                tokio::spawn(tracing::Instrument::instrument(
-                    async move {
-                        if let Err(e) =
-                            Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate).await
-                        {
-                            tracing::warn!(
-                                error = %e,
-                                snapshot_id = %md.id,
-                                "background memory prefetch failed; faults fetch on demand",
-                            );
-                        }
-                    },
-                    tracing::info_span!("restore.prefetch_memory_bg"),
-                ));
-            } else if let Err(e) = tracing::Instrument::instrument(
-                Self::prefetch_memory_chunks(&fill, &metadata, Class::Demand),
+        // A File restore reads the whole memory before the VM starts, so its
+        // prefetch is on the critical path. A lazy restore faults after
+        // `inner.restore`; its prefetch starts once the sidecar is local
+        // (below), because the sidecar names the session's first-touch prefix.
+        if let (false, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
+            if let Err(e) = tracing::Instrument::instrument(
+                Self::prefetch_memory_chunks(&fill, &metadata, Class::Demand, None),
                 tracing::info_span!("restore.prefetch_memory"),
             )
             .await
@@ -1309,6 +1361,25 @@ impl PooledBackend {
                     "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
                 );
             }
+        }
+
+        if let (true, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
+            let session = read_trace_lineage(&src).await;
+            let md = metadata.clone();
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(e) =
+                        Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate, session).await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            snapshot_id = %md.id,
+                            "background memory prefetch failed; faults fetch on demand",
+                        );
+                    }
+                },
+                tracing::info_span!("restore.prefetch_memory_bg"),
+            ));
         }
 
         let disks = match self.volumes.as_ref() {
@@ -1496,6 +1567,7 @@ impl PooledBackend {
             held_snapshots: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
+            attached_at_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
             checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
@@ -1989,6 +2061,14 @@ impl PooledBackend {
         let Some(chunk_store) = self.chunk_store.clone() else {
             return;
         };
+        let attached_at = self.attached_at_ms.get(&id).map(|e| *e);
+        if let Some(dir) = trace_path.parent() {
+            let file = dir.join(engram_chunk_store::FirstTouch::FILE);
+            let store = chunk_store.clone();
+            tokio::spawn(async move {
+                publish_first_touch(&store, session_id, &file, attached_at).await;
+            });
+        }
         tokio::spawn(async move {
             let bytes = match tokio::fs::read(&trace_path).await {
                 Ok(b) => b,
@@ -3212,12 +3292,15 @@ impl PooledBackend {
     }
 
     /// Make the memory manifest's chunks resident in the chunk cache at
-    /// `class`. Best-effort for the caller: a failure leaves the faults
-    /// (or the serial materialize) to fetch on demand.
+    /// `class`. With `first`, the chunks that session touched before its
+    /// harness attached last time are fetched first, at `Prefix`.
+    /// Best-effort for the caller: a failure leaves the faults (or the
+    /// serial materialize) to fetch on demand.
     async fn prefetch_memory_chunks(
         fill: &FillEngine,
         metadata: &SnapshotMetadata,
         class: Class,
+        first: Option<SessionId>,
     ) -> Result<engram_fill::FillStats, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
             return Ok(engram_fill::FillStats::default());
@@ -3226,6 +3309,15 @@ impl PooledBackend {
             fill.store().get_manifest(mref).await.map_err(|e| {
                 SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
             })?;
+        if let Some(session) = first {
+            let prefix = first_touch_hashes(fill.store(), session, &manifest).await;
+            if !prefix.is_empty() {
+                match fill.fill(prefix, Class::Prefix).await {
+                    Ok(stats) => tracing::info!(?stats, "memory first-touch prefix resident"),
+                    Err(e) => tracing::warn!(error = %e, "memory first-touch prefix failed"),
+                }
+            }
+        }
         let stats = fill
             .fill(manifest.chunks.iter().map(|c| c.hash).collect(), class)
             .await
@@ -5769,6 +5861,7 @@ impl SandboxBackend for PooledBackend {
                 let egress = self.egress.clone();
                 let inner = self.inner.clone();
                 let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
+                let attached_at_ms = self.attached_at_ms.clone();
                 let checkpoint_pacing = self.checkpoint_pacing.clone();
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
                 let checkpoint_chains = self.checkpoint_chains.clone();
@@ -5828,6 +5921,7 @@ impl SandboxBackend for PooledBackend {
                         }
                     }
                     let _ = last_snapshot_unix_ms.remove(&id);
+                    let _ = attached_at_ms.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
                     let _ = dead_probe_inflight.remove(&id);
                     // Durable checkpoint records survive destroy: an eviction's
@@ -5861,8 +5955,11 @@ impl SandboxBackend for PooledBackend {
         if agent.host_ca_pem.is_none() {
             agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
         }
-        let result = self.inner.start_agent(id, agent).await;
-        result
+        self.inner.start_agent(id, agent).await?;
+        self.attached_at_ms
+            .entry(id)
+            .or_insert_with(|| self.clock.now_utc().timestamp_millis());
+        Ok(())
     }
 
     /// ADR 0084 §B: cold-base / warm-overlay split.
