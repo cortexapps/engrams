@@ -30,13 +30,14 @@ use engram_protocol::grpc::{
     FencedSandboxRequest, GuestIpResponse, HostReadFileMetadata, HostReadFileRequest,
     HostReadFileResponse, HostWriteFileRequest, HostWriteFileResponse, IdePortResponse,
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
-    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationExportRef,
-    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PeerChunkFrame,
-    PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData,
-    ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress,
+    MigrationAbortUnservedResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
+    MigrationPresetupResponse, PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse,
+    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::WireExecRequest;
 use futures::Stream;
@@ -541,6 +542,22 @@ impl HostService for HostServiceImpl {
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        req: Request<MigrationExportRef>,
+    ) -> Result<Response<MigrationAbortUnservedResponse>, Status> {
+        check_wire_version(&req)?;
+        let req = req.into_inner();
+        let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
+        let aborted = self
+            .inner
+            .migration_abort_unserved(id, &req.export_id, fence)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(MigrationAbortUnservedResponse { aborted }))
     }
 
     async fn migration_presetup(

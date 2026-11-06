@@ -238,6 +238,14 @@ the test named beside it.
   `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`), and the destination's
   disk holds every byte once the source is destroyed
   (`two_host_teleport_rootfs_survives_source_destroy`).
+- A live move whose destination fails before it fetches the paused state aborts on the
+  source, and the session stays active there
+  (`dest_failure_before_the_state_is_served_resumes_the_source`). The source checks and
+  aborts in one step and refuses once a destination fetched the state
+  (`migration_abort_unserved_refuses_after_the_state_is_fetched`). When the state was
+  served, or the source cannot answer, the destination can be running the guest: the move
+  retries the destination and then settles the session Dead
+  (`served_state_dest_failure_is_dead`, `source_without_the_served_answer_is_dead`).
 - A base image is staged into a volume on a node before the image is ready there
   (`only_images_with_a_volume_on_disk_stay_ready`). A session volume is a snapshot of
   that image volume (`a_fork_of_a_published_manifest_starts_its_own_lineage`), so a create

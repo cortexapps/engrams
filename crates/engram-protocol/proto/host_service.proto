@@ -49,6 +49,10 @@ service HostService {
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
+  // MigrationAbort only while no destination has fetched the paused state.
+  // A host that predates it answers Unimplemented; the caller then knows
+  // nothing about the state and must not resume the source.
+  rpc MigrationAbortUnserved(MigrationExportRef) returns (MigrationAbortUnservedResponse);
   // ADR 0045 C2 post-copy: the pre-pause presetup (export identity +
   // the restore package sans state.bin), the blackout capture
   // (vmstate-only + pagemap seal), and the destination's drain await.
@@ -296,9 +300,15 @@ message MigrationExportRef {
   string export_id = 2;
   // ADR 0079: the (session_id, fencing_epoch) fence — see
   // `FencedSandboxRequest`. Rides MigrationCapturePostCopy / Commit /
-  // Abort (the export-scoped source-mutating RPCs). 0 = unfenced interim.
+  // Abort / AbortUnserved (the export-scoped source-mutating RPCs).
+  // 0 = unfenced interim.
   uint64 fencing_epoch = 3;
   bytes session_id = 4;      // 16-byte session UUID; ignored when fencing_epoch == 0
+}
+
+// `aborted = false`: the state was served; the export stays open.
+message MigrationAbortUnservedResponse {
+  bool aborted = 1;
 }
 
 // ADR 0045 C2: see MigrationPresetupOut in engram-core for field

@@ -1652,6 +1652,28 @@ impl PooledBackend {
         self.migrations.state_served(id)
     }
 
+    /// Carry out the export TTL sweep's verdict. The abort re-checks
+    /// `state_served` in the same step that consumes the export, so a
+    /// fetch after the verdict leaves the source paused.
+    pub async fn run_export_ttl_verdict(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        verdict: crate::migration::TtlVerdict,
+    ) -> Result<(), SandboxError> {
+        use crate::migration::TtlVerdict;
+        match verdict {
+            TtlVerdict::AbortInPlace => {
+                if !self.migration_abort_unserved(id, export_id).await? {
+                    tracing::warn!(sandbox_id = %id, "export state served after the TTL verdict; stays paused");
+                }
+                Ok(())
+            }
+            TtlVerdict::Destroy => self.migration_commit(id, export_id).await,
+            TtlVerdict::StayPaused => Ok(()),
+        }
+    }
+
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
     /// (`rolling/` + `records/` subdirs are created lazily). Without
     /// this, `snapshot()` stays pure-Full and the periodic driver
@@ -5527,8 +5549,8 @@ impl SandboxBackend for PooledBackend {
         // coordinator's knowledge that the dest provably never loaded
         // the shipped state (the postcopy-never-loaded marker), so it
         // is allowed even after StateBin was fetched. The forbidden
-        // arm is the dumb-host TTL's self-resume — gated by
-        // `ttl_verdict`'s state_served input, never reaching this RPC.
+        // arm is the dumb-host TTL's self-resume, which goes through
+        // `migration_abort_unserved`, never this RPC.
         //
         // Atomic validate+remove (see migration_commit): the TTL sweep
         // and a coordinator abort RPC race with nothing serializing
@@ -5541,6 +5563,29 @@ impl SandboxBackend for PooledBackend {
             peer.remove(export_id);
         }
         self.abort_migration_export(export).await
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<bool, SandboxError> {
+        use crate::migration::UnservedRemoval;
+        let export = match self.migrations.remove_unserved(id, export_id) {
+            UnservedRemoval::Removed(export) => export,
+            UnservedRemoval::Served => return Ok(false),
+            UnservedRemoval::Missing => return Err(SandboxError::NotFound),
+        };
+        if let Some(peer) = self.migrate_peer_server() {
+            peer.remove(export_id);
+        }
+        // The answer is final once the export is gone: no destination can
+        // load the state. A failed resume is left to the caller's rollback,
+        // whose `resume` is idempotent.
+        if let Err(error) = self.abort_migration_export(export).await {
+            tracing::warn!(sandbox_id = %id, %error, "unserved migration abort did not finish");
+        }
+        Ok(true)
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -5760,6 +5805,8 @@ impl SandboxBackend for PooledBackend {
                 let volumes = self.volumes.clone();
                 let pending_finalizes = self.pending_finalizes.clone();
                 let pending_presetups = self.pending_presetups.clone();
+                let migrations = self.migrations.clone();
+                let migrate_peer = self.migrate_peer.get().cloned();
                 Box::pin(async move {
                     // Unregister from the egress proxy first, so a still-alive
                     // guest's traffic stops being rewritten. The binding goes
@@ -5768,6 +5815,12 @@ impl SandboxBackend for PooledBackend {
                     unreachable_guests.remove(&id);
                     migration_roles.remove(&id);
                     drained_dests.remove(&id);
+                    // An open export's page-server entry reads the VM's
+                    // process, so it goes before the VM.
+                    let export = migrations.remove(id);
+                    if let (Some(export), Some(peer)) = (export.as_ref(), migrate_peer.as_ref()) {
+                        peer.remove(&export.export_id);
+                    }
                     if let Some(egress) = egress.as_ref() {
                         if let Some(session_id) = removed_session {
                             egress.unregister_session(session_id);
@@ -5776,8 +5829,18 @@ impl SandboxBackend for PooledBackend {
                     let result = inner.destroy(id).await;
                     // The disks go after the VM has closed them. A pending
                     // eviction finalize still publishes from them; it runs
-                    // this destroy again at its terminal step. A move that
-                    // never reached its capture holds a precopy of them.
+                    // this destroy again at its terminal step. A move holds
+                    // snapshots of them that the release cannot remove while
+                    // they are open: an export's seals and precopy, or the
+                    // precopy of a presetup that never reached its capture.
+                    if let Some(export) = export {
+                        let _ = fs::remove_dir_all(&export.snapshot_dir).await;
+                        if let Some(volumes) = volumes.as_ref() {
+                            for (_, seal) in export.disk_seal.into_iter().chain(export.precopy) {
+                                discard_seal(volumes, seal).await;
+                            }
+                        }
+                    }
                     if let Some(volumes) = volumes.as_ref() {
                         if let Some((_, presetup)) = pending_presetups.remove(&id) {
                             for (_, seal) in presetup.precopy {
@@ -8981,6 +9044,36 @@ mod tests {
         );
     }
 
+    /// A destroy consumes an open export first, so its seal does not hold
+    /// a snapshot open when the session disks are released.
+    #[tokio::test]
+    async fn destroy_consumes_an_open_export_and_its_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let volumes = volumes_with_a_root(tmp.path(), id).await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: Default::default(),
+        }))
+        .with_session_volumes(volumes.clone());
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        let sealed = seal_root(&volumes, id).await;
+        let seal = Arc::downgrade(&sealed);
+        export.disk_seal.insert(DiskRole::Root, sealed);
+        assert!(pooled.migrations.insert(export));
+
+        pooled.destroy(id).await.unwrap();
+        assert!(pooled.migrations.export_id_of(id).is_none());
+        assert!(
+            seal.upgrade().is_none(),
+            "nothing holds the seal after destroy"
+        );
+        assert!(!dir.exists(), "the export dir goes with the destroy");
+        assert!(volumes.roles(id).await.unwrap().is_empty());
+    }
+
     /// Aborting an export discards its seal, removes the export dir and
     /// resumes the guest in place.
     #[tokio::test]
@@ -9010,6 +9103,99 @@ mod tests {
         let gone = volumes.pending(id, DiskRole::Root).await.unwrap_err();
         assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(volumes.roles(id).await.unwrap(), vec![DiskRole::Root]);
+    }
+
+    /// An abort that requires an unserved state resumes the guest only
+    /// while no destination has fetched `state.bin`; after a fetch it
+    /// leaves the export open and the guest paused.
+    #[tokio::test]
+    async fn migration_abort_unserved_refuses_after_the_state_is_fetched() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
+
+        let served = SandboxId::new();
+        let dir = tmp.path().join("served");
+        let export_id = open_export(&pooled, served, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        assert!(!pooled
+            .migration_abort_unserved(served, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(pooled.migrations.export_id_of(served), Some(export_id));
+        assert!(dir.exists());
+
+        let unserved = SandboxId::new();
+        let dir = tmp.path().join("unserved");
+        let export_id = open_export(&pooled, unserved, dir.clone()).await;
+        assert!(matches!(
+            pooled.migration_abort_unserved(unserved, "other").await,
+            Err(SandboxError::NotFound)
+        ));
+        assert!(pooled
+            .migration_abort_unserved(unserved, &export_id)
+            .await
+            .unwrap());
+        assert_eq!(*resumes.lock(), vec![unserved]);
+        assert!(pooled.migrations.export_id_of(unserved).is_none());
+        assert!(!dir.exists());
+    }
+
+    /// A fetch of `state.bin` after the TTL sweep chose to abort makes the
+    /// abort refuse: the source stays paused and its export stays open.
+    #[tokio::test]
+    async fn export_ttl_abort_refuses_a_state_fetched_after_the_verdict() {
+        use crate::migration::{ttl_verdict, TtlVerdict};
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
+            resumes: resumes.clone(),
+        }));
+
+        let raced = SandboxId::new();
+        let dir = tmp.path().join("raced");
+        let export_id = open_export(&pooled, raced, dir.clone()).await;
+        std::fs::write(dir.join("state.bin"), b"vmstate").unwrap();
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(raced));
+        assert_eq!(verdict, TtlVerdict::AbortInPlace);
+        let frames: Vec<_> = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::StateBin])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok));
+        pooled
+            .run_export_ttl_verdict(raced, &export_id, verdict)
+            .await
+            .unwrap();
+        assert!(resumes.lock().is_empty(), "a served source never resumes");
+        assert_eq!(pooled.migrations.export_id_of(raced), Some(export_id));
+
+        let idle = SandboxId::new();
+        let export_id = open_export(&pooled, idle, tmp.path().join("idle")).await;
+        let verdict = ttl_verdict(true, Some(true), pooled.migration_state_served(idle));
+        pooled
+            .run_export_ttl_verdict(idle, &export_id, verdict)
+            .await
+            .unwrap();
+        assert_eq!(*resumes.lock(), vec![idle]);
+        assert!(pooled.migrations.export_id_of(idle).is_none());
     }
 
     /// ADR 0007 / Phase 5: snapshot wrap chunks an FC-style

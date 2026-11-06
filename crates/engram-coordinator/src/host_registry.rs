@@ -631,6 +631,16 @@ impl HostClient for HostRegistry {
         backend.migration_abort(id, export_id, fence).await
     }
 
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_abort_unserved(id, export_id, fence).await
+    }
+
     async fn commit_snapshot(
         &self,
         id: SandboxId,

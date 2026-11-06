@@ -436,27 +436,12 @@ impl HostAgent {
                                     ?verdict,
                                     "migration export exceeded TTL with no commit/abort",
                                 );
-                                use engram_core::traits::sandbox::SandboxBackend as _;
-                                match verdict {
-                                    migration::TtlVerdict::AbortInPlace => {
-                                        if let Err(e) = pooled_iter
-                                            .migration_abort(sandbox_id, &export_id_iter)
-                                            .await
-                                        {
-                                            tracing::warn!(%sandbox_id, error = %e,
-                                                "export TTL abort failed");
-                                        }
-                                    }
-                                    migration::TtlVerdict::Destroy => {
-                                        if let Err(e) = pooled_iter
-                                            .migration_commit(sandbox_id, &export_id_iter)
-                                            .await
-                                        {
-                                            tracing::warn!(%sandbox_id, error = %e,
-                                                "export TTL destroy failed");
-                                        }
-                                    }
-                                    migration::TtlVerdict::StayPaused => {}
+                                if let Err(e) = pooled_iter
+                                    .run_export_ttl_verdict(sandbox_id, &export_id_iter, verdict)
+                                    .await
+                                {
+                                    tracing::warn!(%sandbox_id, error = %e,
+                                        "export TTL verdict failed");
                                 }
                             })
                             .catch_unwind()

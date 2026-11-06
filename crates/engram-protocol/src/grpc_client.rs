@@ -525,6 +525,26 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    pub async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        let resp = self
+            .inner
+            .clone()
+            .migration_abort_unserved(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(resp.into_inner().aborted)
+    }
+
     pub async fn commit_snapshot(
         &self,
         id: SandboxId,
@@ -1551,6 +1571,15 @@ impl HostClient for GrpcHostClient {
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
         Self::migration_abort(self, id, export_id, fence).await
+    }
+
+    async fn migration_abort_unserved(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<bool, SandboxError> {
+        Self::migration_abort_unserved(self, id, export_id, fence).await
     }
 
     async fn commit_snapshot(
