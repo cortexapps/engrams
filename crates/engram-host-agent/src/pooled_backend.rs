@@ -74,6 +74,11 @@ fn memory_prefetch_config() -> MemoryPrefetchConfig {
     })
 }
 
+/// When each sandbox on this host last finished a restore; read by the
+/// periodic checkpoint span as `restore_age_ms`.
+static RESTORED_AT: std::sync::LazyLock<DashMap<SandboxId, std::time::Instant>> =
+    std::sync::LazyLock::new(DashMap::new);
+
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
 ///
@@ -1449,6 +1454,9 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
         }
         .await;
+        if restore.is_ok() {
+            RESTORED_AT.insert(id, crate::time_source::metrics_now());
+        }
         if restore.is_err() {
             if let Some(volumes) = self.volumes.as_ref() {
                 if let Err(error) = volumes.release(id).await {
@@ -3035,15 +3043,18 @@ impl PooledBackend {
         id: SandboxId,
     ) -> Result<SnapshotMetadata, SandboxError> {
         use engram_core::traits::SandboxBackend as _;
-        let metadata = self
-            .snapshot_with_class(
+        let restore_age_ms = RESTORED_AT.get(&id).map(|t| t.elapsed().as_millis() as u64);
+        let metadata = tracing::Instrument::instrument(
+            self.snapshot_with_class(
                 id,
                 // ADR 0116 C3: the periodic re-chunk is the upload storm
                 // producer — background class, so foreground uploads go
                 // first.
                 engram_chunk_store::UploadClass::Background,
-            )
-            .await?;
+            ),
+            tracing::info_span!("checkpoint.periodic", sandbox_id = %id, restore_age_ms),
+        )
+        .await?;
         let _ = self.commit_snapshot(id).await;
         Ok(metadata)
     }
@@ -3270,8 +3281,21 @@ impl PooledBackend {
             }
         };
         let chunk_count = hashes_to_prefetch.len();
+        let concurrency = memory_prefetch_config().concurrency;
+        let started = crate::time_source::metrics_now();
         chunk_store
-            .prefetch_chunks(hashes_to_prefetch, memory_prefetch_config().concurrency)
+            .prefetch_chunks_with_progress(hashes_to_prefetch, concurrency, |done| {
+                if done % 2048 == 0 || done == chunk_count {
+                    tracing::info!(
+                        done,
+                        chunk_count,
+                        bytes = done as u64 * engram_chunk_store::DEFAULT_MEMORY_CHUNK_SIZE,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        concurrency,
+                        "memory prefetch progress"
+                    );
+                }
+            })
             .await
             .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks: {e}")))?;
         tracing::debug!(

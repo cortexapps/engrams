@@ -28,6 +28,7 @@ use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
@@ -250,11 +251,16 @@ impl SessionVolumes {
         // checkpoint is no longer the reap's to purge.
         self.kept.lock().unwrap().retain(|s| *s != sandbox);
         let provisioned = async {
-            let (root, root_manifest) = self.provision_role(sandbox, DiskRole::Root, root).await?;
+            let (root, root_manifest) = self
+                .provision_role(sandbox, DiskRole::Root, root)
+                .instrument(tracing::info_span!("disk.provision_root"))
+                .await?;
             let (swap, swap_manifest) = match swap {
                 Some(source) => {
-                    let (path, manifest) =
-                        self.provision_role(sandbox, DiskRole::Swap, source).await?;
+                    let (path, manifest) = self
+                        .provision_role(sandbox, DiskRole::Swap, source)
+                        .instrument(tracing::info_span!("disk.provision_swap"))
+                        .await?;
                     (Some(path), Some(manifest))
                 }
                 None => (None, None),
@@ -287,7 +293,12 @@ impl SessionVolumes {
         self.delete_if_present(&tmp).await?;
         let (checkpoint, lineage) = match source {
             Source::Fork { manifest, base } => {
-                let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                let wanted = self
+                    .store
+                    .get_manifest(manifest)
+                    .instrument(tracing::info_span!("disk.manifest_get"))
+                    .await
+                    .map_err(store_err)?;
                 match self.staged(manifest).await {
                     Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
                     None => self.stage_into(&tmp, &wanted, base).await?,
@@ -300,13 +311,22 @@ impl SessionVolumes {
                 (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
             }
             Source::Continue { manifest, base } => {
-                match self.kept(sandbox, role, manifest).await? {
+                match self
+                    .kept(sandbox, role, manifest)
+                    .instrument(tracing::info_span!("disk.find_kept"))
+                    .await?
+                {
                     Some((owner, volume, _, held)) if held == manifest => (
                         self.adopt(owner, volume, sandbox, role, held).await?,
                         manifest,
                     ),
                     kept => {
-                        let wanted = self.store.get_manifest(manifest).await.map_err(store_err)?;
+                        let wanted = self
+                            .store
+                            .get_manifest(manifest)
+                            .instrument(tracing::info_span!("disk.manifest_get"))
+                            .await
+                            .map_err(store_err)?;
                         match kept {
                             Some((_, volume, held_manifest, _))
                                 if volume.size_bytes == wanted.total_bytes =>
@@ -343,6 +363,7 @@ impl SessionVolumes {
         let live = self
             .disk
             .snapshot(&checkpoint, &live_name(sandbox, role))
+            .instrument(tracing::info_span!("disk.live_snapshot"))
             .await?;
         Ok((live.path, lineage))
     }

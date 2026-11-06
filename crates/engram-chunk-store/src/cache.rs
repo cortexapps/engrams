@@ -1224,11 +1224,13 @@ impl ChunkCache {
     /// memory chunks before `inner.restore` triggers UFFD-driven
     /// reads — converts what would be N serial GCS round-trips
     /// during kernel resume into K parallel round-trips upfront.
+    /// `on_done` gets the count of finished chunks after each one.
     pub async fn prefetch_chunks_parallel<F, Fut>(
         &self,
         hashes: Vec<ChunkHash>,
         concurrency: usize,
         fetch: F,
+        mut on_done: impl FnMut(usize) + Send,
     ) -> Result<()>
     where
         F: Fn(ChunkHash) -> Fut + Send + Sync + Clone + 'static,
@@ -1251,8 +1253,11 @@ impl ChunkCache {
             }
         }
         // Drain + refill: each completion lets us start one more.
+        let mut done = 0;
         while let Some(result) = in_flight.next().await {
             result?;
+            done += 1;
+            on_done(done);
             if let Some(h) = iter.next() {
                 in_flight.push(spawn_one(h, self.clone(), fetch.clone()));
             }
@@ -2369,10 +2374,15 @@ mod tests {
 
         let store_clone = store.clone();
         cache
-            .prefetch_chunks_parallel(hashes.clone(), 4, move |h| {
-                let s = store_clone.clone();
-                async move { s.get_chunk(h).await }
-            })
+            .prefetch_chunks_parallel(
+                hashes.clone(),
+                4,
+                move |h| {
+                    let s = store_clone.clone();
+                    async move { s.get_chunk(h).await }
+                },
+                |_| {},
+            )
             .await
             .unwrap();
 

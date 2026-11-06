@@ -5,11 +5,18 @@ use std::io;
 
 use engram_chunk_store::{ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind};
 use futures::stream::{self, TryStreamExt};
+use tracing::Instrument as _;
 
 use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
 
 /// Store calls in flight; peak buffered memory is this many chunks.
 const CONCURRENCY: usize = 64;
+
+/// Data-plane duration logs only; never a decision input.
+#[allow(clippy::disallowed_methods)] // measurement timer, not a simulation input (ADR 0098 D1)
+fn metrics_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
 
 fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
@@ -35,18 +42,43 @@ fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
 }
 
 async fn apply_delta(volume: &Volume, store: &ChunkStore, delta: &ManifestDelta) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let chunk_size = volume.chunk_size;
+    let started = metrics_now();
+    // Summed over concurrent tasks; the fetch includes the store's hash check.
+    let fetch_us = AtomicU64::new(0);
+    let write_us = AtomicU64::new(0);
+    let (fetch_us, write_us) = (&fetch_us, &write_us);
     stream::iter(delta.write.iter().map(Ok))
         .try_for_each_concurrent(CONCURRENCY, |c| async move {
+            let t = metrics_now();
             let bytes = store.get_chunk(c.hash).await.map_err(store_err)?;
-            volume
+            fetch_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            let t = metrics_now();
+            let written = volume
                 .write_chunk(ChunkIndex(c.offset / chunk_size), bytes.to_vec())
-                .await
+                .await;
+            write_us.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            written
         })
         .await?;
+    let fetch_write_elapsed_ms = started.elapsed().as_millis() as u64;
+    let t = metrics_now();
     for offset in &delta.zero {
         volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
     }
+    tracing::info!(
+        volume = %volume.name,
+        write_chunks = delta.write.len(),
+        write_bytes = delta.write.len() as u64 * chunk_size,
+        zero_chunks = delta.zero.len(),
+        fetch_write_elapsed_ms,
+        fetch_ms_sum = fetch_us.load(Relaxed) / 1000,
+        write_ms_sum = write_us.load(Relaxed) / 1000,
+        zero_ms = t.elapsed().as_millis() as u64,
+        concurrency = CONCURRENCY,
+        "disk delta applied"
+    );
     Ok(())
 }
 
@@ -65,10 +97,17 @@ pub async fn stage(
         Some((base_volume, base_manifest)) => {
             shape_matches(base_volume, base_manifest)?;
             let delta = manifest.delta_from(base_manifest).map_err(store_err)?;
-            (disk.snapshot(base_volume, name).await?, delta)
+            let snap = disk
+                .snapshot(base_volume, name)
+                .instrument(tracing::info_span!("disk.thin_snapshot"))
+                .await?;
+            (snap, delta)
         }
         None => {
-            let volume = disk.create(name, manifest.total_bytes).await?;
+            let volume = disk
+                .create(name, manifest.total_bytes)
+                .instrument(tracing::info_span!("disk.create"))
+                .await?;
             let delta = ManifestDelta {
                 write: manifest.chunks.clone(),
                 zero: Vec::new(),
@@ -77,8 +116,17 @@ pub async fn stage(
         }
     };
     shape_matches(&volume, manifest)?;
-    apply_delta(&volume, store, &delta).await?;
-    volume.sync().await?;
+    apply_delta(&volume, store, &delta)
+        .instrument(tracing::info_span!(
+            "disk.delta_fetch_write",
+            chunks = delta.write.len(),
+            zero = delta.zero.len()
+        ))
+        .await?;
+    volume
+        .sync()
+        .instrument(tracing::info_span!("disk.sync"))
+        .await?;
     Ok(volume)
 }
 

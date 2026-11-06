@@ -338,15 +338,32 @@ impl ChunkStore {
     /// [`Self::prefetch_chunk`] for a whole set, at most `concurrency`
     /// fetches at a time.
     pub async fn prefetch_chunks(&self, hashes: Vec<ChunkHash>, concurrency: usize) -> Result<()> {
+        self.prefetch_chunks_with_progress(hashes, concurrency, |_| {})
+            .await
+    }
+
+    /// [`Self::prefetch_chunks`], calling `on_done` with the count of
+    /// finished chunks after each one.
+    pub async fn prefetch_chunks_with_progress(
+        &self,
+        hashes: Vec<ChunkHash>,
+        concurrency: usize,
+        on_done: impl FnMut(usize) + Send,
+    ) -> Result<()> {
         let Some(cache) = &self.cache else {
             return Ok(());
         };
         let resolver = self.resolver.clone();
         cache
-            .prefetch_chunks_parallel(hashes, concurrency, move |hash| {
-                let resolver = resolver.clone();
-                async move { resolver.fetch_chunk(hash).await }
-            })
+            .prefetch_chunks_parallel(
+                hashes,
+                concurrency,
+                move |hash| {
+                    let resolver = resolver.clone();
+                    async move { resolver.fetch_chunk(hash).await }
+                },
+                on_done,
+            )
             .await
     }
 
