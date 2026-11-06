@@ -545,6 +545,7 @@ pub struct Runtime {
     /// First-touch chunk order, `<jail>/fault-order.txt` (set with the
     /// trace output).
     fault_order: Mutex<Option<FaultOrder>>,
+    faults_served: std::sync::atomic::AtomicU64,
 }
 
 impl Runtime {
@@ -622,6 +623,7 @@ impl Runtime {
             drain_done: std::sync::atomic::AtomicBool::new(false),
             window_dump_done: std::sync::atomic::AtomicBool::new(false),
             fault_order: Mutex::new(None),
+            faults_served: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1408,8 +1410,35 @@ impl Runtime {
     /// Run forever, draining events from the UFFD and serving each
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
+    ///
+    /// With `ENGRAM_UFFD_FAULT_THREADS` = N > 1, N threads read the
+    /// userfaultfd; the kernel hands each fault message to exactly one
+    /// reader, and the claim table makes overlapping installs of one
+    /// chunk safe. The first thread to finish (end of file or error)
+    /// ends the loop; the others are left blocked and end with the
+    /// process.
     pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
-        let mut faults_served: u64 = 0;
+        let threads = crate::fault_threads();
+        if threads <= 1 {
+            return self.run_loop();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..threads {
+            let rt = Arc::clone(self);
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name(format!("engram-uffd-fault-{i}"))
+                .spawn(move || {
+                    crate::populate_client::set_thread_slot(i + 1);
+                    let _ = tx.send(rt.run_loop());
+                })?;
+        }
+        drop(tx);
+        tracing::info!(threads, "fault loop serving on several threads");
+        rx.recv().unwrap_or(Ok(()))
+    }
+
+    fn run_loop(self: &Arc<Self>) -> Result<(), HandlerError> {
         loop {
             match self.uffd.read_event() {
                 Ok(Some(Event::Pagefault { addr, .. })) => {
@@ -1429,7 +1458,7 @@ impl Runtime {
                     {
                         order.record(chunk_idx);
                     }
-                    faults_served += 1;
+                    let faults_served = self.faults_served.fetch_add(1, Ordering::Relaxed) + 1;
                     if faults_served.is_power_of_two() {
                         tracing::info!(faults_served, "served page fault");
                         fault_stats::STATS.log("pow2");
@@ -1464,7 +1493,7 @@ impl Runtime {
                 }
                 Err(userfaultfd::Error::ReadEof) => {
                     tracing::info!(
-                        faults_served,
+                        faults_served = self.faults_served.load(Ordering::Relaxed),
                         "uffd closed by firecracker; handler exiting cleanly"
                     );
                     return Ok(());
@@ -3869,6 +3898,50 @@ mod tests {
             )
             .unwrap(),
         ))
+    }
+
+    /// Several fault threads (`ENGRAM_UFFD_FAULT_THREADS` > 1) serving
+    /// faults on the same chunks: each chunk is installed by exactly one
+    /// of them, and the rest only wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fault_threads_serving_overlapping_faults_install_each_chunk_once() {
+        let n_chunks = 8usize;
+        let chunk_size = 4 * 4096u64;
+        let Some(rt) = test_runtime_with_chunk_size(n_chunks, chunk_size) else {
+            return;
+        };
+        let base = rt.mappings()[0].base_host_virt_addr;
+        let threads: Vec<_> = (0..4u64)
+            .map(|t| {
+                let rt = Arc::clone(&rt);
+                std::thread::spawn(move || {
+                    let pages = n_chunks as u64 * chunk_size / 4096;
+                    (0..pages)
+                        .map(|p| {
+                            // Each thread walks the pages from its own start.
+                            let page = (p + t * 3) % pages;
+                            rt.serve_pagefault_classified(base + page * 4096)
+                                .expect("serve fault")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut installs = vec![0usize; n_chunks];
+        for t in threads {
+            for (idx, source) in t.join().unwrap() {
+                if source != Source::Wake {
+                    installs[idx] += 1;
+                }
+            }
+        }
+        assert_eq!(installs, vec![1; n_chunks]);
+        assert!(rt
+            .installed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| *s == ChunkState::Installed));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

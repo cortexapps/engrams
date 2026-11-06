@@ -479,8 +479,15 @@ mod linux {
         // `register memory … userfaultfd … System error`.
         let populate = match &args.substrate_sock {
             Some(sock) => {
+                // One connection per fault thread plus one for the
+                // producer and startup, when more than one thread serves.
+                let threads = engram_uffd_handler::fault_threads();
+                let slots = if threads > 1 { threads + 1 } else { 1 };
                 let client = std::sync::Arc::new(
-                    engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
+                    engram_uffd_handler::populate_client::PopulateClient::with_slots(
+                        sock.clone(),
+                        slots,
+                    ),
                 );
                 match client.hello(Some(args.canonical_manifest), Some(args.session_manifest)) {
                     Ok((tmpfs_ok, cache_writable)) => {
@@ -494,6 +501,10 @@ mod linux {
                             tracing::warn!(
                                 "substrate readiness: cache root not writable at the writer;                                  populates will fail to the direct-blob fallback",
                             );
+                        }
+                        if slots > 1 {
+                            let pre = client.clone();
+                            std::thread::spawn(move || pre.connect_other_slots());
                         }
                         Some(client)
                     }

@@ -11,6 +11,7 @@
 //! writer stays unreachable, so a fault can never wedge on the control
 //! plane being mid-roll.
 
+use std::cell::Cell;
 #[cfg(target_os = "linux")]
 use std::io::Read as _;
 use std::os::unix::net::UnixStream;
@@ -54,12 +55,28 @@ impl std::fmt::Display for PopulateError {
 
 impl std::error::Error for PopulateError {}
 
-/// Synchronous populate client. One connection, lazily (re)dialed
-/// under a mutex — the fault loop serializes chunk misses per handler
-/// anyway (the writer's singleflight collapses cross-handler dupes).
+thread_local! {
+    /// The connection slot this thread's requests use (default 0).
+    static SLOT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Route this thread's requests to connection `slot`.
+pub fn set_thread_slot(slot: usize) {
+    SLOT.with(|s| s.set(slot));
+}
+
+/// This thread's connection slot.
+pub fn thread_slot() -> usize {
+    SLOT.with(Cell::get)
+}
+
+/// Synchronous populate client. One connection per slot, each lazily
+/// (re)dialed under its own mutex; each fault thread uses its own
+/// slot (the writer serves each connection on its own thread, and its
+/// singleflight collapses duplicate chunks).
 pub struct PopulateClient {
     sock_path: PathBuf,
-    conn: Mutex<Option<UnixStream>>,
+    conns: Vec<Mutex<Option<UnixStream>>>,
     /// The manifest refs from the startup `hello`, replayed on every
     /// fresh dial: the server-side session-chunk PIN SET (and the
     /// proto-version check) live for the CONNECTION, and the designed-
@@ -80,9 +97,14 @@ pub struct PopulateClient {
 
 impl PopulateClient {
     pub fn new(sock_path: PathBuf) -> Self {
+        Self::with_slots(sock_path, 1)
+    }
+
+    /// A client with `slots` connections (at least one).
+    pub fn with_slots(sock_path: PathBuf, slots: usize) -> Self {
         Self {
             sock_path,
-            conn: Mutex::new(None),
+            conns: (0..slots.max(1)).map(|_| Mutex::new(None)).collect(),
             hello_manifests: Mutex::new(None),
             last_hello_ack: Mutex::new(None),
         }
@@ -142,8 +164,8 @@ impl PopulateClient {
             Some((canonical_manifest, session_manifest));
         // Force a fresh dial: with_conn runs the Hello exchange on
         // every new connection (the replay path) and caches the ack.
-        *self.conn.lock().expect("populate conn lock") = None;
-        self.with_conn(|_| Ok(()))?;
+        *self.conns[0].lock().expect("populate conn lock") = None;
+        self.with_conn(0, |_| Ok(()))?;
         self.last_hello_ack
             .lock()
             .expect("last_hello_ack lock")
@@ -155,7 +177,22 @@ impl PopulateClient {
     /// Populate one chunk and return its bytes (read from the fd the
     /// writer passed — an eviction unlink after the reply is harmless).
     pub fn request(&self, hash: ChunkHash) -> Result<Vec<u8>, PopulateError> {
-        let bytes = self.with_conn(|stream| {
+        self.request_on(thread_slot(), hash)
+    }
+
+    /// Dial (and `Hello`) every slot after the first, so a fault
+    /// thread's first miss does not pay the dial.
+    pub fn connect_other_slots(&self) {
+        for slot in 1..self.conns.len() {
+            if let Err(e) = self.with_conn(slot, |_| Ok(())) {
+                tracing::warn!(slot, error = %e, "populate slot pre-dial failed");
+            }
+        }
+    }
+
+    /// [`Self::request`] on connection `slot` (taken modulo the slot count).
+    pub fn request_on(&self, slot: usize, hash: ChunkHash) -> Result<Vec<u8>, PopulateError> {
+        let bytes = self.with_conn(slot, |stream| {
             engram_substrate_proto::write_frame(
                 stream,
                 &ToWriter::Populate {
@@ -202,10 +239,13 @@ impl PopulateClient {
     /// strictly request/response, so a fresh dial is always safe.
     fn with_conn<T>(
         &self,
+        slot: usize,
         mut f: impl FnMut(&mut UnixStream) -> std::io::Result<T>,
     ) -> Result<T, PopulateError> {
         let waited = std::time::Instant::now();
-        let mut guard = self.conn.lock().expect("populate conn lock");
+        let mut guard = self.conns[slot % self.conns.len()]
+            .lock()
+            .expect("populate conn lock");
         crate::fault_stats::STATS.record_lock_wait(waited.elapsed());
         let mut last_err = None;
         for attempt in 0..RECONNECT_ATTEMPTS {

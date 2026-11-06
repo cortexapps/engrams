@@ -486,7 +486,8 @@ impl ChunkedMemoryBackend {
         // handler's small private runtime).
         if let Some(client) = &self.populate {
             let client = client.clone();
-            let res = tokio::task::spawn_blocking(move || client.request(hash))
+            let slot = crate::populate_client::thread_slot();
+            let res = tokio::task::spawn_blocking(move || client.request_on(slot, hash))
                 .await
                 .map_err(|e| {
                     ChunkedBackendError::Io(std::io::Error::other(format!(

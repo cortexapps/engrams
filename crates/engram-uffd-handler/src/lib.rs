@@ -53,6 +53,22 @@ pub mod base_shm;
 pub mod runtime;
 
 pub use chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
+
+/// `ENGRAM_UFFD_FAULT_THREADS`: how many threads read the userfaultfd
+/// and serve faults (default 1). Read once.
+pub fn fault_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("ENGRAM_UFFD_FAULT_THREADS") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(value = %s, "unrecognised ENGRAM_UFFD_FAULT_THREADS; using 1");
+                1
+            }
+        },
+        Err(_) => 1,
+    })
+}
 pub use proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 pub use working_set::WorkingSetRecorder;
 
