@@ -67,8 +67,7 @@ pub struct PeerExport {
     pub durable_at: Vec<Option<ChunkHash>>,
     pub chunk_size: u64,
     pub total_bytes: u64,
-    /// Per-leg serve attribution (logged at DrainDone): where the
-    /// per-request wall actually goes on this no-SHA-NI fleet.
+    /// Per-leg serve attribution, logged at DrainDone.
     pub serve: ServeStats,
     /// Issue #216 Gap 2: the TTL clock SHARED with the registry's
     /// `MigrationExport.last_activity` (same `Arc`). The post-copy TTL
@@ -640,11 +639,11 @@ impl PeerServer {
             .readv_us
             .fetch_add(t_readv.elapsed().as_micros() as u64, Relaxed);
 
-        // v3: the AltSource classify (sha256 of the raw 512 KiB, ~1 ms
-        // on this no-SHA-NI fleet) runs ONLY for drain serves. On the
-        // fault path a demote is strictly WORSE than shipping the
-        // resident bytes — it converts one stalled-vCPU round trip
-        // into a dest-side cache/GCS fetch. The zero check stays on
+        // v3: the AltSource classify (sha256 of the raw 512 KiB) runs
+        // ONLY for drain serves. On the fault path a demote is strictly
+        // WORSE than shipping the resident bytes — it converts one
+        // stalled-vCPU round trip into a dest-side cache/GCS fetch.
+        // The zero check stays on
         // both paths (cheap scan, saves the whole payload).
         let t_classify = crate::time_source::metrics_now();
         let classified = if latency_critical {
@@ -676,8 +675,7 @@ impl PeerServer {
             },
             ServedChunk::Page(bytes, _raw_hash) => {
                 // v2: ship the smaller of lz4/raw; integrity covers
-                // the wire bytes (and hashing the smaller payload is
-                // itself a win on this no-SHA-NI fleet).
+                // the wire bytes.
                 let t_encode = crate::time_source::metrics_now();
                 let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
                 let hash = engram_migrate_proto::wire_hash(&wire);
