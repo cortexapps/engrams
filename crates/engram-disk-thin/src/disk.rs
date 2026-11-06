@@ -155,14 +155,10 @@ impl ThinPoolDisk {
             self.dm
                 .create(&self.device_name(name), sectors, "thin", &params)
                 .await?;
-            match self.volume(name, sectors).await {
-                Ok(volume) => Ok(volume),
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(self.node_of(name)).await;
-                    let _ = self.dm.remove(&self.device_name(name)).await;
-                    Err(e)
-                }
-            }
+            self.open_created(name, |node| {
+                Volume::open(name.clone(), node, sectors * SECTOR_BYTES, self.chunk_size)
+            })
+            .await
         }
         .await;
         if activated.is_err() {
@@ -173,10 +169,53 @@ impl ThinPoolDisk {
         activated
     }
 
-    async fn volume(&self, name: &VolumeName, sectors: u64) -> io::Result<Volume> {
+    /// The device node of `name`, made when it is missing or stale.
+    async fn node(&self, name: &VolumeName) -> io::Result<PathBuf> {
         let node = self.node_of(name);
         dm::make_node(&node, self.dm.devno(&self.device_name(name)).await?)?;
+        Ok(node)
+    }
+
+    async fn volume(&self, name: &VolumeName, sectors: u64) -> io::Result<Volume> {
+        let node = self.node(name).await?;
         Volume::open(name.clone(), &node, sectors * SECTOR_BYTES, self.chunk_size)
+    }
+
+    /// Open a device just created through its node. On failure the node
+    /// and the device are removed again.
+    async fn open_created(
+        &self,
+        name: &VolumeName,
+        open: impl FnOnce(&Path) -> io::Result<Volume>,
+    ) -> io::Result<Volume> {
+        let opened = match self.node(name).await {
+            Ok(node) => open(&node),
+            Err(e) => Err(e),
+        };
+        if opened.is_err() {
+            let _ = tokio::fs::remove_file(self.node_of(name)).await;
+            let _ = self.dm.remove(&self.device_name(name)).await;
+        }
+        opened
+    }
+
+    /// Remove `name`'s device, waiting a bounded time for its last holder
+    /// to close it, then its node.
+    async fn remove_device(&self, name: &VolumeName) -> io::Result<()> {
+        let mut attempt = 1;
+        loop {
+            match self.dm.remove(&self.device_name(name)).await {
+                Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(REMOVE_RETRY).await;
+                }
+                removed => break removed?,
+            }
+        }
+        match tokio::fs::remove_file(self.node_of(name)).await {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Run `read` over a reserved metadata snapshot. The reserve is
@@ -305,20 +344,7 @@ impl SessionDisk for ThinPoolDisk {
     /// Waits a bounded time for the last holder to close the device.
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
         let (thin, _) = self.thin_of(name).await?;
-        let mut attempt = 1;
-        loop {
-            match self.dm.remove(&self.device_name(name)).await {
-                Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
-                    attempt += 1;
-                    tokio::time::sleep(REMOVE_RETRY).await;
-                }
-                removed => break removed?,
-            }
-        }
-        match tokio::fs::remove_file(self.node_of(name)).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        self.remove_device(name).await?;
         self.dm
             .message(&self.pool, &format!("delete {}", thin.id))
             .await
