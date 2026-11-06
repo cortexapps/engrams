@@ -1062,7 +1062,10 @@ impl HostAgent {
             // derive both from the same pure gate rather than letting
             // `enabled_images_tx.is_some()` implicitly stand in for it.
             let stages_images = stages_images_gate(self.fill.is_some(), self.chunk_cache.is_some());
-            let enabled_images_tx = match (self.fill.clone(), self.chunk_cache.clone()) {
+            let (enabled_images_tx, image_disks_tx) = match (
+                self.fill.clone(),
+                self.chunk_cache.clone(),
+            ) {
                 (Some(fill), Some(chunk_cache)) => {
                     // ADR 0022 Option A / ADR 0092: a fresh create always
                     // restores on the File backend, so the supervisor
@@ -1086,17 +1089,19 @@ impl HostAgent {
                         ram_ledger.clone(),
                         self.base_shm_protected.clone(),
                     );
-                    if let Some(disk) = self.session_disk.clone() {
-                        image_volumes::spawn(disk, fill.clone(), tx.subscribe());
-                    }
-                    Some(tx)
+                    let disks_tx = session_volumes.as_ref().map(|volumes| {
+                        let (disks_tx, disks_rx) = tokio::sync::watch::channel(Vec::new());
+                        image_volumes::spawn(volumes.images().clone(), disks_rx);
+                        disks_tx
+                    });
+                    (Some(tx), disks_tx)
                 }
                 _ => {
                     tracing::warn!(
                         "image_prefetch supervisor disabled: chunk_store / chunk_cache \
                          missing — host will never report ready_images and coord will 503 every session",
                     );
-                    None
+                    (None, None)
                 }
             };
             debug_assert_eq!(
@@ -1455,6 +1460,17 @@ impl HostAgent {
                                     &resp.prestage_images,
                                 );
                                 let first = !std::mem::replace(&mut enabled_acked, true);
+                                if let Some(disks_tx) = image_disks_tx.as_ref() {
+                                    let disks = image_volumes::desired_disks(
+                                        &union,
+                                        &resp.capturing_disk_manifests,
+                                    );
+                                    disks_tx.send_if_modified(|cur| {
+                                        let changed = first || *cur != disks;
+                                        *cur = disks;
+                                        changed
+                                    });
+                                }
                                 tx.send_if_modified(|cur| {
                                     let changed = first || *cur != union;
                                     *cur = union;

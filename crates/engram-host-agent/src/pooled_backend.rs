@@ -4707,9 +4707,8 @@ impl SandboxBackend for PooledBackend {
                             "image {uri} has no chunked disk manifest"
                         )));
                     };
-                    Source::Fork {
+                    Source::Image {
                         manifest: bundle.disk_manifest,
-                        base: None,
                     }
                 }
             };

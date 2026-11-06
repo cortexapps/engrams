@@ -1,31 +1,27 @@
-//! Image volumes on this host. The enabled set the coordinator sends is
-//! the only trigger: each change runs one convergence pass. Readiness on
-//! disk is read from the pool when a heartbeat is built, never stored.
+//! Image volumes on this host. The desired disks the heartbeat loop
+//! derives from each coordinator ack are the only trigger: each change
+//! runs one convergence pass. Readiness on disk is read from the pool
+//! when a heartbeat is built, never stored.
 
 use std::sync::Arc;
 
 use engram_core::types::manifest::ManifestRef;
-use engram_host_core::image_volumes::{reconcile_once, staged};
+use engram_host_core::image_volumes::{staged, ImageVolumes};
 use engram_host_core::SessionDisk;
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
 use tokio::sync::watch;
 
 pub fn spawn(
-    disk: Arc<dyn SessionDisk>,
-    fill: engram_fill::FillEngine,
-    mut enabled: watch::Receiver<Vec<EnabledImageRef>>,
+    images: Arc<ImageVolumes>,
+    mut desired: watch::Receiver<Vec<ManifestRef>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // The channel's initial value is not a heartbeat ack. A pass on it
         // would delete every image volume, so the first pass waits for the
         // set the coordinator sends.
-        while enabled.changed().await.is_ok() {
-            let desired: Vec<ManifestRef> = enabled
-                .borrow_and_update()
-                .iter()
-                .map(|image| image.base_snapshot_disk_manifest)
-                .collect();
-            match reconcile_once(disk.as_ref(), &fill, &desired).await {
+        while desired.changed().await.is_ok() {
+            let disks = desired.borrow_and_update().clone();
+            match images.reconcile(&disks).await {
                 Ok(report) => {
                     for (name, error) in &report.failed {
                         tracing::warn!(volume = %name, %error, "image volume operation failed");
@@ -46,6 +42,20 @@ pub fn spawn(
             }
         }
     })
+}
+
+/// The disks this host keeps as image volumes: the base disk of every
+/// enabled or prestaging image, and the disk of every image whose
+/// capture is in flight, so the captured version stages as a delta.
+pub fn desired_disks(images: &[EnabledImageRef], capturing: &[ManifestRef]) -> Vec<ManifestRef> {
+    let mut disks: Vec<ManifestRef> = images
+        .iter()
+        .map(|image| image.base_snapshot_disk_manifest)
+        .chain(capturing.iter().copied())
+        .collect();
+    disks.sort_by_key(|disk| (disk.manifest_id, disk.version));
+    disks.dedup();
+    disks
 }
 
 /// `ready` narrowed to the images whose base disk volume exists now.
@@ -119,17 +129,17 @@ mod tests {
         disk.create(&staged_name, 4096).await.unwrap();
 
         // A fresh process: the channel holds its empty initial value.
-        let (tx, rx) = watch::channel(Vec::<EnabledImageRef>::new());
+        let (tx, rx) = watch::channel(Vec::<ManifestRef>::new());
         let fill =
             engram_fill::FillEngine::new(ChunkStore::new(blob), engram_fill::Config::default());
-        let task = spawn(disk.clone(), fill, rx);
+        let task = spawn(Arc::new(ImageVolumes::new(disk.clone(), fill)), rx);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             volume_exists(&disk, &staged_name).await,
             "the initial empty value is not an ack and must delete nothing"
         );
 
-        tx.send_replace(vec![image("a", staged_ref)]);
+        tx.send_replace(vec![staged_ref]);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             volume_exists(&disk, &staged_name).await,
@@ -161,5 +171,15 @@ mod tests {
             ready_on_disk(&disk, &enabled, ready).await,
             vec![ManifestDigest::new("a")]
         );
+    }
+
+    #[test]
+    fn a_capture_in_flight_adds_its_disk_to_the_desired_set() {
+        let enabled = ManifestRef::new();
+        let capturing = ManifestRef::new();
+        let images = [image("a", enabled), image("b", enabled)];
+        let mut want = vec![enabled, capturing];
+        want.sort_by_key(|d| (d.manifest_id, d.version));
+        assert_eq!(desired_disks(&images, &[capturing, enabled]), want);
     }
 }
