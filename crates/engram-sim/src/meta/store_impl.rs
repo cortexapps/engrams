@@ -4217,10 +4217,27 @@ impl MetadataStore for SimMetadataStore {
         Ok(Vec::new())
     }
 
-    /// The sim models no capture_jobs table, so no capture is in flight.
+    /// The distinct disk manifests of the non-terminal capture jobs. A
+    /// row that does not parse fails the read, as in PG.
     async fn capturing_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
         self.gate()?;
-        Ok(Vec::new())
+        let db = self.db.lock();
+        let mut refs = db
+            .capture_jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal())
+            .map(|job| {
+                job.disk_manifest.parse::<ManifestRef>().map_err(|e| {
+                    MetaError::Serialization(format!(
+                        "capture_jobs.disk_manifest {:?} does not parse: {e}",
+                        job.disk_manifest
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        refs.sort_by_key(|r| (r.manifest_id, r.version));
+        refs.dedup();
+        Ok(refs)
     }
 
     async fn claim_enable_jobs(

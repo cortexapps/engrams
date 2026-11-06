@@ -4315,6 +4315,74 @@ async fn enabled_image_config_update(ctx: &Ctx) {
     );
 }
 
+/// `capturing_disk_manifests` is the distinct disk manifests of the
+/// in-flight capture jobs; a finished job leaves the set, and a row that
+/// does not parse fails the read.
+async fn capturing_disk_manifests_in_flight(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::from(uuid::Uuid::from_u128(0xca9));
+    meta.upsert_host(host_record(host, "capturing-host", now))
+        .await
+        .unwrap();
+    let config = ImageConfig::default();
+    let disk = |n: u128, v: u64| engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(n),
+        version: v,
+    };
+    let mut jobs = Vec::new();
+    for (name, manifest) in [
+        ("a", disk(2, 1)),
+        ("b", disk(1, 3)),
+        ("c", disk(2, 1)),
+        ("done", disk(9, 9)),
+    ] {
+        let parent = meta
+            .create_or_get_enable_job(&format!("conf:capturing:{name}"), None, &config)
+            .await
+            .unwrap()
+            .id;
+        let mut row = new_capture(parent);
+        row.disk_manifest = manifest.to_string();
+        jobs.push(meta.insert_capture_job(row).await.unwrap());
+    }
+    let done = meta
+        .place_capture_job(jobs[3].id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: done.id,
+            epoch: done.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
+            }),
+        })
+        .await
+        .unwrap());
+
+    let mut capturing = meta.capturing_disk_manifests().await.unwrap();
+    capturing.sort_by_key(|r| (r.manifest_id, r.version));
+    assert_eq!(capturing, vec![disk(1, 3), disk(2, 1)]);
+
+    let parent = meta
+        .create_or_get_enable_job("conf:capturing:bad", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let mut bad = new_capture(parent);
+    bad.disk_manifest = "not-a-manifest".into();
+    meta.insert_capture_job(bad).await.unwrap();
+    assert!(matches!(
+        meta.capturing_disk_manifests().await,
+        Err(MetaError::Serialization(_))
+    ));
+}
+
 /// The enable/capture read surface over a store with no such jobs:
 /// `live_enable_work_by_host` is the empty map, while
 /// `list_prestaging_refs`, `capturing_disk_manifests` and
@@ -5480,6 +5548,10 @@ conformance!(
     super::enabled_image_config_update
 );
 conformance!(t_live_enable_work_empty, super::live_enable_work_empty);
+conformance!(
+    t_capturing_disk_manifests_in_flight,
+    super::capturing_disk_manifests_in_flight
+);
 conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,
