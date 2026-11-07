@@ -92,6 +92,19 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
+/// Parent `span` on the W3C `traceparent` in `req`'s metadata: the
+/// server side of [`TraceparentInjector`]. A no-op when the request has
+/// none (OTLP disabled, or a caller that does not propagate).
+pub fn link_remote_parent<T>(span: &tracing::Span, req: &tonic::Request<T>) {
+    if let Some(tp) = req
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        engram_telemetry::set_parent_from_traceparent(span, tp);
+    }
+}
+
 /// ADR 0079: build the shared fenced request for the
 /// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
 /// encodes epoch 0 (interim "verb not yet migrated" — the host allows
