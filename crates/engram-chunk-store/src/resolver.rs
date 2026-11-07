@@ -101,34 +101,26 @@ impl ChunkResolver for BlobStorageResolver {
         Ok(self.blob.get(&hash.storage_key()).await?)
     }
 
-    /// `BlobStorage` has no ranged GET, so this streams the object up
-    /// to the range end and drops the rest of the body: it moves
-    /// `offset + len` bytes, not the whole chunk.
+    /// One ranged GET of the object. A range that runs past the end of
+    /// the object is cut short at the end: the size comes from a HEAD,
+    /// which only that rare case pays.
     async fn fetch_chunk_range_unverified(
         &self,
         hash: ChunkHash,
         offset: u64,
         len: u64,
     ) -> Result<Bytes> {
-        use futures::StreamExt as _;
-        let end = offset.saturating_add(len);
-        let mut stream = self.blob.get_streaming(&hash.storage_key()).await?;
-        let mut out = bytes::BytesMut::with_capacity(len as usize);
-        let mut pos = 0u64;
-        while pos < end {
-            let Some(frame) = stream.next().await else {
-                break;
-            };
-            let frame = frame?;
-            let frame_end = pos + frame.len() as u64;
-            if frame_end > offset {
-                let lo = offset.saturating_sub(pos) as usize;
-                let hi = (end.min(frame_end) - pos) as usize;
-                out.extend_from_slice(&frame[lo..hi]);
+        let key = hash.storage_key();
+        match self.blob.get_range(&key, offset, len).await {
+            Err(engram_core::error::BlobError::RangeOutOfBounds { .. }) if len > 0 => {
+                let size = self.blob.head(&key).await?.size_bytes;
+                match size.saturating_sub(offset) {
+                    0 => Ok(Bytes::new()),
+                    left => Ok(self.blob.get_range(&key, offset, left.min(len)).await?),
+                }
             }
-            pos = frame_end;
+            got => Ok(got?),
         }
-        Ok(out.freeze())
     }
 
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {

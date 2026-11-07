@@ -259,6 +259,9 @@ pub enum BlobError {
     /// Local filesystem error (only the `local` backend; SDK backends
     /// fold IO errors into `Sdk`).
     Io(std::io::Error),
+    /// A ranged read ([`crate::traits::BlobStorage::get_range`]) asked
+    /// for no bytes, or for bytes past the end of the object.
+    RangeOutOfBounds { offset: u64, len: u64 },
 }
 
 impl fmt::Display for BlobError {
@@ -269,6 +272,9 @@ impl fmt::Display for BlobError {
             Self::Config(msg) => write!(f, "blob config error: {msg}"),
             Self::Protocol(msg) => write!(f, "blob protocol error: {msg}"),
             Self::Io(e) => write!(f, "blob io error: {e}"),
+            Self::RangeOutOfBounds { offset, len } => {
+                write!(f, "blob range [{offset}, +{len}) is empty or past the end")
+            }
         }
     }
 }

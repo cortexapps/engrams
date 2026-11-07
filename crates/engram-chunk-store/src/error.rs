@@ -118,6 +118,10 @@ impl ChunkStoreError {
                 BlobError::Config(m) => BlobError::Config(m.clone()),
                 BlobError::Protocol(m) => BlobError::Protocol(m.clone()),
                 BlobError::Io(e) => BlobError::Io(io(e)),
+                BlobError::RangeOutOfBounds { offset, len } => BlobError::RangeOutOfBounds {
+                    offset: *offset,
+                    len: *len,
+                },
             }),
             Self::Serialize(e) => Self::Internal(format!("manifest serde: {e}")),
             Self::HashMismatch { expected, actual } => Self::HashMismatch {
