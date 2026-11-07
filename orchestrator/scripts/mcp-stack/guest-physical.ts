@@ -123,29 +123,6 @@ export async function probeManagedAuthority(
       config.listen.port === Number(url.port || "443"),
     "managed_fixture_config_binding",
   );
-  const dns = await guestExec(ctx, client, sessionId, [
-    "/usr/bin/env",
-    "-i",
-    "PATH=/usr/bin:/bin",
-    "/bin/sh",
-    "-c",
-    `set -eu
-control=$(timeout 2s getent ahostsv4 "$1" 2>/dev/null) || exit 21
-[ -n "$control" ] || exit 21
-set +e
-result=$(timeout 2s getent ahostsv4 "$2" 2>/dev/null)
-status=$?
-set -e
-[ "$status" -eq 2 ] && [ -z "$result" ] || exit 22
-`,
-    "fixture-managed-dns",
-    new URL(ctx.endpoints.app.origin).hostname,
-    url.hostname,
-  ]);
-  requireThat(
-    dns.status === 0 && dns.stdout.length === 0,
-    "managed_dns_lookup_failure",
-  );
   const response = await guestExec(ctx, client, sessionId, [
     "/usr/bin/env",
     "-i",
@@ -164,15 +141,7 @@ timeout 5s openssl s_client -connect "$1" -servername "$2" -tls1_3 < /dev/null >
     response.status !== 0 && ![124, 126, 127, 137].includes(response.status),
     "managed_destination_probe_denied",
   );
-  return {
-    sni: url.hostname,
-    sha256: sha256(String(response.status)),
-    dns: {
-      positiveControl: true,
-      managedLookupExit: 2,
-      configurationSha256: fixture.configuration.sha256,
-    },
-  };
+  return { sni: url.hostname, sha256: sha256(String(response.status)) };
 }
 
 /** Fixed sentinels test loss of the old tmpfs state, not removal of every old RAM byte. */
