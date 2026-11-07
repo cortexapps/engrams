@@ -46,9 +46,9 @@
 //! connection.
 //!
 //! A writer that does not speak the requested version replies
-//! `PopulateErr` to the `Hello` and closes the connection; the client
-//! then dials again with the version below (a version-3 client with
-//! version 2, a version-2 handler with version 1).
+//! `PopulateErr` to the `Hello` and closes the connection. A writer
+//! older than version 3 does the same to a version-3 `Hello`. A version-2
+//! handler then dials again with version 1.
 
 use std::io::{Read, Write};
 
@@ -327,8 +327,7 @@ mod tests {
         assert_eq!(to(&ToWriter::Populate { hash: [0; 32] }), [1, 0, 0, 0]);
     }
 
-    /// The version-3 read, byte for byte: a disk client in another
-    /// process encodes it by hand.
+    /// The version-3 read, byte for byte.
     #[test]
     fn a_read_has_a_fixed_wire_shape() {
         let read = ToWriter::Read {
