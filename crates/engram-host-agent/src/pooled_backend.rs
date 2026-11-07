@@ -188,6 +188,109 @@ mod item_assembler_tests {
 mod first_touch_tests {
     use super::*;
 
+    /// Records the chunk GETs in order.
+    struct RecordingBlob {
+        inner: engram_storage_local::LocalBlobStorage,
+        gets: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::BlobStorage for RecordingBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::storage::ByteStream,
+        ) -> Result<u64, engram_core::BlobError> {
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::storage::ByteStream, engram_core::BlobError> {
+            if key.starts_with("chunks/") {
+                self.gets.lock().push(key.to_string());
+            }
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::storage::BlobObjectMeta, engram_core::BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), engram_core::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, engram_core::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lazy_restore_fetches_the_prefix_then_the_rest_in_touch_order() {
+        const CHUNK: u64 = 4096;
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = Arc::new(RecordingBlob {
+            inner: engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+            gets: parking_lot::Mutex::new(Vec::new()),
+        });
+        let plain = ChunkStore::new(blob.clone());
+        let mut chunks = Vec::new();
+        for i in 0..4u8 {
+            let hash = plain.put_chunk(&vec![i + 1; CHUNK as usize]).await.unwrap();
+            chunks.push(engram_chunk_store::ChunkRef {
+                offset: u64::from(i) * CHUNK,
+                hash,
+            });
+        }
+        let hashes: Vec<_> = chunks.iter().map(|c| c.hash).collect();
+        let manifest = engram_chunk_store::Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: engram_chunk_store::ManifestKind::Memory,
+            chunk_size: engram_chunk_store::ChunkSize::bytes(CHUNK),
+            total_bytes: 4 * CHUNK,
+            chunks,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mref = engram_core::types::manifest::ManifestRef::new();
+        plain.put_manifest(mref, &manifest).await.unwrap();
+        // The last run touched chunk 2, then (after its first completed
+        // run) chunks 3 and 1.
+        let session = SessionId::new();
+        let file = tmp.path().join(engram_chunk_store::FirstTouch::FILE);
+        let record = engram_chunk_store::FirstTouch {
+            entries: vec![(2, 10), (3, 20), (1, 30)],
+        };
+        std::fs::write(&file, record.encode()).unwrap();
+        publish_first_touch(&plain, session, &file, Some(10)).await;
+
+        let cache = engram_chunk_store::cache::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+        let fill = FillEngine::new(
+            ChunkStore::new(blob.clone()).with_chunk_cache(cache),
+            engram_fill::Config {
+                in_flight: 1,
+                max_in_flight: 1,
+                ..engram_fill::Config::default()
+            },
+        );
+        blob.gets.lock().clear();
+        PooledBackend::prefetch_memory_chunks(&fill, Some(mref), Class::Hydrate, Some(session))
+            .await
+            .unwrap();
+        let mut first_gets = blob.gets.lock().clone();
+        let mut seen = std::collections::HashSet::new();
+        first_gets.retain(|key| seen.insert(key.clone()));
+        let order: Vec<String> = [2, 3, 1, 0]
+            .iter()
+            .map(|&i| hashes[i].storage_key())
+            .collect();
+        assert_eq!(first_gets, order);
+    }
+
     #[test]
     fn the_prefix_ends_at_the_first_completed_run_and_at_the_cap() {
         let record = engram_chunk_store::FirstTouch {
@@ -262,16 +365,23 @@ async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
     serde_json::from_value(value.get("trace_lineage_id")?.clone()).ok()
 }
 
-/// The session's published first-touch prefix as this manifest's chunk
-/// hashes, in order. Positions the manifest leaves out are zero pages and
-/// need no fetch.
+/// The store key of the chunk indices a session touched after its
+/// published prefix, in touch order (little-endian `u32`s). A build that
+/// does not know it reads only the prefix.
+fn first_touch_rest_key(session: SessionId) -> String {
+    format!("traces/{}/first-touch-rest.v1", session.as_uuid())
+}
+
+/// The chunk indices under `key` as this manifest's chunk hashes, in
+/// order. Positions the manifest leaves out are zero pages and need no
+/// fetch.
 async fn first_touch_hashes(
     store: &ChunkStore,
     session: SessionId,
+    key: &str,
     manifest: &engram_chunk_store::Manifest,
 ) -> Vec<engram_chunk_store::ChunkHash> {
-    let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
-    let indices = match store.blob_storage().get(&key).await {
+    let indices = match store.blob_storage().get(key).await {
         Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
         Err(engram_core::BlobError::NotFound) => return Vec::new(),
         Err(e) => {
@@ -328,11 +438,21 @@ async fn publish_first_touch(
     if record.entries.is_empty() {
         return;
     }
-    let (prefix, _rest) = split_first_touch(&record, first_run_completed.unwrap_or(i64::MAX));
+    let (prefix, rest) = split_first_touch(&record, first_run_completed.unwrap_or(i64::MAX));
+    let encode = engram_chunk_store::FirstTouch::encode_indices;
+    let blob = store.blob_storage();
     let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
-    let body = engram_chunk_store::FirstTouch::encode_indices(&prefix);
-    match store.blob_storage().put(&key, body.into()).await {
-        Ok(_) => tracing::info!(%session, chunks = prefix.len(), "published first-touch prefix"),
+    let rest_key = first_touch_rest_key(session);
+    match tokio::try_join!(
+        blob.put(&key, encode(&prefix).into()),
+        blob.put(&rest_key, encode(&rest).into()),
+    ) {
+        Ok(_) => tracing::info!(
+            %session,
+            chunks = prefix.len(),
+            rest = rest.len(),
+            "published first-touch prefix"
+        ),
         Err(e) => tracing::warn!(%session, error = %e, "publish first-touch prefix failed"),
     }
 }
@@ -1619,7 +1739,7 @@ impl PooledBackend {
         // (below), because the sidecar names the session's first-touch prefix.
         if let (false, Some(fill)) = (memory_is_lazy, self.fill.clone()) {
             if let Err(e) = tracing::Instrument::instrument(
-                Self::prefetch_memory_chunks(&fill, &metadata, Class::Demand, None),
+                Self::prefetch_memory_chunks(&fill, metadata.memory_manifest, Class::Demand, None),
                 tracing::info_span!("restore.prefetch_memory"),
             )
             .await
@@ -1689,8 +1809,13 @@ impl PooledBackend {
             };
             let prefetch = tokio::spawn(tracing::Instrument::instrument(
                 async move {
-                    if let Err(e) =
-                        Self::prefetch_memory_chunks(&fill, &md, Class::Hydrate, session).await
+                    if let Err(e) = Self::prefetch_memory_chunks(
+                        &fill,
+                        md.memory_manifest,
+                        Class::Hydrate,
+                        session,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             error = %e,
@@ -3600,34 +3725,46 @@ impl PooledBackend {
     }
 
     /// Make the memory manifest's chunks resident in the chunk cache at
-    /// `class`. With `first`, the chunks that session touched before its
-    /// harness attached last time are fetched first, at `Prefix`.
+    /// `class`. With `first`, the chunks that session touched first last
+    /// time are fetched first, at `Prefix`; then, at `class`, the chunks it
+    /// touched after them in touch order, then the rest in manifest order.
     /// Best-effort for the caller: a failure leaves the faults (or the
     /// serial materialize) to fetch on demand.
     async fn prefetch_memory_chunks(
         fill: &FillEngine,
-        metadata: &SnapshotMetadata,
+        memory: Option<engram_core::types::manifest::ManifestRef>,
         class: Class,
         first: Option<SessionId>,
     ) -> Result<engram_fill::FillStats, SandboxError> {
-        let Some(mref) = metadata.memory_manifest else {
+        let Some(mref) = memory else {
             return Ok(engram_fill::FillStats::default());
         };
         let manifest =
             fill.store().get_manifest(mref).await.map_err(|e| {
                 SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
             })?;
-        if let Some(session) = first {
-            let prefix = first_touch_hashes(fill.store(), session, &manifest).await;
-            if !prefix.is_empty() {
-                match fill.fill(prefix, Class::Prefix).await {
-                    Ok(stats) => tracing::info!(?stats, "memory first-touch prefix resident"),
-                    Err(e) => tracing::warn!(error = %e, "memory first-touch prefix failed"),
+        let mut order = match first {
+            Some(session) => {
+                let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
+                let rest_key = first_touch_rest_key(session);
+                let (prefix, rest) = tokio::join!(
+                    first_touch_hashes(fill.store(), session, &key, &manifest),
+                    first_touch_hashes(fill.store(), session, &rest_key, &manifest),
+                );
+                if !prefix.is_empty() {
+                    match fill.fill(prefix, Class::Prefix).await {
+                        Ok(stats) => tracing::info!(?stats, "memory first-touch prefix resident"),
+                        Err(e) => tracing::warn!(error = %e, "memory first-touch prefix failed"),
+                    }
                 }
+                rest
             }
-        }
+            None => Vec::new(),
+        };
+        // `fill` skips the repeats.
+        order.extend(manifest.chunks.iter().map(|c| c.hash));
         let stats = fill
-            .fill(manifest.chunks.iter().map(|c| c.hash).collect(), class)
+            .fill(order, class)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("memory prefetch: {e}")))?;
         tracing::debug!(manifest = %mref, ?stats, "memory chunks resident");
