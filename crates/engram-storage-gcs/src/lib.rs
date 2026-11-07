@@ -70,9 +70,11 @@ impl GcsBlobStorage {
         // - bounded connect: a blackholed endpoint fails in 5 s and
         //   surfaces to the BlobClient retry layer, instead of pinning
         //   an attempt for the OS default (minutes).
-        // - sized keep-alive pool: the sparse re-chunk and disk checkpoint
-        //   fan out dozens of concurrent chunk ops; idle-connection
-        //   reuse keeps those off the TLS-handshake path — and keeps
+        // - sized keep-alive pool: as large as the fill engine's in-flight
+        //   ceiling (256), so a fill at that width reuses its connections;
+        //   idle-connection reuse keeps chunk ops off the TLS-handshake
+        //   path (a smaller pool closes the extra connections after each
+        //   use and the next request pays a new handshake) — and keeps
         //   DNS off the hot path entirely, which is why hickory async
         //   DNS was tried and RETIRED here: reqwest's `hickory-dns`
         //   feature unifies workspace-wide and flips the DEFAULT
@@ -98,7 +100,7 @@ impl GcsBlobStorage {
         // with the feature enabled rather than trusting this number.
         let http = engram_tls::client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(256)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .http1_only()
