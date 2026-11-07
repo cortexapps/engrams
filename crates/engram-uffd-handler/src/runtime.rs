@@ -443,6 +443,28 @@ const FIRST_TOUCH_WINDOW: Duration = Duration::from_secs(30);
 /// not install yet.
 const SWEEP_RETRY: Duration = Duration::from_millis(250);
 
+/// Passes over the waiting chunks in which none lands before the sweep
+/// stops (5 s). A running prefetch lands hundreds of chunks a second.
+const SWEEP_STALL_PASSES: usize = 20;
+
+/// The eager sweep's order: divergent chunks, then canonical ones.
+#[derive(Clone, Copy)]
+enum SweepPass {
+    Divergent,
+    Canonical,
+}
+
+/// What [`Runtime::sweep_step`] did with one chunk.
+enum SweepStep {
+    Installed,
+    /// Its bytes are not at hand yet, or the guest should touch it first.
+    Wait,
+    /// A zero chunk, or a canonical one with no hash: faults serve it.
+    Zero,
+    /// Installed already, sealed, or past the end.
+    Skip,
+}
+
 /// The work list the drain connections share.
 struct DrainShared {
     /// `(offset, forced)`: a forced chunk is requested even when another
@@ -981,11 +1003,15 @@ impl Runtime {
     /// (no vCPU waits on a page it hasn't faulted).
     ///
     /// With a writer, the sweep never fetches: it installs only chunks
-    /// the cache (or the base shm) already holds, and goes over the rest
-    /// again every [`SWEEP_RETRY`] as the writer's prefetch lands them.
-    /// A fetch here would be a `Demand` request, made one at a time on
-    /// this thread, for a chunk the prefetch has not reached yet. Without
-    /// a writer nothing else fills the cache, so the sweep fetches.
+    /// the cache (or the base shm) already holds. It keeps the chunks it
+    /// could not install yet and goes over only those every
+    /// [`SWEEP_RETRY`] as the writer's prefetch lands them. After
+    /// [`SWEEP_STALL_PASSES`] passes in which none landed (the prefetch
+    /// ended or the writer restarted), it stops and leaves them to the
+    /// faults. A fetch here would be a `Demand` request, made one at a
+    /// time on this thread, for a chunk the prefetch has not reached yet.
+    /// Without a writer nothing else fills the cache, so the sweep
+    /// fetches.
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
         if std::env::var("ENGRAM_UFFD_EAGER_SWEEP")
             .map(|v| v == "0")
@@ -1013,122 +1039,128 @@ impl Runtime {
         let total = self.backend.total_bytes();
         let follow = self.backend.has_writer();
         let mut installed = 0usize;
-        let mut deferred = 0usize;
-        let mut passes = 0usize;
-        loop {
-            let mut waiting = 0usize;
-            // Two passes, divergent first: those are the chunks an
-            // on-demand fault pays a fetch for (the post-teleport crawl);
-            // canonical pages CONTINUE from the (pre-warmed) base for
-            // near-free, and ZERO chunks are skipped entirely — eagerly
-            // installing them would privately materialize every untouched
-            // page of guest RAM (UFFDIO_ZEROPAGE is rejected on the
-            // substrate's MAP_PRIVATE file mapping, so each would COPY a
-            // zeroed buffer), defeating the density the substrate exists
-            // for. A zero fault is already served with no fetch.
-            for pass in ["divergent", "canonical"] {
-                let mut offset: u64 = 0;
-                while offset < total {
-                    if started.elapsed() > budget {
-                        tracing::warn!(
-                            pass,
-                            installed,
-                            deferred,
-                            "eager sweep budget exhausted; remaining chunks serve on-demand"
-                        );
-                        return Ok(());
-                    }
-                    // ADR 0045 C2: a sealed-but-undrained chunk's truth is the
-                    // PEER, not the manifest — installing resolve()'s stale
-                    // view here would be silent corruption. The drain runs
-                    // before this on the producer thread, so normally every
-                    // sealed chunk is already installed; this guard is the
-                    // belt-and-braces for any other interleaving.
-                    if let Some(peer) = self.peer.as_ref() {
-                        let idx = offset / chunk_size;
-                        if peer.seal().get(idx) && !self.chunk_installed(idx as usize) {
-                            offset += chunk_size;
-                            continue;
-                        }
-                    }
-                    let idx = (offset / chunk_size) as usize;
-                    if self.chunk_installed(idx) {
-                        offset += chunk_size;
-                        continue;
-                    }
-                    if self.first_touch.awaits_guest(idx) {
-                        waiting += 1;
-                        offset += chunk_size;
-                        continue;
-                    }
-                    let held = |hash| !follow || self.backend.is_resident(hash);
-                    let did = match (pass, self.backend.resolve(offset)) {
-                        ("divergent", Some(ResolvedPage::Chunk { hash })) if held(hash) => {
-                            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                            self.install_chunk_at(offset, bytes, false)?
-                        }
-                        ("divergent", Some(ResolvedPage::Chunk { .. })) => {
-                            waiting += 1;
-                            false
-                        }
-                        ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
-                            match self.backend.canonical_chunk_hash(canonical_offset) {
-                                Some(hash) => match self.base_shm.as_ref() {
-                                    Some(base)
-                                        if held(hash)
-                                            || base.is_populated(
-                                                offset,
-                                                chunk_size.min(total - offset),
-                                            ) =>
-                                    {
-                                        self.install_canonical_shared(base, offset, hash, false)?
-                                    }
-                                    None if held(hash) => {
-                                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                                        self.install_chunk_at(offset, bytes, false)?
-                                    }
-                                    _ => {
-                                        waiting += 1;
-                                        false
-                                    }
-                                },
-                                None => {
-                                    deferred += usize::from(passes == 0);
-                                    false
-                                }
-                            }
-                        }
-                        ("canonical", Some(ResolvedPage::Zero { .. })) => {
-                            // Zero chunks are skipped — installing them would
-                            // privately materialize untouched guest RAM (see
-                            // the pass comment above). Counted once, in the
-                            // canonical pass, as zero_skipped.
-                            deferred += usize::from(passes == 0);
-                            false
-                        }
-                        _ => false,
-                    };
-                    if did {
-                        installed += 1;
-                    }
-                    offset += chunk_size;
+        let mut zero_skipped = 0usize;
+        // Divergent first: those are the chunks an on-demand fault pays a
+        // fetch for (the post-teleport crawl); canonical pages CONTINUE
+        // from the (pre-warmed) base for near-free, and ZERO chunks are
+        // skipped entirely — eagerly installing them would privately
+        // materialize every untouched page of guest RAM
+        // (UFFDIO_ZEROPAGE is rejected on the substrate's MAP_PRIVATE
+        // file mapping, so each would COPY a zeroed buffer), defeating
+        // the density the substrate exists for. A zero fault is already
+        // served with no fetch.
+        let mut pending = Vec::new();
+        for pass in [SweepPass::Divergent, SweepPass::Canonical] {
+            for offset in (0..total).step_by(chunk_size as usize) {
+                match self.sweep_step(pass, offset, follow)? {
+                    SweepStep::Installed => installed += 1,
+                    SweepStep::Zero => zero_skipped += 1,
+                    SweepStep::Wait => pending.push((pass, offset)),
+                    SweepStep::Skip => {}
                 }
             }
-            passes += 1;
-            if waiting == 0 {
-                break;
+        }
+        let mut passes = 1usize;
+        let mut stalled = 0usize;
+        let end = loop {
+            if pending.is_empty() {
+                break "complete";
+            }
+            if started.elapsed() > budget {
+                break "budget";
+            }
+            if stalled >= SWEEP_STALL_PASSES {
+                break "stalled";
             }
             std::thread::sleep(SWEEP_RETRY);
-        }
+            let before = installed;
+            let mut still = Vec::with_capacity(pending.len());
+            for (pass, offset) in pending {
+                match self.sweep_step(pass, offset, follow)? {
+                    SweepStep::Installed => installed += 1,
+                    SweepStep::Wait => still.push((pass, offset)),
+                    SweepStep::Zero | SweepStep::Skip => {}
+                }
+            }
+            pending = still;
+            passes += 1;
+            stalled = if installed > before { 0 } else { stalled + 1 };
+        };
         tracing::info!(
+            end,
             installed,
             passes,
-            zero_skipped = deferred,
+            left_to_faults = pending.len(),
+            zero_skipped,
             elapsed_ms = started.elapsed().as_millis() as u64,
             total_chunks = total.div_ceil(chunk_size),
             "eager sweep complete (ADR 0045)"
         );
         Ok(())
+    }
+
+    /// One chunk of the eager sweep: install it when its bytes are at
+    /// hand (with a writer, `follow`: when the cache or the base shm
+    /// holds them).
+    fn sweep_step(
+        &self,
+        pass: SweepPass,
+        offset: u64,
+        follow: bool,
+    ) -> Result<SweepStep, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let idx = (offset / chunk_size) as usize;
+        // ADR 0045 C2: a sealed-but-undrained chunk's truth is the PEER,
+        // not the manifest — installing resolve()'s stale view here would
+        // be silent corruption. The drain runs before this on the
+        // producer thread, so normally every sealed chunk is already
+        // installed; this guard is the belt-and-braces for any other
+        // interleaving.
+        let sealed = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| peer.seal().get(idx as u64));
+        if self.chunk_installed(idx) || sealed {
+            return Ok(SweepStep::Skip);
+        }
+        if self.first_touch.awaits_guest(idx) {
+            return Ok(SweepStep::Wait);
+        }
+        let held = |hash| !follow || self.backend.is_resident(hash);
+        let did = match (pass, self.backend.resolve(offset)) {
+            (SweepPass::Divergent, Some(ResolvedPage::Chunk { hash })) if held(hash) => {
+                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
+                self.install_chunk_at(offset, bytes, false)?
+            }
+            (SweepPass::Divergent, Some(ResolvedPage::Chunk { .. })) => {
+                return Ok(SweepStep::Wait);
+            }
+            (SweepPass::Canonical, Some(ResolvedPage::Canonical { canonical_offset })) => {
+                let Some(hash) = self.backend.canonical_chunk_hash(canonical_offset) else {
+                    return Ok(SweepStep::Zero);
+                };
+                let len = chunk_size.min(self.backend.total_bytes() - offset);
+                match self.base_shm.as_ref() {
+                    Some(base) if held(hash) || base.is_populated(offset, len) => {
+                        self.install_canonical_shared(base, offset, hash, false)?
+                    }
+                    None if held(hash) => {
+                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
+                        self.install_chunk_at(offset, bytes, false)?
+                    }
+                    _ => return Ok(SweepStep::Wait),
+                }
+            }
+            (SweepPass::Canonical, Some(ResolvedPage::Zero { .. })) => {
+                return Ok(SweepStep::Zero);
+            }
+            _ => false,
+        };
+        Ok(if did {
+            SweepStep::Installed
+        } else {
+            SweepStep::Skip
+        })
     }
 
     /// Atomically claim a chunk for installation (CAS `Empty →
