@@ -252,6 +252,14 @@ pub const SESSION_CREATE_TOTAL: &str = "engram_session_create_total";
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
 
+/// Gauge. Open connections in the metadata store's Postgres pool, idle
+/// or in use. At the pool maximum with
+/// [`PG_POOL_IDLE_CONNECTIONS`] at zero, queries wait for a connection.
+pub const PG_POOL_CONNECTIONS: &str = "engram_pg_pool_connections";
+
+/// Gauge. Idle connections in the metadata store's Postgres pool.
+pub const PG_POOL_IDLE_CONNECTIONS: &str = "engram_pg_pool_idle_connections";
+
 /// Counter (ADR 0073). Outbox rows handed to the host relay. The gap
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
