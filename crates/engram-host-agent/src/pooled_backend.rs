@@ -184,6 +184,37 @@ mod item_assembler_tests {
     }
 }
 
+#[cfg(test)]
+mod first_touch_tests {
+    use super::*;
+
+    #[test]
+    fn the_prefix_ends_at_the_first_completed_run_and_at_the_cap() {
+        let record = engram_chunk_store::FirstTouch {
+            entries: vec![(4, 10), (1, 20), (7, 30)],
+        };
+        assert_eq!(split_first_touch(&record, 20), (vec![4, 1], vec![7]));
+        assert_eq!(
+            split_first_touch(&record, i64::MAX),
+            (vec![4, 1, 7], vec![])
+        );
+        let long = engram_chunk_store::FirstTouch {
+            entries: (0..FIRST_TOUCH_PREFIX_CAP as u32 + 2)
+                .map(|i| (i, 0))
+                .collect(),
+        };
+        let (prefix, rest) = split_first_touch(&long, 0);
+        assert_eq!(prefix.len(), FIRST_TOUCH_PREFIX_CAP);
+        assert_eq!(
+            rest,
+            vec![
+                FIRST_TOUCH_PREFIX_CAP as u32,
+                FIRST_TOUCH_PREFIX_CAP as u32 + 1
+            ]
+        );
+    }
+}
+
 /// Land `want` from the snapshot's hinted peers into the chunk cache,
 /// skipping chunks already resident. Best-effort.
 async fn pull_from_peers(
@@ -257,17 +288,35 @@ async fn first_touch_hashes(
         .collect()
 }
 
-/// With no attach time (a host-agent restart lost it), the published
-/// prefix ends this long after the first fault.
-const FIRST_TOUCH_FALLBACK_MS: i64 = 15_000;
+/// The most chunks a published first-touch prefix holds: 4 GiB of 512 KiB
+/// chunks. A cold resume's first agent turn touched about 3,500 chunks, so
+/// the cap keeps more than twice that, and bounds what a restore fetches
+/// at `Prefix` ahead of the rest of guest memory.
+const FIRST_TOUCH_PREFIX_CAP: usize = 8192;
 
-/// Publish the chunks the sandbox touched before its harness attached, for
-/// the session's next restore to fetch first. Best-effort.
+/// The record's chunk indices in touch order, split into the prefix (the
+/// chunks touched up to and including `cut_ms`, at most
+/// [`FIRST_TOUCH_PREFIX_CAP`]) and the rest.
+fn split_first_touch(record: &engram_chunk_store::FirstTouch, cut_ms: i64) -> (Vec<u32>, Vec<u32>) {
+    let mut prefix: Vec<u32> = record.entries.iter().map(|(idx, _)| *idx).collect();
+    let cut = record
+        .entries
+        .iter()
+        .take_while(|(_, at)| *at <= cut_ms)
+        .count()
+        .min(FIRST_TOUCH_PREFIX_CAP);
+    let rest = prefix.split_off(cut);
+    (prefix, rest)
+}
+
+/// Publish the chunks the sandbox touched up to its first completed run
+/// (all of them before one completes), for the session's next restore to
+/// fetch first. Best-effort.
 async fn publish_first_touch(
     store: &ChunkStore,
     session: SessionId,
     file: &Path,
-    attached_at: Option<i64>,
+    first_run_completed: Option<i64>,
 ) {
     let Ok(bytes) = tokio::fs::read(file).await else {
         return;
@@ -276,10 +325,10 @@ async fn publish_first_touch(
         tracing::debug!(file = %file.display(), "first-touch record torn; not published");
         return;
     };
-    let Some(&(_, first)) = record.entries.first() else {
+    if record.entries.is_empty() {
         return;
-    };
-    let prefix = record.until(attached_at.unwrap_or(first + FIRST_TOUCH_FALLBACK_MS));
+    }
+    let (prefix, _rest) = split_first_touch(&record, first_run_completed.unwrap_or(i64::MAX));
     let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
     let body = engram_chunk_store::FirstTouch::encode_indices(&prefix);
     match store.blob_storage().put(&key, body.into()).await {
@@ -638,9 +687,9 @@ pub struct PooledBackend {
     /// manifest: its last successful capture, or the chain seed of its
     /// restore. A sandbox without a stamp is due for a checkpoint.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
-    /// When each sandbox's harness first attached (Unix ms). The
+    /// When each sandbox's first agent run completed (Unix ms). The
     /// first-touch prefix a capture publishes ends here.
-    attached_at_ms: Arc<DashMap<SandboxId, i64>>,
+    first_run_completed_ms: Arc<DashMap<SandboxId, i64>>,
     /// A restored sandbox's hinted peer, registered with the fill engine
     /// for its memory manifest until the sandbox goes.
     peer_registrations: Arc<DashMap<SandboxId, engram_fill::PeerRegistration>>,
@@ -1878,7 +1927,7 @@ impl PooledBackend {
             held_snapshots: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
-            attached_at_ms: Arc::new(DashMap::new()),
+            first_run_completed_ms: Arc::new(DashMap::new()),
             peer_registrations: Arc::new(DashMap::new()),
             memory_prefetches: DashMap::new(),
             checkpoint_pacing: Arc::new(DashMap::new()),
@@ -2359,6 +2408,14 @@ impl PooledBackend {
     /// fault path is the backstop. Idempotent: re-publishing the same
     /// canonical key is a harmless overwrite (a session runs one place at a
     /// time, so there are no concurrent writers).
+    /// Note that an agent run of the sandbox completed. The first one ends
+    /// the first-touch prefix the sandbox's captures publish.
+    pub fn note_run_completed(&self, id: SandboxId) {
+        self.first_run_completed_ms
+            .entry(id)
+            .or_insert_with(|| self.clock.now_utc().timestamp_millis());
+    }
+
     fn spawn_trace_publish(&self, id: SandboxId) {
         let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
             return; // no bound session → no canonical key to publish under
@@ -2369,12 +2426,12 @@ impl PooledBackend {
         let Some(chunk_store) = self.chunk_store.clone() else {
             return;
         };
-        let attached_at = self.attached_at_ms.get(&id).map(|e| *e);
+        let first_run_completed = self.first_run_completed_ms.get(&id).map(|e| *e);
         if let Some(dir) = trace_path.parent() {
             let file = dir.join(engram_chunk_store::FirstTouch::FILE);
             let store = chunk_store.clone();
             tokio::spawn(async move {
-                publish_first_touch(&store, session_id, &file, attached_at).await;
+                publish_first_touch(&store, session_id, &file, first_run_completed).await;
             });
         }
         tokio::spawn(async move {
@@ -5967,7 +6024,7 @@ impl SandboxBackend for PooledBackend {
                 let egress = self.egress.clone();
                 let inner = self.inner.clone();
                 let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
-                let attached_at_ms = self.attached_at_ms.clone();
+                let first_run_completed_ms = self.first_run_completed_ms.clone();
                 let peer_registrations = self.peer_registrations.clone();
                 let checkpoint_pacing = self.checkpoint_pacing.clone();
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
@@ -6028,7 +6085,7 @@ impl SandboxBackend for PooledBackend {
                         }
                     }
                     let _ = last_snapshot_unix_ms.remove(&id);
-                    let _ = attached_at_ms.remove(&id);
+                    let _ = first_run_completed_ms.remove(&id);
                     let _ = peer_registrations.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
                     let _ = dead_probe_inflight.remove(&id);
@@ -6063,11 +6120,7 @@ impl SandboxBackend for PooledBackend {
         if agent.host_ca_pem.is_none() {
             agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
         }
-        self.inner.start_agent(id, agent).await?;
-        self.attached_at_ms
-            .entry(id)
-            .or_insert_with(|| self.clock.now_utc().timestamp_millis());
-        Ok(())
+        self.inner.start_agent(id, agent).await
     }
 
     /// ADR 0084 §B: cold-base / warm-overlay split.

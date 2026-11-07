@@ -433,6 +433,12 @@ const FAULT_RECENT: Duration = Duration::from_millis(2);
 /// of the same chunk before it asks for the chunk itself.
 const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
 
+/// How long after the handshake the first-touch window stays open. A cold
+/// resume's first agent turn ended about 29 s after the VM resumed; the
+/// host-agent cuts the published prefix at the first completed run, so
+/// the window only has to cover that turn.
+const FIRST_TOUCH_WINDOW: Duration = Duration::from_secs(30);
+
 /// The work list the drain connections share.
 struct DrainShared {
     /// `(offset, forced)`: a forced chunk is requested even when another
@@ -1029,6 +1035,13 @@ impl Runtime {
                         offset += chunk_size;
                         continue;
                     }
+                }
+                if self
+                    .first_touch
+                    .awaits_guest((offset / chunk_size) as usize)
+                {
+                    offset += chunk_size;
+                    continue;
                 }
                 let did = match (pass, self.backend.resolve(offset)) {
                     ("divergent", Some(ResolvedPage::Chunk { hash })) => {
@@ -2528,6 +2541,21 @@ pub fn run_listener(
     // sound. Previously prefault ran to completion before `run()`, which put
     // the entire working-set fetch on the resume critical path.
     let rt = Arc::new(rt);
+    {
+        let rt = Arc::clone(&rt);
+        let _ = std::thread::Builder::new()
+            .name("engram-uffd-first-touch".to_string())
+            .spawn(move || {
+                std::thread::sleep(FIRST_TOUCH_WINDOW);
+                if let Some(stats) = rt.first_touch.close_window() {
+                    tracing::info!(
+                        carried = stats.carried,
+                        carried_used = stats.carried_used,
+                        "first-touch window closed"
+                    );
+                }
+            });
+    }
     if let Some(prefix) = previous_prefix {
         let rt = Arc::clone(&rt);
         rt.handle.clone().spawn(async move {

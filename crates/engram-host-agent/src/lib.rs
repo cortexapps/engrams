@@ -659,8 +659,12 @@ impl HostAgent {
             // injected production clock, constructed once for this sink.
             let events_clock: Arc<dyn engram_core::traits::Clock> =
                 Arc::new(engram_core::traits::SystemClock::new());
+            let pooled_for_events = pooled.clone();
             let event_sink =
                 crate::harness::event_sink_to(move |session_id, sandbox_id, ev, delivery| {
+                    if matches!(ev, engram_harness_proto::HarnessEvent::RunCompleted { .. }) {
+                        pooled_for_events.note_run_completed(sandbox_id);
+                    }
                     let cc = coord_client_for_events.clone();
                     let events_clock = events_clock.clone();
                     async move {
