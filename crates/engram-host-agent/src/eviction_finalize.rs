@@ -108,9 +108,11 @@ impl DiffExtents {
 
     async fn read(diff: &Path) -> std::io::Result<Self> {
         let diff = diff.to_path_buf();
-        let ranges = tokio::task::spawn_blocking(move || crate::checkpoint::dirty_ranges(&diff))
-            .await
-            .map_err(std::io::Error::other)??;
+        let ranges = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&diff).and_then(|f| engram_host_core::data_extents(&f))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(Self::of(&ranges))
     }
 }

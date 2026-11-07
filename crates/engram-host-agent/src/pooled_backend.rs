@@ -4628,10 +4628,12 @@ impl SnapshotFinisher {
             return Err("a chain already exists".into());
         }
         let path = sealed.to_path_buf();
-        let ranges = tokio::task::spawn_blocking(move || crate::checkpoint::dirty_ranges(&path))
-            .await
-            .map_err(|e| format!("sealed ranges join: {e}"))?
-            .map_err(|e| format!("sealed ranges: {e}"))?;
+        let ranges = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&path).and_then(|f| engram_host_core::data_extents(&f))
+        })
+        .await
+        .map_err(|e| format!("sealed ranges join: {e}"))?
+        .map_err(|e| format!("sealed ranges: {e}"))?;
         let prev = chunk_store
             .get_manifest(source)
             .await

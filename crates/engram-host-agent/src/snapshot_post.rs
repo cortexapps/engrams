@@ -377,7 +377,8 @@ impl PostPhase<'_> {
                         SandboxError::Snapshot(format!("get chain-prev manifest {prev_ref}: {e}"))
                     })?,
                 };
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                let ranges = std::fs::File::open(&diff_path)
+                    .and_then(|f| engram_host_core::data_extents(&f))
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
                 // A page lost in a crash reads as a hole, so it would look
                 // clean and keep the previous chunk.

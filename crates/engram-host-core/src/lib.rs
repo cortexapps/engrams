@@ -40,7 +40,9 @@ mod test_support;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{CoordControlPlane, CoordError};
-pub use disk::{is_zero_chunk, Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName};
+pub use disk::{
+    data_extents, is_zero_chunk, Capacity, ChunkIndex, FileDisk, SessionDisk, Volume, VolumeName,
+};
 pub use disk_flows::{checkpoint, checkpoint_split, stage};
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
