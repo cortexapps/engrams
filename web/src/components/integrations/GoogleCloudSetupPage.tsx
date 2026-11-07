@@ -34,7 +34,18 @@ import { GoogleCloudEndpointDialog } from "./GoogleCloudConnections";
 type SetupCodeLanguage = "terraform" | "shellscript";
 
 export function GoogleCloudSetupPage() {
-  const { connectionId } = useParams({ strict: false }) as { connectionId?: string };
+  const { connectionId, provider } = useParams({ strict: false }) as {
+    connectionId?: string;
+    provider?: string;
+  };
+  if (provider === "mcp")
+    return (
+      <div className="mx-auto max-w-3xl">
+        <Button asChild variant="ghost">
+          <Link to="/settings/integrations">Manage external MCP connections</Link>
+        </Button>
+      </div>
+    );
   return <GoogleCloudSetupWorkspace connectionId={connectionId ?? ""} />;
 }
 

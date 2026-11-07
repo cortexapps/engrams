@@ -763,6 +763,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
+        managed_deny: None,
         session_id,
         guest_ip,
         network_allow,
@@ -877,6 +878,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
+        managed_deny: None,
         session_id,
         guest_ip,
         network_allow,

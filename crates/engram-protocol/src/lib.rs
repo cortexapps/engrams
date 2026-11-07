@@ -23,3 +23,11 @@ pub mod wire;
 
 pub use heartbeat::*;
 pub use wire::{WireExecRequest, REATTACH_GENERATION, WIRE_VERSION};
+
+pub mod mcp;
+
+pub mod host_tls;
+
+pub mod managed_policy;
+
+pub mod managed_boot;

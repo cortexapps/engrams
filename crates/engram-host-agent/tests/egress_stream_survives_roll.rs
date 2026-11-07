@@ -306,6 +306,7 @@ async fn established_guest_stream_survives_a_host_agent_roll() {
     // The production apply path: policy to the daemon + the ADR 0111
     // persist the successor replays from.
     let policy = engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id: engram_core::SessionId::new(),
         sandbox_id: sandbox,
         guest_ip,

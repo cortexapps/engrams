@@ -608,8 +608,9 @@ async fn reconcile(
         // memfile must land — the SAME path a base session.create restore
         // reads (`snapshot_path_for(base_snapshot_id)/memory.bin`). `None`
         // when density is off. Recorded for disable-time reclaim.
-        let base_memfile =
-            base_memfile_dir.map(|resolver| resolver(image.base_snapshot_id).join("memory.bin"));
+        let base_memfile = base_memfile_dir
+            .filter(|_| image.base_snapshot_memory_manifest.is_some())
+            .map(|resolver| resolver(image.base_snapshot_id).join("memory.bin"));
         if let Some(ref path) = base_memfile {
             memfiles
                 .entry(image.manifest_digest.clone())
@@ -2109,6 +2110,48 @@ mod tests {
             "a completed retry clears the debt",
         );
         assert!(readiness.contains(&img.manifest_digest), "still ready");
+    }
+
+    #[tokio::test]
+    async fn reconcile_tracks_base_memfile_only_with_memory_manifest() {
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let snapshot_root = dir.path().join("snapshots");
+        let resolver: SnapshotDirResolver = Arc::new(move |id| snapshot_root.join(format!("{id}")));
+
+        for memory_manifest in [None, Some(mem_ref)] {
+            let img = image_ref(SnapshotId::new(), disk_ref, memory_manifest);
+            let mut memfiles = HashMap::new();
+            reconcile(
+                std::slice::from_ref(&img),
+                ImageReadiness::new(),
+                store.clone(),
+                cache.clone(),
+                Arc::new(Semaphore::new(0)),
+                crate::peer_fill::PeerHealth::new(),
+                Some(&resolver),
+                &mut memfiles,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(crate::ram_ledger::RamLedger::new()),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await;
+
+            match memory_manifest {
+                None => assert!(
+                    !memfiles.contains_key(&img.manifest_digest),
+                    "a disk-only image must not require a base memfile",
+                ),
+                Some(_) => assert_eq!(
+                    memfiles.get(&img.manifest_digest).unwrap().path,
+                    dir.path()
+                        .join("snapshots")
+                        .join(img.base_snapshot_id.to_string())
+                        .join("memory.bin"),
+                ),
+            }
+        }
     }
 
     /// ADR 0092: a vanished base memfile (out-of-band rm — even under a

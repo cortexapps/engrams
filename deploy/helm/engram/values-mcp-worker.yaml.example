@@ -1,0 +1,39 @@
+# This example is disabled. Create the namespace and TLS Secret separately.
+# The Secret contains tls.key, tls.crt, and the trusted caller CA in ca.crt.
+# Set real SHA-256 client certificate fingerprints. Give the coordinator token
+# access and the orchestrator tool access with different client certificates.
+mcpWorker:
+  enabled: false
+  zones:
+    - namespace: mcp-tools
+      isolationConfirmed: false
+      dispatchEnabled: false
+      replicas: 1
+      tlsSecret: mcp-worker-rpc-tls
+      callers:
+        - fingerprint: "REPLACE_WITH_ORCHESTRATOR_CERTIFICATE_SHA256"
+          role: orchestrator
+        - fingerprint: "REPLACE_WITH_COORDINATOR_CERTIFICATE_SHA256"
+          role: coordinator
+      policy:
+        id: private-tools
+        revision: "1"
+        mode: internal
+        authorities: [tools.example]
+        aliases: []
+        cidrs: [10.20.0.0/16]
+        # Include every platform administration network, including API servers.
+        denyCidrs: [10.20.0.0/24]
+        # Optional private provider CA PEM. This is not the RPC caller CA.
+        # ca: |
+        #   -----BEGIN CERTIFICATE-----
+        #   ...
+        limits: {execute: 32, discover: 2, oauth: 4, schema: 4, toolMs: 60000}
+      egressRules:
+        - cidr: 10.20.0.0/16
+          except: [10.20.0.0/24]
+      ports: [443]
+      dns:
+        namespace: kube-system
+        podLabels:
+          k8s-app: kube-dns

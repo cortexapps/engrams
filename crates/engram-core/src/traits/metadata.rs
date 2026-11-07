@@ -45,12 +45,47 @@ pub enum DisableEnabledImageOutcome {
     Blocked(Vec<(SessionId, String)>),
 }
 
+#[derive(Clone, Debug)]
+pub struct ManagedInitialPrompt {
+    pub row: crate::types::outbox::OutboxRow,
+    pub events: Vec<(String, serde_json::Value)>,
+}
+
+impl ManagedInitialPrompt {
+    pub fn validate(&self, ws: &SessionCreateWriteSet) -> Result<(), MetaError> {
+        if ws.managed_creation.is_none()
+            || self.row.session_id != ws.session_id
+            || self.row.prompt_id != format!("create:{}", ws.session_id)
+            || self.row.kind != crate::types::outbox::OutboxKind::Prompt
+            || !self
+                .row
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty() && s.len() <= 1024 * 1024)
+            || self.row.attempts != 0
+            || self.row.delivered_at.is_some()
+            || self.row.acked_at.is_some()
+        {
+            return Err(MetaError::Conflict("invalid managed initial prompt".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Issue #535 (b): the durable write-set for a new session — one logical
 /// fact ("this session exists with these secrets/capabilities/policy/
 /// harness/skills") passed to [`MetadataStore::reserve_and_persist_create`]
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    /// Approved immutable cold input selection, committed with a managed reservation.
+    pub managed_boot_selection: Option<crate::types::managed_bridge::ManagedBootSelection>,
+    /// Held managed reservation; ordinary placement must never consume it.
+    pub managed_creation: Option<crate::types::managed_create::ManagedCreation>,
+    /// Initial prompt and visible events commit with a held managed creation.
+    pub managed_initial_prompt: Option<ManagedInitialPrompt>,
+    pub mcp_policy: Option<crate::types::mcp_policy::McpPolicyCreation>,
     pub session_id: SessionId,
     pub spec: SessionSpec,
     pub mem_budget_mib: i64,
@@ -239,6 +274,222 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- sessions ----
+    /// Read durable configured publication and pending barrier state.
+    async fn read_operator_publication(
+        &self,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("read_operator_publication")
+    }
+    async fn stage_operator_publication(
+        &self,
+        _expected: Option<u64>,
+        _candidate: crate::types::managed_operator::OperatorCandidate,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("stage_operator_publication")
+    }
+    async fn list_operator_participants(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        unimplemented!("list_operator_participants")
+    }
+    async fn retain_operator_participant(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+        _session: SessionId,
+    ) -> Result<crate::types::managed_operator::OperatorParticipant, MetaError> {
+        unimplemented!("retain_operator_participant")
+    }
+    async fn record_operator_readiness(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+        _participant: &crate::types::managed_operator::OperatorParticipant,
+        _proof: crate::types::managed_operator::OperatorReadiness,
+    ) -> Result<(), MetaError> {
+        unimplemented!("record_operator_readiness")
+    }
+    async fn publish_operator_generation(
+        &self,
+        _generation: &crate::types::managed_operator::OperatorGeneration,
+    ) -> Result<crate::types::managed_operator::OperatorPublication, MetaError> {
+        unimplemented!("publish_operator_generation")
+    }
+
+    /// Read sanitized state under the immutable creation and native association.
+    /// Explicit absence does not fence an in-flight reserve. Terminal rows remain readable.
+    async fn read_managed_creation_state(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<crate::types::managed_bridge::ManagedCreationState, MetaError> {
+        panic!("read_managed_creation_state not implemented")
+    }
+    async fn read_managed_boot_selection(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<crate::types::managed_bridge::ManagedBootSelection, MetaError> {
+        panic!("read_managed_boot_selection not implemented")
+    }
+    async fn begin_managed_boot_intent(
+        &self,
+        _intent: crate::types::managed_bridge::ManagedBootIntent,
+    ) -> Result<crate::types::managed_bridge::ManagedBootIntent, MetaError> {
+        panic!("begin_managed_boot_intent not implemented")
+    }
+    async fn read_managed_boot_intent(
+        &self,
+        _query: &crate::types::managed_bridge::ManagedCreationQuery,
+        _operation: &str,
+    ) -> Result<Option<crate::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        panic!("read_managed_boot_intent not implemented")
+    }
+    async fn advance_managed_boot_intent(
+        &self,
+        _intent_id: &str,
+        _revision: u64,
+        _change: crate::types::managed_bridge::ManagedIntentAdvance,
+    ) -> Result<crate::types::managed_bridge::ManagedBootIntent, MetaError> {
+        panic!("advance_managed_boot_intent not implemented")
+    }
+    async fn list_managed_boot_intents(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<crate::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        panic!("list_managed_boot_intents not implemented")
+    }
+
+    async fn get_managed_boot(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<Option<crate::types::managed_boot::ManagedBootRecord>, MetaError> {
+        unimplemented!("get_managed_boot")
+    }
+    async fn reserve_managed_capture(
+        &self,
+        _request: &crate::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<Option<crate::types::managed_boot::ManagedCaptureAuthority>, MetaError> {
+        unimplemented!("reserve_managed_capture")
+    }
+    async fn record_managed_capture(
+        &self,
+        _authority: &crate::types::managed_boot::ManagedCaptureAuthority,
+    ) -> Result<(), MetaError> {
+        unimplemented!("record_managed_capture")
+    }
+    async fn managed_sandbox_open(&self, _sandbox: SandboxId) -> Result<Option<bool>, MetaError> {
+        unimplemented!("managed_sandbox_open")
+    }
+    /// Claim the exact held row and physical epoch atomically before host I/O.
+    async fn claim_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("claim_managed_boot")
+    }
+    async fn read_managed_boot(
+        &self,
+        _key: &crate::types::managed_boot::ManagedBootKey,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("read_managed_boot")
+    }
+    /// Read the current complete boot authority for an exact physical target.
+    /// Missing, stale, and terminal placements fail closed.
+    async fn read_managed_boot_for_target(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("read_managed_boot_for_target")
+    }
+    async fn advance_managed_boot(
+        &self,
+        _key: &crate::types::managed_boot::ManagedBootKey,
+        _revision: u64,
+        _event: crate::types::managed_boot::ManagedBootAdvance,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("advance_managed_boot")
+    }
+    /// Stable session-ID pages prevent a closed earlier row from starving later boots.
+    async fn list_managed_boots(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<crate::types::managed_boot::ManagedBootKey>, MetaError> {
+        unimplemented!("list_managed_boots")
+    }
+    /// None is ordinary. Some(false) is managed and closed, including no claim.
+    async fn managed_boot_open(&self, _session_id: SessionId) -> Result<Option<bool>, MetaError> {
+        unimplemented!("managed_boot_open")
+    }
+    async fn managed_tool_target_gone(
+        &self,
+        _session_id: SessionId,
+        _tool_call_id: &str,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("managed_tool_target_gone")
+    }
+    async fn managed_delivery_target_gone(
+        &self,
+        _session_id: SessionId,
+        _binding_epoch: u64,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("managed_delivery_target_gone")
+    }
+    async fn read_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_managed_creation")
+    }
+
+    /// Read the original source and held state in one store snapshot. Exact
+    /// retries require queued, no host/sandbox and epoch zero. Only a missing
+    /// source returns NotFound; an existing non-held source returns Conflict.
+    async fn read_held_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_held_managed_creation")
+    }
+
+    /// Read durable server policy and all current ancestors in one locked snapshot.
+    async fn read_mcp_write_policy(
+        &self,
+        _id: SessionId,
+    ) -> Result<crate::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    async fn read_mcp_plan_review(
+        &self,
+        _id: SessionId,
+        _call: &str,
+    ) -> Result<crate::types::mcp_policy::PlanReview, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Commit human decision, policy and original result delivery together.
+    async fn accept_mcp_plan_exit(
+        &self,
+        _input: &crate::types::mcp_policy::PlanAcceptance,
+    ) -> Result<crate::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Call only after the external-write journal barrier. No grant is reusable.
+    async fn validate_mcp_dispatch_fence(
+        &self,
+        _context: &crate::types::mcp_policy::RequestPolicyContext,
+        _expected: &crate::types::mcp_policy::ExecutionRequest,
+    ) -> Result<crate::types::mcp_policy::DispatchFence, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+    /// Exact execution identity only; the trusted caller must use the write fence for writes.
+    async fn validate_mcp_execution_identity(
+        &self,
+        _context: &crate::types::mcp_policy::RequestPolicyContext,
+        _expected: &crate::types::mcp_policy::ExecutionRequest,
+    ) -> Result<crate::types::mcp_policy::DispatchFence, MetaError> {
+        Err(MetaError::Conflict("policy unavailable".into()))
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError>;
 
     /// Atomically insert a session in `Created` status with `host_id`
@@ -509,6 +760,36 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// Reserve only a fresh ref. Ownership survives deletion of its value.
+    async fn reserve_mcp_org_secret(
+        &self,
+        _name: &str,
+        _connection_id: &str,
+        _role: crate::types::org_secret::McpSecretRole,
+    ) -> Result<crate::types::org_secret::McpSecretReservation, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credentials are unavailable".into(),
+        ))
+    }
+    async fn get_mcp_org_secret_reservation(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::org_secret::McpSecretReservation>, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credential purpose is unavailable".into(),
+        ))
+    }
+    /// Store ciphertext only if ownership and generation still match.
+    async fn put_mcp_org_secret(
+        &self,
+        _sealed: crate::types::org_secret::SealedOrgSecret,
+        _expected: &crate::types::org_secret::McpSecretReservation,
+    ) -> Result<crate::types::org_secret::McpSecretReservation, MetaError> {
+        Err(MetaError::Conflict(
+            "MCP credentials are unavailable".into(),
+        ))
+    }
+
     // ---- ADR 0106: subject-scoped OAuth credentials and short-lived flows ----
 
     /// Insert a credential when `expected_version` is `None`, or update it iff
@@ -547,6 +828,72 @@ pub trait MetadataStore: Send + Sync {
         _expected_version: i64,
     ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
         Err(MetaError::NotFound)
+    }
+
+    /// Exclusive refresh dispatch. Marks the current token unavailable immediately;
+    /// an expired or uncertain claim cannot be reacquired without reconnect.
+    async fn claim_mcp_refresh(
+        &self,
+        _claim: &crate::types::mcp::McpRefreshClaim,
+    ) -> Result<bool, MetaError> {
+        Err(MetaError::Conflict("MCP refresh unavailable".into()))
+    }
+    async fn complete_mcp_refresh(
+        &self,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _claim: &crate::types::mcp::McpRefreshClaim,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict("MCP refresh unavailable".into()))
+    }
+    /// Four deployment slots and one slot per connection, shared by replicas.
+    async fn acquire_mcp_oauth_admission(
+        &self,
+        _lease: &crate::types::mcp::McpOAuthAdmission,
+    ) -> Result<bool, MetaError> {
+        Err(MetaError::Conflict("MCP admission unavailable".into()))
+    }
+    async fn release_mcp_oauth_admission(
+        &self,
+        _lease: &crate::types::mcp::McpOAuthAdmission,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP admission unavailable".into()))
+    }
+
+    /// Create encrypted MCP redirect state atomically with its metadata row.
+    async fn create_mcp_oauth_flow(
+        &self,
+        _flow: crate::types::oauth::OAuthFlow,
+        _state: crate::types::mcp::McpSealedState,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+    /// Remove and return state exactly once, before any token exchange.
+    async fn consume_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<crate::types::mcp::McpSealedState, MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+
+    /// Fence this exact MCP attempt, including consumed state. Terminal attempts
+    /// are idempotent; a missing or differently scoped attempt is not evidence.
+    async fn cancel_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+    /// Atomically require a live consumed flow, publish by credential version CAS,
+    /// and finish that flow. Cancellation and publication lock the same flow row.
+    async fn complete_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _expected_version: Option<i64>,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
     }
 
     async fn create_oauth_flow(
@@ -2050,6 +2397,11 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Cold inputs and capture reservations held by managed boots have no snapshot row.
+    async fn list_managed_disk_manifests(&self) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- session event log ----
 
     /// Earliest `at` stamp CARRIED BY the given exec lifecycle event for
@@ -2145,6 +2497,15 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::Serialization(
             "harness settlement is not implemented".into(),
         ))
+    }
+
+    /// Check exact managed physical authority, append, and acknowledge its outbox
+    /// row under the same session lock as interruption. Stale replays also fail.
+    async fn append_managed_harness_event(
+        &self,
+        _event: &crate::types::event::ManagedHarnessEvent,
+    ) -> Result<crate::types::event::ManagedHarnessEventAccepted, MetaError> {
+        unimplemented!("append_managed_harness_event")
     }
 
     /// Append once per session and key. A replay returns no index.
@@ -3191,6 +3552,25 @@ pub trait MetadataStore: Send + Sync {
     // injects without the orchestrator. One blob per session (upsert). Default
     // impls (no-op / None) so test doubles compile; `PostgresStore` is the
     // authority.
+    /// Exact current physical placement. Missing and unbound sessions fail closed.
+    async fn managed_policy_target(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<crate::types::managed_deny::ManagedPolicyTarget, MetaError> {
+        Err(MetaError::Conflict(
+            "managed policy producer unavailable".into(),
+        ))
+    }
+    /// Save the monotone desired union before host I/O, without changing placement.
+    async fn retain_managed_deny(
+        &self,
+        _target: &crate::types::managed_deny::ManagedPolicyTarget,
+        _policy: &crate::types::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict(
+            "managed policy producer unavailable".into(),
+        ))
+    }
     async fn bind_session_integration_policy(
         &self,
         session_id: SessionId,

@@ -1,0 +1,932 @@
+//! Exact managed VZ ownership from CLOSED preparation through source retirement.
+use engram_core::{
+    types::sandbox::{SessionFileMetadata, SessionFileSpec, SessionFileStream},
+    SandboxError,
+};
+use std::{io, path::Path};
+
+fn verify_file(path: &Path, digest: &str, size: Option<u64>) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || size.is_some_and(|s| s != metadata.len())
+        || !engram_core::types::managed_cold::is_sha256(digest)
+    {
+        return Err(io::Error::other("invalid managed artifact"));
+    }
+    let mut hash = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    if hex::encode(hash.finalize()) != digest {
+        return Err(io::Error::other("managed artifact mismatch"));
+    }
+    Ok(())
+}
+
+/// The selected helper artifact is copied and verified before execution. The
+/// digest must come from the trusted installed host artifact set.
+#[derive(Clone, Debug)]
+pub struct ManagedHelperArtifact {
+    pub path: std::path::PathBuf,
+    pub sha256: String,
+}
+
+/// A private VM and network owner. It never enters the ordinary sandbox map.
+pub struct PreparedManagedVz {
+    // Drop the native machine before files or the attachment owner.
+    vm: crate::vm::VzVm,
+    helper: helper::Helper,
+    _files: PinnedFiles,
+    receipt: ManagedVzClosedReceipt,
+    failed: bool,
+    released_epoch: Option<u64>,
+    started: bool,
+    bridge: Option<crate::vsock_bridge::VsockBridge>,
+    connector: Option<crate::vsock_bridge::VsockConnector>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ManagedVzClosedReceipt {
+    pub prepared: engram_core::types::managed_cold::ManagedColdPrepared,
+    pub allocation: engram_egress_proto::private::Allocation,
+    pub mac: String,
+    pub mtu: u32,
+    pub helper_sha256: String,
+}
+
+impl PreparedManagedVz {
+    /// A fresh liveness check, never a final enforcement or start receipt.
+    pub async fn closed_receipt(
+        &mut self,
+    ) -> Result<ManagedVzClosedReceipt, engram_core::SandboxError> {
+        let native_closed = tokio::time::timeout(
+            std::time::Duration::from_secs(engram_egress_proto::private::HANDOFF_SECONDS),
+            self.vm.managed_attachment_closed(),
+        )
+        .await
+        .unwrap_or(false);
+        if self.failed || !native_closed || self.helper.check_closed().is_err() {
+            self.failed = true;
+            let _ = self.helper.close().await;
+            return Err(io::Error::other("managed preparation is no longer live").into());
+        }
+        Ok(self.receipt.clone())
+    }
+    /// Keep the fresh VM stopped until the helper acknowledges the exact epoch.
+    pub async fn release(&mut self, epoch: u64) -> Result<(), engram_core::SandboxError> {
+        self.closed_receipt().await?;
+        self.failed = true;
+        self.helper.release(epoch).await?;
+        if !self.vm.managed_attachment_closed().await {
+            let _ = self.helper.close().await;
+            return Err(io::Error::other("managed attachment changed before release").into());
+        }
+        self.released_epoch = Some(epoch);
+        self.failed = false;
+        Ok(())
+    }
+    pub async fn check_ready(&mut self, epoch: u64) -> Result<(), engram_core::SandboxError> {
+        if self.failed || self.released_epoch != Some(epoch) || self.vm.is_dead() {
+            return Err(io::Error::other("managed owner is not ready").into());
+        }
+        self.helper.check_ready(epoch)?;
+        if !self.vm.managed_attachment_current(self.started).await {
+            return Err(io::Error::other("managed attachment changed").into());
+        }
+        Ok(())
+    }
+    /// A single SpawnHarness write into a fresh kernel context. No reattach retry.
+    pub async fn start_agent(
+        &mut self,
+        agent: engram_core::types::sandbox::AgentSpec,
+        sink: engram_core::traits::HarnessSink,
+    ) -> Result<(), engram_core::SandboxError> {
+        let epoch = agent.binding_epoch;
+        self.check_ready(epoch).await?;
+        if self.started {
+            return Err(io::Error::other("managed start already issued").into());
+        }
+        self.started = true;
+        // Preserve the exact source through an unknown start, Drop or close.
+        self._files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.failed = true;
+        self.vm.start().await?;
+        let dir = engram_core::socket::short_socket_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!(
+            "{}.managed",
+            self.receipt.prepared.request.sandbox_id
+        ));
+        let (bridge, connector) = crate::vsock_bridge::VsockBridge::start(
+            self.vm.raw_clone(),
+            self.vm.queue_clone(),
+            path,
+            Some(sink),
+            None,
+            None,
+        )
+        .await
+        .map_err(io::Error::other)?;
+        self.bridge = Some(bridge);
+        self.connector = Some(connector.clone());
+        let mut conn = connector.connect_stream(1024).await?;
+        let request =
+            engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
+                argv: agent.argv,
+                env: agent.env.into_iter().collect(),
+                session_env: agent.session_env.into_iter().collect(),
+                host_ca_pem: agent.host_ca_pem,
+            });
+        engram_agentd::write_msg(&mut conn, &request).await?;
+        let response: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn).await?;
+        if !matches!(response, engram_agentd::WireResponse::HarnessSpawned { .. }) {
+            return Err(io::Error::other("managed harness start failed").into());
+        }
+        self.helper.check_ready(epoch)?;
+        self.failed = false;
+        Ok(())
+    }
+    pub fn owns(&self, request: &engram_core::types::managed_cold::ManagedColdPrepare) -> bool {
+        &self.receipt.prepared.request == request
+    }
+    async fn exec_connection(
+        &mut self,
+        epoch: u64,
+    ) -> Result<engram_core::traits::HarnessByteStream, engram_core::SandboxError> {
+        self.check_ready(epoch).await?;
+        if !self.started {
+            return Err(io::Error::other("managed execution requires a started owner").into());
+        }
+        Ok(self
+            .connector
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed connector unavailable"))?
+            .connect_stream(1024)
+            .await?)
+    }
+    pub async fn exec_stream(
+        &mut self,
+        epoch: u64,
+        cmd: engram_core::types::sandbox::ExecRequest,
+    ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError> {
+        let probe = self.exec_connection(epoch).await?;
+        let durable = crate::backend::probe_durable_exec(probe).await?;
+        let connection = self.exec_connection(epoch).await?;
+        let (reader, writer) = tokio::io::split(connection);
+        crate::backend::drive_exec_protocol(
+            self.receipt.prepared.request.sandbox_id,
+            reader,
+            writer,
+            cmd,
+            durable,
+        )
+        .await
+    }
+    pub async fn prepare_read_file(
+        &mut self,
+        epoch: u64,
+        path: String,
+        mut closed: tokio::sync::watch::Receiver<()>,
+    ) -> Result<
+        impl std::future::Future<
+                Output = Result<(SessionFileMetadata, SessionFileStream), SandboxError>,
+            > + Send
+            + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        // This future owns the exact connection and has no reconnect capability.
+        Ok(engram_agentd::file_transfer::read_file_until_closed(
+            connection,
+            path,
+            async move {
+                let _ = closed.changed().await;
+            },
+        ))
+    }
+    pub async fn prepare_write_file(
+        &mut self,
+        epoch: u64,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<
+        impl std::future::Future<Output = Result<SessionFileMetadata, SandboxError>> + Send + 'static,
+        SandboxError,
+    > {
+        let connection = self.exec_connection(epoch).await?;
+        Ok(engram_agentd::file_transfer::write_file(
+            connection, spec, bytes,
+        ))
+    }
+    pub async fn cancel_exec(
+        &mut self,
+        epoch: u64,
+        exec_id: String,
+    ) -> Result<(), engram_core::SandboxError> {
+        let mut connection = self.exec_connection(epoch).await?;
+        engram_agentd::write_msg(
+            &mut connection,
+            &engram_agentd::WireRequest::CancelExec { exec_id },
+        )
+        .await?;
+        match engram_agentd::read_msg::<_, engram_agentd::WireResponse>(&mut connection).await? {
+            engram_agentd::WireResponse::ExecCancelled => Ok(()),
+            _ => Err(io::Error::other("managed execution cancellation failed").into()),
+        }
+    }
+    /// Pause, retire the source, sync its disk, then copy the exact durable cut.
+    /// This makes no claim about unflushed guest page-cache data.
+    pub async fn retire_disk(
+        &mut self,
+        destination: &Path,
+    ) -> Result<(), engram_core::SandboxError> {
+        if self.failed {
+            return Err(io::Error::other("managed capture source unavailable").into());
+        }
+        self._files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.started {
+            if let Some(epoch) = self.released_epoch {
+                self.check_ready(epoch).await?;
+            } else {
+                self.closed_receipt().await?;
+            }
+        }
+        self.failed = true;
+        if self.started {
+            self.vm.pause().await?;
+            self.vm.stop().await?;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop().await;
+        }
+        self.helper.close().await?;
+        let source = self._files.path.join("rootfs.ext4");
+        let destination = destination.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&source)?.sync_all()?;
+            std::fs::copy(&source, &destination)?;
+            std::fs::File::open(&destination)?.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(())
+    }
+    /// Await owned process cleanup without blocking the executor. Drop starts
+    /// cleanup but does not wait for its result. Success does not acknowledge the proxy
+    /// policy barrier. Only that proxy can release its lease or poison its gate.
+    pub async fn close(mut self) -> Result<(), engram_core::SandboxError> {
+        self.failed = true;
+        if self.started {
+            let _ = self.vm.stop().await;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop().await;
+        }
+        self.helper.close().await?;
+        Ok(())
+    }
+}
+
+pub(crate) async fn prepare(
+    work_dir: &Path,
+    cfg: &crate::backend::VzConfig,
+    request: engram_core::types::managed_cold::ManagedColdPrepare,
+    spec: engram_core::types::sandbox::SandboxSpec,
+    network: engram_egress_proto::private::RegisteredPrivateNetwork,
+    artifact: ManagedHelperArtifact,
+    staging: tempfile::TempDir,
+) -> Result<PreparedManagedVz, engram_core::SandboxError> {
+    use engram_core::{
+        types::managed_cold::{ManagedColdPrepared, ManagedColdState},
+        SandboxError,
+    };
+    request.validate(&spec).map_err(SandboxError::InvalidSpec)?;
+    let allocation = network.allocation().clone();
+    if allocation.session_id != request.session_id
+        || allocation.sandbox_id != request.sandbox_id
+        || allocation.boot_attempt != request.boot_attempt
+    {
+        return Err(SandboxError::InvalidSpec(
+            "managed allocation does not match cold request".into(),
+        ));
+    }
+    let private_stream = network.into_stream();
+    let pin = {
+        let request = request.clone();
+        let spec = spec.clone();
+        let cfg = cfg.clone();
+        let work_dir = work_dir.to_owned();
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || {
+            PinnedFiles::prepare(&work_dir, &cfg, &request, &spec, &artifact, staging)
+        })
+    };
+    // Before a helper exists, this stream owns no packet or flow work. Return
+    // cleanup EOF at once on proxy stop, even if the disk copy is still running.
+    // The blocking task owns its files and removes them when its result drops.
+    let files = tokio::select! {
+        biased;
+        _ = wait_for_private_stop(&private_stream) => {
+            drop(private_stream);
+            return Err(io::Error::other("private allocation closed during preparation").into());
+        }
+        result = pin => result.map_err(|_| io::Error::other("artifact preparation failed"))??,
+    };
+    let (packet, peer) = std::os::unix::net::UnixDatagram::pair()?;
+    configure_packet(&packet)?;
+    configure_packet(&peer)?;
+    // A point-to-point attachment has no shared Ethernet segment. Its fixed
+    // unicast source is selected here and shared with the exact helper config.
+    let mac = "02:00:00:00:00:02".to_owned();
+    let vm_cfg = crate::vm::VmConfig::new(
+        files.path.join("kernel"),
+        files.path.join("rootfs.ext4"),
+        if spec.memory.max_mib > 0 {
+            spec.memory.max_mib
+        } else {
+            cfg.default_memory_mib
+        },
+        if spec.cpu.vcpus > 0 {
+            spec.cpu.vcpus
+        } else {
+            cfg.default_vcpus
+        },
+    )
+    .with_aux_ro_drives(request.aux_ro_drives.clone(), files.path.clone())
+    .with_swap_path(
+        spec.swap_mib
+            .filter(|m| *m > 0)
+            .map(|_| files.path.join("swap.img")),
+    )
+    .with_machine_identifier(crate::vm::fresh_machine_identifier())
+    .with_managed_network(crate::vm::ManagedVmNetwork {
+        packet: std::sync::Arc::new(packet),
+        guest: allocation.guest_ip,
+        gateway: allocation.gateway_ip,
+        mac: mac.clone(),
+    })?;
+    let helper = helper::Helper::spawn(
+        &files.path.join("netstack"),
+        peer,
+        private_stream,
+        &helper::Config {
+            version: 1,
+            guest: allocation.guest_ip,
+            gateway: allocation.gateway_ip,
+            mac: mac.clone(),
+        },
+    )
+    .await?;
+    // New kernel/device construction only. Neither start nor restore is called.
+    let vm = crate::vm::VzVm::new(vm_cfg)?;
+    let mut prepared = PreparedManagedVz {
+        vm,
+        helper,
+        _files: files,
+        failed: false,
+        released_epoch: None,
+        started: false,
+        bridge: None,
+        connector: None,
+        receipt: ManagedVzClosedReceipt {
+            prepared: ManagedColdPrepared {
+                version: 1,
+                request,
+                state: ManagedColdState::Closed,
+            },
+            allocation,
+            mac,
+            mtu: 1500,
+            helper_sha256: artifact.sha256,
+        },
+    };
+    prepared.closed_receipt().await?;
+    Ok(prepared)
+}
+
+async fn wait_for_private_stop(stream: &tokio::net::UnixStream) {
+    loop {
+        // No reply is valid here: registration has already consumed CLOSED and
+        // the unbound allocation has no operation in flight. Data also fails closed.
+        match stream.try_read(&mut [0]) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if stream.readable().await.is_err() {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+fn configure_packet(socket: &std::os::unix::net::UnixDatagram) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Apple's attachment requires receive >= 2 * send. Bound both queues.
+    for (option, size) in [(libc::SO_SNDBUF, 16_384_i32), (libc::SO_RCVBUF, 65_536_i32)] {
+        // SAFETY: socket owns this FD, and the integer pointer and size agree.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const i32).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+struct PinnedFiles {
+    retain: std::sync::atomic::AtomicBool,
+    path: std::path::PathBuf,
+}
+impl PinnedFiles {
+    fn prepare(
+        work_dir: &Path,
+        cfg: &crate::backend::VzConfig,
+        request: &engram_core::types::managed_cold::ManagedColdPrepare,
+        spec: &engram_core::types::sandbox::SandboxSpec,
+        artifact: &ManagedHelperArtifact,
+        _staging: tempfile::TempDir,
+    ) -> Result<Self, engram_core::SandboxError> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::create_dir_all(work_dir)?;
+        let path = work_dir.join(format!(
+            "managed-{}-{}",
+            request.sandbox_id, request.boot_attempt
+        ));
+        // No overwrite or adoption of an earlier attempt's directory.
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let files = Self {
+            path,
+            retain: std::sync::atomic::AtomicBool::new(false),
+        };
+        files.pin(
+            spec.rootfs_source
+                .as_deref()
+                .ok_or_else(|| io::Error::other("missing disk"))?,
+            "rootfs.ext4",
+            &request.disk.sha256,
+            Some(request.disk.size_bytes),
+        )?;
+        files.pin(&cfg.kernel_path, "kernel", &request.kernel_sha256, None)?;
+        for drive in &request.aux_ro_drives {
+            let hash = drive
+                .sha256
+                .as_deref()
+                .ok_or_else(|| io::Error::other("unresolved boot drive"))?;
+            let filename = format!("{hash}.squashfs");
+            // Several slots can intentionally have the same immutable content.
+            if !files.path.join(&filename).exists() {
+                files.pin(&cfg.bundle_dir.join(&filename), &filename, hash, None)?;
+            }
+        }
+        use std::os::unix::fs::MetadataExt;
+        let helper_metadata = std::fs::symlink_metadata(&artifact.path)?;
+        // SAFETY: geteuid only reads this process identity.
+        let owner = unsafe { libc::geteuid() };
+        if !artifact.path.is_absolute()
+            || !helper_metadata.is_file()
+            || helper_metadata.mode() & 0o022 != 0
+            || (helper_metadata.uid() != 0 && helper_metadata.uid() != owner)
+        {
+            return Err(io::Error::other("managed helper is not operator owned").into());
+        }
+        files.pin(&artifact.path, "netstack", &artifact.sha256, None)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            files.path.join("netstack"),
+            std::fs::Permissions::from_mode(0o500),
+        )?;
+        if let Some(mib) = spec.swap_mib.filter(|m| *m > 0) {
+            let swap = std::fs::File::create_new(files.path.join("swap.img"))?;
+            swap.set_len(u64::from(mib) * 1024 * 1024)?;
+        }
+        Ok(files)
+    }
+    fn pin(
+        &self,
+        source: &Path,
+        name: &str,
+        digest: &str,
+        size: Option<u64>,
+    ) -> Result<(), engram_core::SandboxError> {
+        let dest = self.path.join(name);
+        std::fs::copy(source, &dest)?;
+        if !std::fs::symlink_metadata(&dest)?.is_file() {
+            return Err(io::Error::other("managed artifact is not a regular file").into());
+        }
+        verify_file(&dest, digest, size)?;
+        Ok(())
+    }
+}
+impl Drop for PinnedFiles {
+    fn drop(&mut self) {
+        if self.retain.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[tokio::test]
+    async fn proxy_stop_is_observed_before_any_helper_or_packet_work() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut proxy) = tokio::net::UnixStream::pair().unwrap();
+        proxy.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                wait_for_private_stop(&client)
+            )
+            .await
+            .is_ok(),
+            "proxy drain must not wait for disk pinning"
+        );
+    }
+
+    fn inputs(
+        dir: &Path,
+    ) -> (
+        crate::backend::VzConfig,
+        engram_core::types::managed_cold::ManagedColdPrepare,
+        engram_core::types::sandbox::SandboxSpec,
+        ManagedHelperArtifact,
+    ) {
+        use engram_core::types::{
+            managed_cold::{ManagedColdDisk, ManagedColdPrepare, ManagedColdSource},
+            manifest::ManifestRef,
+            sandbox::AuxRoDrive,
+        };
+        let hash = |s: &[u8]| hex::encode(Sha256::digest(s));
+        for (name, bytes) in [
+            ("kernel", b"kernel-a".as_slice()),
+            ("disk", b"disk-a"),
+            ("helper", b"helper-a"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let bundle = hash(b"bundle-a");
+        std::fs::write(dir.join(format!("{bundle}.squashfs")), b"bundle-a").unwrap();
+        // The managed path must not resolve the current host's symbolic stamp.
+        std::fs::write(dir.join("current.json"), b"invalid-current-stamp").unwrap();
+        let drives: Vec<_> = (0..3)
+            .map(|i| AuxRoDrive {
+                drive_id: AuxRoDrive::slot_drive_id(i),
+                guest_mount: AuxRoDrive::slot_guest_mount(i),
+                fs_type: "squashfs".into(),
+                sha256: Some(bundle.clone()),
+            })
+            .collect();
+        let manifest = ManifestRef::new();
+        let spec: engram_core::types::sandbox::SandboxSpec =
+            serde_json::from_value(serde_json::json!({
+                "image": "image-v1", "rootfs_source": dir.join("disk"), "rootfs_manifest": manifest,
+                "cpu": {"vcpus": 1}, "memory": {"max_mib": 128}, "disk": {"max_gib": 1},
+                "env": {}, "aux_ro_drives": drives,
+            }))
+            .unwrap();
+        let request = ManagedColdPrepare {
+            version: 1,
+            session_id: engram_core::SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
+            boot_attempt: "boot-1".into(),
+            image: "image-v1".into(),
+            disk: ManagedColdDisk {
+                manifest,
+                sha256: hash(b"disk-a"),
+                size_bytes: 6,
+                source: ManagedColdSource::FreshImage {
+                    base_manifest: ManifestRef::new(),
+                },
+            },
+            kernel_sha256: hash(b"kernel-a"),
+            aux_ro_drives: spec.aux_ro_drives.clone(),
+        };
+        (
+            crate::backend::VzConfig::with_kernel(dir.join("kernel")).with_bundle_dir(dir),
+            request,
+            spec,
+            ManagedHelperArtifact {
+                path: dir.join("helper"),
+                sha256: hash(b"helper-a"),
+            },
+        )
+    }
+
+    #[test]
+    fn staging_is_removed_after_pin_success_or_verification_failure() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, mut spec, artifact) = inputs(dir.path());
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            let path = staging.path().to_owned();
+            let disk = path.join("selected.ext4");
+            std::fs::write(&disk, if valid { b"disk-a" } else { b"bad-aa" }).unwrap();
+            spec.rootfs_source = Some(disk);
+            let result = PinnedFiles::prepare(
+                &dir.path().join("owned"),
+                &cfg,
+                &request,
+                &spec,
+                &artifact,
+                staging,
+            );
+            assert!(!path.exists(), "staging must end with the pin operation");
+            if valid {
+                let files = result.unwrap();
+                assert_eq!(
+                    std::fs::read(files.path.join("rootfs.ext4")).unwrap(),
+                    b"disk-a"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_failure_retains_source_and_untrusted_helper_mode_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, spec, artifact) = inputs(dir.path());
+        let files = PinnedFiles::prepare(
+            &dir.path().join("owned"),
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
+        let path = files.path.clone();
+        files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(files);
+        assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
+        std::fs::set_permissions(&artifact.path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(PinnedFiles::prepare(
+            &dir.path().join("other"),
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn all_selected_boot_files_are_private_and_failed_attempts_leave_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, spec, artifact) = inputs(dir.path());
+        request.validate(&spec).unwrap();
+        let work = dir.path().join("work");
+        let files = PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
+        let path = files.path.clone();
+        assert_eq!(std::fs::read(path.join("kernel")).unwrap(), b"kernel-a");
+        assert_eq!(std::fs::read(path.join("netstack")).unwrap(), b"helper-a");
+        let name = format!(
+            "{}.squashfs",
+            request.aux_ro_drives[1].sha256.as_ref().unwrap()
+        );
+        assert_eq!(std::fs::read(path.join(name)).unwrap(), b"bundle-a");
+        assert!(PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
+        assert!(
+            path.join("rootfs.ext4").exists(),
+            "collision must not remove the first owner"
+        );
+        drop(files);
+        assert!(!path.exists());
+        std::fs::write(&cfg.kernel_path, b"kernel-b").unwrap();
+        assert!(PinnedFiles::prepare(
+            &work,
+            &cfg,
+            &request,
+            &spec,
+            &artifact,
+            tempfile::tempdir().unwrap()
+        )
+        .is_err());
+        assert!(
+            !path.exists(),
+            "failed pin must remove the private partial copy"
+        );
+        assert_eq!(std::fs::read(&cfg.kernel_path).unwrap(), b"kernel-b");
+    }
+
+    #[tokio::test]
+    async fn allocation_mismatch_stops_before_artifacts_or_helper() {
+        use engram_egress_proto::private::{self, Allocation, Reply};
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, mut spec, artifact) = inputs(dir.path());
+        let staging = tempfile::tempdir_in(dir.path()).unwrap();
+        let staging_path = staging.path().to_owned();
+        let staged_disk = staging_path.join("selected.ext4");
+        std::fs::copy(spec.rootfs_source.as_ref().unwrap(), &staged_disk).unwrap();
+        spec.rootfs_source = Some(staged_disk);
+        let allocation = Allocation {
+            version: 1,
+            host_id: engram_core::HostId::new(),
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: "proxy-1".into(),
+            session_id: request.session_id,
+            sandbox_id: engram_core::SandboxId::new(),
+            boot_attempt: request.boot_attempt.clone(),
+            attachment_generation: 1,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let _: engram_egress_proto::ToProxyd =
+                engram_egress_proto::read_frame(&mut server).await.unwrap();
+            let _: Allocation = private::read(&mut server).await.unwrap();
+            private::write(
+                &mut server,
+                &Reply {
+                    version: 1,
+                    sequence: 0,
+                    epoch: 0,
+                    state: "closed".into(),
+                },
+            )
+            .await
+            .unwrap();
+            server
+        });
+        let capability = private::register(client, &allocation).await.unwrap();
+        let mut peer = peer.await.unwrap();
+        let work = dir.path().join("work");
+        let result = prepare(&work, &cfg, request, spec, capability, artifact, staging).await;
+        assert!(matches!(
+            result,
+            Err(engram_core::SandboxError::InvalidSpec(_))
+        ));
+        assert!(!work.exists());
+        assert!(
+            !staging_path.exists(),
+            "backend rejection must remove staging"
+        );
+        use tokio::io::AsyncReadExt;
+        assert_eq!(
+            peer.read(&mut [0]).await.unwrap(),
+            0,
+            "rejected capability must close"
+        );
+    }
+
+    #[test]
+    fn cancelled_prepare_keeps_staging_until_queued_pin_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use engram_egress_proto::private::{self, Allocation, Reply};
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, mut spec, artifact) = inputs(dir.path());
+            let staging = tempfile::tempdir_in(dir.path()).unwrap();
+            let staging_path = staging.path().to_owned();
+            let disk = staging_path.join("selected.ext4");
+            std::fs::write(&disk, b"disk-a").unwrap();
+            spec.rootfs_source = Some(disk);
+            let allocation = Allocation {
+                version: 1,
+                host_id: engram_core::HostId::new(),
+                host_incarnation: "host-1".into(),
+                proxy_incarnation: "proxy-1".into(),
+                session_id: request.session_id,
+                sandbox_id: request.sandbox_id,
+                boot_attempt: request.boot_attempt.clone(),
+                attachment_generation: 1,
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                gateway_ip: "192.0.2.1".parse().unwrap(),
+                policy_revision: 1,
+                policy_digest: format!("sha256:{}", "a".repeat(64)),
+            };
+            let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let _: engram_egress_proto::ToProxyd =
+                    engram_egress_proto::read_frame(&mut server).await.unwrap();
+                let _: Allocation = private::read(&mut server).await.unwrap();
+                private::write(
+                    &mut server,
+                    &Reply {
+                        version: 1,
+                        sequence: 0,
+                        epoch: 0,
+                        state: "closed".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                server
+            });
+            let capability = private::register(client, &allocation).await.unwrap();
+            let peer = peer.await.unwrap();
+            let (release, held) = std::sync::mpsc::channel();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let work = dir.path().join("work");
+            let task = tokio::spawn(async move {
+                prepare(&work, &cfg, request, spec, capability, artifact, staging).await
+            });
+            tokio::task::yield_now().await;
+            drop(peer);
+            let result = task.await.unwrap();
+            let retained_while_queued = staging_path.join("selected.ext4").is_file();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            // The queued pin runs before this queue barrier can complete.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(result.is_err());
+            assert!(
+                retained_while_queued,
+                "cancel must not unlink a pending pin input"
+            );
+            assert!(!staging_path.exists(), "finished pin must remove staging");
+        });
+    }
+
+    #[test]
+    fn pinned_disk_survives_source_replacement_and_rejects_changed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"disk-a").unwrap();
+        let owned = dir.path().join("private");
+        std::fs::create_dir(&owned).unwrap();
+        let files = PinnedFiles {
+            retain: std::sync::atomic::AtomicBool::new(false),
+            path: owned.clone(),
+        };
+        let digest = hex::encode(Sha256::digest(b"disk-a"));
+        files.pin(&source, "rootfs.ext4", &digest, Some(6)).unwrap();
+        std::fs::write(&source, b"disk-b").unwrap();
+        assert_eq!(std::fs::read(owned.join("rootfs.ext4")).unwrap(), b"disk-a");
+        assert!(files.pin(&source, "changed", &digest, Some(6)).is_err());
+        drop(files);
+        assert!(!owned.exists());
+        assert_eq!(std::fs::read(source).unwrap(), b"disk-b");
+    }
+
+    #[test]
+    fn materialized_bytes_must_match_selected_disk_even_at_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk");
+        std::fs::write(&path, b"disk-a").unwrap();
+        let digest = hex::encode(Sha256::digest(b"disk-a"));
+        assert!(verify_file(&path, &digest, Some(6)).is_ok());
+        std::fs::write(&path, b"disk-b").unwrap();
+        assert!(
+            verify_file(&path, &digest, Some(6)).is_err(),
+            "same size is not byte identity"
+        );
+        assert!(verify_file(&path, &digest, Some(7)).is_err());
+    }
+}
+
+mod helper;

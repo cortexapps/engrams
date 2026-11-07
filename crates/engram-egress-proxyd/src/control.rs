@@ -17,6 +17,9 @@ use engram_egress_proxy::{GuestGatewayRegistry, Listeners, Proxy, Registry};
 
 pub(crate) struct ControlState {
     pub registry: Arc<Registry>,
+    pub private: Arc<crate::private::Ingress>,
+    pub proxy: Arc<Proxy>,
+    pub host_id: engram_core::HostId,
     pub gateway: Arc<GuestGatewayRegistry>,
     pub hello: HelloInfo,
     /// Flipped by the `Shutdown` op; [`crate::run`] selects on it and
@@ -57,6 +60,68 @@ async fn serve_conn(
     loop {
         let msg: ToProxyd = engram_egress_proto::read_frame(&mut stream).await?;
         let reply = match msg {
+            ToProxyd::PrivateNetwork => {
+                let allocation = engram_egress_proto::private::read(&mut stream).await?;
+                let proxy = state.proxy.clone();
+                return state
+                    .private
+                    .serve(
+                        stream,
+                        allocation,
+                        state.registry.clone(),
+                        proxy,
+                        state.host_id,
+                        &state.hello.incarnation,
+                    )
+                    .await;
+            }
+            ToProxyd::HandoffClosedPrivate(request) => {
+                match state.private.handoff_closed(*request).await {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
+            }
+            ToProxyd::RetirePrivateNetwork(allocation) => {
+                // Managed registrations reject tunnels. Only ordinary removal
+                // needs the session-wide gateway callback.
+                match state
+                    .private
+                    .retire(
+                        &allocation,
+                        &state.registry,
+                        state.host_id,
+                        &state.hello.incarnation,
+                    )
+                    .await
+                {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
+            }
+            ToProxyd::ListManaged => FromProxyd::ManagedSessions(state.registry.managed_sessions()),
+            ToProxyd::QuarantineManaged(session) => {
+                state.registry.quarantine_and_drain(session).await;
+                if state.registry.is_poisoned(session) {
+                    FromProxyd::Err(
+                        "private network cleanup failed; replace proxy before replay".into(),
+                    )
+                } else {
+                    FromProxyd::Ok
+                }
+            }
+            ToProxyd::ReadManaged(session) => {
+                FromProxyd::ManagedState(state.registry.lookup_session(session).and_then(|s| {
+                    s.managed_deny.clone().map(|policy| {
+                        engram_core::types::managed_deny::ManagedProxyState {
+                            incarnation: state.hello.incarnation.clone(),
+                            session_id: s.session_id,
+                            sandbox_id: s.sandbox_id,
+                            guest_ip: s.guest_ip,
+                            policy,
+                        }
+                    })
+                }))
+            }
             ToProxyd::Hello { proto_version } => {
                 if proto_version != engram_egress_proto::PROTO_VERSION {
                     tracing::warn!(
@@ -70,14 +135,18 @@ async fn serve_conn(
                 // on a mismatch.
                 FromProxyd::HelloAck(state.hello.clone())
             }
-            ToProxyd::SyncPolicies(policies) => sync_policies(&state, policies),
-            ToProxyd::ApplyPolicy(policy) => match register_policy(&state.registry, *policy) {
-                Ok(()) => FromProxyd::Ok,
-                Err(e) => FromProxyd::Err(format!("translate egress policy: {e}")),
-            },
+            ToProxyd::SyncPolicies(policies) => sync_policies(&state, policies).await,
+            ToProxyd::ApplyPolicy(policy) => {
+                match register_policy(&state.registry, *policy).await {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(e) => FromProxyd::Err(format!("translate egress policy: {e}")),
+                }
+            }
             ToProxyd::RemoveSession(session_id) => {
-                unregister_session(&state, session_id);
-                FromProxyd::Ok
+                match unregister_session(&state, session_id).await {
+                    Ok(()) => FromProxyd::Ok,
+                    Err(error) => FromProxyd::Err(error),
+                }
             }
             ToProxyd::Health => FromProxyd::HealthReport {
                 sessions: state.registry.live_count(),
@@ -102,6 +171,7 @@ async fn serve_conn(
                 }))
             }
             ToProxyd::Shutdown => {
+                state.private.shutdown().await;
                 tracing::info!("shutdown requested over control socket; exiting");
                 let _ = engram_egress_proto::write_frame(&mut stream, &FromProxyd::Ok).await;
                 let _ = state.shutdown.send(true);
@@ -115,9 +185,17 @@ async fn serve_conn(
 /// The single session-teardown entry point (the `HostEgress::
 /// unregister_session` contract): drop the registration AND fan
 /// `session_closed` to every tunnel upstream, or pooled state leaks.
-fn unregister_session(state: &ControlState, session_id: engram_core::SessionId) {
+async fn unregister_session(
+    state: &ControlState,
+    session_id: engram_core::SessionId,
+) -> Result<(), String> {
+    state.registry.quarantine_and_drain(session_id).await;
+    if state.registry.is_poisoned(session_id) {
+        return Err("private network cleanup failed; replace proxy before replay".into());
+    }
     state.registry.unregister(session_id);
     state.gateway.session_closed(session_id);
+    Ok(())
 }
 
 /// Full replace: register everything in the set, then drop any
@@ -130,24 +208,27 @@ fn unregister_session(state: &ControlState, session_id: engram_core::SessionId) 
 /// that translated, instead of being pruned into a total egress
 /// lockout. The per-apply path (`ApplyPolicy`) keeps erroring loudly
 /// — only the bulk replace shields survivors.
-fn sync_policies(
+async fn sync_policies(
     state: &ControlState,
     policies: Vec<engram_core::types::egress::SessionEgressPolicy>,
 ) -> FromProxyd {
     let mut keep = std::collections::HashSet::with_capacity(policies.len());
     let mut failed = 0usize;
+    let mut managed_failed = false;
     let mut applied = 0usize;
     let total = policies.len();
     for policy in policies {
         let session_id = policy.session_id;
+        let managed = policy.managed_deny.is_some();
         // Shield the session from the prune below regardless of the
         // translate outcome — a defective UPDATE must not evict a
         // working registration.
         keep.insert(session_id);
-        match register_policy(&state.registry, policy) {
+        match register_policy(&state.registry, policy).await {
             Ok(()) => applied += 1,
             Err(e) => {
                 failed += 1;
+                managed_failed |= managed || state.registry.is_poisoned(session_id);
                 tracing::error!(
                     %session_id,
                     error = %e,
@@ -164,11 +245,18 @@ fn sync_policies(
         .into_iter()
         .filter(|sid| !keep.contains(sid))
     {
-        unregister_session(state, stale);
-        pruned += 1;
+        if unregister_session(state, stale).await.is_err() {
+            managed_failed = true;
+        } else {
+            pruned += 1;
+        }
     }
     tracing::info!(applied, failed, pruned, total, "policies synced");
-    FromProxyd::Ok
+    if managed_failed {
+        FromProxyd::Err("managed policy unavailable; session quarantined".into())
+    } else {
+        FromProxyd::Ok
+    }
 }
 
 /// Bind the proxy listeners, retrying briefly to ride a transient port
@@ -232,19 +320,30 @@ fn graphql_match(op: &str, field: &str) -> Result<Option<engram_egress_proxy::Gr
 /// any prior entry for the same IP, so a re-issued policy frame
 /// (e.g. on cold resume to a new host that previously held the
 /// session) updates cleanly.
-pub(crate) fn register_policy(
+pub(crate) async fn register_policy(
     registry: &Registry,
     policy: engram_core::types::egress::SessionEgressPolicy,
-) -> Result<(), engram_egress_proxy::policy::ParseError> {
+) -> Result<(), String> {
+    if policy.managed_deny.is_some() {
+        registry.quarantine(policy.session_id);
+    }
+    registry.apply(translate_policy(policy)?).await
+}
+
+pub(crate) fn translate_policy(
+    policy: engram_core::types::egress::SessionEgressPolicy,
+) -> Result<engram_egress_proxy::SessionState, String> {
     let network_allow = engram_egress_proxy::HostList::from_manifest(
         &policy.network_allow_hosts,
         &policy.network_allow_host_patterns,
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     let allow_all = policy.allow_all;
     let mut secrets = Vec::with_capacity(policy.secrets.len());
     for s in policy.secrets {
         let allow =
-            engram_egress_proxy::HostList::from_manifest(&s.allow_hosts, &s.allow_host_patterns)?;
+            engram_egress_proxy::HostList::from_manifest(&s.allow_hosts, &s.allow_host_patterns)
+                .map_err(|e| e.to_string())?;
         secrets.push(engram_egress_proxy::SecretEntry {
             placeholder: s.placeholder,
             real_value: s.real_value,
@@ -257,7 +356,8 @@ pub(crate) fn register_policy(
     let mut injects = Vec::with_capacity(policy.injects.len());
     for i in policy.injects {
         let allow =
-            engram_egress_proxy::HostList::from_manifest(&i.allow_hosts, &i.allow_host_patterns)?;
+            engram_egress_proxy::HostList::from_manifest(&i.allow_hosts, &i.allow_host_patterns)
+                .map_err(|e| e.to_string())?;
         // ADR 0059: a non-empty-but-unparseable graphql op is a corrupt entry —
         // skip it (fail-closed) so it never degrades into a permissive REST gate
         // on `/graphql`.
@@ -292,7 +392,8 @@ pub(crate) fn register_policy(
     let mut observes = Vec::with_capacity(policy.observes.len());
     for o in policy.observes {
         let allow =
-            engram_egress_proxy::HostList::from_manifest(&o.allow_hosts, &o.allow_host_patterns)?;
+            engram_egress_proxy::HostList::from_manifest(&o.allow_hosts, &o.allow_host_patterns)
+                .map_err(|e| e.to_string())?;
         let graphql = match graphql_match(&o.graphql_operation, &o.graphql_field) {
             Ok(g) => g,
             Err(()) => {
@@ -332,7 +433,8 @@ pub(crate) fn register_policy(
             }),
         });
     }
-    registry.register(engram_egress_proxy::SessionState {
+    Ok(engram_egress_proxy::SessionState {
+        managed_deny: policy.managed_deny,
         session_id: policy.session_id,
         sandbox_id: policy.sandbox_id,
         guest_ip: policy.guest_ip,
@@ -345,8 +447,7 @@ pub(crate) fn register_policy(
         tunnels: policy.tunnels,
         // ADR 0118: the session's own app hostnames, for the SNI short circuit.
         apps: policy.apps,
-    });
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -359,6 +460,7 @@ mod tests {
 
     fn policy(session_id: SessionId, ip: Ipv4Addr) -> SessionEgressPolicy {
         SessionEgressPolicy {
+            managed_deny: None,
             session_id,
             sandbox_id: SandboxId::new(),
             guest_ip: ip,
@@ -376,11 +478,23 @@ mod tests {
     }
 
     fn state() -> ControlState {
+        let registry = Arc::new(Registry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(engram_egress_proxy::Ca::load_or_generate(dir.path()).unwrap());
+        let proxy = Arc::new(Proxy::new(engram_egress_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            registry.clone(),
+            Arc::new(engram_egress_proxy::CertMint::new(ca)),
+        )));
         ControlState {
-            registry: Arc::new(Registry::new()),
+            private: Arc::new(crate::private::Ingress::default()),
+            proxy,
+            host_id: engram_core::HostId::new(),
+            registry,
             gateway: Arc::new(GuestGatewayRegistry::default()),
             shutdown: tokio::sync::watch::channel(false).0,
             hello: HelloInfo {
+                incarnation: "test-incarnation".into(),
                 proto_version: engram_egress_proto::PROTO_VERSION,
                 source_fingerprint: None,
                 proxy_port: 8443,
@@ -392,16 +506,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sync_registers_and_prunes() {
+    #[tokio::test]
+    async fn late_managed_removal_cannot_retire_a_same_session_replacement() {
+        let state = Arc::new(state());
+        let session = SessionId::new();
+        let mut old = policy(session, "192.0.2.2".parse().unwrap());
+        old.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap(),
+        );
+        register_policy(&state.registry, old.clone()).await.unwrap();
+        let (_, mut lease) = state.registry.enroll(old.guest_ip).unwrap();
+        let mut replacement = old.clone();
+        replacement.sandbox_id = SandboxId::new();
+        let registry = state.registry.clone();
+        let next = replacement.clone();
+        let apply = tokio::spawn(async move { register_policy(&registry, next).await });
+        // Replacement owns the existing session lifecycle lock and waits for
+        // the old lease. The old removal will execute only after replacement.
+        lease.cancelled().await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let serving = state.clone();
+        let removal = tokio::spawn(async move { serve_conn(server, serving).await });
+        let allocation = engram_egress_proto::private::Allocation {
+            version: engram_egress_proto::private::VERSION,
+            host_id: state.host_id,
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: state.hello.incarnation.clone(),
+            session_id: session,
+            sandbox_id: old.sandbox_id,
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: old.guest_ip,
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: old.managed_deny.as_ref().unwrap().digest.clone(),
+        };
+        engram_egress_proto::write_frame(
+            &mut client,
+            &ToProxyd::RetirePrivateNetwork(Box::new(allocation)),
+        )
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            engram_egress_proto::read_frame::<_, FromProxyd>(&mut client),
+        )
+        .await
+        .is_err());
+        drop(client);
+        drop(lease);
+        apply.await.unwrap().unwrap();
+        let _ = removal.await.unwrap();
+        let current = state
+            .registry
+            .lookup_session(session)
+            .expect("late removal must preserve replacement");
+        assert_eq!(current.sandbox_id, replacement.sandbox_id);
+        assert_eq!(current.guest_ip, replacement.guest_ip);
+    }
+
+    #[tokio::test]
+    async fn sync_cannot_acknowledge_a_poisoned_session_as_ordinary_or_removed() {
+        let state = state();
+        let session = SessionId::new();
+        let mut p = policy(session, "192.0.2.2".parse().unwrap());
+        p.managed_deny = Some(
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap(),
+        );
+        register_policy(&state.registry, p.clone()).await.unwrap();
+        let (_, lease) = state.registry.enroll_session(session).unwrap();
+        lease.poison();
+        drop(lease);
+        assert!(matches!(
+            sync_policies(&state, vec![p.clone()]).await,
+            FromProxyd::Err(_)
+        ));
+        p.managed_deny = None;
+        assert!(matches!(
+            sync_policies(&state, vec![p]).await,
+            FromProxyd::Err(_)
+        ));
+        assert!(matches!(
+            sync_policies(&state, vec![]).await,
+            FromProxyd::Err(_)
+        ));
+        assert!(unregister_session(&state, session).await.is_err());
+        assert!(state.registry.is_poisoned(session));
+    }
+
+    #[tokio::test]
+    async fn sync_registers_and_prunes() {
         let state = state();
         let kept = SessionId::new();
         let stale = SessionId::new();
         // A pre-existing registration the sync set does not carry.
-        register_policy(&state.registry, policy(stale, Ipv4Addr::new(10, 200, 0, 2))).unwrap();
+        register_policy(&state.registry, policy(stale, Ipv4Addr::new(10, 200, 0, 2)))
+            .await
+            .unwrap();
         assert_eq!(state.registry.live_count(), 1);
 
-        let reply = sync_policies(&state, vec![policy(kept, Ipv4Addr::new(10, 200, 0, 6))]);
+        let reply = sync_policies(&state, vec![policy(kept, Ipv4Addr::new(10, 200, 0, 6))]).await;
         assert_eq!(reply, FromProxyd::Ok);
         assert_eq!(state.registry.live_count(), 1);
         assert!(state
@@ -414,8 +620,8 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn sync_skips_untranslatable_policies_and_keeps_the_rest() {
+    #[tokio::test]
+    async fn sync_skips_untranslatable_policies_and_keeps_the_rest() {
         let state = state();
         let good = SessionId::new();
         let mut bad = policy(SessionId::new(), Ipv4Addr::new(10, 200, 0, 10));
@@ -424,7 +630,8 @@ mod tests {
         let reply = sync_policies(
             &state,
             vec![bad, policy(good, Ipv4Addr::new(10, 200, 0, 14))],
-        );
+        )
+        .await;
         assert_eq!(reply, FromProxyd::Ok);
         assert_eq!(state.registry.live_count(), 1);
         assert!(state
@@ -438,17 +645,19 @@ mod tests {
     /// a total egress lockout by the sync's replace half. The failed
     /// update leaves the existing registration live under its previous
     /// policy (the ADR 0111 "reduce, never strand" posture).
-    #[test]
-    fn sync_keeps_a_live_session_whose_updated_policy_is_untranslatable() {
+    #[tokio::test]
+    async fn sync_keeps_a_live_session_whose_updated_policy_is_untranslatable() {
         let state = state();
         let session = SessionId::new();
         let ip = Ipv4Addr::new(10, 200, 0, 18);
-        register_policy(&state.registry, policy(session, ip)).expect("initial apply");
+        register_policy(&state.registry, policy(session, ip))
+            .await
+            .expect("initial apply");
         assert!(state.registry.lookup(ip).is_some());
 
         let mut update = policy(session, ip);
         update.network_allow_host_patterns = vec!["[".into()]; // untranslatable
-        let reply = sync_policies(&state, vec![update]);
+        let reply = sync_policies(&state, vec![update]).await;
         assert_eq!(reply, FromProxyd::Ok);
         let survivor = state
             .registry
@@ -466,26 +675,30 @@ mod tests {
     /// posture-mapping tests live) with a scoped allowlist must
     /// translate + register cleanly. Moved from `pooled_backend.rs`
     /// with the translation itself (ADR 0121).
-    #[test]
-    fn capture_shaped_allowlist_policy_registers() {
+    #[tokio::test]
+    async fn capture_shaped_allowlist_policy_registers() {
         let mut p = policy(SessionId::new(), Ipv4Addr::new(169, 254, 0, 2));
         p.network_allow_hosts = vec!["accounts.google.com".into()];
         p.network_allow_host_patterns = vec!["*.auth0.com".into()];
         let registry = Registry::new();
-        register_policy(&registry, p).expect("proxy must accept the capture-egress allowlist");
+        register_policy(&registry, p)
+            .await
+            .expect("proxy must accept the capture-egress allowlist");
     }
 
     /// A capture-shaped allow-all policy must register, and the proxy
     /// must bypass an arbitrary host under it (the dev posture for an
     /// image whose warm boot needs unrestricted network).
-    #[test]
-    fn capture_shaped_allow_all_policy_bypasses() {
+    #[tokio::test]
+    async fn capture_shaped_allow_all_policy_bypasses() {
         let mut p = policy(SessionId::new(), Ipv4Addr::new(169, 254, 0, 3));
         p.network_allow_hosts = Vec::new();
         p.allow_all = true;
         let guest_ip = p.guest_ip;
         let registry = Registry::new();
-        register_policy(&registry, p).expect("register allow-all");
+        register_policy(&registry, p)
+            .await
+            .expect("register allow-all");
         let state = registry.lookup(guest_ip).expect("registered");
         assert!(matches!(
             state.decide("anything.example.com"),
@@ -493,11 +706,76 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn sha256_hex_is_stable() {
+    #[tokio::test]
+    async fn sha256_hex_is_stable() {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+    #[tokio::test]
+    async fn private_upgrade_uses_dedicated_host_uds_and_never_returns_final_receipt() {
+        use engram_egress_proto::private::{
+            self as wire, Allocation, Operation, Reply, Request, VERSION,
+        };
+        let state = Arc::new(state());
+        let session = SessionId::new();
+        let mut p = policy(session, "192.0.2.2".parse().unwrap());
+        let managed =
+            engram_core::types::managed_deny::ManagedDenyPolicy::new(1, ["mcp.example".into()])
+                .unwrap();
+        p.managed_deny = Some(managed.clone());
+        let a = Allocation {
+            version: VERSION,
+            host_id: state.host_id,
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: state.hello.incarnation.clone(),
+            session_id: session,
+            sandbox_id: p.sandbox_id,
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: p.guest_ip,
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: managed.digest,
+        };
+        register_policy(&state.registry, p).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_conn(stream, state).await
+        });
+        let client = tokio::net::UnixStream::connect(path).await.unwrap();
+        let mut capability = wire::register(client, &a).await.unwrap().into_stream();
+        wire::write(
+            &mut capability,
+            &Request {
+                version: VERSION,
+                sequence: 1,
+                epoch: 7,
+                operation: Operation::Bind,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: Reply = wire::read(&mut capability).await.unwrap();
+        assert_eq!(ready.state, "ready");
+        wire::write(
+            &mut capability,
+            &Request {
+                version: VERSION,
+                sequence: 2,
+                epoch: 7,
+                operation: Operation::Close,
+            },
+        )
+        .await
+        .unwrap();
+        let closed: Reply = wire::read(&mut capability).await.unwrap();
+        assert_eq!(closed.state, "closed");
+        drop(capability);
+        task.await.unwrap().unwrap();
     }
 }

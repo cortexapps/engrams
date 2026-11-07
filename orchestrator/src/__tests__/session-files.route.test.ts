@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import {
   makeSessionFilesRoute,
@@ -42,6 +43,7 @@ describe("session file routes", () => {
       },
     );
     expect(response.status).toBe(200);
+    expect(response.headers.has("x-engram-rpc-code")).toBe(false);
     expect(await response.json()).toEqual({
       path,
       size_bytes: bytes.length,
@@ -115,8 +117,96 @@ describe("session file routes", () => {
       `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
     );
     expect(response.status).toBe(200);
+    expect(response.headers.has("x-engram-rpc-code")).toBe(false);
     expect(response.headers.get("content-length")).toBe(String(bytes.length));
     expect(response.headers.get("x-content-sha256")).toBe(digest);
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+  });
+
+  test("keeps file RPC status and body while exposing only its numeric code in the diagnostic header", async () => {
+    const cases: Array<[Code, number]> = [
+      [Code.Canceled, 400],
+      [Code.Unknown, 400],
+      [Code.InvalidArgument, 400],
+      [Code.DeadlineExceeded, 400],
+      [Code.NotFound, 404],
+      [Code.AlreadyExists, 409],
+      [Code.PermissionDenied, 403],
+      [Code.ResourceExhausted, 413],
+      [Code.FailedPrecondition, 409],
+      [Code.Aborted, 400],
+      [Code.OutOfRange, 400],
+      [Code.Unimplemented, 400],
+      [Code.Internal, 400],
+      [Code.Unavailable, 400],
+      [Code.DataLoss, 400],
+      [Code.Unauthenticated, 401],
+    ];
+    for (const [code, status] of cases) {
+      const error = new ConnectError("file RPC failed", code, {
+        "x-private": "private-error-metadata",
+      });
+      const client: SessionFileClient = {
+        async writeFile() {
+          throw error;
+        },
+        async *readFile() {
+          throw error;
+        },
+      };
+      for (const method of ["GET", "POST"]) {
+        const response = await app(client).request(
+          `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
+          { method, ...(method === "POST" ? { headers: { "x-upload-size": "0" } } : {}) },
+        );
+        expect(response.status).toBe(status);
+        expect(response.headers.get("x-engram-rpc-code")).toBe(String(code));
+        expect(response.headers.has("x-private")).toBe(false);
+        expect(await response.json()).toEqual({ error: "file RPC failed" });
+      }
+    }
+  });
+
+  test("omits the diagnostic header for invalid RPC error codes", async () => {
+    for (const code of [0, 17, -1, 1.5, NaN, Infinity, -Infinity]) {
+      const error = new ConnectError("file RPC failed", code);
+      const client: SessionFileClient = {
+        async writeFile() {
+          throw error;
+        },
+        async *readFile() {
+          throw error;
+        },
+      };
+      for (const method of ["GET", "POST"]) {
+        const response = await app(client).request(
+          `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
+          { method, ...(method === "POST" ? { headers: { "x-upload-size": "0" } } : {}) },
+        );
+        expect(response.status).toBe(400);
+        expect(response.headers.has("x-engram-rpc-code")).toBe(false);
+        expect(await response.json()).toEqual({ error: "file RPC failed" });
+      }
+    }
+  });
+
+  test("does not give non-RPC file errors an RPC diagnostic code", async () => {
+    const client: SessionFileClient = {
+      async writeFile() {
+        throw new Error("file failed");
+      },
+      async *readFile() {
+        throw new Error("file failed");
+      },
+    };
+    for (const method of ["GET", "POST"]) {
+      const response = await app(client).request(
+        `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
+        { method, ...(method === "POST" ? { headers: { "x-upload-size": "0" } } : {}) },
+      );
+      expect(response.status).toBe(500);
+      expect(response.headers.has("x-engram-rpc-code")).toBe(false);
+      expect(await response.json()).toEqual({ error: "file failed" });
+    }
   });
 });

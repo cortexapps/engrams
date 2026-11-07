@@ -8,10 +8,13 @@ import { getAllRegisteredFunctions } from "../../node_modules/@dbos-inc/dbos-sdk
  */
 export interface SweepPolicy {
   mode: "adopt";
-  staleAfterHours: number;
+  /** Null preserves durable delivery obligations across an arbitrarily long outage. */
+  staleAfterHours: number | null;
 }
 
 export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
+  McpRequestWorkflow: { mode: "adopt", staleAfterHours: null },
+  McpExecWorkflow: { mode: "adopt", staleAfterHours: null },
   ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
   // ADR 0119: interpreter runs park on recv (waits, session phases) for as
   // long as a review or a thread takes, so the launch-scale 1h staleness
@@ -50,18 +53,12 @@ export function registeredWorkflowNames(): string[] {
     .map((registration) => registration.name);
 }
 
-export function assertSweepPoliciesExhaustive(
-  names: string[] = registeredWorkflowNames(),
-): void {
+export function assertSweepPoliciesExhaustive(names: string[] = registeredWorkflowNames()): void {
   const missing = names.filter(
     (name) =>
-      !SWEEP_POLICIES[name] &&
-      !name.startsWith("_dbos_") &&
-      !name.startsWith("temp_workflow-"),
+      !SWEEP_POLICIES[name] && !name.startsWith("_dbos_") && !name.startsWith("temp_workflow-"),
   );
   if (missing.length > 0) {
-    throw new Error(
-      `DBOS workflows missing sweep policies: ${missing.join(", ")}`,
-    );
+    throw new Error(`DBOS workflows missing sweep policies: ${missing.join(", ")}`);
   }
 }

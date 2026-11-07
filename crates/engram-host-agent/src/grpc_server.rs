@@ -67,6 +67,7 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 /// the host's SandboxBackend + HarnessHub).
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
+    managed_tls: bool,
     /// ADR 0079: per-session fencing-epoch high-water, durable under
     /// work_dir. Gates every session-scoped lifecycle RPC.
     epochs: SessionEpochStore,
@@ -81,6 +82,7 @@ impl HostServiceImpl {
     pub fn new(inner: Arc<dyn HostClient>, epochs: SessionEpochStore) -> Self {
         Self {
             inner,
+            managed_tls: false,
             epochs,
             peer: None,
         }
@@ -99,6 +101,8 @@ impl HostServiceImpl {
     ///
     /// Returns the decoded [`SessionFence`] so the handler can thread it
     /// to the inner `HostClient` without re-decoding.
+    /// Epoch zero preserves a supplied identity without accessing the
+    /// high-water store. Empty bytes retain the unfenced sentinel.
     ///
     /// `fencing_epoch == 0` (allow WITHOUT advancing the high-water; the
     /// store's `check_and_advance` holds the reject-zero semantics for
@@ -123,10 +127,13 @@ impl HostServiceImpl {
         session_id: &[u8],
         fencing_epoch: u64,
     ) -> Result<SessionFence, Status> {
-        if fencing_epoch == 0 {
+        if fencing_epoch == 0 && session_id.is_empty() {
             return Ok(SessionFence::unfenced());
         }
         let session_id = decode_session_id(session_id)?;
+        if fencing_epoch == 0 {
+            return Ok(SessionFence::new(session_id, 0));
+        }
         self.epochs
             .check_and_advance(session_id, fencing_epoch)
             .map_err(|e| match e {
@@ -165,12 +172,79 @@ pub async fn boot(
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
+    serve(listen_addr, inner, epochs, peer, None).await
+}
+
+/// Serve one authenticated listener for all lifecycle operations in managed mode.
+pub async fn boot_with_managed_tls(
+    listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    tls: Option<crate::managed_tls::ManagedHostTls>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tls = tls
+        .map(|config| {
+            let server = config.server_config().map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>((server, config.coordinator_pins))
+        })
+        .transpose()?;
+    serve(listen_addr, inner, epochs, peer, tls).await?;
+    Ok(())
+}
+
+async fn serve(
+    listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+    tls: Option<(
+        tonic::transport::ServerTlsConfig,
+        std::collections::BTreeSet<String>,
+    )>,
+) -> Result<(), tonic::transport::Error> {
     let mut svc = HostServiceImpl::new(inner, epochs);
     if let Some(p) = peer {
         svc = svc.with_peer_serve(p);
     }
+    svc.managed_tls = tls.is_some();
+    let (server, pins) = match tls {
+        Some((config, pins)) => (
+            tonic::transport::Server::builder().tls_config(config)?,
+            Some(pins),
+        ),
+        None => (tonic::transport::Server::builder(), None),
+    };
+    let service = HostServiceServer::new(svc)
+        .max_encoding_message_size(32 * 1024 * 1024)
+        .max_decoding_message_size(9 * 1024 * 1024);
+    let authenticated =
+        tonic::service::interceptor::InterceptedService::new(service, move |req: Request<()>| {
+            if let Some(pins) = &pins {
+                let certificates = req
+                    .peer_certs()
+                    .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+                let leaf = certificates
+                    .first()
+                    .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+                if !pins.contains(&engram_protocol::host_tls::certificate_pin(leaf.as_ref())) {
+                    return Err(Status::unauthenticated("client certificate not authorized"));
+                }
+                let version = req
+                    .metadata()
+                    .get(engram_protocol::wire::WIRE_VERSION_METADATA_KEY)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u32>().ok());
+                if version != Some(engram_protocol::WIRE_VERSION) {
+                    return Err(Status::failed_precondition(
+                        "host protocol version required",
+                    ));
+                }
+            }
+            Ok(req)
+        });
     tracing::info!(addr = %listen_addr, "gRPC HostService listening");
-    tonic::transport::Server::builder()
+    server
         // ADR 0013: HTTP/2 multiplexes many concurrent streams over
         // one TCP connection per coord pod. 256 is well above the
         // running_sandboxes ceiling — we don't expect to hit it.
@@ -184,7 +258,7 @@ pub async fn boot(
         .initial_stream_window_size(Some(16 * 1024 * 1024))
         .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_adaptive_window(Some(true))
-        .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
+        .add_service(authenticated)
         .serve(listen_addr)
         .await
 }
@@ -990,17 +1064,201 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    /// ADR 0013: bundled policy + start. One trait call applies the
-    /// `SessionEgressPolicy` to the host's egress proxy registry
-    /// BEFORE spawning the agent process. Atomic by construction.
-    ///
-    /// This entry-point serves the **cold-create** path: coord
-    /// calls `StartAgent` after `Create` returns, the in-guest
-    /// bootstrap may not be accept()'ing yet, and the dial blocks
-    /// until kernel + engram-init + ext4 mount complete. The
-    /// warm-lease path doesn't reach here — it goes through
-    /// `WarmPool::launch` (which has its own histogram emission
-    /// labelled `kind="warm"`).
+    /// Read physical cold-boot inputs through the authenticated host boundary.
+    /// This operation cannot allocate a VM, policy lease or network owner.
+    async fn read_managed_cold_assets(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ReadManagedColdAssetsRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ReadManagedColdAssetsResponse>, tonic::Status>
+    {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed cold assets require authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .read_managed_cold_assets(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ReadManagedColdAssetsResponse { payload_json },
+        ))
+    }
+    async fn capture_managed_boot(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .capture_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
+    }
+    async fn prepare_managed_boot(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .prepare_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
+    }
+    async fn read_managed_boot(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .read_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
+    }
+    async fn finalize_managed_boot(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .finalize_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
+    }
+    async fn start_managed_boot(
+        &self,
+        req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed boot requires authenticated host mode",
+            ));
+        }
+        let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
+            .map_err(sandbox_to_status)?;
+        let result = self
+            .inner
+            .start_managed_boot(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        let payload_json =
+            engram_protocol::managed_boot::encode(&result).map_err(sandbox_to_status)?;
+        Ok(Response::new(engram_protocol::grpc::ManagedBootResponse {
+            payload_json,
+        }))
+    }
+    async fn read_managed_policy(
+        &self,
+        req: Request<engram_protocol::grpc::ReadManagedPolicyRequest>,
+    ) -> Result<Response<engram_protocol::grpc::ReadManagedPolicyResponse>, Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed policy requires authenticated host mode",
+            ));
+        }
+        if req.get_ref().target_bincode.len() > 4096 {
+            return Err(Status::resource_exhausted("managed request too large"));
+        }
+        let target = engram_protocol::managed_policy::decode(&req.into_inner().target_bincode)
+            .map_err(|_| Status::invalid_argument("invalid managed target"))?;
+        let state = self
+            .inner
+            .read_managed_policy(target)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ReadManagedPolicyResponse {
+                state_bincode: bincode::serialize(&state)
+                    .map_err(|_| Status::internal("managed response encoding failed"))?,
+            },
+        ))
+    }
+    async fn apply_managed_policy(
+        &self,
+        req: Request<engram_protocol::grpc::ApplyManagedPolicyRequest>,
+    ) -> Result<Response<engram_protocol::grpc::ApplyManagedPolicyResponse>, Status> {
+        check_wire_version(&req)?;
+        if !self.managed_tls {
+            return Err(Status::failed_precondition(
+                "managed policy requires authenticated host mode",
+            ));
+        }
+        if req.get_ref().request_bincode.len() > 4 * 1024 * 1024 {
+            return Err(Status::resource_exhausted("managed request too large"));
+        }
+        let request = engram_protocol::managed_policy::decode(&req.into_inner().request_bincode)
+            .map_err(|_| Status::invalid_argument("invalid managed request"))?;
+        let state = self
+            .inner
+            .apply_managed_policy(request)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(
+            engram_protocol::grpc::ApplyManagedPolicyResponse {
+                state_bincode: bincode::serialize(&state)
+                    .map_err(|_| Status::internal("managed response encoding failed"))?,
+            },
+        ))
+    }
     async fn start_agent(
         &self,
         req: Request<StartAgentRequest>,
@@ -1225,13 +1483,12 @@ impl HostService for HostServiceImpl {
         use futures::StreamExt;
         let request = req.into_inner();
         let sandbox_id = decode_sandbox_id(&request.sandbox_id)?;
-        let (metadata, mut bytes) = self
+        let (metadata, bytes) = self
             .inner
             .read_file(sandbox_id, request.path)
             .await
             .map_err(sandbox_to_status)?;
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(Ok(HostReadFileResponse {
+        let metadata = HostReadFileResponse {
             frame: Some(
                 engram_protocol::grpc::host_read_file_response::Frame::Metadata(
                     HostReadFileMetadata {
@@ -1241,28 +1498,21 @@ impl HostService for HostServiceImpl {
                     },
                 ),
             ),
-        }))
-        .await
-        .map_err(|_| Status::cancelled("read client closed before metadata"))?;
-        tokio::spawn(async move {
-            while let Some(item) = bytes.next().await {
-                let frame = item
-                    .map(|chunk| HostReadFileResponse {
-                        frame: Some(
-                            engram_protocol::grpc::host_read_file_response::Frame::Chunk(
-                                chunk.to_vec(),
-                            ),
+        };
+        // The response owns the source, so downstream cancellation drops it even
+        // while its next chunk is pending.
+        let response =
+            futures::stream::once(async move { Ok(metadata) }).chain(bytes.map(|item| {
+                item.map(|chunk| HostReadFileResponse {
+                    frame: Some(
+                        engram_protocol::grpc::host_read_file_response::Frame::Chunk(
+                            chunk.to_vec(),
                         ),
-                    })
-                    .map_err(sandbox_to_status);
-                if tx.send(frame).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+                    ),
+                })
+                .map_err(sandbox_to_status)
+            }));
+        Ok(Response::new(Box::pin(response)))
     }
 
     /// ADR 0014 issue #6: bidi WS-frame tunnel.
@@ -1707,6 +1957,9 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         ),
         // Same marker shape: the coordinator reads the typed variant and
         // recovers the session from its disk instead of retrying.
+        SandboxError::ManagedRecoveryRequired => {
+            Status::failed_precondition(engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS)
+        }
         SandboxError::MemoryImageUnusable(message) => Status::failed_precondition(
             engram_protocol::wire::memory_image_unusable_message(&message),
         ),
@@ -1720,6 +1973,69 @@ mod wire_version_tests {
     use engram_core::types::sandbox::ExecEventStream;
     use engram_protocol::wire::WIRE_VERSION_METADATA_KEY;
     use futures::StreamExt;
+
+    #[test]
+    fn epoch_zero_preserves_session_identity_without_high_water_access() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let path = work.path().join("epochs");
+        let epochs = SessionEpochStore::open(&path).unwrap();
+        let service = HostServiceImpl::new(host, epochs.clone());
+        let session = engram_core::SessionId::new();
+        let uuid = session.as_uuid();
+        let bytes = uuid.as_bytes();
+
+        assert_eq!(
+            service.check_session_epoch(&[], 0).unwrap(),
+            SessionFence::unfenced()
+        );
+        assert_eq!(
+            service.check_session_epoch(&[0; 16], 0).unwrap(),
+            SessionFence::unfenced()
+        );
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert!(epochs.read(session).unwrap().is_none());
+        assert_eq!(
+            service.check_session_epoch(bytes, 5).unwrap(),
+            SessionFence::new(session, 5)
+        );
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert_eq!(epochs.read(session).unwrap().unwrap().epoch, 5);
+        let stale = service.check_session_epoch(bytes, 4).unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert!(stale.message().contains("stored high-water 5, incoming 4"));
+        assert_eq!(epochs.read(session).unwrap().unwrap().epoch, 5);
+
+        // A zero epoch must not read or repair even a corrupt high-water record.
+        let record = path.join(format!("{session}.json"));
+        std::fs::write(&record, b"corrupt").unwrap();
+        assert_eq!(
+            service.check_session_epoch(bytes, 0).unwrap(),
+            SessionFence::new(session, 0)
+        );
+        assert_eq!(std::fs::read(record).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn epoch_zero_rejects_malformed_session_identity() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        for bytes in [&[1][..], &[1; 15][..], &[1; 17][..]] {
+            assert_eq!(
+                service.check_session_epoch(bytes, 0).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
 
     fn exec_events<I>(events: I) -> ExecEventStream
     where
@@ -1848,6 +2164,57 @@ mod wire_version_tests {
     }
 
     #[tokio::test]
+    async fn cold_assets_route_requires_authenticated_mode_and_wire_match() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let mut service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        let req = || {
+            let mut request = Request::new(engram_protocol::grpc::ReadManagedColdAssetsRequest {
+                payload_json: b"null".to_vec(),
+            });
+            request.metadata_mut().insert(
+                WIRE_VERSION_METADATA_KEY,
+                engram_protocol::WIRE_VERSION.to_string().parse().unwrap(),
+            );
+            request
+        };
+        assert_eq!(
+            service
+                .read_managed_cold_assets(req())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        service.managed_tls = true;
+        let mut skew = req();
+        skew.metadata_mut().insert(
+            WIRE_VERSION_METADATA_KEY,
+            (engram_protocol::WIRE_VERSION + 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            service
+                .read_managed_cold_assets(skew)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            service
+                .read_managed_cold_assets(req())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
     async fn migration_fetch_rejects_wire_skew_before_artifacts() {
         let work = tempfile::tempdir().unwrap();
         let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
@@ -1956,6 +2323,16 @@ mod wire_version_tests {
                 "NotFound".to_string(),
                 "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn managed_recovery_maps_to_exact_failed_precondition_marker() {
+        let status = sandbox_to_status(SandboxError::ManagedRecoveryRequired);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            engram_protocol::wire::MANAGED_RECOVERY_REQUIRED_STATUS
         );
     }
 

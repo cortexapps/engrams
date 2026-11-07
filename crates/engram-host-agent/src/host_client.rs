@@ -11,7 +11,7 @@
 //!   `engram-protocol::server` serves over the WS — so the coord on
 //!   the other end of a `RemoteHostClient` is talking to one of these.
 //!
-//! All sandbox methods are pure delegation to the inner `SandboxBackend`.
+//! Sandbox methods delegate after the applicable host lifecycle guards.
 //! The harness methods (`bind_session`, `unbind_session`,
 //! `send_prompt`) delegate to the `HarnessHub`, mapping its
 //! `HarnessError` into `SandboxError` so the trait surface stays
@@ -37,6 +37,8 @@ use crate::harness::{HarnessError, HarnessHub};
 pub struct LocalHostClient {
     sandbox: Arc<dyn SandboxBackend>,
     harness_hub: Arc<HarnessHub>,
+    managed: Option<Arc<crate::managed_policy::ManagedPolicyHost>>,
+    boot: Option<Arc<crate::managed_boot::ManagedBootHost>>,
 }
 
 impl LocalHostClient {
@@ -44,7 +46,88 @@ impl LocalHostClient {
         Self {
             sandbox,
             harness_hub,
+            managed: None,
+            boot: None,
         }
+    }
+
+    pub fn with_managed_boot(mut self, boot: Arc<crate::managed_boot::ManagedBootHost>) -> Self {
+        self.boot = Some(boot);
+        self
+    }
+    /// The coordinator has disowned this exact sandbox through its heartbeat.
+    pub(crate) async fn destroy_tombstoned(&self, id: SandboxId) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            self.boot()?.destroy_tombstoned(id).await
+        } else {
+            self.sandbox.destroy(id).await
+        }
+    }
+    fn boot(&self) -> Result<&Arc<crate::managed_boot::ManagedBootHost>, SandboxError> {
+        self.boot
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("managed boot unavailable".into()))
+    }
+    fn ordinary_only(&self, id: SandboxId) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return Err(SandboxError::InvalidSpec(
+                "managed session requires its current boot owner".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn running_or_ordinary(&self, id: SandboxId) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.guard_running(id).await;
+        }
+        Ok(())
+    }
+    pub fn with_managed_policy(
+        mut self,
+        host: Arc<crate::managed_policy::ManagedPolicyHost>,
+    ) -> Self {
+        self.managed = Some(host);
+        self
+    }
+
+    fn check_restore_gate(
+        &self,
+        fence: SessionFence,
+        sandbox: Option<SandboxId>,
+    ) -> Result<(), SandboxError> {
+        let bindings = self.harness_hub.binding_store();
+        let mut managed = bindings.managed_required(fence.session_id);
+        if let Some(sandbox) = sandbox {
+            managed |= bindings
+                .managed_sandbox_required(sandbox)
+                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
+        }
+        if managed {
+            return Err(SandboxError::InvalidSpec(
+                "managed restore quarantine unavailable".into(),
+            ));
+        }
+        if self.managed.is_some() && fence.session_id.as_uuid().is_nil() {
+            return Err(SandboxError::InvalidSpec(
+                "restore session identity required".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Convenience constructor for callers that don't need to route
@@ -73,6 +156,9 @@ impl LocalHostClient {
 #[async_trait]
 impl HostClient for LocalHostClient {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        if let Some(boot) = &self.boot {
+            boot.ordinary_spec(&spec)?;
+        }
         let id = SandboxId::new();
         self.sandbox.create(id, spec).await?;
         Ok(id)
@@ -82,7 +168,16 @@ impl HostClient for LocalHostClient {
     // server's `check_session_epoch` gate BEFORE it delegates here —
     // the local composition is behind the fence, not the fence itself
     // (and in --mode=all there is no second writer to fence out).
-    async fn destroy(&self, id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
+    async fn destroy(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.destroy(id, fence).await;
+        }
+        self.ordinary_only(id)?;
         // ADR 0073 phase 4: no shell pin to clear — the pin is a PG
         // column stamped by the coordinator's relay and lapses by
         // itself (the issue #219 leak class is gone with the refcount).
@@ -90,13 +185,28 @@ impl HostClient for LocalHostClient {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        self.sandbox.list().await
+        let mut ids = Vec::new();
+        for id in self.sandbox.list().await? {
+            if !self
+                .harness_hub
+                .binding_store()
+                .managed_sandbox_required(id)
+                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            {
+                ids.push(id);
+            }
+        }
+        if let Some(boot) = &self.boot {
+            ids.extend(boot.list()?);
+        }
+        Ok(ids)
     }
 
     async fn probe_sandbox(
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.probe_sandbox(id).await
     }
 
@@ -105,10 +215,28 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.exec_stream(id, cmd).await;
+        }
+        self.ordinary_only(id)?;
         self.sandbox.exec_stream(id, cmd).await
     }
 
     async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.cancel_exec(id, exec_id).await;
+        }
+        self.ordinary_only(id)?;
         self.sandbox.cancel_exec(id, exec_id).await
     }
 
@@ -118,6 +246,15 @@ impl HostClient for LocalHostClient {
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.write_file(id, spec, bytes).await;
+        }
+        self.ordinary_only(id)?;
         self.sandbox.write_file(id, spec, bytes).await
     }
 
@@ -126,6 +263,15 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         path: String,
     ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+        {
+            return self.boot()?.read_file(id, path).await;
+        }
+        self.ordinary_only(id)?;
         self.sandbox.read_file(id, path).await
     }
 
@@ -134,6 +280,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.snapshot(id).await
     }
 
@@ -142,6 +289,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.snapshot_hold(id, false).await
     }
 
@@ -150,6 +298,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        self.ordinary_only(id)?;
         // ADR 0052 Phase 2 (clean-idle-shutdown). The two-phase
         // `snapshot_begin` is the IDLE-eviction capture entry: the
         // coordinator starts capture and waits for durable finalize for
@@ -185,6 +334,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_presetup(id).await
     }
 
@@ -194,6 +344,7 @@ impl HostClient for LocalHostClient {
         export_id: &str,
         _fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_capture_postcopy(id, export_id).await
     }
 
@@ -201,6 +352,7 @@ impl HostClient for LocalHostClient {
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_drain_wait(id).await
     }
 
@@ -224,6 +376,7 @@ impl HostClient for LocalHostClient {
         export_id: &str,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_commit(id, export_id).await
     }
 
@@ -233,6 +386,7 @@ impl HostClient for LocalHostClient {
         export_id: &str,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_abort(id, export_id).await
     }
 
@@ -242,6 +396,7 @@ impl HostClient for LocalHostClient {
         export_id: &str,
         _fence: SessionFence,
     ) -> Result<bool, SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.migration_abort_unserved(id, export_id).await
     }
 
@@ -250,6 +405,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.commit_snapshot(id).await
     }
 
@@ -258,14 +414,20 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.ordinary_only(id)?;
         self.sandbox.abort_snapshot(id).await
     }
 
     async fn restore(
         &self,
         metadata: SnapshotMetadata,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.check_restore_gate(fence, metadata.source_sandbox_id)?;
+        if let Some(boot) = &self.boot {
+            boot.ordinary_disk(metadata.disk_manifest, None)?;
+            boot.ordinary_disk(metadata.swap_manifest, None)?;
+        }
         let id = SandboxId::new();
         self.sandbox.restore(id, metadata, None).await?;
         Ok(id)
@@ -297,8 +459,13 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.check_restore_gate(fence, metadata.source_sandbox_id)?;
+        if let Some(boot) = &self.boot {
+            boot.ordinary_disk(metadata.disk_manifest, None)?;
+            boot.ordinary_disk(metadata.swap_manifest, None)?;
+        }
         let id = SandboxId::new();
         self.sandbox
             .restore_base_for_session(id, metadata, session_env, selected_mounts)
@@ -306,13 +473,111 @@ impl HostClient for LocalHostClient {
         Ok(id)
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        self.boot()?.read_cold_assets(request).await
+    }
+    async fn prepare_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        self.boot()?.prepare(request).await
+    }
+    async fn read_managed_boot(
+        &self,
+        key: engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.boot()?.read(key).await
+    }
+    async fn finalize_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        self.boot()?.finalize(request).await
+    }
+    async fn start_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootStart,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.boot()?.start(request).await
+    }
+    async fn capture_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<engram_core::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        self.boot()?.capture(request).await
+    }
+
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(target.sandbox_id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            && self.boot.is_some()
+        {
+            return self.boot()?.read_policy(target).await;
+        }
+        self.managed
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("managed host mode unavailable".into()))?
+            .read_applied(&target)
+            .await
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_sandbox_required(request.context.target.sandbox_id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            && self.boot.is_some()
+        {
+            return self.boot()?.apply(request).await;
+        }
+        self.managed
+            .as_ref()
+            .ok_or_else(|| SandboxError::InvalidSpec("managed host mode unavailable".into()))?
+            .compare_and_apply(request)
+            .await
+    }
     async fn start_agent(
         &self,
         id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        let bindings = self.harness_hub.binding_store();
+        if bindings
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            || bindings.managed_required(fence.session_id)
+            || policy.managed_deny.is_some()
+            || self
+                .harness_hub
+                .binding_store()
+                .managed_required(policy.session_id)
+        {
+            return Err(SandboxError::InvalidSpec(
+                "managed session requires acknowledged boot finalization".into(),
+            ));
+        }
+        // Legacy ordinary callers can still use the explicit unfenced sentinel.
+        // Every supplied identity must otherwise agree before any durable mutation.
+        if policy.sandbox_id != id
+            || policy.session_id.as_uuid().is_nil()
+            || (fence != SessionFence::unfenced() && fence.session_id != policy.session_id)
+        {
+            return Err(SandboxError::InvalidSpec("start identity mismatch".into()));
+        }
         // ADR 0073: persist the binding record BEFORE the harness can
         // dial (the spawn below), so the first attach validates instead
         // of bouncing UnknownBinding. Monotonic: a stale caller's bind
@@ -352,6 +617,9 @@ impl HostClient for LocalHostClient {
     }
 
     async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
+        if self.ordinary_only(id).is_err() {
+            return None;
+        }
         self.sandbox
             .guest_endpoints(id)
             .await
@@ -364,12 +632,29 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         binding_epoch: u64,
     ) -> Result<(), engram_core::SandboxError> {
+        self.ordinary_only(sandbox_id)?;
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_required(session_id)
+        {
+            return Err(SandboxError::InvalidSpec(
+                "managed session requires its boot owner".into(),
+            ));
+        }
         self.harness_hub
             .bind_session(session_id, sandbox_id, binding_epoch)
             .map_err(|e| engram_core::SandboxError::Vm(format!("bind session: {e}").into()))
     }
 
     async fn unbind_session(&self, session_id: SessionId) {
+        if self
+            .harness_hub
+            .binding_store()
+            .managed_required(session_id)
+        {
+            return;
+        }
         self.harness_hub.unbind_session(session_id);
     }
 
@@ -380,6 +665,7 @@ impl HostClient for LocalHostClient {
         text: String,
         mode: Option<String>,
     ) -> Result<(), SandboxError> {
+        self.running_or_ordinary(sandbox_id).await?;
         self.harness_hub
             .send_prompt(sandbox_id, prompt_id, text, mode)
             .await
@@ -392,6 +678,7 @@ impl HostClient for LocalHostClient {
         prompt_id: String,
         text: String,
     ) -> Result<(), SandboxError> {
+        self.running_or_ordinary(sandbox_id).await?;
         self.harness_hub
             .edit_queued_prompt(sandbox_id, prompt_id, text)
             .await
@@ -403,6 +690,7 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         prompt_id: String,
     ) -> Result<(), SandboxError> {
+        self.running_or_ordinary(sandbox_id).await?;
         self.harness_hub
             .dequeue_queued_prompt(sandbox_id, prompt_id)
             .await
@@ -415,6 +703,7 @@ impl HostClient for LocalHostClient {
         tool_call_id: String,
         result_json: String,
     ) -> Result<(), SandboxError> {
+        self.running_or_ordinary(sandbox_id).await?;
         self.harness_hub
             .tool_result(sandbox_id, tool_call_id, result_json)
             .await
@@ -422,6 +711,7 @@ impl HostClient for LocalHostClient {
     }
 
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.running_or_ordinary(sandbox_id).await?;
         self.harness_hub
             .interrupt(sandbox_id)
             .await
@@ -431,14 +721,12 @@ impl HostClient for LocalHostClient {
     // ADR 0045 Phase F: freeze/unfreeze the microVM in place — pure
     // delegation to the inner backend (no harness involvement).
     async fn pause(&self, sandbox_id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         self.sandbox.pause(sandbox_id).await
     }
 
-    async fn resume(
-        &self,
-        sandbox_id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<(), SandboxError> {
+    async fn resume(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.check_restore_gate(fence, Some(sandbox_id))?;
         self.sandbox.resume(sandbox_id).await
     }
 
@@ -446,6 +734,7 @@ impl HostClient for LocalHostClient {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         // ADR 0014 issue #6 + ADR 0066: bridge WS frames through a
         // ShellTunnel pair, reaching ttyd via the vsock relay when the
         // backend has one (FC; VZ after Phase 2) or a direct dial_ip
@@ -493,6 +782,7 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         port: u16,
     ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         let (tunnel, ends) = engram_core::types::port::PortTunnel::pair();
         // ADR 0066: FC (and, after its Phase 2 migration, VZ) reach the dev
         // server through the in-guest agentd relay, which dials the guest's own
@@ -528,6 +818,7 @@ impl HostClient for LocalHostClient {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         // ADR 0065: bring up the in-guest browser stack (Xvfb + x11vnc +
         // headful chromium with the CDP debug port) and return the VNC port
         // (+ agentd's optional chromium-CDP liveness warning, issue #569).
@@ -537,12 +828,14 @@ impl HostClient for LocalHostClient {
     }
 
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         // ADR 0065: forward to the inner backend. Teardown is at the snapshot /
         // idle-eviction boundary (the browser is ephemeral, never snapshotted).
         self.sandbox.stop_browser(sandbox_id).await
     }
 
     async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         // ADR 0085: bring up the in-guest IDE (code-server) and return its
         // loopback HTTP port. The orchestrator reaches it over the ADR-0066
         // vsock port relay — the guest binds loopback, agentd dials it.
@@ -550,6 +843,7 @@ impl HostClient for LocalHostClient {
     }
 
     async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.ordinary_only(sandbox_id)?;
         // ADR 0085: forward to the inner backend. Teardown is at the snapshot /
         // idle-eviction boundary (code-server is ephemeral, never snapshotted).
         self.sandbox.stop_ide(sandbox_id).await

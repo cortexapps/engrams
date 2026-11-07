@@ -1,0 +1,417 @@
+import { z } from "zod";
+import { posix } from "node:path";
+import { requireThat, RunnerFailure, sha256, type Context } from "./context.ts";
+import type { PublicClient } from "./transport.ts";
+
+export function canonicalJson(value: unknown): string {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string" ||
+    (typeof value === "number" && Number.isFinite(value))
+  )
+    return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value)
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${canonicalJson(Reflect.get(value, key))}`,
+      )
+      .join(",")}}`;
+  throw new RunnerFailure("ASSERTION_FAILED", "canonical_json_value");
+}
+
+export async function readGuestFile(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  path: string,
+) {
+  const name = path.slice(ctx.guest.stateDirectory.length + 1);
+  requireThat(
+    path.startsWith(ctx.guest.stateDirectory + "/") &&
+      name.length > 0 &&
+      !/[^A-Za-z0-9_.-]/.test(name) &&
+      name !== "." &&
+      name !== "..",
+    "guest_proof_path",
+  );
+  return await client.downloadGuestProofFile(sessionId, path);
+}
+
+export const NativeProofSchema = z
+  .object({
+    callId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+    tool: z.string().regex(/^[A-Za-z0-9_]{1,128}$/),
+    observation: z
+      .enum([
+        "completionBarrierHeld",
+        "completionBarrierReleased",
+        "prematureBarrierHeld",
+        "prematureBarrierReleased",
+        "prematureCompletionEmitted",
+      ])
+      .optional(),
+    eventSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    expectExposure: z.enum(["present", "absent"]).optional(),
+    requestAttempted: z.literal(true).optional(),
+    protocolDenialCode: z.literal("unknown_tool").optional(),
+    nativeDenialCode: z.literal(-32602).optional(),
+    resultReceived: z.boolean().optional(),
+    forgedRejected: z.boolean().optional(),
+    delivery: z.enum(["available", "unavailable"]).optional(),
+    outcome: z
+      .enum(["succeeded", "failed", "canceled", "outcome_unknown"])
+      .nullable()
+      .optional(),
+    resultUnavailable: z.boolean().nullable().optional(),
+    isError: z.boolean().nullable().optional(),
+    denialPlanMode: z.boolean().optional(),
+    selectedToolName: z
+      .string()
+      .regex(/^[A-Za-z0-9_]{1,128}$/)
+      .optional(),
+    selectedSchemaSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    exposedMcpToolNamesSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    planSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    resultMatchesExpected: z.boolean().optional(),
+    resultSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    expectedResultSha256: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    const resultFields = [
+      value.resultReceived,
+      value.forgedRejected,
+      value.delivery,
+      value.outcome,
+      value.resultUnavailable,
+      value.isError,
+      value.denialPlanMode,
+      value.resultMatchesExpected,
+      value.resultSha256,
+      value.expectedResultSha256,
+    ];
+    if (value.observation !== undefined) {
+      if (
+        resultFields.some((field) => field !== undefined) ||
+        value.expectExposure !== undefined ||
+        value.requestAttempted !== undefined ||
+        value.protocolDenialCode !== undefined ||
+        value.nativeDenialCode !== undefined ||
+        value.selectedSchemaSha256 !== undefined ||
+        value.selectedToolName !== undefined ||
+        value.exposedMcpToolNamesSha256 !== undefined ||
+        (value.observation === "prematureCompletionEmitted") !==
+          (value.eventSha256 !== undefined)
+      )
+        ctx.addIssue({ code: "custom", message: "observation_is_not_result" });
+    } else if (value.eventSha256 !== undefined) {
+      ctx.addIssue({ code: "custom", message: "event_requires_observation" });
+    }
+    if (
+      value.expectExposure === "absent" &&
+      (value.observation !== undefined ||
+        !value.tool.startsWith("mcp_") ||
+        value.selectedToolName !== value.tool ||
+        value.requestAttempted !== true ||
+        value.protocolDenialCode !== "unknown_tool" ||
+        !value.planSha256 ||
+        !value.exposedMcpToolNamesSha256 ||
+        value.selectedSchemaSha256 !== undefined ||
+        resultFields.some((field) => field !== undefined))
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "absent_is_protocol_denial_only",
+      });
+    if (
+      value.expectExposure !== "absent" &&
+      [
+        value.requestAttempted,
+        value.protocolDenialCode,
+        value.nativeDenialCode,
+      ].some((field) => field !== undefined)
+    )
+      ctx.addIssue({ code: "custom", message: "denial_requires_absence" });
+  });
+
+export function parseGuestProofRecords(bytes: Buffer) {
+  requireThat(bytes.length <= 1024 * 1024, "guest_proof_size");
+  const text = bytes.toString("utf8");
+  // Each flushed record is one line. A writer may currently be appending the final line.
+  const lines = text.split("\n");
+  lines.pop();
+  requireThat(lines.length <= 128, "guest_proof_record_bound");
+  return lines.map((line) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      throw new RunnerFailure("ASSERTION_FAILED", "guest_proof_json");
+    }
+    const proof = NativeProofSchema.safeParse(raw);
+    requireThat(proof.success, "guest_proof_shape");
+    return { proof: proof.data, sha256: sha256(line + "\n") };
+  });
+}
+export async function readGuestProofRecords(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  path: string,
+) {
+  return parseGuestProofRecords(
+    await readGuestFile(ctx, client, sessionId, path),
+  );
+}
+export async function readGuestProof(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  path: string,
+) {
+  return (
+    (await readGuestProofRecords(ctx, client, sessionId, path)).at(-1) ?? null
+  );
+}
+
+export type GuestExecClient = {
+  sessions: Pick<PublicClient["sessions"], "exec">;
+};
+
+export async function guestExec(
+  ctx: Context,
+  client: GuestExecClient,
+  sessionId: string,
+  argv: string[],
+) {
+  let started = false;
+  let exited = false;
+  let status: number | undefined;
+  let bytes = 0;
+  const output: Uint8Array[] = [];
+  for await (const response of client.sessions.exec(
+    {
+      sessionId,
+      argv,
+      timeoutSecs: BigInt(
+        Math.max(1, Math.floor(ctx.deadlines.requestMs / 1000)),
+      ),
+    },
+    { timeoutMs: ctx.deadlines.requestMs },
+  )) {
+    requireThat(!exited, "guest_exec_after_exit");
+    switch (response.event.case) {
+      case "started":
+        requireThat(!started, "guest_exec_single_start");
+        started = true;
+        break;
+      case "stdout":
+      case "stderr":
+        requireThat(started, "guest_exec_start_first");
+        bytes += response.event.value.length;
+        requireThat(bytes <= 65536, "guest_exec_output_bound");
+        if (response.event.case === "stdout") output.push(response.event.value);
+        break;
+      case "exit":
+        requireThat(started, "guest_exec_start_first");
+        exited = true;
+        status = response.event.value.exitStatus;
+        break;
+      default:
+        throw new RunnerFailure("ASSERTION_FAILED", "guest_exec_frame");
+    }
+  }
+  requireThat(
+    started && exited && status !== undefined,
+    "guest_exec_completion",
+  );
+  return { status, stdout: Buffer.concat(output) };
+}
+
+export async function guestReady(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+) {
+  const response = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    'test -d /tmp/mcp-stack-fixture && test ! -L /tmp/mcp-stack-fixture && test "$(stat -c %a /tmp/mcp-stack-fixture)" = 700',
+  ]);
+  requireThat(response.status === 0, "guest_fixture_directory_ready");
+}
+
+export function guestHarnessPath(ctx: Context) {
+  return posix.join(posix.dirname(ctx.guest.cliPath), "harness");
+}
+
+/** Observe live harness/model environments, including inline ENGRAM_TOOLS. This is not a disk scan. */
+export async function probeOAuthCredentialAbsence(
+  ctx: Context,
+  client: GuestExecClient,
+  sessionId: string,
+) {
+  const script = `set -eu
+harness_count=0
+model_count=0
+manifest_count=0
+scanned=0
+for path in /proc/[0-9]*/cmdline; do
+  [ -r "$path" ] || continue
+  first=$(tr '\\000' '\\n' < "$path" | head -n 1)
+  kind=other
+  case "$first" in
+    "$2") kind=harness;;
+    "$1") kind=model;;
+  esac
+  [ "$kind" != other ] || continue
+  scanned=$((scanned+1))
+  [ "$scanned" -le 256 ] || exit 12
+  env_path=\${path%cmdline}environ
+  [ -r "$env_path" ] || exit 13
+  values=$(head -c 1048577 "$env_path" | tr '\\000' '\\n')
+  bytes=$(printf '%s' "$values" | wc -c)
+  [ "$bytes" -le 1048576 ] || exit 14
+  if printf '%s' "$values" | grep -Eq 'fixture-(access|refresh)-[0-9]+'; then exit 15; fi
+  if [ "$kind" = harness ]; then
+    harness_count=$((harness_count+1))
+    if printf '%s' "$values" | grep -q '^ENGRAM_TOOLS=.'; then manifest_count=$((manifest_count+1)); fi
+  else
+    model_count=$((model_count+1))
+  fi
+done
+[ "$harness_count" -ge 1 ] && [ "$model_count" -ge 1 ] && [ "$manifest_count" -eq "$harness_count" ] || exit 16
+printf '{"harnesses":%s,"models":%s,"manifests":%s,"credentialFound":false}\\n' "$harness_count" "$model_count" "$manifest_count"
+`;
+  const result = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    script,
+    "fixture-env-probe",
+    ctx.guest.cliPath,
+    guestHarnessPath(ctx),
+  ]);
+  requireThat(result.status === 0, "live_oauth_environment_clean");
+  const parsed = z
+    .strictObject({
+      harnesses: z.number().int().min(1).max(256),
+      models: z.number().int().min(1).max(256),
+      manifests: z.number().int().min(1).max(256),
+      credentialFound: z.literal(false),
+    })
+    .safeParse(JSON.parse(result.stdout.toString("utf8")));
+  requireThat(
+    parsed.success && parsed.data.manifests === parsed.data.harnesses,
+    "live_oauth_environment_observation",
+  );
+  return { ...parsed.data, sha256: sha256(result.stdout) };
+}
+
+export function isProofFilename(suffix: string, name: string) {
+  requireThat(/^[a-z0-9-]{1,40}$/.test(suffix), "guest_proof_suffix");
+  return new RegExp(`^${suffix}-[0-9]+-[a-f0-9]{32}\\.json$`).test(name);
+}
+export async function proofPaths(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  suffix: string,
+) {
+  requireThat(/^[a-z0-9-]{1,40}$/.test(suffix), "guest_proof_suffix");
+  const result = await guestExec(ctx, client, sessionId, [
+    "/bin/ls",
+    "-1",
+    ctx.guest.stateDirectory,
+  ]);
+  requireThat(result.status === 0, "guest_proof_listing");
+  return result.stdout
+    .toString("utf8")
+    .trim()
+    .split("\n")
+    .filter((name) => isProofFilename(suffix, name))
+    .map((name) => `${ctx.guest.stateDirectory}/${name}`);
+}
+
+/** Literal native response contract from engram-harness-proto/tool_result.rs. */
+export function expectedCounterNative(
+  harness: "claude" | "codex",
+  count: number,
+  isError: boolean,
+): Record<string, unknown> {
+  const output = {
+    content: [{ type: "text", text: `count=${count}` }],
+    structuredContent: { count },
+    isError,
+  };
+  const metadata = {
+    outcome: isError ? "failed" : "succeeded",
+    delivery: "available",
+    resultUnavailable: false,
+    isError,
+  };
+  return harness === "claude"
+    ? { ...output, _meta: { "engrams/toolResult": metadata } }
+    : {
+        success: !isError,
+        contentItems: [
+          { type: "inputText", text: `count=${count}` },
+          {
+            type: "inputText",
+            text: canonicalJson({ structuredContent: { count } }),
+          },
+          { type: "inputText", text: canonicalJson(metadata) },
+        ],
+      };
+}
+
+/** Publish only the fixed exclusive release file; the CLI independently checks its owner/type/mode. */
+export async function releaseGuestBarrier(
+  ctx: Context,
+  client: PublicClient,
+  sessionId: string,
+  kind: "completion" | "premature",
+) {
+  requireThat(
+    kind === "completion" || kind === "premature",
+    "guest_barrier_kind",
+  );
+  const response = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    `set -eu
+root=/tmp/mcp-stack-fixture
+path="$root/${kind}-release"
+test -d "$root" && test ! -L "$root"
+test "$(stat -c %a "$root")" = 700
+test "$(stat -c %u "$root")" = "$(id -u)"
+umask 077
+set -C
+: > "$path"
+`,
+  ]);
+  requireThat(
+    response.status === 0 && response.stdout.length === 0,
+    "guest_barrier_exclusive_release",
+  );
+}

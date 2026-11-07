@@ -188,6 +188,7 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
     let session_id = engram_core::SessionId::new();
     let guest_ip = std::net::Ipv4Addr::new(10, 200, 0, 2);
     let policy = engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id: sandbox,
         guest_ip,

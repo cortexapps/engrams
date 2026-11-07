@@ -142,6 +142,7 @@ pub(crate) struct BootInputs {
 /// its response). Built by `sessions::prepare_from_request` (from a live
 /// request) or `sessions::prepare_from_row` (from a durable queued row).
 pub(crate) struct PreparedBoot {
+    pub managed_selection: Option<engram_core::types::managed_bridge::ManagedBootSelection>,
     pub inputs: BootInputs,
     pub memory_mib: u32,
     pub cpu_budget_vcpus: u32,
@@ -195,10 +196,14 @@ pub(crate) async fn boot_on_reserved_host(
     host_id: HostId,
     // ADR 0079: the caller's fencing epoch, stamped into every session-
     // scoped host RPC below. The create_boot verb threads its op fence;
-    // the direct (capacity-available) create pipeline is out-of-op and
-    // passes `SessionFence::unfenced()`.
+    // the direct (capacity-available) create pipeline preserves the
+    // session identity with epoch zero, without claiming an op epoch.
     fence: SessionFence,
 ) -> Result<(), BootError> {
+    crate::managed_boot::gate(state, inputs.session_id, false)
+        .await
+        .map_err(BootError::NotStarted)?;
+
     let BootInputs {
         session_id,
         spec,
@@ -363,6 +368,9 @@ pub(crate) async fn boot_on_reserved_host(
     let egress_secret_count = egress_secrets.len();
     let inject_count = injects.len();
     let resolved_policy = ResolvedEgressPolicy {
+        managed_deny: integration_policy
+            .as_ref()
+            .and_then(|p| p.managed_deny.clone()),
         secrets: egress_secrets,
         injects,
         observes,
@@ -493,6 +501,15 @@ pub(crate) async fn boot_on_reserved_host(
     // the next thing that trips this is as invisible as the VZ boot race
     // was (a 2s guest-IP timeout that lost to a 2.5s guest boot; fixed in
     // `engram-sandbox-vz`'s `guest_endpoints`, which now waits).
+    if egress_policy.is_none()
+        && integration_policy
+            .as_ref()
+            .is_some_and(|p| p.managed_deny.is_some())
+    {
+        return Err(BootError::NotStarted(ApiError::BadRequest(
+            "managed policy requires an enforceable guest identity".into(),
+        )));
+    }
     let policy = egress_policy.unwrap_or_else(|| {
         tracing::warn!(
             %session_id,
@@ -505,6 +522,7 @@ pub(crate) async fn boot_on_reserved_host(
              guest traffic as UnknownGuest and brokered credentials will not substitute",
         );
         engram_core::types::egress::SessionEgressPolicy {
+            managed_deny: None,
             session_id,
             sandbox_id,
             guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
@@ -674,6 +692,7 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// IP (process backend / some VZ configs) — the caller synthesizes an
 /// unspecified-IP fallback.
 struct ResolvedEgressPolicy {
+    managed_deny: Option<engram_core::types::managed_deny::ManagedDenyPolicy>,
     secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
@@ -692,6 +711,7 @@ async fn assemble_egress_policy(
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: resolved.managed_deny,
         session_id,
         sandbox_id,
         guest_ip,
@@ -753,6 +773,7 @@ pub(crate) fn assemble_capture_egress_policy(
         return None;
     }
     Some(engram_core::types::egress::SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         // Stamped by the host at registration (the capture VM doesn't
         // exist yet when this is assembled).
@@ -878,15 +899,15 @@ pub(crate) async fn resolve_inject_entries(
             .get_session_capabilities(session_id)
             .await
         {
-            Ok(c) => c,
+            Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(%session_id, error = %e,
-                    "capabilities lookup failed under a mint inject; minting unscoped");
-                Vec::new()
+                    "capabilities lookup failed; skipping mint injections");
+                None
             }
         }
     } else {
-        Vec::new()
+        None
     };
     let mut out = Vec::with_capacity(policy.injects.len());
     for inj in &policy.injects {
@@ -896,11 +917,14 @@ pub(crate) async fn resolve_inject_entries(
             continue;
         }
         let entry = if let Some(mint_source) = &inj.mint_source {
+            let Some(caps) = caps.as_deref() else {
+                continue;
+            };
             // Minted: the GATING is policy-owned (this entry's hosts/methods/paths),
             // but the HEADER (name + rendered value) is the integration's — so the
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
-            match mint_inject_header(state, session_id, mint_source, &caps).await {
+            match mint_inject_header(state, session_id, mint_source, caps).await {
                 Some((h, expires_at)) => {
                     // Connection mints return a pre-rendered header (name +
                     // full value; template collapses to "{}"). Connector
@@ -1269,7 +1293,7 @@ pub(crate) async fn mint_remote_connection_credential(
 /// inject/refresh`) runs when the proxy's minted credential nears expiry. Fetches
 /// the session's bound capabilities (the same scope `resolve_inject_entries` uses
 /// at boot) and re-runs the mint. Returns the freshly rendered header + its new
-/// `expires_at`, or `None` (logged in `mint_inject_header`) on any failure — the
+/// `expires_at`, or `None` on any lookup or mint failure — the
 /// proxy then keeps the stale secret rather than failing the request.
 pub(crate) async fn refresh_inject_header(
     state: &SharedState,
@@ -1279,12 +1303,19 @@ pub(crate) async fn refresh_inject_header(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
-    let caps = state
+    let caps = match state
         .services
         .meta
         .get_session_capabilities(session_id)
         .await
-        .unwrap_or_default();
+    {
+        Ok(caps) => caps,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "capabilities lookup failed; refusing mint refresh");
+            return None;
+        }
+    };
     mint_inject_header(state, session_id, source, &caps).await
 }
 
@@ -1388,6 +1419,149 @@ mod capture_egress_tests {
             super::synthetic_capture_session_id(job_a),
             super::synthetic_capture_session_id(job_b),
             "distinct job_ids must derive distinct session_ids",
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod credential_tests {
+    use std::sync::Arc;
+
+    use engram_core::traits::{Clock, CredentialHint, Integration, ScopedCredential};
+    use engram_core::types::{Capability, IntegrationPolicy, Session, SessionMode, SessionState};
+    use engram_sim::{SimClock, SimEntropy, SimMetadataStore};
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    pub(crate) fn fixture() -> (
+        SharedState,
+        Arc<SimMetadataStore>,
+        Session,
+        tempfile::TempDir,
+    ) {
+        let clock = SimClock::new();
+        let entropy = Arc::new(SimEntropy::seeded(71));
+        let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
+        let session = Session {
+            id: SessionId::from(uuid::Uuid::from_u128(71)),
+            status: SessionState::Queued,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/credential-scope:v1".into(),
+            mode: SessionMode::DevVm,
+            created_at: clock.now_utc(),
+            last_active_at: clock.now_utc(),
+            last_event_at: None,
+            park_rung: 0,
+            parked_at: None,
+            suggested_title: None,
+        };
+        let (mut state, _, dir) = crate::state::tests::build_state_for_session(session.clone());
+        let app = Arc::get_mut(&mut state).unwrap();
+        app.services.meta = meta.clone();
+        app.services.clock = clock.clone();
+        app.services.entropy = entropy;
+        app.boot_bundles = Arc::new(crate::boot_bundle::BootBundleCache::new(clock));
+        (state, meta, session, dir)
+    }
+
+    #[derive(Default)]
+    struct RecordingMint(Mutex<Vec<Vec<Capability>>>);
+
+    #[async_trait::async_trait]
+    impl Integration for RecordingMint {
+        fn provider(&self) -> &str {
+            "github"
+        }
+
+        async fn mint_credential(
+            &self,
+            caps: &[Capability],
+            _: &CredentialHint,
+        ) -> Result<ScopedCredential, engram_core::error::IntegrationError> {
+            self.0.lock().push(caps.to_vec());
+            Ok(ScopedCredential::Bearer {
+                token: "minted-token".into(),
+                expires_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            })
+        }
+    }
+
+    fn mint_source() -> CredentialMintSource {
+        CredentialMintSource::Connection {
+            connection_id: "test-connection".into(),
+            provider: "github".into(),
+        }
+    }
+
+    fn policy() -> IntegrationPolicy {
+        serde_json::from_value(serde_json::json!({
+            "injects": [
+                {
+                    "hosts": ["api.github.com"], "header_name": "Authorization",
+                    "header_template": "Bearer {}", "mint_source": mint_source()
+                },
+                {
+                    "hosts": ["static.example.com"], "header_name": "X-Api-Key",
+                    "header_template": "{}", "secret_ref": "static-key"
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn install_mint(state: &mut SharedState) -> Arc<RecordingMint> {
+        let mint = Arc::new(RecordingMint::default());
+        let app = Arc::get_mut(state).unwrap();
+        app.integrations = crate::integrations::IntegrationBroker::with(mint.clone());
+        app.services.secrets = Arc::new(engram_secrets_dev::InMemorySecretStore::with_secrets([(
+            "static-key",
+            "static-token",
+        )]));
+        mint
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_read_failure_skips_mint_but_keeps_static_injection() {
+        let (mut state, meta, session, _dir) = fixture();
+        let mint = install_mint(&mut state);
+        meta.set_outage(true);
+        let entries =
+            resolve_inject_entries(&state, session.id, Some(&policy()), &session.image).await;
+        assert!(
+            mint.0.lock().is_empty(),
+            "failed scope reads must never invoke the mint"
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].secret, "static-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_read_failure_prevents_refresh_mint() {
+        let (mut state, meta, session, _dir) = fixture();
+        let mint = install_mint(&mut state);
+        meta.set_outage(true);
+        assert!(refresh_inject_header(&state, session.id, &mint_source())
+            .await
+            .is_none());
+        assert!(mint.0.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_empty_capabilities_still_allow_boot_and_refresh_mints() {
+        let (mut state, _meta, session, _dir) = fixture();
+        let mint = install_mint(&mut state);
+        let entries =
+            resolve_inject_entries(&state, session.id, Some(&policy()), &session.image).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].secret, "Bearer minted-token");
+        assert!(refresh_inject_header(&state, session.id, &mint_source())
+            .await
+            .is_some());
+        assert_eq!(
+            mint.0.lock().as_slice(),
+            &[Vec::<Capability>::new(), Vec::new()]
         );
     }
 }

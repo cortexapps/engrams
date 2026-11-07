@@ -121,11 +121,30 @@ impl ProxydHandle {
         }
     }
 
-    /// One request/response round-trip. Serialized behind the mutex —
-    /// the control plane is low-rate (policy applies and removals).
-    /// On any transport error the cached connection is dropped so the
-    /// next call redials (the respawn recovery path).
+    /// Managed requests own separate streams so a session drain cannot block
+    /// another session. Ordinary requests share the cached stream; an error
+    /// drops that connection so the next call redials. No request is retried.
     async fn request(&self, msg: &ToProxyd) -> Result<FromProxyd, ProxydError> {
+        let managed = matches!(
+            msg,
+            ToProxyd::ListManaged
+                | ToProxyd::ReadManaged(_)
+                | ToProxyd::QuarantineManaged(_)
+                | ToProxyd::RetirePrivateNetwork(_)
+                | ToProxyd::Hello { .. }
+        ) || matches!(msg, ToProxyd::ApplyPolicy(policy) if policy.managed_deny.is_some());
+        if managed {
+            // A session drain must not occupy another session's control stream.
+            let mut stream = tokio::net::UnixStream::connect(&self.control_sock)
+                .await
+                .map_err(|e| ProxydError(format!("managed control connect: {e}")))?;
+            engram_egress_proto::write_frame(&mut stream, msg)
+                .await
+                .map_err(|e| ProxydError(format!("managed control write: {e}")))?;
+            return engram_egress_proto::read_frame(&mut stream)
+                .await
+                .map_err(|e| ProxydError(format!("managed control read: {e}")));
+        }
         let mut guard = self.conn.lock().await;
         if guard.is_none() {
             let stream = tokio::net::UnixStream::connect(&self.control_sock)
@@ -158,6 +177,44 @@ impl ProxydHandle {
         }
     }
 
+    /// Dedicated allocation capability, initially CLOSED. This is not a final
+    /// policy receipt. A new boot or channel loss requires a fresh allocation.
+    pub async fn register_private_network(
+        &self,
+        allocation: &engram_egress_proto::private::Allocation,
+    ) -> Result<engram_egress_proto::private::RegisteredPrivateNetwork, ProxydError> {
+        let stream = tokio::net::UnixStream::connect(&self.control_sock)
+            .await
+            .map_err(|e| ProxydError(format!("private network connect: {e}")))?;
+        engram_egress_proto::private::register(stream, allocation)
+            .await
+            .map_err(|e| ProxydError(format!("private network register: {e}")))
+    }
+
+    /// The response is for this exact allocation on a disposable stream.
+    /// Cancellation drops that stream; the daemon can finish only this retirement.
+    pub async fn retire_private_network(
+        &self,
+        allocation: &engram_egress_proto::private::Allocation,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::RetirePrivateNetwork(Box::new(allocation.clone())),
+            "retire private network",
+        )
+        .await
+    }
+
+    pub async fn handoff_closed_private(
+        &self,
+        request: engram_egress_proto::private::ClosedPolicyHandoff,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::HandoffClosedPrivate(Box::new(request)),
+            "closed policy handoff",
+        )
+        .await
+    }
+
     pub async fn hello(&self) -> Result<HelloInfo, ProxydError> {
         match self
             .request(&ToProxyd::Hello {
@@ -170,6 +227,31 @@ impl ProxydHandle {
         }
     }
 
+    pub async fn managed_sessions(&self) -> Result<Vec<engram_core::SessionId>, ProxydError> {
+        match self.request(&ToProxyd::ListManaged).await? {
+            FromProxyd::ManagedSessions(sessions) => Ok(sessions),
+            _ => Err(ProxydError("invalid managed enumeration response".into())),
+        }
+    }
+    pub async fn read_managed(
+        &self,
+        session: engram_core::SessionId,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedProxyState>, ProxydError> {
+        match self.request(&ToProxyd::ReadManaged(session)).await? {
+            FromProxyd::ManagedState(state) => Ok(state),
+            _ => Err(ProxydError("invalid managed policy response".into())),
+        }
+    }
+    pub async fn quarantine_managed(
+        &self,
+        session: engram_core::SessionId,
+    ) -> Result<(), ProxydError> {
+        self.expect_ok(
+            &ToProxyd::QuarantineManaged(session),
+            "quarantine managed session",
+        )
+        .await
+    }
     pub async fn apply_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,

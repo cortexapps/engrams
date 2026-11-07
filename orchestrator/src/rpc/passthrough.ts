@@ -61,6 +61,8 @@ export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
 /** Optional per-method pre-flight, keyed by policyKey ("ImageService.DisableImage").
  *  Runs AFTER the authz gate and BEFORE the upstream forward. Throws to block. */
+export type UnaryOverride = (req: unknown, ctx: HandlerContext) => Promise<{ response: unknown } | undefined>;
+
 export type Preflight = (req: unknown, ctx: HandlerContext) => Promise<void>;
 
 // ---------------------------------------------------------------------------
@@ -177,6 +179,7 @@ export function registerPassthrough(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
   preflight?: Record<string, Preflight>,
+  overrides?: Record<string, UnaryOverride>,
 ): void {
   const resolveSession: GetSession =
     getSession ??
@@ -277,6 +280,8 @@ export function registerPassthrough(
           await gate(req, ctx);
           const pf = preflight?.[key];
           if (pf) await pf(req, ctx);
+          const handled = await overrides?.[key]?.(req, ctx);
+          if (handled) return handled.response;
           let res;
           try {
             res = await upstream.unary(

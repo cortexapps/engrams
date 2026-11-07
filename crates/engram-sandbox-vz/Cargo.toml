@@ -22,7 +22,11 @@ description = "macOS Apple Silicon SandboxBackend driving Apple's Virtualization
 unsafe_code = "allow"
 
 [dependencies]
+tempfile = "3"
 engram-core.workspace = true
+engram-egress-proto.workspace = true
+sha2.workspace = true
+hex.workspace = true
 engram-agentd.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
@@ -50,5 +54,4 @@ libc = "0.2"
 
 [dev-dependencies]
 futures.workspace = true
-tempfile = "3"
 tracing-subscriber.workspace = true

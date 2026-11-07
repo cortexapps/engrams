@@ -41,6 +41,9 @@ use proptest::prelude::*;
 /// them *panic*. A panic here unwinds out of the closure and fails the
 /// proptest case with the shrunk counterexample.
 fn decode_every_type(bytes: &[u8]) {
+    if let Ok(raw) = std::str::from_utf8(bytes) {
+        let _ = engram_harness_proto::tool_result::McpToolResult::parse(raw);
+    }
     let _ = serde_json::from_slice::<engram_harness_proto::attach_token::AttachToken>(bytes);
     let _ = bincode::deserialize::<HarnessAttach>(bytes);
     let _ = bincode::deserialize::<HarnessAttachAck>(bytes);

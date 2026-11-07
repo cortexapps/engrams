@@ -5,9 +5,8 @@
 //! `bytes` fields — bincode round-trips Rust types without needing
 //! a proto mirror for every nested struct (SandboxSpec,
 //! SnapshotMetadata, SessionEgressPolicy, AgentSpec, etc. stay
-//! authoritative). Coord + host deploy together (OSS image tag →
-//! engrams-internal Helm pin) so bincode skew can't happen across
-//! versions.
+//! authoritative). The wire-version gate rejects incompatible peers before
+//! it decodes these positional payloads.
 //!
 //! Pre-0013 this file held the full `Frame`/`RequestKind`/`ResponseKind`/
 //! `NotifyKind` enum surface for the bincode-over-WS protocol. ADR 0013
@@ -117,7 +116,7 @@ use serde::{Deserialize, Serialize};
 // v21 (ADR 0109): `SessionEgressPolicy.google_adc` tells the host whether
 // to expose the session-local Google metadata endpoint. Trailing bincode
 // field addition. Lockstep coordinator and host roll.
-// v22 (issue: engrams-review outage 2026-08-01): `CredentialMintSource`
+// v22: `CredentialMintSource`
 // becomes externally tagged. The internally-tagged form (#931) bincode-
 // ENCODED as a map but could never DECODE (`deserialize_any`), so every
 // `SessionEgressPolicy` carrying a minted inject failed host-side at
@@ -175,7 +174,9 @@ use serde::{Deserialize, Serialize};
 // snapshot before the pause: MigrationItem::DiskBlockAt replaces
 // DiskChunkAt at the same index, DiskPrecopyInfo is appended, and the
 // capture reports sealed and precopy block counts.
-pub const WIRE_VERSION: u32 = 38;
+// v43 combines the block migration layout with managed deny policies,
+// per-call cancellation, managed boot authority, and deferred-turn identity.
+pub const WIRE_VERSION: u32 = 43;
 
 /// Whether a host-agent build can adopt the microVMs the previous build left
 /// running (ADR 0126). Two builds with the same number can reattach each
@@ -249,6 +250,9 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
     }
     Some((kind.to_string(), message.trim().to_string()))
 }
+
+/// Exact failed-precondition marker. It is an outcome, not retirement proof.
+pub const MANAGED_RECOVERY_REQUIRED_STATUS: &str = "managed_recovery_required";
 
 /// Marker prefix for the host-agent's "memory image unusable" restore
 /// refusal ([`engram_core::SandboxError::MemoryImageUnusable`], the

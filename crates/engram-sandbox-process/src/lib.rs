@@ -1977,6 +1977,7 @@ mod tests {
         let (backend, _dir) = backend();
         let error = backend
             .notify_session_policy(SessionEgressPolicy {
+                managed_deny: None,
                 session_id: SessionId::new(),
                 sandbox_id: SandboxId::new(),
                 guest_ip: std::net::Ipv4Addr::LOCALHOST,

@@ -31,6 +31,17 @@ use support::wire_exec_request;
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
+    use prost::Message;
+    let _ = engram_protocol::mcp::ReserveManagedCreateRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestRequest::decode(bytes);
+    let _ = engram_protocol::mcp::ReadNativeManifestResponse::decode(bytes);
+
+    let _ = engram_protocol::managed_policy::decode::<
+        engram_core::types::managed_deny::ManagedPolicyApply,
+    >(bytes);
+    let _ = engram_protocol::managed_policy::decode::<
+        Option<engram_core::types::managed_deny::ManagedAppliedState>,
+    >(bytes);
     // Crate-local payloads.
     let _ = bincode::deserialize::<WireExecRequest>(bytes);
     // A representative slice of the shared engram-core payloads that cross

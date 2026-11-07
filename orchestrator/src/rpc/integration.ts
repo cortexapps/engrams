@@ -10,7 +10,12 @@
  *
  * Injectable deps (getSession, connectors) for tests.
  */
+import { requireMcpHumanAdmin } from "../mcp/credential-rpc.ts";
 
+import {
+  mcpHandlers, mcpConfigFromProto, mcpConfigToProto,
+  requireMcp, requireMcpHook, mcpOperation, type McpServices,
+} from "../mcp/contracts.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter } from "@connectrpc/connect";
 
@@ -125,6 +130,7 @@ export interface IntegrationOpAccess {
 }
 
 export interface IntegrationDeps {
+  mcp?: McpServices;
   getSession?: GetSession;
   connectors?: ConnectorStore;
   connectorLogos?: ConnectorLogoStore;
@@ -305,6 +311,7 @@ function connectionToProto(row: IntegrationConnectionRow) {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     ...config,
+    ...(row.provider === "mcp" ? { mcp: mcpConfigToProto(row.config), ...row.mcp } : {}),
   };
 }
 
@@ -400,6 +407,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const requireConnection = (id: string) => requireConnectionIn(providers, connections, id);
 
   router.service(IntegrationService, {
+    ...mcpHandlers({ services: deps?.mcp, connections, getSession, now, connectionToProto }),
     async listConnectors(_req, ctx) {
       await requireAdmin(ctx, getSession);
       const statusInputs = await fetchStatusInputs(orgSecret, mint, oauthCredential);
@@ -729,6 +737,25 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
 
     async createConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
+      if (req.provider === "mcp") {
+        await requireMcpHumanAdmin(ctx, getSession);
+        if (req.mcp?.apiKeySecretRef)
+          throw new ConnectError(
+            "use fresh credential setup after creating the connection",
+            Code.InvalidArgument,
+          );
+        const service = requireMcp(deps?.mcp);
+        const validate = requireMcpHook(service.validateDestination);
+        assertConnectionNames(req.alias, req.displayName);
+        const config = mcpConfigFromProto(req.mcp);
+        return mcpOperation(async () => {
+          await validate(config);
+          const row = await connections.create({
+            alias: req.alias, provider: "mcp", displayName: req.displayName.trim(), config,
+          });
+          return { connection: connectionToProto(row) };
+        });
+      }
       const provider = requireProvider(req.provider);
       provider.assertDeploymentReady?.({ issuer, deploymentId });
       assertConnectionNames(req.alias, req.displayName);
@@ -745,6 +772,28 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
     async updateConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
       assertConnectionNames(req.alias, req.displayName);
+      const current = await connections.get(req.id);
+      if (current?.provider === "mcp") {
+        const actor = await requireMcpHumanAdmin(ctx, getSession);
+        const service = requireMcp(deps?.mcp);
+        const validate = requireMcpHook(service.validateDestination);
+        const credentials = requireMcpHook(service.credentials);
+        if (req.mcp?.apiKeySecretRef)
+          throw new ConnectError("credential references cannot be entered", Code.InvalidArgument);
+        const config = mcpConfigFromProto(req.mcp);
+        return mcpOperation(async () => {
+          await validate(config);
+          await credentials.configure(
+            req.id,
+            req.expectedRevision,
+            req.expectedGeneration,
+            actor.id,
+            config,
+            { alias: req.alias, displayName: req.displayName.trim() },
+          );
+          return { connection: connectionToProto((await connections.get(req.id))!) };
+        });
+      }
       const { provider } = await requireConnection(req.id);
       provider.assertDeploymentReady?.({ issuer, deploymentId });
       const config = configFromProto(provider, req);
@@ -770,6 +819,18 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       );
       if (referenced) {
         throw new ConnectError("connection is still granted to a profile", Code.FailedPrecondition);
+      }
+      if (connection?.provider === "mcp") {
+        const actor = await requireMcpHumanAdmin(ctx, getSession);
+        const credentials = requireMcpHook(requireMcp(deps?.mcp).credentials);
+        return mcpOperation(async () => ({
+          deleted: await credentials.remove(
+            req.id,
+            req.expectedRevision,
+            req.expectedGeneration,
+            actor.id,
+          ),
+        }));
       }
       return { deleted: await connections.delete(req.id) };
     },
@@ -799,6 +860,13 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireAdmin(ctx, getSession);
       const current = await connections.get(req.id);
       if (!current) throw new ConnectError("connection not found", Code.NotFound);
+      if (current.provider === "mcp") {
+        const service = requireMcp(deps?.mcp);
+        return mcpOperation(async () => {
+          await service.repository.setEnabled(req.id, req.expectedRevision, req.enabled, now());
+          return { connection: connectionToProto((await connections.get(req.id))!) };
+        });
+      }
       if (req.enabled) {
         providers.get(current.provider)?.assertDeploymentReady?.({ issuer, deploymentId });
       }

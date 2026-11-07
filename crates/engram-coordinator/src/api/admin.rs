@@ -91,11 +91,11 @@ pub async fn pause_session(
             "session has no live sandbox to pause — it is idle or not yet started".into(),
         )
     })?;
-    // ADR 0079: epoch threaded by the op executor; 0 until the verb migrates.
+    // ADR 0079: preserve identity without claiming an op epoch.
     state
         .services
         .host
-        .pause(sandbox_id, SessionFence::unfenced())
+        .pause(sandbox_id, SessionFence::new(session_id, 0))
         .await
         .map_err(|e| ApiError::Internal(format!("pause sandbox: {e}")))?;
     tracing::info!(%session_id, %sandbox_id, "admin: froze microVM in place");
@@ -118,11 +118,11 @@ pub async fn resume_session(
             "session has no live sandbox to resume in place — it is idle or not yet started".into(),
         )
     })?;
-    // ADR 0079: epoch threaded by the op executor; 0 until the verb migrates.
+    // ADR 0079: preserve identity without claiming an op epoch.
     state
         .services
         .host
-        .resume(sandbox_id, SessionFence::unfenced())
+        .resume(sandbox_id, SessionFence::new(session_id, 0))
         .await
         .map_err(|e| ApiError::Internal(format!("resume sandbox: {e}")))?;
     tracing::info!(%session_id, %sandbox_id, "admin: unfroze microVM in place");

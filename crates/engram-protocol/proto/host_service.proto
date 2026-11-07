@@ -8,9 +8,8 @@ syntax = "proto3";
 // SnapshotMetadata, SessionEgressPolicy, AgentSpec, and ExecRequest's base)
 // stay bincode-encoded inside a `bytes` field. That carves a small
 // proto surface while keeping the existing Rust types
-// authoritative — coord+host always deploy at the same OSS tag so
-// bincode drift can't happen (same atomic-deploy property the WS
-// path relies on today).
+// authoritative. The wire-version gate rejects incompatible peers
+// before it decodes positional payloads.
 //
 // UUIDs ride as 16-byte `bytes` fields, not as strings. Strings
 // would double the wire size for no schema benefit.
@@ -18,13 +17,21 @@ syntax = "proto3";
 package engram.host.v1;
 
 service HostService {
+  rpc CaptureManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc ReadManagedColdAssets(ReadManagedColdAssetsRequest) returns (ReadManagedColdAssetsResponse);
+  rpc PrepareManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc ReadManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc FinalizeManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc StartManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
+  rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
   // ---- sandbox lifecycle ----
   //
   // ADR 0079 (wire v12): every session-scoped lifecycle RPC carries a
   // (session_id, fencing_epoch) stamp — see `FencedSandboxRequest` —
   // checked by the host's `check_session_epoch` gate right after the
   // wire-version gate. Sandbox-scoped-but-not-lifecycle RPCs (harness
-  // routing, proxies, COW diagnostics, migration internals) are NOT
+  // routing, proxies, migration internals) are NOT
   // fenced: they never make the writes the op executor serializes.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
   rpc DestroySandbox(FencedSandboxRequest) returns (Empty);
@@ -796,3 +803,16 @@ message ProxyPortData {
 // side say "I'm done writing" explicitly when it has no trailing data.
 message ProxyPortClose {}
 
+// These operations are served only in mandatory managed mTLS mode.
+message ReadManagedPolicyRequest { bytes target_bincode = 1; }
+message ReadManagedPolicyResponse { bytes state_bincode = 1; }
+message ApplyManagedPolicyRequest { bytes request_bincode = 1; }
+message ApplyManagedPolicyResponse { bytes state_bincode = 1; }
+
+// Versioned, bounded JSON for the exact typed managed boot commands.
+// Finalize contains plaintext environment only on authenticated host transport.
+message ManagedBootRequest { bytes payload_json = 1; }
+message ManagedBootResponse { bytes payload_json = 1; }
+
+message ReadManagedColdAssetsRequest { bytes payload_json = 1; }
+message ReadManagedColdAssetsResponse { bytes payload_json = 1; }

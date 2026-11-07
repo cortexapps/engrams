@@ -1,0 +1,3 @@
+ALTER TABLE "mcp_execution" ADD COLUMN "authorization_kind" text NOT NULL;--> statement-breakpoint
+ALTER TABLE "mcp_execution" ADD COLUMN "automation_grant_hash" text;--> statement-breakpoint
+ALTER TABLE "mcp_execution" ADD CONSTRAINT "mcp_execution_authorization_check" CHECK (("mcp_execution"."authorization_kind" = 'read' AND "mcp_execution"."classification" = 'read' AND "mcp_execution"."automation_grant_hash" IS NULL) OR ("mcp_execution"."authorization_kind" = 'approval' AND "mcp_execution"."automation_grant_hash" IS NULL) OR ("mcp_execution"."authorization_kind" = 'automation' AND "mcp_execution"."classification" = 'write' AND "mcp_execution"."automation_grant_hash" IS NOT NULL));

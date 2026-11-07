@@ -72,6 +72,16 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
+    async fn get_mcp_write_policy(
+        &self,
+        req: Request<app::GetMcpWritePolicyRequest>,
+    ) -> Result<Response<app::GetMcpWritePolicyResponse>, Status> {
+        self.auth.check(&req)?;
+        Err(Status::failed_precondition(
+            "trusted policy transport required",
+        ))
+    }
+
     async fn get_session(
         &self,
         req: Request<app::GetSessionRequest>,
@@ -160,6 +170,11 @@ impl app::session_service_server::SessionService for AppSessionService {
     ) -> Result<Response<app::CompleteToolCallResponse>, Status> {
         self.auth.check(&req)?;
         let r = req.into_inner();
+        if r.expected_mcp_plan_review.is_some() {
+            return Err(Status::failed_precondition(
+                "trusted policy transport required",
+            ));
+        }
         let id = parse_session_id(&r.session_id)?;
         let note = crate::api::prompt::complete_tool_call_core(
             &self.state,
@@ -465,7 +480,7 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let request = req.into_inner();
         let session_id = parse_session_id(&request.session_id)?;
-        let (metadata, mut bytes) =
+        let (metadata, bytes) =
             crate::api::session_files::read_file_core(&self.state, session_id, request.path)
                 .await
                 .map_err(into_status)?;
@@ -475,8 +490,7 @@ impl app::session_service_server::SessionService for AppSessionService {
             .next()
             .unwrap_or_default()
             .to_owned();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.send(Ok(app::ReadFileResponse {
+        let metadata = app::ReadFileResponse {
             frame: Some(app::read_file_response::Frame::Metadata(
                 app::ReadFileMetadata {
                     path: metadata.path,
@@ -485,24 +499,17 @@ impl app::session_service_server::SessionService for AppSessionService {
                     file_name,
                 },
             )),
-        }))
-        .await
-        .map_err(|_| Status::cancelled("read client closed before metadata"))?;
-        tokio::spawn(async move {
-            while let Some(item) = bytes.next().await {
-                let response = item
-                    .map(|chunk| app::ReadFileResponse {
-                        frame: Some(app::read_file_response::Frame::Chunk(chunk.to_vec())),
-                    })
-                    .map_err(|error| into_status(error.into()));
-                if tx.send(response).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
+        };
+        // Keep ownership of the source in the response. A stalled source must
+        // also be dropped when the downstream client closes.
+        let response =
+            futures::stream::once(async move { Ok(metadata) }).chain(bytes.map(|item| {
+                item.map(|chunk| app::ReadFileResponse {
+                    frame: Some(app::read_file_response::Frame::Chunk(chunk.to_vec())),
+                })
+                .map_err(|error| into_status(error.into()))
+            }));
+        Ok(Response::new(Box::pin(response)))
     }
 
     async fn copy_files(

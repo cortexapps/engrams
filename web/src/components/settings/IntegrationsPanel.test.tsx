@@ -178,6 +178,7 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
   const connectionUpdates: Caps["connectionUpdates"] = [];
   const transport = createRouterTransport((router) => {
     router.service(IntegrationService, {
+      getMcpSetup: () => ({ enabled: false, registrations: [], destinations: [] }),
       listConnectors: () => ({ connectors: CONNECTORS }),
       getIntegrationCatalog: () => ({ providers: CATALOG }),
       upsertConnector: (req) => {
@@ -324,6 +325,12 @@ describe("IntegrationsPanel (marketplace)", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  test("shows when external MCP setup is unavailable", async () => {
+    const caps = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport: caps.transport });
+    expect(await screen.findByText("External MCP is unavailable.")).toBeTruthy();
   });
 
   test("renders Connected and Available provider cards", async () => {

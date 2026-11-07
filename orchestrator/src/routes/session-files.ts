@@ -62,7 +62,16 @@ function errorResponse(error: unknown): Response {
               : error.code === Code.AlreadyExists || error.code === Code.FailedPrecondition
                 ? 409
                 : 400;
-    return Response.json({ error: error.rawMessage }, { status });
+    return Response.json(
+      { error: error.rawMessage },
+      {
+        status,
+        headers:
+          Number.isInteger(error.code) && error.code >= 1 && error.code <= 16
+            ? { "x-engram-rpc-code": String(error.code) }
+            : {},
+      },
+    );
   }
   return Response.json(
     { error: error instanceof Error ? error.message : String(error) },

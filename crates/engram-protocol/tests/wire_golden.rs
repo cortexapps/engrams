@@ -221,6 +221,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
 
 fn session_egress_policy() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         session_id: SessionId::from(fixed_uuid(0x30)),
         sandbox_id: SandboxId::from(fixed_uuid(0x31)),
         guest_ip: Ipv4Addr::new(169, 254, 0, 21),
@@ -250,7 +251,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
     }
 }
 
-/// The engrams-review outage (2026-08-01): every field of the inject/observe
+/// A populated minted policy: every field of the inject/observe
 /// ENTRY types populated — most importantly `mint_source: Some(..)`, which the
 /// empty-`injects` golden above can never exercise. `CredentialMintSource` was
 /// internally tagged (#931); bincode ENCODED that as a map but could never
@@ -260,6 +261,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
 /// entry types can't silently drop off the corpus again.
 fn session_egress_policy_minted() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "ghs_minted".into(),
             header_name: "authorization".into(),
@@ -312,6 +314,7 @@ fn session_egress_policy_minted() -> SessionEgressPolicy {
 ///   that #931 fixed stays pinned for a second provider.
 fn session_egress_policy_google() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         network_allow_hosts: vec!["compute.googleapis.com".into()],
         injects: vec![EgressInjectEntry {
             secret: "ya29.minted".into(),
@@ -353,6 +356,7 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
 /// variant's encoding (index 1) inside a fully-populated entry.
 fn session_egress_policy_oauth() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "linear-access-token".into(),
             header_name: "Authorization".into(),
@@ -380,6 +384,7 @@ fn session_egress_policy_oauth() -> SessionEgressPolicy {
 /// fully-populated entry.
 fn session_egress_policy_oauth_user() -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         injects: vec![EgressInjectEntry {
             secret: "personal-access-token".into(),
             header_name: "Authorization".into(),
@@ -482,8 +487,7 @@ fn struct_payloads_golden() {
             sha256: "d".repeat(64),
         },
     );
-    // SessionEgressPolicy doesn't derive `PartialEq`; pin its encoded
-    // bytes (field-order regression catch).
+    // Pin the policy field order, including the optional managed deny.
     assert_golden_no_eq("session_egress_policy", &session_egress_policy());
     assert_golden_no_eq(
         "session_egress_policy_minted",
@@ -501,8 +505,7 @@ fn struct_payloads_golden() {
         "session_egress_policy_oauth_user",
         &session_egress_policy_oauth_user(),
     );
-    // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
-    // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
+    // Pin the persisted warm-stage shape.
     assert_golden("warm_stages", &warm_stages());
 
     // ADR 0080 phase 3b (wire v14) — the MaterializeImage payloads.
@@ -581,8 +584,7 @@ fn nested_enum_variant_indices() {
 
 #[test]
 fn wire_mirrors_golden() {
-    // The wire.rs mirror shapes (ADR 0013 — the pattern the rest should
-    // eventually adopt). WireExecRequest isn't `PartialEq`; pin bytes.
+    // Pin the exec request field order.
     assert_golden_no_eq(
         "wire_exec_request",
         &WireExecRequest {
@@ -649,8 +651,8 @@ fn wire_version_pinned() {
     // bincode field. The session-egress-policy golden was regenerated.
     // 21 -> 22: `CredentialMintSource` becomes externally tagged — the
     // internally-tagged form (#931) could never bincode-DECODE, so every
-    // minted-inject policy failed host-side at boot (the engrams-review
-    // outage, 2026-08-01). No existing golden changes bytes (the broken
+    // minted-inject policy failed host-side at boot (the minted-policy
+    // decode failure). No existing golden changes bytes (the broken
     // `Some` shape never had one); the minted-policy golden is ADDED.
     // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` became
     // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
@@ -702,8 +704,9 @@ fn wire_version_pinned() {
     // 37 -> 38: MigrationItem::DiskBlockAt replaces DiskChunkAt at bincode
     // index 2 (protobuf 7) and DiskPrecopyInfo is appended (bincode 4,
     // protobuf 8); the capture reports block counts. No golden embeds either.
+    // 38 -> 43 combines managed policy, cancellation, boot and deferred identity.
     assert_eq!(
-        WIRE_VERSION, 38,
+        WIRE_VERSION, 43,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -740,6 +743,7 @@ fn regen_golden() {
         },
     );
     write("session_egress_policy", &session_egress_policy());
+    write("session_egress_policy_managed", &managed_egress_policy());
     write(
         "session_egress_policy_minted",
         &session_egress_policy_minted(),
@@ -798,7 +802,7 @@ fn regen_golden() {
     );
 }
 
-/// The engrams-review outage (2026-08-01): the internally-tagged
+/// A populated minted policy: the internally-tagged
 /// `CredentialMintSource` (#931) bincode-ENCODED fine but could never DECODE
 /// (`deserialize_any`), so the encode-only golden pin above was green while
 /// every minted-inject policy failed host-side. This test pins the DECODE leg:
@@ -821,7 +825,7 @@ fn minted_inject_policy_bincode_round_trips() {
     );
 }
 
-/// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds
+/// ADR 0080 capture contract: `WarmConfig.env` holds
 /// `CaptureEnvValue`, an internally-tagged serde enum — bincode cannot
 /// DECODE that representation (`deserialize_any`), so a non-empty
 /// `[[warm.env]]` crossing the wire fails host-side at capture. The
@@ -862,4 +866,20 @@ fn warm_config_wire_shape_round_trips_only_when_stripped() {
         "tagged CaptureEnvValue became bincode-decodable — retire the coordinator's \
          wire-strip in enabled_images.rs and this pin together"
     );
+}
+
+fn managed_egress_policy() -> SessionEgressPolicy {
+    let mut policy = session_egress_policy();
+    policy.managed_deny = Some(
+        engram_core::types::managed_deny::ManagedDenyPolicy::new(
+            9,
+            ["mcp.example".into(), "alias.example".into()],
+        )
+        .unwrap(),
+    );
+    policy
+}
+#[test]
+fn managed_policy_is_appended_to_egress_wire() {
+    assert_golden("session_egress_policy_managed", &managed_egress_policy());
 }

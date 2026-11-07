@@ -11,6 +11,7 @@ import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
+import { MCP_LIMITS } from "../mcp/limits.ts";
 
 const protoGrant = (capability: string) =>
   create(ProfileIntegrationGrantSchema, capabilityGrant(
@@ -765,4 +766,140 @@ describe("user-scoped grants (ADR 0115)", () => {
       );
     } finally { await s.close(); }
   });
+});
+
+describe("MCP profile grant contract", () => {
+  test("numeric MCP constraints preserve decimal and equivalent exponent values", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("admin", "admin"),
+      store: makeFakeStore(),
+      images: fakeImages(["img-1"]),
+    });
+    const schema =
+      '{"type":"object","properties":{"count":{"type":"number","minimum":0.1,"maximum":1e3}}}';
+    const canonical = schema.replace("1e3", "1000");
+    const grant = {
+      connectionId: "default-mcp",
+      operation: "invoke",
+      credentialScope: "org",
+      mcp: {
+        upstreamName: "Create.Record",
+        automationWrite: true,
+        argumentConstraintDocumentsJson: [schema],
+        unrestricted: false,
+      },
+    };
+    const input = {
+      name: "Tools",
+      imageId: "img-1",
+      harness: "claude",
+      integrationGrants: [grant],
+    };
+    try {
+      const created = await s.client.createProfile(input);
+      expect(created.profile!.integrationGrants[0]!.mcp!.argumentConstraintDocumentsJson).toEqual([
+        canonical,
+      ]);
+      const updated = await s.client.updateProfile({
+        ...input,
+        id: created.profile!.id,
+        integrationGrants: [
+          { ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: [canonical] } },
+        ],
+      });
+      expect(updated.profile!.integrationGrants[0]!.mcp!.argumentConstraintDocumentsJson).toEqual([
+        canonical,
+      ]);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test.each([
+    ["rounded decimal", '{"type":"object","properties":{"count":{"minimum":0.10000000000000001}}}'],
+    ["unsafe integer", '{"type":"object","properties":{"count":{"maximum":9007199254740993}}}'],
+    ["raw byte limit", '{"type":"object"}'.padStart(MCP_LIMITS.argumentBytes + 1)],
+  ])(
+    "rejects MCP constraints with %s before create or update persistence",
+    async (_name, schema) => {
+      const store = makeFakeStore();
+      const s = await spawn({
+        getSession: makeGetSession("admin", "admin"),
+        store,
+        images: fakeImages(["img-1"]),
+      });
+      const input = { name: "Tools", imageId: "img-1", harness: "claude" };
+      const grant = {
+        connectionId: "default-mcp",
+        operation: "invoke",
+        credentialScope: "org",
+        mcp: {
+          upstreamName: "Create.Record",
+          automationWrite: true,
+          argumentConstraintDocumentsJson: [schema],
+          unrestricted: false,
+        },
+      };
+      try {
+        const created = await s.client.createProfile(input);
+        await expectErr(
+          s.client.createProfile({ ...input, integrationGrants: [grant] }),
+          Code.InvalidArgument,
+        );
+        await expectErr(
+          s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [grant] }),
+          Code.InvalidArgument,
+        );
+        expect(await store.list({ includeArchived: true })).toHaveLength(1);
+        expect((await store.get(created.profile!.id))!.integrationGrants).toEqual([]);
+      } finally {
+        await s.close();
+      }
+    },
+  );
+
+  test("create, update, and list preserve explicit organization scope and constraints", async () => {
+    const s = await spawn({ getSession: makeGetSession("admin", "admin"), store: makeFakeStore(), images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]) });
+    const grant = { connectionId: "default-mcp", operation: "invoke", credentialScope: "org", resourceConstraints: [], mcp: { upstreamName: "Create.Record", automationWrite: true, argumentConstraintDocumentsJson: [
+      JSON.stringify({ $schema: "http://json-schema.org/draft-07/schema#", $id: "https://schemas.example.test/constraint", $defs: { item: { const: "allowed" } }, type: "object", properties: { project: { $ref: "#/$defs/item" } }, required: ["project"] }),
+      JSON.stringify({ $schema: "https://json-schema.org/draft/2020-12/schema", $id: "https://schemas.example.test/constraint", $defs: { item: { type: "integer", minimum: 1 } }, type: "object", properties: { count: { $ref: "#/$defs/item" } }, required: ["count"] }),
+    ], unrestricted: false } };
+    const input = { name: "Tools", imageId: "img-1", harness: "claude", integrationGrants: [grant] };
+    try {
+      const created = await s.client.createProfile(input);
+      expect(created.profile!.integrationGrants[0]!.credentialScope).toBe("org");
+      expect(created.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
+      const updated = await s.client.updateProfile({ ...input, id: created.profile!.id, name: "Renamed tools" });
+      expect(updated.profile!.integrationGrants[0]!.mcp?.automationWrite).toBe(true);
+      expect(updated.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
+      const listed = await s.client.listProfiles({});
+      expect(listed.profiles[0]!.integrationGrants[0]!.mcp?.upstreamName).toBe("Create.Record");
+      expect(listed.profiles[0]!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
+      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, credentialScope: "user" }] }), Code.InvalidArgument);
+      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: [] } }] }), Code.InvalidArgument);
+      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: ["[]"] } }] }), Code.InvalidArgument);
+      const unrestricted = await s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: [], unrestricted: true } }] });
+      expect(unrestricted.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual([]);
+      expect(unrestricted.profile!.integrationGrants[0]!.mcp?.unrestricted).toBe(true);
+    } finally { await s.close(); }
+  });
+});
+
+test("typed profile publication preserves optional revision presence and authenticates the publisher", async () => {
+  const store = makeFakeStore();
+  const calls: unknown[] = [];
+  const originalCreate = store.create.bind(store);
+  store.create = async (input, publication) => {
+    calls.push(publication);
+    return originalCreate(input);
+  };
+  const s = await spawn({ getSession: makeGetSession("admin-publisher", "admin"), store, images: fakeImages(["img-1"]) });
+  const input = { name: "Profile", imageId: "img-1", harness: "claude" };
+  try {
+    await s.client.createProfile(input);
+    await s.client.createProfile({ ...input, expectedMcpGrantRevision: 0n });
+    expect(calls).toEqual([undefined, { actorId: "admin-publisher", expectedRevision: 0 }]);
+    await expectErr(s.client.createProfile({ ...input, expectedMcpGrantRevision: BigInt(Number.MAX_SAFE_INTEGER) + 1n }), Code.InvalidArgument);
+    expect(calls).toHaveLength(2);
+  } finally { await s.close(); }
 });

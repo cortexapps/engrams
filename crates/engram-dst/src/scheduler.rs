@@ -621,6 +621,10 @@ impl Sim {
                 use engram_core::traits::Entropy as _;
                 let session_id = SessionId::from(self.world.entropy.uuid());
                 let ws = SessionCreateWriteSet {
+                    managed_boot_selection: None,
+                    managed_initial_prompt: None,
+                    managed_creation: None,
+                    mcp_policy: None,
                     session_id,
                     spec: SessionSpec {
                         image: SIM_IMAGE.into(),

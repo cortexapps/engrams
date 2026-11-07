@@ -60,6 +60,7 @@ vi.mock("../hooks/use-mobile", () => ({
 vi.mock("../auth/AuthProvider", () => ({
   useIsAdmin: () => false,
 }));
+vi.mock("../components/session-thread/McpSessionPanel", () => ({ McpSessionPanel: () => null }));
 vi.mock("../components/session-thread/SessionThread", () => ({
   SessionThread: () => <div data-testid="session-thread" />,
 }));

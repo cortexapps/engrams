@@ -116,6 +116,36 @@ pub struct HostRegistry {
 }
 
 impl HostRegistry {
+    async fn managed_sandbox_gate(
+        &self,
+        id: SandboxId,
+        allow_started: bool,
+    ) -> Result<(), SandboxError> {
+        match self
+            .meta
+            .managed_sandbox_open(id)
+            .await
+            .map_err(|_| SandboxError::Unavailable("managed authority unavailable".into()))?
+        {
+            None => Ok(()),
+            Some(true) if allow_started => Ok(()),
+            _ => Err(SandboxError::Unavailable("managed boot gate closed".into())),
+        }
+    }
+    async fn managed_session_gate(&self, id: SessionId) -> Result<(), SandboxError> {
+        if self
+            .meta
+            .managed_boot_open(id)
+            .await
+            .map_err(|_| SandboxError::Unavailable("managed authority unavailable".into()))?
+            .is_some()
+        {
+            return Err(SandboxError::Unavailable(
+                "managed session requires registered boot commands".into(),
+            ));
+        }
+        Ok(())
+    }
     /// Construct a registry backed by `meta` for read-through cache
     /// misses. TTL is read from `ENGRAM_HOST_REGISTRY_TTL_SECS`
     /// (default 60s).
@@ -325,6 +355,8 @@ impl HostRegistry {
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
         fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.managed_session_gate(fence.session_id).await?;
+
         // The capacity decision already happened in `reserve_placement`; just
         // resolve the chosen host's backend (dialing through PG if this
         // replica hasn't seen the host yet — ADR 0047).
@@ -505,6 +537,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        self.managed_sandbox_gate(id, true).await?;
+
         // ADR 0050 C: the gRPC pool dials lazily and defers per-RPC
         // retry to the call site. A freshly-scaled host's first call
         // can come back `Unavailable` (connect not yet established);
@@ -542,6 +576,8 @@ impl HostClient for HostRegistry {
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
+        self.managed_sandbox_gate(id, true).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.write_file(id, spec, bytes).await
     }
@@ -551,6 +587,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         path: String,
     ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        self.managed_sandbox_gate(id, true).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.read_file(id, path).await
     }
@@ -560,6 +598,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         fence: SessionFence,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.snapshot(id, fence).await
     }
@@ -569,6 +609,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         fence: SessionFence,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.snapshot_hold(id, fence).await
     }
@@ -578,6 +620,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.snapshot_begin(id, fence).await
     }
@@ -587,6 +631,8 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_presetup(id, fence).await
     }
@@ -597,6 +643,8 @@ impl HostClient for HostRegistry {
         export_id: &str,
         fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend
             .migration_capture_postcopy(id, export_id, fence)
@@ -607,6 +655,8 @@ impl HostClient for HostRegistry {
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_drain_wait(id).await
     }
@@ -617,6 +667,8 @@ impl HostClient for HostRegistry {
         export_id: &str,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_commit(id, export_id, fence).await
     }
@@ -627,6 +679,8 @@ impl HostClient for HostRegistry {
         export_id: &str,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_abort(id, export_id, fence).await
     }
@@ -646,11 +700,15 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.commit_snapshot(id, fence).await
     }
 
     async fn abort_snapshot(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.abort_snapshot(id, fence).await
     }
@@ -660,6 +718,8 @@ impl HostClient for HostRegistry {
         metadata: SnapshotMetadata,
         fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.managed_session_gate(fence.session_id).await?;
+
         let (host_id, backend) = self.pick_any().ok_or_else(Self::no_host_error)?;
         let sandbox_id = backend.restore(metadata, fence).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
@@ -700,6 +760,87 @@ impl HostClient for HostRegistry {
         result
     }
 
+    async fn read_managed_cold_assets(
+        &self,
+        request: engram_core::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<engram_core::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        self.backend_for(request.host_id)
+            .await?
+            .read_managed_cold_assets(request)
+            .await
+    }
+    async fn prepare_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        self.backend_for(request.key.context.target.host_id)
+            .await?
+            .prepare_managed_boot(request)
+            .await
+    }
+    async fn read_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.backend_for(request.context.target.host_id)
+            .await?
+            .read_managed_boot(request)
+            .await
+    }
+    async fn finalize_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        self.backend_for(
+            request
+                .finalization
+                .prepared
+                .request
+                .key
+                .context
+                .target
+                .host_id,
+        )
+        .await?
+        .finalize_managed_boot(request)
+        .await
+    }
+    async fn start_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootStart,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        self.backend_for(request.receipt.key.context.target.host_id)
+            .await?
+            .start_managed_boot(request)
+            .await
+    }
+    async fn capture_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<engram_core::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        self.backend_for(request.key.context.target.host_id)
+            .await?
+            .capture_managed_boot(request)
+            .await
+    }
+    async fn read_managed_policy(
+        &self,
+        target: engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<engram_core::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        self.backend_for(target.host_id)
+            .await?
+            .read_managed_policy(target)
+            .await
+    }
+    async fn apply_managed_policy(
+        &self,
+        request: engram_core::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<engram_core::types::managed_deny::ManagedAppliedState, SandboxError> {
+        self.backend_for(request.context.target.host_id)
+            .await?
+            .apply_managed_policy(request)
+            .await
+    }
     async fn start_agent(
         &self,
         id: SandboxId,
@@ -707,6 +848,8 @@ impl HostClient for HostRegistry {
         policy: engram_core::types::egress::SessionEgressPolicy,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(id, false).await?;
+
         let (_, backend) = self.resolve_owner(id).await?;
         backend.start_agent(id, agent, policy, fence).await
     }
@@ -761,6 +904,8 @@ impl HostClient for HostRegistry {
         sandbox_id: SandboxId,
         binding_epoch: u64,
     ) -> Result<(), engram_core::SandboxError> {
+        self.managed_session_gate(session_id).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend
             .bind_session(session_id, sandbox_id, binding_epoch)
@@ -793,6 +938,8 @@ impl HostClient for HostRegistry {
         text: String,
         mode: Option<String>,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.send_prompt(sandbox_id, prompt_id, text, mode).await
     }
@@ -803,6 +950,8 @@ impl HostClient for HostRegistry {
         prompt_id: String,
         text: String,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend
             .edit_queued_prompt(sandbox_id, prompt_id, text)
@@ -814,6 +963,8 @@ impl HostClient for HostRegistry {
         sandbox_id: SandboxId,
         prompt_id: String,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.dequeue_queued_prompt(sandbox_id, prompt_id).await
     }
@@ -824,6 +975,8 @@ impl HostClient for HostRegistry {
         tool_call_id: String,
         result_json: String,
     ) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend
             .tool_result(sandbox_id, tool_call_id, result_json)
@@ -836,11 +989,15 @@ impl HostClient for HostRegistry {
     }
 
     async fn pause(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, false).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.pause(sandbox_id, fence).await
     }
 
     async fn resume(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, false).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.resume(sandbox_id, fence).await
     }
@@ -849,6 +1006,8 @@ impl HostClient for HostRegistry {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.start_browser(sandbox_id).await
     }
@@ -859,6 +1018,8 @@ impl HostClient for HostRegistry {
     }
 
     async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.start_ide(sandbox_id).await
     }
@@ -872,6 +1033,8 @@ impl HostClient for HostRegistry {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.proxy_shell(sandbox_id).await
     }
@@ -881,6 +1044,8 @@ impl HostClient for HostRegistry {
         sandbox_id: SandboxId,
         port: u16,
     ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        self.managed_sandbox_gate(sandbox_id, true).await?;
+
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.proxy_port(sandbox_id, port).await
     }
@@ -982,6 +1147,18 @@ mod tests {
             _: Option<HostId>,
         ) -> Result<(), engram_core::MetaError> {
             Ok(())
+        }
+        async fn managed_sandbox_open(
+            &self,
+            _id: SandboxId,
+        ) -> Result<Option<bool>, engram_core::MetaError> {
+            Ok(None)
+        }
+        async fn managed_boot_open(
+            &self,
+            _id: SessionId,
+        ) -> Result<Option<bool>, engram_core::MetaError> {
+            Ok(None)
         }
         async fn host_for_sandbox(
             &self,

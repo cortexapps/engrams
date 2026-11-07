@@ -44,6 +44,10 @@ async fn reserve_session(sim: &mut Sim) -> (engram_coordinator::state::SharedSta
         .expect("replica 0 is up");
     let session_id = SessionId::from(sim.world.entropy.uuid());
     let ws = SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
         session_id,
         spec: SessionSpec {
             image: SIM_IMAGE.into(),
@@ -164,6 +168,7 @@ fn agent_spec_with_prompt(prompt_id: &str, text: &str) -> AgentSpec {
 
 fn egress_policy(session_id: SessionId, sandbox_id: SandboxId) -> SessionEgressPolicy {
     SessionEgressPolicy {
+        managed_deny: None,
         session_id,
         sandbox_id,
         guest_ip: std::net::Ipv4Addr::UNSPECIFIED,

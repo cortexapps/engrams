@@ -34,6 +34,13 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
+mod managed_boot;
+mod managed_bridge;
+mod managed_create;
+mod managed_operator;
+mod managed_operator_gate;
+mod mcp_policy;
+mod outbox_accept;
 mod row;
 
 #[derive(Clone)]
@@ -1392,6 +1399,40 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)
     }
 
+    async fn read_mcp_write_policy(
+        &self,
+        id: SessionId,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_read(id).await
+    }
+    async fn read_mcp_plan_review(
+        &self,
+        id: SessionId,
+        call: &str,
+    ) -> Result<engram_core::types::mcp_policy::PlanReview, MetaError> {
+        self.policy_review(id, call).await
+    }
+    async fn accept_mcp_plan_exit(
+        &self,
+        input: &engram_core::types::mcp_policy::PlanAcceptance,
+    ) -> Result<engram_core::types::mcp_policy::TrustedWritePolicy, MetaError> {
+        self.policy_accept(input).await
+    }
+    async fn validate_mcp_dispatch_fence(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx, expected, true).await
+    }
+    async fn validate_mcp_execution_identity(
+        &self,
+        ctx: &engram_core::types::mcp_policy::RequestPolicyContext,
+        expected: &engram_core::types::mcp_policy::ExecutionRequest,
+    ) -> Result<engram_core::types::mcp_policy::DispatchFence, MetaError> {
+        self.policy_fence(ctx, expected, false).await
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = self.entropy.uuid();
         let now = self.clock.now_utc();
@@ -1450,14 +1491,245 @@ impl MetadataStore for PostgresStore {
         Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
+    async fn read_operator_publication(
+        &self,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_read().await
+    }
+    async fn stage_operator_publication(
+        &self,
+        expected: Option<u64>,
+        candidate: engram_core::types::managed_operator::OperatorCandidate,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_stage(expected, candidate).await
+    }
+    async fn list_operator_participants(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        self.operator_list(after, limit).await
+    }
+    async fn retain_operator_participant(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+        session: SessionId,
+    ) -> Result<engram_core::types::managed_operator::OperatorParticipant, MetaError> {
+        self.operator_retain(generation, session).await
+    }
+    async fn record_operator_readiness(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+        participant: &engram_core::types::managed_operator::OperatorParticipant,
+        proof: engram_core::types::managed_operator::OperatorReadiness,
+    ) -> Result<(), MetaError> {
+        self.operator_ready(generation, participant, proof).await
+    }
+    async fn publish_operator_generation(
+        &self,
+        generation: &engram_core::types::managed_operator::OperatorGeneration,
+    ) -> Result<engram_core::types::managed_operator::OperatorPublication, MetaError> {
+        self.operator_publish(generation).await
+    }
+
+    async fn read_managed_creation_state(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<engram_core::types::managed_bridge::ManagedCreationState, MetaError> {
+        self.bridge_state(q).await
+    }
+    async fn read_managed_boot_selection(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootSelection, MetaError> {
+        self.bridge_selection(q).await
+    }
+
+    async fn begin_managed_boot_intent(
+        &self,
+        i: engram_core::types::managed_bridge::ManagedBootIntent,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootIntent, MetaError> {
+        self.bridge_begin(i).await
+    }
+    async fn read_managed_boot_intent(
+        &self,
+        q: &engram_core::types::managed_bridge::ManagedCreationQuery,
+        op: &str,
+    ) -> Result<Option<engram_core::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        self.bridge_intent(q, op).await
+    }
+    async fn advance_managed_boot_intent(
+        &self,
+        id: &str,
+        r: u64,
+        c: engram_core::types::managed_bridge::ManagedIntentAdvance,
+    ) -> Result<engram_core::types::managed_bridge::ManagedBootIntent, MetaError> {
+        self.bridge_advance(id, r, c).await
+    }
+    async fn list_managed_boot_intents(
+        &self,
+        a: Option<SessionId>,
+        l: u32,
+    ) -> Result<Vec<engram_core::types::managed_bridge::ManagedBootIntent>, MetaError> {
+        self.bridge_list(a, l).await
+    }
+    async fn get_managed_boot(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<Option<engram_core::types::managed_boot::ManagedBootRecord>, MetaError> {
+        self.boot_get(identity).await
+    }
+    async fn reserve_managed_capture(
+        &self,
+        request: &engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<Option<engram_core::types::managed_boot::ManagedCaptureAuthority>, MetaError> {
+        self.capture_reserve(request).await
+    }
+    async fn record_managed_capture(
+        &self,
+        authority: &engram_core::types::managed_boot::ManagedCaptureAuthority,
+    ) -> Result<(), MetaError> {
+        self.capture_record(authority).await
+    }
+    async fn managed_sandbox_open(&self, sandbox: SandboxId) -> Result<Option<bool>, MetaError> {
+        self.boot_sandbox_open(sandbox).await
+    }
+    async fn claim_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_claim(request).await
+    }
+    async fn read_managed_boot(
+        &self,
+        key: &engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_read(key).await
+    }
+    async fn read_managed_boot_for_target(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_read_target(target).await
+    }
+    async fn advance_managed_boot(
+        &self,
+        key: &engram_core::types::managed_boot::ManagedBootKey,
+        revision: u64,
+        event: engram_core::types::managed_boot::ManagedBootAdvance,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_advance(key, revision, event).await
+    }
+    async fn list_managed_boots(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<engram_core::types::managed_boot::ManagedBootKey>, MetaError> {
+        self.boot_list(after, limit).await
+    }
+    async fn managed_boot_open(&self, sid: SessionId) -> Result<Option<bool>, MetaError> {
+        self.boot_open(sid).await
+    }
+    async fn managed_tool_target_gone(
+        &self,
+        sid: SessionId,
+        call: &str,
+    ) -> Result<bool, MetaError> {
+        self.boot_tool_target_gone(sid, call).await
+    }
+    async fn managed_delivery_target_gone(
+        &self,
+        sid: SessionId,
+        epoch: u64,
+    ) -> Result<bool, MetaError> {
+        self.boot_target_gone(sid, epoch).await
+    }
+    async fn read_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity, false).await
+    }
+
+    async fn read_held_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity, true).await
+    }
+
     async fn reserve_and_persist_create(
         &self,
-        ws: SessionCreateWriteSet,
+        mut ws: SessionCreateWriteSet,
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
+        if ws.oauth_binding.as_ref().is_some_and(|binding| {
+            binding.key.subject_kind == engram_core::types::oauth::OAuthSubjectKind::Mcp
+        }) {
+            return Err(MetaError::Conflict(
+                "MCP credentials cannot be bound to a guest session".into(),
+            ));
+        }
+
+        if let Some(creation) = &ws.managed_creation {
+            creation.validate_for(&ws)?;
+        }
+        if let Some(initial) = &ws.managed_initial_prompt {
+            initial.validate(&ws)?;
+        }
+        if let Some(selection) = &ws.managed_boot_selection {
+            selection.validate()?;
+            if ws.managed_creation.is_none()
+                || selection.image != ws.spec.image
+                || i64::from(selection.memory_mib) > ws.mem_budget_mib
+                || i64::from(selection.vcpus) > i64::from(ws.cpu_budget_vcpus)
+            {
+                return Err(engram_core::types::managed_bridge::conflict());
+            }
+        }
+
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        managed_operator::prepare_creation(&mut tx, &mut ws).await?;
+
+        if let Some(creation) = &ws.managed_creation {
+            if !managed_create::reserve(&mut tx, creation).await? {
+                let selection: Option<serde_json::Value> = sqlx::query_scalar(
+                    "SELECT selection FROM session_managed_boot_selections WHERE session_id=$1",
+                )
+                .bind(ws.session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let expected = ws
+                    .managed_boot_selection
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|_| engram_core::types::managed_bridge::conflict())?;
+                if selection != expected {
+                    return Err(engram_core::types::managed_bridge::conflict());
+                }
+                let prior: Option<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM session_outbox WHERE prompt_id=$1 AND session_id=$2 AND kind='prompt'")
+                    .bind(format!("create:{}",ws.session_id)).bind(ws.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+                if prior.as_ref() != ws.managed_initial_prompt.as_ref().map(|p| &p.row.payload) {
+                    return Err(MetaError::Conflict("managed initial prompt changed".into()));
+                }
+                tx.commit().await.map_err(db_err)?;
+                return Ok(CreateDisposition::Queued);
+            }
+        }
+        let candidates = if ws.managed_creation.is_some() {
+            &[][..]
+        } else {
+            candidates
+        };
+        let affinity_len = if ws.managed_creation.is_some() {
+            0
+        } else {
+            affinity_len
+        };
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
         // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
@@ -1540,6 +1812,32 @@ impl MetadataStore for PostgresStore {
                 CreateDisposition::Queued
             }
         };
+
+        if let Some(policy) = &ws.mcp_policy {
+            if policy.actor_id.is_empty()
+                || policy.input_id.is_empty()
+                || policy.parent_session_id == Some(ws.session_id)
+            {
+                return Err(MetaError::Conflict("invalid policy creation".into()));
+            }
+            if let Some(parent) = policy.parent_session_id {
+                mcp_policy::nodes(&mut tx, parent).await?;
+            }
+            sqlx::query(
+                "UPDATE sessions SET mcp_write_policy=$2,mcp_policy_parent_id=$3 WHERE id=$1",
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(
+                serde_json::to_value(engram_core::types::mcp_policy::StoredWritePolicy::initial(
+                    policy,
+                ))
+                .map_err(|_| MetaError::Conflict("policy encode failed".into()))?,
+            )
+            .bind(policy.parent_session_id.map(|id| id.as_uuid()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
 
         // -------- satellites, in the SAME transaction (issue #535 (b)) --------
         // `harness` already rode the row INSERT above (mirrored from the
@@ -1649,6 +1947,27 @@ impl MetadataStore for PostgresStore {
             }
         }
 
+        if let Some(selection) = &ws.managed_boot_selection {
+            sqlx::query(
+                "INSERT INTO session_managed_boot_selections(session_id,selection) VALUES($1,$2)",
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(
+                serde_json::to_value(selection)
+                    .map_err(|_| engram_core::types::managed_bridge::conflict())?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query("UPDATE chunk_generation SET generation=generation+1 WHERE id=TRUE")
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        if let Some(initial) = &ws.managed_initial_prompt {
+            outbox_accept::accept(&mut tx, now, ws.session_id, &initial.events, &initial.row)
+                .await?;
+        }
         tx.commit().await.map_err(db_err)?;
         if matches!(disposition, CreateDisposition::Queued) {
             // Closes the race where capacity frees between the failed
@@ -1729,6 +2048,22 @@ impl MetadataStore for PostgresStore {
         &self,
         sealed: engram_core::types::org_secret::SealedOrgSecret,
     ) -> Result<engram_core::types::org_secret::OrgSecret, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("INSERT INTO org_secret_purposes (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&sealed.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT connection_id FROM org_secret_purposes WHERE name=$1 FOR UPDATE",
+        )
+        .bind(&sealed.name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if owner.is_some() {
+            return Err(MetaError::Conflict("credential is reserved for MCP".into()));
+        }
         let (name, key_id, created_at, updated_at): (
             String,
             String,
@@ -1736,8 +2071,8 @@ impl MetadataStore for PostgresStore {
             chrono::DateTime<chrono::Utc>,
         ) = sqlx::query_as(
             r#"
-            INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $6)
             ON CONFLICT (name) DO UPDATE SET
                 wrapped_dek = EXCLUDED.wrapped_dek,
                 nonce       = EXCLUDED.nonce,
@@ -1753,9 +2088,10 @@ impl MetadataStore for PostgresStore {
         .bind(&sealed.ciphertext)
         .bind(&sealed.key_id)
         .bind(self.clock.now_utc())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         // Wake every replica's mint broker so a rotated cred rebuilds its
         // engine (ADR 0057 C2). Best-effort: the value is already committed,
         // so a notify failure must not fail the write.
@@ -1821,12 +2157,23 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn delete_org_secret(&self, name: &str) -> Result<bool, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT name FROM org_secret_purposes WHERE name=$1 FOR UPDATE")
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         let res = sqlx::query("DELETE FROM org_secrets WHERE name = $1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         let deleted = res.rows_affected() > 0;
+        if deleted {
+            sqlx::query("UPDATE org_secret_purposes SET generation=generation+1 WHERE name=$1 AND connection_id IS NOT NULL")
+                .bind(name).execute(&mut *tx).await.map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         if deleted {
             let _ = sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
                 .bind(name)
@@ -1836,6 +2183,89 @@ impl MetadataStore for PostgresStore {
         Ok(deleted)
     }
 
+    async fn reserve_mcp_org_secret(
+        &self,
+        name: &str,
+        connection_id: &str,
+        role: engram_core::types::org_secret::McpSecretRole,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        if name.is_empty() || connection_id.is_empty() {
+            return Err(MetaError::Conflict("invalid MCP reservation".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("INSERT INTO org_secret_purposes (name, connection_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+            .bind(name).bind(connection_id).bind(role.as_str()).execute(&mut *tx).await.map_err(db_err)?;
+        let (owner, stored_role, generation): (Option<String>, Option<String>, i64) = sqlx::query_as("SELECT connection_id, role, generation FROM org_secret_purposes WHERE name=$1 FOR UPDATE")
+            .bind(name).fetch_one(&mut *tx).await.map_err(db_err)?;
+        if owner.as_deref() != Some(connection_id) || stored_role.as_deref() != Some(role.as_str())
+        {
+            return Err(MetaError::Conflict("credential purpose conflict".into()));
+        }
+        sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::org_secret::McpSecretReservation {
+            name: name.into(),
+            connection_id: connection_id.into(),
+            role,
+            generation,
+        })
+    }
+
+    async fn get_mcp_org_secret_reservation(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::org_secret::McpSecretReservation>, MetaError> {
+        use engram_core::types::org_secret::{McpSecretReservation, McpSecretRole};
+        let row: Option<(String,String,i64)> = sqlx::query_as("SELECT connection_id, role, generation FROM org_secret_purposes WHERE name=$1 AND connection_id IS NOT NULL")
+            .bind(name).fetch_optional(&self.pool).await.map_err(db_err)?;
+        row.map(|(connection_id, role, generation)| {
+            Ok(McpSecretReservation {
+                name: name.into(),
+                connection_id,
+                role: match role.as_str() {
+                    "api_key" => McpSecretRole::ApiKey,
+                    "client_secret" => McpSecretRole::ClientSecret,
+                    _ => return Err(MetaError::Conflict("invalid credential role".into())),
+                },
+                generation,
+            })
+        })
+        .transpose()
+    }
+
+    async fn put_mcp_org_secret(
+        &self,
+        sealed: engram_core::types::org_secret::SealedOrgSecret,
+        expected: &engram_core::types::org_secret::McpSecretReservation,
+    ) -> Result<engram_core::types::org_secret::McpSecretReservation, MetaError> {
+        if sealed.name != expected.name {
+            return Err(MetaError::Conflict("credential reservation changed".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let generation: Option<i64> = sqlx::query_scalar("UPDATE org_secret_purposes SET generation=generation+1 WHERE name=$1 AND connection_id=$2 AND role=$3 AND generation=$4 RETURNING generation")
+            .bind(&sealed.name).bind(&expected.connection_id).bind(expected.role.as_str()).bind(expected.generation)
+            .fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let generation = generation
+            .ok_or_else(|| MetaError::Conflict("credential reservation changed".into()))?;
+        sqlx::query("INSERT INTO org_secrets (name,wrapped_dek,nonce,ciphertext,key_id,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$6) ON CONFLICT (name) DO UPDATE SET wrapped_dek=$2,nonce=$3,ciphertext=$4,key_id=$5,updated_at=$6")
+            .bind(&sealed.name).bind(&sealed.wrapped_dek).bind(&sealed.nonce).bind(&sealed.ciphertext).bind(&sealed.key_id).bind(self.clock.now_utc())
+            .execute(&mut *tx).await.map_err(db_err)?;
+        sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+            .bind(&sealed.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::org_secret::McpSecretReservation {
+            generation,
+            ..expected.clone()
+        })
+    }
+
     // ---- ADR 0106: subject-scoped OAuth credentials and flow state ----
 
     async fn put_oauth_credential(
@@ -1843,71 +2273,14 @@ impl MetadataStore for PostgresStore {
         credential: engram_core::types::oauth::NewSealedOAuthCredential,
         expected_version: Option<i64>,
     ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
-        let now = self.clock.now_utc();
-        let metadata = serde_json::to_value(&credential.metadata)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let row = if let Some(expected) = expected_version {
-            sqlx::query(
-                r#"
-                UPDATE oauth_credentials SET
-                    wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
-                    account_metadata = $8, version = version + 1,
-                    updated_at = $9, revoked_at = NULL, expires_at = $11,
-                    refresh_claim_until = NULL, broken_at = NULL, broken_reason = NULL
-                WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
-                  AND version = $10
-                RETURNING *
-                "#,
-            )
-            .bind(credential.key.subject_kind.as_str())
-            .bind(&credential.key.subject_id)
-            .bind(&credential.key.provider)
-            .bind(&credential.wrapped_dek)
-            .bind(&credential.nonce)
-            .bind(&credential.ciphertext)
-            .bind(&credential.key_id)
-            .bind(metadata)
-            .bind(now)
-            .bind(expected)
-            .bind(credential.expires_at)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?
-        } else {
-            sqlx::query(
-                r#"
-                INSERT INTO oauth_credentials (
-                    subject_kind, subject_id, provider, wrapped_dek, nonce,
-                    ciphertext, key_id, account_metadata, version, created_at,
-                    updated_at, revoked_at, expires_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL,$10)
-                ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
-                RETURNING *
-                "#,
-            )
-            .bind(credential.key.subject_kind.as_str())
-            .bind(&credential.key.subject_id)
-            .bind(&credential.key.provider)
-            .bind(&credential.wrapped_dek)
-            .bind(&credential.nonce)
-            .bind(&credential.ciphertext)
-            .bind(&credential.key_id)
-            .bind(metadata)
-            .bind(now)
-            .bind(credential.expires_at)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?
-        };
-        match row {
-            Some(row) => oauth_credential_from_pg(&row),
-            None => Err(MetaError::Conflict(format!(
-                "OAuth credential CAS rejected for {}/{}/{}",
-                credential.key.subject_kind.as_str(),
-                credential.key.subject_id,
-                credential.key.provider
-            ))),
-        }
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        put_oauth_credential_on(
+            &mut conn,
+            self.clock.now_utc(),
+            credential,
+            expected_version,
+        )
+        .await
     }
 
     async fn get_oauth_credential(
@@ -1990,6 +2363,160 @@ impl MetadataStore for PostgresStore {
                 }
             }
         }
+    }
+
+    async fn claim_mcp_refresh(
+        &self,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        if claim.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp
+            || claim.expires_at <= now
+            || claim.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid refresh claim".into()));
+        }
+        let r = sqlx::query("UPDATE oauth_credentials SET mcp_refresh_claim=$4, refresh_claim_until=$5, broken_at=$6, broken_reason='refresh_pending' WHERE subject_kind='mcp' AND subject_id=$1 AND provider=$2 AND version=$3 AND revoked_at IS NULL AND broken_at IS NULL")
+            .bind(&claim.key.subject_id).bind(&claim.key.provider).bind(claim.version).bind(claim.id).bind(claim.expires_at).bind(now).execute(&self.pool).await.map_err(db_err)?;
+        Ok(r.rows_affected() == 1)
+    }
+    async fn complete_mcp_refresh(
+        &self,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        claim: &engram_core::types::mcp::McpRefreshClaim,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        if credential.key != claim.key
+            || claim.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp
+        {
+            return Err(MetaError::Conflict("refresh claim lost".into()));
+        }
+        let metadata = serde_json::to_value(&credential.metadata)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let row = sqlx::query("UPDATE oauth_credentials SET wrapped_dek=$6,nonce=$7,ciphertext=$8,key_id=$9,account_metadata=$10,expires_at=$11,version=version+1,updated_at=$12,broken_at=NULL,broken_reason=NULL,refresh_claim_until=NULL,mcp_refresh_claim=NULL WHERE subject_kind='mcp' AND subject_id=$1 AND provider=$2 AND version=$3 AND mcp_refresh_claim=$4 AND refresh_claim_until=$5 AND refresh_claim_until>$12 AND revoked_at IS NULL AND broken_reason='refresh_pending' RETURNING *")
+            .bind(&claim.key.subject_id).bind(&claim.key.provider).bind(claim.version).bind(claim.id).bind(claim.expires_at)
+            .bind(credential.wrapped_dek).bind(credential.nonce).bind(credential.ciphertext).bind(credential.key_id).bind(metadata).bind(credential.expires_at).bind(self.clock.now_utc()).fetch_optional(&self.pool).await.map_err(db_err)?.ok_or_else(|| MetaError::Conflict("refresh claim lost".into()))?;
+        oauth_credential_from_pg(&row)
+    }
+    async fn acquire_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        if lease.deployment_id.is_empty()
+            || lease.connection_id.is_empty()
+            || lease.expires_at <= now
+            || lease.expires_at > now + chrono::Duration::seconds(30)
+        {
+            return Err(MetaError::Conflict("invalid OAuth admission".into()));
+        }
+        sqlx::query("DELETE FROM mcp_oauth_admission WHERE expires_at<=$1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        // The fixed slot primary key and connection uniqueness bound concurrent replicas.
+        for slot in 0..4i16 {
+            let r = sqlx::query("INSERT INTO mcp_oauth_admission (deployment_id,slot,id,connection_id,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+                .bind(&lease.deployment_id).bind(slot).bind(lease.id).bind(&lease.connection_id).bind(lease.expires_at).execute(&self.pool).await.map_err(db_err)?;
+            if r.rows_affected() == 1 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    async fn release_mcp_oauth_admission(
+        &self,
+        lease: &engram_core::types::mcp::McpOAuthAdmission,
+    ) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM mcp_oauth_admission WHERE id=$1 AND deployment_id=$2 AND connection_id=$3 AND expires_at=$4")
+            .bind(lease.id).bind(&lease.deployment_id).bind(&lease.connection_id).bind(lease.expires_at).execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn create_mcp_oauth_flow(
+        &self,
+        flow: engram_core::types::oauth::OAuthFlow,
+        state: engram_core::types::mcp::McpSealedState,
+    ) -> Result<(), MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        if flow.key.subject_kind != OAuthSubjectKind::Mcp
+            || flow.status != OAuthFlowStatus::Pending
+            || flow.expires_at <= self.clock.now_utc()
+        {
+            return Err(MetaError::Conflict("MCP flow creation rejected".into()));
+        }
+        let state =
+            serde_json::to_value(state).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let result = sqlx::query("INSERT INTO oauth_flows (id,subject_kind,subject_id,provider,owner_replica,lease_expires_at,expires_at,status,created_at,updated_at,mcp_state) VALUES ($1,'mcp',$2,$3,$4,$5,$6,'pending',$7,$8,$9) ON CONFLICT DO NOTHING")
+            .bind(flow.id).bind(&flow.key.subject_id).bind(&flow.key.provider).bind(&flow.owner_replica).bind(flow.lease_expires_at).bind(flow.expires_at).bind(flow.created_at).bind(flow.updated_at).bind(state).execute(&self.pool).await.map_err(db_err)?;
+        if result.rows_affected() != 1 {
+            return Err(MetaError::Conflict("MCP flow creation rejected".into()));
+        }
+        Ok(())
+    }
+    async fn consume_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<engram_core::types::mcp::McpSealedState, MetaError> {
+        if key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP state unavailable".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let state: Option<serde_json::Value> = sqlx::query_scalar("SELECT mcp_state FROM oauth_flows WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3 AND status='pending' AND expires_at>$4 AND mcp_state IS NOT NULL FOR UPDATE")
+            .bind(id).bind(&key.subject_id).bind(&key.provider).bind(self.clock.now_utc()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let state = state.ok_or_else(|| MetaError::Conflict("MCP state unavailable".into()))?;
+        sqlx::query("UPDATE oauth_flows SET mcp_state=NULL WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        serde_json::from_value(state).map_err(|e| MetaError::Serialization(e.to_string()))
+    }
+
+    async fn cancel_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<(), MetaError> {
+        if key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP flow cancellation rejected".into()));
+        }
+        let result = sqlx::query("UPDATE oauth_flows SET status=CASE WHEN status='pending' THEN 'cancelled' ELSE status END, mcp_state=NULL, updated_at=$4 WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3")
+            .bind(id).bind(&key.subject_id).bind(&key.provider).bind(self.clock.now_utc())
+            .execute(&self.pool).await.map_err(db_err)?;
+        if result.rows_affected() != 1 {
+            return Err(MetaError::Conflict("MCP flow cancellation rejected".into()));
+        }
+        Ok(())
+    }
+    async fn complete_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        expected_version: Option<i64>,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        if credential.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP flow publication rejected".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let now = self.clock.now_utc();
+        let locked: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM oauth_flows WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3 AND status='pending' AND mcp_state IS NULL AND expires_at>$4 FOR UPDATE")
+            .bind(id).bind(&credential.key.subject_id).bind(&credential.key.provider).bind(now)
+            .fetch_optional(&mut *tx).await.map_err(db_err)?;
+        if locked.is_none() {
+            return Err(MetaError::Conflict("MCP flow publication rejected".into()));
+        }
+        let row = put_oauth_credential_on(&mut tx, now, credential, expected_version).await?;
+        sqlx::query("UPDATE oauth_flows SET status='succeeded', updated_at=$2 WHERE id=$1")
+            .bind(id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(row)
     }
 
     async fn create_oauth_flow(
@@ -2314,6 +2841,8 @@ impl MetadataStore for PostgresStore {
         now: chrono::DateTime<chrono::Utc>,
         delete_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, MetaError> {
+        sqlx::query("UPDATE oauth_flows SET mcp_state=NULL WHERE mcp_state IS NOT NULL AND (status<>'pending' OR expires_at<=$1 OR lease_expires_at<=$1)")
+            .bind(now).execute(&self.pool).await.map_err(db_err)?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let changed = sqlx::query(
             r#"
@@ -2437,7 +2966,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at
             FROM sessions
-            WHERE status = 'queued'
+            WHERE status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             ORDER BY queued_at ASC
             "#,
         )
@@ -2481,7 +3010,7 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE sessions
                SET status = 'pending', host_id = $2, last_active_at = $3
-             WHERE id = $1 AND status = 'queued'
+             WHERE id = $1 AND status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             "#,
         )
         .bind(id.as_uuid())
@@ -3430,6 +3959,13 @@ impl MetadataStore for PostgresStore {
         }
 
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
+        crate::managed_boot::require_tool_result_target(&mut tx, outbox).await?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO session_outbox
@@ -3525,121 +4061,12 @@ impl MetadataStore for PostgresStore {
         events: &[(String, serde_json::Value)],
         outbox: &engram_core::types::outbox::OutboxRow,
     ) -> Result<Option<Vec<i64>>, MetaError> {
-        if outbox.session_id != session_id {
-            return Err(MetaError::Serialization(
-                "event/outbox session ids do not match".into(),
-            ));
-        }
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO session_outbox
-                (prompt_id, session_id, kind, payload, created_at, not_before)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (prompt_id) DO NOTHING
-            RETURNING prompt_id
-            "#,
-        )
-        .bind(&outbox.prompt_id)
-        .bind(session_id.as_uuid())
-        .bind(outbox.kind.as_str())
-        .bind(&outbox.payload)
-        .bind(outbox.created_at)
-        .bind(outbox.not_before)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?
-        .is_some();
-
-        if !inserted {
-            // A retry of the SAME command is the designed no-op; a
-            // prompt_id claimed by a DIFFERENT command — including the
-            // same kind with different text/mode (review finding on
-            // #993: payload must be part of the identity, as it is in
-            // `append_session_event_and_outbox`) — is a Conflict, never
-            // a silent drop.
-            let existing = sqlx::query(
-                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
-            )
-            .bind(&outbox.prompt_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| {
-                MetaError::Conflict(format!(
-                    "outbox id {} disappeared during accept",
-                    outbox.prompt_id
-                ))
-            })?;
-            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
-            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
-            let existing_payload: serde_json::Value =
-                existing.try_get("payload").map_err(db_err)?;
-            if existing_session != session_id.as_uuid()
-                || existing_kind != outbox.kind.as_str()
-                || existing_payload != outbox.payload
-            {
-                return Err(MetaError::Conflict(format!(
-                    "outbox id {} belongs to another command",
-                    outbox.prompt_id
-                )));
-            }
-            tx.rollback().await.map_err(db_err)?;
-            return Ok(None);
-        }
-
-        let mut idxs = Vec::with_capacity(events.len());
-        for (kind, payload) in events {
-            let event = sqlx::query(
-                r#"
-                WITH next AS (
-                    UPDATE sessions
-                       SET next_event_idx = next_event_idx + 1,
-                           updated_at = $4,
-                           last_event_at = $4
-                     WHERE id = $1
-                 RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
-                ),
-                inserted AS (
-                    INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
-                    SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
-                    RETURNING idx
-                )
-                SELECT idx FROM inserted
-                "#,
-            )
-            .bind(session_id.as_uuid())
-            .bind(kind)
-            .bind(payload)
-            .bind(self.clock.now_utc())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .ok_or(MetaError::NotFound)?;
-            idxs.push(event.try_get::<i64, _>("idx").map_err(db_err)?);
-        }
-
-        // Notifications fire at commit: replicas see the events and the
-        // outbox row together, so delivery can never observe the row
-        // without its echo (the ADR 0052 echo-before-run_started
-        // ordering, now transactional instead of sequenced).
-        for idx in &idxs {
-            sqlx::query("SELECT pg_notify('session_events', $1)")
-                .bind(
-                    serde_json::json!({ "session_id": session_id.to_string(), "idx": idx })
-                        .to_string(),
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        }
-        sqlx::query("SELECT pg_notify('session_outbox', $1)")
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        let result =
+            outbox_accept::accept(&mut tx, self.clock.now_utc(), session_id, events, outbox)
+                .await?;
         tx.commit().await.map_err(db_err)?;
-        Ok(Some(idxs))
+        Ok(result)
     }
 
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
@@ -5226,6 +5653,13 @@ impl MetadataStore for PostgresStore {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(Some(settled))
+    }
+
+    async fn append_managed_harness_event(
+        &self,
+        event: &engram_core::types::event::ManagedHarnessEvent,
+    ) -> Result<engram_core::types::event::ManagedHarnessEventAccepted, MetaError> {
+        self.managed_event_append(event).await
     }
 
     async fn append_session_event_idempotent(
@@ -7547,24 +7981,83 @@ impl MetadataStore for PostgresStore {
 
     // ---- session integration policy (ADR 0056 B′) ----
 
+    async fn managed_policy_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<engram_core::types::managed_deny::ManagedPolicyTarget, MetaError> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT host_id, sandbox_id, binding_epoch FROM sessions WHERE id=$1 AND host_id IS NOT NULL AND sandbox_id IS NOT NULL AND binding_epoch > 0 AND status NOT IN ('dead','failed','completed')")
+            .bind(session_id.as_uuid()).fetch_optional(&self.pool).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
+        Ok(engram_core::types::managed_deny::ManagedPolicyTarget {
+            session_id,
+            host_id: HostId(row.try_get("host_id").map_err(db_err)?),
+            sandbox_id: SandboxId(row.try_get("sandbox_id").map_err(db_err)?),
+            binding_epoch: u64::try_from(row.try_get::<i64, _>("binding_epoch").map_err(db_err)?)
+                .map_err(|e| MetaError::Serialization(e.to_string()))?,
+        })
+    }
+    async fn retain_managed_deny(
+        &self,
+        target: &engram_core::types::managed_deny::ManagedPolicyTarget,
+        policy: &engram_core::types::managed_deny::ManagedDenyPolicy,
+    ) -> Result<(), MetaError> {
+        use sqlx::Row;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let pending = managed_operator::policy_registration_lock(&mut tx).await?;
+        let row = sqlx::query("SELECT host_id, sandbox_id, binding_epoch FROM sessions WHERE id=$1 AND status NOT IN ('dead','failed','completed') FOR UPDATE")
+            .bind(target.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
+        if row
+            .try_get::<Option<uuid::Uuid>, _>("host_id")
+            .map_err(db_err)?
+            != Some(target.host_id.as_uuid())
+            || row
+                .try_get::<Option<uuid::Uuid>, _>("sandbox_id")
+                .map_err(db_err)?
+                != Some(target.sandbox_id.as_uuid())
+            || row.try_get::<i64, _>("binding_epoch").map_err(db_err)?
+                != i64::try_from(target.binding_epoch)
+                    .map_err(|e| MetaError::Serialization(e.to_string()))?
+        {
+            return Err(MetaError::Conflict("managed placement changed".into()));
+        }
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT policy_json FROM session_integration_policy WHERE session_id=$1",
+        )
+        .bind(target.session_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let next = engram_core::types::managed_deny::retain_in_policy_json(old.as_deref(), policy)
+            .map_err(MetaError::Conflict)?;
+        managed_operator::check_registration(pending, old.as_deref(), &next)?;
+        sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(target.session_id.as_uuid()).bind(next).execute(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
     async fn bind_session_integration_policy(
         &self,
         session_id: SessionId,
         policy_json: &str,
     ) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO session_integration_policy (session_id, policy_json)
-            VALUES ($1, $2)
-            ON CONFLICT (session_id) DO UPDATE SET policy_json = EXCLUDED.policy_json
-            "#,
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let pending = managed_operator::policy_registration_lock(&mut tx).await?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT policy_json FROM session_integration_policy WHERE session_id=$1",
         )
         .bind(session_id.as_uuid())
-        .bind(policy_json)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        managed_operator::check_registration(pending, old.as_deref(), policy_json)?;
+        engram_core::types::managed_deny::validate_policy_replacement(old.as_deref(), policy_json)
+            .map_err(MetaError::Conflict)?;
+        sqlx::query("INSERT INTO session_integration_policy (session_id,policy_json) VALUES ($1,$2) ON CONFLICT (session_id) DO UPDATE SET policy_json=EXCLUDED.policy_json").bind(session_id.as_uuid()).bind(policy_json).execute(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
     }
 
     async fn get_session_integration_policy(
@@ -8463,6 +8956,37 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    /// Managed cold inputs and capture reservations are roots without snapshot rows.
+    async fn list_managed_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT (record->'request'->'cold'->'disk'->'manifest'->>'manifest_id')::UUID,
+                    (record->'request'->'cold'->'disk'->'manifest'->>'version')::BIGINT
+               FROM session_managed_boots
+             UNION SELECT capture_id, 1 FROM session_managed_captures
+             UNION SELECT (selection->'base_manifest'->>'manifest_id')::UUID,
+                          (selection->'base_manifest'->>'version')::BIGINT
+               FROM session_managed_boot_selections
+             UNION SELECT (record->'disk_manifest'->>'manifest_id')::UUID,
+                          (record->'disk_manifest'->>'version')::BIGINT
+               FROM session_managed_boot_intents",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(manifest_id, version)| {
+                Ok(engram_core::types::manifest::ManifestRef {
+                    manifest_id,
+                    version: u64::try_from(version).map_err(|_| {
+                        MetaError::Serialization("invalid managed manifest version".into())
+                    })?,
+                })
+            })
+            .collect()
+    }
+
     /// Pin-set sources #3 and #8: root and swap refs from recoverable
     /// snapshots. Return each distinct pair, including swap-only rows.
     async fn list_recoverable_snapshot_disk_manifests(
@@ -8905,7 +9429,9 @@ impl MetadataStore for PostgresStore {
              UNION
              SELECT b->>'drive_id', b->>'sha256'
                FROM hosts h, jsonb_array_elements(h.current_bundles) AS b
-              WHERE h.status IN ('ready','draining')",
+              WHERE h.status IN ('ready','draining')
+             UNION SELECT b->>'drive_id',b->>'sha256' FROM session_managed_boot_selections,jsonb_array_elements(selection->'aux_ro_drives') AS b
+             UNION SELECT b->>'drive_id',b->>'sha256' FROM session_managed_boot_intents,jsonb_array_elements(record->'selection'->'aux_ro_drives') AS b",
         )
         .fetch_all(&self.pool)
         .await
@@ -9452,4 +9978,76 @@ async fn append_teleport_finished_tx(
         .await?;
     }
     Ok(())
+}
+
+async fn put_oauth_credential_on(
+    conn: &mut sqlx::PgConnection,
+    now: chrono::DateTime<chrono::Utc>,
+    credential: engram_core::types::oauth::NewSealedOAuthCredential,
+    expected_version: Option<i64>,
+) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+    let metadata = serde_json::to_value(&credential.metadata)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let row = if let Some(expected) = expected_version {
+        sqlx::query(
+            r#"
+                UPDATE oauth_credentials SET
+                    wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
+                    account_metadata = $8, version = version + 1,
+                    updated_at = $9, revoked_at = NULL, expires_at = $11,
+                    refresh_claim_until = NULL, broken_at = NULL, broken_reason = NULL
+                WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
+                  AND version = $10
+                RETURNING *
+                "#,
+        )
+        .bind(credential.key.subject_kind.as_str())
+        .bind(&credential.key.subject_id)
+        .bind(&credential.key.provider)
+        .bind(&credential.wrapped_dek)
+        .bind(&credential.nonce)
+        .bind(&credential.ciphertext)
+        .bind(&credential.key_id)
+        .bind(metadata)
+        .bind(now)
+        .bind(expected)
+        .bind(credential.expires_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?
+    } else {
+        sqlx::query(
+            r#"
+                INSERT INTO oauth_credentials (
+                    subject_kind, subject_id, provider, wrapped_dek, nonce,
+                    ciphertext, key_id, account_metadata, version, created_at,
+                    updated_at, revoked_at, expires_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL,$10)
+                ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
+                RETURNING *
+                "#,
+        )
+        .bind(credential.key.subject_kind.as_str())
+        .bind(&credential.key.subject_id)
+        .bind(&credential.key.provider)
+        .bind(&credential.wrapped_dek)
+        .bind(&credential.nonce)
+        .bind(&credential.ciphertext)
+        .bind(&credential.key_id)
+        .bind(metadata)
+        .bind(now)
+        .bind(credential.expires_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?
+    };
+    match row {
+        Some(row) => oauth_credential_from_pg(&row),
+        None => Err(MetaError::Conflict(format!(
+            "OAuth credential CAS rejected for {}/{}/{}",
+            credential.key.subject_kind.as_str(),
+            credential.key.subject_id,
+            credential.key.provider
+        ))),
+    }
 }

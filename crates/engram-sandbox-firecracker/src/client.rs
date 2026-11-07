@@ -442,6 +442,13 @@ impl FirecrackerClient {
         self.patch_vm_state(VmState::Resumed).await
     }
 
+    /// Read back the cold VM state and configuration for the managed owner.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn managed_get(&self, path: &str) -> Result<serde_json::Value, SandboxError> {
+        let bytes = self.request_with_body::<()>("GET", path, None).await?;
+        serde_json::from_slice(&bytes).map_err(|_| vm_err("invalid managed VM readback"))
+    }
+
     // ---- transport --------------------------------------------------
 
     /// One-shot PUT helper for endpoints that just acknowledge with 204.

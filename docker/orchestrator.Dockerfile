@@ -5,8 +5,8 @@
 # HTTP/WS surface. Entry is `bun src/index.ts` (package.json `start`), listening
 # on ORCHESTRATOR_PORT (default 8787).
 #
-# Mirrors docker/web.Dockerfile's two-stage shape: a deps layer keyed on the
-# lockfile (stays warm across source edits), then a slim runtime that ships only
+# Uses dependency layers keyed on their lockfiles, which stay warm across
+# source edits, then a slim runtime that ships only
 # the production node_modules + the source. Built from the repo root:
 #
 #   docker buildx build -f docker/orchestrator.Dockerfile -t engram/orchestrator:dev .
@@ -33,6 +33,12 @@ COPY orchestrator/packages/spec-document ./packages/spec-document
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production
 
+# Worker source imports need the worker's locked production dependencies.
+FROM node:24.22.2-bookworm-slim AS worker-deps
+WORKDIR /app/mcp-worker
+COPY mcp-worker/package.json mcp-worker/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
 # ── runtime ──────────────────────────────────────────────────────────────
 # Keep in lockstep with the deps stage and `.bun-version` (see above).
 FROM oven/bun:1.4.4-alpine
@@ -42,6 +48,10 @@ WORKDIR /app/orchestrator
 # step), so the runtime needs the production node_modules + the full source.
 COPY --from=deps /app/orchestrator/node_modules ./node_modules
 COPY orchestrator/ ./
+# Runtime imports worker modules and their dependencies through their repository path.
+COPY --from=worker-deps /app/mcp-worker/node_modules /app/mcp-worker/node_modules
+COPY --from=worker-deps /app/mcp-worker/package.json /app/mcp-worker/package-lock.json /app/mcp-worker/
+COPY mcp-worker/src/ /app/mcp-worker/src/
 
 # The Google credential denylist is ONE checked-in table shared with the Rust
 # egress proxy, which is the enforcement point and owns the file (ADR 0109).

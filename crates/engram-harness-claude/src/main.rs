@@ -30,13 +30,13 @@
 
 // Cross-platform stub — vsock dialing is Linux-only, and the
 // adapter only ships inside FC rootfs / Linux ProcessBackend.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(test)))]
 fn main() {
     eprintln!("engram-harness-claude is Linux-only");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod adapter {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::os::unix::process::ExitStatusExt;
@@ -47,6 +47,7 @@ mod adapter {
 
     use clap::Parser;
     use engram_core::SessionId;
+    use engram_harness_proto::tool_result::{McpToolResult, ResultFormat};
     use engram_harness_proto::{
         AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
@@ -89,6 +90,8 @@ mod adapter {
         pub description: String,
         pub input_schema: Value,
         pub execution: ToolExecution,
+        #[serde(default)]
+        pub result_format: ResultFormat,
         #[serde(default)]
         pub native_bindings: NativeBindings,
     }
@@ -134,6 +137,7 @@ mod adapter {
                 description: browser_view::TOOL_DESCRIPTION.into(),
                 input_schema: browser_view::input_schema(),
                 execution: ToolExecution::Sync,
+                result_format: ResultFormat::Json,
                 native_bindings: NativeBindings::default(),
             });
         }
@@ -462,10 +466,9 @@ mod adapter {
             event_rx,
             reattach,
         } = engram_harness_sdk::Channels::new();
-        // Issue #535 (d): no more env-seeded initial prompt — every prompt,
-        // first or follow-up, arrives as a `HarnessCommand::Prompt` frame
-        // over the same connection this loop dials. The engine starts with
-        // an empty pending queue and waits.
+        // The engine reads the create-time initial prompt from its spawn
+        // environment once. Later prompts arrive as `HarnessCommand::Prompt`
+        // frames; prompt-id deduplication also covers initial-prompt replays.
 
         let engine = tokio::spawn(run_engine(
             cli.clone(),
@@ -1274,7 +1277,8 @@ mod adapter {
     /// request/response.
     pub mod mcp_bridge {
         use super::{
-            browser_view, injected_tools, manifest_from_env, BufReader, StateDir, ToolManifest,
+            browser_view, injected_tools, manifest_from_env, BufReader, McpToolResult,
+            ResultFormat, StateDir, ToolManifest,
         };
         use serde::{Deserialize, Serialize};
         use serde_json::Value;
@@ -1301,27 +1305,86 @@ mod adapter {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| StateDir::from_env().mcp_sock());
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            let mut stdout = tokio::io::stdout();
+            serve_io(
+                BufReader::new(tokio::io::stdin()),
+                tokio::io::stdout(),
+                &manifest,
+                &socket_path,
+            )
+            .await
+        }
+
+        pub async fn serve_io<R: tokio::io::AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+            reader: R,
+            mut stdout: W,
+            manifest: &ToolManifest,
+            socket_path: &Path,
+        ) -> std::process::ExitCode {
+            let mut lines = reader.lines();
+            let mut calls = tokio::task::JoinSet::new();
+            let mut pending: std::collections::HashMap<String, tokio::task::AbortHandle> =
+                std::collections::HashMap::new();
             loop {
-                let line = match lines.next_line().await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => return std::process::ExitCode::SUCCESS,
-                    Err(_) => return std::process::ExitCode::from(1),
-                };
-                let request: Value = match serde_json::from_str(&line) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        let response = json_rpc_error(Value::Null, -32700, "Parse error");
-                        if write_response(&mut stdout, &response).await.is_err() {
-                            return std::process::ExitCode::from(1);
+                tokio::select! {
+                    completed = calls.join_next_with_id(), if !calls.is_empty() => {
+                        match completed {
+                            Some(Ok((task_id, (key, response)))) => {
+                                // Cancellation and request-id reuse can race a completed task.
+                                if pending.get(&key).is_some_and(|handle| handle.id() == task_id) {
+                                    pending.remove(&key);
+                                    if let Some(response) = response {
+                                        if write_response(&mut stdout, &response).await.is_err() {
+                                            return std::process::ExitCode::FAILURE;
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Err(error)) => pending.retain(|_, handle| handle.id() != error.id()),
+                            None => {}
                         }
-                        continue;
                     }
-                };
-                if let Some(response) = handle_request(request, &manifest, &socket_path).await {
-                    if write_response(&mut stdout, &response).await.is_err() {
-                        return std::process::ExitCode::from(1);
+                    line = lines.next_line() => {
+                        let line = match line {
+                            Ok(Some(line)) => line,
+                            Ok(None) => {
+                                calls.shutdown().await;
+                                return std::process::ExitCode::SUCCESS;
+                            }
+                            Err(_) => return std::process::ExitCode::FAILURE,
+                        };
+                        let request: Value = match serde_json::from_str(&line) {
+                            Ok(request) => request,
+                            Err(_) => {
+                                if write_response(&mut stdout, &json_rpc_error(Value::Null, -32700, "Parse error")).await.is_err() {
+                                    return std::process::ExitCode::FAILURE;
+                                }
+                                continue;
+                            }
+                        };
+                        if request.get("id").is_none() {
+                            if request.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+                                if let Some(id) = request.pointer("/params/requestId") {
+                                    if let Some(handle) = pending.remove(&id.to_string()) { handle.abort(); }
+                                }
+                            }
+                            continue;
+                        }
+                        let id = request["id"].clone();
+                        let key = id.to_string();
+                        if pending.contains_key(&key) || pending.len() >= 128 {
+                            if write_response(&mut stdout, &json_rpc_error(id, -32600, "Duplicate request or too many pending calls.")).await.is_err() {
+                                return std::process::ExitCode::FAILURE;
+                            }
+                            continue;
+                        }
+                        let manifest = manifest.clone();
+                        let socket_path = socket_path.to_path_buf();
+                        let request_key = key.clone();
+                        let handle = calls.spawn(async move {
+                            let response = handle_request(request, &manifest, &socket_path).await;
+                            (request_key, response)
+                        });
+                        pending.insert(key, handle);
                     }
                 }
             }
@@ -1424,6 +1487,12 @@ mod adapter {
                         .pointer("/params/_meta/claudecode~1toolUseId")
                         .and_then(Value::as_str);
                     match round_trip(socket_path, name, args, tool_use_id).await {
+                        Ok(result_json) if tool.result_format == ResultFormat::Mcp => {
+                            Some(match McpToolResult::parse(&result_json) {
+                                Ok(result) => result.claude_response(id),
+                                Err(message) => json_rpc_error(id, -32603, message),
+                            })
+                        }
                         Ok(result_json) => Some(json_rpc_result(
                             id,
                             serde_json::json!({
@@ -1488,7 +1557,7 @@ mod adapter {
     /// otherwise the connection is parked in a oneshot table and the generic
     /// request event is emitted exactly once.
     pub mod mcp_server {
-        use super::{emit, hook_server, BufReader, HarnessEvent};
+        use super::{emit, hook_server, BufReader, HarnessEvent, ResultFormat, ToolManifest};
         use serde::{Deserialize, Serialize};
         use serde_json::Value;
         use std::collections::HashMap;
@@ -1498,12 +1567,20 @@ mod adapter {
         use tokio::sync::{mpsc, oneshot, Mutex};
 
         pub type ResultsInHand = Arc<Mutex<HashMap<String, String>>>;
-        pub type ParkedCalls = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
+        pub type ParkedCalls = Arc<Mutex<HashMap<String, PendingCall>>>;
+
+        pub struct PendingCall {
+            socket_owner: Arc<()>,
+            pub tool_name: String,
+            pub result_format: ResultFormat,
+            pub sender: Option<oneshot::Sender<String>>,
+        }
 
         #[derive(Clone)]
         pub struct State {
             pub results_in_hand: ResultsInHand,
             pub parked_calls: ParkedCalls,
+            pub manifest: Arc<ToolManifest>,
             pub deferred_calls: hook_server::DeferredCalls,
             pub current_run_id: hook_server::CurrentRunId,
             pub evt_tx: mpsc::Sender<HarnessEvent>,
@@ -1618,12 +1695,14 @@ mod adapter {
             let State {
                 results_in_hand,
                 parked_calls,
+                manifest,
                 deferred_calls,
                 current_run_id,
                 evt_tx,
             } = state;
             let (r, mut w) = stream.into_split();
-            let Some(line) = BufReader::new(r).lines().next_line().await.ok().flatten() else {
+            let mut lines = BufReader::new(r).lines();
+            let Some(line) = lines.next_line().await.ok().flatten() else {
                 return;
             };
             let request: McpCallRequest = match serde_json::from_str(&line) {
@@ -1638,6 +1717,7 @@ mod adapter {
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| format!("toolu-engram-{}", uuid::Uuid::new_v4()));
 
+            let socket_owner = Arc::new(());
             // Both this insertion and `route_tool_result` lock parked→results.
             // Holding the parked lock across the stash check closes the only
             // lost-wakeup window: a result can neither slip between the check
@@ -1652,6 +1732,8 @@ mod adapter {
                     calls.remove(&call_id);
                     calls.remove(&stashed_id);
                     drop(calls);
+                    parked.remove(&call_id);
+                    parked.remove(&stashed_id);
                     drop(parked);
                     if stashed_id != call_id {
                         // The stash was keyed by an EARLIER call id (the
@@ -1676,7 +1758,19 @@ mod adapter {
                     return;
                 }
                 let (tx, rx) = oneshot::channel();
-                parked.insert(call_id.clone(), tx);
+                parked.insert(
+                    call_id.clone(),
+                    PendingCall {
+                        socket_owner: socket_owner.clone(),
+                        tool_name: request.name.clone(),
+                        result_format: manifest
+                            .iter()
+                            .find(|tool| tool.name == request.name)
+                            .map(|tool| tool.result_format)
+                            .unwrap_or_default(),
+                        sender: Some(tx),
+                    },
+                );
                 rx
             };
 
@@ -1684,7 +1778,7 @@ mod adapter {
             emit(
                 &evt_tx,
                 HarnessEvent::ToolCallRequested {
-                    run_id,
+                    run_id: run_id.clone(),
                     call_id: call_id.clone(),
                     name: request.name.clone(),
                     args_json: request.args.to_string(),
@@ -1692,11 +1786,46 @@ mod adapter {
             )
             .await;
 
-            match rx.await {
-                Ok(result_json) => {
-                    write_result(&mut w, render_result_for_model(&request.name, result_json)).await
+            tokio::select! {
+                result = rx => match result {
+                    Ok(result_json) => write_result(&mut w, render_result_for_model(&request.name, result_json)).await,
+                    Err(_) => tracing::debug!(%call_id, "parked MCP call was canceled"),
+                },
+                _ = lines.next_line() => {
+                    cancel_disconnected_call(&parked_calls, &socket_owner, &evt_tx,
+                        run_id, call_id, request.name).await;
                 }
-                Err(_) => tracing::debug!(%call_id, "parked MCP call was cancelled"),
+            }
+        }
+
+        async fn cancel_disconnected_call(
+            parked_calls: &ParkedCalls,
+            socket_owner: &Arc<()>,
+            evt_tx: &mpsc::Sender<HarnessEvent>,
+            run_id: String,
+            call_id: String,
+            name: String,
+        ) {
+            let canceled = {
+                let mut calls = parked_calls.lock().await;
+                calls
+                    .get_mut(&call_id)
+                    .filter(|call| Arc::ptr_eq(&call.socket_owner, socket_owner))
+                    // Keep identity after disconnect for late host results.
+                    .is_some_and(|call| call.sender.take().is_some())
+            };
+            // A re-fire can replace this ID while the old socket waits for
+            // the map lock. Only the socket that still owns it may cancel.
+            if canceled {
+                emit(
+                    evt_tx,
+                    HarnessEvent::ToolCallCancelRequested {
+                        run_id,
+                        call_id,
+                        name,
+                    },
+                )
+                .await;
             }
         }
 
@@ -1712,8 +1841,9 @@ mod adapter {
             let _ = writer.flush().await;
         }
 
-        /// Route a host result to a currently parked bridge, or durably stash
-        /// it for a later id-stable re-fire. Returns true only when a live
+        /// Route a host result to a currently parked bridge, or stash it in
+        /// memory for a later id-stable re-fire. The host outbox owns durability.
+        /// Returns true only when a live
         /// parked connection accepted the result.
         pub async fn route_tool_result(
             call_id: &str,
@@ -1722,9 +1852,12 @@ mod adapter {
             results_in_hand: &ResultsInHand,
         ) -> bool {
             let mut parked = parked_calls.lock().await;
-            if let Some(sender) = parked.remove(call_id) {
+            if let Some(sender) = parked.get_mut(call_id).and_then(|call| call.sender.take()) {
                 match sender.send(result_json) {
-                    Ok(()) => return true,
+                    Ok(()) => {
+                        parked.remove(call_id);
+                        return true;
+                    }
                     Err(result_json) => {
                         results_in_hand
                             .lock()
@@ -1739,6 +1872,95 @@ mod adapter {
                 .await
                 .insert(call_id.to_string(), result_json);
             false
+        }
+        #[cfg(test)]
+        mod socket_ownership_tests {
+            use super::*;
+
+            #[tokio::test]
+            async fn stale_socket_disconnect_cannot_cancel_replacement_call() {
+                let (evt_tx, mut events) = mpsc::channel(8);
+                let state = State {
+                    results_in_hand: Arc::new(Mutex::new(HashMap::new())),
+                    parked_calls: Arc::new(Mutex::new(HashMap::new())),
+                    manifest: Arc::new(super::super::parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap()),
+                    deferred_calls: Arc::new(Mutex::new(HashMap::new())),
+                    current_run_id: Arc::new(Mutex::new(Some("run-1".into()))),
+                    evt_tx,
+                };
+                let request =
+                    b"{\"name\":\"remote_inventory\",\"tool_use_id\":\"same-call\",\"args\":{}}\n";
+                let (socket_a, mut client_a) = UnixStream::pair().unwrap();
+                client_a.write_all(request).await.unwrap();
+                let mut a = std::pin::pin!(handle_one(socket_a, state.clone()));
+                tokio::select! {
+                    () = &mut a => panic!("socket A must remain pending"),
+                    event = events.recv() => assert!(matches!(event, Some(HarnessEvent::ToolCallRequested { .. }))),
+                }
+                let owner_a = state.parked_calls.lock().await["same-call"]
+                    .socket_owner
+                    .clone();
+
+                // Pause A before its EOF cleanup. B uses the same stable ID,
+                // then the exact production cleanup step for A runs late.
+                drop(client_a);
+                let (socket_b, mut client_b) = UnixStream::pair().unwrap();
+                client_b.write_all(request).await.unwrap();
+                let mut b = std::pin::pin!(handle_one(socket_b, state.clone()));
+                tokio::select! {
+                    () = &mut b => panic!("socket B must remain pending"),
+                    event = events.recv() => assert!(matches!(event, Some(HarnessEvent::ToolCallRequested { .. }))),
+                }
+                {
+                    let calls = state.parked_calls.lock().await;
+                    let replacement = &calls["same-call"];
+                    assert!(!Arc::ptr_eq(&replacement.socket_owner, &owner_a));
+                    assert_eq!(replacement.tool_name, "remote_inventory");
+                    assert_eq!(replacement.result_format, ResultFormat::Mcp);
+                }
+                cancel_disconnected_call(
+                    &state.parked_calls,
+                    &owner_a,
+                    &state.evt_tx,
+                    "run-1".into(),
+                    "same-call".into(),
+                    "remote_inventory".into(),
+                )
+                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut a)
+                    .await
+                    .unwrap();
+                let result = r#"{"outcome":"succeeded","delivery":"available","output":{"content":[{"type":"text","text":"replacement result"}]}}"#;
+                assert!(
+                    route_tool_result(
+                        "same-call",
+                        result.into(),
+                        &state.parked_calls,
+                        &state.results_in_hand
+                    )
+                    .await,
+                    "the replacement socket must still accept its result"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut b)
+                    .await
+                    .unwrap();
+                let response = BufReader::new(client_b)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response).unwrap()["result_json"],
+                    result
+                );
+                assert!(
+                    matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                    "stale cleanup must not emit cancellation for B"
+                );
+                assert!(state.parked_calls.lock().await.is_empty());
+                assert!(state.results_in_hand.lock().await.is_empty());
+            }
         }
     }
 
@@ -1809,24 +2031,12 @@ mod adapter {
         tokio::fs::write(tracker, format!("{}\n", cwd.display())).await
     }
 
-    /// Write claude's strict MCP config when the manifest contains at least
-    /// one tool that is not natively bound to Claude. Removing a stale file on
-    /// the empty path matters on ProcessBackend, where `/workspace` can
-    /// survive a harness restart with a different manifest.
+    /// Always limit Claude to the trusted bridge, including an empty manifest.
     async fn write_mcp_config(
         path: &Path,
-        manifest: &ToolManifest,
+        _manifest: &ToolManifest,
         self_exe: &Path,
     ) -> std::io::Result<bool> {
-        if injected_tools(manifest).next().is_none() {
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            return Ok(false);
-        }
-
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -1967,20 +2177,15 @@ mod adapter {
         let self_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("engram-harness-claude"));
         let mcp_config_file = state.claude_mcp_config();
-        let mcp_config_path = match write_mcp_config(
-            &mcp_config_file,
-            &cli.tool_manifest,
-            &self_exe,
-        )
-        .await
-        {
-            Ok(true) => Some(mcp_config_file.as_path()),
-            Ok(false) => None,
-            Err(e) => {
-                tracing::error!(error = %e, "couldn't write claude MCP config; exposing no injected tools");
-                None
-            }
-        };
+        let mcp_config_path =
+            match write_mcp_config(&mcp_config_file, &cli.tool_manifest, &self_exe).await {
+                Ok(true) => Some(mcp_config_file.as_path()),
+                Ok(false) => None,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not write strict Claude MCP config");
+                    return ExitCode::FAILURE;
+                }
+            };
         let hook_sock_path = state.hook_sock();
         let _ = tokio::fs::remove_file(&hook_sock_path).await; // clear a stale bind
         let _sock_guard = match tokio::net::UnixListener::bind(&hook_sock_path) {
@@ -2017,6 +2222,7 @@ mod adapter {
                     mcp_server::State {
                         results_in_hand: results_in_hand.clone(),
                         parked_calls: parked_mcp_calls.clone(),
+                        manifest: tool_manifest.clone(),
                         deferred_calls: deferred_calls.clone(),
                         current_run_id: current_run_id.clone(),
                         evt_tx: evt_tx.clone(),
@@ -2200,6 +2406,20 @@ mod adapter {
         ]
     }
 
+    fn unresolved_deferred_ids(
+        run_id: &str,
+        calls: &HashMap<String, hook_server::DeferredCall>,
+        results: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut ids: Vec<_> = calls
+            .iter()
+            .filter(|(id, call)| call.run_id == run_id && !results.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The single in-flight turn, owned by the session loop. `run_id` is
     /// minted on prompt-accept — BEFORE any claude output — so no event
     /// can be emitted without a valid `run_id`, and a bare-event desync
@@ -2258,12 +2478,10 @@ mod adapter {
     /// these in memory and writes one to claude's stdin only at the
     /// consumption boundary (the running turn's `result`). `prompt_id`
     /// carries the client/coord-minted id used to correlate the queue
-    /// events and the eventual `RunStarted{prompt_id}` — issue #535 (d):
-    /// every prompt, first or follow-up, now arrives via `HarnessCommand::
-    /// Prompt`, so this is always `Some` in practice (the historical `None`
-    /// case was the env-seeded initial prompt, deleted). Kept `Option`
-    /// rather than force-unwrapping at each read site — a defensive `None`
-    /// costs nothing here and this isn't a wire type.
+    /// events and the eventual `RunStarted{prompt_id}`. Both the create-time
+    /// prompt read from the spawn environment and host-delivered prompts
+    /// carry an id. The optional form allows callers to handle an absent id
+    /// without force-unwrapping it.
     struct QueuedPrompt {
         prompt_id: Option<String>,
         text: String,
@@ -2767,11 +2985,37 @@ mod adapter {
                                         interrupted_run = None;
                                         interrupt_deadline = None;
                                     }
+                                    // Only the hook ledger can establish a deferred request.
+                                    // The model's terminal marker and transcript are not authority.
+                                    let mut deferred_ids = Vec::new();
+                                    if !abort_requested
+                                        && !marker.is_error
+                                        && (tool_deferred || narrated_past)
+                                        && pending.is_empty()
+                                        && bg_agents == 0
+                                    {
+                                        let results = results_in_hand.lock().await;
+                                        if !is_delivery_resume || results.is_empty() {
+                                            let calls = deferred_calls.lock().await;
+                                            deferred_ids = unresolved_deferred_ids(&run_id, &calls, &results);
+                                        }
+                                    }
+                                    let invalid_deferred_ids = deferred_ids.len() > 128
+                                        || deferred_ids.iter().any(|id| id.is_empty() || id.len() > 256);
                                     if abort_requested
                                         && marker.subtype == "error_during_execution"
                                     {
                                         // The `control_request` abort landed.
                                         emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
+                                    } else if !deferred_ids.is_empty() && !invalid_deferred_ids {
+                                        emit(
+                                            evt_tx,
+                                            HarnessEvent::RunDeferred {
+                                                run_id,
+                                                deferred_tool_call_ids: deferred_ids,
+                                            },
+                                        )
+                                        .await;
                                     } else {
                                         // Either no abort was requested, or
                                         // the turn COMPLETED in the
@@ -2785,7 +3029,7 @@ mod adapter {
                                             evt_tx,
                                             HarnessEvent::RunCompleted {
                                                 run_id,
-                                                ok: !marker.is_error,
+                                                ok: !marker.is_error && !invalid_deferred_ids,
                                             },
                                         )
                                         .await;
@@ -2814,6 +3058,7 @@ mod adapter {
                                         if stale_results.is_empty() {
                                             HashMap::new()
                                         } else {
+                                            let mut pending = parked_mcp_calls.lock().await;
                                             let mut deferred = deferred_calls.lock().await;
                                             stale_results
                                                 .iter()
@@ -2821,6 +3066,7 @@ mod adapter {
                                                     let tool_name = deferred
                                                         .remove(call_id)
                                                         .map(|call| call.tool_name)
+                                                        .or_else(|| pending.remove(call_id).map(|call| call.tool_name))
                                                         .unwrap_or_default();
                                                     (call_id.clone(), tool_name)
                                                 })
@@ -2831,6 +3077,7 @@ mod adapter {
                                             let text = fallback_delivery_message(
                                                 &stale_results,
                                                 &stale_result_names,
+                                                &cli.tool_manifest,
                                             );
                                             let ft = start_turn(
                                                 evt_tx, s, cli, None, &text, current_run_id,
@@ -2844,7 +3091,9 @@ mod adapter {
                                             // each drained result explicitly or
                                             // its coordinator outbox row will
                                             // redeliver forever.
-                                            for (tool_call_id, _) in stale_results {
+                                            for (tool_call_id, result_json) in stale_results {
+                                                let ok = external_fallback_result(&tool_call_id, &result_json, &stale_result_names, &cli.tool_manifest)
+                                                    .is_none_or(|result| result.is_ok_and(|result| result.success()));
                                                 emit(
                                                     evt_tx,
                                                     HarnessEvent::ToolCallCompleted {
@@ -2854,7 +3103,7 @@ mod adapter {
                                                             .cloned()
                                                             .unwrap_or_default(),
                                                         tool_call_id,
-                                                        ok: true,
+                                                        ok,
                                                         duration_ms: 0,
                                                         result_summary: None,
                                                     },
@@ -3179,6 +3428,12 @@ mod adapter {
                                 .await
                                 .get(&call_id)
                                 .map(|call| call.tool_name.clone());
+                            let known_deferred = known_tool.is_some();
+                            let live_context = parked_mcp_calls.lock().await.get(&call_id)
+                                .map(|call| (call.tool_name.clone(), call.result_format));
+                            let is_mcp = live_context.as_ref().is_some_and(|(_, format)| *format == ResultFormat::Mcp)
+                                || known_tool.as_ref().is_some_and(|name| cli.tool_manifest.iter().any(|tool| tool.name == *name && tool.result_format == ResultFormat::Mcp));
+                            let known_tool = known_tool.or_else(|| live_context.map(|(name, _)| name));
                             // ADR 0107 (2026-08-03: injected exit_plan_mode).
                             // BOTH plan decisions take the ordinary deferred
                             // path: stash the result → respawn `--resume` →
@@ -3194,8 +3449,8 @@ mod adapter {
                             // `--permission-mode plan`; reject keeps plan for a
                             // read-only revision turn. (The unknown-call_id arm
                             // — post-eviction fresh harness — parses the shape.)
-                            let is_plan_call = known_tool.as_deref() == Some("exit_plan_mode")
-                                || known_tool.is_none();
+                            let is_plan_call = !is_mcp && (known_tool.as_deref() == Some("exit_plan_mode")
+                                || known_tool.is_none());
                             if is_plan_call {
                                 if let Some(decision) =
                                     engram_harness_sdk::plan::parse_plan_decision(&result_json)
@@ -3224,7 +3479,6 @@ mod adapter {
                             // bridge until their id-stable resume re-fire, so
                             // every other result is stashed before SIGINT and
                             // consumed only after transcript scrub + --resume.
-                            let known_deferred = known_tool.is_some();
                             let delivered = mcp_server::route_tool_result(
                                 &call_id,
                                 result_json,
@@ -3626,9 +3880,18 @@ mod adapter {
     fn fallback_delivery_message(
         stale_results: &[(String, String)],
         names: &HashMap<String, String>,
+        manifest: &[ManifestTool],
     ) -> String {
         let mut lines = vec!["Results for the deferred tool call(s) you made earlier:".to_string()];
         for (call_id, result_json) in stale_results {
+            if let Some(result) = external_fallback_result(call_id, result_json, names, manifest) {
+                lines.push(format!("- {call_id}:"));
+                match result {
+                    Ok(result) => lines.extend(result.text_items()),
+                    Err(error) => lines.push(error.into()),
+                }
+                continue;
+            }
             let plan_decision = (names.get(call_id).map(String::as_str) == Some("exit_plan_mode"))
                 .then(|| engram_harness_sdk::plan::parse_plan_decision(result_json))
                 .flatten();
@@ -3638,6 +3901,19 @@ mod adapter {
             }
         }
         lines.join("\n")
+    }
+
+    fn external_fallback_result(
+        call_id: &str,
+        result_json: &str,
+        names: &HashMap<String, String>,
+        manifest: &[ManifestTool],
+    ) -> Option<Result<McpToolResult, &'static str>> {
+        let name = names.get(call_id)?;
+        manifest
+            .iter()
+            .find(|tool| tool.name == *name && tool.result_format == ResultFormat::Mcp)
+            .map(|_| McpToolResult::parse(result_json))
     }
 
     /// Write one prompt to claude's stdin as a stream-json `user` message.
@@ -3788,8 +4064,8 @@ mod adapter {
             // Without strict mode claude merges the guest user's own MCP
             // configuration, exposing servers outside the orchestrator's
             // per-session manifest (ADR 0089 spike, Claude 2.1.207).
-            argv.push("--strict-mcp-config".into());
         }
+        argv.push("--strict-mcp-config".into());
         // ADR 0060: an external trigger (e.g. Slack) flavors the agent's system
         // prompt via ENGRAM_APPEND_SYSTEM_PROMPT (carried through harness_env).
         // Empty = unset (skip the flag).
@@ -4681,10 +4957,10 @@ mod adapter {
         }
 
         #[test]
-        fn argv_omits_mcp_flags_without_injected_tools() {
+        fn argv_keeps_strict_mcp_flags_without_injected_tools() {
             let argv = build_claude_argv(&None, None, None, "default", test_settings());
             assert!(!argv.iter().any(|arg| arg == "--mcp-config"));
-            assert!(!argv.iter().any(|arg| arg == "--strict-mcp-config"));
+            assert!(argv.iter().any(|arg| arg == "--strict-mcp-config"));
         }
 
         #[tokio::test]
@@ -4730,12 +5006,12 @@ mod adapter {
             )
             .unwrap();
             assert!(
-                !write_mcp_config(&path, &native_only, Path::new("/sbin/harness"))
+                write_mcp_config(&path, &native_only, Path::new("/sbin/harness"))
                     .await
                     .unwrap(),
-                "a native-only manifest must not enable MCP"
+                "a native-only manifest must keep the strict bridge config"
             );
-            assert!(tokio::fs::metadata(&path).await.is_err());
+            assert!(tokio::fs::metadata(&path).await.is_ok());
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
 
@@ -4842,7 +5118,7 @@ mod adapter {
 
         #[tokio::test]
         async fn mcp_tools_call_round_trips_through_main_process_socket() {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-mcp-bridge-test-{}.sock",
                     uuid::Uuid::new_v4()
@@ -4889,6 +5165,58 @@ mod adapter {
             let _ = tokio::fs::remove_file(sock).await;
         }
 
+        #[tokio::test]
+        async fn external_mcp_bridge_preserves_text_structure_and_upstream_error() {
+            let dir =
+                test_socket_root().join(format!("engram-mcp-result-{}", uuid::Uuid::new_v4()));
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            let sock = dir.join("bridge.sock");
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let _: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let result = serde_json::json!({
+                    "outcome":"failed", "delivery":"available", "resultUnavailable":false,
+                    "output": {"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}],
+                               "structuredContent":{"count":2}, "isError":true}
+                });
+                let mut response =
+                    serde_json::to_vec(&serde_json::json!({"result_json":result.to_string()}))
+                        .unwrap();
+                response.push(b'\n');
+                w.write_all(&response).await.unwrap();
+            });
+            let manifest = parse_tool_manifest(r#"[{"name":"mcp_inventory_01234567890123456789","description":"Read inventory","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+            let response = mcp_bridge::handle_request(
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"mcp_inventory_01234567890123456789","arguments":{}}}),
+                &manifest,
+                &sock,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response["result"]["content"],
+                serde_json::json!([
+                    {"type":"text","text":"first"}, {"type":"text","text":"second"}
+                ])
+            );
+            assert_eq!(
+                response["result"]["structuredContent"],
+                serde_json::json!({"count":2})
+            );
+            assert_eq!(response["result"]["isError"], true);
+            assert!(
+                response.get("error").is_none(),
+                "an upstream tool error is not a delivery error"
+            );
+            server.await.unwrap();
+            tokio::fs::remove_dir_all(dir).await.unwrap();
+        }
+
         async fn spawn_main_mcp_server() -> (
             String,
             mcp_server::ResultsInHand,
@@ -4896,7 +5224,7 @@ mod adapter {
             mpsc::Receiver<HarnessEvent>,
             hook_server::DeferredCalls,
         ) {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-mcp-main-test-{}.sock",
                     uuid::Uuid::new_v4()
@@ -4917,6 +5245,7 @@ mod adapter {
                 mcp_server::State {
                     results_in_hand: results.clone(),
                     parked_calls: parked.clone(),
+                    manifest: Arc::new(Vec::new()),
                     deferred_calls: deferred.clone(),
                     current_run_id: run_id.clone(),
                     evt_tx,
@@ -4993,6 +5322,104 @@ mod adapter {
             );
             assert!(results.lock().await.is_empty());
             let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
+        async fn main_mcp_disconnect_requests_cancel_with_original_identity() {
+            let (sock, results, parked, mut events, _deferred) = spawn_main_mcp_server().await;
+            let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            stream.write_all(b"{\"name\":\"mcp_inventory_01234567890123456789\",\"args\":{},\"tool_use_id\":\"call-cancel\"}\n").await.unwrap();
+            let requested = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(requested.kind(), "tool_call_requested");
+            drop(stream);
+            let canceled = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("disconnect must request cancellation")
+                .unwrap();
+            assert_eq!(canceled.kind(), "tool_call_cancel_requested");
+            assert_eq!(canceled.run_id(), Some("run-mcp"));
+            assert_eq!(canceled.tool_call_id(), Some("call-cancel"));
+            assert_eq!(
+                serde_json::to_value(&canceled).unwrap()["ToolCallCancelRequested"]["name"],
+                "mcp_inventory_01234567890123456789"
+            );
+            assert!(parked
+                .lock()
+                .await
+                .get("call-cancel")
+                .unwrap()
+                .sender
+                .is_none());
+            assert_eq!(
+                parked.lock().await.get("call-cancel").unwrap().tool_name,
+                "mcp_inventory_01234567890123456789"
+            );
+            // A late journal result is retained. Cancellation is not completion.
+            assert!(
+                !mcp_server::route_tool_result("call-cancel", "late".into(), &parked, &results)
+                    .await
+            );
+            assert_eq!(
+                results.lock().await.get("call-cancel").map(String::as_str),
+                Some("late")
+            );
+            tokio::fs::remove_file(sock).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn external_mcp_native_cancel_is_processed_while_call_is_pending() {
+            let (sock, _results, _parked, mut events, _deferred) = spawn_main_mcp_server().await;
+            let manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+            let (client, bridge) = tokio::io::duplex(8192);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (bridge_read, bridge_write) = tokio::io::split(bridge);
+            let bridge_sock = sock.clone();
+            let task = tokio::spawn(async move {
+                mcp_bridge::serve_io(
+                    BufReader::new(bridge_read),
+                    bridge_write,
+                    &manifest,
+                    Path::new(&bridge_sock),
+                )
+                .await
+            });
+            client_write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\",\"params\":{\"name\":\"remote_inventory\",\"arguments\":{},\"_meta\":{\"claudecode/toolUseId\":\"native-cancel\"}}}\n").await.unwrap();
+            let requested = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(requested.tool_call_id(), Some("native-cancel"));
+            client_write.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":17}}\n{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"tools/list\"}\n").await.unwrap();
+            let mut responses = BufReader::new(client_read).lines();
+            let response = tokio::time::timeout(Duration::from_secs(1), responses.next_line())
+                .await
+                .expect("pending call must not block cancellation or tools/list")
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                response["id"], 18,
+                "canceled request must not produce a late response"
+            );
+            let canceled = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(canceled.kind(), "tool_call_cancel_requested");
+            assert_eq!(canceled.tool_call_id(), Some("native-cancel"));
+            assert_eq!(canceled.run_id(), Some("run-mcp"));
+            client_write.shutdown().await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                std::process::ExitCode::SUCCESS
+            );
+            tokio::fs::remove_file(sock).await.unwrap();
         }
 
         #[tokio::test]
@@ -5306,7 +5733,7 @@ mod adapter {
             // starts clean instead of `--resume`-ing a conversation this fake
             // cannot replay. (State-dir isolation is `test_cli`'s job.)
             body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
-            body.push_str("while IFS= read -r _line; do\n");
+            body.push_str("while IFS= read -r _line; do\n  :\n");
             for l in per_turn {
                 body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
             }
@@ -5772,9 +6199,16 @@ mod adapter {
             let _ = engine.await;
         }
 
+        // macOS TMPDIR can leave too little room for UUID-named socket paths.
+        fn test_socket_root() -> PathBuf {
+            let root = engram_core::socket::short_socket_dir();
+            std::fs::create_dir_all(&root).expect("test socket root");
+            root
+        }
+
         fn test_cli(claude_bin: String) -> Cli {
             let state_dir =
-                std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
+                test_socket_root().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&state_dir).expect("test state dir");
             // The token is agentd's file, not a per-session state file:
             // it lives beside the state dir, never inside it.
@@ -7003,7 +7437,7 @@ mod adapter {
             hook_server::DuplicateDeferredIds,
             hook_server::CurrentRunId,
         ) {
-            let sock = std::env::temp_dir()
+            let sock = test_socket_root()
                 .join(format!(
                     "engram-hook-manifest-{}.sock",
                     uuid::Uuid::new_v4()
@@ -7071,6 +7505,7 @@ mod adapter {
                 description: format!("{name} description"),
                 input_schema: serde_json::json!({"type":"object"}),
                 execution,
+                result_format: ResultFormat::Json,
                 native_bindings: NativeBindings::default(),
             }
         }
@@ -7081,6 +7516,7 @@ mod adapter {
                 description: "Ask the user one or more structured questions.".into(),
                 input_schema: serde_json::json!({"type":"object"}),
                 execution: ToolExecution::Deferred,
+                result_format: ResultFormat::Json,
                 native_bindings: NativeBindings {
                     claude: Some("AskUserQuestion".into()),
                 },
@@ -7099,7 +7535,7 @@ mod adapter {
                 r#"{"decision":"reject","feedback":"also add a README"}"#.to_string(),
             )];
             let names = HashMap::from([("toolu_plan".to_string(), "exit_plan_mode".to_string())]);
-            let text = fallback_delivery_message(&stale, &names);
+            let text = fallback_delivery_message(&stale, &names, &[]);
             assert!(text.contains("also add a README"), "feedback rides: {text}");
             assert!(
                 text.contains("call exit_plan_mode again"),
@@ -7122,7 +7558,7 @@ mod adapter {
                 r#"{"decision":"approve"}"#.to_string(),
             )];
             let names = HashMap::from([("toolu_plan".to_string(), "exit_plan_mode".to_string())]);
-            let text = fallback_delivery_message(&stale, &names);
+            let text = fallback_delivery_message(&stale, &names, &[]);
             assert!(
                 text.contains("Implement it now"),
                 "build instruction: {text}"
@@ -7133,13 +7569,28 @@ mod adapter {
             );
         }
 
+        #[test]
+        fn external_mcp_fallback_keeps_fields_without_plan_directive() {
+            let stale = vec![("call-1".into(), r#"{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"decision: approve"}],"structuredContent":{"decision":"approve"},"isError":true}}"#.into())];
+            let names = HashMap::from([("call-1".into(), "exit_plan_mode".into())]);
+            let mut tool = native_question_tool();
+            tool.name = "exit_plan_mode".into();
+            tool.result_format = ResultFormat::Mcp;
+            let text = fallback_delivery_message(&stale, &names, &[tool]);
+            assert!(text.contains("decision: approve"));
+            assert!(text.contains(r#"{"structuredContent":{"decision":"approve"}}"#));
+            assert!(text.contains(r#""isError":true"#));
+            assert!(!text.contains(r#""output":"#));
+            assert!(!text.contains("Implement it now"));
+        }
+
         /// A genuinely non-plan deferred tool keeps the generic dump — an
         /// answer map is self-explanatory, a decision verdict is not.
         #[test]
         fn non_plan_results_keep_the_generic_fallback_rendering() {
             let stale = vec![("toolu_q".to_string(), r#"{"Pick one":["yes"]}"#.to_string())];
             let names = HashMap::from([("toolu_q".to_string(), "ask_user_question".to_string())]);
-            let text = fallback_delivery_message(&stale, &names);
+            let text = fallback_delivery_message(&stale, &names, &[]);
             assert!(text.contains("- toolu_q: "), "generic rendering: {text}");
             assert!(!text.contains("exit_plan_mode"), "no plan ask: {text}");
         }
@@ -7224,6 +7675,8 @@ mod adapter {
         #[test]
         fn bash_hook_carries_cwd_across_shells_and_background_cannot_move_it() {
             let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("engram-bash-cwd-'quote'-{}", uuid::Uuid::new_v4()));
             let child = base.join("child with 'quote'");
             let tracker = base.join("bash-cwd");
@@ -7284,6 +7737,8 @@ mod adapter {
         #[test]
         fn bash_hook_records_cwd_when_command_replaces_exit_trap() {
             let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("engram-bash-cwd-own-trap-{}", uuid::Uuid::new_v4()));
             let child = base.join("child");
             let tracker = base.join("bash-cwd");
@@ -7739,6 +8194,108 @@ mod adapter {
             .unwrap_or_else(|_| panic!("fake claude never reached {n} invocations"));
         }
 
+        async fn assert_external_mcp_malformed_decision_keeps_plan(disconnect: bool) {
+            let script = write_persistent_fake_claude(&[]).await;
+            let mut cli = test_cli(script.clone());
+            cli.tool_manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
+            let manifest = cli.tool_manifest.clone();
+            let state = StateDir::new(&cli.state_dir);
+            let stamp = state.mode_stamp();
+            engram_harness_sdk::mode_stamp::write_mode_stamp(&stamp, "plan").unwrap();
+            let socket = state.mcp_sock();
+            let (commands, command_rx) = mpsc::channel(8);
+            let (events, mut event_rx) = mpsc::channel(16);
+            let engine = tokio::spawn(run_engine(cli, command_rx, Arc::new(Notify::new()), events));
+            assert!(matches!(event_rx.recv().await, Some(HarnessEvent::Idle)));
+            let bridge = tokio::spawn(async move {
+                mcp_bridge::handle_request(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remote_inventory","arguments":{},"_meta":{"claudecode/toolUseId":"live-call"}}}), &manifest, &socket).await.unwrap()
+            });
+            assert!(
+                matches!(event_rx.recv().await, Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == "live-call")
+            );
+            if disconnect {
+                bridge.abort();
+                assert!(
+                    matches!(event_rx.recv().await, Some(HarnessEvent::ToolCallCancelRequested { call_id, .. }) if call_id == "live-call")
+                );
+            }
+            commands
+                .send(HarnessCommand::ToolResult {
+                    call_id: "live-call".into(),
+                    result_json: r#"{"decision":"approve"}"#.into(),
+                })
+                .await
+                .unwrap();
+            if !disconnect {
+                let response = tokio::time::timeout(Duration::from_secs(2), bridge)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response["error"]["code"], -32603);
+            }
+            commands
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+                "plan"
+            );
+            tokio::fs::remove_file(script).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn external_mcp_live_malformed_decision_cannot_relax_plan() {
+            assert_external_mcp_malformed_decision_keeps_plan(false).await;
+        }
+
+        #[tokio::test]
+        async fn external_mcp_disconnected_malformed_decision_cannot_relax_plan() {
+            assert_external_mcp_malformed_decision_keeps_plan(true).await;
+        }
+
+        #[tokio::test]
+        async fn external_mcp_zero_tools_fake_cli_still_receives_strict_bridge_config() {
+            let dir =
+                std::env::temp_dir().join(format!("engram-strict-zero-{}", uuid::Uuid::new_v4()));
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            let invocations = dir.join("argv");
+            let stdin_log = dir.join("stdin");
+            let script = write_plan_flow_fake_claude(&invocations, &stdin_log).await;
+            let (mut cli, _, _) = deferred_engine_cli(script.clone());
+            cli.tool_manifest.clear();
+            let config_path = StateDir::new(&cli.state_dir).claude_mcp_config();
+            let (commands, receiver) = mpsc::channel(8);
+            let (events, mut received) = mpsc::channel(16);
+            let engine = tokio::spawn(run_engine(cli, receiver, Arc::new(Notify::new()), events));
+            assert!(matches!(received.recv().await, Some(HarnessEvent::Idle)));
+            wait_for_invocations(&invocations, 1).await;
+            let argv = tokio::fs::read_to_string(invocations).await.unwrap();
+            assert!(argv.contains("--strict-mcp-config"));
+            assert!(argv.contains(&format!("--mcp-config {}", config_path.display())));
+            let config: Value =
+                serde_json::from_slice(&tokio::fs::read(&config_path).await.unwrap()).unwrap();
+            assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+            assert_eq!(
+                config["mcpServers"]["engrams"]["args"],
+                serde_json::json!(["mcp-bridge"])
+            );
+            commands
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::fs::remove_file(script).await.unwrap();
+            tokio::fs::remove_dir_all(dir).await.unwrap();
+        }
+
         /// `exit_plan_mode` as production ships it since PR #981: an INJECTED
         /// deferred tool (no claude native binding), reached as
         /// `mcp__engrams__exit_plan_mode`. The old `native_bindings.claude =
@@ -7750,6 +8307,7 @@ mod adapter {
                 description: "Present your finished implementation plan.".into(),
                 input_schema: serde_json::json!({"type":"object"}),
                 execution: ToolExecution::Deferred,
+                result_format: ResultFormat::Json,
                 native_bindings: NativeBindings::default(),
             }
         }
@@ -8197,6 +8755,117 @@ mod adapter {
             (cli, state.hook_sock(), state.mcp_sock())
         }
 
+        #[test]
+        fn deferred_association_excludes_other_runs_and_received_results() {
+            let calls = [
+                ("current", "run-a"),
+                ("received", "run-a"),
+                ("stale", "run-b"),
+            ]
+            .into_iter()
+            .map(|(id, run)| {
+                (
+                    id.to_string(),
+                    hook_server::DeferredCall {
+                        run_id: run.to_string(),
+                        tool_name: "save_memory".to_string(),
+                    },
+                )
+            })
+            .collect();
+            let results = [("received".to_string(), "{}".to_string())]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                unresolved_deferred_ids("run-a", &calls, &results),
+                ["current"]
+            );
+        }
+
+        #[tokio::test]
+        async fn forged_failed_and_invalid_deferred_calls_do_not_authorize_suspension() {
+            use std::os::unix::fs::PermissionsExt;
+
+            for (case, hook_id, is_error, expected_ok) in [
+                ("forged", None, false, true),
+                ("failed", Some("toolu_failed".to_string()), true, false),
+                ("oversized", Some("x".repeat(257)), false, false),
+            ] {
+                let base =
+                    std::env::temp_dir().join(format!("deferred-check-{}", uuid::Uuid::new_v4()));
+                let script = base.with_extension("sh");
+                let gate = base.with_extension("gate");
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\nIFS= read -r _prompt\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"forged\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"forged-id\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{}}}}]}}}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"{}\",\"is_error\":{},\"terminal_reason\":\"tool_deferred\"}}'\nwhile IFS= read -r _line; do :; done\n",
+                    gate.display(),
+                    if is_error { "error_during_execution" } else { "success" },
+                    is_error,
+                );
+                tokio::fs::write(&script, body).await.unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let (cli, hook, _) = deferred_engine_cli(script.to_string_lossy().into_owned());
+                let (cmd_tx, cmd_rx) = mpsc::channel(8);
+                let (evt_tx, mut evt_rx) = mpsc::channel(64);
+                let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+                assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+                cmd_tx
+                    .send(HarnessCommand::Prompt {
+                        prompt_id: case.into(),
+                        text: "test".into(),
+                        mode: None,
+                    })
+                    .await
+                    .unwrap();
+                let run_id = expect_run_started(&mut evt_rx).await;
+                if let Some(id) = hook_id {
+                    assert!(matches!(
+                        hook_fire_named(
+                            &hook,
+                            &id,
+                            "mcp__engrams__save_memory",
+                            serde_json::json!({"text":"remember"})
+                        )
+                        .await,
+                        hook_server::HookVerdict::Defer
+                    ));
+                    assert!(
+                        matches!(evt_rx.recv().await, Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == id)
+                    );
+                }
+                tokio::fs::write(&gate, "go").await.unwrap();
+                let event = tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        match evt_rx.recv().await {
+                            Some(event @ HarnessEvent::RunCompleted { .. })
+                            | Some(event @ HarnessEvent::RunDeferred { .. }) => break event,
+                            Some(_) => {}
+                            None => panic!("event stream closed for {case}"),
+                        }
+                    }
+                })
+                .await
+                .expect("terminal event");
+                assert_eq!(
+                    event,
+                    HarnessEvent::RunCompleted {
+                        run_id,
+                        ok: expected_ok
+                    },
+                    "{case}"
+                );
+                cmd_tx
+                    .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), engine)
+                    .await
+                    .expect("engine exits")
+                    .expect("engine task");
+                let _ = tokio::fs::remove_file(script).await;
+                let _ = tokio::fs::remove_file(gate).await;
+            }
+        }
+
         #[tokio::test]
         async fn deferred_result_after_process_death_resumes_and_serves_refire() {
             let counter =
@@ -8216,7 +8885,7 @@ mod adapter {
                 })
                 .await
                 .unwrap();
-            let _ = expect_run_started(&mut evt_rx).await;
+            let deferred_run = expect_run_started(&mut evt_rx).await;
             assert!(matches!(
                 hook_fire_named(
                     &hook,
@@ -8236,12 +8905,20 @@ mod adapter {
             // Drain the deferred turn's tool log/completion and both Parked
             // announcements: one at turn-end, one from the respawned process.
             let mut waiting = Vec::new();
+            let mut terminal = None;
             tokio::time::timeout(Duration::from_secs(8), async {
                 while waiting.len() < 2 {
                     match evt_rx.recv().await {
                         Some(HarnessEvent::Parked) => waiting.push("parked"),
                         Some(HarnessEvent::Idle) => waiting.push("idle"),
-                        Some(_) => {}
+                        Some(event) => {
+                            let value = serde_json::to_value(event).unwrap();
+                            if value.get("RunCompleted").is_some()
+                                || value.get("RunDeferred").is_some()
+                            {
+                                terminal = Some(value);
+                            }
+                        }
                         None => panic!("engine event channel closed before parked re-announce"),
                     }
                 }
@@ -8249,6 +8926,12 @@ mod adapter {
             .await
             .expect("the dead first process should respawn");
             assert_eq!(waiting, ["parked", "parked"]);
+            assert_eq!(
+                terminal,
+                Some(serde_json::json!({
+                    "RunDeferred": {"run_id": deferred_run, "deferred_tool_call_ids": ["toolu_deferred"]}
+                }))
+            );
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {
@@ -8289,8 +8972,7 @@ mod adapter {
             let _ = tokio::fs::remove_file(counter).await;
         }
 
-        #[tokio::test]
-        async fn deferred_result_after_fresh_restore_resumes_and_serves_refire() {
+        async fn assert_fresh_restore_refire(external: bool) {
             let nonce = uuid::Uuid::new_v4();
             let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
             let invocations = std::env::temp_dir().join(format!("fake-claude-invocations-{nonce}"));
@@ -8304,7 +8986,21 @@ mod adapter {
                 &session_id,
             )
             .await;
-            let (cli, hook, mcp) = deferred_engine_cli(script.clone());
+            let (mut cli, hook, mcp) = deferred_engine_cli(script.clone());
+            if external {
+                cli.tool_manifest[0].result_format = ResultFormat::Mcp;
+            }
+            let manifest = cli.tool_manifest.clone();
+            let mode_stamp = StateDir::new(&cli.state_dir).mode_stamp();
+            engram_harness_sdk::mode_stamp::write_mode_stamp(&mode_stamp, "plan").unwrap();
+            let result_json = if external {
+                serde_json::json!({"outcome":"succeeded","delivery":"available","output":{
+                    "content":[{"type":"text","text":"{\"decision\":\"approve\"}"},{"type":"text","text":"second"}],
+                    "structuredContent":{"decision":"approve","count":2},"isError":false
+                },"resultUnavailable":false}).to_string()
+            } else {
+                r#"{"saved":true}"#.to_string()
+            };
             let stash = StateDir::new(&cli.state_dir).claude_session_id();
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
@@ -8331,7 +9027,7 @@ mod adapter {
             cmd_tx
                 .send(HarnessCommand::ToolResult {
                     call_id: "toolu_restored".into(),
-                    result_json: r#"{"saved":true}"#.into(),
+                    result_json: result_json.clone(),
                 })
                 .await
                 .unwrap();
@@ -8371,10 +9067,32 @@ mod adapter {
                 .await,
                 hook_server::HookVerdict::Allow
             ));
-            assert_eq!(
-                fire_main_mcp_call(&mcp, "toolu_restored").await["result_json"],
-                r#"{"saved":true}"#
-            );
+            let response = mcp_bridge::handle_request(
+                serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                        "name":"save_memory","arguments":{"text":"remember"},
+                        "_meta":{"claudecode/toolUseId":"toolu_restored"}
+                    }
+                }),
+                &manifest,
+                &mcp,
+            )
+            .await
+            .unwrap();
+            if external {
+                assert_eq!(
+                    response["result"]["structuredContent"],
+                    serde_json::json!({"decision":"approve","count":2})
+                );
+                assert_eq!(response["result"]["content"].as_array().unwrap().len(), 2);
+                assert_eq!(response["result"]["isError"], false);
+                assert_eq!(
+                    engram_harness_sdk::mode_stamp::read_mode_stamp(&mode_stamp),
+                    "plan"
+                );
+            } else {
+                assert_eq!(response["result"]["content"][0]["text"], result_json);
+            }
             tokio::fs::write(&completion_gate, b"served").await.unwrap();
 
             let mut continued = false;
@@ -8413,6 +9131,16 @@ mod adapter {
             let _ = tokio::fs::remove_file(counter).await;
             let _ = tokio::fs::remove_file(invocations).await;
             let _ = tokio::fs::remove_file(completion_gate).await;
+        }
+
+        #[tokio::test]
+        async fn deferred_result_after_fresh_restore_resumes_and_serves_refire() {
+            assert_fresh_restore_refire(false).await;
+        }
+
+        #[tokio::test]
+        async fn external_mcp_fresh_engine_refire_preserves_envelope_and_plan_latch() {
+            assert_fresh_restore_refire(true).await;
         }
 
         #[tokio::test]
@@ -8651,7 +9379,7 @@ mod adapter {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // ADR 0054: git/busybox argv dispatch — the SAME binary is the socket
@@ -8667,7 +9395,7 @@ async fn main() -> std::process::ExitCode {
     adapter::entry().await
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::adapter::*;
     use engram_harness_proto::{FileChange, HarnessEvent};
@@ -9209,22 +9937,22 @@ mod tests {
 
     /// Pins the OBSERVED `background_tasks_changed` wire shape (probed
     /// 2026-08-06 against the harness argv; the event is undocumented).
-    /// The lines are verbatim probe captures. If a future CLI changes the
-    /// shape, this fails loudly instead of the harness silently reverting
+    /// Synthetic fixtures preserve the observed shape. If a future CLI changes
+    /// the shape, this fails loudly instead of the harness silently reverting
     /// to announce-idle-immediately.
     #[test]
     fn background_agent_inventory_counts_local_agents_only() {
-        let agent = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a9e33c94e91b3d1b5","task_type":"local_agent","description":"Sleep then output done"}],"uuid":"d3ae041e-47fd-4d0f-add6-0f13a50f6b2f","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        let agent = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"agent-fixture","task_type":"local_agent","description":"Sleep then output done"}],"uuid":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000010"}"#;
         assert_eq!(detect_background_agents(agent), Some(1));
-        let drained = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"9b1482bc-3149-4371-8318-6f56b4397b81","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        let drained = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-000000000010"}"#;
         assert_eq!(detect_background_agents(drained), Some(0));
         // A background SHELL never counts: it can be a never-exiting dev
         // server, and holding the idle announcement on it would pin the
         // session resident until the hard TTL.
-        let bash = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bw9ttimtt","task_type":"local_bash","description":"Sleep 20 seconds in background"}],"uuid":"eb30b242-265e-4fec-8928-cf7368376864","session_id":"816f8b56-7307-4175-b4a5-89c453bbc577"}"#;
+        let bash = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bash-fixture","task_type":"local_bash","description":"Sleep 20 seconds in background"}],"uuid":"00000000-0000-4000-8000-000000000003","session_id":"00000000-0000-4000-8000-000000000020"}"#;
         assert_eq!(detect_background_agents(bash), Some(0));
         // Lifecycle lines are NOT inventory lines.
-        let started = r#"{"type":"system","subtype":"task_started","task_id":"a9e33c94e91b3d1b5","task_type":"local_agent"}"#;
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"agent-fixture","task_type":"local_agent"}"#;
         assert_eq!(detect_background_agents(started), None);
         assert_eq!(detect_background_agents(r#"{"type":"assistant"}"#), None);
     }
@@ -9241,9 +9969,9 @@ mod tests {
         assert!(is_main_loop_message(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]},"parent_tool_use_id":null}"#
         ));
-        // Verbatim-shaped subagent line from the probe: tagged → never.
+        // Synthetic subagent line preserves the observed shape: tagged → never.
         assert!(!is_main_loop_message(
-            r#"{"type":"assistant","message":{"id":"m2","content":[]},"parent_tool_use_id":"toolu_01TUxcDgGE8cPe7wZ2B1sKbm"}"#
+            r#"{"type":"assistant","message":{"id":"m2","content":[]},"parent_tool_use_id":"toolu_fixture_parent"}"#
         ));
         assert!(!is_main_loop_message(
             r#"{"type":"system","subtype":"init"}"#
@@ -9318,6 +10046,7 @@ mod tests {
             description: "Save a memory".into(),
             input_schema: serde_json::json!({"type":"object"}),
             execution: ToolExecution::Deferred,
+            result_format: engram_harness_proto::tool_result::ResultFormat::Json,
             native_bindings: NativeBindings::default(),
         }];
         let deferred_names = deferred_tool_names(&manifest);
@@ -9387,7 +10116,7 @@ mod tests {
         assert!(!ok(""));
     }
 
-    /// ADR 0107 / session 28216894: a natively-bound deferred tool arrives as
+    /// ADR 0107: a natively-bound deferred tool arrives as
     /// `ExitPlanMode`, NOT `mcp__engrams__exit_plan_mode`, and
     /// `injected_tools` excludes natively-bound tools by design. The parked
     /// call therefore never marked itself deferred, so the model's "the
@@ -9401,6 +10130,7 @@ mod tests {
             description: "Present the plan".into(),
             input_schema: serde_json::json!({"type":"object"}),
             execution: ToolExecution::Deferred,
+            result_format: engram_harness_proto::tool_result::ResultFormat::Json,
             native_bindings: NativeBindings {
                 claude: Some("ExitPlanMode".into()),
             },

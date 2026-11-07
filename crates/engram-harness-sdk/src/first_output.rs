@@ -95,6 +95,7 @@ fn output_run_id(event: &HarnessEvent) -> Option<&str> {
         HarnessEvent::RunStarted { .. }
         | HarnessEvent::ToolCallCompleted { .. }
         | HarnessEvent::RunCompleted { .. }
+        | HarnessEvent::RunDeferred { .. }
         | HarnessEvent::RunInterrupted { .. }
         | HarnessEvent::RunContinued { .. }
         | HarnessEvent::Idle
@@ -107,13 +108,25 @@ fn output_run_id(event: &HarnessEvent) -> Option<&str> {
         | HarnessEvent::Parked
         | HarnessEvent::BrowserActivity { .. }
         | HarnessEvent::Busy
-        | HarnessEvent::RunCost { .. } => None,
+        | HarnessEvent::RunCost { .. }
+        | HarnessEvent::ToolCallCancelRequested { .. } => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_completion_is_lifecycle_not_model_output() {
+        assert_eq!(
+            output_run_id(&HarnessEvent::RunDeferred {
+                run_id: "r1".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            }),
+            None
+        );
+    }
 
     fn run_started(run: &str) -> HarnessEvent {
         HarnessEvent::RunStarted {

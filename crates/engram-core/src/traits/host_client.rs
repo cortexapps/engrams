@@ -1,24 +1,9 @@
 //! The coord↔host boundary trait.
 //!
-//! `SandboxBackend` is the VMM dimension (FC vs VZ vs Process — "what
-//! kind of VM am I"). `HostClient` is the transport dimension ("where
-//! am I"). Splitting the two means the coord never imports
-//! `SandboxBackend` directly — it talks to a `HostClient`, which
-//! either composes a local backend (in-process) or sends RPCs over the
-//! WS (remote). Two impls today:
-//!
-//! - `LocalHostClient` in `engram-host-agent::host_client` — wraps an
-//!   `Arc<dyn SandboxBackend>` + an `Arc<HarnessHub>`. Used in
-//!   `--mode=all` (coord constructs one inline) and inside the
-//!   host-agent itself (what its WS server serves over the wire).
-//! - `RemoteHostClient` in `engram-protocol::client` — wraps a
-//!   `ConnectedHost` (WS). Every method is a unary RPC.
-//!
-//! The trait surface unions what used to live separately on
-//! `SandboxBackend`'s coord-facing methods and on `HarnessHub`'s
-//! direct in-process API. `snapshot_path_for` and `set_harness_sink`
-//! stay on `SandboxBackend` only — they're host-local concepts that
-//! don't cross the wire.
+//! `SandboxBackend` selects the VMM. `HostClient` selects its location:
+//! `LocalHostClient` composes a backend and harness hub in this process;
+//! `engram_protocol::grpc_client::GrpcHostClient` sends HTTP/2 RPCs to a host.
+//! Host-local paths and callbacks stay on the backend.
 
 use async_trait::async_trait;
 
@@ -386,6 +371,67 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    /// Read immutable disk, kernel and ordered bundle identities without creating a VM.
+    async fn read_managed_cold_assets(
+        &self,
+        _request: crate::types::managed_assets::ManagedColdAssetsRequest,
+    ) -> Result<crate::types::managed_assets::ManagedColdAssetsReceipt, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "managed cold assets unavailable".into(),
+        ))
+    }
+    async fn capture_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<crate::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "managed capture unavailable".into(),
+        ))
+    }
+    async fn prepare_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<crate::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn read_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootKey,
+    ) -> Result<crate::types::managed_boot::ManagedBootHostState, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn finalize_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<crate::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn start_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootStart,
+    ) -> Result<crate::types::managed_boot::ManagedBootHostState, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    async fn read_managed_policy(
+        &self,
+        _target: crate::types::managed_deny::ManagedPolicyTarget,
+    ) -> Result<Option<crate::types::managed_deny::ManagedAppliedState>, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "managed host mode unavailable".into(),
+        ))
+    }
+    async fn apply_managed_policy(
+        &self,
+        _request: crate::types::managed_deny::ManagedPolicyApply,
+    ) -> Result<crate::types::managed_deny::ManagedAppliedState, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "managed host mode unavailable".into(),
+        ))
+    }
     /// ADR 0013: bundle the egress policy with the agent spawn so the
     /// host applies the policy to its egress proxy registry BEFORE
     /// starting the agent process. Atomic by construction —

@@ -39,18 +39,50 @@ impl OrgSecretBackend {
 
 #[async_trait]
 impl SecretStore for OrgSecretBackend {
+    async fn check_access(&self, name: &str, schema: &SecretSchema) -> Result<(), SecretError> {
+        for reference in [
+            Some(name),
+            schema
+                .r#ref
+                .as_deref()
+                .filter(|reference| *reference != name),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if self
+                .meta
+                .get_mcp_org_secret_reservation(reference)
+                .await
+                .map_err(|e| SecretError::Backend(Box::new(e)))?
+                .is_some()
+            {
+                return Err(SecretError::Unauthorized(
+                    "credential is reserved for MCP".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn get(
         &self,
         _ctx: &SecretContext<'_>,
         name: &str,
-        _schema: &SecretSchema,
+        schema: &SecretSchema,
     ) -> Result<Option<String>, SecretError> {
-        let Some(sealed) = self
+        self.check_access(name, schema).await?;
+        let sealed = self
             .meta
             .get_org_secret_sealed(name)
             .await
-            .map_err(|e| SecretError::Backend(Box::new(e)))?
-        else {
+            .map_err(|e| SecretError::Backend(Box::new(e)))?;
+        // A fresh name can be reserved and published after the first check.
+        // Purpose is permanent, and these are current reads from the same
+        // store: any MCP payload observed above must have a reservation here.
+        // Check absent payloads too, before allowing a deployment fallback.
+        self.check_access(name, schema).await?;
+        let Some(sealed) = sealed else {
             return Ok(None);
         };
         let cred = to_sealed_cred(&sealed)?;

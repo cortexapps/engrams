@@ -199,9 +199,17 @@ pub enum SessionEvent {
         args_json: String,
         at: DateTime<Utc>,
     },
+    HarnessToolCallCancelRequested {
+        run_id: String,
+        tool_call_id: String,
+        name: String,
+        at: DateTime<Utc>,
+    },
     HarnessRunCompleted {
         run_id: String,
         ok: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_tool_call_ids: Vec<String>,
         at: DateTime<Utc>,
     },
     /// ADR 0030: the in-flight run was stopped by an operator interrupt
@@ -530,6 +538,7 @@ impl SessionEvent {
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
             Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
+            Self::HarnessToolCallCancelRequested { .. } => "tool_call_cancel_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessRunContinued { .. } => "run_continued",
@@ -633,9 +642,31 @@ impl SessionEvent {
                 args_json,
                 at,
             },
-            HarnessEvent::RunCompleted { run_id, ok } => {
-                Self::HarnessRunCompleted { run_id, ok, at }
-            }
+            HarnessEvent::ToolCallCancelRequested {
+                run_id,
+                call_id,
+                name,
+            } => Self::HarnessToolCallCancelRequested {
+                run_id,
+                tool_call_id: call_id,
+                name,
+                at,
+            },
+            HarnessEvent::RunCompleted { run_id, ok } => Self::HarnessRunCompleted {
+                run_id,
+                ok,
+                deferred_tool_call_ids: Vec::new(),
+                at,
+            },
+            HarnessEvent::RunDeferred {
+                run_id,
+                deferred_tool_call_ids,
+            } => Self::HarnessRunCompleted {
+                run_id,
+                ok: true,
+                deferred_tool_call_ids,
+                at,
+            },
             HarnessEvent::RunContinued { run_id } => Self::HarnessRunContinued { run_id, at },
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted {
                 run_id,
@@ -821,13 +852,13 @@ impl PreviewConnLimiter {
     /// cap. The map entry is pruned when a session's last permit drops, so the
     /// map only ever holds sessions with live previews.
     pub fn try_acquire(self: &Arc<Self>, session: SessionId) -> Option<PreviewPermit> {
-        let sem = self
+        let entry = self
             .per_session
             .entry(session)
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.cap)))
-            .value()
-            .clone();
-        let permit = sem.try_acquire_owned().ok()?;
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.cap)));
+        // Hold the entry guard until acquisition so pruning cannot detach this semaphore.
+        let permit = entry.value().clone().try_acquire_owned().ok()?;
+        drop(entry);
         Some(PreviewPermit {
             limiter: Arc::clone(self),
             session,
@@ -846,11 +877,8 @@ pub struct PreviewPermit {
 
 impl Drop for PreviewPermit {
     fn drop(&mut self) {
-        // Release the slot FIRST so `available_permits` reflects this drop,
-        // THEN prune the entry iff no live previews remain for the session.
-        // `remove_if` is atomic per key: a concurrent `try_acquire` either
-        // keeps the entry (it holds a permit → predicate false) or re-creates a
-        // fresh one after removal — never a lost or double-counted slot.
+        // Acquisition and pruning hold the same entry lock, so an acquired
+        // permit always keeps its semaphore in the map.
         drop(self.permit.take());
         self.limiter.per_session.remove_if(&self.session, |_, sem| {
             sem.available_permits() >= self.limiter.cap
@@ -1328,14 +1356,14 @@ pub type SharedState = Arc<AppState>;
 pub async fn emit_harness_event(
     state: &SharedState,
     session_id: SessionId,
-    _sandbox_id: engram_core::SandboxId,
+    sandbox_id: engram_core::SandboxId,
     event: engram_harness_proto::HarnessEvent,
     _at: chrono::DateTime<chrono::Utc>,
     delivery: Option<EventDelivery>,
 ) -> Result<(), crate::error::ApiError> {
     state
         .harness_event_writer
-        .emit(session_id, event, delivery)
+        .ingest(session_id, sandbox_id, event, delivery)
         .await
 }
 
@@ -1374,15 +1402,73 @@ impl HarnessEventWriter {
     /// withholds the acknowledgement and drops the connection, so the
     /// harness replays the event (ADR 0123 C4).
     fn sink(self: Arc<Self>) -> EventSink {
-        Arc::new(move |session, _sandbox, event, delivery| {
+        Arc::new(move |session, sandbox, event, delivery| {
             let writer = self.clone();
             Box::pin(async move {
                 writer
-                    .emit(session, event, delivery)
+                    .ingest(session, sandbox, event, delivery)
                     .await
                     .map_err(|e| engram_host_agent::harness::SinkError(e.to_string()))
             })
         })
+    }
+
+    async fn wake_waiting_harness(&self, session_id: SessionId, kind: &str) {
+        if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
+            // ADR 0108 A8: a harness that just announced Idle can
+            // take a prompt NOW — a row waiting out ACK_TIMEOUT
+            // from a forward into a dead link has no reason to
+            // keep waiting. Without this recall the wake below
+            // finds nothing due and no-ops; the row then sits out
+            // the full timeout after a fast reattach.
+            if let Err(e) = self.meta.outbox_make_due(session_id).await {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "outbox make-due on attach signal failed (ack timeout backstops)",
+                );
+            }
+            if let Err(e) = self
+                .meta
+                .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+                .await
+            {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "deliver wake on attach signal failed (poll backstops)",
+                );
+            }
+            // The shim scan enqueues a Deliver op when rows are due
+            // and none is queued; a wake with nothing due is a
+            // no-op.
+            self.outbox_wake.notify_one();
+        }
+    }
+
+    async fn ingest(
+        &self,
+        session: SessionId,
+        sandbox: engram_core::SandboxId,
+        event: engram_harness_proto::HarnessEvent,
+        delivery: Option<EventDelivery>,
+    ) -> Result<(), crate::error::ApiError> {
+        let managed_target = if let Some(open) = self.meta.managed_boot_open(session).await? {
+            let target = self.meta.managed_policy_target(session).await?;
+            if !open
+                || target.sandbox_id != sandbox
+                || delivery.as_ref().map(|d| d.binding_epoch) != Some(target.binding_epoch)
+            {
+                return Err(engram_core::MetaError::Conflict(
+                    "managed event authority is closed".into(),
+                )
+                .into());
+            }
+            Some(target)
+        } else {
+            None
+        };
+        self.emit(session, event, delivery, managed_target).await
     }
 
     async fn emit(
@@ -1390,15 +1476,16 @@ impl HarnessEventWriter {
         session_id: SessionId,
         ev: engram_harness_proto::HarnessEvent,
         delivery: Option<EventDelivery>,
+        managed_target: Option<engram_core::types::managed_deny::ManagedPolicyTarget>,
     ) -> Result<(), crate::error::ApiError> {
         let Self {
             events,
             meta,
             clock,
-            outbox_wake,
+            outbox_wake: _,
             last_kind,
         } = self;
-        if let Some(delivery) = delivery {
+        if let Some(delivery) = delivery.filter(|_| managed_target.is_none()) {
             // ADR 0123 C5: the first event of a new generation settles the
             // open runs of older generations, except the run this event
             // itself continues (a re-attached harness keeps running it).
@@ -1474,7 +1561,8 @@ impl HarnessEventWriter {
         // phantom re-runs + resume/evict churn + a duplicate-turn transcript
         // the web can't render). Capture the ack id here (before
         // `session_event` moves into the published frame) and retire the row
-        // after the append. Unknown / already-acked ids are no-ops.
+        // with the append for managed sessions, or after it for ordinary
+        // sessions. Unknown / already-acked ids are no-ops.
         let ack_id = outbox_ack_id(session_id, &session_event);
 
         // Session titles: a harness-suggested title is materialized onto
@@ -1500,34 +1588,8 @@ impl HarnessEventWriter {
         // below: a re-announce after a reattach is exactly the
         // signal the incident waited 41 s for, and it is exactly
         // the shape the dedupe drops from the log.
-        if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
-            // ADR 0108 A8: a harness that just announced Idle can
-            // take a prompt NOW — a row waiting out ACK_TIMEOUT
-            // from a forward into a dead link has no reason to
-            // keep waiting. Without this recall the wake below
-            // finds nothing due and no-ops; the row then sits out
-            // the full timeout.
-            if let Err(e) = meta.outbox_make_due(session_id).await {
-                tracing::debug!(
-                    session_id = %session_id,
-                    error = %e,
-                    "outbox make-due on attach signal failed (ack timeout backstops)",
-                );
-            }
-            if let Err(e) = meta
-                .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
-                .await
-            {
-                tracing::debug!(
-                    session_id = %session_id,
-                    error = %e,
-                    "deliver wake on attach signal failed (poll backstops)",
-                );
-            }
-            // The shim scan enqueues a Deliver op when rows are due
-            // and none is queued; a wake with nothing due is a
-            // no-op.
-            outbox_wake.notify_one();
+        if managed_target.is_none() {
+            self.wake_waiting_harness(session_id, kind).await;
         }
 
         // Drop a back-to-back duplicate waiting-state marker. The
@@ -1596,7 +1658,27 @@ impl HarnessEventWriter {
             return Ok(());
         }
 
-        let idx = if let Some(delivery) = delivery {
+        let managed = managed_target.is_some();
+        let idx = if let Some(target) = managed_target {
+            let delivery = delivery.ok_or_else(|| {
+                engram_core::MetaError::Conflict("managed event sequence is missing".into())
+            })?;
+            let accepted = meta
+                .append_managed_harness_event(&engram_core::types::event::ManagedHarnessEvent {
+                    target,
+                    incarnation: delivery.incarnation,
+                    seq: delivery.seq,
+                    kind: kind.into(),
+                    payload,
+                    ack_id: ack_id.clone(),
+                })
+                .await?;
+            if accepted.outbox_acked {
+                metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+            }
+            self.wake_waiting_harness(session_id, kind).await;
+            accepted.idx
+        } else if let Some(delivery) = delivery {
             meta.append_session_event_idempotent(
                 session_id,
                 &format!(
@@ -1633,14 +1715,15 @@ impl HarnessEventWriter {
         // ADR 0073 fix: retire the durable outbox row this harness
         // event confirms. Placed AFTER `publish` so the ack's PG
         // write never sits in front of the live SSE frame (same
-        // rationale as the metric join below). Without this, the
+        // rationale as the metric join below). Managed sessions already
+        // acknowledged atomically with the accepted event. Without this, the
         // delivery driver never learns the prompt was consumed and
         // redelivers it on every resume forever. The ack runs for a
         // replayed duplicate too (idx None): the first delivery may
         // have stored the event and died before this ack, and the
         // replay is the only retry there is. A failed ack withholds the
         // harness ack so the event is replayed again.
-        if let Some(ack_id) = &ack_id {
+        if let Some(ack_id) = ack_id.as_ref().filter(|_| !managed) {
             match meta.outbox_ack(ack_id).await {
                 Ok(true) => {
                     metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -1764,6 +1847,26 @@ fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn tool_cancel_requested_keeps_original_identity_without_completion() {
+        let event = SessionEvent::from_harness(
+            HarnessEvent::ToolCallCancelRequested {
+                run_id: "r1".into(),
+                call_id: "c1".into(),
+                name: "remote_inventory".into(),
+            },
+            DateTime::from_timestamp(0, 0).unwrap(),
+        );
+        assert_eq!(event.kind(), "tool_call_cancel_requested");
+        assert_eq!(outbox_ack_id(SessionId::new(), &event), None);
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["run_id"], "r1");
+        assert_eq!(json["tool_call_id"], "c1");
+        assert_eq!(json["name"], "remote_inventory");
+        assert!(json.get("ok").is_none());
+        assert!(json.get("result_json").is_none());
+    }
 
     /// Incident 2026-07-10: PG jsonb rejects U+0000, so a
     /// `tool_call_completed` whose `result_summary` carried raw binary
@@ -2013,6 +2116,36 @@ pub(crate) mod tests {
             SessionEvent::PromptReceived { prompt_id, .. } => assert_eq!(prompt_id, "p-1"),
             other => panic!("expected PromptReceived, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deferred_completion_keeps_exact_association_and_old_records_default_closed() {
+        let at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let event = SessionEvent::from_harness(
+            HarnessEvent::RunDeferred {
+                run_id: "r1".into(),
+                deferred_tool_call_ids: vec!["t1".into()],
+            },
+            at,
+        );
+        assert_eq!(event.kind(), "run_completed");
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["deferred_tool_call_ids"], serde_json::json!(["t1"]));
+        let old = SessionEvent::from_harness(
+            HarnessEvent::RunCompleted {
+                run_id: "r1".into(),
+                ok: true,
+            },
+            at,
+        );
+        let old_json = serde_json::to_value(&old).unwrap();
+        assert!(old_json.get("deferred_tool_call_ids").is_none());
+        assert!(
+            matches!(serde_json::from_value::<SessionEvent>(old_json).unwrap(),
+            SessionEvent::HarnessRunCompleted { deferred_tool_call_ids, .. }
+                if deferred_tool_call_ids.is_empty())
+        );
     }
 
     #[test]
@@ -2481,6 +2614,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl MetadataStore for MiniMeta {
+        async fn managed_boot_open(&self, _: SessionId) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_sandbox_open(
+            &self,
+            _: engram_core::SandboxId,
+        ) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_tool_target_gone(&self, _: SessionId, _: &str) -> Result<bool, MetaError> {
+            Ok(false)
+        }
+
         /// ADR 0073: derive the idle-scan candidate from the mock's own
         /// session + event rows — the same "newest event" semantics the
         /// PG lateral implements, so idle_detector tests exercise real

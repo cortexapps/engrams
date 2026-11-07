@@ -21,7 +21,8 @@ const queryClient = new QueryClient({
 // useQuery/useMutation connect-query hooks without threading a transport prop everywhere.
 const transport = createConnectTransport({
   baseUrl: RPC_BASE,
-  fetch: (input, init) => fetch(input, { ...init, credentials: API_CREDENTIALS }),
+  fetch: (input, init) =>
+    fetch(input, { ...init, credentials: API_CREDENTIALS, cache: "no-store" }),
 });
 
 function InnerApp() {
