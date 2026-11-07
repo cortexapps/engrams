@@ -4903,7 +4903,9 @@ async fn wait_for_socket(
                 budget
             ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A restore waits on this twice, so the poll is short: each probe
+        // costs one syscall, and a long poll adds its interval to the restore.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
