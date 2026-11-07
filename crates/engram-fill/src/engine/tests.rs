@@ -783,3 +783,31 @@ async fn without_a_sandbox_cap_a_flood_takes_every_demand_slot() {
         fault.abort();
     }
 }
+
+#[tokio::test]
+async fn a_chunk_filled_once_is_not_fetched_again_at_a_lower_class() {
+    let f = fixture();
+    let a = put(&f, b"prefix chunk").await;
+    let b = put(&f, b"hydrate chunk").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+
+    engine.fill(vec![a], Class::Prefix).await.unwrap();
+    // Let the index build and sweep that the first write starts run.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stats = engine.fill(vec![b, a, b], Class::Hydrate).await.unwrap();
+
+    assert_eq!(
+        stats,
+        FillStats {
+            resident: 1,
+            fetched: 1,
+            duplicate: 1
+        }
+    );
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        2,
+        "one GET per chunk"
+    );
+}
