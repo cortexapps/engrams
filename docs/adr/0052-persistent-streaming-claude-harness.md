@@ -80,6 +80,8 @@ pipe survives a UFFD restore before Track C relies on it.
    on-disk JSONL via the existing `/workspace/.engram/claude-session-id`). Fresh
    process = fresh epoll each wake. This is the mainstream-proven path (OpenHands
    and the Claude Agent SDK both resume by reloading a disk transcript).
+   *Superseded 2026-11-06: this is now the `drain` setting; the default keeps
+   the harness alive (see the update after the steering update).*
 
 2. **Live mid-turn teleport (ADR 0045) — warm, gated on the Phase 0 spike.** A
    run actively generating crosses warm in the UFFD memory image; the migrated
@@ -185,6 +187,29 @@ on a CLI pin ≥ 2.1.237.
   steered message that ran is durable in OUR transcript, but a
   `--resume` respawn may lack it in claude's own context — acceptable,
   recorded.
+
+## Update 2026-11-06: the idle capture keeps the harness by default
+
+Decision 1 is now a host-agent setting, `ENGRAM_IDLE_EVICTION_HARNESS`
+(host-fleet chart value `hostAgent.idleEvictionHarness`), and its default
+changes from `drain` to `keep`.
+
+- `keep`: `LocalHostClient::snapshot_begin` does not send `Shutdown`. The
+  idle image holds the live harness and `claude`. On resume agentd's
+  reattach arm (the live-teleport path of decision 2) SIGUSR1s the harness,
+  which re-dials and keeps its process. A dev-cluster run showed the same
+  `claude` pid after restore, an API connection that recovered with no
+  help, and prompt → first token about 1.3–1.7 s shorter than the
+  `--resume` respawn.
+- `drain`: decision 1 as written above.
+
+The reasons decision 1 gave do not hold against the measurement: the
+reattach path already runs on every live teleport, rung-2 un-park, and
+un-drained idle capture, and "a fresh epoll each wake" costs a full
+`claude` start on every resume. The costs of `keep`: the agent's memory is
+in every idle image, a kept agent keeps the env it started with until it
+restarts, and the agent's own network state must recover after a long idle
+(not yet measured past one hour).
 
 ## Rollout (stacked PRs; ADR bookends)
 

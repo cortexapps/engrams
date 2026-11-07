@@ -50,6 +50,9 @@ pub struct HostAgentConfig {
     /// the mode=all / in-process test-harness backend, which never
     /// constructs a `HostAgentConfig` through `main.rs`'s match anyway.
     pub backend_name: String,
+    /// Whether an idle-eviction capture keeps the in-guest harness alive
+    /// or stops it first.
+    pub idle_eviction_harness: crate::host_client::IdleEvictionHarness,
 }
 
 impl Default for HostAgentConfig {
@@ -67,6 +70,7 @@ impl Default for HostAgentConfig {
             grpc_advertise_addr: None,
             migrate_peer_listen_addr: None,
             backend_name: "process".to_string(),
+            idle_eviction_harness: Default::default(),
         }
     }
 }

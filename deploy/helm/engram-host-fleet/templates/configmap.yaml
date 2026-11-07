@@ -13,6 +13,10 @@ data:
   ENGRAM_GRPC_LISTEN_ADDR: "0.0.0.0:{{ .Values.hostAgent.grpcPort }}"
   ENGRAM_HOST_METRICS_ADDR: "0.0.0.0:{{ .Values.hostAgent.metricsPort }}"
   ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
+  {{- if not (has .Values.hostAgent.idleEvictionHarness (list "keep" "drain")) }}
+  {{- fail "hostAgent.idleEvictionHarness must be keep or drain" }}
+  {{- end }}
+  ENGRAM_IDLE_EVICTION_HARNESS: {{ .Values.hostAgent.idleEvictionHarness | quote }}
   {{- if .Values.coordinator.endpoint }}
   ENGRAM_COORDINATOR_ENDPOINT: {{ .Values.coordinator.endpoint | quote }}
   {{- end }}
