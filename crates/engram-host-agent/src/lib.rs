@@ -662,9 +662,7 @@ impl HostAgent {
             let pooled_for_events = pooled.clone();
             let event_sink =
                 crate::harness::event_sink_to(move |session_id, sandbox_id, ev, delivery| {
-                    if matches!(ev, engram_harness_proto::HarnessEvent::RunCompleted { .. }) {
-                        pooled_for_events.note_run_completed(sandbox_id);
-                    }
+                    pooled_for_events.note_harness_event(sandbox_id, &ev);
                     let cc = coord_client_for_events.clone();
                     let events_clock = events_clock.clone();
                     async move {

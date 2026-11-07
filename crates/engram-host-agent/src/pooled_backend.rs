@@ -267,7 +267,10 @@ mod first_touch_tests {
         publish_first_touch(&plain, session, &file, Some(10)).await;
 
         let cache = engram_chunk_store::cache::ChunkCache::new(
-            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+            engram_chunk_store::cache::ChunkCacheConfig {
+                eviction_enabled: false,
+                ..engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache"))
+            },
         );
         let fill = FillEngine::new(
             ChunkStore::new(blob.clone()).with_chunk_cache(cache),
@@ -281,14 +284,33 @@ mod first_touch_tests {
         PooledBackend::prefetch_memory_chunks(&fill, Some(mref), Class::Hydrate, Some(session))
             .await
             .unwrap();
-        let mut first_gets = blob.gets.lock().clone();
-        let mut seen = std::collections::HashSet::new();
-        first_gets.retain(|key| seen.insert(key.clone()));
         let order: Vec<String> = [2, 3, 1, 0]
             .iter()
             .map(|&i| hashes[i].storage_key())
             .collect();
-        assert_eq!(first_gets, order);
+        assert_eq!(*blob.gets.lock(), order);
+    }
+
+    #[test]
+    fn only_the_first_run_started_here_ends_the_prefix() {
+        use engram_harness_proto::HarnessEvent;
+        let started = |id: &str| HarnessEvent::RunStarted {
+            run_id: id.into(),
+            prompt_summary: None,
+            prompt_id: None,
+        };
+        let completed = |id: &str| HarnessEvent::RunCompleted {
+            run_id: id.into(),
+            ok: true,
+        };
+        // A replayed completion of a run from before the restore.
+        assert_eq!(first_run_after(None, &completed("old"), || 1), None);
+        let first = first_run_after(None, &started("r1"), || 1).unwrap();
+        assert_eq!(first_run_after(Some(&first), &started("r2"), || 2), None);
+        assert_eq!(first_run_after(Some(&first), &completed("old"), || 3), None);
+        let done = first_run_after(Some(&first), &completed("r1"), || 4).unwrap();
+        assert_eq!(done, FirstRun::Completed { at_ms: 4 });
+        assert_eq!(first_run_after(Some(&done), &completed("r1"), || 5), None);
     }
 
     #[test]
@@ -403,6 +425,35 @@ async fn first_touch_hashes(
 /// the cap keeps more than twice that, and bounds what a restore fetches
 /// at `Prefix` ahead of the rest of guest memory.
 const FIRST_TOUCH_PREFIX_CAP: usize = 8192;
+
+/// The first agent run that started in a sandbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FirstRun {
+    Started { run_id: String },
+    Completed { at_ms: i64 },
+}
+
+/// The first run after `event`, or `None` when `event` changes nothing:
+/// the first `RunStarted` names the run, and only its `RunCompleted`
+/// completes it.
+fn first_run_after(
+    current: Option<&FirstRun>,
+    event: &engram_harness_proto::HarnessEvent,
+    now_ms: impl FnOnce() -> i64,
+) -> Option<FirstRun> {
+    use engram_harness_proto::HarnessEvent;
+    match (current, event) {
+        (None, HarnessEvent::RunStarted { run_id, .. }) => Some(FirstRun::Started {
+            run_id: run_id.clone(),
+        }),
+        (Some(FirstRun::Started { run_id: first }), HarnessEvent::RunCompleted { run_id, .. })
+            if first == run_id =>
+        {
+            Some(FirstRun::Completed { at_ms: now_ms() })
+        }
+        _ => None,
+    }
+}
 
 /// The record's chunk indices in touch order, split into the prefix (the
 /// chunks touched up to and including `cut_ms`, at most
@@ -807,15 +858,16 @@ pub struct PooledBackend {
     /// manifest: its last successful capture, or the chain seed of its
     /// restore. A sandbox without a stamp is due for a checkpoint.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
-    /// When each sandbox's first agent run completed (Unix ms). The
-    /// first-touch prefix a capture publishes ends here.
-    first_run_completed_ms: Arc<DashMap<SandboxId, i64>>,
+    /// Each sandbox's first agent run. The first-touch prefix a capture
+    /// publishes ends when it completes.
+    first_runs: Arc<DashMap<SandboxId, FirstRun>>,
     /// A restored sandbox's hinted peer, registered with the fill engine
     /// for its memory manifest until the sandbox goes.
     peer_registrations: Arc<DashMap<SandboxId, engram_fill::PeerRegistration>>,
     /// A lazily restored sandbox's registration with the fill engine for
-    /// its memory manifest: the faults of one sandbox share one `Demand`
-    /// cap while it lives.
+    /// its memory manifest, until the sandbox goes: its faults and its
+    /// disk reads share one `Demand` cap, also after the memory prefetch
+    /// ends.
     sandbox_registrations: Arc<DashMap<SandboxId, engram_fill::SandboxRegistration>>,
     /// A lazy restore's background memory prefetch; dropping the entry
     /// cancels it.
@@ -1849,7 +1901,7 @@ impl PooledBackend {
             {
                 Ok(disks) => Some(disks),
                 Err(error) => {
-                    self.drop_restore_fetches(id);
+                    self.drop_failed_restore(id);
                     return Err(error);
                 }
             }
@@ -1956,7 +2008,7 @@ impl PooledBackend {
         }
         .await;
         if restore.is_err() {
-            self.drop_restore_fetches(id);
+            self.drop_failed_restore(id);
             if let Some(volumes) = self.volumes.as_ref() {
                 if let Err(error) = volumes.release(id).await {
                     tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
@@ -1967,11 +2019,15 @@ impl PooledBackend {
     }
 
     /// End a restore's memory fetches: cancel its background prefetch and
-    /// drop its peer registration, which ends the peer's batching task,
-    /// and its sandbox registration.
+    /// drop its peer registration, which ends the peer's batching task.
     fn drop_restore_fetches(&self, id: SandboxId) {
         self.memory_prefetches.remove(&id);
         self.peer_registrations.remove(&id);
+    }
+
+    /// Undo what a failed restore left for the sandbox's fetches.
+    fn drop_failed_restore(&self, id: SandboxId) {
+        self.drop_restore_fetches(id);
         self.sandbox_registrations.remove(&id);
     }
 
@@ -2063,7 +2119,7 @@ impl PooledBackend {
             held_snapshots: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
-            first_run_completed_ms: Arc::new(DashMap::new()),
+            first_runs: Arc::new(DashMap::new()),
             peer_registrations: Arc::new(DashMap::new()),
             sandbox_registrations: Arc::new(DashMap::new()),
             memory_prefetches: DashMap::new(),
@@ -2525,6 +2581,20 @@ impl PooledBackend {
         }
     }
 
+    /// Note a harness event of the sandbox. The first run that starts in
+    /// this sandbox ends the first-touch prefix its captures publish, when
+    /// it completes. A completion of another run (one the harness replays
+    /// from before the restore) does not count.
+    pub fn note_harness_event(&self, id: SandboxId, event: &engram_harness_proto::HarnessEvent) {
+        // One reader loop delivers a sandbox's events in order.
+        let current = self.first_runs.get(&id).map(|e| e.clone());
+        if let Some(next) = first_run_after(current.as_ref(), event, || {
+            self.clock.now_utc().timestamp_millis()
+        }) {
+            self.first_runs.insert(id, next);
+        }
+    }
+
     /// Publish this sandbox's per-jail working-set trace to the blob store
     /// under the session-stable **canonical** key, so the session's NEXT
     /// resume finds it and prefaults its working set (the replay side landed
@@ -2547,14 +2617,6 @@ impl PooledBackend {
     /// fault path is the backstop. Idempotent: re-publishing the same
     /// canonical key is a harmless overwrite (a session runs one place at a
     /// time, so there are no concurrent writers).
-    /// Note that an agent run of the sandbox completed. The first one ends
-    /// the first-touch prefix the sandbox's captures publish.
-    pub fn note_run_completed(&self, id: SandboxId) {
-        self.first_run_completed_ms
-            .entry(id)
-            .or_insert_with(|| self.clock.now_utc().timestamp_millis());
-    }
-
     fn spawn_trace_publish(&self, id: SandboxId) {
         let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
             return; // no bound session → no canonical key to publish under
@@ -2565,7 +2627,10 @@ impl PooledBackend {
         let Some(chunk_store) = self.chunk_store.clone() else {
             return;
         };
-        let first_run_completed = self.first_run_completed_ms.get(&id).map(|e| *e);
+        let first_run_completed = match self.first_runs.get(&id).as_deref() {
+            Some(FirstRun::Completed { at_ms }) => Some(*at_ms),
+            _ => None,
+        };
         if let Some(dir) = trace_path.parent() {
             let file = dir.join(engram_chunk_store::FirstTouch::FILE);
             let store = chunk_store.clone();
@@ -6182,7 +6247,7 @@ impl SandboxBackend for PooledBackend {
                 let egress = self.egress.clone();
                 let inner = self.inner.clone();
                 let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
-                let first_run_completed_ms = self.first_run_completed_ms.clone();
+                let first_runs = self.first_runs.clone();
                 let peer_registrations = self.peer_registrations.clone();
                 let sandbox_registrations = self.sandbox_registrations.clone();
                 let checkpoint_pacing = self.checkpoint_pacing.clone();
@@ -6244,7 +6309,7 @@ impl SandboxBackend for PooledBackend {
                         }
                     }
                     let _ = last_snapshot_unix_ms.remove(&id);
-                    let _ = first_run_completed_ms.remove(&id);
+                    let _ = first_runs.remove(&id);
                     let _ = peer_registrations.remove(&id);
                     let _ = sandbox_registrations.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
