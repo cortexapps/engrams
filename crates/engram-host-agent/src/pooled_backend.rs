@@ -3799,9 +3799,11 @@ impl PooledBackend {
     }
 
     /// Make the memory manifest's chunks resident in the chunk cache at
-    /// `class`. With `first`, the chunks that session touched first last
-    /// time are fetched first, at `Prefix`; then, at `class`, the chunks it
-    /// touched after them in touch order, then the rest in manifest order.
+    /// `class`. With `first`, every chunk that session touched last time
+    /// (its first-touch prefix, then the chunks it touched after them) is
+    /// fetched first, in touch order, at `Prefix`: a resume touches most of
+    /// the previous life's later chunks before its own first run starts.
+    /// Then the rest of the manifest, in manifest order, at `class`.
     /// Best-effort for the caller: a failure leaves the faults (or the
     /// serial materialize) to fetch on demand.
     async fn prefetch_memory_chunks(
@@ -3817,26 +3819,23 @@ impl PooledBackend {
             fill.store().get_manifest(mref).await.map_err(|e| {
                 SandboxError::Snapshot(format!("prefetch get_manifest {mref}: {e}"))
             })?;
-        let mut order = match first {
-            Some(session) => {
-                let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
-                let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
-                let (prefix, rest) = tokio::join!(
-                    first_touch_hashes(fill.store(), session, &key, &manifest),
-                    first_touch_hashes(fill.store(), session, &rest_key, &manifest),
-                );
-                if !prefix.is_empty() {
-                    match fill.fill(prefix, Class::Prefix).await {
-                        Ok(stats) => tracing::info!(?stats, "memory first-touch prefix resident"),
-                        Err(e) => tracing::warn!(error = %e, "memory first-touch prefix failed"),
-                    }
+        if let Some(session) = first {
+            let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
+            let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
+            let (mut touched, rest) = tokio::join!(
+                first_touch_hashes(fill.store(), session, &key, &manifest),
+                first_touch_hashes(fill.store(), session, &rest_key, &manifest),
+            );
+            touched.extend(rest);
+            if !touched.is_empty() {
+                match fill.fill(touched, Class::Prefix).await {
+                    Ok(stats) => tracing::info!(?stats, "memory first-touch prefix resident"),
+                    Err(e) => tracing::warn!(error = %e, "memory first-touch prefix failed"),
                 }
-                rest
             }
-            None => Vec::new(),
-        };
-        // `fill` skips the repeats.
-        order.extend(manifest.chunks.iter().map(|c| c.hash));
+        }
+        // `fill` skips what the prefix already made resident.
+        let order = manifest.chunks.iter().map(|c| c.hash).collect();
         let stats = fill
             .fill(order, class)
             .await
