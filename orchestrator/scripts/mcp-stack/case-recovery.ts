@@ -634,7 +634,7 @@ export const revokeResumeDriver: CaseDriver = async ({
       callId: scenario.input.callId,
       tool: scenario.alias,
       planSha256: scenario.planSha256,
-      afterCount: prior.length,
+      expectExposure: "absent",
     });
     const oldDenied = retried.filter(
       (record) => record.proof.expectExposure === "absent",

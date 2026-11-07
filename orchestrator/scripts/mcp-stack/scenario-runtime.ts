@@ -523,7 +523,13 @@ type ProofSelection = {
   tool: string;
   planSha256?: string;
   afterCount?: number;
+  expectExposure?: "absent";
 };
+type ProofObservation = NonNullable<
+  Awaited<
+    ReturnType<typeof readGuestProofRecords>
+  >[number]["proof"]["observation"]
+>;
 export async function pollProof(
   ctx: Context,
   scenario: StartedScenario,
@@ -535,12 +541,7 @@ export async function pollGuestObservation(
   ctx: Context,
   scenario: StartedScenario,
   input: ProofSelection & {
-    observation:
-      | "completionBarrierHeld"
-      | "completionBarrierReleased"
-      | "prematureBarrierHeld"
-      | "prematureBarrierReleased"
-      | "prematureCompletionEmitted";
+    observation: ProofObservation;
   },
 ) {
   return pollSelectedProof(ctx, scenario, input);
@@ -548,18 +549,7 @@ export async function pollGuestObservation(
 async function pollSelectedProof(
   ctx: Context,
   scenario: StartedScenario,
-  input: {
-    callId: string;
-    tool: string;
-    planSha256?: string;
-    afterCount?: number;
-    observation?:
-      | "completionBarrierHeld"
-      | "completionBarrierReleased"
-      | "prematureBarrierHeld"
-      | "prematureBarrierReleased"
-      | "prematureCompletionEmitted";
-  },
+  input: ProofSelection & { observation?: ProofObservation },
 ) {
   requireThat(
     /^[A-Za-z0-9_-]{1,64}$/.test(input.callId) &&
@@ -594,25 +584,34 @@ async function pollSelectedProof(
           ),
         )
       ).flat();
-      return records.filter(
-        (record) =>
-          record.proof.callId === input.callId &&
-          record.proof.tool === input.tool &&
-          (input.planSha256 === undefined ||
-            record.proof.planSha256 === input.planSha256) &&
-          (input.observation !== undefined
-            ? record.proof.observation === input.observation
-            : record.proof.observation === undefined &&
-              (record.proof.resultReceived === true ||
-                record.proof.forgedRejected === true ||
-                (record.proof.expectExposure === "absent" &&
-                  record.proof.requestAttempted === true &&
-                  record.proof.protocolDenialCode === "unknown_tool"))),
-      );
+      return selectProofRecords(records, input);
     },
     (records) => records.length > afterCount,
   );
 }
+export function selectProofRecords(
+  records: Awaited<ReturnType<typeof readGuestProofRecords>>,
+  input: ProofSelection & { observation?: ProofObservation },
+) {
+  return records.filter(
+    (record) =>
+      record.proof.callId === input.callId &&
+      record.proof.tool === input.tool &&
+      (input.planSha256 === undefined ||
+        record.proof.planSha256 === input.planSha256) &&
+      (input.expectExposure === undefined ||
+        record.proof.expectExposure === input.expectExposure) &&
+      (input.observation !== undefined
+        ? record.proof.observation === input.observation
+        : record.proof.observation === undefined &&
+          (record.proof.resultReceived === true ||
+            record.proof.forgedRejected === true ||
+            (record.proof.expectExposure === "absent" &&
+              record.proof.requestAttempted === true &&
+              record.proof.protocolDenialCode === "unknown_tool"))),
+  );
+}
+
 export async function closeScenario(
   principals: {
     automation: Pick<PublicClient, "automationRuns">;
