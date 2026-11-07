@@ -476,22 +476,19 @@ impl ChunkStore {
                 if is_all_zero(&slice) {
                     return Ok::<_, crate::error::ChunkStoreError>((offset, None));
                 }
-                let hash = match &local_sink {
-                    // Migration flavor: hash + land in the local
+                let slice = slice.freeze();
+                let hash = crate::cache::hash_chunk(&slice).await?;
+                match &local_sink {
+                    // Migration flavor: land in the local
                     // cache only; no GCS round-trip on the pause
                     // path. NO per-write eviction sweep (the prod
                     // canary's 12.6s capture leg was mostly sweep
                     // readdirs) — the batch-closing sweep runs
                     // below, once.
                     Some(cache) => {
-                        let hash = crate::manifest::ChunkHash::of(&slice);
-                        cache
-                            .put_no_evict(hash, slice.freeze(), store.class())
-                            .await?;
-                        hash
+                        cache.put_no_evict(hash, slice, store.class()).await?;
                     }
                     None => {
-                        let hash = crate::manifest::ChunkHash::of(&slice);
                         if prev_hash == Some(hash) {
                             // Rebuilt to identical content: already
                             // durable — the parent manifest referencing
@@ -526,13 +523,10 @@ impl ChunkStore {
                             // sibling carries — new to this chain, so
                             // the dedup HEAD would almost always miss:
                             // unchecked PUT (ADR 0078 move 5).
-                            store
-                                .put_chunk_unchecked_prehashed(hash, slice.freeze())
-                                .await?;
+                            store.put_chunk_unchecked_prehashed(hash, slice).await?;
                         }
-                        hash
                     }
-                };
+                }
                 Ok((offset, Some(ChunkRef { offset, hash })))
             });
         }

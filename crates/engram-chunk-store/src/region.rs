@@ -285,10 +285,10 @@ impl ChunkStore {
                                 stats.chunks_uploaded += 1;
                                 stats.bytes_uploaded += body.len() as u64;
                                 let store = store.clone();
-                                // Its own task, so the SHA-256 and the PUT's
-                                // TLS use every core.
+                                // Its own task, so the PUT's TLS uses every
+                                // core; the SHA-256 runs off the async worker.
                                 inflight.spawn(async move {
-                                    let hash = store.put_chunk(&body).await?;
+                                    let hash = store.put_chunk_bytes(body.into()).await?;
                                     crate::Result::Ok((offset, hash))
                                 });
                             }

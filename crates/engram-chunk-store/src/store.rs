@@ -190,7 +190,7 @@ impl ChunkStore {
 
     /// [`Self::put_chunk`] for bytes the caller owns: no copy.
     pub async fn put_chunk_bytes(&self, body: Bytes) -> Result<ChunkHash> {
-        let hash = ChunkHash::of(&body);
+        let hash = crate::cache::hash_chunk(&body).await?;
         self.upload(hash, body, PutMode::Checked).await?;
         Ok(hash)
     }
@@ -209,9 +209,9 @@ impl ChunkStore {
     /// Not for capture/enable uploads — see [`Self::put_chunk`], where
     /// the dedup HEAD saves re-uploading tens of GiB on a re-bake.
     pub async fn put_chunk_unchecked(&self, body: &[u8]) -> Result<ChunkHash> {
-        let hash = ChunkHash::of(body);
-        self.put_chunk_unchecked_prehashed(hash, Bytes::copy_from_slice(body))
-            .await?;
+        let body = Bytes::copy_from_slice(body);
+        let hash = crate::cache::hash_chunk(&body).await?;
+        self.put_chunk_unchecked_prehashed(hash, body).await?;
         Ok(hash)
     }
 

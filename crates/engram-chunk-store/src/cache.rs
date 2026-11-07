@@ -2002,17 +2002,21 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
 /// a runtime worker (and the fetch timers on it) for over 5 ms.
 const INLINE_HASH_MAX: usize = 1024 * 1024;
 
+/// The hash of `bytes`; a large chunk is hashed off the async worker.
+pub async fn hash_chunk(bytes: &Bytes) -> Result<ChunkHash> {
+    if bytes.len() <= INLINE_HASH_MAX {
+        return Ok(ChunkHash::of(bytes));
+    }
+    let bytes = bytes.clone();
+    tokio::task::spawn_blocking(move || ChunkHash::of(&bytes))
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("hash task: {e}")))
+}
+
 /// `Err(HashMismatch)` unless `bytes`, fetched from the object store,
 /// hash to `hash`. A large chunk is hashed off the async worker.
 pub async fn verify_fetched(hash: ChunkHash, bytes: &Bytes) -> Result<()> {
-    let actual = if bytes.len() > INLINE_HASH_MAX {
-        let bytes = bytes.clone();
-        tokio::task::spawn_blocking(move || ChunkHash::of(&bytes))
-            .await
-            .map_err(|e| ChunkStoreError::Internal(format!("hash task: {e}")))?
-    } else {
-        ChunkHash::of(bytes)
-    };
+    let actual = hash_chunk(bytes).await?;
     if actual != hash {
         tracing::error!(
             hash = %hash,
