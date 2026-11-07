@@ -60,6 +60,21 @@ const DEFAULT_PULL_CONNS: usize = 4;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 const PEER_LOST_WINDOW: Duration = Duration::from_secs(30);
 
+/// A peer that opens no stream, or sends no frame, for this long is lost.
+/// A frame is at most a few MiB, which a live peer sends in milliseconds;
+/// a peer that stops answering would otherwise hold every stream open.
+const PEER_IDLE: Duration = Duration::from_secs(5);
+
+/// The next frame of a peer stream, or `Err` when the peer sent nothing
+/// for `idle`.
+async fn next_frame<S: futures::Stream + Unpin>(
+    stream: &mut S,
+    idle: Duration,
+) -> Result<Option<S::Item>, tokio::time::error::Elapsed> {
+    use futures::StreamExt;
+    tokio::time::timeout(idle, stream.next()).await
+}
+
 /// HTTP/2 stream/connection windows for peer pulls. Tonic's defaults
 /// (64 KiB / 1 MiB) cap a stream at ~20 MB/s; these put the
 /// bandwidth-delay product comfortably above NVMe rate. Adaptive
@@ -373,10 +388,16 @@ async fn pull_shard(
     hashes: Vec<ChunkHash>,
     cache: ChunkCache,
 ) -> PullStats {
-    use futures::StreamExt;
     let mut stats = PullStats::default();
     let wire_hashes: Vec<[u8; 32]> = hashes.iter().map(|h| *h.as_bytes()).collect();
-    let mut stream = match client.peer_chunk_get(wire_hashes, scope).await {
+    let opened = tokio::time::timeout(PEER_IDLE, client.peer_chunk_get(wire_hashes, scope)).await;
+    let Ok(opened) = opened else {
+        tracing::warn!("peer pull: stream open timed out");
+        metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout").increment(1);
+        stats.failed = true;
+        return stats;
+    };
+    let mut stream = match opened {
         Ok(s) => s,
         Err(e) => {
             // RESOURCE_EXHAUSTED (→ LimitExceeded) is backpressure, not
@@ -394,7 +415,18 @@ async fn pull_shard(
         }
     };
     let mut reassembly = Reassembly::new(hashes.len());
-    while let Some(frame) = stream.next().await {
+    loop {
+        let frame = match next_frame(&mut stream, PEER_IDLE).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!("peer pull: peer sent nothing; stream ends");
+                metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout")
+                    .increment(1);
+                stats.failed = true;
+                return stats;
+            }
+        };
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
@@ -538,8 +570,25 @@ pub struct PeerFetcher {
 impl PeerFetcher {
     /// Start the fetcher's batching task. It ends when the fetcher drops.
     pub fn spawn(addr: String, scope: PeerChunkScope, health: Arc<PeerHealth>) -> Arc<Self> {
+        Self::spawn_with_idle(addr, scope, health, PEER_IDLE)
+    }
+
+    /// [`Self::spawn`], with the peer lost after `idle` without a stream
+    /// or a frame.
+    fn spawn_with_idle(
+        addr: String,
+        scope: PeerChunkScope,
+        health: Arc<PeerHealth>,
+        idle: Duration,
+    ) -> Arc<Self> {
         let (requests, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(batch_requests(addr.clone(), scope, health.clone(), rx));
+        tokio::spawn(batch_requests(
+            addr.clone(),
+            scope,
+            health.clone(),
+            idle,
+            rx,
+        ));
         Arc::new(Self {
             addr,
             health,
@@ -595,6 +644,7 @@ async fn batch_requests(
     addr: String,
     scope: PeerChunkScope,
     health: Arc<PeerHealth>,
+    idle: Duration,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(ChunkHash, PeerWaiter)>,
 ) {
     let in_flight = Arc::new(Semaphore::new(PEER_BATCHES_IN_FLIGHT));
@@ -619,7 +669,11 @@ async fn batch_requests(
         let connected = match client.clone() {
             Some(c) => c,
             None => match peer_endpoint(&addr) {
-                Ok(endpoint) => match endpoint.connect().await {
+                Ok(endpoint) => match tokio::time::timeout(idle, endpoint.connect())
+                    .await
+                    .map_err(|_| "timed out".to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()))
+                {
                     Ok(channel) => {
                         let c = GrpcHostClient::new(channel);
                         client = Some(c.clone());
@@ -641,7 +695,7 @@ async fn batch_requests(
         let (scope, health, addr) = (scope.clone(), health.clone(), addr.clone());
         tokio::spawn(async move {
             let _slot = slot;
-            fetch_batch(connected, scope, batch, &health, &addr).await;
+            fetch_batch(connected, scope, batch, &health, &addr, idle).await;
         });
     }
 }
@@ -655,11 +709,20 @@ async fn fetch_batch(
     batch: Vec<(ChunkHash, PeerWaiter)>,
     health: &PeerHealth,
     addr: &str,
+    idle: Duration,
 ) {
-    use futures::StreamExt;
     let wire: Vec<[u8; 32]> = batch.iter().map(|(h, _)| *h.as_bytes()).collect();
     let mut waiters: Vec<Option<PeerWaiter>> = batch.into_iter().map(|(_, w)| Some(w)).collect();
-    let mut stream = match client.peer_chunk_get(wire, scope).await {
+    let Ok(opened) = tokio::time::timeout(idle, client.peer_chunk_get(wire, scope)).await else {
+        tracing::warn!(
+            addr,
+            "peer fetch: stream open timed out; peer lost for the window"
+        );
+        metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout").increment(1);
+        health.mark_lost(addr);
+        return;
+    };
+    let mut stream = match opened {
         Ok(s) => s,
         Err(engram_core::SandboxError::LimitExceeded(_)) => {
             metrics::counter!("engram_peer_pull_total", "outcome" => "backpressure").increment(1);
@@ -672,7 +735,21 @@ async fn fetch_batch(
         }
     };
     let mut reassembly = Reassembly::new(waiters.len());
-    while let Some(frame) = stream.next().await {
+    loop {
+        let frame = match next_frame(&mut stream, idle).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!(
+                    addr,
+                    "peer fetch: peer sent nothing; peer lost for the window"
+                );
+                metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout")
+                    .increment(1);
+                health.mark_lost(addr);
+                return;
+            }
+        };
         let assembled = match frame {
             Ok(frame) => reassembly.push(frame),
             Err(e) => Err(e.to_string()),
@@ -698,6 +775,38 @@ async fn fetch_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that accepts the connection and never answers is lost after
+    /// the idle deadline, and its waiters get `None`.
+    #[tokio::test]
+    async fn a_silent_peer_is_lost_after_the_idle_deadline() {
+        use engram_fill::PeerSource as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                open.push(socket);
+            }
+        });
+        let health = PeerHealth::new();
+        let fetcher = PeerFetcher::spawn_with_idle(
+            addr.clone(),
+            PeerChunkScope::Snapshot(engram_core::SnapshotId::new()),
+            health.clone(),
+            Duration::from_millis(200),
+        );
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetcher.fetch(ChunkHash::of(b"chunk")),
+        )
+        .await
+        .expect("the fetch ends");
+        assert_eq!(got, None);
+        assert!(health.is_lost(&addr));
+        held.abort();
+    }
 
     fn frame(item_idx: u32, offset: u64, data: &[u8], last: bool) -> PeerChunkFrame {
         PeerChunkFrame {
