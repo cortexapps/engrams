@@ -16,9 +16,12 @@
 use engram_chunk_store::bootstrap::Bootstrap;
 use engram_chunk_store::error::ChunkStoreError;
 use engram_chunk_store::manifest::{
-    ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION,
+    ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, ManifestRef, MANIFEST_SCHEMA_VERSION,
 };
+use engram_chunk_store::manifest_codec::BINARY_MAGIC;
+use engram_chunk_store::working_set::TraceRef;
 use proptest::prelude::*;
+use uuid::Uuid;
 
 /// Capped per the ADR: heavier targets keep `cases` in the 64..128 band
 /// so the whole suite respects the nextest slow-timeout.
@@ -130,6 +133,36 @@ fn arb_valid_manifest_with_chunks(min_chunks: usize) -> impl Strategy<Value = Ma
                 annotations: serde_json::Value::Null,
             }
         })
+}
+
+/// A valid manifest with each optional field present or absent.
+fn arb_decorated_manifest() -> impl Strategy<Value = Manifest> {
+    let uuid = any::<u128>().prop_map(Uuid::from_u128);
+    let parent = proptest::option::of((uuid.clone(), any::<u64>()).prop_map(
+        |(manifest_id, version)| ManifestRef {
+            manifest_id,
+            version,
+        },
+    ));
+    let trace = proptest::option::of((uuid.clone(), proptest::option::of(uuid)).prop_map(
+        |(manifest_id, host_id)| TraceRef {
+            manifest_id,
+            host_id,
+        },
+    ));
+    let annotations = prop_oneof![
+        Just(serde_json::Value::Null),
+        "[a-z]{0,8}".prop_map(|tag| serde_json::json!({ "image_tag": tag })),
+        Just(serde_json::json!([1, "two", null])),
+    ];
+    (arb_valid_manifest(), parent, trace, annotations).prop_map(
+        |(m, parent, working_set_trace, annotations)| Manifest {
+            parent,
+            working_set_trace,
+            annotations,
+            ..m
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -249,15 +282,16 @@ proptest! {
         prop_assert_eq!(ChunkHash::from_hex(&a.to_hex()).unwrap(), a);
     }
 
-    /// Manifest serde-JSON round-trip is lossless AND preserves
-    /// `content_ref()` — the digest is the reuse key, so any serde skew
-    /// that perturbed it would silently defeat base-snapshot reuse.
+    /// Both encodings round-trip losslessly AND preserve `content_ref()`
+    /// — the digest is the reuse key, so any codec skew that perturbed it
+    /// would silently defeat base-snapshot reuse.
     #[test]
-    fn manifest_json_round_trip_preserves_content_ref(m in arb_valid_manifest()) {
-        let json = serde_json::to_string(&m).unwrap();
-        let back: Manifest = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(&back, &m, "JSON round-trip must be lossless");
-        prop_assert_eq!(back.content_ref(), m.content_ref(), "content_ref must survive serde");
+    fn manifest_round_trip_preserves_content_ref(m in arb_decorated_manifest()) {
+        for bytes in [m.encode_json().unwrap(), m.encode_binary().unwrap()] {
+            let back = Manifest::decode(&bytes).unwrap();
+            prop_assert_eq!(&back, &m, "round-trip must be lossless");
+            prop_assert_eq!(back.content_ref(), m.content_ref(), "content_ref must survive");
+        }
         // content_ref is always a well-formed RFC 4122 v8 UUID, v1.
         let r = m.content_ref();
         prop_assert_eq!(r.version, 1);
@@ -353,5 +387,41 @@ proptest! {
             ),
             "future schema_version must be rejected as unsupported",
         );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/proptest-regressions/manifest_decode.txt"
+            )),
+        )),
+        ..ProptestConfig::default()
+    })]
+
+    /// `Manifest::decode` returns an error, never a panic, on any input:
+    /// raw bytes, bytes behind the binary magic, and a valid binary
+    /// manifest with one byte changed or a tail cut off.
+    #[test]
+    fn decode_never_panics(
+        raw in proptest::collection::vec(any::<u8>(), 0..512),
+        m in arb_decorated_manifest(),
+        flip in any::<(usize, u8)>(),
+        cut in any::<usize>(),
+    ) {
+        let _ = Manifest::decode(&raw);
+        let mut behind_magic = BINARY_MAGIC.to_vec();
+        behind_magic.extend_from_slice(&raw);
+        let _ = Manifest::decode(&behind_magic);
+
+        let valid = m.encode_binary().unwrap();
+        let mut flipped = valid.clone();
+        let at = flip.0 % flipped.len();
+        flipped[at] ^= flip.1;
+        let _ = Manifest::decode(&flipped);
+        let _ = Manifest::decode(&valid[..cut % valid.len()]);
     }
 }

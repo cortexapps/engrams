@@ -633,15 +633,35 @@ fn publish_hot_hint(dir: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
     std::fs::rename(tmp, dir.join("hot-hint.json"))
 }
 
+/// First bytes of a binary hot hint. A `u16` LE format version and the
+/// 32-byte hashes, in order, follow. Any other hint is JSON.
+const HOT_HINT_MAGIC: [u8; 4] = *b"EGHH";
+const HOT_HINT_FORMAT_VERSION: u16 = 1;
+
+#[cfg(test)]
+fn encode_hot_hint_binary(hot: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + hot.len() * 32);
+    out.extend_from_slice(&HOT_HINT_MAGIC);
+    out.extend_from_slice(&HOT_HINT_FORMAT_VERSION.to_le_bytes());
+    out.extend(hot.iter().flatten());
+    out
+}
+
 /// Parse the optional hint independently of the required disk seal.
+/// `None` means the JSON hint has no `hot_chunks` yet.
 fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
-    let result = (|| {
-        let value: serde_json::Value = serde_json::from_slice(bytes)?;
-        value
-            .get("hot_chunks")
-            .map(|hot| serde_json::from_value(hot.clone()))
-            .transpose()
-    })();
+    let result = match bytes.strip_prefix(&HOT_HINT_MAGIC) {
+        Some(body) => decode_hot_hint_binary(body).map(Some),
+        None => serde_json::from_slice::<serde_json::Value>(bytes)
+            .and_then(|mut value| {
+                value
+                    .as_object_mut()
+                    .and_then(|hint| hint.remove("hot_chunks"))
+                    .map(serde_json::from_value)
+                    .transpose()
+            })
+            .map_err(|e| e.to_string()),
+    };
     match result {
         Ok(hot) => hot,
         Err(error) => {
@@ -649,6 +669,21 @@ fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
             Some(Vec::new())
         }
     }
+}
+
+fn decode_hot_hint_binary(body: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    let (version, hashes) = body
+        .split_first_chunk::<2>()
+        .ok_or("binary hot hint: truncated version")?;
+    let version = u16::from_le_bytes(*version);
+    if version != HOT_HINT_FORMAT_VERSION {
+        return Err(format!("binary hot hint: unknown format version {version}"));
+    }
+    let (hashes, rest) = hashes.as_chunks::<32>();
+    if !rest.is_empty() {
+        return Err(format!("binary hot hint: {} trailing bytes", rest.len()));
+    }
+    Ok(hashes.to_vec())
 }
 
 /// Atomically stage an advisory hint after state.bin has opened the load gate.
@@ -8583,6 +8618,26 @@ mod tests {
         }
         assert_eq!(parse_hot_hint(br#"{"hot_chunks":[]}"#), Some(vec![]));
         assert!(parse_hot_hint(br#"{}"#).is_none());
+    }
+
+    #[test]
+    fn hot_hint_reads_the_json_and_the_binary_form() {
+        let hot = vec![[7u8; 32], [0u8; 32], [255u8; 32]];
+        let json = serde_json::to_vec(&serde_json::json!({ "hot_chunks": hot })).unwrap();
+        assert_eq!(parse_hot_hint(&json), Some(hot.clone()));
+        let binary = encode_hot_hint_binary(&hot);
+        assert_eq!(parse_hot_hint(&binary), Some(hot.clone()));
+        // A torn or unknown binary hint is malformed, never pending.
+        for len in 0..binary.len() {
+            let want = match len.checked_sub(6) {
+                Some(body) if body % 32 == 0 => hot[..body / 32].to_vec(),
+                _ => Vec::new(),
+            };
+            assert_eq!(parse_hot_hint(&binary[..len]), Some(want), "prefix {len}");
+        }
+        let mut future = binary;
+        future[4] = 2;
+        assert_eq!(parse_hot_hint(&future), Some(Vec::new()));
     }
 
     #[tokio::test(start_paused = true)]
