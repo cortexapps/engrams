@@ -1584,6 +1584,18 @@ impl PooledBackend {
         }
 
         let src = self.inner.snapshot_path_for(metadata.id);
+        // A hinted peer holds the session's chunks on local disk: the disk
+        // stages and every memory fetch of a lazy restore ask it before
+        // the store.
+        let peer: Option<Arc<dyn engram_fill::PeerSource>> =
+            metadata.peer_hints.first().map(|addr| {
+                let peer: Arc<dyn engram_fill::PeerSource> = crate::peer_fill::PeerFetcher::spawn(
+                    addr.clone(),
+                    engram_protocol::grpc_client::PeerChunkScope::Snapshot(metadata.id),
+                    self.peer_health.clone(),
+                );
+                peer
+            });
 
         // The sidecar names the memory manifest `materialize_memory_if_missing`
         // rebuilds from, so on a cross-host restore it is downloaded first.
@@ -1614,17 +1626,10 @@ impl PooledBackend {
             // An earlier restore's fetches for this id end before this
             // restore registers its own.
             self.drop_restore_fetches(id);
-            // A hinted peer holds the session's chunks on local disk: every
-            // memory fetch of this restore (faults through the substrate,
-            // the prefix, the rest) asks it before the store.
-            let fill = match (md.peer_hints.first(), md.memory_manifest) {
-                (Some(addr), Some(memory)) => {
-                    let peer: Arc<dyn engram_fill::PeerSource> =
-                        crate::peer_fill::PeerFetcher::spawn(
-                            addr.clone(),
-                            engram_protocol::grpc_client::PeerChunkScope::Snapshot(md.id),
-                            self.peer_health.clone(),
-                        );
+            // Faults through the substrate, the prefix and the rest ask the
+            // peer.
+            let fill = match (peer.clone(), md.memory_manifest) {
+                (Some(peer), Some(memory)) => {
                     self.peer_registrations.insert(
                         id,
                         fill.register_peer(memory.manifest_id, Arc::clone(&peer)),
@@ -1650,10 +1655,13 @@ impl PooledBackend {
             self.memory_prefetches.insert(id, AbortTaskOnDrop(prefetch));
         }
 
-        let disks = match self.volumes.as_ref() {
-            Some(volumes) => match tracing::Instrument::instrument(
-                self.provision_for_restore(volumes, id, &metadata, &src, fresh, fork_disk),
-                tracing::info_span!("restore.provision_disks"),
+        let disks = if self.volumes.is_some() {
+            match tracing::Instrument::instrument(
+                self.provision_for_restore(id, &metadata, &src, fresh, fork_disk, peer),
+                tracing::info_span!(
+                    "restore.provision_disks",
+                    peer_chunks = tracing::field::Empty
+                ),
             )
             .await
             {
@@ -1662,8 +1670,9 @@ impl PooledBackend {
                     self.drop_restore_fetches(id);
                     return Err(error);
                 }
-            },
-            None => None,
+            }
+        } else {
+            None
         };
         let restore = async {
             // A staged post-copy destination arms its fetch poller as soon
@@ -1784,12 +1793,12 @@ impl PooledBackend {
     /// Provision a restored sandbox's disks from the snapshot's manifests.
     async fn provision_for_restore(
         &self,
-        volumes: &SessionVolumes,
         id: SandboxId,
         metadata: &SnapshotMetadata,
         src: &Path,
         fresh: bool,
         fork_disk: bool,
+        peer: Option<Arc<dyn engram_fill::PeerSource>>,
     ) -> Result<SessionDisks, SandboxError> {
         let manifest = metadata.disk_manifest.ok_or_else(|| {
             SandboxError::MemoryImageUnusable("snapshot has no disk manifest".into())
@@ -1826,10 +1835,21 @@ impl PooledBackend {
                 size_bytes: mib << 20,
             }),
         };
-        let provisioned = volumes
-            .provision(id, root, swap)
+        let peer = peer.map(crate::peer_fill::CountingPeer::new);
+        let provisioned = self
+            .volumes()?
+            .provision_with_peer(
+                id,
+                root,
+                swap,
+                peer.clone().map(|p| p as Arc<dyn engram_fill::PeerSource>),
+            )
             .await
-            .map_err(|e| SandboxError::Vm(format!("provision session disks: {e}").into()))?;
+            .map_err(|e| SandboxError::Vm(format!("provision session disks: {e}").into()));
+        if let Some(peer) = &peer {
+            tracing::Span::current().record("peer_chunks", peer.answered());
+        }
+        let provisioned = provisioned?;
         Ok(SessionDisks {
             root: provisioned.root,
             swap: provisioned.swap,

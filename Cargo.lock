@@ -2723,6 +2723,7 @@ name = "engram-host-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "engram-chunk-store",
  "engram-core",

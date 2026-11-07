@@ -560,6 +560,37 @@ impl engram_fill::PeerSource for PeerFetcher {
     }
 }
 
+/// A peer source that counts the chunks its peer answered.
+pub struct CountingPeer {
+    inner: Arc<dyn engram_fill::PeerSource>,
+    answered: std::sync::atomic::AtomicU64,
+}
+
+impl CountingPeer {
+    pub fn new(inner: Arc<dyn engram_fill::PeerSource>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            answered: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn answered(&self) -> u64 {
+        self.answered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl engram_fill::PeerSource for CountingPeer {
+    async fn fetch(&self, hash: ChunkHash) -> Option<bytes::Bytes> {
+        let got = self.inner.fetch(hash).await;
+        if got.is_some() {
+            self.answered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        got
+    }
+}
+
 async fn batch_requests(
     addr: String,
     scope: PeerChunkScope,

@@ -28,7 +28,7 @@ use engram_chunk_store::{ChunkSize, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
-use engram_fill::{Class, FillEngine};
+use engram_fill::{Class, FillEngine, PeerSource};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
@@ -270,15 +270,34 @@ impl SessionVolumes {
         root: Source,
         swap: Option<Source>,
     ) -> io::Result<Provisioned> {
+        self.provision_with_peer(sandbox, root, swap, None).await
+    }
+
+    /// [`Self::provision`], with each chunk a stage fetches asked of
+    /// `peer` (a host that holds the session's chunks) before the store.
+    pub async fn provision_with_peer(
+        &self,
+        sandbox: SandboxId,
+        root: Source,
+        swap: Option<Source>,
+        peer: Option<Arc<dyn PeerSource>>,
+    ) -> io::Result<Provisioned> {
+        let fill = match peer {
+            Some(peer) => self.fill.with_peer(peer),
+            None => self.fill.clone(),
+        };
         // A sandbox resumed on this host is live again: its kept
         // checkpoint is no longer the reap's to purge.
         self.kept.lock().unwrap().retain(|s| *s != sandbox);
         let provisioned = async {
-            let (root, root_manifest) = self.provision_role(sandbox, DiskRole::Root, root).await?;
+            let (root, root_manifest) = self
+                .provision_role(&fill, sandbox, DiskRole::Root, root)
+                .await?;
             let (swap, swap_manifest) = match swap {
                 Some(source) => {
-                    let (path, manifest) =
-                        self.provision_role(sandbox, DiskRole::Swap, source).await?;
+                    let (path, manifest) = self
+                        .provision_role(&fill, sandbox, DiskRole::Swap, source)
+                        .await?;
                     (Some(path), Some(manifest))
                 }
                 None => (None, None),
@@ -301,6 +320,7 @@ impl SessionVolumes {
     /// manifest is in the store; then the live volume as its snapshot.
     /// A `Continue` of a checkpoint this host kept for the lineage skips
     /// the stage; one of a newer manifest stages only the delta onto it.
+    /// A stage fetches through `fill`.
     #[tracing::instrument(
         name = "disk.provision",
         skip_all,
@@ -308,6 +328,7 @@ impl SessionVolumes {
     )]
     async fn provision_role(
         &self,
+        fill: &FillEngine,
         sandbox: SandboxId,
         role: DiskRole,
         source: Source,
@@ -340,7 +361,7 @@ impl SessionVolumes {
                 match self.staged(manifest).await {
                     Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
                     None => {
-                        self.stage_into(&tmp, &wanted, base)
+                        self.stage_into(fill, &tmp, &wanted, base)
                             .instrument(tracing::info_span!("disk.stage"))
                             .await?
                     }
@@ -367,7 +388,7 @@ impl SessionVolumes {
                             {
                                 stage(
                                     self.disk.as_ref(),
-                                    &self.fill,
+                                    fill,
                                     Class::Demand,
                                     &tmp,
                                     &wanted,
@@ -377,7 +398,7 @@ impl SessionVolumes {
                                 .await?
                             }
                             _ => {
-                                self.stage_into(&tmp, &wanted, base)
+                                self.stage_into(fill, &tmp, &wanted, base)
                                     .instrument(tracing::info_span!("disk.stage"))
                                     .await?
                             }
@@ -516,10 +537,11 @@ impl SessionVolumes {
         self.disk.open(&name).await
     }
 
-    /// Write `wanted` into a new volume `name`, from the staged volume of
-    /// `base` when this host has it.
+    /// Write `wanted` into a new volume `name` through `fill`, from the
+    /// staged volume of `base` when this host has it.
     async fn stage_into(
         &self,
+        fill: &FillEngine,
         name: &VolumeName,
         wanted: &Manifest,
         base: Option<ManifestRef>,
@@ -530,7 +552,7 @@ impl SessionVolumes {
         };
         stage(
             self.disk.as_ref(),
-            &self.fill,
+            fill,
             Class::Demand,
             name,
             wanted,
@@ -1260,6 +1282,56 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
         assert_eq!(p.root_manifest, published);
+    }
+
+    /// Holds every chunk a stage asks for.
+    struct MapPeer(std::collections::HashMap<engram_chunk_store::ChunkHash, bytes::Bytes>);
+
+    #[async_trait::async_trait]
+    impl PeerSource for MapPeer {
+        async fn fetch(&self, hash: engram_chunk_store::ChunkHash) -> Option<bytes::Bytes> {
+            self.0.get(&hash).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stage_with_a_peer_reads_the_peer_before_the_store() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let published = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+        let pattern = [1u8, 9];
+        let chunks = r.store.get_manifest(published).await.unwrap().chunks;
+        let peer = MapPeer(
+            chunks
+                .iter()
+                .map(|c| {
+                    let byte = pattern[(c.offset / CHUNK) as usize];
+                    (c.hash, bytes::Bytes::from(vec![byte; CHUNK as usize]))
+                })
+                .collect(),
+        );
+
+        let gets = r.blob.gets();
+        let second = SandboxId::new();
+        let p = r
+            .volumes
+            .provision_with_peer(
+                second,
+                Source::Continue {
+                    manifest: published,
+                    base: None,
+                },
+                None,
+                Some(Arc::new(peer)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+        assert_eq!(r.blob.gets(), gets, "every chunk came from the peer");
     }
 
     #[tokio::test]

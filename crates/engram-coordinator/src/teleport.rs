@@ -452,11 +452,9 @@ mod steps {
                 .meta
                 .latest_snapshot_for_session(row.session_id)
                 .await?;
-            let source_addr = state
-                .services
-                .meta
-                .get_host(row.source_host_id)
-                .await?
+            let source = state.services.meta.get_host(row.source_host_id).await?;
+            let peer_hints = source_peer_hints(state, source.as_ref());
+            let source_addr = source
                 .and_then(|h| h.host_addr)
                 .ok_or_else(|| ApiError::Unavailable("source host has no address".into()))?;
             let hostpart = source_addr
@@ -495,7 +493,7 @@ mod steps {
                 working_set_blob_key: None,
                 aux_bundles: durable.map(|s| s.aux_bundles).unwrap_or_default(),
                 paused_at: None,
-                peer_hints: Vec::new(),
+                peer_hints,
             };
             return advance(
                 ctx,
@@ -966,21 +964,8 @@ mod steps {
                 .await?
                 .ok_or_else(|| ApiError::Internal("teleport snapshot missing".into()))?;
         let session = state.services.meta.get_session(row.session_id).await?;
-        let peer_hints = state
-            .services
-            .meta
-            .get_host(row.source_host_id)
-            .await?
-            .and_then(|h| {
-                crate::placement::host_can_serve_chunks(
-                    &h,
-                    state.services.clock.now_utc(),
-                    crate::placement::placement_ttl(),
-                )
-                .map(str::to_owned)
-            })
-            .into_iter()
-            .collect();
+        let source = state.services.meta.get_host(row.source_host_id).await?;
+        let peer_hints = source_peer_hints(state, source.as_ref());
         let base = crate::api::snapshot::base_manifests_for_image(state, &session.image).await;
         let metadata = SnapshotMetadata {
             id: snapshot.id,
@@ -1376,6 +1361,25 @@ mod steps {
             .await?;
         Ok(Some(OpOutcome::Done))
     }
+}
+
+/// The source host as the destination's chunk peer, when it can serve:
+/// it holds the session's chunks on local disk.
+fn source_peer_hints(
+    state: &SharedState,
+    source: Option<&engram_core::types::host::HostRecord>,
+) -> Vec<String> {
+    source
+        .and_then(|h| {
+            crate::placement::host_can_serve_chunks(
+                h,
+                state.services.clock.now_utc(),
+                crate::placement::placement_ttl(),
+            )
+        })
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

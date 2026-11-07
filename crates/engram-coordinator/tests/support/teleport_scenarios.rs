@@ -382,6 +382,35 @@ async fn crash_after_presetup_reuses_live_payload(mut rig: Rig) {
 }
 scenario!(crash_after_presetup_reuses_live_payload);
 
+async fn live_payload_names_the_source_as_a_chunk_peer(mut rig: Rig) {
+    let meta = &rig.state.services.meta;
+    let mut source = meta
+        .get_host(rig.row.source_host_id)
+        .await
+        .unwrap()
+        .unwrap();
+    source.wire_version = engram_protocol::WIRE_VERSION;
+    meta.upsert_host(source).await.unwrap();
+    rig.make_live().await;
+    rig.source.block_capture.store(true, Ordering::SeqCst);
+    let task = rig.spawn_drive();
+    rig.source.capture_entered.notified().await;
+    let row = meta
+        .open_teleport_for_session(rig.row.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: engram_core::types::snapshot::SnapshotMetadata =
+        serde_json::from_value(row.live_payload.unwrap()).unwrap();
+    assert_eq!(metadata.peer_hints, vec!["http://source:8080".to_string()]);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    rig.reclaim().await;
+    rig.source.block_capture.store(false, Ordering::SeqCst);
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+}
+scenario!(live_payload_names_the_source_as_a_chunk_peer);
+
 async fn live_refusal_downgrades_to_snapshot_in_row(rig: Rig) {
     assert_eq!(
         rig.row.kind,

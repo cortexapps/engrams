@@ -30,6 +30,7 @@ uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+bytes.workspace = true
 engram-storage-local.workspace = true
 serde_json.workspace = true
 tempfile = "3"
