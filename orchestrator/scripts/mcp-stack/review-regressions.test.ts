@@ -3,7 +3,10 @@ import { create } from "@bufbuild/protobuf";
 import { ListSessionEventsResponseSchema } from "../../src/gen/engram/app/v1/session_pb.ts";
 import { toolCompletionEvents } from "./scenario-runtime.ts";
 import { selectColdDenial } from "./case-physical.ts";
-import { assertNewIdWriteDenial } from "./case-recovery.ts";
+import {
+  assertDuplicateWriteUnknown,
+  assertNewIdWriteDenial,
+} from "./case-recovery.ts";
 import { canonicalJson, parseGuestProofRecords } from "./guest.ts";
 import { sha256 } from "./context.ts";
 
@@ -228,4 +231,30 @@ test("new-ID unknown-write restriction rejects unavailable or missing runtime re
       ),
     ).toThrow();
   expect(() => assertNewIdWriteDenial([])).toThrow();
+});
+
+test("duplicate unknown-write proof rejects invented success in either file order", () => {
+  const unknown = records({
+    callId: "held-write-1",
+    tool: alias,
+    planSha256,
+    resultReceived: true,
+    delivery: "unavailable",
+    outcome: "outcome_unknown",
+  });
+  const success = records({
+    ...unknown[0]!.proof,
+    delivery: "available",
+    outcome: "succeeded",
+    isError: false,
+  });
+  for (const unordered of [
+    [...success, ...unknown],
+    [...unknown, ...success],
+  ])
+    expect(() => assertDuplicateWriteUnknown(unordered)).toThrow();
+  expect(() =>
+    assertDuplicateWriteUnknown([...unknown, ...unknown]),
+  ).not.toThrow();
+  expect(() => assertDuplicateWriteUnknown([])).toThrow();
 });

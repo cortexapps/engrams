@@ -74,6 +74,20 @@ export function assertNewIdWriteDenial(
   );
 }
 
+export function assertDuplicateWriteUnknown(
+  repeated: Awaited<ReturnType<typeof completions>>,
+) {
+  requireThat(
+    repeated.length > 0 &&
+      repeated.every(
+        ({ proof }) =>
+          proof.outcome === "outcome_unknown" &&
+          proof.delivery === "unavailable",
+      ),
+    "duplicate_id_stays_unknown",
+  );
+}
+
 export const heldWriteRestartDriver: CaseDriver = async ({
   ctx,
   principals,
@@ -200,11 +214,7 @@ export const heldWriteRestartDriver: CaseDriver = async ({
       () => completions(ctx, scenario, "held-write-1"),
       (records) => records.length > first.length,
     );
-    requireThat(
-      repeated.at(-1)?.proof.outcome === "outcome_unknown" &&
-        repeated.at(-1)?.proof.delivery === "unavailable",
-      "duplicate_id_stays_unknown",
-    );
+    assertDuplicateWriteUnknown(repeated);
     await sendScenarioPrompt(scenario, false, "second");
     const denied = await waitFor(
       ctx,
