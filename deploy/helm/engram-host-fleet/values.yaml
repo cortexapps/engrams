@@ -247,6 +247,11 @@ hostAgent:
     limits:
       cpu: "16"
       memory: 32Gi
+  # What an idle eviction does with the agent in the VM. `keep` captures
+  # the running agent, and a resume continues the same process. `drain`
+  # stops the agent before the capture, and a resume starts it again from
+  # its saved conversation.
+  idleEvictionHarness: keep
   extraEnv: []        # [{name, value}] escape hatch for any ENGRAM_* knob
 
 # Distributed tracing (ADR 0019 / telemetry restoration #526). The K8s host
