@@ -24,16 +24,17 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use engram_chunk_store::{ChunkSize, ChunkStore, Manifest, ManifestKind};
+use engram_chunk_store::{ChunkSize, Manifest, ManifestKind};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::DiskRole;
+use engram_fill::{Class, FillEngine, PeerSource};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
 use crate::disk_flows::{checkpoint_split, stage};
-use crate::image_volumes;
+use crate::image_volumes::{self, ImageVolumes};
 
 const LIVE_PREFIX: &str = "sb-";
 const TRANSIENT_PREFIX: &str = "tmp-sb-";
@@ -148,6 +149,10 @@ pub fn parse(name: &VolumeName) -> Option<Parsed> {
 /// written. A manifest that is itself a staged image is snapshotted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
+    /// An image's disk: the volume starts a new lineage as a snapshot of
+    /// the image's volume, which is staged first when the host has none
+    /// (see [`ImageVolumes::fork`]).
+    Image { manifest: ManifestRef },
     /// A manifest many sandboxes share: the volume starts a new lineage
     /// that holds a copy of it.
     Fork {
@@ -166,6 +171,7 @@ pub enum Source {
 impl Source {
     fn kind(&self) -> &'static str {
         match self {
+            Source::Image { .. } => "image",
             Source::Fork { .. } => "fork",
             Source::Continue { .. } => "continue",
             Source::Empty { .. } => "empty",
@@ -225,7 +231,8 @@ pub struct Report {
 /// The owner of every `sb-` volume on a host.
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
-    store: ChunkStore,
+    fill: FillEngine,
+    images: Arc<ImageVolumes>,
     /// Released sandboxes whose checkpoint volumes stay, oldest release
     /// first. A sandbox `reconcile` finds with no live volume joins at
     /// the front: its age is unknown, so it goes first.
@@ -233,16 +240,22 @@ pub struct SessionVolumes {
 }
 
 impl SessionVolumes {
-    pub fn new(disk: Arc<dyn SessionDisk>, store: ChunkStore) -> Self {
+    pub fn new(disk: Arc<dyn SessionDisk>, fill: FillEngine) -> Self {
         Self {
+            images: Arc::new(ImageVolumes::new(disk.clone(), fill.clone())),
             disk,
-            store,
+            fill,
             kept: Mutex::new(VecDeque::new()),
         }
     }
 
     pub fn disk(&self) -> &dyn SessionDisk {
         self.disk.as_ref()
+    }
+
+    /// The image volumes of the same disk.
+    pub fn images(&self) -> &Arc<ImageVolumes> {
+        &self.images
     }
 
     pub async fn capacity(&self) -> io::Result<Capacity> {
@@ -257,15 +270,34 @@ impl SessionVolumes {
         root: Source,
         swap: Option<Source>,
     ) -> io::Result<Provisioned> {
+        self.provision_with_peer(sandbox, root, swap, None).await
+    }
+
+    /// [`Self::provision`], with each chunk a stage fetches asked of
+    /// `peer` (a host that holds the session's chunks) before the store.
+    pub async fn provision_with_peer(
+        &self,
+        sandbox: SandboxId,
+        root: Source,
+        swap: Option<Source>,
+        peer: Option<Arc<dyn PeerSource>>,
+    ) -> io::Result<Provisioned> {
+        let fill = match peer {
+            Some(peer) => self.fill.with_peer(peer),
+            None => self.fill.clone(),
+        };
         // A sandbox resumed on this host is live again: its kept
         // checkpoint is no longer the reap's to purge.
         self.kept.lock().unwrap().retain(|s| *s != sandbox);
         let provisioned = async {
-            let (root, root_manifest) = self.provision_role(sandbox, DiskRole::Root, root).await?;
+            let (root, root_manifest) = self
+                .provision_role(&fill, sandbox, DiskRole::Root, root)
+                .await?;
             let (swap, swap_manifest) = match swap {
                 Some(source) => {
-                    let (path, manifest) =
-                        self.provision_role(sandbox, DiskRole::Swap, source).await?;
+                    let (path, manifest) = self
+                        .provision_role(&fill, sandbox, DiskRole::Swap, source)
+                        .await?;
                     (Some(path), Some(manifest))
                 }
                 None => (None, None),
@@ -288,6 +320,7 @@ impl SessionVolumes {
     /// manifest is in the store; then the live volume as its snapshot.
     /// A `Continue` of a checkpoint this host kept for the lineage skips
     /// the stage; one of a newer manifest stages only the delta onto it.
+    /// A stage fetches through `fill`.
     #[tracing::instrument(
         name = "disk.provision",
         skip_all,
@@ -295,6 +328,7 @@ impl SessionVolumes {
     )]
     async fn provision_role(
         &self,
+        fill: &FillEngine,
         sandbox: SandboxId,
         role: DiskRole,
         source: Source,
@@ -302,9 +336,24 @@ impl SessionVolumes {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
         let (checkpoint, lineage) = match source {
+            Source::Image { manifest } => {
+                let wanted = self
+                    .fill
+                    .store()
+                    .get_manifest(manifest)
+                    .instrument(tracing::info_span!("disk.manifest_get"))
+                    .await
+                    .map_err(store_err)?;
+                self.images
+                    .fork(manifest, &tmp)
+                    .instrument(tracing::info_span!("disk.image_fork"))
+                    .await?;
+                self.new_lineage(&tmp, sandbox, role, &wanted).await?
+            }
             Source::Fork { manifest, base } => {
                 let wanted = self
-                    .store
+                    .fill
+                    .store()
                     .get_manifest(manifest)
                     .instrument(tracing::info_span!("disk.manifest_get"))
                     .await
@@ -312,18 +361,12 @@ impl SessionVolumes {
                 match self.staged(manifest).await {
                     Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
                     None => {
-                        self.stage_into(&tmp, &wanted, base)
+                        self.stage_into(fill, &tmp, &wanted, base)
                             .instrument(tracing::info_span!("disk.stage"))
                             .await?
                     }
                 };
-                let lineage = ManifestRef::new();
-                self.store
-                    .put_manifest(lineage, &wanted)
-                    .instrument(tracing::info_span!("disk.manifest_put"))
-                    .await
-                    .map_err(store_err)?;
-                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
+                self.new_lineage(&tmp, sandbox, role, &wanted).await?
             }
             Source::Continue { manifest, base } => {
                 match self.kept(sandbox, role, manifest).await? {
@@ -333,7 +376,8 @@ impl SessionVolumes {
                     ),
                     kept => {
                         let wanted = self
-                            .store
+                            .fill
+                            .store()
                             .get_manifest(manifest)
                             .instrument(tracing::info_span!("disk.manifest_get"))
                             .await
@@ -344,7 +388,8 @@ impl SessionVolumes {
                             {
                                 stage(
                                     self.disk.as_ref(),
-                                    &self.store,
+                                    fill,
+                                    Class::Demand,
                                     &tmp,
                                     &wanted,
                                     Some((&volume, &held_manifest)),
@@ -353,7 +398,7 @@ impl SessionVolumes {
                                 .await?
                             }
                             _ => {
-                                self.stage_into(&tmp, &wanted, base)
+                                self.stage_into(fill, &tmp, &wanted, base)
                                     .instrument(tracing::info_span!("disk.stage"))
                                     .await?
                             }
@@ -364,17 +409,11 @@ impl SessionVolumes {
             }
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
-                let lineage = ManifestRef::new();
                 let manifest = Manifest {
                     chunk_size: ChunkSize::bytes(volume.chunk_size),
                     ..Manifest::empty(ManifestKind::Disk, size_bytes)
                 };
-                self.store
-                    .put_manifest(lineage, &manifest)
-                    .instrument(tracing::info_span!("disk.manifest_put"))
-                    .await
-                    .map_err(store_err)?;
-                (self.commit(&tmp, sandbox, role, lineage).await?, lineage)
+                self.new_lineage(&tmp, sandbox, role, &manifest).await?
             }
         };
         let live = self
@@ -383,6 +422,25 @@ impl SessionVolumes {
             .instrument(tracing::info_span!("disk.live_snapshot"))
             .await?;
         Ok((live.path, lineage))
+    }
+
+    /// Start a lineage that holds `manifest`, whose bytes `tmp` holds,
+    /// and commit `tmp` as its first checkpoint.
+    async fn new_lineage(
+        &self,
+        tmp: &VolumeName,
+        sandbox: SandboxId,
+        role: DiskRole,
+        manifest: &Manifest,
+    ) -> io::Result<(Volume, ManifestRef)> {
+        let lineage = ManifestRef::new();
+        self.fill
+            .store()
+            .put_manifest(lineage, manifest)
+            .instrument(tracing::info_span!("disk.manifest_put"))
+            .await
+            .map_err(store_err)?;
+        Ok((self.commit(tmp, sandbox, role, lineage).await?, lineage))
     }
 
     /// Give the staged transient volume its checkpoint name and delete
@@ -453,7 +511,7 @@ impl SessionVolumes {
             return Ok(None);
         };
         let volume = self.disk.open(&checkpoint_name(owner, role, held)).await?;
-        Ok(match self.store.get_manifest(held).await {
+        Ok(match self.fill.store().get_manifest(held).await {
             Ok(manifest) => Some((owner, volume, manifest, held)),
             Err(_) => None,
         })
@@ -479,10 +537,11 @@ impl SessionVolumes {
         self.disk.open(&name).await
     }
 
-    /// Write `wanted` into a new volume `name`, from the staged volume of
-    /// `base` when this host has it.
+    /// Write `wanted` into a new volume `name` through `fill`, from the
+    /// staged volume of `base` when this host has it.
     async fn stage_into(
         &self,
+        fill: &FillEngine,
         name: &VolumeName,
         wanted: &Manifest,
         base: Option<ManifestRef>,
@@ -493,7 +552,8 @@ impl SessionVolumes {
         };
         stage(
             self.disk.as_ref(),
-            &self.store,
+            fill,
+            Class::Demand,
             name,
             wanted,
             base.as_ref().map(|(v, m)| (v, m)),
@@ -506,7 +566,7 @@ impl SessionVolumes {
     async fn staged(&self, image: ManifestRef) -> Option<(Volume, Manifest)> {
         match (
             self.disk.open(&image_volumes::volume_name(image)).await,
-            self.store.get_manifest(image).await,
+            self.fill.store().get_manifest(image).await,
         ) {
             (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
             _ => None,
@@ -634,10 +694,15 @@ impl SessionVolumes {
         } = pending;
         let previous_name = checkpoint_name(sandbox, role, previous);
         let previous_volume = self.disk.open(&previous_name).await?;
-        let previous_manifest = self.store.get_manifest(previous).await.map_err(store_err)?;
+        let previous_manifest = self
+            .fill
+            .store()
+            .get_manifest(previous)
+            .await
+            .map_err(store_err)?;
         let manifest = checkpoint_split::upload(
             self.disk.as_ref(),
-            &self.store,
+            self.fill.store(),
             &snapshot,
             Some((&previous_volume, &previous_manifest)),
         )
@@ -647,7 +712,8 @@ impl SessionVolumes {
         // crash after `put_manifest` and before the rename leaves a
         // version the name never reached.
         let latest = self
-            .store
+            .fill
+            .store()
             .latest_manifest_version(previous.manifest_id)
             .await
             .map_err(store_err)?
@@ -656,7 +722,8 @@ impl SessionVolumes {
             manifest_id: previous.manifest_id,
             version: latest.max(previous.version) + 1,
         };
-        self.store
+        self.fill
+            .store()
             .put_manifest(next, &manifest)
             .await
             .map_err(store_err)?;
@@ -850,6 +917,7 @@ impl SessionVolumes {
 
 #[cfg(test)]
 mod tests {
+    use engram_chunk_store::ChunkStore;
     use engram_storage_local::LocalBlobStorage;
 
     use super::*;
@@ -889,7 +957,10 @@ mod tests {
         )));
         let store = ChunkStore::new(blob.clone());
         Rig {
-            volumes: SessionVolumes::new(disk.clone(), store.clone()),
+            volumes: SessionVolumes::new(
+                disk.clone(),
+                engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default()),
+            ),
             disk,
             store,
             blob,
@@ -964,9 +1035,7 @@ mod tests {
         r.store.put_manifest(image, &manifest).await.unwrap();
         r.disk.delete(&scratch).await.unwrap();
         r.disk.delete(&snap).await.unwrap();
-        image_volumes::reconcile_once(r.disk.as_ref(), &r.store, &[image])
-            .await
-            .unwrap();
+        r.volumes.images().reconcile(&[image]).await.unwrap();
         image
     }
 
@@ -1075,6 +1144,41 @@ mod tests {
         );
     }
 
+    /// An image with no volume on the host stages one image volume; the
+    /// sandbox and every later one are snapshots of it.
+    #[tokio::test]
+    async fn an_image_source_stages_the_image_volume_once() {
+        let r = rig();
+        let image = staged_image(&r, &[2, 0, 5]).await;
+        r.disk
+            .delete(&image_volumes::volume_name(image))
+            .await
+            .unwrap();
+
+        let first = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(first, Source::Image { manifest: image }, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![2, 0, 5]);
+        assert_ne!(p.root_manifest, image);
+        r.disk
+            .open(&image_volumes::volume_name(image))
+            .await
+            .expect("the image volume stays");
+
+        let gets = r.blob.gets();
+        let second = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(second, Source::Image { manifest: image }, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![2, 0, 5]);
+        assert_eq!(r.blob.gets(), gets, "the second sandbox is a snapshot");
+    }
+
     #[tokio::test]
     async fn provision_from_an_image_snapshots_it_and_starts_a_lineage() {
         let r = rig();
@@ -1178,6 +1282,56 @@ mod tests {
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
         assert_eq!(p.root_manifest, published);
+    }
+
+    /// Holds every chunk a stage asks for.
+    struct MapPeer(std::collections::HashMap<engram_chunk_store::ChunkHash, bytes::Bytes>);
+
+    #[async_trait::async_trait]
+    impl PeerSource for MapPeer {
+        async fn fetch(&self, hash: engram_chunk_store::ChunkHash) -> Option<bytes::Bytes> {
+            self.0.get(&hash).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stage_with_a_peer_reads_the_peer_before_the_store() {
+        let r = rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let published = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+        let pattern = [1u8, 9];
+        let chunks = r.store.get_manifest(published).await.unwrap().chunks;
+        let peer = MapPeer(
+            chunks
+                .iter()
+                .map(|c| {
+                    let byte = pattern[(c.offset / CHUNK) as usize];
+                    (c.hash, bytes::Bytes::from(vec![byte; CHUNK as usize]))
+                })
+                .collect(),
+        );
+
+        let gets = r.blob.gets();
+        let second = SandboxId::new();
+        let p = r
+            .volumes
+            .provision_with_peer(
+                second,
+                Source::Continue {
+                    manifest: published,
+                    base: None,
+                },
+                None,
+                Some(Arc::new(peer)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9]);
+        assert_eq!(r.blob.gets(), gets, "every chunk came from the peer");
     }
 
     #[tokio::test]
@@ -1912,7 +2066,10 @@ mod tests {
         let dead = SandboxId::new();
         r.volumes.provision(dead, fork(image), None).await.unwrap();
 
-        let restarted = SessionVolumes::new(r.disk.clone(), r.store.clone());
+        let restarted = SessionVolumes::new(
+            r.disk.clone(),
+            engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+        );
         let report = restarted.reconcile(&[]).await.unwrap();
         assert_eq!(report.kept, vec![dead]);
         assert_eq!(checkpoints_of(&r, dead, DiskRole::Root).await.len(), 1);

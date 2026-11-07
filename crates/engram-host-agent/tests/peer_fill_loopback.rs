@@ -6,8 +6,9 @@
 //! REQUESTER side (structurally zero GCS involvement for peer-landed
 //! chunks — there is nothing to fall back to, so every assertion about
 //! landed bytes is an assertion about the peer path):
-//!   1. batch pull lands CRC-checked bytes as unverified-origin; the
-//!      scrubber verifies them; the serve-onward gate opens only then;
+//!   1. batch pull lands the peer's bytes (each frame CRC32C-checked and
+//!      in order; the bytes themselves trusted, not hashed), and they
+//!      serve onward at once;
 //!   2. a locally-missing hash streams a `missing` marker (peer stays
 //!      healthy);
 //!   3. a stale BaseImage scope is rejected (`scope_reject`), which the
@@ -176,7 +177,10 @@ async fn seed_verified(cache: &ChunkCache, bodies: &[Vec<u8>]) -> Vec<ChunkHash>
     let mut hashes = Vec::new();
     for b in bodies {
         let h = ChunkHash::of(b);
-        cache.put(h, b).await.expect("seed put");
+        cache
+            .put(h, bytes::Bytes::copy_from_slice(b))
+            .await
+            .expect("seed put");
         hashes.push(h);
     }
     hashes
@@ -191,7 +195,7 @@ fn ready_digest(digest: &str) -> Arc<ImageReadiness> {
 const DIGEST: &str = "sha256:feedc0de";
 
 #[tokio::test]
-async fn pull_lands_scrubs_and_opens_the_serve_gate() {
+async fn pull_lands_chunks_that_serve_onward_at_once() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("engram_host_agent=debug")
         .try_init();
@@ -234,42 +238,10 @@ async fn pull_lands_scrubs_and_opens_the_serve_gate() {
     );
     assert!(!health.is_lost(&addr));
 
+    // A trusted landing is servable, so each chunk serves onward at once.
     for (h, body) in hashes.iter().zip(&bodies) {
-        // Landed + locally readable...
-        assert!(land_cache.contains(*h).await, "chunk {h} not resident");
-        // ...but unverified-origin: NOT servable onward pre-scrub (the
-        // one-hop containment property).
-        assert!(
-            land_cache
-                .read_verified_for_serve(*h)
-                .await
-                .unwrap()
-                .is_none(),
-            "peer-landed chunk {h} served onward before scrub"
-        );
-        let _ = body;
-    }
-
-    // Scrubber drains the backlog; every chunk becomes servable and
-    // byte-identical to the source.
-    let _scrubber = land_cache.spawn_scrubber(u64::MAX);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    'outer: loop {
-        for (h, body) in hashes.iter().zip(&bodies) {
-            match land_cache.read_verified_for_serve(*h).await.unwrap() {
-                Some(bytes) if bytes.as_ref() == body.as_slice() => {}
-                Some(_) => panic!("scrubbed chunk {h} has wrong bytes"),
-                None => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "scrub did not drain within 5s"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue 'outer;
-                }
-            }
-        }
-        break;
+        let bytes = land_cache.read_resident(*h).await.unwrap();
+        assert_eq!(bytes.as_deref(), Some(body.as_slice()), "chunk {h}");
     }
 }
 
@@ -299,8 +271,8 @@ async fn missing_hash_is_an_honest_miss_not_a_fault() {
     assert_eq!(stats.landed, 1);
     assert_eq!(stats.missing, 1);
     assert!(!health.is_lost(&addr), "a miss must not mark the peer lost");
-    assert!(land_cache.contains(hashes[0]).await);
-    assert!(!land_cache.contains(absent).await);
+    assert!(land_cache.contains(hashes[0]));
+    assert!(!land_cache.contains(absent));
 }
 
 #[tokio::test]
@@ -331,7 +303,7 @@ async fn stale_base_image_scope_is_rejected() {
     .await;
     assert!(stats.failed, "stale scope must fail the window");
     assert_eq!(stats.landed, 0);
-    assert!(!land_cache.contains(hashes[0]).await);
+    assert!(!land_cache.contains(hashes[0]));
 }
 
 #[tokio::test]
@@ -408,4 +380,58 @@ async fn dead_peer_costs_one_bounded_dial_and_is_cached_lost() {
         started.elapsed() < Duration::from_millis(200),
         "health-cached peer must be skipped without dialing"
     );
+}
+
+/// The fill engine's peer tier against a real peer server: many
+/// concurrent requests share batched streams and each gets its own
+/// chunk; a chunk the peer lacks answers None and does not mark it lost.
+#[tokio::test]
+async fn peer_fetcher_answers_concurrent_requests_and_misses() {
+    use engram_fill::PeerSource;
+    use engram_host_agent::peer_fill::PeerFetcher;
+
+    let serve_dir = tempfile::tempdir().unwrap();
+    let serve_cache = mk_cache(&serve_dir);
+    let bodies: Vec<Vec<u8>> = (0..100u8).map(|i| vec![i; 4096 + i as usize]).collect();
+    let hashes = seed_verified(&serve_cache, &bodies).await;
+    let peer = PeerServe::with_limits(serve_cache, ready_digest(DIGEST), 4, 4 * 1024 * 1024);
+    let addr = boot_peer_server(peer).await;
+
+    let health = PeerHealth::new();
+    let fetcher = PeerFetcher::spawn(
+        addr.clone(),
+        PeerChunkScope::BaseImage(DIGEST.into()),
+        health.clone(),
+    );
+    let answers = futures::future::join_all(hashes.iter().map(|h| fetcher.fetch(*h))).await;
+    for (answer, body) in answers.iter().zip(&bodies) {
+        assert_eq!(answer.as_deref(), Some(body.as_slice()));
+    }
+
+    assert!(fetcher
+        .fetch(ChunkHash::of(b"never seeded"))
+        .await
+        .is_none());
+    assert!(!health.is_lost(&addr), "a miss must not mark the peer lost");
+}
+
+/// A dead peer is marked lost on the first failed dial; later requests
+/// answer None at once instead of dialing again.
+#[tokio::test]
+async fn peer_fetcher_on_a_dead_peer_answers_none_and_stays_fast() {
+    use engram_fill::PeerSource;
+    use engram_host_agent::peer_fill::PeerFetcher;
+
+    let addr = format!("http://{}", pick_local_addr()); // nothing listening
+    let health = PeerHealth::new();
+    let fetcher = PeerFetcher::spawn(
+        addr.clone(),
+        PeerChunkScope::Snapshot(engram_core::SnapshotId::new()),
+        health.clone(),
+    );
+    assert!(fetcher.fetch(ChunkHash::of(b"a")).await.is_none());
+    assert!(health.is_lost(&addr));
+    let started = std::time::Instant::now();
+    assert!(fetcher.fetch(ChunkHash::of(b"b")).await.is_none());
+    assert!(started.elapsed() < Duration::from_millis(100));
 }

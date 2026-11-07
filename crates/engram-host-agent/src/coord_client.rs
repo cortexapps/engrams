@@ -573,6 +573,13 @@ pub struct HeartbeatResponse {
     /// pre-fix behavior.
     #[serde(default)]
     pub prestage_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// The disk manifests of images whose capture is in flight. The host
+    /// stages them as image volumes during the capture, so the captured
+    /// version stages as a delta over them. `None` (the field is absent:
+    /// the coordinator's read failed, or the coordinator is older) means
+    /// unknown, not empty.
+    #[serde(default)]
+    pub capturing_disk_manifests: Option<Vec<engram_core::types::manifest::ManifestRef>>,
     /// ADR 0035 §5: the coord's bundle pin set (every generation some
     /// snapshot row references). The host's bundle supervisor
     /// prefetches missing pinned generations and sweeps staged files

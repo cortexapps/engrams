@@ -17,6 +17,12 @@
 //!   single-writer; the pid component is vestigial-but-harmless
 //!   belt-and-braces from the multi-writer era, whose fixed-temp
 //!   collision once cost a prod resume ~92 s of GCS page-faulting.)
+//! - **Write slots**: every chunk write takes a slot from one
+//!   class-ordered [`Admission`] ([`ChunkCache::write_slot`]), shared
+//!   with the volume writes of a restore on the same disk. A bulk memory
+//!   fill (`Hydrate`) so stops dirtying the disk while a restore's disk
+//!   writes (`Prefix`) wait for a slot, instead of halving
+//!   their rate. The `Demand` reserve keeps slots for page faults.
 //! - **Eviction (FIFO by populate time)**: when the cache filesystem is
 //!   fuller than the free-space floor (default: keep ~20% free) — or,
 //!   when total cached bytes exceed the absolute ceiling (disk-derived
@@ -30,9 +36,10 @@
 //!   one walk on the first sweep, maintained by every populate/unlink
 //!   thereafter): #1003 — walking a 516k-file cache per sweep
 //!   materialized ~200 MB of listing per pass and cost 100-500 ms, and
-//!   concurrent sweeps compounded into multi-GB heap bursts. Only the
-//!   periodic [`ChunkCache::sweep`] still walks the directory, to
-//!   reconcile drift from out-of-process writers (the UFFD handler).
+//!   concurrent sweeps compounded into multi-GB heap bursts. The one
+//!   walk runs at boot: the host-agent is the cache's only writer and
+//!   evictor (ADR 0075; the UFFD handler only reads), so the index
+//!   stays exact after it. [`ChunkCache::contains`] reads the index too.
 //!   The free-space floor is re-checked via `statvfs(2)` on every
 //!   sweep, so the cache yields disk to the snapshots and checkpoints
 //!   that share the work_dir mount rather than racing them to ENOSPC
@@ -52,9 +59,10 @@
 //!   raced over the same directory with disjoint in-memory pin state, so
 //!   a pressured non-pinning evictor could unlink exactly the chunks the
 //!   pinning one was protecting.
-//! - **Singleflight on miss**: if N threads simultaneously ask for
-//!   a chunk that's not cached, exactly one BlobStorage fetch
-//!   runs; the others await its completion.
+//! - **Singleflight on miss**: if N callers ask at once for a chunk
+//!   that is not cached, one fetch runs and the others wait for its
+//!   answer. A caller of a higher class than the running fetch runs a
+//!   second fetch beside it (see [`ChunkCache::fill_with`]).
 //! - **Pin set**: working-set chunks can be marked never-evict. The
 //!   image-prefetch supervisor (ADR 0039) pins each enabled image's
 //!   canonical base manifest (disk + memory) so the LRU can never evict
@@ -89,9 +97,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::fs;
 use tokio::sync::oneshot;
 
+use crate::admission::{Admission, Class, Permit};
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::ChunkHash;
 
@@ -105,15 +113,14 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 /// name — a typo in either literal would silently fork the series.
 ///
 /// - `source="gcs"` / `source="peer"`: incremented in
-///   [`ChunkCache::get_with_source`]'s leader-persist arm with the label
-///   the fetch closure reported (ADR 0095: the closure seam is the one
-///   place that knows the backend), only when `write_local` actually
-///   landed the fetched bytes on disk (a `write_local` failure means the
-///   fetch happened but the cache did NOT fill — see the `write_local`
-///   error-handling comment just above the increment site).
+///   [`ChunkCache::fill_with`] after the winning leader's write, with
+///   the label the fetch reported (ADR 0095: the fetch is the one place
+///   that knows the backend), only when `write_local` landed the bytes on
+///   disk (a failed write means the fetch happened but the cache did NOT
+///   fill).
 /// - `source="peer"` is ALSO incremented by
-///   `engram-host-agent::peer_fill` at the bulk
-///   [`ChunkCache::put_unverified_no_evict`] landings (ADR 0095).
+///   `engram-host-agent::peer_fill` at its bulk [`ChunkCache::put`]
+///   landings (ADR 0095).
 pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
 
 /// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
@@ -513,17 +520,9 @@ fn resolve_free_floor_pct(root: &Path) -> f64 {
 ///
 /// The cache is **backend-agnostic**: it does not own a
 /// `ChunkStore` reference. Every `get` call takes an async
-/// fetcher closure that runs on local-NVMe miss. Callers pick
-/// the right backend per call — `ChunkStore::get_chunk`, a
-/// `TieredChunkResolver`, a direct `BlobStorage::get`, whatever
-/// makes sense at the call site.
-///
-/// This decoupling was lifted out of the pre-ADR-0008 shape,
-/// where `ChunkCache` pinned a `ChunkStore` at construction.
-/// That made the cache silently incompatible with per-session
-/// upgrades (the chunked-OCI tiered resolver) — the caller's
-/// upgraded store was passed in but ignored. Closure-based
-/// fetcher eliminates the whole class of bug.
+/// fetcher closure that runs on local-NVMe miss, so the caller
+/// chooses the source (on a host, the fill engine's object-store
+/// fetch).
 #[derive(Clone)]
 pub struct ChunkCache {
     inner: Arc<CacheInner>,
@@ -536,34 +535,72 @@ pub struct ChunkCache {
 /// the working-set-too-big-for-the-disk thrash this metric targets.
 const EVICTED_RING_CAP: usize = 4096;
 
-/// Singleflight slot map: hash → the waiters' oneshot senders the
-/// leader broadcasts the fetched bytes to. An entry exists iff a leader
-/// is in flight for that hash.
-type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
+/// One chunk's fetch in flight. The entry exists while a leader of it
+/// fetches the chunk or writes it.
+struct Flight {
+    /// Tells this flight from a later one for the same hash.
+    id: u64,
+    /// The highest class among the flight's fetches.
+    class: Class,
+    /// Calls that run a fetch for this flight, or write its bytes.
+    leaders: usize,
+    /// Every call waiting for the bytes, the leaders included.
+    waiters: Vec<oneshot::Sender<Result<Bytes>>>,
+    /// The verified bytes, set while the winning leader writes them. A
+    /// call that arrives in that time is served from here.
+    fetched: Option<Bytes>,
+}
 
-/// Removes a leader's in-flight slot on drop **unless disarmed** — the
-/// cancel-safety net for [`ChunkCache::get`]. The leader registers a
-/// slot, then `fetch().await`s; if that future is *cancelled* (e.g. an
-/// FC `load_snapshot` 60 s timeout tears down the whole restore), the
-/// leader's normal "remove slot + notify waiters" tail never runs, so
-/// the slot — holding the leader's own sender — lingers forever and
-/// every waiter (and every later `get` for this hash, which joins the
-/// orphaned slot) blocks on a broadcast that never comes. That poisons
-/// the host's chunk cache and wedges every resume retry. This guard removes the slot on drop, dropping its
-/// senders so waiters observe `RecvError` and retry as a fresh leader.
-/// The leader disarms it once it has removed the slot itself.
+/// Singleflight map: the flight of each chunk being fetched.
+type InflightMap = HashMap<ChunkHash, Flight>;
+
+/// Ids of flights, unique within the process.
+static NEXT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One leader leaves flight `id`. The last leader to leave ends the
+/// flight; the ended flight is returned, so the caller can answer its
+/// waiters.
+fn leave(inflight: &mut InflightMap, hash: ChunkHash, id: u64) -> Option<Flight> {
+    let flight = inflight.get_mut(&hash).filter(|f| f.id == id)?;
+    flight.leaders -= 1;
+    if flight.leaders == 0 {
+        inflight.remove(&hash)
+    } else {
+        None
+    }
+}
+
+/// A leader's place in its flight, given up on drop unless disarmed: the
+/// cancel-safety net for [`ChunkCache::fill_with`]. A leader dropped
+/// mid-fetch (an FC `load_snapshot` timeout tears down the restore)
+/// never reaches its own cleanup. Without the guard the flight would
+/// stay in the map, and its waiters and every later call for the hash
+/// would wait for an answer that never comes. When the last leader
+/// leaves, the guard removes the flight; its waiters see `RecvError`
+/// and retry.
 struct LeaderGuard<'a> {
     inflight: &'a Mutex<InflightMap>,
     hash: ChunkHash,
+    id: u64,
     armed: bool,
 }
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.inflight.lock().remove(&self.hash);
+            leave(&mut self.inflight.lock(), self.hash, self.id);
         }
     }
+}
+
+/// What a call to [`ChunkCache::fill_with`] does for a missing chunk.
+enum Role {
+    /// The flight has verified bytes.
+    Served(Bytes),
+    /// Wait for the flight's answer.
+    Wait,
+    /// Run a fetch for flight `id`; `first` when this call started it.
+    Lead { id: u64, first: bool },
 }
 
 struct CacheInner {
@@ -604,12 +641,6 @@ struct CacheInner {
     /// stays the sweep's cheap read; this map exists so multiple
     /// writers can't clobber each other's terms.
     co_tenant_sources: Mutex<std::collections::HashMap<&'static str, u64>>,
-    /// ADR 0095: live feed from [`ChunkCache::put_unverified_no_evict`]
-    /// to the background scrubber. `None` until
-    /// [`ChunkCache::spawn_scrubber`] runs (a cache without a scrubber
-    /// still lands unverified chunks correctly — the markers are
-    /// durable and a later scrubber's boot scan picks them up).
-    scrub_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ChunkHash>>>,
     /// #1003: in-memory eviction index — hash → (size, populate time),
     /// plus a maintained byte total. Built from ONE directory walk on
     /// the first sweep, then updated by every in-process populate and
@@ -617,20 +648,34 @@ struct CacheInner {
     /// cache root: on the incident host (516k files / 442 GB) each
     /// walk materialized ~200 MB of `Vec<CacheEntry>` + `PathBuf`s and
     /// cost 100-500 ms, and the capture path ran it per chunk written
-    /// — the multi-GB heap bursts behind the OOM loop. Out-of-process
-    /// writers (the UFFD handler, ADR 0070) still land chunks the
-    /// index can't see; the periodic [`ChunkCache::sweep`] re-walks
-    /// and reconciles, bounding drift to one sweep interval.
+    /// — the multi-GB heap bursts behind the OOM loop.
     index: Mutex<IndexState>,
     /// #1003: single-sweeper gate. Sweep cost used to compound the
     /// other way too: on a big cache a sweep outlived the write-path
     /// debounce window, so sweeps piled up concurrently (the burst
     /// profile showed ~10 listings live at once). The populate path
     /// `try_lock`s this and SKIPS if a sweep is already running (the
-    /// running sweep enforces the same budget); the periodic
-    /// reconcile waits its turn.
+    /// running sweep enforces the same budget); the periodic sweep
+    /// waits its turn.
     sweep_gate: tokio::sync::Mutex<()>,
+    /// Chunk writes to the cache's disk in flight, granted in class
+    /// order (see [`ChunkCache::write_slot`]).
+    writes: Arc<Admission>,
+    /// Held across a chunk file's change and its index update, by hash
+    /// ([`ChunkCache::file_lock`]). The index gains an entry only after
+    /// its file is in place and loses it before the file goes, so an
+    /// index hit always has a file.
+    file_locks: [Mutex<()>; FILE_LOCKS],
 }
+
+const FILE_LOCKS: usize = 64;
+
+/// Chunk writes to local disk in flight for classes other than `Demand`,
+/// and the extra slots `Demand` may use. Enough to keep an NVMe busy with
+/// 16 MiB writes; few enough that a write a guest waits for queues behind
+/// at most this many bulk writes.
+const WRITE_SLOTS: usize = 16;
+const WRITE_DEMAND_RESERVE: usize = 8;
 
 /// #1003: the in-memory mirror of the cache directory that budget
 /// sweeps run against. No `PathBuf` per entry — paths derive from the
@@ -664,8 +709,7 @@ impl CacheIndex {
 /// in-process populates/unlinks are BUFFERED as ops and replayed onto
 /// the walk result when it installs — a put that races the in-flight
 /// walk (walk already passed its prefix dir) would otherwise be
-/// tracked by neither side and stay invisible until the next
-/// reconcile, exactly the capture-storm window the budget must see.
+/// tracked by neither side and stay invisible to the budget.
 enum IndexState {
     Pending(Vec<PendingOp>),
     Ready(CacheIndex),
@@ -688,6 +732,10 @@ struct IndexEntry {
 impl ChunkCache {
     pub fn new(config: ChunkCacheConfig) -> Self {
         let free_floor_pct = resolve_free_floor_pct(&config.root);
+        Self::with_floor(config, free_floor_pct)
+    }
+
+    fn with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
         Self {
             inner: Arc::new(CacheInner {
                 config,
@@ -698,9 +746,10 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
-                scrub_tx: Mutex::new(None),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
+                writes: Admission::fixed("disk_write", WRITE_SLOTS, WRITE_DEMAND_RESERVE),
+                file_locks: std::array::from_fn(|_| Mutex::new(())),
             }),
         }
     }
@@ -719,21 +768,7 @@ impl ChunkCache {
     /// (e.g. `file.rs`) can pin it too. Not part of the public surface.
     #[cfg(test)]
     pub(crate) fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
-        Self {
-            inner: Arc::new(CacheInner {
-                config,
-                free_floor_pct,
-                inflight: Mutex::new(HashMap::new()),
-                pinned: Mutex::new(HashMap::new()),
-                evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
-                last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
-                co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
-                co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
-                scrub_tx: Mutex::new(None),
-                index: Mutex::new(IndexState::Pending(Vec::new())),
-                sweep_gate: tokio::sync::Mutex::new(()),
-            }),
-        }
+        Self::with_floor(config, free_floor_pct)
     }
 
     /// ADR 0092 / ADR 0112: record how many allocated bytes one NAMED
@@ -787,11 +822,23 @@ impl ChunkCache {
         crate::reader::chunk_path(&self.inner.config.root, hash)
     }
 
-    /// Does this chunk's content-addressed file exist on local NVMe right now?
-    /// Distinguishes "never warmed here" / "evicted" from "warmed but
-    /// `get` still missed".
+    /// Does this chunk's content-addressed file exist on local NVMe right
+    /// now? A `stat`: it also sees files removed behind the cache's back
+    /// (an operator `rm`), which [`Self::contains`] does not.
     pub fn contains_on_disk(&self, hash: ChunkHash) -> bool {
         self.path_for(hash).try_exists().unwrap_or(false)
+    }
+
+    /// Whether the cache holds this chunk, from the in-memory index (a
+    /// `stat` until the boot walk has built it). This process is the
+    /// cache's only writer and evictor, so the index is exact for every
+    /// change made through the cache.
+    pub fn contains(&self, hash: ChunkHash) -> bool {
+        match &*self.inner.index.lock() {
+            IndexState::Ready(idx) => return idx.entries.contains_key(&hash),
+            IndexState::Pending(_) => {}
+        }
+        self.contains_on_disk(hash)
     }
 
     /// Read `len` bytes at `offset` from a resident chunk's file WITHOUT
@@ -864,52 +911,41 @@ impl ChunkCache {
         }
     }
 
-    /// Test-only: drop a chunk's on-disk cache file, simulating an LRU
-    /// eviction (or a silently-failed `write_local`) so callers can exercise
-    /// the "pinned-but-not-resident" recovery paths without driving real
-    /// disk pressure. Not part of the runtime surface.
+    /// Test-only: one budget sweep that first re-walks the directory, for
+    /// tests that create or drop chunk files behind the cache's back.
     #[doc(hidden)]
-    /// Test-only: run one budget sweep synchronously. Production
-    /// sweeps ride `spawn_sweeper` + the write-path debounce; tests
-    /// (ADR 0075 pin-integrity-under-pressure) need a deterministic
-    /// trigger.
     pub async fn sweep_for_test(&self) {
-        // The reconciling variant: tests drop/create files on disk
-        // directly, so a test sweep must see disk truth, not the
-        // in-memory index.
+        let walked = {
+            let _gate = self.inner.sweep_gate.lock().await;
+            self.walk_into_index().await
+        };
+        if let Err(e) = walked {
+            panic!("test walk failed: {e}");
+        }
         if let Err(e) = self.sweep().await {
             panic!("test sweep failed: {e}");
         }
     }
 
+    /// Test-only: drop a chunk's on-disk cache file, simulating an
+    /// eviction, so callers can exercise the "pinned-but-not-resident"
+    /// recovery paths without driving real disk pressure.
+    #[doc(hidden)]
     pub fn evict_on_disk_for_test(&self, hash: ChunkHash) {
-        let _ = std::fs::remove_file(self.path_for(hash));
+        let _lock = self.file_lock(hash).lock();
         self.index_remove(hash);
+        let _ = std::fs::remove_file(self.path_for(hash));
     }
 
-    /// Get a chunk's bytes. Local NVMe first; on miss, the
-    /// `fetch` closure is invoked exactly once (singleflight —
-    /// concurrent waiters for the same hash share its result).
-    /// Fetched bytes are written to local NVMe before returning.
-    ///
-    /// The fetcher's return value is what flows back; if it
-    /// errors, the error propagates to all in-flight waiters.
-    ///
-    /// # Why a closure rather than a stored `ChunkStore`
-    ///
-    /// Each call site picks its own backend. `materialize_*`
-    /// against a per-session tiered resolver and the UFFD
-    /// handler against the global store can coexist behind the
-    /// same cache without any rebind dance.
-    pub async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
+    /// [`Self::get_with_source`] with a cold-tier fetcher, writing at
+    /// `Demand`.
+    #[cfg(test)]
+    pub(crate) async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
     {
-        // Plain closures are the cold tier by definition — the
-        // source-aware sibling below is for tiered (peer-capable)
-        // fetchers (ADR 0095).
-        self.get_with_source(hash, || async move {
+        self.get_with_source(hash, Class::Demand, || async move {
             fetch().await.map(|b| (b, FillSource::BlobStorage))
         })
         .await
@@ -921,6 +957,10 @@ impl ChunkCache {
     /// correct and is not hashed again (a 16 MiB sha256 costs about
     /// 80 ms on hosts without SHA extensions).
     pub async fn read_resident(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
+        // A miss the index knows of costs no blocking hop.
+        if !self.contains(hash) {
+            return Ok(None);
+        }
         let start = crate::time_source::metrics_now();
         let Some(bytes) = read_if_present(&self.path_for(hash)).await? else {
             // A miss is a failed open, not a latency sample.
@@ -934,308 +974,354 @@ impl ChunkCache {
         Ok(Some(bytes))
     }
 
-    /// [`Self::get`] with a source-aware fetcher: the closure reports
-    /// where the bytes actually came from, so the
-    /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label
-    /// and the fetch histogram's `tier` stay honest when a call site
-    /// composes a peer tier ahead of BlobStorage (ADR 0095). Populate
-    /// semantics are identical — singleflight, sha256
-    /// verify-on-populate (a fault-time peer chunk IS verified; only
-    /// the bulk `put_unverified_no_evict` path defers hashing to the
-    /// scrubber), atomic write-through.
-    pub async fn get_with_source<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
+    /// `len` bytes at `offset` of a resident chunk: from the bytes of a
+    /// fill that is writing it, else from its file. `None` when the
+    /// cache does not hold the chunk. Like [`Self::read_resident`], it
+    /// trusts what it reads.
+    pub async fn read_resident_range(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Bytes>> {
+        let fetched = self
+            .inner
+            .inflight
+            .lock()
+            .get(&hash)
+            .and_then(|f| f.fetched.clone());
+        if let Some(bytes) = fetched {
+            return slice_chunk_range(hash, &bytes, offset, len).map(Some);
+        }
+        if !self.contains(hash) {
+            return Ok(None);
+        }
+        let path = self.path_for(hash);
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::FileExt;
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            range_in(hash, offset, len, file.metadata()?.len())?;
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, offset)?;
+            Ok(Some(Bytes::from(buf)))
+        })
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
+    }
+
+    /// [`Self::fill_with`] without a slot taken ahead.
+    pub async fn get_with_source<F, Fut>(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        fetch: F,
+    ) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
+    {
+        self.fill_with(hash, class, None, |_| fetch()).await
+    }
+
+    /// A chunk's bytes. Local NVMe first. On a miss, one fetch serves
+    /// every concurrent caller (singleflight): its bytes are verified
+    /// (unless they came from a peer), handed to every waiter, then
+    /// written to local NVMe at the writer's class
+    /// ([`Self::write_slot`]). The fetch reports where its bytes came
+    /// from, so the [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`]
+    /// `source` label and the fetch histogram's `tier` stay honest
+    /// (ADR 0095). When every fetch of the flight fails, the last error
+    /// reaches every waiter.
+    ///
+    /// A caller of a higher class than the running fetch (a fault on a
+    /// chunk a bulk fill fetches) does not wait for that fetch: it runs
+    /// its own `fetch` beside it, and the first verified answer serves
+    /// every caller.
+    ///
+    /// `permit` is an admission slot the caller took ahead (a fill takes
+    /// its slots in fetch order). It goes to `fetch`, and is dropped when
+    /// this call waits for another call's fetch.
+    pub async fn fill_with<F, Fut>(
+        &self,
+        hash: ChunkHash,
+        class: Class,
+        mut permit: Option<Permit>,
+        fetch: F,
+    ) -> Result<Bytes>
+    where
+        F: FnOnce(Option<Permit>) -> Fut,
         Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
     {
         if let Some(bytes) = self.read_resident(hash).await? {
             return Ok(bytes);
         }
-
-        // Singleflight, cancel-safe. We loop because a waiter whose leader
-        // is cancelled mid-fetch (see `LeaderGuard`) wakes with `RecvError`
-        // and re-enters — re-checking the local hit, then re-leading or
-        // re-joining — rather than failing the read. The leader path runs
-        // at most once per call (the `fetch` closure is `FnOnce`, taken via
-        // `Option::take`); a call only re-loops as a woken waiter.
+        // A call loops only as a waiter whose flight ended without an
+        // answer (its last leader was cancelled); a leader returns.
         let mut fetch = Some(fetch);
         loop {
             let (tx, rx) = oneshot::channel();
-            let do_fetch = {
+            let role = {
                 let mut inflight = self.inner.inflight.lock();
-                let entry = inflight.entry(hash).or_default();
-                let first = entry.is_empty();
-                entry.push(tx);
-                first
+                match inflight.get_mut(&hash) {
+                    None => {
+                        let id = NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        inflight.insert(
+                            hash,
+                            Flight {
+                                id,
+                                class,
+                                leaders: 1,
+                                waiters: vec![tx],
+                                fetched: None,
+                            },
+                        );
+                        Role::Lead { id, first: true }
+                    }
+                    Some(flight) => match &flight.fetched {
+                        Some(bytes) => Role::Served(bytes.clone()),
+                        // `Class` orders `Demand` first.
+                        None if class < flight.class => {
+                            flight.class = class;
+                            flight.leaders += 1;
+                            flight.waiters.push(tx);
+                            Role::Lead {
+                                id: flight.id,
+                                first: false,
+                            }
+                        }
+                        None => {
+                            flight.waiters.push(tx);
+                            Role::Wait
+                        }
+                    },
+                }
             };
+            match role {
+                Role::Served(bytes) => return Ok(bytes),
+                Role::Wait => {
+                    drop(permit.take());
+                    match rx.await {
+                        Ok(result) => return result,
+                        Err(_) => continue,
+                    }
+                }
+                Role::Lead { id, first } => {
+                    let fetch = fetch.take().expect("a call leads at most once");
+                    let guard = LeaderGuard {
+                        inflight: &self.inner.inflight,
+                        hash,
+                        id,
+                        armed: true,
+                    };
+                    return self
+                        .lead(guard, class, first, rx, fetch(permit.take()))
+                        .await;
+                }
+            }
+        }
+    }
 
-            if do_fetch {
-                // Arm the cancel-safety guard for the whole leader section:
-                // if this future is dropped before we remove the slot below,
-                // the guard removes it so waiters retry instead of wedging.
-                let mut guard = LeaderGuard {
-                    inflight: &self.inner.inflight,
-                    hash,
-                    armed: true,
-                };
-                // Double-checked hit: leadership was won on the state of the
-                // inflight MAP, but this call's fast-path disk check ran
-                // before the lock — a prior leader may have persisted and
-                // drained in between (its persist happens before its slot
-                // removal, below, so slot-gone implies file-present). Serve
-                // from disk instead of paying a duplicate remote fetch —
-                // without this, a stale-miss caller that wins leadership
-                // re-fetches a chunk that is already on NVMe (the
-                // `concurrent_clients_collapse_to_one_fetch` flake).
-                if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
-                    let waiters = {
-                        let mut inflight = self.inner.inflight.lock();
-                        inflight.remove(&hash).unwrap_or_default()
-                    };
-                    guard.armed = false;
-                    for waiter in waiters {
-                        let _ = waiter.send(Ok(bytes.clone()));
-                    }
-                    metrics::counter!(
-                        "engram_chunk_cache_hits_total",
-                        "tier" => "nvme",
-                    )
-                    .increment(1);
-                    metrics::counter!(
-                        "engram_chunk_cache_bytes_total",
-                        "tier" => "nvme",
-                    )
-                    .increment(bytes.len() as u64);
-                    return Ok(bytes);
-                }
-                let fetch = fetch.take().expect("leader runs the fetch once");
-                // ADR 0039 #16: thrash signal. If we're about to pay a remote
-                // round-trip for a hash we recently evicted, the cache is too
-                // small for the working set — count it (and stop tracking the
-                // hash; it's about to be re-cached). A sustained nonzero rate
-                // says "raise the budget / the disk is the bottleneck."
-                if self.inner.evicted_ring.lock().take(&hash) {
-                    metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
-                }
-                // ADR 0019 0d: time the remote fetch — the cold-cache page-in
-                // cost that stretches cold boot (the slow tier). Histogram +
-                // the bytes counter below quantify "how much of the boot is
-                // blob page-in" without per-read trace spam.
-                let fetch_start = crate::time_source::metrics_now();
-                let fetched = fetch().await;
-                let source = fetched
-                    .as_ref()
-                    .map(|(_, s)| *s)
-                    .unwrap_or(FillSource::BlobStorage);
-                let fetched = fetched.map(|(b, _)| b);
-                metrics::histogram!(
-                    "engram_chunk_fetch_seconds",
-                    "tier" => source.fetch_tier(),
-                )
-                .record(fetch_start.elapsed().as_secs_f64());
-                // Verify-on-populate. This is the ONE place a chunk is hashed:
-                // a content-addressed cache must never serve OR store bytes that
-                // don't match the requested hash (corrupt / truncated object). On
-                // mismatch we fail the read for every waiter rather than poison
-                // the guest's rootfs, and never write the bad bytes. The read
-                // fast path above then trusts the verified, atomically-written
-                // file — that's what moves the 16 MiB sha256 off the hot per-read
-                // path (ADR 0021).
-                let result = match fetched {
-                    Ok(bytes) => {
-                        let actual = ChunkHash::of(&bytes);
-                        if actual == hash {
-                            Ok(bytes)
-                        } else {
-                            tracing::error!(
-                                hash = %hash,
-                                actual = %actual,
-                                "fetched chunk hash mismatch; refusing to cache or serve",
-                            );
-                            Err(ChunkStoreError::HashMismatch {
-                                expected: hash.to_hex(),
-                                actual: actual.to_hex(),
-                            })
-                        }
-                    }
-                    Err(e) => Err(e),
-                };
-                // Persist BEFORE releasing the slot. The ordering is the
-                // singleflight's collapse invariant: a fresh caller can only
-                // become the next leader after this slot is removed, so
-                // slot-gone must imply file-present — otherwise every caller
-                // arriving in the remove→persist window (fast-path miss, then
-                // an empty inflight entry) re-fetches a chunk that is already
-                // in flight to disk. The leader's double-checked read above
-                // relies on the same invariant. Cancellation mid-persist is
-                // covered by the still-armed guard (slot removed on drop;
-                // waiters wake with RecvError and retry).
-                if let Ok(bytes) = result.as_ref() {
-                    // write_local failure is non-fatal I/O (ENOSPC, perms): the
-                    // fetched bytes still return to the caller, but the chunk
-                    // isn't cached, so every later read re-fetches from GCS —
-                    // which presents exactly as "warming ran but reads still
-                    // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    let write_local_ok = match self.write_local(hash, bytes).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            tracing::warn!(
-                                hash = %hash,
-                                root = %self.inner.config.root.display(),
-                                bytes = bytes.len(),
-                                error = %e,
-                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                            );
-                            false
-                        }
-                    };
-                    // This measures the fetch (bytes pulled from
-                    // BlobStorage), not the fill — it stays unconditional
-                    // even when write_local below fails.
-                    metrics::counter!(
-                        "engram_chunk_cache_bytes_total",
-                        "tier" => source.fetch_tier(),
-                    )
-                    .increment(bytes.len() as u64);
-                    // ADR 0019 / telemetry restoration (#526), review finding
-                    // 4: the baseline meter for epic-gcs-free-resume's
-                    // "GCS-free by policy" claim. ADR 0095 moved the label to
-                    // the closure seam: the fetcher reports its actual source
-                    // (`gcs` = the cold BlobStorage tier in every deployed
-                    // configuration; `peer` = a fleet sibling's NVMe), so a
-                    // tiered fetcher can't launder a peer fill as GCS or vice
-                    // versa. Gated on `write_local_ok`: a fetch whose local
-                    // persist failed did NOT fill the cache — counting it
-                    // here would mask exactly the "warming ran but reads
-                    // still miss" state the write_local warning above exists
-                    // to catch.
-                    if write_local_ok {
-                        metrics::counter!(
-                            CHUNK_FILL_TOTAL,
-                            "source" => source.label(),
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            CHUNK_FILL_BYTES_TOTAL,
-                            "source" => source.label(),
-                        )
-                        .increment(bytes.len() as u64);
-                    }
-                }
-                // Drain waiters + DISARM: the slot is gone, so the guard must
-                // not remove a fresh slot a later leader may have created.
-                let waiters = {
+    /// One leader of a flight: run `fetching` until it or another leader
+    /// answers, then answer the flight.
+    async fn lead<Fut>(
+        &self,
+        mut guard: LeaderGuard<'_>,
+        class: Class,
+        first: bool,
+        mut rx: oneshot::Receiver<Result<Bytes>>,
+        fetching: Fut,
+    ) -> Result<Bytes>
+    where
+        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
+    {
+        let (hash, id) = (guard.hash, guard.id);
+        if first {
+            // Double-checked hit: this call's fast-path disk check ran
+            // before it took the map lock, and a previous flight may have
+            // written the file and ended in between (a flight ends only
+            // after its write, so no flight implies the file is there).
+            // Serve the file instead of fetching it again.
+            if let Some(bytes) = read_if_present(&self.path_for(hash)).await? {
+                let ended = {
                     let mut inflight = self.inner.inflight.lock();
-                    inflight.remove(&hash).unwrap_or_default()
+                    match inflight.get(&hash) {
+                        Some(f) if f.id == id => inflight.remove(&hash),
+                        _ => None,
+                    }
                 };
                 guard.armed = false;
-                // Notify waiters. Send-failure (their rx dropped)
-                // is benign.
-                for waiter in waiters {
-                    let _ = waiter.send(clone_result(&result));
+                for waiter in ended.into_iter().flat_map(|f| f.waiters) {
+                    let _ = waiter.send(Ok(bytes.clone()));
                 }
-                // ADR 0014 M1.15: count the leader's fetch as a remote-tier
-                // hit (we went past local NVMe — `blobstorage`, or `peer`
-                // when a tiered fetcher resolved there, ADR 0095).
-                // Singleflight FOLLOWERS are not counted here at all — the
-                // rx-await arm increments no metric; a follower surfaces as
-                // an nvme hit only on its own later `get` call that finds
-                // the now-cached chunk.
                 metrics::counter!(
                     "engram_chunk_cache_hits_total",
-                    "tier" => source.fetch_tier(),
+                    "tier" => "nvme",
                 )
                 .increment(1);
-                return result;
-            } else {
-                // We're not the first; await the leader's broadcast. The
-                // closure we were passed stays unused (the leader's fetcher
-                // fires; content-addressing means any fetcher yields the same
-                // bytes).
-                match rx.await {
+                metrics::counter!(
+                    "engram_chunk_cache_bytes_total",
+                    "tier" => "nvme",
+                )
+                .increment(bytes.len() as u64);
+                return Ok(bytes);
+            }
+        }
+        // ADR 0039 #16: thrash signal. If we're about to pay a remote
+        // round-trip for a hash we recently evicted, the cache is too
+        // small for the working set — count it (and stop tracking the
+        // hash; it's about to be re-cached). A sustained nonzero rate
+        // says "raise the budget / the disk is the bottleneck."
+        if self.inner.evicted_ring.lock().take(&hash) {
+            metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
+        }
+        // ADR 0019 0d: time the remote fetch — the cold-cache page-in
+        // cost that stretches cold boot (the slow tier).
+        let fetch_start = crate::time_source::metrics_now();
+        tokio::pin!(fetching);
+        let mut rx_open = true;
+        let fetched = loop {
+            tokio::select! {
+                got = &mut fetching => break got,
+                answer = &mut rx, if rx_open => match answer {
+                    // Another leader of the flight answered first; the
+                    // guard gives up this leader's place.
                     Ok(result) => return result,
-                    // `RecvError` ⇒ the leader was dropped (cancelled) before
-                    // broadcasting and its `LeaderGuard` cleaned the slot.
-                    // Retry: re-loop to re-check the local hit, then re-lead
-                    // or re-join. This is the un-poisoning — a cancelled
-                    // restore no longer wedges every later read of this hash.
-                    Err(_) => continue,
+                    Err(_) => rx_open = false,
+                },
+            }
+        };
+        let source = fetched
+            .as_ref()
+            .map(|(_, s)| *s)
+            .unwrap_or(FillSource::BlobStorage);
+        metrics::histogram!(
+            "engram_chunk_fetch_seconds",
+            "tier" => source.fetch_tier(),
+        )
+        .record(fetch_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            "engram_chunk_cache_hits_total",
+            "tier" => source.fetch_tier(),
+        )
+        .increment(1);
+        // A chunk from the object store is hashed here, once, before
+        // it is stored or served; a mismatch fails the fetch and stores
+        // nothing. A peer's chunk is trusted: the peer checked it when it
+        // stored it, and each frame carries a CRC32C.
+        let verified = match fetched {
+            Ok((bytes, FillSource::Peer)) => Ok(bytes),
+            Ok((bytes, FillSource::BlobStorage)) => {
+                verify_fetched(hash, &bytes).await.map(|()| bytes)
+            }
+            Err(e) => Err(e),
+        };
+        match verified {
+            Ok(bytes) => self.answer_flight(guard, class, bytes, source).await,
+            Err(e) => {
+                let ended = leave(&mut self.inner.inflight.lock(), hash, id);
+                guard.armed = false;
+                match ended {
+                    Some(Flight {
+                        fetched: Some(bytes),
+                        ..
+                    }) => Ok(bytes),
+                    // This was the flight's last fetch: its error is the
+                    // flight's answer.
+                    Some(flight) => {
+                        for waiter in flight.waiters {
+                            let _ = waiter.send(Err(e.duplicate()));
+                        }
+                        Err(e)
+                    }
+                    // Another leader still fetches, or has answered.
+                    None if rx_open => match rx.await {
+                        Ok(Ok(bytes)) => Ok(bytes),
+                        _ => Err(e),
+                    },
+                    None => Err(e),
                 }
             }
         }
     }
 
-    /// Pre-warm: fetch and store locally without returning bytes
-    /// to the caller. Used by working-set replay to load the
-    /// prefault set in parallel before vCPUs run.
-    pub async fn prefetch<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<()>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Bytes>>,
-    {
-        // Already resident? Confirm presence with a cheap stat instead of
-        // reading (and discarding) the whole chunk off NVMe. prefetch only
-        // needs the chunk *resident*, not its bytes — content-addressing +
-        // verify-on-populate (ADR 0021) mean a present file is known-good,
-        // and skipping the read stops a warm-cache prefetch from inflating
-        // the nvme hit/bytes counters with reads no consumer received. A
-        // miss still routes through `get` (singleflight + verify-on-populate).
-        if self.contains(hash).await {
-            return Ok(());
-        }
-        let _ = self.get(hash, fetch).await?;
-        Ok(())
-    }
-
-    /// ADR 0014 M1.13: parallel prefetch of a whole manifest's
-    /// chunk set into local NVMe. Bounds concurrency so a bursty
-    /// refill doesn't saturate the host NIC or GCS rate limits.
-    ///
-    /// Returns once every chunk is either confirmed in cache or
-    /// fetched. The `fetch` closure is called once per missing
-    /// chunk (concurrent calls are fine; per-chunk dedup happens
-    /// inside `get`). Errors propagate from the first failure;
-    /// already-completed fetches stay in cache (the prefetch is
-    /// best-effort lazy from the caller's POV).
-    ///
-    /// Used by `pooled_backend::restore` to warm the snapshot's
-    /// memory chunks before `inner.restore` triggers UFFD-driven
-    /// reads — converts what would be N serial GCS round-trips
-    /// during kernel resume into K parallel round-trips upfront.
-    pub async fn prefetch_chunks_parallel<F, Fut>(
+    /// Serve verified `bytes` to the flight's waiters at once, then write
+    /// them to local NVMe at `class` and end the flight. A later leader
+    /// with the same answer only leaves the flight.
+    async fn answer_flight(
         &self,
-        hashes: Vec<ChunkHash>,
-        concurrency: usize,
-        fetch: F,
-    ) -> Result<()>
-    where
-        F: Fn(ChunkHash) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = Result<Bytes>> + Send + 'static,
-    {
-        use futures::stream::{FuturesUnordered, StreamExt};
-        type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-        let spawn_one = |h: ChunkHash, cache: ChunkCache, fetcher: F| -> Task {
-            Box::pin(async move { cache.prefetch(h, || fetcher(h)).await })
+        mut guard: LeaderGuard<'_>,
+        class: Class,
+        bytes: Bytes,
+        source: FillSource,
+    ) -> Result<Bytes> {
+        let (hash, id) = (guard.hash, guard.id);
+        let first_answer = {
+            let mut inflight = self.inner.inflight.lock();
+            match inflight.get_mut(&hash) {
+                Some(f) if f.id == id && f.fetched.is_none() => {
+                    f.fetched = Some(bytes.clone());
+                    for waiter in f.waiters.drain(..) {
+                        let _ = waiter.send(Ok(bytes.clone()));
+                    }
+                    true
+                }
+                _ => false,
+            }
         };
-
-        let max_in_flight = concurrency.max(1);
-        let mut in_flight: FuturesUnordered<Task> = FuturesUnordered::new();
-        let mut iter = hashes.into_iter();
-        // Seed the pipeline.
-        for _ in 0..max_in_flight {
-            match iter.next() {
-                Some(h) => in_flight.push(spawn_one(h, self.clone(), fetch.clone())),
-                None => break,
+        if !first_answer {
+            return Ok(bytes);
+        }
+        // The flight stays in the map during the write, so a call that
+        // arrives now is served from it instead of fetching again; it
+        // ends after the write, so no flight implies the file is there.
+        // A leader cancelled mid-write leaves through the still-armed
+        // guard, and the write's blocking task still ends.
+        //
+        // A failed write (ENOSPC, permissions) is not fatal: the bytes
+        // still return, but the chunk is not cached and every later read
+        // fetches it again — which looks like "warming ran but reads
+        // still miss". Log it loudly rather than swallow it.
+        let written = match self.write_local(hash, bytes.clone(), class).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    hash = %hash,
+                    root = %self.inner.config.root.display(),
+                    bytes = bytes.len(),
+                    error = %e,
+                    "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                );
+                false
+            }
+        };
+        // This measures the fetch, not the fill, so it counts a chunk
+        // whose write failed too.
+        metrics::counter!(
+            "engram_chunk_cache_bytes_total",
+            "tier" => source.fetch_tier(),
+        )
+        .increment(bytes.len() as u64);
+        // ADR 0019 / ADR 0095: fills by their actual source (`gcs` = the
+        // object store, `peer` = a fleet sibling's NVMe). Only a chunk
+        // that reached the disk counts, so a failed write cannot hide the
+        // "warming ran but reads still miss" state.
+        if written {
+            metrics::counter!(CHUNK_FILL_TOTAL, "source" => source.label()).increment(1);
+            metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => source.label())
+                .increment(bytes.len() as u64);
+        }
+        {
+            let mut inflight = self.inner.inflight.lock();
+            if inflight.get(&hash).is_some_and(|f| f.id == id) {
+                inflight.remove(&hash);
             }
         }
-        // Drain + refill: each completion lets us start one more.
-        while let Some(result) = in_flight.next().await {
-            result?;
-            if let Some(h) = iter.next() {
-                in_flight.push(spawn_one(h, self.clone(), fetch.clone()));
-            }
-        }
-        Ok(())
+        guard.armed = false;
+        Ok(bytes)
     }
 
     /// Pin a chunk against eviction (increments its refcount). Used by
@@ -1303,299 +1389,70 @@ impl ChunkCache {
         self.inner.pinned.lock().contains_key(&hash)
     }
 
-    /// True if local NVMe currently has this chunk. Cheap stat;
-    /// doesn't load bytes.
-    pub async fn contains(&self, hash: ChunkHash) -> bool {
-        fs::try_exists(self.path_for(hash)).await.unwrap_or(false)
+    /// Like [`Self::put_trusted`] but WITHOUT the per-write eviction
+    /// sweep, for paths that write many chunks back to back. Callers MUST
+    /// call [`Self::sweep`] once after the batch (the budget/floor
+    /// invariant is per batch, not per write).
+    pub(crate) async fn put_no_evict(
+        &self,
+        hash: ChunkHash,
+        bytes: Bytes,
+        class: Class,
+    ) -> Result<()> {
+        self.store_file(hash, bytes, class).await
     }
 
-    /// Like [`Self::put`] but WITHOUT the per-write eviction sweep —
-    /// for bulk staging paths (migration prestage / local-sink
-    /// re-chunk) that write dozens of chunks back-to-back: the sweep
-    /// is a full two-level readdir of the cache root + statvfs, and
-    /// paying it per chunk turned a ~94 MiB prod migration transfer
-    /// into a 70 s leg. Callers MUST call [`Self::sweep`] once after
-    /// the batch (the budget/floor invariant is per-batch, not
-    /// per-write).
-    pub async fn put_no_evict(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-        let actual = ChunkHash::of(bytes);
-        if actual != hash {
-            return Err(ChunkStoreError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
-        let target = self.path_for(hash);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        write_atomic(&target, bytes).await?;
-        self.index_insert(hash, bytes.len() as u64);
-        Ok(())
-    }
-
-    /// One RECONCILING eviction sweep — the batch-closing pair of
+    /// One eviction sweep: the batch-closing pair of
     /// [`Self::put_no_evict`], and what the periodic
-    /// [`Self::spawn_sweeper`] runs. Re-walks the cache directory,
-    /// rebuilds the in-memory index from disk truth (out-of-process
-    /// writers — the UFFD handler, ADR 0070 — land chunks the index
-    /// can't see), gauges the drift, then enforces the budget. The
-    /// only remaining full-walk path; everything per-write reads the
-    /// index ([`Self::evict_with_index`]).
+    /// [`Self::spawn_sweeper`] runs. It enforces the budget against the
+    /// in-memory index; the first sweep after boot builds the index with
+    /// the cache's one directory walk.
     pub async fn sweep(&self) -> Result<()> {
-        // ADR 0070: single-evictor — a non-evicting process (the UFFD
-        // handler) must not pay the reconcile walk either. Checked
-        // BEFORE the walk, preserving the old evict_to_budget's
-        // early-return semantics.
+        // ADR 0070: single-evictor — a non-evicting process must not pay
+        // the walk either.
         if !self.inner.config.eviction_enabled {
             tracing::debug!("chunk cache sweep skipped: eviction_enabled=false on this cache");
             return Ok(());
         }
         let _gate = self.inner.sweep_gate.lock().await;
+        if matches!(&*self.inner.index.lock(), IndexState::Pending(_)) {
+            self.walk_into_index().await?;
+        }
+        self.evict_with_index().await
+    }
+
+    /// Rebuild the index from a directory walk and gauge its drift.
+    /// Caller holds `sweep_gate`.
+    async fn walk_into_index(&self) -> Result<()> {
         let started = crate::time_source::metrics_now();
         let entries = self.list_entries().await?;
         metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
             .record(started.elapsed().as_secs_f64());
         self.index_install(&entries);
-        self.evict_with_index().await
-    }
-
-    /// ADR 0095: land peer-pulled bytes WITHOUT the sha256
-    /// verify-on-populate — the bulk peer-fill landing path, where
-    /// hashing at line rate would cost cores the co-tenant guests need
-    /// (no SHA-NI on this fleet). Integrity contract: the transport
-    /// already CRC32C-checked every frame; this call marks the chunk
-    /// **unverified-origin** (a `.unverified` sidecar, written BEFORE
-    /// the chunk becomes visible) and enqueues it for the background
-    /// scrubber ([`Self::spawn_scrubber`]), which sha256s it off the
-    /// critical path — a mismatch deletes the file (next read refetches
-    /// from GCS) and counts `engram_chunk_scrub_total{outcome="corrupt"}`.
-    /// Until the scrub clears the marker the chunk is readable LOCALLY
-    /// (CRC-checked bytes; trust-on-read as usual) but is NOT served
-    /// onward to peers ([`Self::read_verified_for_serve`]) — corruption
-    /// can travel at most one hop.
-    ///
-    /// Like [`Self::put_no_evict`], skips the per-write budget sweep:
-    /// bulk callers MUST call [`Self::sweep`] once after the batch.
-    pub async fn put_unverified_no_evict(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-        let target = self.path_for(hash);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        // Marker FIRST: a crash between the two writes must leave
-        // either (marker, no chunk) — a stale marker the scrubber
-        // reaps — or nothing. The bad state (unverified chunk with no
-        // marker) must be unreachable. Markers are never removed
-        // outside the scrubber (racing a verified writer on the same
-        // hash then converges to "marked, scrub verifies" instead of
-        // leaving unhashed bytes unmarked).
-        write_atomic(&self.marker_path_for(hash), b"").await?;
-        write_atomic(&target, bytes).await?;
-        self.index_insert(hash, bytes.len() as u64);
-        if let Some(tx) = self.inner.scrub_tx.lock().as_ref() {
-            let _ = tx.send(hash);
-        }
         Ok(())
     }
 
-    /// `.unverified` sidecar path for a chunk. Lives next to the chunk
-    /// file; invisible to the LRU walk ([`Self::list_entries`] only
-    /// matches 62-hex names), so eviction can never strip a marker out
-    /// from under its chunk.
-    fn marker_path_for(&self, hash: ChunkHash) -> PathBuf {
-        let mut p = self.path_for(hash).into_os_string();
-        p.push(".unverified");
-        PathBuf::from(p)
-    }
-
-    /// ADR 0095 serve-onward gate: the chunk's bytes IF it is resident
-    /// AND verified-origin (sha256'd at populate, or scrubbed since a
-    /// bulk peer landing). `None` ⇒ the peer-serve path streams a
-    /// `missing` marker and the requester sources it from GCS — an
-    /// unverified chunk is never re-served, so a corrupt source can
-    /// poison at most its direct pullers, and only until the scrub.
-    pub async fn read_verified_for_serve(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
-        if fs::try_exists(self.marker_path_for(hash))
-            .await
-            .unwrap_or(false)
-        {
-            return Ok(None);
-        }
-        read_if_present(&self.path_for(hash)).await
-    }
-
-    /// ADR 0095: spawn the background scrubber that drains the
-    /// unverified-origin backlog. Rate-limited to `bytes_per_sec`
-    /// (sha256 on no-SHA-NI hosts is ~0.5-1 GB/s/core — the limit keeps
-    /// the drain to a fraction of a core next to live guests). On boot
-    /// it scans for leftover markers (crash recovery), then drains the
-    /// live queue fed by [`Self::put_unverified_no_evict`].
-    ///
-    /// Outcomes (`engram_chunk_scrub_total{outcome}`):
-    /// - `ok`: content matches its hash — marker removed, chunk becomes
-    ///   servable onward.
-    /// - `corrupt`: mismatch — chunk + marker deleted (next read
-    ///   refetches from GCS), logged at ERROR.
-    /// - `missing`: marker with no chunk (evicted mid-queue, or a
-    ///   crashed landing) — marker reaped.
-    ///
-    /// The caller keeps the returned handle alive for the process
-    /// lifetime (same held-handle pattern as [`Self::spawn_sweeper`]).
-    pub fn spawn_scrubber(&self, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChunkHash>();
-        *self.inner.scrub_tx.lock() = Some(tx);
-        let cache = self.clone();
-        tokio::spawn(async move {
-            // Crash recovery: enqueue every marker already on disk.
-            let leftover = cache.scan_unverified_markers().await;
-            if !leftover.is_empty() {
-                tracing::info!(
-                    count = leftover.len(),
-                    "chunk scrubber: found unverified-origin markers from a prior life",
-                );
-            }
-            let mut backlog: std::collections::VecDeque<ChunkHash> = leftover.into();
-            loop {
-                let hash = match backlog.pop_front() {
-                    Some(h) => h,
-                    None => match rx.recv().await {
-                        Some(h) => h,
-                        None => return, // cache dropped
-                    },
-                };
-                let started = crate::time_source::metrics_now();
-                let scrubbed = cache.scrub_one(hash).await;
-                // Rate limit: sleep so that (bytes hashed) / (elapsed +
-                // sleep) ≤ bytes_per_sec. Zero-byte outcomes (missing)
-                // pace on a nominal floor so a marker storm can't spin.
-                let bytes = scrubbed.max(64 * 1024) as f64;
-                let budget =
-                    std::time::Duration::from_secs_f64(bytes / (bytes_per_sec.max(1) as f64));
-                if let Some(sleep) = budget.checked_sub(started.elapsed()) {
-                    tokio::time::sleep(sleep).await;
-                }
-            }
-        })
-    }
-
-    /// Scrub one unverified-origin chunk; returns the byte count hashed
-    /// (0 for `missing`). See [`Self::spawn_scrubber`].
-    async fn scrub_one(&self, hash: ChunkHash) -> usize {
-        let marker = self.marker_path_for(hash);
-        if !fs::try_exists(&marker).await.unwrap_or(false) {
-            // Already scrubbed (duplicate queue entry) — not an outcome.
-            return 0;
-        }
-        let bytes = match read_if_present(&self.path_for(hash)).await {
-            Ok(Some(b)) => b,
-            _ => {
-                let _ = fs::remove_file(&marker).await;
-                // The chunk file is gone (evicted mid-queue or a crashed
-                // landing) — drop any stale index entry with it.
-                self.index_remove(hash);
-                metrics::counter!("engram_chunk_scrub_total", "outcome" => "missing").increment(1);
-                return 0;
-            }
-        };
-        if ChunkHash::of(&bytes) == hash {
-            let _ = fs::remove_file(&marker).await;
-            metrics::counter!("engram_chunk_scrub_total", "outcome" => "ok").increment(1);
-        } else {
-            // Delete chunk BEFORE marker (the crash-safe order: the bad
-            // bytes must never linger unmarked). Next read misses and
-            // refetches from GCS through the verifying populate.
-            let _ = fs::remove_file(self.path_for(hash)).await;
-            self.index_remove(hash);
-            let _ = fs::remove_file(&marker).await;
-            metrics::counter!("engram_chunk_scrub_total", "outcome" => "corrupt").increment(1);
-            tracing::error!(
-                hash = %hash,
-                "chunk scrubber: peer-landed chunk FAILED sha256 — deleted (will refetch \
-                 from GCS); if this fires repeatedly the sourcing peer has disk rot or a \
-                 serve bug (ADR 0095 §Integrity)",
-            );
-        }
-        bytes.len()
-    }
-
-    /// Walk the cache for `.unverified` sidecars (boot-time crash
-    /// recovery for the scrubber). Same two-level layout as
-    /// [`Self::list_entries`].
-    async fn scan_unverified_markers(&self) -> Vec<ChunkHash> {
-        let mut out = Vec::new();
-        let Ok(mut top) = fs::read_dir(&self.inner.config.root).await else {
-            return out;
-        };
-        while let Ok(Some(prefix_entry)) = top.next_entry().await {
-            let prefix_path = prefix_entry.path();
-            if !prefix_entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let Some(prefix) = prefix_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let Ok(mut inner) = fs::read_dir(&prefix_path).await else {
-                continue;
-            };
-            while let Ok(Some(file)) = inner.next_entry().await {
-                let Some(name) = file.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let Some(rest) = name.strip_suffix(".unverified") else {
-                    continue;
-                };
-                if rest.len() != 62 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                    continue;
-                }
-                if let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) {
-                    out.push(hash);
-                }
-            }
-        }
-        out
-    }
-
-    /// Spawn the periodic sweeper (ADR 0070): calls [`Self::sweep`] every
-    /// `interval`, independent of populate traffic — closes the gap where
-    /// a host under disk pressure with no populate activity (or one that
-    /// just restarted with a cold pin set) enforces nothing until the
-    /// next write. Errors are logged and looping continues; a single
-    /// failed sweep must never take enforcement offline.
+    /// Spawn the periodic sweeper (ADR 0070). It builds the index at once
+    /// (the walk evicts nothing), then calls [`Self::sweep`] every
+    /// `interval`, independent of populate traffic, so a host under disk
+    /// pressure with no populate activity still enforces the budget.
+    /// Errors are logged and looping continues; a single failed sweep
+    /// must never take enforcement offline.
     ///
     /// `interval` of [`Duration::ZERO`] disables the sweeper (the spawned
-    /// task returns immediately without ticking) — deterministic tests
-    /// that want to control exactly when a sweep happens call
+    /// task returns immediately) — deterministic tests call
     /// [`Self::sweep`] directly instead of racing a background timer.
     ///
-    /// Deliberately does NOT sweep at t=0: `tokio::time::interval`'s
-    /// first tick fires immediately, but on a freshly-started host-agent
-    /// pins are in-memory only and haven't been re-established yet (the
-    /// image-prefetch supervisor's reconcile needs a coordinator RPC
-    /// round-trip after registration). A t=0 sweep on a restarted host
-    /// with an over-budget cache would run pin-blind and evict the
-    /// oldest-mtime chunks — exactly the boot-staged base-image chunks
-    /// that were pinned in the prior life — flapping readiness and
-    /// re-fetching from GCS on every rollout of a host that happens to
-    /// sit at or over budget. The first sweep waits one full `interval`
-    /// instead, giving the pin set a chance to repopulate first; the
-    /// populate-path debounced sweep (`sweep_debounce_ms`) still bounds
-    /// growth from writes in the meantime.
+    /// The first eviction waits one full `interval`: on a freshly started
+    /// host-agent the pins are in memory only and not yet re-established
+    /// (the image-prefetch supervisor's reconcile needs a coordinator
+    /// round trip), so an eviction at t=0 on an over-budget cache would
+    /// run pin-blind and evict the boot-staged base-image chunks the prior
+    /// life had pinned. The populate-path debounced sweep
+    /// (`sweep_debounce_ms`) still bounds growth from writes meanwhile.
     ///
-    /// Mirrors `base_shm_gc::spawn`'s held-handle pattern: the caller
-    /// keeps the returned handle alive for the process lifetime (dropping
-    /// or aborting it stops the sweeper).
+    /// The caller keeps the returned handle alive for the process
+    /// lifetime (dropping or aborting it stops the sweeper).
     pub fn spawn_sweeper(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let cache = self.clone();
         tokio::spawn(async move {
@@ -1603,11 +1460,16 @@ impl ChunkCache {
                 tracing::debug!("chunk cache periodic sweeper disabled (interval=0)");
                 return;
             }
+            {
+                let _gate = cache.inner.sweep_gate.lock().await;
+                if matches!(&*cache.inner.index.lock(), IndexState::Pending(_)) {
+                    if let Err(e) = cache.walk_into_index().await {
+                        tracing::warn!(error = %e, "chunk cache boot walk failed");
+                    }
+                }
+            }
             let mut tick = engram_core::periodic(interval);
-            // Consume the immediate t=0 tick without sweeping — see the
-            // doc comment above. Every tick after this one is spaced a
-            // full `interval` apart, so the first real sweep lands at
-            // t=interval, not t=0.
+            // The first tick fires at once; skip it (see above).
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -1618,49 +1480,32 @@ impl ChunkCache {
         })
     }
 
-    /// Write bytes to the cache atomically. Used internally on
-    /// miss; also exposed so a caller that already has the bytes
-    /// can populate the cache without a BlobStorage round trip.
-    pub async fn put(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-        // Verify caller's hash claim — defensive; cheap.
-        let actual = ChunkHash::of(bytes);
-        if actual != hash {
-            return Err(ChunkStoreError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
-        self.write_local(hash, bytes).await
+    /// Store a chunk after checking that `bytes` hash to `hash`, at
+    /// `Background`.
+    pub async fn put(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
+        check_hash(hash, &bytes)?;
+        self.write_local(hash, bytes, Class::Background).await
     }
 
-    /// Write a *pre-hashed* chunk to the cache with the debounced budget
-    /// sweep — the primitive behind [`Self::put`], minus `put`'s defensive
-    /// re-hash. `pub(crate)` so `ChunkStore::put_chunk`'s write-through can
-    /// populate a chunk it already hashed without re-hashing it (matters on
-    /// no-SHA-NI hosts, ADR 0021) while still enforcing the budget (unlike
-    /// [`Self::put_no_evict`], which skips the sweep). Caller guarantees
-    /// `hash == ChunkHash::of(bytes)`; the read path verifies on GET anyway.
-    pub(crate) async fn write_local(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-        let target = self.path_for(hash);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        // Writer-unique temp + rename — atomic on POSIX, and safe even
-        // when the out-of-process UFFD handler caches the same hash into
-        // this shared cache_root concurrently (see `write_atomic`).
-        write_atomic(&target, bytes).await?;
-        self.index_insert(hash, bytes.len() as u64);
+    /// Store a chunk the caller trusts without hashing it (a peer's chunk,
+    /// or one the caller just hashed), at `class`.
+    pub async fn put_trusted(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
+        self.write_local(hash, bytes, class).await
+    }
+
+    /// Store a chunk whose hash the caller guarantees, then run the
+    /// debounced budget sweep.
+    pub(crate) async fn write_local(
+        &self,
+        hash: ChunkHash,
+        bytes: Bytes,
+        class: Class,
+    ) -> Result<()> {
+        self.store_file(hash, bytes, class).await?;
 
         // Best-effort eviction sweep, DEBOUNCED to at most once per
         // interval across all writers, and SKIPPED outright if a sweep
-        // is already running (#1003: on a 516k-file cache the walk-based
-        // sweep outlived the debounce window, so sweeps piled up
-        // concurrently — ~10 directory listings live at once in the
-        // burst profile; the running sweep enforces the same budget, so
-        // piling on buys nothing). The sweep itself now reads the
-        // in-memory index — the per-write full readdir (100-500 ms per
-        // populate on a loaded cache, ADR 0045 C1 / #184) is gone; only
-        // the periodic [`Self::sweep`] walks the directory.
+        // is already running (the running sweep enforces the same budget).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -1682,7 +1527,7 @@ impl ChunkCache {
                 .is_ok()
         {
             if matches!(&*self.inner.index.lock(), IndexState::Pending(_)) {
-                // First sweep since boot: build off-path (see
+                // No boot walk yet: build off-path (see
                 // spawn_index_build) instead of stalling this write —
                 // and this task may be a singleflight leader.
                 self.spawn_index_build();
@@ -1696,6 +1541,46 @@ impl ChunkCache {
         Ok(())
     }
 
+    /// A slot for one chunk write to the cache's disk at `class`, held
+    /// until the write returns. Every chunk write of the cache takes one;
+    /// other bulk chunk writes to the same disk (a volume being staged)
+    /// take one too, so a restore's disk writes go ahead of a bulk memory
+    /// fill's cache writes.
+    pub async fn write_slot(&self, class: Class) -> Permit {
+        self.inner.writes.acquire(class).await
+    }
+
+    /// Place the chunk file and index it, under a write slot at `class`.
+    /// A chunk the cache already holds is not written again. The
+    /// directory, the write, the rename and the index insert run in one
+    /// blocking task, on `bytes` without a copy. That task holds the slot
+    /// and runs to its end when the caller is dropped, so the index
+    /// learns every file the cache places.
+    async fn store_file(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
+        if self.contains(hash) {
+            return Ok(());
+        }
+        let slot = self.write_slot(class).await;
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let _lock = cache.file_lock(hash).lock();
+            if cache.contains(hash) {
+                return Ok(());
+            }
+            write_atomic(&cache.path_for(hash), &bytes)?;
+            cache.index_insert(hash, bytes.len() as u64);
+            Ok(())
+        })
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("cache write task: {e}")))?
+    }
+
+    /// The lock for `hash`'s file and index entry (see
+    /// [`CacheInner::file_locks`]). Held only in blocking code.
+    fn file_lock(&self, hash: ChunkHash) -> &Mutex<()> {
+        &self.inner.file_locks[hash.as_bytes()[0] as usize % FILE_LOCKS]
+    }
     /// #1003: the budget sweep, driven by the in-memory index. Totals
     /// come from [`CacheIndex`], not a directory walk; eviction unlinks
     /// oldest-populated-first and updates the index as it goes. The
@@ -1705,7 +1590,7 @@ impl ChunkCache {
     /// cache itself didn't grow.
     ///
     /// Caller MUST hold `sweep_gate` — the populate path `try_lock`s
-    /// (skip-if-busy), the reconcile path locks (wait).
+    /// (skip-if-busy), the periodic sweep locks (wait).
     async fn evict_with_index(&self) -> Result<()> {
         // ADR 0070: single-evictor switch. A cache with eviction disabled
         // never unlinks (populate already happened by the time the write
@@ -1721,10 +1606,9 @@ impl ChunkCache {
         let pinned = self.inner.pinned.lock().clone();
         let (cache_total, pinned_bytes) = {
             let guard = self.inner.index.lock();
-            // Not built yet (first sweep after boot, build in flight in
-            // the background) — nothing to enforce against; the build's
-            // own tail sweep and the periodic reconcile backstop this
-            // window.
+            // Not built yet (the boot walk is in flight) — nothing to
+            // enforce against; the build's own tail sweep and the
+            // periodic sweep backstop this window.
             let IndexState::Ready(idx) = &*guard else {
                 return Ok(());
             };
@@ -1806,7 +1690,8 @@ impl ChunkCache {
             );
         }
 
-        let mut over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
+        let ceiling_over = ceiling_over(cache_total, ceiling);
+        let over = ceiling_over.max(floor_over(cache_total, self.inner.free_floor_pct, fs));
         if over > 0 {
             // Oldest populate time first; skip pinned (any refcount > 0).
             // Snapshot (populated_ms, hash, size) triples under the lock,
@@ -1824,61 +1709,87 @@ impl ChunkCache {
                     .collect()
             };
             candidates.sort_unstable_by_key(|(ms, _, _)| *ms);
-            for (_, hash, size) in candidates {
-                if over == 0 {
-                    break;
-                }
-                // Re-check the LIVE pin map at unlink time. The `pinned`
-                // snapshot above was taken at sweep start, and the unlink
-                // loop awaits — a chunk pinned AFTER the snapshot but
-                // BEFORE its unlink (the ADR 0075 Hello pin-around-open
-                // sequence racing an in-flight sweep) was a candidate the
-                // stale snapshot could not see, and this sweep would evict
-                // a pinned chunk. Same delete-time re-verify shape as the
-                // chunk/bundle/snapshot-blob GC promote passes. Surfaced
-                // by `pinned_chunks_survive_populate_pressure` flaking
-                // under host disk pressure (the statvfs floor made a
-                // pre-pin sweep want to evict everything; its delayed
-                // unlink then removed the just-pinned chunk).
-                if self.inner.pinned.lock().contains_key(&hash) {
-                    continue;
-                }
-                let _ = fs::remove_file(self.path_for(hash)).await;
-                self.index_remove(hash);
-                over = over.saturating_sub(size);
-                // ADR 0039 #16: track what we evicted so a later remote miss
-                // for it can be counted as refetch-after-evict thrash.
-                self.inner.evicted_ring.lock().insert(hash);
-                // ADR 0014 M1.15: per-chunk LRU eviction counter.
-                // Operators watch the rate to know if the budget is
-                // too small for the working set.
-                metrics::counter!(
-                    "engram_chunk_cache_evictions_total",
-                    "reason" => "lru",
-                )
-                .increment(1);
-                tracing::trace!(
-                    hash = %hash,
-                    bytes = size,
-                    "evicted from chunk cache",
-                );
-            }
+            let cache = self.clone();
+            let spare_from_ms = now_ms() - RECENT_SPARE_MS;
+            tokio::task::spawn_blocking(move || {
+                cache.evict_oldest(candidates, over, ceiling_over, spare_from_ms)
+            })
+            .await
+            .map_err(|e| ChunkStoreError::Internal(format!("cache evict task: {e}")))?;
         }
         metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "index")
             .record(sweep_started.elapsed().as_secs_f64());
         Ok(())
     }
 
-    /// Build the index from one directory walk, OFF the write path.
-    /// The first populate-path sweep after boot lands here: at prod
-    /// scale the walk is seconds-to-tens-of-seconds (516k files,
-    /// spawn_blocking per stat, cold dentry cache right after a pod
-    /// roll), and the triggering task can be a get-miss populate
-    /// holding a singleflight leader slot on a restore path — it must
-    /// never pay the walk inline. The spawned task serializes on the
-    /// sweep gate, rechecks (a racing reconcile may have built the
-    /// index first), builds, then runs one enforcement sweep so the
-    /// budget takes effect the moment the index exists.
+    /// Unlink `candidates` (oldest first) until `over` bytes are freed.
+    /// A chunk written at or after `spare_from_ms` goes only while the
+    /// byte ceiling still needs `ceiling_over` bytes: the free-space floor
+    /// alone never takes it (see [`RECENT_SPARE_MS`]). Blocking. Each
+    /// unlink holds the chunk's file lock, and skips a chunk pinned or
+    /// written again since the candidates were taken.
+    fn evict_oldest(
+        &self,
+        candidates: Vec<(i64, ChunkHash, u64)>,
+        over: u64,
+        ceiling_over: u64,
+        spare_from_ms: i64,
+    ) {
+        let mut freed = 0u64;
+        for (populated_ms, hash, size) in candidates {
+            // Sorted oldest first, so every later candidate is recent too.
+            let need = if populated_ms >= spare_from_ms {
+                ceiling_over
+            } else {
+                over
+            };
+            if freed >= need {
+                break;
+            }
+            // Re-check the LIVE pin map at unlink time. The candidates
+            // were taken at sweep start; a chunk pinned since then (the
+            // ADR 0075 Hello pin-around-open sequence racing a sweep)
+            // must not be evicted. Same delete-time re-verify shape as
+            // the chunk/bundle/snapshot-blob GC promote passes.
+            if self.inner.pinned.lock().contains_key(&hash) {
+                continue;
+            }
+            {
+                let _lock = self.file_lock(hash).lock();
+                if !self.index_remove_if_populated_at(hash, populated_ms) {
+                    continue;
+                }
+                let _ = std::fs::remove_file(self.path_for(hash));
+            }
+            freed += size;
+            // ADR 0039 #16: track what we evicted so a later remote miss
+            // for it can be counted as refetch-after-evict thrash.
+            self.inner.evicted_ring.lock().insert(hash);
+            // ADR 0014 M1.15: per-chunk LRU eviction counter.
+            // Operators watch the rate to know if the budget is
+            // too small for the working set.
+            metrics::counter!(
+                "engram_chunk_cache_evictions_total",
+                "reason" => "lru",
+            )
+            .increment(1);
+            tracing::trace!(
+                hash = %hash,
+                bytes = size,
+                "evicted from chunk cache",
+            );
+        }
+    }
+
+    /// Build the index from one directory walk, OFF the write path, for
+    /// a populate that finds no index (no sweeper has built it yet). At
+    /// prod scale the walk takes seconds (516k files, cold dentry cache
+    /// right after a pod roll), and the triggering task can be a
+    /// singleflight leader on a restore path — it must never pay the
+    /// walk inline. The spawned task serializes on the sweep gate,
+    /// rechecks (the sweeper may have built the index first), builds,
+    /// then runs one enforcement sweep so the budget takes effect the
+    /// moment the index exists.
     fn spawn_index_build(&self) {
         let cache = self.clone();
         tokio::spawn(async move {
@@ -1886,21 +1797,14 @@ impl ChunkCache {
             if matches!(&*cache.inner.index.lock(), IndexState::Ready(_)) {
                 return;
             }
-            let started = crate::time_source::metrics_now();
-            match cache.list_entries().await {
-                Ok(entries) => {
-                    metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
-                        .record(started.elapsed().as_secs_f64());
-                    cache.index_install(&entries);
-                    if let Err(e) = cache.evict_with_index().await {
-                        tracing::warn!(error = %e, "post-build chunk cache sweep failed");
-                    }
-                }
-                Err(e) => {
-                    // Next debounce winner re-spawns; the periodic
-                    // reconcile builds it regardless.
-                    tracing::warn!(error = %e, "chunk cache index build walk failed");
-                }
+            let built = match cache.walk_into_index().await {
+                Ok(()) => cache.evict_with_index().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = built {
+                // The next debounce winner re-spawns; the sweeper builds
+                // it regardless.
+                tracing::warn!(error = %e, "chunk cache index build failed");
             }
         });
     }
@@ -1934,20 +1838,35 @@ impl ChunkCache {
     /// first walk is still in flight. Overwrites (same hash
     /// re-populated) adjust the total by the size delta.
     fn index_insert(&self, hash: ChunkHash, size: u64) {
-        let populated_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let entry = IndexEntry { size, populated_ms };
+        let entry = IndexEntry {
+            size,
+            populated_ms: now_ms(),
+        };
         match &mut *self.inner.index.lock() {
             IndexState::Pending(ops) => ops.push(PendingOp::Insert(hash, entry)),
             IndexState::Ready(idx) => idx.apply(PendingOp::Insert(hash, entry)),
         }
     }
 
-    /// Record an in-process unlink (eviction, scrub-delete, test
-    /// helper) in the index; buffered while the first walk is in
-    /// flight, same as inserts.
+    /// Remove `hash` from a built index when its entry is the one
+    /// populated at `populated_ms`; whether it did.
+    fn index_remove_if_populated_at(&self, hash: ChunkHash, populated_ms: i64) -> bool {
+        match &mut *self.inner.index.lock() {
+            IndexState::Ready(idx)
+                if idx
+                    .entries
+                    .get(&hash)
+                    .is_some_and(|e| e.populated_ms == populated_ms) =>
+            {
+                idx.apply(PendingOp::Remove(hash));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record an in-process unlink (the test helper) in the index;
+    /// buffered while the first walk is in flight, same as inserts.
     fn index_remove(&self, hash: ChunkHash) {
         match &mut *self.inner.index.lock() {
             IndexState::Pending(ops) => ops.push(PendingOp::Remove(hash)),
@@ -1957,8 +1876,8 @@ impl ChunkCache {
 
     /// Install a completed walk: replay any ops buffered while the
     /// walk ran (they postdate the walk's view of each directory), and
-    /// gauge drift when replacing an earlier `Ready` index (the
-    /// reconcile case).
+    /// gauge drift when replacing an earlier `Ready` index (a test
+    /// re-walk).
     fn index_install(&self, entries: &[CacheEntry]) {
         let mut built = Self::index_from_entries(entries);
         let mut guard = self.inner.index.lock();
@@ -1969,10 +1888,8 @@ impl ChunkCache {
                 }
             }
             IndexState::Ready(prev) => {
-                // |walk truth − maintained index|. Persistent large
-                // drift means an unaccounted writer; transient small
-                // drift is normal (puts racing the walk, UFFD landings
-                // since the last reconcile).
+                // |walk truth − maintained index|. Drift means a
+                // writer the index did not see.
                 let drift = built.total_bytes.abs_diff(prev.total_bytes);
                 metrics::gauge!("engram_chunk_cache_index_drift_bytes").set(drift as f64);
             }
@@ -1980,96 +1897,12 @@ impl ChunkCache {
         *guard = IndexState::Ready(built);
     }
 
+    /// Walk the cache directory, in one blocking task.
     async fn list_entries(&self) -> Result<Vec<CacheEntry>> {
-        // Two-level scan: each prefix dir holds chunk files named
-        // by the rest of the hex digest. Cheap on macOS/Linux for
-        // <O(100k) entries; rebuild as a persistent index if it
-        // gets hot.
-        //
-        // ENOENT mid-walk is NORMAL, not an error: populate's
-        // temp+rename and our own eviction unlink entries concurrently
-        // with the walk, so a listed name can vanish before its
-        // `file_type`/`metadata` stat lands. Propagating that (the
-        // pre-2026-07-16 behavior) aborted the ENTIRE sweep several
-        // times an hour on every busy host — the eviction loop never
-        // completed a pass and the cache grew far past its budget
-        // (424 GiB / 77 % of the incident node's volume). Skip the
-        // vanished entry and keep walking; only non-NotFound I/O
-        // errors abort.
-        fn vanished(e: &std::io::Error) -> bool {
-            e.kind() == std::io::ErrorKind::NotFound
-        }
-        let mut out = Vec::new();
-        let mut top = match fs::read_dir(&self.inner.config.root).await {
-            Ok(d) => d,
-            Err(e) if vanished(&e) => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        loop {
-            let prefix_entry = match top.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(e) if vanished(&e) => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let prefix_path = prefix_entry.path();
-            match prefix_entry.file_type().await {
-                Ok(t) if t.is_dir() => {}
-                Ok(_) => continue,
-                Err(e) if vanished(&e) => continue,
-                Err(e) => return Err(e.into()),
-            }
-            let Some(prefix) = prefix_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let mut inner = match fs::read_dir(&prefix_path).await {
-                Ok(d) => d,
-                Err(e) if vanished(&e) => continue,
-                Err(e) => return Err(e.into()),
-            };
-            loop {
-                let file = match inner.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    Err(e) if vanished(&e) => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                match file.file_type().await {
-                    Ok(t) if t.is_file() => {}
-                    Ok(_) => continue,
-                    Err(e) if vanished(&e) => continue,
-                    Err(e) => return Err(e.into()),
-                }
-                let Some(rest) = file.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if rest.len() != 62 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                    continue;
-                }
-                let full_hex = format!("{prefix}{rest}");
-                let Ok(hash) = ChunkHash::from_hex(&full_hex) else {
-                    continue;
-                };
-                let meta = match file.metadata().await {
-                    Ok(m) => m,
-                    Err(e) if vanished(&e) => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                out.push(CacheEntry {
-                    hash,
-                    size: meta.len(),
-                    mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                });
-            }
-        }
-        Ok(out)
+        let root = self.inner.config.root.clone();
+        tokio::task::spawn_blocking(move || list_entries_blocking(&root))
+            .await
+            .map_err(|e| ChunkStoreError::Internal(format!("cache walk task: {e}")))?
     }
 
     /// Total bytes currently on disk. Diagnostic; not used by the
@@ -2080,35 +1913,181 @@ impl ChunkCache {
     }
 }
 
-/// Atomically place `bytes` at `target` (which must already have its
-/// parent dir) via a writer-unique temp + rename. Last-writer-wins on
-/// the content-addressed target is correct (the bytes are identical),
-/// and because each writer renames its *own* temp, two writers racing
-/// the same hash never see the other's temp vanish mid-rename. On any
-/// failure the temp is removed best-effort, so an ENOSPC/crash doesn't
-/// strand an orphan the LRU sweep won't reclaim (it only tracks 62-hex
-/// chunk files, not `.partial.*`).
-async fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = unique_tmp_path(target);
-    let res = async {
-        fs::write(&tmp, bytes).await?;
-        fs::rename(&tmp, target).await
+/// Every chunk file under `root` (`<2-hex>/<62-hex>`).
+///
+/// ENOENT mid-walk is NORMAL, not an error: populate's temp+rename and the
+/// eviction unlink entries concurrently with the walk, so a listed name
+/// can vanish before its stat lands. Propagating that aborted the ENTIRE
+/// sweep several times an hour on every busy host, so the cache grew far
+/// past its budget. A vanished entry is skipped; only other I/O errors
+/// abort.
+///
+/// The walk also deletes `<62-hex>.unverified` sidecars. Earlier builds
+/// wrote one beside each chunk they landed from a peer; no build reads
+/// them, and the chunk beside one is trusted like any peer chunk.
+fn list_entries_blocking(root: &Path) -> Result<Vec<CacheEntry>> {
+    fn vanished(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::NotFound
     }
-    .await;
+    let mut out = Vec::new();
+    let top = match std::fs::read_dir(root) {
+        Ok(d) => d,
+        Err(e) if vanished(&e) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for prefix_entry in top {
+        let prefix_entry = match prefix_entry {
+            Ok(entry) => entry,
+            Err(e) if vanished(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        match prefix_entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if vanished(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let Some(prefix) = prefix_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let inner = match std::fs::read_dir(prefix_entry.path()) {
+            Ok(d) => d,
+            Err(e) if vanished(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for file in inner {
+            let file = match file {
+                Ok(entry) => entry,
+                Err(e) if vanished(&e) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let Some(name) = file.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let is_chunk_name = |n: &str| n.len() == 62 && n.chars().all(|c| c.is_ascii_hexdigit());
+            if name.strip_suffix(".unverified").is_some_and(is_chunk_name) {
+                let _ = std::fs::remove_file(file.path());
+                continue;
+            }
+            if !is_chunk_name(&name) {
+                continue;
+            }
+            let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{name}")) else {
+                continue;
+            };
+            let meta = match file.metadata() {
+                Ok(m) => m,
+                Err(e) if vanished(&e) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            out.push(CacheEntry {
+                hash,
+                size: meta.len(),
+                mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Atomically place `bytes` at `target` (creating its parent dir) via a
+/// writer-unique temp + rename. Blocking. Last-writer-wins on the
+/// content-addressed target is correct (the bytes are identical), and
+/// because each writer renames its *own* temp, two writers racing the
+/// same hash never see the other's temp vanish mid-rename. On any failure
+/// the temp is removed best-effort, so an ENOSPC doesn't strand an orphan
+/// the sweep won't reclaim (it only tracks 62-hex chunk files, not
+/// `.partial.*`).
+fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = unique_tmp_path(target);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, target));
     if res.is_err() {
-        let _ = fs::remove_file(&tmp).await;
+        let _ = std::fs::remove_file(&tmp);
     }
     Ok(res?)
 }
 
+/// Chunks larger than this are hashed on a blocking thread: without SHA
+/// extensions SHA-256 runs at about 200 MB/s, so a larger chunk would hold
+/// a runtime worker (and the fetch timers on it) for over 5 ms.
+const INLINE_HASH_MAX: usize = 1024 * 1024;
+
+/// The hash of `bytes`; a large chunk is hashed off the async worker.
+pub async fn hash_chunk(bytes: &Bytes) -> Result<ChunkHash> {
+    if bytes.len() <= INLINE_HASH_MAX {
+        return Ok(ChunkHash::of(bytes));
+    }
+    let bytes = bytes.clone();
+    tokio::task::spawn_blocking(move || ChunkHash::of(&bytes))
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("hash task: {e}")))
+}
+
+/// `Err(HashMismatch)` unless `bytes`, fetched from the object store,
+/// hash to `hash`. A large chunk is hashed off the async worker.
+pub async fn verify_fetched(hash: ChunkHash, bytes: &Bytes) -> Result<()> {
+    let actual = hash_chunk(bytes).await?;
+    if actual != hash {
+        tracing::error!(
+            hash = %hash,
+            actual = %actual,
+            "fetched chunk hash mismatch; refusing to cache or serve",
+        );
+        return Err(ChunkStoreError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(())
+}
+
+/// `bytes[offset..offset + len]` of chunk `hash`, or
+/// [`ChunkStoreError::RangeOutOfBounds`] when the range runs past `bytes`.
+pub fn slice_chunk_range(hash: ChunkHash, bytes: &Bytes, offset: u64, len: usize) -> Result<Bytes> {
+    Ok(bytes.slice(range_in(hash, offset, len, bytes.len() as u64)?))
+}
+
+/// `offset..offset + len` when it lies within a chunk of `size` bytes.
+fn range_in(hash: ChunkHash, offset: u64, len: usize, size: u64) -> Result<std::ops::Range<usize>> {
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= size => Ok(offset as usize..end as usize),
+        _ => Err(ChunkStoreError::RangeOutOfBounds {
+            hash: hash.to_hex(),
+            offset,
+            len: len as u64,
+            size,
+        }),
+    }
+}
+
+/// `Err(HashMismatch)` unless `bytes` hash to `hash`.
+fn check_hash(hash: ChunkHash, bytes: &[u8]) -> Result<()> {
+    let actual = ChunkHash::of(bytes);
+    if actual != hash {
+        return Err(ChunkStoreError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(())
+}
+
 /// A writer-unique sibling temp path for `target`:
-/// `<target-filename>.partial.<pid>.<seq>`. The pid disambiguates across
-/// processes sharing a cache_root (the restore prefetch vs. the
-/// out-of-process UFFD handler); the process-global counter
-/// disambiguates concurrent writers within one process. Stays in
-/// `target`'s parent dir so the rename is same-filesystem (atomic), and
-/// the dotted suffix keeps `list_entries`' 62-hex filter from ever
-/// mistaking a temp for a cache entry.
+/// `<target-filename>.partial.<pid>.<seq>`. The process-global counter
+/// disambiguates concurrent writers within this process; the pid keeps a
+/// temp of an earlier process apart. Stays in `target`'s parent dir so
+/// the rename is same-filesystem (atomic), and the dotted suffix keeps
+/// `list_entries`' 62-hex filter from ever mistaking a temp for a cache
+/// entry.
 fn unique_tmp_path(target: &Path) -> PathBuf {
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2170,18 +2149,24 @@ fn fs_total_bytes(path: &Path) -> Option<u64> {
 /// `fs` is `None` when the `statvfs` probe failed: we then apply the
 /// ceiling only and exert no floor pressure (fail soft — better to risk
 /// over-filling than to evict the working set on a bad reading).
+#[cfg(test)]
 fn bytes_to_free(
     cache_total: u64,
     ceiling: Option<u64>,
     free_floor_pct: f64,
     fs: Option<FsUsage>,
 ) -> u64 {
-    let ceiling_over = match ceiling {
-        Some(c) => cache_total.saturating_sub(c),
-        None => 0,
-    };
+    ceiling_over(cache_total, ceiling).max(floor_over(cache_total, free_floor_pct, fs))
+}
 
-    let floor_over = match fs {
+/// Bytes the cache holds above its byte ceiling.
+fn ceiling_over(cache_total: u64, ceiling: Option<u64>) -> u64 {
+    ceiling.map_or(0, |c| cache_total.saturating_sub(c))
+}
+
+/// Bytes to free so the disk gets back to its free-space floor.
+fn floor_over(cache_total: u64, free_floor_pct: f64, fs: Option<FsUsage>) -> u64 {
+    match fs {
         Some(fs) if fs.total > 0 => {
             let required_free = (fs.total as f64 * free_floor_pct.clamp(0.0, 1.0)) as u64;
             let deficit = required_free.saturating_sub(fs.free);
@@ -2190,9 +2175,23 @@ fn bytes_to_free(
             deficit.min(cache_total)
         }
         _ => 0,
-    };
+    }
+}
 
-    ceiling_over.max(floor_over)
+/// The free-space floor does not evict a chunk written in the last
+/// 30 s. A restore writes chunks for a reader that comes within seconds
+/// (the fault handler's eager sweep, a disk read); the floor would
+/// otherwise delete them before that read, and the next sweep (at most
+/// a minute later) takes them if the disk is still short. The byte
+/// ceiling ignores it: the ceiling is the hard limit.
+const RECENT_SPARE_MS: i64 = 30_000;
+
+/// The cache's clock for populate times: unix millis.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Bounded FIFO set of recently-evicted hashes. Membership query +
@@ -2258,26 +2257,23 @@ impl EvictedRing {
     }
 }
 
+/// The file's bytes, read into a pooled buffer in one blocking task, or
+/// `None` when there is no file.
 async fn read_if_present(path: &Path) -> Result<Option<Bytes>> {
-    match fs::read(path).await {
-        Ok(bytes) => Ok(Some(Bytes::from(bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// `Result<Bytes>` isn't `Clone` because `ChunkStoreError` carries
-/// non-cloneable variants (io::Error, serde_json::Error). The
-/// singleflight broadcast wants to send the same outcome to N
-/// waiters; we hand each one a fresh result by mirroring the
-/// success bytes or by re-projecting the error as `Internal`
-/// (waiters don't need the original cause chain; the first
-/// fetcher does).
-fn clone_result(r: &Result<Bytes>) -> Result<Bytes> {
-    match r {
-        Ok(bytes) => Ok(bytes.clone()),
-        Err(e) => Err(ChunkStoreError::Internal(format!("singleflight: {e}"))),
-    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut buf = crate::buffers::ChunkBuf::take(file.metadata()?.len() as usize);
+        file.read_exact(&mut buf)?;
+        Ok(Some(buf.freeze()))
+    })
+    .await
+    .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
 }
 
 #[cfg(test)]
@@ -2325,53 +2321,6 @@ mod tests {
         cache.get(h, || store.get_chunk(h)).await
     }
 
-    /// ADR 0014 M1.13: parallel prefetch of a chunk set. Verifies
-    /// that all hashes land in the cache + the fetcher is called
-    /// at most once per hash even when the hash list contains
-    /// duplicates (singleflight inside `prefetch_chunks_parallel`
-    /// piggybacks on `get`'s in-flight dedup).
-    #[tokio::test]
-    async fn prefetch_chunks_parallel_warms_all_listed_hashes() {
-        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
-        // Push 16 distinct chunks so the parallel pipeline has
-        // enough work to exercise the bounded-concurrency loop.
-        let mut hashes = Vec::with_capacity(16);
-        for i in 0..16u8 {
-            let body = vec![i; 4 * 1024];
-            let h = store.put_chunk(&body).await.unwrap();
-            hashes.push(h);
-        }
-        // Plus one duplicate to confirm dedup.
-        hashes.push(hashes[0]);
-
-        let store_clone = store.clone();
-        cache
-            .prefetch_chunks_parallel(hashes.clone(), 4, move |h| {
-                let s = store_clone.clone();
-                async move { s.get_chunk(h).await }
-            })
-            .await
-            .unwrap();
-
-        // Every chunk is now in the cache.
-        for h in hashes.iter() {
-            assert!(
-                cache.contains(*h).await,
-                "chunk {h:?} should be cached after prefetch_chunks_parallel",
-            );
-        }
-        // Subsequent get must NOT fire the fetcher.
-        let body0_actual = cache
-            .get(hashes[0], || async {
-                panic!("fetcher must not fire on prefetched hit");
-                #[allow(unreachable_code)]
-                Ok(Bytes::new())
-            })
-            .await
-            .unwrap();
-        assert_eq!(body0_actual.len(), 4 * 1024);
-    }
-
     /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
     /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
     /// before returning — this must be pure instrumentation, not a
@@ -2389,7 +2338,7 @@ mod tests {
         let via_miss = cache_get_from(&cache, &store, hash).await.unwrap();
         assert_eq!(via_miss.as_ref(), body.as_slice());
         assert!(
-            cache.contains(hash).await,
+            cache.contains(hash),
             "chunk must be cached after the miss fetch"
         );
 
@@ -2451,7 +2400,9 @@ mod tests {
                     cache_b.clone()
                 };
                 let body = body.clone();
-                tasks.push(tokio::spawn(async move { cache.put(h, &body).await }));
+                tasks.push(tokio::spawn(async move {
+                    cache.put(h, Bytes::copy_from_slice(&body)).await
+                }));
             }
         }
         for t in tasks {
@@ -2463,7 +2414,7 @@ mod tests {
         // Every chunk is durably cached and served from local (no fetch).
         let reader = make();
         for (h, body) in hashes.iter().copied().zip(bodies.iter()) {
-            assert!(reader.contains(h).await, "chunk {h:?} should be cached");
+            assert!(reader.contains(h), "chunk {h:?} should be cached");
             let got = reader
                 .get(h, || async {
                     panic!("must hit local cache, not fetch");
@@ -2485,7 +2436,7 @@ mod tests {
         let got = cache_get_from(&cache, &store, h).await.unwrap();
         assert_eq!(&got[..], body);
         // Local copy now exists.
-        assert!(cache.contains(h).await);
+        assert!(cache.contains(h));
         // Second call: served from local — fetcher should never be
         // called. Assert with a panicking fetcher.
         let got2 = cache
@@ -2506,7 +2457,7 @@ mod tests {
         let h = ChunkHash::of(body);
         // Don't write to the remote store. The cache.put primes
         // the local file directly.
-        cache.put(h, body).await.unwrap();
+        cache.put(h, Bytes::copy_from_slice(body)).await.unwrap();
         let got = cache_get_from(&cache, &store, h).await.unwrap();
         assert_eq!(&got[..], body);
         // Confirm the remote store doesn't have it.
@@ -2518,7 +2469,7 @@ mod tests {
         let (cache, _s, _b, _c) = setup(1024 * 1024 * 1024).await;
         let body = b"a";
         let wrong_hash = ChunkHash::of(b"b");
-        match cache.put(wrong_hash, body).await {
+        match cache.put(wrong_hash, Bytes::copy_from_slice(body)).await {
             Err(ChunkStoreError::HashMismatch { .. }) => {}
             other => panic!("expected HashMismatch, got {other:?}"),
         }
@@ -2535,12 +2486,12 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         // tiny sleep so mtimes differ
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, c).await.unwrap();
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
 
         // The oldest (a) should be gone; b and c should remain.
         // Note: the eviction sweep runs after each put, so the
@@ -2548,11 +2499,59 @@ mod tests {
         // eviction. We need a fourth to actually trip eviction.
         let d = b"dddddddddd";
         let hd = ChunkHash::of(d);
-        cache.put(hd, d).await.unwrap();
-        assert!(!cache.contains(ha).await, "a should be evicted");
-        assert!(cache.contains(hb).await);
-        assert!(cache.contains(hc).await);
-        assert!(cache.contains(hd).await);
+        cache.put(hd, Bytes::copy_from_slice(d)).await.unwrap();
+        assert!(!cache.contains(ha), "a should be evicted");
+        assert!(cache.contains(hb));
+        assert!(cache.contains(hc));
+        assert!(cache.contains(hd));
+    }
+
+    /// Below the free-space floor, a sweep takes the old chunks and spares
+    /// the one written a moment ago.
+    #[tokio::test]
+    async fn the_floor_spares_a_chunk_just_written() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A floor of 100 % free: every real disk is below it.
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: NO_CEILING,
+                sweep_debounce_ms: i64::MAX,
+                eviction_enabled: true,
+            },
+            1.0,
+        );
+        cache.sweep().await.unwrap();
+        let (old, new) = (b"written a while ago", b"written just now");
+        let (h_old, h_new) = (ChunkHash::of(old), ChunkHash::of(new));
+        cache.put(h_old, Bytes::from_static(old)).await.unwrap();
+        cache.put(h_new, Bytes::from_static(new)).await.unwrap();
+        if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
+            idx.entries.get_mut(&h_old).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
+        }
+
+        cache.sweep().await.unwrap();
+
+        assert!(!cache.contains_on_disk(h_old), "the old chunk goes");
+        assert!(cache.contains_on_disk(h_new), "the new chunk stays");
+    }
+
+    /// The byte ceiling is a hard limit: it evicts a recent chunk too.
+    #[tokio::test]
+    async fn the_ceiling_evicts_a_chunk_just_written() {
+        let (cache, _store, _b, _c) = setup(10).await;
+        let (a, b) = (b"aaaaaaaaaa", b"bbbbbbbbbb");
+        cache
+            .put(ChunkHash::of(a), Bytes::from_static(a))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cache
+            .put(ChunkHash::of(b), Bytes::from_static(b))
+            .await
+            .unwrap();
+        assert!(!cache.contains(ChunkHash::of(a)));
+        assert!(cache.contains(ChunkHash::of(b)));
     }
 
     #[tokio::test]
@@ -2569,14 +2568,14 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, c).await.unwrap();
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
         cache.sweep().await.unwrap();
         assert!(
-            cache.contains(ha).await && cache.contains(hb).await && cache.contains(hc).await,
+            cache.contains(ha) && cache.contains(hb) && cache.contains(hc),
             "30/30 with no reserve: at boundary, nothing evicts",
         );
 
@@ -2584,13 +2583,13 @@ mod tests {
         // chunk goes.
         cache.set_co_tenant_reserved("test", 10);
         cache.sweep().await.unwrap();
-        assert!(!cache.contains(ha).await, "a must yield to the reserve");
-        assert!(cache.contains(hb).await && cache.contains(hc).await);
+        assert!(!cache.contains(ha), "a must yield to the reserve");
+        assert!(cache.contains(hb) && cache.contains(hc));
 
         // Reserve released → 20/30 → no further eviction pressure.
         cache.set_co_tenant_reserved("test", 0);
         cache.sweep().await.unwrap();
-        assert!(cache.contains(hb).await && cache.contains(hc).await);
+        assert!(cache.contains(hb) && cache.contains(hc));
     }
 
     #[tokio::test]
@@ -2603,18 +2602,18 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
 
         cache.set_co_tenant_reserved("test", 1_000_000);
         cache.sweep().await.unwrap();
         assert!(
-            cache.contains(ha).await,
+            cache.contains(ha),
             "pinned chunk survives even a saturating reserve",
         );
-        assert!(!cache.contains(hb).await, "unpinned chunk evicts to 0");
+        assert!(!cache.contains(hb), "unpinned chunk evicts to 0");
     }
 
     #[tokio::test]
@@ -2632,17 +2631,17 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // Putting c pushes us to 30; eviction targets the oldest
         // un-pinned (b), not the pinned a.
-        cache.put(hc, c).await.unwrap();
-        assert!(cache.contains(ha).await, "pinned a must survive");
-        assert!(!cache.contains(hb).await, "unpinned b should evict");
-        assert!(cache.contains(hc).await);
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        assert!(cache.contains(ha), "pinned a must survive");
+        assert!(!cache.contains(hb), "unpinned b should evict");
+        assert!(cache.contains(hc));
     }
 
     #[tokio::test]
@@ -2658,7 +2657,7 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         // Two holders pin `a`.
         cache.pin(ha);
         cache.pin(ha);
@@ -2667,12 +2666,12 @@ mod tests {
         cache.unpin(ha);
         assert_eq!(cache.pinned_count(), 1, "still pinned after one unpin");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, c).await.unwrap();
-        assert!(cache.contains(ha).await, "a still pinned (refcount 1)");
-        assert!(!cache.contains(hb).await, "unpinned b evicts");
-        assert!(cache.contains(hc).await);
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        assert!(cache.contains(ha), "a still pinned (refcount 1)");
+        assert!(!cache.contains(hb), "unpinned b evicts");
+        assert!(cache.contains(hc));
         // Last holder releases — now evictable.
         cache.unpin(ha);
         assert_eq!(cache.pinned_count(), 0, "fully unpinned");
@@ -2727,8 +2726,14 @@ mod tests {
     async fn size_bytes_reports_total() {
         let (cache, _s, _b, _c) = setup(1024 * 1024).await;
         assert_eq!(cache.size_bytes().await.unwrap(), 0);
-        cache.put(ChunkHash::of(b"abc"), b"abc").await.unwrap();
-        cache.put(ChunkHash::of(b"defgh"), b"defgh").await.unwrap();
+        cache
+            .put(ChunkHash::of(b"abc"), Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        cache
+            .put(ChunkHash::of(b"defgh"), Bytes::from_static(b"defgh"))
+            .await
+            .unwrap();
         assert_eq!(cache.size_bytes().await.unwrap(), 8);
     }
 
@@ -2753,6 +2758,21 @@ mod tests {
         );
     }
 
+    /// A chunk large enough to hash on a blocking thread is checked the
+    /// same way: good bytes are stored, bad bytes are refused.
+    #[tokio::test]
+    async fn a_large_fetched_chunk_is_verified() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from(vec![5u8; 2 * INLINE_HASH_MAX]);
+        let h = ChunkHash::of(&body);
+        let bad = ChunkHash::of(b"other");
+        let got = cache.get(bad, || async { Ok(body.clone()) }).await;
+        assert!(matches!(got, Err(ChunkStoreError::HashMismatch { .. })));
+        let got = cache.get(h, || async { Ok(body.clone()) }).await.unwrap();
+        assert_eq!(got, body);
+        assert!(cache.contains_on_disk(h) && !cache.contains_on_disk(bad));
+    }
+
     #[tokio::test]
     async fn get_trusts_present_file_without_rehashing() {
         // ADR 0021: the read fast path no longer re-verifies (a 16 MiB sha256
@@ -2766,7 +2786,9 @@ mod tests {
         let h = store.put_chunk(body).await.unwrap();
         let _ = cache_get_from(&cache, &store, h).await.unwrap(); // warm
         let path = cache.path_for(h);
-        fs::write(&path, b"divergent on-disk bytes").await.unwrap();
+        tokio::fs::write(&path, b"divergent on-disk bytes")
+            .await
+            .unwrap();
         let got = cache
             .get(h, || async {
                 panic!("must not refetch when the file is present")
@@ -2914,6 +2936,78 @@ mod tests {
         }
     }
 
+    /// A waiter on a leader whose chunk is missing gets `NotFound`, not
+    /// a generic error.
+    #[tokio::test]
+    async fn a_waiter_sees_the_leaders_error_kind() {
+        use std::time::Duration;
+        let (cache, _store, _b, _c) = setup(1024 * 1024).await;
+        let h = ChunkHash::of(b"never stored");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let leader = {
+            let cache = cache.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                cache
+                    .get(h, move || async move {
+                        gate.notified().await;
+                        Err(ChunkStoreError::Blob(
+                            engram_core::error::BlobError::NotFound,
+                        ))
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiter = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get(h, || async { unreachable!("the waiter joins the leader") })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+
+        for task in [leader, waiter] {
+            let err = task.await.unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// A cache write whose caller is dropped once the write has started
+    /// still places the file and indexes it.
+    #[tokio::test]
+    async fn a_dropped_write_still_indexes_its_file() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from_static(b"written after the caller left");
+        let h = ChunkHash::of(&body);
+        let mut write = Box::pin(cache.put_trusted(h, body, Class::Background));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(write.as_mut(), &mut cx).is_pending(),
+            "the write waits on its blocking task"
+        );
+        drop(write);
+
+        for _ in 0..1000 {
+            if cache.contains(h) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(cache.contains(h), "never indexed");
+        assert!(cache.contains_on_disk(h));
+    }
+
     #[tokio::test]
     async fn clear_pins_releases_all() {
         // LRU comparator is mtime-based, and Linux ext4's mtime
@@ -2929,16 +3023,16 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         cache.clear_pins();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, c).await.unwrap();
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
         // With pin released, a (oldest) gets evicted.
-        assert!(!cache.contains(ha).await);
-        assert!(cache.contains(hc).await);
+        assert!(!cache.contains(ha));
+        assert!(cache.contains(hc));
     }
 
     // ---- ChunkCacheConfig::from_env_or_default ----
@@ -3337,13 +3431,19 @@ mod tests {
         // sweep see the not-yet-pinned 10-byte chunk alone exceed the
         // 5-byte budget and evict it before `pin()` ever runs.
         cache.pin(hp);
-        cache.put(hp, pinned_body).await.unwrap();
+        cache
+            .put(hp, Bytes::copy_from_slice(pinned_body))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(he, evictable_body).await.unwrap();
+        cache
+            .put(he, Bytes::copy_from_slice(evictable_body))
+            .await
+            .unwrap();
 
-        assert!(cache.contains(hp).await, "pinned chunk must survive");
+        assert!(cache.contains(hp), "pinned chunk must survive");
         assert!(
-            !cache.contains(he).await,
+            !cache.contains(he),
             "unpinned chunk must still evict even though it can't close the deficit alone",
         );
     }
@@ -3355,10 +3455,10 @@ mod tests {
         let (cache, _store, _b, _c) = setup(1024 * 1024).await;
         let body = b"aaaaaaaaaa";
         let h = ChunkHash::of(body);
-        cache.put(h, body).await.unwrap();
+        cache.put(h, Bytes::copy_from_slice(body)).await.unwrap();
         cache.pin(h);
         cache.sweep().await.unwrap();
-        assert!(cache.contains(h).await, "far under budget: nothing evicts");
+        assert!(cache.contains(h), "far under budget: nothing evicts");
     }
 
     // ---- ADR 0070: eviction_enabled: false never unlinks ----
@@ -3379,17 +3479,11 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
-        cache.put(ha, a).await.unwrap();
-        cache.put(hb, b).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         cache.sweep().await.unwrap();
-        assert!(
-            cache.contains(ha).await,
-            "eviction disabled: a must survive"
-        );
-        assert!(
-            cache.contains(hb).await,
-            "eviction disabled: b must survive"
-        );
+        assert!(cache.contains(ha), "eviction disabled: a must survive");
+        assert!(cache.contains(hb), "eviction disabled: b must survive");
     }
 
     // ---- 2026-07-16 RCA: the sweep walk tolerates vanishing entries ----
@@ -3416,7 +3510,10 @@ mod tests {
         );
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
-        cache.put_no_evict(ha, a).await.unwrap();
+        cache
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .await
+            .unwrap();
 
         // A 62-hex-named dangling symlink inside a valid prefix dir:
         // `file_type()` (no follow) sees a symlink, `metadata()`
@@ -3435,7 +3532,7 @@ mod tests {
             .await
             .expect("a vanished/dangling entry must not abort the sweep");
         assert!(
-            !cache.contains(ha).await,
+            !cache.contains(ha),
             "the sweep must still complete its eviction pass",
         );
     }
@@ -3461,11 +3558,11 @@ mod tests {
         let ha = ChunkHash::of(a);
         // `put_no_evict` skips the sweep entirely, modeling "populated,
         // then zero traffic since" (e.g. a host that just restarted).
-        cache.put_no_evict(ha, a).await.unwrap();
-        assert!(
-            cache.contains(ha).await,
-            "chunk lands before any sweep runs"
-        );
+        cache
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .await
+            .unwrap();
+        assert!(cache.contains(ha), "chunk lands before any sweep runs");
 
         // No further writes and no explicit sweep() — only the periodic
         // sweeper can enforce the budget from here.
@@ -3474,7 +3571,7 @@ mod tests {
         handle.abort();
 
         assert!(
-            !cache.contains(ha).await,
+            !cache.contains(ha),
             "the periodic sweeper must evict the over-budget chunk with zero populate traffic",
         );
     }
@@ -3501,14 +3598,17 @@ mod tests {
         );
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
-        cache.put_no_evict(ha, a).await.unwrap();
+        cache
+            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .await
+            .unwrap();
 
         let handle = cache.spawn_sweeper(std::time::Duration::from_millis(200));
         // Well before the first interval elapses: the chunk must still
         // be there — a t=0 sweep would have evicted it immediately.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            cache.contains(ha).await,
+            cache.contains(ha),
             "the sweeper must not evict on its immediate t=0 tick",
         );
         // Past the first interval: the (now real) first sweep must have
@@ -3516,7 +3616,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         handle.abort();
         assert!(
-            !cache.contains(ha).await,
+            !cache.contains(ha),
             "the sweeper must still enforce the budget once the first real interval elapses",
         );
     }
@@ -3556,64 +3656,125 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let c = b"cccccccccc";
         let (ha, hb, hc) = (ChunkHash::of(a), ChunkHash::of(b), ChunkHash::of(c));
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         // Distinct populate times: eviction orders by populated_ms
         // (millisecond resolution).
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hc, c).await.unwrap();
+        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
 
         assert!(
-            !cache.contains(ha).await,
+            !cache.contains(ha),
             "oldest chunk must be evicted by the index-driven populate-path sweep",
         );
-        assert!(cache.contains(hc).await, "newest chunk must survive");
+        assert!(cache.contains(hc), "newest chunk must survive");
+    }
+
+    /// The walk deletes a sidecar an earlier build left beside a chunk,
+    /// and keeps the chunk.
+    #[tokio::test]
+    async fn the_walk_deletes_unverified_sidecars() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from_static(b"landed by an earlier build");
+        let h = ChunkHash::of(&body);
+        cache.put(h, body).await.unwrap();
+        let mut sidecar = cache.path_for(h).into_os_string();
+        sidecar.push(".unverified");
+        std::fs::write(&sidecar, b"").unwrap();
+
+        cache.sweep_for_test().await;
+
+        assert!(!std::path::Path::new(&sidecar).exists());
+        assert!(cache.contains_on_disk(h));
     }
 
     #[tokio::test]
-    async fn reconcile_sweep_sees_out_of_band_writes() {
-        // A chunk landed by ANOTHER process (the UFFD handler shares the
-        // cache root, ADR 0070) is invisible to this process's index.
-        // The reconciling sweep() must re-walk, adopt it, and enforce
-        // the budget against it.
-        let (cache, _store, _b, _c) = setup(15).await;
-        // Build the index first (any sweep builds it).
-        cache.sweep().await.unwrap();
+    async fn only_the_first_sweep_walks_the_directory() {
+        // The first sweep builds the index from one walk, and adopts what
+        // an earlier process left on disk. Later sweeps read the index
+        // alone: this process is the cache's only writer.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: dir.path().to_path_buf(),
+                budget_bytes: 15,
+                sweep_debounce_ms: 0,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let land = |bytes: &[u8], age_secs: u64| {
+            let target = cache.on_disk_path(ChunkHash::of(bytes));
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, bytes).unwrap();
+            let f = std::fs::File::options().write(true).open(&target).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age_secs))
+                .unwrap();
+        };
+        let (a, b, c) = (b"aaaaaaaaaa", b"bbbbbbbbbb", b"cccccccccc");
+        let (ha, hb, hc) = (ChunkHash::of(a), ChunkHash::of(b), ChunkHash::of(c));
 
-        // Out-of-band landing: bytes written straight to the target
-        // path, bypassing every ChunkCache API.
-        let a = b"aaaaaaaaaa";
-        let b = b"bbbbbbbbbb";
-        let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
-        let target = cache.on_disk_path(ha);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, a).unwrap();
-        // Backdate it a minute so "oldest" is deterministic — populate
-        // times carry millisecond resolution, and two writes in the
-        // same millisecond tie (arbitrary eviction order).
-        let f = std::fs::File::options().write(true).open(&target).unwrap();
-        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+        land(a, 120);
+        land(b, 60);
+        cache.sweep().await.unwrap();
+        assert!(!cache.contains(ha), "the walk adopted it; oldest goes");
+        assert!(cache.contains(hb));
+
+        land(c, 180);
+        cache.sweep().await.unwrap();
+        assert!(!cache.contains(hc), "a file the index never saw");
+        assert!(cache.contains_on_disk(hc), "and no sweep evicts it");
+        assert!(cache.contains(hb));
+    }
+
+    #[tokio::test]
+    async fn a_resident_chunk_is_not_written_again() {
+        let (cache, _store, _b, _c) = setup(1024).await;
+        let body = b"resident chunk";
+        let h = ChunkHash::of(body);
+        cache.put(h, Bytes::from_static(body)).await.unwrap();
+        let first = std::fs::metadata(cache.on_disk_path(h)).unwrap();
+
+        cache.put(h, Bytes::from_static(body)).await.unwrap();
+
+        let again = std::fs::metadata(cache.on_disk_path(h)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(first.ino(), again.ino(), "no rename replaced the file");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_cache_write_waits_behind_a_waiting_demand_write() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let mut held = Vec::new();
+        for _ in 0..WRITE_SLOTS + WRITE_DEMAND_RESERVE {
+            held.push(cache.write_slot(Class::Demand).await);
+        }
+        let body = Bytes::from_static(b"a bulk memory chunk");
+        let h = ChunkHash::of(&body);
+        let bulk = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.put_trusted(h, body, Class::Hydrate).await }
+        });
+        let demand = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.write_slot(Class::Demand).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        held.pop();
+        let demand = tokio::time::timeout(Duration::from_secs(5), demand)
+            .await
+            .expect("the demand write gets the freed slot")
             .unwrap();
-
-        // In-process populate of a second chunk: 20 bytes total now on
-        // disk against a 15-byte ceiling, but the index only knows 10 —
-        // the index-driven sweep sees no pressure and evicts nothing.
-        cache.put(hb, b).await.unwrap();
-        assert!(cache.contains(ha).await);
-        assert!(cache.contains(hb).await);
-
-        // The reconcile re-walks: both chunks visible, 20 > 15, oldest
-        // (the out-of-band one) goes.
-        cache.sweep().await.unwrap();
         assert!(
-            !cache.contains(ha).await,
-            "reconcile must adopt the out-of-band chunk and evict it under ceiling pressure",
+            !bulk.is_finished() && !cache.contains(h),
+            "the bulk write waits"
         );
-        assert!(
-            cache.contains(hb).await,
-            "in-index chunk within budget survives"
-        );
+
+        drop((held, demand));
+        bulk.await.unwrap().unwrap();
+        assert!(cache.contains(h));
     }
 
     #[tokio::test]
@@ -3625,11 +3786,11 @@ mod tests {
         let (cache, _store, _b, _c) = setup(10).await;
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
-        cache.put(ha, a).await.unwrap();
-        cache.put(ha, a).await.unwrap();
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         assert!(
-            cache.contains(ha).await,
+            cache.contains(ha),
             "re-populating one in-budget hash must not inflate the index total and self-evict",
         );
     }
@@ -3643,17 +3804,17 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
         let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hb, b).await.unwrap();
-        assert!(!cache.contains(ha).await, "over-ceiling: oldest evicted");
-        assert!(cache.contains(hb).await);
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        assert!(!cache.contains(ha), "over-ceiling: oldest evicted");
+        assert!(cache.contains(hb));
 
         // A stale (not-decremented) total would read 20 > 15 here and
         // evict the survivor too.
         cache.sweep().await.unwrap();
         assert!(
-            cache.contains(hb).await,
+            cache.contains(hb),
             "post-eviction sweep must see the decremented total and keep the survivor",
         );
     }
@@ -3677,15 +3838,15 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
         let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         // 20 bytes against a 15-byte ceiling. The put itself must not
         // block on a walk; the spawned build + its tail sweep evict.
-        cache.put(hb, b).await.unwrap();
+        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
 
         let deadline = tokio::time::Duration::from_secs(5);
         let evicted = tokio::time::timeout(deadline, async {
-            while cache.contains(ha).await {
+            while cache.contains(ha) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -3694,7 +3855,7 @@ mod tests {
             evicted.is_ok(),
             "background index build must complete and enforce the ceiling",
         );
-        assert!(cache.contains(hb).await, "newest chunk survives");
+        assert!(cache.contains(hb), "newest chunk survives");
     }
 
     // ---- ChunkCacheConfig::SWEEP_INTERVAL_ENV_VAR precedence ----
@@ -3755,7 +3916,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cache_get_from(&cache, &store, hc).await.unwrap();
         // a is gone and remembered as evicted.
-        assert!(!cache.contains(ha).await, "a should be evicted");
+        assert!(!cache.contains(ha), "a should be evicted");
         assert!(
             cache.inner.evicted_ring.lock().contains(&ha),
             "evicted hash must be in the thrash ring",
@@ -3797,11 +3958,16 @@ mod tests {
         cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
-        cache.put(ha, a).await.unwrap();
-        // The post-put sweep saw the disk under the (impossible) 100%
-        // floor and evicted the only unpinned chunk we hold.
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        // Older than the floor's spare window.
+        if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
+            idx.entries.get_mut(&ha).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
+        }
+        cache.sweep().await.unwrap();
+        // The sweep saw the disk under the (impossible) 100% floor and
+        // evicted the only unpinned chunk we hold.
         assert!(
-            !cache.contains(ha).await,
+            !cache.contains(ha),
             "tight free-space floor must evict even with no byte ceiling",
         );
     }
@@ -3830,102 +3996,15 @@ mod tests {
         cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         // Trigger another sweep via a second put of the same (idempotent)
         // chunk; the pinned chunk must survive the floor pressure.
-        cache.put(ha, a).await.unwrap();
+        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
         assert!(
-            cache.contains(ha).await,
+            cache.contains(ha),
             "pinned chunk must survive free-space-floor eviction",
         );
-    }
-
-    /// ADR 0095: an unverified-origin landing is locally readable but
-    /// NOT servable onward until the scrubber sha256s it; a good chunk
-    /// clears its marker, and the read path serves it afterwards.
-    #[tokio::test]
-    async fn put_unverified_marks_then_scrub_clears() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        let body = b"peer-landed bytes".to_vec();
-        let h = ChunkHash::of(&body);
-        cache.put_unverified_no_evict(h, &body).await.unwrap();
-        // Locally readable (CRC-checked upstream; trust-on-read)...
-        assert!(cache.contains(h).await);
-        // ...but gated from onward serving until scrubbed.
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-        // Scrub (direct call — the spawned loop is timing, not logic).
-        assert!(cache.scrub_one(h).await > 0);
-        let served = cache.read_verified_for_serve(h).await.unwrap();
-        assert_eq!(served.as_deref(), Some(body.as_slice()));
-    }
-
-    /// ADR 0095 §Integrity: a peer-landed chunk whose content does not
-    /// match its claimed hash (source rot / serve bug) is deleted by
-    /// the scrub — the next read misses and refetches through the
-    /// verifying GCS populate; it is never served onward.
-    #[tokio::test]
-    async fn scrub_deletes_corrupt_peer_landing() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        let honest = b"the real content".to_vec();
-        let h = ChunkHash::of(&honest);
-        cache
-            .put_unverified_no_evict(h, b"corrupt impostor bytes")
-            .await
-            .unwrap();
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-        cache.scrub_one(h).await;
-        assert!(
-            !cache.contains(h).await,
-            "corrupt chunk must be deleted, not kept",
-        );
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
-    }
-
-    /// ADR 0095: the spawned scrubber drains the live queue AND the
-    /// boot-time marker scan (crash recovery), and a marker whose chunk
-    /// was evicted mid-queue is reaped without error.
-    #[tokio::test]
-    async fn scrubber_drains_queue_and_boot_scan() {
-        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
-        // Landed BEFORE the scrubber exists — covered by the boot scan.
-        let pre = b"landed before scrubber".to_vec();
-        let pre_h = ChunkHash::of(&pre);
-        cache.put_unverified_no_evict(pre_h, &pre).await.unwrap();
-        // A stale marker with no chunk (evicted mid-queue).
-        let ghost = ChunkHash::of(b"ghost");
-        let ghost_marker = cache.marker_path_for(ghost);
-        fs::create_dir_all(ghost_marker.parent().unwrap())
-            .await
-            .unwrap();
-        crate::cache::write_atomic(&ghost_marker, b"")
-            .await
-            .unwrap();
-        let _scrubber = cache.spawn_scrubber(u64::MAX);
-        // Landed AFTER — covered by the live queue.
-        let post = b"landed after scrubber".to_vec();
-        let post_h = ChunkHash::of(&post);
-        cache.put_unverified_no_evict(post_h, &post).await.unwrap();
-        for _ in 0..300 {
-            let pre_ok = cache
-                .read_verified_for_serve(pre_h)
-                .await
-                .unwrap()
-                .is_some();
-            let post_ok = cache
-                .read_verified_for_serve(post_h)
-                .await
-                .unwrap()
-                .is_some();
-            let ghost_gone = !fs::try_exists(cache.marker_path_for(ghost))
-                .await
-                .unwrap_or(true);
-            if pre_ok && post_ok && ghost_gone {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("scrubber did not drain the backlog within 3s");
     }
 
     /// ADR 0095: `get_with_source` keeps the populate contract of `get`
@@ -3933,26 +4012,26 @@ mod tests {
     /// report a peer source — and a hash mismatch from a "peer" closure
     /// still refuses to land, exactly like a corrupt GCS fetch.
     #[tokio::test]
-    async fn get_with_source_verifies_peer_bytes_too() {
+    async fn get_with_source_hashes_store_bytes_and_trusts_peer_bytes() {
         let (cache, _store, _b, _c) = setup(NO_CEILING).await;
         let body = Bytes::from_static(b"fault-time peer chunk");
         let h = ChunkHash::of(&body);
         let got = cache
-            .get_with_source(h, || async { Ok((body.clone(), FillSource::Peer)) })
+            .get_with_source(h, Class::Demand, || async {
+                Ok((body.clone(), FillSource::Peer))
+            })
             .await
             .unwrap();
         assert_eq!(got, body);
-        assert!(cache.contains(h).await);
-        // Verified at populate ⇒ immediately servable onward.
-        assert!(cache.read_verified_for_serve(h).await.unwrap().is_some());
+        assert!(cache.contains(h));
 
         let wrong = ChunkHash::of(b"something else");
         let err = cache
-            .get_with_source(wrong, || async {
-                Ok((Bytes::from_static(b"not that"), FillSource::Peer))
+            .get_with_source(wrong, Class::Demand, || async {
+                Ok((Bytes::from_static(b"not that"), FillSource::BlobStorage))
             })
             .await;
         assert!(matches!(err, Err(ChunkStoreError::HashMismatch { .. })));
-        assert!(!cache.contains(wrong).await);
+        assert!(!cache.contains(wrong));
     }
 }

@@ -38,6 +38,8 @@
 
 pub mod chunked;
 pub mod fault_stats;
+pub mod first_touch;
+pub mod mapped;
 /// ADR 0045 C2: the post-copy peer channel — `PeerSession` (sync TCP
 /// client to the source host-agent's page server) + `ControlTx` (the
 /// one-way `--control-sock` reports). Portable (plain sockets); the
@@ -58,3 +60,13 @@ pub use working_set::WorkingSetRecorder;
 
 #[cfg(target_os = "linux")]
 pub use runtime::{recv_handshake, run_listener, HandlerError, Runtime};
+
+/// Threads that read the userfaultfd. A guest has at most one fault
+/// outstanding per vCPU, so more threads than vCPUs only wait. From
+/// `ENGRAM_UFFD_FAULT_THREADS` (at least 1); default 8.
+pub fn fault_threads() -> usize {
+    std::env::var("ENGRAM_UFFD_FAULT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(8, |n| n.max(1))
+}

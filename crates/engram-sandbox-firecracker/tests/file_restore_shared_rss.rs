@@ -370,7 +370,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
     std::fs::remove_file(&mem_path).expect("delete captured memory.bin");
     let mat = Instant::now();
     chunk_store
-        .materialize_to_file(&memory_manifest, &mem_path)
+        .materialize_to_file_from(&memory_manifest, &mem_path, &chunk_store)
         .await
         .expect("re-materialize memory.bin from manifest");
     eprintln!(

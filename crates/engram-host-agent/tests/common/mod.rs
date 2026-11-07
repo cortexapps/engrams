@@ -503,6 +503,6 @@ pub fn session_volumes(
     );
     std::sync::Arc::new(engram_host_core::SessionVolumes::new(
         disk,
-        chunk_store.clone(),
+        engram_fill::FillEngine::new(chunk_store.clone(), engram_fill::Config::default()),
     ))
 }

@@ -216,6 +216,7 @@ impl FirecrackerClient {
             dir.join("state.bin"),
             dir.join("memory.bin"),
             SnapshotType::Full,
+            false,
         )
         .await
     }
@@ -227,11 +228,18 @@ impl FirecrackerClient {
     /// cold boot, or `enable_diff_snapshots` at `snapshot/load`).
     /// Same pause/resume + cancellation-guard contract as
     /// [`Self::create_snapshot`].
+    ///
+    /// With `defer_sync`, Firecracker does not fsync the two files inside
+    /// the pause and the caller must sync them before it relies on them
+    /// across a host crash. A Firecracker that does not know the field
+    /// rejects the body before it captures anything; the create then runs
+    /// again without it, so the files come back synced.
     pub async fn create_snapshot_at(
         &self,
         state_path: PathBuf,
         mem_path: PathBuf,
         snapshot_type: SnapshotType,
+        defer_sync: bool,
     ) -> Result<SnapshotPaths, SandboxError> {
         self.pause().await?;
 
@@ -245,15 +253,23 @@ impl FirecrackerClient {
         // don't double-resume.
         let mut guard = ResumeOnDrop::arm(self.clone());
 
-        let body = SnapshotCreateBody {
+        let mut body = SnapshotCreateBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_file_path: mem_path.to_string_lossy().into_owned(),
             snapshot_type,
             vmstate_only: false,
+            defer_sync,
         };
-        let create_res = self
-            .put("/snapshot/create", &body)
-            .instrument(tracing::info_span!("fc.snapshot_create"))
+        let create = async {
+            let res = self.put("/snapshot/create", &body).await;
+            if defer_sync && res.as_ref().is_err_and(rejects_defer_sync) {
+                body.defer_sync = false;
+                return self.put("/snapshot/create", &body).await;
+            }
+            res
+        };
+        let create_res = create
+            .instrument(tracing::info_span!("fc.snapshot_create", defer_sync))
             .await;
 
         // Always try to resume, regardless of whether the create
@@ -288,6 +304,7 @@ impl FirecrackerClient {
                 mem_file_path: mem_path.to_string_lossy().into_owned(),
                 snapshot_type,
                 vmstate_only: false,
+                defer_sync: false,
             },
         )
         .instrument(tracing::info_span!("fc.snapshot_create"))
@@ -327,6 +344,7 @@ impl FirecrackerClient {
                 .into_owned(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: false,
         };
         self.put("/snapshot/create", &body).await
     }
@@ -664,6 +682,20 @@ pub fn is_balloon_device_missing(e: &SandboxError) -> bool {
     }
 }
 
+/// Whether a `PUT /snapshot/create` failed because this Firecracker does
+/// not know `defer_sync`. Its API server rejects an unknown field
+/// (`deny_unknown_fields`) while it parses the body, before the create
+/// runs, so the dirty bitmap is not consumed and a retry is safe.
+fn rejects_defer_sync(e: &SandboxError) -> bool {
+    match e {
+        SandboxError::Vm(inner) => {
+            let msg = inner.to_string();
+            msg.contains("-> 400:") && msg.contains("unknown field `defer_sync`")
+        }
+        _ => false,
+    }
+}
+
 /// `PUT /balloon` payload (pre-boot device attach).
 #[derive(Debug, Clone, Serialize)]
 pub struct BalloonConfig {
@@ -816,6 +848,10 @@ struct SnapshotCreateBody {
     /// the fork-v3 capability gate.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     vmstate_only: bool,
+    /// Fork only: write both files without an fsync; the caller syncs them
+    /// after the resume. Left off the wire when false, like `vmstate_only`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    defer_sync: bool,
 }
 
 /// PascalCase variant names match Firecracker's expected JSON values
@@ -1286,6 +1322,7 @@ mod tests {
             mem_file_path: "/snap/memory.bin".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: false,
+            defer_sync: false,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");
@@ -1295,15 +1332,46 @@ mod tests {
         // byte-identical to stock so non-migration captures keep working
         // against any FC binary (R2 posture).
         assert!(v.get("vmstate_only").is_none());
+        assert!(v.get("defer_sync").is_none());
 
         let body = SnapshotCreateBody {
             snapshot_path: "/snap/state.bin".into(),
             mem_file_path: "/snap/ignored".into(),
             snapshot_type: SnapshotType::Full,
             vmstate_only: true,
+            defer_sync: true,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["vmstate_only"], true);
+        assert_eq!(v["defer_sync"], true);
+    }
+
+    /// Only the parse rejection of the field itself allows the retry
+    /// without it; any other create failure stays a failure.
+    #[test]
+    fn only_an_unknown_defer_sync_field_allows_the_retry() {
+        let err_for = |code: u16, fault: &str| {
+            let body = serde_json::json!({ "fault_message": fault }).to_string();
+            let raw = format!("HTTP/1.1 {code} X\r\n\r\n{body}");
+            parse_response("PUT", "/snapshot/create", raw.as_bytes()).unwrap_err()
+        };
+        assert!(rejects_defer_sync(&err_for(
+            400,
+            "An error occurred when deserializing the json body of a request: \
+             unknown field `defer_sync`, expected one of `snapshot_type`, `snapshot_path`"
+        )));
+        assert!(!rejects_defer_sync(&err_for(
+            400,
+            "unknown field `vmstate_only`, expected one of `snapshot_type`"
+        )));
+        assert!(!rejects_defer_sync(&err_for(
+            500,
+            "unknown field `defer_sync`"
+        )));
+        assert!(!rejects_defer_sync(&err_for(
+            400,
+            "Cannot write memory file"
+        )));
     }
 
     #[test]

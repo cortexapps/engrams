@@ -114,6 +114,8 @@ pub async fn move_guest(
     (moved, presetup)
 }
 
+/// Wait for the drain, then for the post-copy finish: the destination
+/// takes no capture until its chain is seeded and its role cleared.
 pub async fn drain(pooled: &Arc<PooledBackend>, vm: SandboxId) {
     assert!(
         matches!(
@@ -122,6 +124,14 @@ pub async fn drain(pooled: &Arc<PooledBackend>, vm: SandboxId) {
         ),
         "both drains must finish before commit"
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while pooled.migration_role(vm).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-copy finish did not clear the destination role"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// The forked Firecracker the vmstate-only capture needs.

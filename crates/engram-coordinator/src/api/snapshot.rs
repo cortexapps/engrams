@@ -111,8 +111,9 @@ pub(crate) async fn reattach_harness_in_place(
     let session = state.services.meta.get_session(session_id).await?;
     // Re-confirm the session is still bound to the sandbox the caller resolved —
     // a concurrent eviction/resume may have moved it, and we must never re-issue
-    // start_agent against a stale or unbound sandbox.
-    if session.sandbox_id != Some(sandbox_id) {
+    // start_agent against a stale or unbound sandbox. A dev-VM session has no
+    // harness, so there is nothing to rebind.
+    if session.sandbox_id != Some(sandbox_id) || session.mode.is_dev_vm() {
         return Ok(false);
     }
     let epoch = state

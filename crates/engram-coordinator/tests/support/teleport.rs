@@ -51,6 +51,8 @@ pub struct ScriptedHost {
     pub live_refused: AtomicBool,
     pub live_lost: AtomicBool,
     pub peer_lost: AtomicBool,
+    /// `migration_drain_wait` never answers: the drain is still running.
+    pub drain_pending: AtomicBool,
     pub block_capture: AtomicBool,
     pub capture_entered: tokio::sync::Notify,
 }
@@ -84,6 +86,7 @@ impl ScriptedHost {
             live_refused: AtomicBool::new(true),
             live_lost: AtomicBool::new(false),
             peer_lost: AtomicBool::new(false),
+            drain_pending: AtomicBool::new(false),
             block_capture: AtomicBool::new(false),
             capture_entered: tokio::sync::Notify::new(),
         })
@@ -298,6 +301,9 @@ impl HostClient for ScriptedHost {
         &self,
         _id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        if self.drain_pending.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.peer_lost.load(Ordering::SeqCst) {
             Ok(engram_core::types::snapshot::DrainOutcome::PeerLost {
                 remaining: 1,

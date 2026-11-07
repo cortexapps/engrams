@@ -118,6 +118,26 @@ impl BlobStorage for LocalBlobStorage {
         Ok(ByteStream::new(mapped))
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<bytes::Bytes, BlobError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        Self::validate_key(key)?;
+        let (_, last) = engram_core::traits::storage::inclusive_range(offset, len)?;
+        let mut file = match fs::File::open(self.path_for(key)).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BlobError::NotFound);
+            }
+            Err(e) => return Err(BlobError::Io(e)),
+        };
+        if last >= file.metadata().await?.len() {
+            return Err(BlobError::RangeOutOfBounds { offset, len });
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = vec![0u8; len as usize];
+        file.read_exact(&mut buf).await?;
+        Ok(bytes::Bytes::from(buf))
+    }
+
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
         Self::validate_key(key)?;
         let path = self.path_for(key);
@@ -236,6 +256,13 @@ mod tests {
         // A handful of chunks proves writer advancement; volume is
         // the wire backends' concern.
         blob_conformance::streaming_round_trip(&store, 1024, 3).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_ranged_get() {
+        let dir = tempdir().unwrap();
+        let store = LocalBlobStorage::new(dir.path());
+        blob_conformance::ranged_get(&store).await;
     }
 
     #[tokio::test]

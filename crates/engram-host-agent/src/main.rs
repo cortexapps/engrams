@@ -353,13 +353,6 @@ async fn main() -> Result<(), HostAgentError> {
         .await
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
 
-    // ADR 0088 addendum: ONE host-global upload budget shared by every
-    // ChunkStore this process builds — materialize chunking, capture
-    // memory-seed/diff chunking, and the disk checkpoint upload all acquire
-    // from the same FIFO pool, so concurrent bulk uploads share the
-    // NIC instead of stacking on it (`ENGRAM_UPLOAD_BUDGET_PERMITS`).
-    let upload_budget = engram_chunk_store::UploadBudget::from_env_or_default();
-
     // ADR 0009 §6: when the backend is FC, keep a typed Arc on the
     // side so the host-agent's startup live-attach pass can call
     // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
@@ -626,9 +619,15 @@ async fn main() -> Result<(), HostAgentError> {
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
     // served locally on the next resume instead of re-fetched from GCS.
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob)
-        .with_chunk_cache(chunk_cache.clone())
-        .with_upload_budget(upload_budget);
+    let chunk_store =
+        engram_chunk_store::ChunkStore::new(blob).with_chunk_cache(chunk_cache.clone());
+    // The one fill engine on this host: every chunk fetch and upload below
+    // goes through it (uploads through `fill.store()`), so they share one
+    // class-ordered in-flight limit.
+    let fill = engram_fill::FillEngine::new(
+        chunk_store,
+        engram_fill::Config::from_env().map_err(HostAgentError::Config)?,
+    );
 
     // ADR 0075: spawn the substrate populate server now both halves
     // exist. The uffd base dir mirrors the FC config default (env
@@ -641,7 +640,7 @@ async fn main() -> Result<(), HostAgentError> {
         BackendChoice::Firecracker => Some(
             engram_host_agent::substrate_server::SubstrateServer::new(
                 chunk_cache.clone(),
-                std::sync::Arc::new(chunk_store.clone()),
+                fill.clone(),
                 engram_sandbox_firecracker::uffd_base_dir_from_env()
                     .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
             )
@@ -687,7 +686,7 @@ async fn main() -> Result<(), HostAgentError> {
     let observe_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
-        .with_chunk_store(chunk_store)
+        .with_fill(fill)
         .with_chunk_cache(chunk_cache)
         .with_session_disk(session_disk)
         .with_image_cache(image_cache)

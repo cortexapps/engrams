@@ -176,6 +176,24 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
     }
 }
 
+/// The HTTP status of a failed request, from either error shape.
+fn http_status(e: &GcsHttpError) -> Option<u16> {
+    match e {
+        GcsHttpError::Response(resp) => Some(resp.code),
+        GcsHttpError::HttpClient(rq) | GcsHttpError::RawResponse(rq, _) => {
+            rq.status().map(|s| s.as_u16())
+        }
+        _ => None,
+    }
+}
+
+/// The SDK range for `[offset, offset + len)`; the SDK sends it as
+/// `Range: bytes=first-last`.
+fn gcs_range(offset: u64, len: u64) -> Result<Range, BlobError> {
+    let (first, last) = engram_core::traits::storage::inclusive_range(offset, len)?;
+    Ok(Range(Some(first), Some(last)))
+}
+
 #[async_trait]
 impl BlobStorage for GcsBlobStorage {
     /// Buffered PUT: the body is already in hand, so skip the trait
@@ -254,6 +272,27 @@ impl BlobStorage for GcsBlobStorage {
         // off the wire — no re-buffering.
         let mapped = stream.map(|chunk| chunk.map_err(|e| BlobError::Sdk(Box::new(e))));
         Ok(ByteStream::new(mapped))
+    }
+
+    /// One ranged GET (`206 Partial Content`). GCS answers a range that
+    /// starts past the end with 416, and one that ends past it with the
+    /// bytes it has; both are out of bounds.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<bytes::Bytes, BlobError> {
+        let range = gcs_range(offset, len)?;
+        let req = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: key.to_string(),
+            ..Default::default()
+        };
+        let body =
+            self.client
+                .download_object(&req, &range)
+                .await
+                .map_err(|e| match http_status(&e) {
+                    Some(416) => BlobError::RangeOutOfBounds { offset, len },
+                    _ => map_http_err(e),
+                })?;
+        engram_core::traits::storage::checked_range(body.into(), offset, len)
     }
 
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
@@ -447,6 +486,24 @@ mod tests {
             return;
         };
         blob_conformance::streaming_round_trip(&store, 64 * 1024, 1024).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conformance_ranged_get_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::ranged_get(&store).await;
+    }
+
+    #[test]
+    fn a_gcs_range_names_the_first_and_last_byte() {
+        let range = gcs_range(65_536, 65_536).unwrap();
+        assert_eq!((range.0, range.1), (Some(65_536), Some(131_071)));
+        assert!(matches!(
+            gcs_range(0, 0),
+            Err(BlobError::RangeOutOfBounds { .. })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

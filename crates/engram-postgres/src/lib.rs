@@ -969,31 +969,39 @@ impl PostgresStore {
         // pin set before the row committed would miss the snapshot's
         // chunks; with the bump, the sweep's post-collection
         // generation read catches the divergence and restarts.
+        if fence.is_some() && snap.session_id.is_none() {
+            return Err(MetaError::Serialization(
+                "fenced_record_snapshot requires a session-scoped snapshot".into(),
+            ));
+        }
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Lock order: the session row, then the snapshot row, then
+        // `chunk_generation`. Every session-scoped write takes the session
+        // row FIRST, fenced or not: the durable-head UPDATE below locks it
+        // too, so an unfenced write that locked the snapshot row first
+        // deadlocks a fenced write of the same snapshot (the heartbeat
+        // reconcile against the Snapshot RPC's promote).
+        //
         // ADR 0079 (re-review findings #3/#4): the optional fence. When
         // `Some(epoch)`, gate the write on the session's `current_epoch`
-        // in the SAME transaction (the fence read + the write serialize
-        // against a concurrent claim/reclaim CAS via `FOR UPDATE`). A
-        // mismatch means the op executor was fenced by a successor's
-        // re-claim: write NOTHING (a reclaimed-out predecessor must never
-        // land a phantom `recoverable` row a resume would pick) and return
-        // `Ok(None)`.
-        if let Some(epoch) = fence {
-            let session_id = snap.session_id.ok_or_else(|| {
-                MetaError::Serialization(
-                    "fenced_record_snapshot requires a session-scoped snapshot".into(),
-                )
-            })?;
+        // read under that lock (it serializes against a concurrent
+        // claim/reclaim CAS). A mismatch means the op executor was fenced
+        // by a successor's re-claim: write NOTHING (a reclaimed-out
+        // predecessor must never land a phantom `recoverable` row a resume
+        // would pick) and return `Ok(None)`.
+        if let Some(session_id) = snap.session_id {
             let stored: Option<i64> =
                 sqlx::query_scalar("SELECT current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
                     .bind(session_id.as_uuid())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?;
-            if stored != Some(epoch) {
-                let _ = tx.rollback().await;
-                return Ok(None);
+            if let Some(epoch) = fence {
+                if stored != Some(epoch) {
+                    let _ = tx.rollback().await;
+                    return Ok(None);
+                }
             }
         }
         // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
@@ -1125,6 +1133,37 @@ impl PostgresStore {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(Some(inserted))
+    }
+
+    /// The body behind `op_requeue_with_backoff` / `op_requeue_wait`:
+    /// `refund` is how many of the claim's counted attempts to give back.
+    async fn op_requeue(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        error: &str,
+        refund: i32,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops
+                SET state = 'queued',
+                    not_before = $5 + make_interval(secs => $3),
+                    error = $4,
+                    attempts = GREATEST(attempts - $6, 0),
+                    epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .bind(delay.as_secs_f64())
+        .bind(error)
+        .bind(self.clock.now_utc())
+        .bind(refund)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 }
 
@@ -4895,27 +4934,48 @@ impl MetadataStore for PostgresStore {
         // portable `snapshots/<id>/` blobs (state.bin / sidecar), which
         // the chunk GC doesn't sweep (different namespace) and would
         // otherwise orphan in BlobStorage.
+        let retention = sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
+        };
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Lock order: the session rows first (the delete's ON DELETE SET
+        // NULL on `durable_head_snapshot_id` writes them), in id order.
+        let sessions: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM sessions
+            WHERE id IN (
+                SELECT session_id FROM snapshots
+                WHERE session_id IS NOT NULL AND created_at < $2 - $1::interval
+            )
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(retention)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
         let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
             r#"
             DELETE FROM snapshots s
-            WHERE s.session_id IS NOT NULL
+            WHERE s.session_id = ANY($3)
               AND s.created_at < $2 - $1::interval
               AND s.id NOT IN (
                   SELECT DISTINCT ON (session_id) id
                   FROM snapshots
-                  WHERE session_id IS NOT NULL
+                  WHERE session_id = ANY($3)
                   ORDER BY session_id, created_at DESC
               )
             RETURNING s.id
             "#,
         )
-        .bind(sqlx::postgres::types::PgInterval {
-            months: 0,
-            days: 0,
-            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
-        })
-        .bind(self.clock.now_utc())
+        .bind(retention)
+        .bind(now)
+        .bind(&sessions)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -7319,6 +7379,29 @@ impl MetadataStore for PostgresStore {
             .collect())
     }
 
+    async fn capturing_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT disk_manifest FROM capture_jobs
+                WHERE stage NOT IN ('done', 'failed')"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // Hosts keep exactly the volumes this set names, so a row that
+        // does not parse fails the read instead of dropping its volume.
+        rows.into_iter()
+            .map(|(text,)| {
+                text.parse().map_err(|e| {
+                    MetaError::Serialization(format!(
+                        "capture_jobs.disk_manifest {text:?} does not parse: {e}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     async fn hosts_with_live_capture_jobs(
         &self,
     ) -> Result<std::collections::HashSet<HostId>, MetaError> {
@@ -7890,23 +7973,17 @@ impl MetadataStore for PostgresStore {
         // Back to `queued` with the claim stamps cleared; `attempts`
         // stays (it was counted at claim) and `step` stays (the next
         // claimer resumes idempotent-from-step).
-        let res = sqlx::query(
-            "UPDATE session_ops
-                SET state = 'queued',
-                    not_before = $5 + make_interval(secs => $3),
-                    error = $4,
-                    epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
-              WHERE id = $1 AND epoch = $2 AND state = 'running'",
-        )
-        .bind(op_id)
-        .bind(epoch)
-        .bind(backoff.as_secs_f64())
-        .bind(error)
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        self.op_requeue(op_id, epoch, backoff, error, 0).await
+    }
+
+    async fn op_requeue_wait(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> Result<bool, MetaError> {
+        self.op_requeue(op_id, epoch, delay, reason, 1).await
     }
 
     async fn op_cancel_queued(

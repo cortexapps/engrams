@@ -1725,6 +1725,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxBackend for D5SplitBackend {
+        fn captures_guest_memory(&self) -> bool {
+            self.inner.captures_guest_memory()
+        }
         async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
             self.inner.create(id, spec).await
         }
@@ -4166,6 +4169,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxBackend for ManifestSnapshotBackend {
+        fn captures_guest_memory(&self) -> bool {
+            self.inner.captures_guest_memory()
+        }
         async fn create(&self, id: SandboxId, spec: SandboxSpec) -> Result<(), SandboxError> {
             self.inner.create(id, spec).await
         }

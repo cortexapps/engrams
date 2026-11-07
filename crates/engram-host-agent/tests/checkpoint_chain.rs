@@ -226,7 +226,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     // ---- 6. Restore from the DIFF checkpoint on the same backend ----
     // File mode materializes memory.bin from the v2 sparse-rechunk
-    // manifest — the byte-fidelity proof for update_for_dirty_ranges_sparse
+    // manifest — the byte-fidelity proof for update_for_dirty_ranges_sparse_from
     // against real guest memory. Destroy first (frees the canonical
     // vsock path for the restored sibling).
     pooled.destroy(sandbox).await.expect("destroy original");
@@ -254,7 +254,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // ---- 7. ADR 0038 B2: the restored sandbox's chain was seeded
     // SPARSE on resume (manifest-only, no rolling memfile). Its NEXT
     // checkpoint must therefore be a DIFF via
-    // `update_for_dirty_ranges_sparse` — NOT a fresh Full. This is the
+    // `update_for_dirty_ranges_sparse_from` — NOT a fresh Full. This is the
     // production path (UFFD idle→active resume → first checkpoint) the
     // 60 s hang lived on; pre-fix it would have re-Full-seeded (a new
     // manifest_id) and faulted the whole working set in.
@@ -281,7 +281,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     // ---- 8. Restore from the SPARSE-built checkpoint and verify all
     // three markers survive byte-identical — the end-to-end byte-
-    // fidelity proof for `update_for_dirty_ranges_sparse` against real
+    // fidelity proof for `update_for_dirty_ranges_sparse_from` against real
     // guest memory (fetch-prev-chunk + apply-diff == current).
     pooled.destroy(restored).await.expect("destroy restored");
     let restored2 = SandboxId::new();

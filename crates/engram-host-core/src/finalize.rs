@@ -3,12 +3,12 @@
 //! `snapshot_begin` moves a paused sandbox's durability boundary from
 //! "upload complete" to "record persisted": the disk checkpoints taken
 //! under the pause, the FC memory snapshot, and the aux-bundle pins are
-//! held locally and a
-//! durable `EvictionFinalizeRecord` is written; a background job then walks
-//! the legs (disk manifest publish → memory chunking → blob upload →
-//! terminal checkpoint record + destroy), persisting the stage bump after
-//! each leg BEFORE deleting the leg's consumed input, so a crash re-enters
-//! at the persisted stage.
+//! held locally and a durable `EvictionFinalizeRecord` is written; a
+//! background job then runs the legs (disk manifest publish, memory
+//! chunking, blob upload) at the same time, persists one stage bump BEFORE
+//! it deletes the consumed memory file, then writes the terminal
+//! checkpoint record and destroys the sandbox. A crash re-enters at the
+//! persisted stage.
 //!
 //! This module holds the **pure decisions** of that flow, extracted out of
 //! the host-agent driver so the boundary simulator (`engram-dst-cosim`)
@@ -31,6 +31,10 @@ use serde::{Deserialize, Serialize};
 /// BlobsUploaded`. The terminal transition is the record's deletion, not a
 /// variant. Serde variant names are load-bearing: they are the on-disk
 /// `EvictionFinalizeRecord.stage` encoding.
+///
+/// The finalize persists `Captured` and then `BlobsUploaded`.
+/// `DiskUploaded` and `MemoryChunked` are read from records an earlier
+/// build wrote, which bumped one stage per leg.
 #[derive(
     Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
@@ -55,21 +59,6 @@ impl FinalizeStage {
         FinalizeStage::MemoryChunked,
         FinalizeStage::BlobsUploaded,
     ];
-
-    /// The next stage in the linear ladder, or `None` at the terminal
-    /// [`BlobsUploaded`](FinalizeStage::BlobsUploaded) (whose own "next"
-    /// is the record's deletion).
-    pub fn next(self) -> Option<FinalizeStage> {
-        let i = Self::LADDER.iter().position(|s| *s == self)?;
-        Self::LADDER.get(i + 1).copied()
-    }
-
-    /// A stage transition is legal only one rung forward — the legs bump
-    /// exactly one stage each, and a redrive re-enters at the persisted
-    /// stage rather than skipping ahead.
-    pub fn can_advance_to(self, to: FinalizeStage) -> bool {
-        self.next() == Some(to)
-    }
 }
 
 /// Backoff unit for the redrive loop: `BACKOFF_UNIT * attempt`, capped at
@@ -106,18 +95,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ladder_is_linear_and_ordered() {
+    fn ladder_is_in_declaration_order() {
         // Declaration order == Ord order == LADDER order.
         for pair in FinalizeStage::LADDER.windows(2) {
             assert!(pair[0] < pair[1]);
-            assert_eq!(pair[0].next(), Some(pair[1]));
-            assert!(pair[0].can_advance_to(pair[1]));
-            assert!(!pair[1].can_advance_to(pair[0]));
         }
-        assert_eq!(FinalizeStage::BlobsUploaded.next(), None);
         assert_eq!(FinalizeStage::default(), FinalizeStage::Captured);
-        // Skipping a rung is never a legal advance.
-        assert!(!FinalizeStage::Captured.can_advance_to(FinalizeStage::MemoryChunked));
     }
 
     #[test]

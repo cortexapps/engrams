@@ -45,10 +45,10 @@ pub struct CheckpointChain {
     /// chain's lifetime, `version` ticking on every checkpoint.
     pub manifest_ref: ManifestRef,
     /// Its full chunk list — the `prev` for the next incremental
-    /// re-chunk. Diffs re-chunk via `update_for_dirty_ranges_sparse`
-    /// (fetch the dirty set's prev chunks from the warm cache + apply
-    /// the sparse diff), so we never materialize guest RAM — or keep a
-    /// full local image — just to checkpoint.
+    /// re-chunk. Diffs re-chunk via `update_for_dirty_ranges_sparse_from`
+    /// (read the dirty set's prev chunks through the fill engine, then
+    /// apply the sparse diff), so we never materialize guest RAM — or keep
+    /// a full local image — just to checkpoint.
     pub manifest: engram_chunk_store::Manifest,
 }
 
@@ -377,15 +377,21 @@ pub struct CheckpointConfig {
     /// The controller scales the next epoch so `dirty_bytes ≈ target` at
     /// the last observed dirty rate. `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`.
     pub target_epoch_bytes: u64,
+    /// The first epoch after a bind (create, restore, reattach): no capture
+    /// has measured the dirty rate yet, so the controller takes a short
+    /// epoch to get one instead of waiting for the backstop. Inside
+    /// `[min_interval, interval]`. `ENGRAM_CHECKPOINT_FIRST_INTERVAL_SECS`.
+    pub first_interval: Duration,
 }
 
 /// ADR 0101 B: the next epoch length, from the last epoch's observed
 /// dirty rate. Aim for `target_epoch_bytes` of dirt per capture:
 /// `next = last_epoch × target / last_dirty`, clamped to
-/// `[min_interval, max_interval]`. No rate signal (first capture after
-/// a chain seed, a Full capture, a zero-dirty epoch) → the max
-/// backstop — an idle guest keeps the cheap ADR 0043 cadence; only a
-/// guest actually dirtying RAM earns short epochs. Pure — unit-tested
+/// `[min_interval, max_interval]`. No rate signal (a Full capture, a
+/// zero-dirty epoch) → the max backstop — an idle guest keeps the cheap
+/// ADR 0043 cadence; only a guest actually dirtying RAM earns short
+/// epochs. The epoch before the first sample is
+/// [`CheckpointConfig::first_interval`], not this function's. Pure — unit-tested
 /// directly, and the driver stays simulable (ADR 0098).
 pub fn next_epoch_after(
     last_epoch: Duration,
@@ -446,6 +452,10 @@ impl CheckpointConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(256);
+        let first_secs = std::env::var("ENGRAM_CHECKPOINT_FIRST_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
         // Normalize a min > max pair (engrams review, #835): an operator
         // lowering INTERVAL below the MIN default asked for a tighter
         // ceiling — honor it rather than hand `next_epoch_after` an
@@ -460,10 +470,16 @@ impl CheckpointConfig {
             );
             min_secs = secs;
         }
+        let first_secs = first_secs.max(min_secs);
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
             min_interval: Duration::from_secs(min_secs),
             target_epoch_bytes: target_mb * 1024 * 1024,
+            first_interval: Duration::from_secs(if secs > 0 {
+                first_secs.min(secs)
+            } else {
+                first_secs
+            }),
         }
     }
 }

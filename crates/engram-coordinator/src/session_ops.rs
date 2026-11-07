@@ -75,8 +75,9 @@ pub enum OpOutcome {
     /// backoff is wrong twice: the wait is not a failure, and the
     /// inflated attempts counter then slows the retries that matter
     /// (the 2026-07-31 incident recovered at a 40 s cadence for this
-    /// reason). The attempts counter still increments in the store;
-    /// only the pacing is fixed.
+    /// reason). The requeue gives back the attempt the claim counted, so
+    /// a wait never grows a later `Retry` backoff or spends a verb's
+    /// attempt budget.
     RetryAfter(Duration, String),
     /// Terminal failure.
     Failed(String),
@@ -922,7 +923,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         OpOutcome::RetryAfter(delay, e) => {
             let paced = attempt_elapsed(state, attempt_started) + delay;
             tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (fixed cadence)");
-            let requeued = meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await;
+            let requeued = meta.op_requeue_wait(op.id, epoch, paced, &e).await;
             if matches!(requeued, Ok(true)) {
                 arm_maturity_wake(state, paced);
             }

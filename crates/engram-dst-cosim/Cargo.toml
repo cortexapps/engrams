@@ -17,6 +17,7 @@ engram-core.workspace = true
 engram-crypto.workspace = true
 engram-host-agent.workspace = true
 engram-host-core.workspace = true
+engram-fill.workspace = true
 engram-oci.workspace = true
 engram-protocol.workspace = true
 engram-secrets-dev.workspace = true

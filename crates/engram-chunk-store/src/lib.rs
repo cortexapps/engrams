@@ -39,8 +39,9 @@
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev
 //! - `engram-rootfs-materializer` — chunks bake/materialize outputs
 
+pub mod admission;
 pub mod bootstrap;
-pub mod budget;
+pub mod buffers;
 pub mod cache;
 pub mod error;
 pub mod file;
@@ -50,14 +51,17 @@ pub mod reader;
 pub mod region;
 pub mod resolver;
 pub mod snapshot_blob;
+pub mod source;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod time_source;
+mod uploads;
 pub mod working_set;
 
+pub use admission::{Admission, Class, Permit};
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
-pub use budget::{UploadBudget, UploadClass};
+pub use buffers::ChunkBuf;
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;
@@ -66,6 +70,7 @@ pub use manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestDelta, ManifestKind, ManifestRef,
     DEFAULT_DISK_CHUNK_SIZE, DEFAULT_MEMORY_CHUNK_SIZE,
 };
-pub use resolver::{BlobStorageResolver, ChunkResolver, TieredChunkResolver};
+pub use resolver::{BlobStorageResolver, ChunkResolver};
+pub use source::ChunkSource;
 pub use store::ChunkStore;
-pub use working_set::{TraceRef, WorkingSetTrace};
+pub use working_set::{FirstTouch, TraceRef, WorkingSetTrace};

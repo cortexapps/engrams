@@ -155,12 +155,33 @@ impl HostServiceImpl {
     }
 }
 
-/// Boot a tonic `Server` bound to `listen_addr` and serve the
-/// `HostService` until the caller drops the returned future. The
-/// JoinHandle terminates with `Err` on bind failure or panic; a
-/// clean Ctrl-C just drops the future, which the runtime collects.
+/// Bind the `HostService` listener. Connections queue in the kernel
+/// until [`serve`] runs, so a self-connect probe passes from here on.
+pub fn bind(
+    listen_addr: std::net::SocketAddr,
+) -> std::io::Result<tonic::transport::server::TcpIncoming> {
+    let incoming = tonic::transport::server::TcpIncoming::bind(listen_addr)?;
+    tracing::info!(addr = %listen_addr, "gRPC HostService listening");
+    Ok(incoming.with_nodelay(Some(true)))
+}
+
+/// Bind `listen_addr` and serve the `HostService` until the caller drops
+/// the returned future.
 pub async fn boot(
     listen_addr: std::net::SocketAddr,
+    inner: Arc<dyn HostClient>,
+    epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let incoming = bind(listen_addr)?;
+    Ok(serve(incoming, inner, epochs, peer).await?)
+}
+
+/// Serve the `HostService` on a bound listener until the caller drops
+/// the returned future. Ends with `Err` on a server error; a clean
+/// Ctrl-C just drops the future, which the runtime collects.
+pub async fn serve(
+    incoming: tonic::transport::server::TcpIncoming,
     inner: Arc<dyn HostClient>,
     epochs: SessionEpochStore,
     peer: Option<Arc<crate::peer_fill::PeerServe>>,
@@ -169,7 +190,6 @@ pub async fn boot(
     if let Some(p) = peer {
         svc = svc.with_peer_serve(p);
     }
-    tracing::info!(addr = %listen_addr, "gRPC HostService listening");
     tonic::transport::Server::builder()
         // ADR 0013: HTTP/2 multiplexes many concurrent streams over
         // one TCP connection per coord pod. 256 is well above the
@@ -185,7 +205,7 @@ pub async fn boot(
         .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_adaptive_window(Some(true))
         .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
-        .serve(listen_addr)
+        .serve_with_incoming(incoming)
         .await
 }
 
@@ -451,6 +471,7 @@ impl HostService for HostServiceImpl {
                     offset: f.offset,
                     data: f.data.to_vec(),
                     last: f.last,
+                    item_hash: f.item_hash.map(|h| h.to_vec()).unwrap_or_default(),
                 })
                 .map_err(sandbox_to_status)
         });
@@ -564,6 +585,8 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
+        let span = tracing::info_span!("host.migration_presetup");
+        link_remote_parent(&span, &req);
         check_wire_version(&req)?;
         let r = req.into_inner();
         let id = decode_sandbox_id(&r.uuid)?;
@@ -571,6 +594,7 @@ impl HostService for HostServiceImpl {
         let out = self
             .inner
             .migration_presetup(id, fence)
+            .instrument(span)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(MigrationPresetupResponse {

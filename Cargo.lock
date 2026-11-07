@@ -2358,6 +2358,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "engram-chunk-store",
+ "engram-fill",
  "engram-host-core",
  "engram-storage-local",
  "libc",
@@ -2409,6 +2410,7 @@ dependencies = [
  "engram-coordinator",
  "engram-core",
  "engram-crypto",
+ "engram-fill",
  "engram-host-agent",
  "engram-host-core",
  "engram-oci",
@@ -2503,6 +2505,24 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-fill"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-chunk-store",
+ "engram-core",
+ "engram-storage-local",
+ "metrics",
+ "parking_lot 0.13.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
  "workspace-hack",
 ]
 
@@ -2633,7 +2653,6 @@ name = "engram-host-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "base64 0.23.1",
  "bincode",
  "bytes",
@@ -2650,6 +2669,7 @@ dependencies = [
  "engram-egress-proto",
  "engram-egress-proxy",
  "engram-egress-proxyd",
+ "engram-fill",
  "engram-harness-noop",
  "engram-harness-proto",
  "engram-host-core",
@@ -2672,7 +2692,6 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
- "http",
  "jemalloc_pprof",
  "libc",
  "metrics",
@@ -2704,11 +2723,12 @@ name = "engram-host-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "engram-chunk-store",
  "engram-core",
+ "engram-fill",
  "engram-storage-local",
- "futures",
  "libc",
  "serde",
  "serde_json",

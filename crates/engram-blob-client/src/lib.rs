@@ -261,6 +261,16 @@ impl BlobStorage for BlobClient {
         .await
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        let deadline = Some(self.policy.attempt_timeout);
+        self.with_retry("get_range", deadline, || {
+            let inner = self.inner.clone();
+            let key = key.to_owned();
+            async move { inner.get_range(&key, offset, len).await }
+        })
+        .await
+    }
+
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
         self.with_retry("head", deadline, || {

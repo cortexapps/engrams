@@ -302,3 +302,40 @@ pub async fn list_prefix_page_walks_whole_prefix(store: &dyn BlobStorage, n: usi
     );
     assert_eq!(walked_set.len(), n, "expected {n} keys under {prefix}");
 }
+
+/// `get_range` returns exactly the asked bytes, the last byte of the
+/// object included; an empty range or one past the end is
+/// `RangeOutOfBounds`; a missing key is `NotFound`.
+pub async fn ranged_get(store: &dyn BlobStorage) {
+    let key = format!("{}/ranged.bin", unique_prefix("ranged"));
+    let body = patterned_body(200_000);
+    store
+        .put(&key, Bytes::from(body.clone()))
+        .await
+        .expect("put");
+    let size = body.len() as u64;
+
+    for (offset, len) in [(0, 1), (65_536, 65_536), (size - 1, 1), (size - 5, 5)] {
+        let got = store.get_range(&key, offset, len).await.expect("get_range");
+        assert_eq!(
+            &got[..],
+            &body[offset as usize..(offset + len) as usize],
+            "range [{offset}, +{len})"
+        );
+    }
+    for (offset, len) in [(size - 5, 6), (size, 1), (size + 10, 1), (0, 0)] {
+        assert!(
+            matches!(
+                store.get_range(&key, offset, len).await,
+                Err(BlobError::RangeOutOfBounds { .. })
+            ),
+            "range [{offset}, +{len}) must be out of bounds"
+        );
+    }
+    let missing = format!("{}/absent.bin", unique_prefix("ranged"));
+    assert!(matches!(
+        store.get_range(&missing, 0, 1).await,
+        Err(BlobError::NotFound)
+    ));
+    store.delete(&key).await.expect("delete");
+}

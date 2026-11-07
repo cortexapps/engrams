@@ -49,24 +49,29 @@ pub async fn persist<T: Serialize>(
 ) -> std::io::Result<()> {
     fs.create_dir(dir).await?;
     let id = id.to_string();
-    let dest = record_path(dir, &id);
-    let tmp = dest.with_extension("json.partial");
     let body = serde_json::to_string_pretty(record)
         .map_err(|e| std::io::Error::other(format!("serialize {what}: {e}")))?;
     // R5: seal the body under a content hash + the record id (the filename
     // stem), so a lying disk cannot hand a resume a corrupt-but-valid record.
     let bytes = crate::durable_envelope::seal(&id, &body);
-    fs.write(&tmp, &bytes).await?;
-    // fsync the temp file so the rename publishes complete bytes.
+    replace(fs, &record_path(dir, &id), &bytes).await
+}
+
+/// Durably replace the file at `path` with `bytes`: write a `.partial`
+/// sibling, fsync it, rename it over `path`, fsync the parent dir. A
+/// crash at any point leaves the old file or the new one, never a torn
+/// one, and the dir fsync makes the rename itself crash-durable.
+pub async fn replace(fs: &dyn HostFs, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".partial");
+    let tmp = PathBuf::from(tmp);
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other(format!("{} has no parent", path.display())))?;
+    fs.write(&tmp, bytes).await?;
     fs.sync_file(&tmp).await?;
-    fs.rename(&tmp, &dest).await?;
-    // fsync the PARENT DIRECTORY so the rename itself is durable — without
-    // this, a crash after `rename` returns can still lose the directory
-    // entry (the file's data is synced, but the dir's updated block that
-    // points at it may sit only in the page cache). Opening a directory
-    // read-only for `fsync` is valid on Linux and macOS.
-    fs.sync_dir(dir).await?;
-    Ok(())
+    fs.rename(&tmp, path).await?;
+    fs.sync_dir(dir).await
 }
 
 /// All records in `dir`. Unreadable/partial files are skipped with a

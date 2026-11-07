@@ -20,8 +20,8 @@ disallowed_methods = "deny"
 async-trait.workspace = true
 chrono.workspace = true
 engram-chunk-store.workspace = true
+engram-fill.workspace = true
 engram-core.workspace = true
-futures.workspace = true
 libc = "0.2"
 serde.workspace = true
 tokio.workspace = true
@@ -30,6 +30,7 @@ uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+bytes.workspace = true
 engram-storage-local.workspace = true
 serde_json.workspace = true
 tempfile = "3"

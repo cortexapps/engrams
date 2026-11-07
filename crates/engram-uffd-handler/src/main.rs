@@ -204,6 +204,9 @@ mod linux {
         /// `HandlerControl` reports (Sealed/DrainProgress/DrainDone/
         /// PeerLost) to whichever host-agent dials in.
         pub control_sock: Option<PathBuf>,
+        /// Peer mode: write every peer-supplied chunk here, at its
+        /// session offset; the file gets this name once the drain is done.
+        pub sealed_output: Option<PathBuf>,
         /// ADR 0075: the substrate populate socket (the single-writer
         /// host-agent). When set, chunk misses are populated by the
         /// writer (its singleflight / pins / budget govern) and this
@@ -234,6 +237,7 @@ mod linux {
         let mut peer_export_id: Option<String> = None;
         let mut peer_token: Option<String> = None;
         let mut control_sock: Option<PathBuf> = None;
+        let mut sealed_output: Option<PathBuf> = None;
         let mut substrate_sock: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
@@ -352,6 +356,12 @@ mod linux {
                             "--control-sock requires a value".to_string()
                         })?));
                 }
+                "--sealed-output" => {
+                    sealed_output =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--sealed-output requires a value".to_string()
+                        })?));
+                }
                 "--substrate-sock" => {
                     substrate_sock =
                         Some(PathBuf::from(argv.next().ok_or_else(|| {
@@ -417,6 +427,7 @@ mod linux {
             peer_export_id,
             peer_token,
             control_sock,
+            sealed_output,
             substrate_sock,
         })
     }
@@ -475,6 +486,23 @@ mod linux {
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
+        // The session's published first-touch prefix, read beside the
+        // startup work: the first-touch recorder carries it forward.
+        let previous_prefix = args.trace_key.map(|session| {
+            let blob = blob.clone();
+            tokio::spawn(async move {
+                let key = engram_chunk_store::FirstTouch::key(session);
+                match blob.get(&key).await {
+                    Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes),
+                    Err(engram_core::BlobError::NotFound) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "first-touch prefix unreadable");
+                        None
+                    }
+                }
+            })
+        });
+
         // ADR 0075: dial the single writer and run the readiness Hello
         // BEFORE any FC-facing surface exists (base-shm creation + the
         // UDS bind happen downstream of here). A HelloAck with
@@ -488,19 +516,25 @@ mod linux {
                     engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
                 );
                 let hello = tracing::info_span!("uffd.substrate_hello").in_scope(|| {
-                    client.hello(Some(args.canonical_manifest), Some(args.session_manifest))
+                    client.hello(
+                        Some(args.canonical_manifest),
+                        Some(args.session_manifest),
+                        engram_uffd_handler::fault_threads(),
+                    )
                 });
                 match hello {
                     Ok((tmpfs_ok, cache_writable)) => {
                         if !tmpfs_ok {
                             return Err(
-                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to                                  serve (the guest would die later with `register memory …                                  userfaultfd … System error`)"
+                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to \
+                                 serve (the guest would die later with `register memory … \
+                                 userfaultfd … System error`)"
                                     .to_string(),
                             );
                         }
                         if !cache_writable {
                             tracing::warn!(
-                                "substrate readiness: cache root not writable at the writer;                                  populates will fail to the direct-blob fallback",
+                                "substrate readiness: the writer's cache root is not writable",
                             );
                         }
                         Some(client)
@@ -716,6 +750,7 @@ mod linux {
             let backend = backend.clone();
             let window = args.recorder_window;
             let trace_out = args.trace_output.clone();
+            let sealed_output = args.sealed_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
                     listen,
@@ -729,6 +764,8 @@ mod linux {
                         trace_output: trace_out,
                         base_shm,
                         peer: peer_wiring,
+                        sealed_output,
+                        previous_prefix,
                     },
                 )
             }
@@ -850,7 +887,7 @@ mod linux {
   [--cache-root <path>] \\
   [--recorder-window-ms <ms>] \\
   [--peer-addr <host:port> --peer-export-id <id> [--peer-token <tok>]] \\
-  [--control-sock <sock>]
+  [--control-sock <sock>] [--sealed-output <path>]
 
 Peer mode (ADR 0045 C2, post-copy destination): with --peer-addr +
 --peer-export-id (token via ENGRAM_PEER_TOKEN), the handler connects
@@ -858,6 +895,7 @@ to the SOURCE host-agent's page server, blocks for the sealed dirty
 bitmap BEFORE binding <sock>, serves sealed faults from the peer
 (sha-verified) and drains the rest in the background. --control-sock
 streams Sealed/DrainProgress/DrainDone/PeerLost to the host-agent.
+--sealed-output records the peer-supplied chunks for the first checkpoint.
 
 UFFD page-fault handler (ADR 0020 Route B). Firecracker connects to
 <sock>, hands over the guest's UFFD, and the handler serves every
