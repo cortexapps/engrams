@@ -23,6 +23,32 @@ import {
   policyObservation,
 } from "./case-grants.ts";
 
+export async function enableReviewedOAuthConnection(
+  integration: {
+    setConnectionEnabled(request: {
+      id: string;
+      expectedRevision: bigint;
+      enabled: boolean;
+    }): Promise<{
+      connection?: { id: string; configRevision: bigint; enabled: boolean };
+    }>;
+  },
+  id: string,
+  expectedRevision: bigint,
+) {
+  const enabled = await integration.setConnectionEnabled({
+    id,
+    expectedRevision,
+    enabled: true,
+  });
+  requireThat(
+    enabled.connection?.id === id &&
+      enabled.connection.configRevision === expectedRevision &&
+      enabled.connection.enabled,
+    "oauth_reviewed_connection_enabled",
+  );
+}
+
 export function assertOAuthRefusal(
   proof: Parameters<typeof assertPolicyDenial>[0],
 ) {
@@ -471,6 +497,11 @@ export const oauthAuthorityDriver: CaseDriver = async ({
             enabled: true,
           })),
         });
+        await enableReviewedOAuthConnection(
+          principals.admin.integration,
+          scenario.connection.id,
+          current.current.connection.configRevision,
+        );
         const recovery = await recoverCurrentBinding(ctx, scenario, database);
         requireThat(
           recovery.old.binding_hash === old.bindingHash,
@@ -518,7 +549,9 @@ export const oauthAuthorityDriver: CaseDriver = async ({
                     "guest-proof",
                     scenario.sessionId,
                     "failed",
-                    { hash: repeatedHash },
+                    {
+                      hash: repeatedHash,
+                    },
                   ),
                 ]
               : []),

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import * as oauth from "./case-oauth.ts";
 import {
   assertStableAuthority,
   assertRejectedRefreshAuthority,
@@ -7,6 +8,41 @@ import {
   assertInvalidatedAuthority,
   oauthCallPlan,
 } from "./case-oauth.ts";
+
+test("a reviewed catalog is enabled with its current connection revision", async () => {
+  expect(typeof oauth.enableReviewedOAuthConnection).toBe("function");
+  let enabled = false;
+  const integration = {
+    async setConnectionEnabled(request: {
+      id: string;
+      expectedRevision: bigint;
+      enabled: boolean;
+    }) {
+      expect(request).toEqual({
+        id: "fixture",
+        expectedRevision: 7n,
+        enabled: true,
+      });
+      enabled = true;
+      return { connection: { id: "fixture", configRevision: 7n, enabled } };
+    },
+  };
+  await oauth.enableReviewedOAuthConnection(integration, "fixture", 7n);
+  expect(enabled).toBe(true);
+  await expect(
+    oauth.enableReviewedOAuthConnection(
+      {
+        async setConnectionEnabled() {
+          return {
+            connection: { id: "fixture", configRevision: 7n, enabled: false },
+          };
+        },
+      },
+      "fixture",
+      7n,
+    ),
+  ).rejects.toThrow();
+});
 
 test("ordinary token rotation cannot silently replace bound authority", () => {
   const before = {
