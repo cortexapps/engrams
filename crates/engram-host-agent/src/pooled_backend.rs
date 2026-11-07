@@ -813,6 +813,10 @@ pub struct PooledBackend {
     /// A restored sandbox's hinted peer, registered with the fill engine
     /// for its memory manifest until the sandbox goes.
     peer_registrations: Arc<DashMap<SandboxId, engram_fill::PeerRegistration>>,
+    /// A lazily restored sandbox's registration with the fill engine for
+    /// its memory manifest: the faults of one sandbox share one `Demand`
+    /// cap while it lives.
+    sandbox_registrations: Arc<DashMap<SandboxId, engram_fill::SandboxRegistration>>,
     /// A lazy restore's background memory prefetch; dropping the entry
     /// cancels it.
     memory_prefetches: DashMap<SandboxId, AbortTaskOnDrop>,
@@ -1795,6 +1799,10 @@ impl PooledBackend {
             // An earlier restore's fetches for this id end before this
             // restore registers its own.
             self.drop_restore_fetches(id);
+            if let Some(memory) = md.memory_manifest {
+                self.sandbox_registrations
+                    .insert(id, fill.register_sandbox(memory.manifest_id));
+            }
             // Faults through the substrate, the prefix and the rest ask the
             // peer.
             let fill = match (peer.clone(), md.memory_manifest) {
@@ -1959,10 +1967,12 @@ impl PooledBackend {
     }
 
     /// End a restore's memory fetches: cancel its background prefetch and
-    /// drop its peer registration, which ends the peer's batching task.
+    /// drop its peer registration, which ends the peer's batching task,
+    /// and its sandbox registration.
     fn drop_restore_fetches(&self, id: SandboxId) {
         self.memory_prefetches.remove(&id);
         self.peer_registrations.remove(&id);
+        self.sandbox_registrations.remove(&id);
     }
 
     /// Provision a restored sandbox's disks from the snapshot's manifests.
@@ -2055,6 +2065,7 @@ impl PooledBackend {
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             first_run_completed_ms: Arc::new(DashMap::new()),
             peer_registrations: Arc::new(DashMap::new()),
+            sandbox_registrations: Arc::new(DashMap::new()),
             memory_prefetches: DashMap::new(),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
@@ -6173,6 +6184,7 @@ impl SandboxBackend for PooledBackend {
                 let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
                 let first_run_completed_ms = self.first_run_completed_ms.clone();
                 let peer_registrations = self.peer_registrations.clone();
+                let sandbox_registrations = self.sandbox_registrations.clone();
                 let checkpoint_pacing = self.checkpoint_pacing.clone();
                 let dead_probe_inflight = self.dead_probe_inflight.clone();
                 let checkpoint_chains = self.checkpoint_chains.clone();
@@ -6234,6 +6246,7 @@ impl SandboxBackend for PooledBackend {
                     let _ = last_snapshot_unix_ms.remove(&id);
                     let _ = first_run_completed_ms.remove(&id);
                     let _ = peer_registrations.remove(&id);
+                    let _ = sandbox_registrations.remove(&id);
                     let _ = checkpoint_pacing.remove(&id);
                     let _ = dead_probe_inflight.remove(&id);
                     // Durable checkpoint records survive destroy: an eviction's
