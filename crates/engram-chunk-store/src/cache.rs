@@ -1690,7 +1690,8 @@ impl ChunkCache {
             );
         }
 
-        let over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
+        let ceiling_over = ceiling_over(cache_total, ceiling);
+        let over = ceiling_over.max(floor_over(cache_total, self.inner.free_floor_pct, fs));
         if over > 0 {
             // Oldest populate time first; skip pinned (any refcount > 0).
             // Snapshot (populated_ms, hash, size) triples under the lock,
@@ -1709,9 +1710,12 @@ impl ChunkCache {
             };
             candidates.sort_unstable_by_key(|(ms, _, _)| *ms);
             let cache = self.clone();
-            tokio::task::spawn_blocking(move || cache.evict_oldest(candidates, over))
-                .await
-                .map_err(|e| ChunkStoreError::Internal(format!("cache evict task: {e}")))?;
+            let spare_from_ms = now_ms() - RECENT_SPARE_MS;
+            tokio::task::spawn_blocking(move || {
+                cache.evict_oldest(candidates, over, ceiling_over, spare_from_ms)
+            })
+            .await
+            .map_err(|e| ChunkStoreError::Internal(format!("cache evict task: {e}")))?;
         }
         metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "index")
             .record(sweep_started.elapsed().as_secs_f64());
@@ -1719,11 +1723,27 @@ impl ChunkCache {
     }
 
     /// Unlink `candidates` (oldest first) until `over` bytes are freed.
-    /// Blocking. Each unlink holds the chunk's file lock, and skips a
-    /// chunk pinned or written again since the candidates were taken.
-    fn evict_oldest(&self, candidates: Vec<(i64, ChunkHash, u64)>, mut over: u64) {
+    /// A chunk written at or after `spare_from_ms` goes only while the
+    /// byte ceiling still needs `ceiling_over` bytes: the free-space floor
+    /// alone never takes it (see [`RECENT_SPARE_MS`]). Blocking. Each
+    /// unlink holds the chunk's file lock, and skips a chunk pinned or
+    /// written again since the candidates were taken.
+    fn evict_oldest(
+        &self,
+        candidates: Vec<(i64, ChunkHash, u64)>,
+        over: u64,
+        ceiling_over: u64,
+        spare_from_ms: i64,
+    ) {
+        let mut freed = 0u64;
         for (populated_ms, hash, size) in candidates {
-            if over == 0 {
+            // Sorted oldest first, so every later candidate is recent too.
+            let need = if populated_ms >= spare_from_ms {
+                ceiling_over
+            } else {
+                over
+            };
+            if freed >= need {
                 break;
             }
             // Re-check the LIVE pin map at unlink time. The candidates
@@ -1741,7 +1761,7 @@ impl ChunkCache {
                 }
                 let _ = std::fs::remove_file(self.path_for(hash));
             }
-            over = over.saturating_sub(size);
+            freed += size;
             // ADR 0039 #16: track what we evicted so a later remote miss
             // for it can be counted as refetch-after-evict thrash.
             self.inner.evicted_ring.lock().insert(hash);
@@ -1818,11 +1838,10 @@ impl ChunkCache {
     /// first walk is still in flight. Overwrites (same hash
     /// re-populated) adjust the total by the size delta.
     fn index_insert(&self, hash: ChunkHash, size: u64) {
-        let populated_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let entry = IndexEntry { size, populated_ms };
+        let entry = IndexEntry {
+            size,
+            populated_ms: now_ms(),
+        };
         match &mut *self.inner.index.lock() {
             IndexState::Pending(ops) => ops.push(PendingOp::Insert(hash, entry)),
             IndexState::Ready(idx) => idx.apply(PendingOp::Insert(hash, entry)),
@@ -2130,18 +2149,24 @@ fn fs_total_bytes(path: &Path) -> Option<u64> {
 /// `fs` is `None` when the `statvfs` probe failed: we then apply the
 /// ceiling only and exert no floor pressure (fail soft — better to risk
 /// over-filling than to evict the working set on a bad reading).
+#[cfg(test)]
 fn bytes_to_free(
     cache_total: u64,
     ceiling: Option<u64>,
     free_floor_pct: f64,
     fs: Option<FsUsage>,
 ) -> u64 {
-    let ceiling_over = match ceiling {
-        Some(c) => cache_total.saturating_sub(c),
-        None => 0,
-    };
+    ceiling_over(cache_total, ceiling).max(floor_over(cache_total, free_floor_pct, fs))
+}
 
-    let floor_over = match fs {
+/// Bytes the cache holds above its byte ceiling.
+fn ceiling_over(cache_total: u64, ceiling: Option<u64>) -> u64 {
+    ceiling.map_or(0, |c| cache_total.saturating_sub(c))
+}
+
+/// Bytes to free so the disk gets back to its free-space floor.
+fn floor_over(cache_total: u64, free_floor_pct: f64, fs: Option<FsUsage>) -> u64 {
+    match fs {
         Some(fs) if fs.total > 0 => {
             let required_free = (fs.total as f64 * free_floor_pct.clamp(0.0, 1.0)) as u64;
             let deficit = required_free.saturating_sub(fs.free);
@@ -2150,9 +2175,23 @@ fn bytes_to_free(
             deficit.min(cache_total)
         }
         _ => 0,
-    };
+    }
+}
 
-    ceiling_over.max(floor_over)
+/// The free-space floor does not evict a chunk written in the last
+/// 30 s. A restore writes chunks for a reader that comes within seconds
+/// (the fault handler's eager sweep, a disk read); the floor would
+/// otherwise delete them before that read, and the next sweep (at most
+/// a minute later) takes them if the disk is still short. The byte
+/// ceiling ignores it: the ceiling is the hard limit.
+const RECENT_SPARE_MS: i64 = 30_000;
+
+/// The cache's clock for populate times: unix millis.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Bounded FIFO set of recently-evicted hashes. Membership query +
@@ -2465,6 +2504,54 @@ mod tests {
         assert!(cache.contains(hb));
         assert!(cache.contains(hc));
         assert!(cache.contains(hd));
+    }
+
+    /// Below the free-space floor, a sweep takes the old chunks and spares
+    /// the one written a moment ago.
+    #[tokio::test]
+    async fn the_floor_spares_a_chunk_just_written() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A floor of 100 % free: every real disk is below it.
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: NO_CEILING,
+                sweep_debounce_ms: i64::MAX,
+                eviction_enabled: true,
+            },
+            1.0,
+        );
+        cache.sweep().await.unwrap();
+        let (old, new) = (b"written a while ago", b"written just now");
+        let (h_old, h_new) = (ChunkHash::of(old), ChunkHash::of(new));
+        cache.put(h_old, Bytes::from_static(old)).await.unwrap();
+        cache.put(h_new, Bytes::from_static(new)).await.unwrap();
+        if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
+            idx.entries.get_mut(&h_old).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
+        }
+
+        cache.sweep().await.unwrap();
+
+        assert!(!cache.contains_on_disk(h_old), "the old chunk goes");
+        assert!(cache.contains_on_disk(h_new), "the new chunk stays");
+    }
+
+    /// The byte ceiling is a hard limit: it evicts a recent chunk too.
+    #[tokio::test]
+    async fn the_ceiling_evicts_a_chunk_just_written() {
+        let (cache, _store, _b, _c) = setup(10).await;
+        let (a, b) = (b"aaaaaaaaaa", b"bbbbbbbbbb");
+        cache
+            .put(ChunkHash::of(a), Bytes::from_static(a))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cache
+            .put(ChunkHash::of(b), Bytes::from_static(b))
+            .await
+            .unwrap();
+        assert!(!cache.contains(ChunkHash::of(a)));
+        assert!(cache.contains(ChunkHash::of(b)));
     }
 
     #[tokio::test]
@@ -3872,8 +3959,13 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
         cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
-        // The post-put sweep saw the disk under the (impossible) 100%
-        // floor and evicted the only unpinned chunk we hold.
+        // Older than the floor's spare window.
+        if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
+            idx.entries.get_mut(&ha).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
+        }
+        cache.sweep().await.unwrap();
+        // The sweep saw the disk under the (impossible) 100% floor and
+        // evicted the only unpinned chunk we hold.
         assert!(
             !cache.contains(ha),
             "tight free-space floor must evict even with no byte ceiling",
