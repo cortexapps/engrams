@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { SessionPolicyService } from "../gen/engram/mcp/v1/session_policy_pb.ts";
 import { makeManagedLifecycleStore } from "../mcp/managed-lifecycle-store.ts";
@@ -18,6 +18,10 @@ import {
 import { managedPolicy } from "../mcp/managed-policy.ts";
 import type { ManagedCreationState } from "../mcp/managed-state.ts";
 import { operatorPublication } from "./mcp-binding-fixture.ts";
+import * as controlClients from "../mcp/control-client.ts";
+import * as bindingStore from "../mcp/binding-store.ts";
+import { makeMcpRuntime } from "../mcp/runtime.ts";
+import { McpAuthorityStale } from "../mcp/authority-error.ts";
 
 // Real O persistence and generated in-process control transport; no physical boot is claimed.
 test("lost reserve response retains immutable identity and never regenerates or resends secret input", async () => {
@@ -376,10 +380,64 @@ for (const missingProof of [false, true])
       expect((await store.read(f.sessionId)).session.mcpManagedLifecycle!.phase).toBe("finalizing");
       if (!missingProof) {
         state!.boot!.phase = "started";
-        await runtime.runOnce(f.sessionId);
-        expect(finalizeCalls).toBe(1);
-        expect(applyCalls).toBe(1);
-        expect((await store.read(f.sessionId)).session.mcpManagedLifecycle!.phase).toBe("started");
+        const tls = {
+          url: "https://control.example.test/",
+          ca: "ca",
+          cert: "cert",
+          key: "key",
+          serverFingerprint: Array(32).fill("AA").join(":"),
+        };
+        const clientSpy = spyOn(controlClients, "makeSessionPolicyControlClient").mockReturnValue(
+          control,
+        );
+        const storedSpy = spyOn(bindingStore, "readStoredBindingSession").mockRejectedValue(
+          Error("stored binding reached"),
+        );
+        try {
+          const composed = makeMcpRuntime({
+            db: f.db,
+            deploymentId: f.deploymentId,
+            enabled: () => true,
+            configuration: {
+              infrastructure: operatorPublication,
+              control: tls,
+              registrations: [],
+              workers: new Map(),
+            },
+            bridge: () => ({
+              readManagedCreationState: async () => encode(),
+              prepareManagedBoot: async () => encode(),
+              recoverManagedBoot: async () => encode(),
+            }),
+          });
+          if (!composed.resolver) throw Error("configured resolver missing");
+          const error = await composed.resolver.readCurrent(f.sessionId).catch((e: unknown) => e);
+          expect(error).toBeInstanceOf(Error);
+          expect(error).not.toBeInstanceOf(McpAuthorityStale);
+          expect(error).toHaveProperty("message", "MCP managed session start is pending");
+          expect(storedSpy).not.toHaveBeenCalled();
+          const originalKey = state!.boot!.request.key;
+          state!.boot!.request.key = {
+            ...originalKey,
+            boot_attempt: "other-attempt",
+          };
+          await expect(composed.resolver.readCurrent(f.sessionId)).rejects.toBeInstanceOf(
+            McpAuthorityStale,
+          );
+          state!.boot!.request.key = originalKey;
+          await runtime.runOnce(f.sessionId);
+          expect(finalizeCalls).toBe(1);
+          expect(applyCalls).toBe(1);
+          expect((await store.read(f.sessionId)).session.mcpManagedLifecycle!.phase).toBe(
+            "started",
+          );
+          await expect(composed.resolver.readCurrent(f.sessionId)).rejects.toThrow(
+            "stored binding reached",
+          );
+        } finally {
+          storedSpy.mockRestore();
+          clientSpy.mockRestore();
+        }
       }
     } finally {
       await f.cleanup();

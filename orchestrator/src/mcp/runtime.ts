@@ -129,6 +129,14 @@ export function makeMcpRuntime(deps: {
     async readSession(id) {
       const { value, result } = await state(id);
       if (
+        value.phase === "finalizing" &&
+        result.state === "boot" &&
+        result.boot?.phase === "started" &&
+        value.sourceKey &&
+        canonicalJson(result.boot.request.key) === canonicalJson(value.sourceKey)
+      )
+        throw Error("MCP managed session start is pending");
+      if (
         value.phase !== "started" ||
         result.state !== "boot" ||
         result.boot?.phase !== "started" ||
