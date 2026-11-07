@@ -56,6 +56,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod time_source;
+mod uploads;
 pub mod working_set;
 
 pub use admission::{Admission, Class, Permit};

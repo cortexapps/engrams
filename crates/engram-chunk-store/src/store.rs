@@ -41,6 +41,24 @@ use crate::manifest::{ChunkHash, Manifest, ManifestRef};
 use crate::resolver::{BlobStorageResolver, ChunkResolver};
 use crate::working_set::{TraceRef, WorkingSetTrace};
 
+/// How a chunk upload learns whether the store already holds the chunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PutMode {
+    /// A dedup HEAD first.
+    Checked,
+    /// No HEAD: the chunk is new by construction.
+    Unchecked,
+}
+
+impl PutMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Checked => "checked",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
 /// Front door to chunked-immutable storage. Cheap to clone (it's
 /// `Arc`s internally); pass clones around freely.
 #[derive(Clone)]
@@ -62,6 +80,9 @@ pub struct ChunkStore {
     admission: Option<Arc<Admission>>,
     /// The class this store's transfers are admitted at.
     class: Class,
+    /// Shared by every clone, so the uploads of one process to `inner`
+    /// see each other.
+    uploads: Arc<crate::uploads::Uploads>,
 }
 
 impl ChunkStore {
@@ -79,6 +100,7 @@ impl ChunkStore {
             cache: None,
             admission: None,
             class: Class::Prefix,
+            uploads: Arc::default(),
         }
     }
 
@@ -169,16 +191,7 @@ impl ChunkStore {
     /// [`Self::put_chunk`] for bytes the caller owns: no copy.
     pub async fn put_chunk_bytes(&self, body: Bytes) -> Result<ChunkHash> {
         let hash = ChunkHash::of(&body);
-        let key = hash.storage_key();
-        // For S3/GCS this is a HEAD round-trip; for local fs it's a stat.
-        if self.inner.exists(&key).await? {
-            self.warm_local(hash, body).await;
-            metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "deduped")
-                .increment(1);
-            return Ok(hash);
-        }
-        self.put_body(hash, &key, body.clone(), "checked").await?;
-        self.warm_local(hash, body).await;
+        self.upload(hash, body, PutMode::Checked).await?;
         Ok(hash)
     }
 
@@ -190,7 +203,8 @@ impl ChunkStore {
     /// changed). The HEAD there is pure waste: O(dirty) GCS round-trips
     /// per flush that always miss. Content-addressed PUTs are idempotent,
     /// so the rare identical-content revert re-uploads one 16 MiB chunk
-    /// harmlessly. Unconditional PUT + unconditional local warm.
+    /// harmlessly. A PUT unless this process stored the chunk a short
+    /// time ago (see [`Self::upload`]), then the local warm.
     ///
     /// Not for capture/enable uploads — see [`Self::put_chunk`], where
     /// the dedup HEAD saves re-uploading tens of GiB on a re-bake.
@@ -209,8 +223,39 @@ impl ChunkStore {
         hash: ChunkHash,
         body: Bytes,
     ) -> Result<()> {
-        let key = hash.storage_key();
-        self.put_body(hash, &key, body.clone(), "unchecked").await?;
+        self.upload(hash, body, PutMode::Unchecked).await
+    }
+
+    /// Make chunk `hash` durable, then warm the local cache with it. In
+    /// one process, one upload of a chunk runs at a time, and a chunk the
+    /// process uploaded or saw in the store a short time ago is not sent
+    /// again: concurrent PUTs of one object hit the store's per-object
+    /// write limit.
+    async fn upload(&self, hash: ChunkHash, body: Bytes, mode: PutMode) -> Result<()> {
+        let outcome = if self.uploads.knows(hash) {
+            "known"
+        } else {
+            let _flight = self.uploads.one_at_a_time(hash).await;
+            let key = hash.storage_key();
+            let outcome = if self.uploads.knows(hash) {
+                "known"
+            } else if mode == PutMode::Checked && self.inner.exists(&key).await? {
+                "deduped"
+            } else {
+                self.put_body(hash, &key, body.clone(), mode.label())
+                    .await?;
+                "uploaded"
+            };
+            self.uploads.learn(hash);
+            outcome
+        };
+        if outcome != "uploaded" {
+            metrics::counter!(
+                "engram_chunk_put_total",
+                "mode" => mode.label(), "outcome" => outcome
+            )
+            .increment(1);
+        }
         self.warm_local(hash, body).await;
         Ok(())
     }
@@ -915,25 +960,74 @@ mod tests {
         assert_eq!(counting.put_count(), 16, "one PUT per dirty chunk");
     }
 
-    /// The capture-path `put_chunk` STILL dedups via the `exists()`
-    /// HEAD — a second put of identical bytes issues the HEAD and skips
-    /// the upload (regression guard: move 5 must not change `put_chunk`).
+    /// The capture-path `put_chunk` dedups with the `exists()` HEAD: a
+    /// process that did not upload the chunk asks the store and skips
+    /// the upload. The process that uploaded it sends nothing at all.
     #[tokio::test]
     async fn put_chunk_still_dedups_on_second_identical_put() {
         let (s, counting, _cache, _d) = counting_store_with_cache().await;
         let body = b"capture-path chunk, deduped on re-put";
         s.put_chunk(body).await.unwrap();
-        let after_first_puts = counting.put_count();
+        assert_eq!((counting.exists_count(), counting.put_count()), (1, 1));
+
         s.put_chunk(body).await.unwrap();
         assert_eq!(
-            counting.put_count(),
-            after_first_puts,
-            "second identical put_chunk must dedup (no re-upload)",
+            (counting.exists_count(), counting.put_count()),
+            (1, 1),
+            "the uploader knows the chunk is durable"
         );
-        assert!(
-            counting.exists_count() >= 2,
-            "put_chunk keeps its dedup HEAD on every call",
+
+        let other_process = ChunkStore::new(counting.clone());
+        other_process.put_chunk(body).await.unwrap();
+        assert_eq!(
+            (counting.exists_count(), counting.put_count()),
+            (2, 1),
+            "another process asks the store and skips the upload"
         );
+    }
+
+    /// Concurrent uploads of one chunk send one PUT: the store limits
+    /// writes to one object to about one per second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_of_one_chunk_send_one_put() {
+        for unchecked in [false, true] {
+            let (s, counting, _cache, _d) = counting_store_with_cache().await;
+            let body = Bytes::from_static(b"the same chunk from many writers");
+            let mut puts = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let (s, body) = (s.clone(), body.clone());
+                puts.spawn(async move {
+                    if unchecked {
+                        s.put_chunk_unchecked(&body).await
+                    } else {
+                        s.put_chunk_bytes(body).await
+                    }
+                });
+            }
+            while let Some(done) = puts.join_next().await {
+                assert_eq!(done.unwrap().unwrap(), ChunkHash::of(&body));
+            }
+            assert_eq!(counting.put_count(), 1, "unchecked={unchecked}");
+            assert_eq!(counting.exists_count(), usize::from(!unchecked));
+        }
+    }
+
+    /// A failed upload teaches the memo nothing: the next upload of the
+    /// chunk sends its own PUT.
+    #[tokio::test]
+    async fn an_upload_after_a_failed_one_sends_its_own_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let plan = FaultPlan::new().fail_nth_put(1, InjectedError::Sdk("rate limit".into()));
+        let (faulty, counters) = FaultyBlobStorage::arc(inner, plan);
+        let s = ChunkStore::new(faulty);
+        let body = b"the first PUT fails";
+
+        assert!(s.put_chunk_unchecked(body).await.is_err());
+        s.put_chunk_unchecked(body).await.unwrap();
+
+        assert_eq!(counters.puts_attempted(), 2);
+        assert_eq!(&s.get_chunk(ChunkHash::of(body)).await.unwrap()[..], body);
     }
 
     // ---- 2026-08-04 chain-poison alert: failed-PUT exists() resolve ----
