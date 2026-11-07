@@ -140,10 +140,12 @@ mod linux {
         pub listen: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
-        /// ADR 0045: read the SESSION manifest from this local JSON
-        /// file instead of the blob store — a migration destination
-        /// restores from a not-yet-durable manifest whose chunks the
-        /// host-agent pre-pulled into the NVMe cache.
+        /// Read the CANONICAL manifest from this local JSON file instead
+        /// of the blob store (the host stages a copy beside the snapshot).
+        pub canonical_manifest_json: Option<PathBuf>,
+        /// Read the SESSION manifest from this local JSON file instead of
+        /// the blob store: a migration destination's not-yet-durable
+        /// manifest, or the host's staged copy.
         pub session_manifest_json: Option<PathBuf>,
         pub prefault_trace: Option<PrefaultTraceSpec>,
         /// If `Some(host_id)`, publish the recorded trace as
@@ -221,6 +223,7 @@ mod linux {
         let mut listen: Option<PathBuf> = None;
         let mut canonical_manifest: Option<ManifestRef> = None;
         let mut session_manifest: Option<ManifestRef> = None;
+        let mut canonical_manifest_json: Option<PathBuf> = None;
         let mut session_manifest_json: Option<PathBuf> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
         let mut publish_trace_host: Option<Uuid> = None;
@@ -265,6 +268,12 @@ mod linux {
                         .next()
                         .ok_or_else(|| "--session-manifest requires a value".to_string())?;
                     session_manifest = Some(parse_manifest_ref(&v)?);
+                }
+                "--canonical-manifest-json" => {
+                    let v = argv
+                        .next()
+                        .ok_or_else(|| "--canonical-manifest-json requires a value".to_string())?;
+                    canonical_manifest_json = Some(PathBuf::from(v));
                 }
                 "--session-manifest-json" => {
                     let v = argv
@@ -413,6 +422,7 @@ mod linux {
             listen,
             canonical_manifest,
             session_manifest,
+            canonical_manifest_json,
             session_manifest_json,
             prefault_trace,
             publish_trace_host,
@@ -466,6 +476,31 @@ mod linux {
     }
 
     pub async fn run(args: Args, handle: TokioHandle) -> Result<(), String> {
+        // ADR 0075: dial the single writer and run the readiness Hello
+        // BEFORE any FC-facing surface exists (base-shm creation + the
+        // UDS bind happen downstream of here). A HelloAck with
+        // tmpfs_ok=false exits nonzero with a distinct string the
+        // host-agent surfaces in the spawn failure — the VM fails at
+        // spawn time instead of booting and later dying with
+        // `register memory … userfaultfd … System error`. The Hello runs
+        // beside the blob backend's setup; neither needs the other.
+        let hello = args.substrate_sock.as_ref().map(|sock| {
+            let client = std::sync::Arc::new(
+                engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
+            );
+            let span = tracing::info_span!("uffd.substrate_hello");
+            let (canonical, session) = (args.canonical_manifest, args.session_manifest);
+            tokio::task::spawn_blocking(move || {
+                let probes = span.in_scope(|| {
+                    client.hello(
+                        Some(canonical),
+                        Some(session),
+                        engram_uffd_handler::fault_threads(),
+                    )
+                });
+                (client, probes)
+            })
+        });
         let blob = match args.blob_root.as_ref() {
             Some(root) => {
                 tokio::fs::create_dir_all(root)
@@ -503,25 +538,11 @@ mod linux {
             })
         });
 
-        // ADR 0075: dial the single writer and run the readiness Hello
-        // BEFORE any FC-facing surface exists (base-shm creation + the
-        // UDS bind happen downstream of here). A HelloAck with
-        // tmpfs_ok=false exits nonzero with a distinct string the
-        // host-agent surfaces in the spawn failure — the VM fails at
-        // spawn time instead of booting and later dying with
-        // `register memory … userfaultfd … System error`.
-        let populate = match &args.substrate_sock {
-            Some(sock) => {
-                let client = std::sync::Arc::new(
-                    engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
-                );
-                let hello = tracing::info_span!("uffd.substrate_hello").in_scope(|| {
-                    client.hello(
-                        Some(args.canonical_manifest),
-                        Some(args.session_manifest),
-                        engram_uffd_handler::fault_threads(),
-                    )
-                });
+        let populate = match hello {
+            Some(hello) => {
+                let (client, hello) = hello
+                    .await
+                    .map_err(|e| format!("substrate hello join: {e}"))?;
                 match hello {
                     Ok((tmpfs_ok, cache_writable)) => {
                         if !tmpfs_ok {
@@ -562,7 +583,10 @@ mod linux {
         let (backend, canonical_fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             args.canonical_manifest,
             args.session_manifest,
-            args.session_manifest_json.as_deref(),
+            engram_uffd_handler::chunked::LocalManifests {
+                canonical: args.canonical_manifest_json.as_deref(),
+                session: args.session_manifest_json.as_deref(),
+            },
             blob.clone(),
             &args.cache_root,
             populate,

@@ -1882,6 +1882,21 @@ impl PooledBackend {
             self.memory_prefetches.insert(id, AbortTaskOnDrop(prefetch));
         }
 
+        // The handler reads the memory manifests from these copies, which
+        // are written while the disks provision and removed after the restore.
+        let mut staged_refs: Vec<_> = [metadata.memory_manifest, metadata.base_memory_manifest]
+            .into_iter()
+            .flatten()
+            .collect();
+        staged_refs.dedup();
+        let mut staged_manifests = match (memory_is_lazy, self.fill.clone()) {
+            (true, Some(fill)) => Some(AbortTaskOnDrop(tokio::spawn(
+                stage_memory_manifests(fill, src.clone(), staged_refs.clone())
+                    .instrument(tracing::info_span!("restore.stage_manifests")),
+            ))),
+            _ => None,
+        };
+
         let disks = if self.volumes.is_some() {
             match tracing::Instrument::instrument(
                 self.provision_for_restore(id, &metadata, &src, fresh, fork_disk, peer),
@@ -1923,6 +1938,9 @@ impl PooledBackend {
                     snapshot_id = %metadata.id,
                     "lazy memory restore (UFFD); skipping memory.bin materialization",
                 );
+                if let Some(staged) = staged_manifests.as_mut() {
+                    let _ = (&mut staged.0).await;
+                }
             } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
                 tracing::warn!(
                     error = %e,
@@ -2000,6 +2018,13 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
         }
         .await;
+        if let Some(staged) = staged_manifests {
+            drop(staged);
+            for r in &staged_refs {
+                let _ = fs::remove_file(engram_sandbox_firecracker::staged_manifest_path(&src, r))
+                    .await;
+            }
+        }
         if restore.is_err() {
             self.drop_failed_restore(id);
             if let Some(volumes) = self.volumes.as_ref() {
@@ -3949,6 +3974,39 @@ impl PooledBackend {
             ),
         }
         Ok(())
+    }
+}
+
+/// Write a copy of each manifest in `refs` beside the snapshot in `dir`,
+/// where the UFFD handler reads it instead of the blob store. A manifest
+/// that is not staged is read from the store, so a failure here only warns.
+async fn stage_memory_manifests(
+    fill: FillEngine,
+    dir: PathBuf,
+    refs: Vec<engram_core::types::manifest::ManifestRef>,
+) {
+    let stage = |r| {
+        let (fill, dir) = (fill.clone(), dir.clone());
+        async move {
+            let manifest = fill
+                .store()
+                .get_manifest(r)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+            let path = engram_sandbox_firecracker::staged_manifest_path(&dir, &r);
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, bytes).await.map_err(|e| e.to_string())?;
+            fs::rename(&tmp, &path).await.map_err(|e| e.to_string())
+        }
+    };
+    for (r, result) in refs
+        .iter()
+        .zip(futures::future::join_all(refs.iter().map(|r| stage(*r))).await)
+    {
+        if let Err(error) = result {
+            tracing::warn!(manifest = %r, %error, "manifest copy not staged; the handler reads the store");
+        }
     }
 }
 
