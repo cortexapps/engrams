@@ -32,6 +32,11 @@ pub struct Config {
     /// also asks the store; the first correct answer wins. A peer hit on
     /// the LAN takes about 1-2 ms.
     pub peer_race_after: Duration,
+    /// The longest a fetch of any class waits for its peer; then it takes
+    /// the store's answer. A peer answers a 512 KiB chunk in about 1-3 ms,
+    /// and a batch of 64 in about 200 ms, so 2 s cuts only a peer that has
+    /// stopped answering.
+    pub peer_timeout: Duration,
     /// `Demand` fetches in flight for one registered sandbox
     /// ([`FillEngine::register_sandbox`]), so one cold restore cannot
     /// take every `Demand` slot from the others. `None`: no cap per
@@ -59,6 +64,7 @@ impl Default for Config {
             demand_reserve: 16,
             hedge_after: Some(Duration::from_millis(200)),
             peer_race_after: Duration::from_millis(20),
+            peer_timeout: Duration::from_secs(2),
             sandbox_demand_cap: None,
         }
     }
@@ -146,6 +152,7 @@ struct Inner {
     admission: Arc<Admission>,
     hedge_after: Option<Duration>,
     peer_race_after: Duration,
+    peer_timeout: Duration,
     /// Peers by session manifest id, for fetches that know only which
     /// manifest they serve (a page fault).
     peers: Registry<Arc<dyn PeerSource>>,
@@ -230,6 +237,7 @@ impl FillEngine {
                 admission,
                 hedge_after: cfg.hedge_after,
                 peer_race_after: cfg.peer_race_after,
+                peer_timeout: cfg.peer_timeout,
                 peers: Registry::new(),
                 sandbox_demand: Registry::new(),
                 sandbox_demand_cap: cfg.sandbox_demand_cap,
@@ -491,9 +499,17 @@ impl FillEngine {
     }
 
     /// The peer's answer, when this view has a peer and the peer has the
-    /// chunk. Trusted: the peer checked it when it stored it.
+    /// chunk within `peer_timeout`. Trusted: the peer checked it when it
+    /// stored it.
     async fn peer_answer(&self, hash: ChunkHash) -> Option<Bytes> {
-        self.peer.as_ref()?.fetch(hash).await
+        let peer = self.peer.as_ref()?;
+        match tokio::time::timeout(self.inner.peer_timeout, peer.fetch(hash)).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                metrics::counter!("engram_fill_peer_timeout_total").increment(1);
+                None
+            }
+        }
     }
 
     /// The peer (when this view has one), then the store, under `permit`

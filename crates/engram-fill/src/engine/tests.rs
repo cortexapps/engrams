@@ -386,7 +386,7 @@ async fn a_failed_store_waits_for_a_slow_peer_in_a_demand_race() {
     let f = fixture();
     let hash = ChunkHash::of(b"only on the peer");
     let engine = engine_over(&f, counting(&f, None), Config::default())
-        .with_peer(peer(Some(b"only on the peer"), Duration::from_secs(2)));
+        .with_peer(peer(Some(b"only on the peer"), Duration::from_secs(1)));
 
     assert_eq!(
         &engine.get(hash, Class::Demand).await.unwrap()[..],
@@ -809,5 +809,31 @@ async fn a_chunk_filled_once_is_not_fetched_again_at_a_lower_class() {
         resolver.calls.load(Ordering::SeqCst),
         2,
         "one GET per chunk"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_stops_answering_falls_back_to_the_store() {
+    let f = fixture();
+    let hash = put(&f, b"the peer never answers").await;
+    let resolver = counting(&f, None);
+    let cfg = Config {
+        peer_timeout: Duration::from_secs(2),
+        ..Config::default()
+    };
+    let engine = engine_over(&f, resolver.clone(), cfg).with_peer(peer(
+        Some(b"the peer never answers"),
+        Duration::from_secs(3600),
+    ));
+
+    let started = tokio::time::Instant::now();
+    let bytes = engine.get(hash, Class::Hydrate).await.unwrap();
+
+    assert_eq!(&bytes[..], b"the peer never answers");
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(2) && waited < Duration::from_secs(3),
+        "{waited:?}"
     );
 }
