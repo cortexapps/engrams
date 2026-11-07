@@ -289,19 +289,21 @@ impl SessionVolumes {
         // A sandbox resumed on this host is live again: its kept
         // checkpoint is no longer the reap's to purge.
         self.kept.lock().unwrap().retain(|s| *s != sandbox);
+        // The roles use separate volumes, so they provision together.
         let provisioned = async {
-            let (root, root_manifest) = self
-                .provision_role(&fill, sandbox, DiskRole::Root, root)
-                .await?;
-            let (swap, swap_manifest) = match swap {
-                Some(source) => {
-                    let (path, manifest) = self
+            let swap = async {
+                match swap {
+                    Some(source) => self
                         .provision_role(&fill, sandbox, DiskRole::Swap, source)
-                        .await?;
-                    (Some(path), Some(manifest))
+                        .await
+                        .map(|(path, manifest)| (Some(path), Some(manifest))),
+                    None => Ok((None, None)),
                 }
-                None => (None, None),
             };
+            let ((root, root_manifest), (swap, swap_manifest)) = tokio::try_join!(
+                self.provision_role(&fill, sandbox, DiskRole::Root, root),
+                swap
+            )?;
             Ok(Provisioned {
                 root,
                 root_manifest,
