@@ -432,7 +432,14 @@ export async function preflight(
   check(head === inputs.sourceCommit, "source_commit");
   const dirty = await command(
     "/usr/bin/git",
-    ["-C", REPO, "status", "--porcelain", "--untracked-files=no"],
+    [
+      "--no-optional-locks",
+      "-C",
+      REPO,
+      "status",
+      "--porcelain",
+      "--untracked-files=no",
+    ],
     REPO,
     env,
   );
