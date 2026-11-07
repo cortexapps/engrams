@@ -7,6 +7,7 @@
 use engram_core::types::session_op::OpKind;
 use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
+use tracing::Instrument as _;
 
 use crate::error::ApiError;
 use crate::session_ops::{OpCtx, OpOutcome};
@@ -860,6 +861,7 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
         .services
         .meta
         .op_cancel_queued(id, OpKind::Deliver)
+        .instrument(tracing::info_span!("coord.deliver.sweep_duplicates"))
         .await
     {
         Ok(true) => {
@@ -872,7 +874,13 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
         }
     }
     loop {
-        let row: OutboxRow = match state.services.meta.outbox_next_due(id).await {
+        let row: OutboxRow = match state
+            .services
+            .meta
+            .outbox_next_due(id)
+            .instrument(tracing::info_span!("coord.deliver.next_due"))
+            .await
+        {
             Ok(Some(r)) => r,
             Ok(None) => return OpOutcome::Done,
             Err(e) => return OpOutcome::Retry(format!("outbox next-due fetch: {e}")),
@@ -882,7 +890,13 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             Ok(false) => {}
             Err(reason) => return OpOutcome::Retry(reason),
         }
-        let session = match state.services.meta.get_session(id).await {
+        let session = match state
+            .services
+            .meta
+            .get_session(id)
+            .instrument(tracing::info_span!("coord.deliver.get_session"))
+            .await
+        {
             Ok(s) => s,
             // Row gone (FK CASCADE already reaped the outbox too).
             Err(engram_core::MetaError::NotFound) => return OpOutcome::Done,
@@ -1078,12 +1092,18 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
         }
 
         // -- forward the row (the ADR 0073 `deliver_one` body) ---------
-        match forward_outbox_row(ctx, &row).await {
+        let forward_span = tracing::info_span!(
+            "coord.deliver.forward",
+            prompt_id = %row.prompt_id,
+            kind = ?row.kind,
+        );
+        match forward_outbox_row(ctx, &row).instrument(forward_span).await {
             Ok(()) => {
                 if let Err(e) = state
                     .services
                     .meta
                     .outbox_mark_delivered(&row.prompt_id, ACK_TIMEOUT)
+                    .instrument(tracing::info_span!("coord.deliver.mark_delivered"))
                     .await
                 {
                     return OpOutcome::Retry(format!("outbox mark_delivered: {e}"));
@@ -1174,7 +1194,11 @@ async fn forward_outbox_row(
     {
         return Ok(());
     }
-    let Some(sandbox_id) = state.resolve_sandbox(row.session_id).await else {
+    let Some(sandbox_id) = state
+        .resolve_sandbox(row.session_id)
+        .instrument(tracing::info_span!("coord.deliver.resolve_sandbox"))
+        .await
+    else {
         return Err(ForwardDeferral::backoff(
             "no live sandbox on an Active session",
         ));
@@ -1224,7 +1248,10 @@ async fn forward_outbox_row(
         }
     };
 
-    match forward().await {
+    match forward()
+        .instrument(tracing::info_span!("coord.deliver.host_rpc"))
+        .await
+    {
         Ok(()) => {
             // Delivered — the attach question is settled for this
             // binding; drop the grace stamp.

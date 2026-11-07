@@ -39,6 +39,7 @@ use engram_protocol::grpc::{
     SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
+use engram_protocol::grpc_client::link_remote_parent;
 use engram_protocol::wire::WireExecRequest;
 use futures::Stream;
 use std::pin::Pin;
@@ -47,20 +48,6 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::session_epochs::{EpochError, SessionEpochStore};
-
-/// Link a handler span to the caller's distributed trace (ADR 0019) by
-/// reading the W3C `traceparent` the coord's [`TraceparentInjector`] put
-/// in the request metadata. No-op when absent (OTLP disabled, or a caller
-/// that doesn't propagate).
-fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
-    if let Some(tp) = req
-        .metadata()
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-    {
-        engram_telemetry::set_parent_from_traceparent(span, tp);
-    }
-}
 
 /// Concrete `HostService` impl. Holds the in-proc
 /// `Arc<dyn HostClient>` (typically a `LocalHostClient` wrapping
@@ -953,13 +940,22 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<SendHarnessPromptRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        self.inner
-            .send_prompt(sandbox_id, r.prompt_id, r.text, r.harness_mode)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
+        let span = tracing::info_span!(
+            "host.send_harness_prompt",
+            prompt_id = %req.get_ref().prompt_id,
+        );
+        link_remote_parent(&span, &req);
+        async move {
+            let r = req.into_inner();
+            let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+            self.inner
+                .send_prompt(sandbox_id, r.prompt_id, r.text, r.harness_mode)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(Empty {}))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn edit_harness_queued_prompt(

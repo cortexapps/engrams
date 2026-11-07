@@ -10,6 +10,7 @@ use engram_core::types::sandbox::SessionFileSpec;
 use engram_protocol::app;
 use futures::StreamExt as _;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use super::{auth, into_status, parse_session_id, BoxStream};
 use crate::state::SharedState;
@@ -103,22 +104,32 @@ impl app::session_service_server::SessionService for AppSessionService {
         req: Request<app::SendPromptRequest>,
     ) -> Result<Response<app::SendPromptResponse>, Status> {
         self.auth.check(&req)?;
-        let r = req.into_inner();
-        let id = parse_session_id(&r.session_id)?;
-        let note = crate::api::prompt::send_prompt_core(
-            &self.state,
-            id,
-            r.prompt_id,
-            r.text,
-            r.harness_mode,
-            crate::api::prompt::PromptDelivery::Enqueue,
-        )
+        let span = tracing::info_span!(
+            "coord.send_prompt",
+            session_id = %req.get_ref().session_id,
+            prompt_id = %req.get_ref().prompt_id,
+        );
+        engram_protocol::grpc_client::link_remote_parent(&span, &req);
+        async move {
+            let r = req.into_inner();
+            let id = parse_session_id(&r.session_id)?;
+            let note = crate::api::prompt::send_prompt_core(
+                &self.state,
+                id,
+                r.prompt_id,
+                r.text,
+                r.harness_mode,
+                crate::api::prompt::PromptDelivery::Enqueue,
+            )
+            .await
+            .map_err(into_status)?;
+            Ok(Response::new(app::SendPromptResponse {
+                session_id: id.to_string(),
+                note: note.to_string(),
+            }))
+        }
+        .instrument(span)
         .await
-        .map_err(into_status)?;
-        Ok(Response::new(app::SendPromptResponse {
-            session_id: id.to_string(),
-            note: note.to_string(),
-        }))
     }
 
     async fn edit_queued_prompt(
