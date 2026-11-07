@@ -31,7 +31,10 @@ const auxDrives = z
   .min(3)
   .max(12)
   .refine((items) =>
-    items.every((v, i) => v.drive_id === `dyn_${i}` && v.guest_mount === `/opt/engram/dyn/${i}`),
+    items.every(
+      (v, i) =>
+        v.drive_id === `dyn_${i}` && v.guest_mount === `/opt/engram/dyn/${i}`,
+    ),
   );
 const captureRequest = z.strictObject({
   key: sourceKeySchema,
@@ -541,17 +544,19 @@ export function parseProxyDenials(
   );
   lines.pop();
   if (partial) lines.shift();
-  return lines.flatMap((line) => {
-    requireThat(Buffer.byteLength(line) <= 65536, "host_log_line_bound");
-    const entry = z
-      .object({ target: z.string().optional(), fields: object })
-      .parse(boundedHostJson(line, 65536));
-    return entry.target === "engram_egress_proxy::proxy" &&
-      entry.fields.message ===
-        "egress rejected — destination not in any allow_hosts" &&
-      entry.fields.session_id === sessionId &&
-      entry.fields.sni === sni
+  let malformedDenial = false;
+  const records = lines.flatMap((line) => {
+    const match = line.match(
+      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)  INFO engram_egress_proxy::proxy: egress rejected — destination not in any allow_hosts session_id=([0-9a-f-]{36}) sni=([a-z0-9.-]+) original_dst=(?:None|Some\(\((?:\d{1,3}\.){3}\d{1,3}, \d{1,5}\)\))$/,
+    );
+    if (
+      !match &&
+      line.includes("egress rejected — destination not in any allow_hosts")
+    )
+      malformedDenial = true;
+    return match && match[2] === sessionId && match[3] === sni
       ? [{ sha256: sha256(line + "\n"), bytes: Buffer.byteLength(line) }]
       : [];
   });
+  return !malformedDenial && records.length === 1 ? records : [];
 }

@@ -891,9 +891,8 @@ test("effective container audit rejects added authority and environment", async 
 
 test("platform output keeps only approved runner failure classifications", async () => {
   const { platformFailureLabel } = await import("./main.ts");
-  const { RunnerFailure } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/failure.ts"
-  );
+  const { RunnerFailure } =
+    await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
   for (const [code, seam, label] of [
     [
       "INVALID_CONTEXT",
@@ -964,12 +963,10 @@ test("platform output keeps only approved runner failure classifications", async
 for (const kind of ["modern", "legacy"] as const) {
   test(`fixture ${kind} readiness gives unknown errors a fixed phase label`, async () => {
     const { Stack } = await import("./launch.ts");
-    const { FixtureObserver } = await import(
-      "../../../../orchestrator/scripts/mcp-stack/observer.ts"
-    );
-    const { RunnerFailure } = await import(
-      "../../../../orchestrator/scripts/mcp-stack/failure.ts"
-    );
+    const { FixtureObserver } =
+      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
+    const { RunnerFailure } =
+      await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
     const inputs = {
       images: { fixture: { id: "fixture-image" } },
     } as Inputs;
@@ -1608,6 +1605,10 @@ test("FC launch uses the declared configuration, private namespace and original 
       engine,
     );
     const ctx = await stack.prepare();
+    expect(ctx.observer.hostLogFile).toBe(
+      join(root, "host", "egress-proxyd.log"),
+    );
+    expect((await stat(ctx.observer.hostLogFile)).mode & 0o777).toBe(0o600);
     await stack.startRole(ctx, "host-agent", "normal");
     const launch = launches[0]!;
     expect(launch.role).toBe("host-agent");
@@ -1642,6 +1643,9 @@ test("FC launch uses the declared configuration, private namespace and original 
     expect(actualEnv.ENGRAM_GRPC_LISTEN_ADDR).toBe("0.0.0.0:9101");
     expect(actualEnv.ENGRAM_GRPC_ADVERTISE_ADDR).toBe(
       "https://host.fixture.example:9101",
+    );
+    expect(actualEnv.MCP_FIXTURE_HOST_LOG).toBe(
+      join(root, "host", "host.jsonl"),
     );
     expect(actualEnv.ENGRAM_FIRECRACKER_BIN).toBe("/usr/local/bin/firecracker");
     const coordinatorConfiguration = JSON.parse(
@@ -2857,31 +2861,22 @@ test("cleanup selects only authenticated fixture or managed-principal sessions o
 });
 
 test("session teardown ignores a deleted old automation task and cleans the exact pending session", async () => {
-  const { create } = await import(
-    "../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js"
-  );
-  const { WhoAmIResponseSchema } = await import(
-    "../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts"
-  );
-  const { GetAutomationResponseSchema, GetRunResponseSchema } = await import(
-    "../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts"
-  );
-  const { GetTaskResponseSchema } = await import(
-    "../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts"
-  );
+  const { create } =
+    await import("../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js");
+  const { WhoAmIResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts");
+  const { GetAutomationResponseSchema, GetRunResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts");
+  const { GetTaskResponseSchema } =
+    await import("../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts");
   const { ListSessionsResponseSchema, DeleteSessionResponseSchema } =
-    await import(
-      "../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts"
-    );
-  const { recordOwnedAutomation } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts"
-  );
-  const { canonicalJson } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/guest.ts"
-  );
-  const { publicClient } = await import(
-    "../../../../orchestrator/scripts/mcp-stack/transport.ts"
-  );
+    await import("../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts");
+  const { recordOwnedAutomation } =
+    await import("../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts");
+  const { canonicalJson } =
+    await import("../../../../orchestrator/scripts/mcp-stack/guest.ts");
+  const { publicClient } =
+    await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
   const { destroyRunSessions } = await import("./main.ts");
   const root = await mkdtemp(
     join(process.cwd(), "var/mcp-platform-composition/automation-cleanup-"),

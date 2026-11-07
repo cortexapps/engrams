@@ -64,8 +64,9 @@ API key, environment file, image, or primary-checkout path is used.
   points to a fixture DNS host and database `mcp_<runId with hyphens changed to
 underscores>`. Only fixed read-only queries are implemented. The two services
   can use different database servers with that database name. `hostManagedRoot`
-  is the actual host-agent `work_dir/managed-boots` directory, owned and mode 0700. `hostLogFile` is its actual JSON tracing log, owned regular mode 0600
-  with one link. Both are direct paths below the run root, not worker mounts
+  is the actual host-agent `work_dir/managed-boots` directory, owned and mode
+  0700. `hostLogFile` is the egress proxy daemon tracing log, owned regular
+  mode 0600 with one link. Both are direct paths below the run root, not worker mounts
   or adapter-created observation files.
 - `guest`: owned `/tmp/mcp-stack-fixture` directory and absolute immutable model
   CLI path ending in `/engram-mcp-model-fixture`. The image/init owner prepares
@@ -249,7 +250,7 @@ receipt proves which backend the authenticated production host path selected.
 It does not replace that platform evidence. Configuration strings or supplied
 success booleans do not establish either layer.
 
-For managed-destination denial, the runner records the actual host log inode
+For managed-destination denial, the runner records the proxy daemon log inode
 and byte offset, issues a fixed guest TLS probe to the configured resource
 origin, then requires a new exact proxy Reject event for the owned session and
 SNI. The log must not rotate or truncate. The reader allows at most 8 MiB of

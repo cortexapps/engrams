@@ -142,6 +142,7 @@ export class Stack {
     await mkdir(work, { mode: 0o700 });
     await put(join(work, "host_id"), this.identity.hostId);
     await put(join(work, "host.jsonl"), "");
+    await put(join(work, "egress-proxyd.log"), "");
     await mkdir(join(work, "egress-ca"), { mode: 0o700 });
     await put(
       join(work, "egress-ca/ca.pem"),
@@ -477,7 +478,7 @@ export class Stack {
         orchestratorDsnFile: oDsn.path,
         coordinatorDsnFile: cDsn.path,
         hostManagedRoot: join(work, "managed-boots"),
-        hostLogFile: join(work, "host.jsonl"),
+        hostLogFile: join(work, "egress-proxyd.log"),
       },
       guest: {
         stateDirectory: "/tmp/mcp-stack-fixture",
@@ -815,8 +816,9 @@ export class Stack {
         (await this.nativeProcesses()).length === 0,
         "native_processes_before_start",
       );
-      const log = await open(ctx.observer.hostLogFile, "a", 0o600);
-      await chmod(ctx.observer.hostLogFile, 0o600);
+      const hostLog = join(this.root, "host", "host.jsonl");
+      const log = await open(hostLog, "a", 0o600);
+      await chmod(hostLog, 0o600);
       this.engine.checkCancellation();
       try {
         this.host = new OwnedProcess(

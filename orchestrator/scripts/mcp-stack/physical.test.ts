@@ -295,56 +295,33 @@ test("actual backend chain rejects backend substitution and changed native exten
     ),
   ).toThrow();
 });
-test("proxy denial requires exact newly flushed host/session/SNI event", () => {
-  const event = {
-    target: "engram_egress_proxy::proxy",
-    fields: {
-      message: "egress rejected — destination not in any allow_hosts",
-      session_id: id(1),
-      sni: "resource.fixture.example",
-    },
-  };
-  const line = JSON.stringify(event);
+test("proxy denial requires one complete exact daemon event", () => {
+  const line = `2026-11-07T00:00:00.000000Z  INFO engram_egress_proxy::proxy: egress rejected — destination not in any allow_hosts session_id=${id(1)} sni=resource.fixture.example original_dst=Some((10.88.2.30, 443))`;
+  const parse = (
+    text: string,
+    partial = false,
+    session = id(1),
+    sni = "resource.fixture.example",
+  ) => parseProxyDenials(Buffer.from(text), partial, session, sni);
+  expect(parse(line + "\n")).toHaveLength(1);
+  expect(parse(line)).toHaveLength(0);
+  expect(parse(line + "\n", true)).toHaveLength(0);
+  expect(parse(line + "\n", false, id(9))).toHaveLength(0);
   expect(
-    parseProxyDenials(
-      Buffer.from(line + "\n"),
-      false,
-      id(1),
-      "resource.fixture.example",
-    ),
-  ).toHaveLength(1);
-  expect(
-    parseProxyDenials(
-      Buffer.from(line),
-      false,
-      id(1),
-      "resource.fixture.example",
-    ),
+    parse(line + "\n", false, id(1), "other.fixture.example"),
   ).toHaveLength(0);
+  expect(parse(line.replace(" INFO ", " WARN ") + "\n")).toHaveLength(0);
   expect(
-    parseProxyDenials(
-      Buffer.from(line + "\n"),
-      true,
-      id(1),
-      "resource.fixture.example",
-    ),
+    parse(line.replace("engram_egress_proxy::proxy", "other::proxy") + "\n"),
   ).toHaveLength(0);
+  expect(parse("prefix " + line + "\n")).toHaveLength(0);
+  expect(parse(line + " session_id=" + id(1) + "\n")).toHaveLength(0);
+  expect(parse(line + "\n" + line + "\n")).toHaveLength(0);
+  expect(parse(line + "\n" + "prefix " + line + "\n")).toHaveLength(0);
   expect(
-    parseProxyDenials(
-      Buffer.from(line + "\n"),
-      false,
-      id(9),
-      "resource.fixture.example",
-    ),
+    parse(line.replace("sni=resource", "sni=bad\nsni=resource") + "\n"),
   ).toHaveLength(0);
-  expect(() =>
-    parseProxyDenials(
-      Buffer.from("x".repeat(65537)),
-      false,
-      id(1),
-      "resource.fixture.example",
-    ),
-  ).toThrow();
+  expect(() => parse("x".repeat(65537))).toThrow();
 });
 test("worker TLS requires a verified server and certificate-required alert", async () => {
   const root = await realpath(
