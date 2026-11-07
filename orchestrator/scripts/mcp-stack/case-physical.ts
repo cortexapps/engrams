@@ -178,7 +178,10 @@ export const credentialNetworkIsolationDriver: CaseDriver = async ({
       },
       {
         assertion: "default-allow-managed-authority-denied",
-        observations: [denial],
+        observations: [
+          denial,
+          observe(identity, "guest-proof", "current", probe.dns),
+        ],
       },
       {
         assertion: "worker-control-denied",

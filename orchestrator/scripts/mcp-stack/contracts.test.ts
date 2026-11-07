@@ -41,7 +41,10 @@ import {
   probeOAuthCredentialAbsence,
   readGuestFile,
 } from "./guest.ts";
-import { guestColdObservation } from "./guest-physical.ts";
+import {
+  guestColdObservation,
+  probeManagedAuthority,
+} from "./guest-physical.ts";
 import { parseArgs } from "./cli.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -1881,4 +1884,104 @@ test("guest process probes identify the staged harness and keep their guards", a
   await process(3, [harness, "mcp-bridge"], ["ENGRAM_TOOLS=manifest"]);
   await rm(join(proc, "2"), { recursive: true });
   expect(oauth().status).toBe(16);
+});
+
+test("managed DNS lookup failure still probes the exact fixture IP with its SNI", async () => {
+  const dir = await mkdtemp(join(root, "managed-probe-"));
+  const bin = join(dir, "bin");
+  await mkdir(bin);
+  const ctx = ContextSchema.parse(validContext());
+  const fixture = ctx.protocolFixtures.modern;
+  fixture.runRoot = dir;
+  fixture.resourceOrigin = "https://resource.fixture.example:8443";
+  const config = JSON.stringify({
+    listen: { host: "10.82.7.30", port: 8443 },
+    advertised: { resource: fixture.resourceOrigin },
+  });
+  const configPath = join(dir, "config.json");
+  await writeFile(configPath, config, { mode: 0o600 });
+  fixture.configuration = { path: configPath, sha256: sha256(config) };
+  const managed = new URL(fixture.resourceOrigin).hostname;
+  const control = new URL(ctx.endpoints.app.origin).hostname;
+  const calls: string[][] = [];
+  let controlStatus = 0,
+    managedStatus = 2,
+    tlsStatus = 1,
+    negativeOutput = false;
+  async function executable(name: string, body: string) {
+    const path = join(bin, name);
+    await writeFile(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  await executable("timeout", 'shift; exec "$@"');
+  const client = {
+    sessions: {
+      async *exec(request: { argv: string[] }) {
+        const argv = request.argv;
+        calls.push(argv);
+        await executable(
+          "getent",
+          `if [ "$2" = "${control}" ]; then if [ ${controlStatus} -eq 0 ]; then echo 10.82.7.20; fi; exit ${controlStatus}; fi; if [ "$2" = "${managed}" ]; then ${negativeOutput ? "echo unexpected;" : ""} exit ${managedStatus}; fi; exit 99`,
+        );
+        await executable("openssl", `exit ${tlsStatus}`);
+        const i = argv.indexOf("-c");
+        const result = spawnSync(
+          "/bin/sh",
+          ["-c", argv[i + 1]!, ...argv.slice(i + 2)],
+          { env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: "utf8" },
+        );
+        yield { event: { case: "started", value: {} } };
+        yield { event: { case: "stdout", value: Buffer.from(result.stdout) } };
+        yield {
+          event: { case: "exit", value: { exitStatus: result.status ?? 255 } },
+        };
+      },
+    },
+  } as Parameters<typeof probeManagedAuthority>[1];
+  const result = await probeManagedAuthority(ctx, client, "session");
+  expect(result.sni).toBe(managed);
+  expect(result.dns).toEqual({
+    positiveControl: true,
+    managedLookupExit: 2,
+    configurationSha256: sha256(config),
+  });
+  expect(calls).toHaveLength(2);
+  expect(calls[1]).toContain("10.82.7.30:443");
+  expect(calls[1]).not.toContain("10.82.7.30:8443");
+  expect(calls[1]).toContain(managed);
+  fixture.configuration.sha256 = "0".repeat(64);
+  await expect(probeManagedAuthority(ctx, client, "session")).rejects.toThrow(
+    "managed_fixture_config_digest",
+  );
+  fixture.configuration.sha256 = sha256(config);
+  const wrongOrigin = JSON.stringify({
+    listen: { host: "10.82.7.30", port: 8443 },
+    advertised: { resource: "https://other.fixture.example:8443" },
+  });
+  await writeFile(configPath, wrongOrigin);
+  fixture.configuration.sha256 = sha256(wrongOrigin);
+  await expect(probeManagedAuthority(ctx, client, "session")).rejects.toThrow(
+    "managed_fixture_config_binding",
+  );
+  await writeFile(configPath, config);
+  fixture.configuration.sha256 = sha256(config);
+  for (const status of [0, 3, 124, 127]) {
+    managedStatus = status;
+    await expect(
+      probeManagedAuthority(ctx, client, "session"),
+    ).rejects.toThrow();
+  }
+  managedStatus = 2;
+  negativeOutput = true;
+  await expect(probeManagedAuthority(ctx, client, "session")).rejects.toThrow();
+  negativeOutput = false;
+  controlStatus = 2;
+  await expect(probeManagedAuthority(ctx, client, "session")).rejects.toThrow();
+  controlStatus = 0;
+  for (const status of [0, 124, 126, 127, 137]) {
+    tlsStatus = status;
+    await expect(
+      probeManagedAuthority(ctx, client, "session"),
+    ).rejects.toThrow();
+  }
 });

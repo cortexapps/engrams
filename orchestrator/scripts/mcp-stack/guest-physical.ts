@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import {
   requireThat,
+  privateFile,
   sha256,
   verifyArtifact,
   type Context,
@@ -101,7 +102,50 @@ export async function probeManagedAuthority(
   client: PublicClient,
   sessionId: string,
 ) {
-  const url = new URL(ctx.protocolFixtures.modern.resourceOrigin);
+  const fixture = ctx.protocolFixtures.modern;
+  const url = new URL(fixture.resourceOrigin);
+  const bytes = await privateFile(fixture.runRoot, fixture.configuration.path);
+  requireThat(
+    sha256(bytes) === fixture.configuration.sha256,
+    "managed_fixture_config_digest",
+  );
+  const config = z
+    .object({
+      listen: z.object({
+        host: z.ipv4(),
+        port: z.number().int().min(1).max(65535),
+      }),
+      advertised: z.object({ resource: z.string() }),
+    })
+    .parse(JSON.parse(bytes.toString("utf8")));
+  requireThat(
+    config.advertised.resource === fixture.resourceOrigin &&
+      config.listen.port === Number(url.port || "443"),
+    "managed_fixture_config_binding",
+  );
+  const dns = await guestExec(ctx, client, sessionId, [
+    "/usr/bin/env",
+    "-i",
+    "PATH=/usr/bin:/bin",
+    "/bin/sh",
+    "-c",
+    `set -eu
+control=$(timeout 2s getent ahostsv4 "$1" 2>/dev/null) || exit 21
+[ -n "$control" ] || exit 21
+set +e
+result=$(timeout 2s getent ahostsv4 "$2" 2>/dev/null)
+status=$?
+set -e
+[ "$status" -eq 2 ] && [ -z "$result" ] || exit 22
+`,
+    "fixture-managed-dns",
+    new URL(ctx.endpoints.app.origin).hostname,
+    url.hostname,
+  ]);
+  requireThat(
+    dns.status === 0 && dns.stdout.length === 0,
+    "managed_dns_lookup_failure",
+  );
   const response = await guestExec(ctx, client, sessionId, [
     "/usr/bin/env",
     "-i",
@@ -112,14 +156,23 @@ export async function probeManagedAuthority(
 timeout 5s openssl s_client -connect "$1" -servername "$2" -tls1_3 < /dev/null >/dev/null 2>&1
 `,
     "fixture-managed-destination",
-    `${url.hostname}:${url.port || "443"}`,
+    // Port 443 follows the enforced proxy path; denial happens before upstream dial.
+    `${config.listen.host}:443`,
     url.hostname,
   ]);
   requireThat(
-    response.status !== 0 && response.status !== 127,
+    response.status !== 0 && ![124, 126, 127, 137].includes(response.status),
     "managed_destination_probe_denied",
   );
-  return { sni: url.hostname, sha256: sha256(String(response.status)) };
+  return {
+    sni: url.hostname,
+    sha256: sha256(String(response.status)),
+    dns: {
+      positiveControl: true,
+      managedLookupExit: 2,
+      configurationSha256: fixture.configuration.sha256,
+    },
+  };
 }
 
 /** Fixed sentinels test loss of the old tmpfs state, not removal of every old RAM byte. */
