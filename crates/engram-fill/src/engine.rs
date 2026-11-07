@@ -25,6 +25,9 @@ pub struct Config {
     pub max_in_flight: usize,
     /// Extra slots only `Demand` may use.
     pub demand_reserve: usize,
+    /// The most slots `Hydrate` and `Background` use together, so a bulk
+    /// fill leaves the rest of the limit to `Demand` and `Prefix`.
+    pub bulk_in_flight: usize,
     /// A `Demand` fetch still running after this gets a second request; the
     /// first answer wins. `None` turns hedging off.
     pub hedge_after: Option<Duration>,
@@ -62,6 +65,7 @@ impl Default for Config {
             in_flight: 64,
             max_in_flight: 256,
             demand_reserve: 16,
+            bulk_in_flight: 64,
             hedge_after: Some(Duration::from_millis(200)),
             peer_race_after: Duration::from_millis(20),
             peer_timeout: Duration::from_secs(2),
@@ -73,6 +77,7 @@ impl Default for Config {
 impl Config {
     /// [`Config::default`], with `ENGRAM_FILL_IN_FLIGHT`,
     /// `ENGRAM_FILL_IN_FLIGHT_MAX`, `ENGRAM_FILL_DEMAND_RESERVE`,
+    /// `ENGRAM_FILL_BULK_IN_FLIGHT`,
     /// `ENGRAM_FILL_HEDGE_MS` (0 = off) and
     /// `ENGRAM_FILL_SANDBOX_DEMAND_CAP` read when set.
     /// `ENGRAM_FILL_IN_FLIGHT` sets the start and the ceiling, so the
@@ -100,6 +105,12 @@ impl Config {
         }
         if let Some(v) = get("ENGRAM_FILL_DEMAND_RESERVE")? {
             cfg.demand_reserve = v;
+        }
+        if let Some(v) = get("ENGRAM_FILL_BULK_IN_FLIGHT")? {
+            if v == 0 {
+                return Err("ENGRAM_FILL_BULK_IN_FLIGHT must be at least 1".into());
+            }
+            cfg.bulk_in_flight = v;
         }
         if let Some(ms) = get("ENGRAM_FILL_HEDGE_MS")? {
             cfg.hedge_after = (ms > 0).then(|| Duration::from_millis(ms as u64));
@@ -230,6 +241,7 @@ impl FillEngine {
             MIN_IN_FLIGHT.min(cfg.in_flight),
             cfg.max_in_flight,
             cfg.demand_reserve,
+            cfg.bulk_in_flight,
         );
         Self {
             inner: Arc::new(Inner {

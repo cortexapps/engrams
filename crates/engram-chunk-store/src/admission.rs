@@ -48,11 +48,14 @@ impl Class {
 
 /// Grants permits under one limit. `Demand` may also use `demand_reserve`
 /// slots above the limit, so a pipe full of bulk transfers delays a fault
-/// by at most one completion. Within a class, permits are granted in
-/// arrival order.
+/// by at most one completion. `Hydrate` and `Background` together use at
+/// most `bulk_cap` slots, so a bulk fill cannot take the link, the CPU and
+/// the disk from a restore's critical path. Within a class, permits are
+/// granted in arrival order.
 pub struct Admission {
     name: &'static str,
     demand_reserve: usize,
+    bulk_cap: usize,
     state: Mutex<State>,
 }
 
@@ -109,17 +112,19 @@ pub(crate) fn is_overload(e: &engram_core::error::BlobError) -> bool {
 impl Admission {
     /// A fixed limit. `name` labels the metrics.
     pub fn fixed(name: &'static str, limit: usize, demand_reserve: usize) -> Arc<Self> {
-        Self::build(name, limit.max(1), demand_reserve, None)
+        Self::build(name, limit.max(1), demand_reserve, usize::MAX, None)
     }
 
     /// A limit that starts at `start` and moves between `min` and `max`
-    /// with the measured throughput (see [`Tuner`]).
+    /// with the measured throughput (see [`Tuner`]). Bulk classes use at
+    /// most `bulk_cap` slots of it.
     pub fn adaptive(
         name: &'static str,
         start: usize,
         min: usize,
         max: usize,
         demand_reserve: usize,
+        bulk_cap: usize,
     ) -> Arc<Self> {
         let max = max.max(1);
         let min = min.clamp(1, max);
@@ -128,6 +133,7 @@ impl Admission {
             name,
             start,
             demand_reserve,
+            bulk_cap.max(1),
             Some(Tuner::new(min, max, crate::time_source::metrics_now())),
         )
     }
@@ -136,12 +142,14 @@ impl Admission {
         name: &'static str,
         limit: usize,
         demand_reserve: usize,
+        bulk_cap: usize,
         tuner: Option<Tuner>,
     ) -> Arc<Self> {
         metrics::gauge!("engram_admission_limit", "admission" => name).set(limit as f64);
         Arc::new(Self {
             name,
             demand_reserve,
+            bulk_cap,
             state: Mutex::new(State {
                 in_flight: 0,
                 limit,
@@ -154,7 +162,8 @@ impl Admission {
     fn cap(&self, limit: usize, class: Class) -> usize {
         match class {
             Class::Demand => limit + self.demand_reserve,
-            _ => limit,
+            Class::Prefix => limit,
+            Class::Hydrate | Class::Background => limit.min(self.bulk_cap),
         }
     }
 
@@ -434,6 +443,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_stops_at_its_cap_while_prefix_uses_the_whole_limit() {
+        let adm = Admission::adaptive("test", 3, 1, 3, 0, 1);
+        let _bulk = adm.acquire(Class::Hydrate).await;
+        let mut more_bulk = Box::pin(adm.acquire(Class::Background));
+        assert!(poll_once(&mut more_bulk).is_none(), "bulk is at its cap");
+        let _a = adm.acquire(Class::Prefix).await;
+        let _b = adm.acquire(Class::Prefix).await;
+        assert_eq!(adm.in_flight(), 3);
+    }
+
+    #[tokio::test]
     async fn a_dropped_waiter_does_not_leak_its_slot() {
         let adm = Admission::fixed("test", 1, 0);
         let held = adm.acquire(Class::Hydrate).await;
@@ -448,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reported_outcome_frees_the_slot() {
-        let adm = Admission::adaptive("test", 1, 1, 4, 0);
+        let adm = Admission::adaptive("test", 1, 1, 4, 0, usize::MAX);
         adm.acquire(Class::Hydrate).await.done(10);
         adm.acquire(Class::Hydrate).await.failed();
         assert_eq!(adm.in_flight(), 0);
