@@ -131,7 +131,6 @@ export const credentialNetworkIsolationDriver: CaseDriver = async ({
       ctx,
       scenario.client,
       scenario.sessionId,
-      harness,
     );
     const host = new HostObserver(ctx);
     const baseline = await host.logBaseline();
@@ -280,7 +279,6 @@ export const diskOnlyColdRebindDriver: CaseDriver = async ({
       ctx,
       scenario.client,
       scenario.sessionId,
-      harness,
       true,
     );
     requireThat(
@@ -315,7 +313,6 @@ export const diskOnlyColdRebindDriver: CaseDriver = async ({
       ctx,
       scenario.client,
       scenario.sessionId,
-      harness,
       false,
     );
     requireThat(

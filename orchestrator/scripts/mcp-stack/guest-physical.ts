@@ -7,9 +7,8 @@ import {
   verifyArtifact,
   type Context,
 } from "./context.ts";
-import { guestExec } from "./guest.ts";
+import { guestExec, guestHarnessPath } from "./guest.ts";
 import type { PublicClient } from "./transport.ts";
-import type { Harness } from "./manifest.ts";
 
 /** Parse actual OpenSSL output. A timeout, close or generic TLS failure is not a denial receipt. */
 export function parseWorkerTlsDenial(
@@ -128,7 +127,6 @@ export async function guestColdObservation(
   ctx: Context,
   client: PublicClient,
   sessionId: string,
-  harness: Harness,
   prepare: boolean,
 ) {
   const sentinel = sha256(`${ctx.runId}:${sessionId}:cold-sentinel`);
@@ -153,7 +151,9 @@ manifest_hash=''
 for path in /proc/[0-9]*/cmdline; do
   [ -r "$path" ] || continue
   first=$(tr '\\000' '\\n' < "$path" | head -n 1)
-  case "$first" in */engram-harness-"$3") ;; *) continue;; esac
+  [ "$first" = "$3" ] || continue
+  second=$(tr '\\000' '\\n' < "$path" | sed -n '2p')
+  case "$second" in --connect|--vsock-host) ;; *) continue;; esac
   count=$((count+1))
   [ "$count" -le 1 ] || exit 12
   env_path=$(dirname "$path")/environ
@@ -173,7 +173,7 @@ printf '{"bootId":"%s","manifestSha256":"%s","tmpfsVerified":true,"diskRetained"
     "fixture-cold-observe",
     prepare ? "prepare" : "verify",
     sentinel,
-    harness,
+    guestHarnessPath(ctx),
   ]);
   requireThat(response.status === 0, "guest_cold_actual_observation");
   const observed = z

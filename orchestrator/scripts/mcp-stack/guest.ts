@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { posix } from "node:path";
 import { requireThat, RunnerFailure, sha256, type Context } from "./context.ts";
 import type { PublicClient } from "./transport.ts";
 
@@ -257,12 +258,15 @@ export async function guestReady(
   requireThat(response.status === 0, "guest_fixture_directory_ready");
 }
 
+export function guestHarnessPath(ctx: Context) {
+  return posix.join(posix.dirname(ctx.guest.cliPath), "harness");
+}
+
 /** Observe live harness/model environments, including inline ENGRAM_TOOLS. This is not a disk scan. */
 export async function probeOAuthCredentialAbsence(
   ctx: Context,
   client: PublicClient,
   sessionId: string,
-  harness: "claude" | "codex",
 ) {
   const script = `set -eu
 harness_count=0
@@ -274,7 +278,7 @@ for path in /proc/[0-9]*/cmdline; do
   first=$(tr '\\000' '\\n' < "$path" | head -n 1)
   kind=other
   case "$first" in
-    */engram-harness-"$2") kind=harness;;
+    "$2") kind=harness;;
     "$1") kind=model;;
   esac
   [ "$kind" != other ] || continue
@@ -302,7 +306,7 @@ printf '{"harnesses":%s,"models":%s,"manifests":%s,"credentialFound":false}\\n' 
     script,
     "fixture-env-probe",
     ctx.guest.cliPath,
-    harness,
+    guestHarnessPath(ctx),
   ]);
   requireThat(result.status === 0, "live_oauth_environment_clean");
   const parsed = z

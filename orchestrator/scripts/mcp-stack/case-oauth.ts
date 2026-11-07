@@ -284,7 +284,10 @@ export const oauthAuthorityDriver: CaseDriver = async ({
               "fixture-observer",
               scenario.connection.id,
               "succeeded",
-              { before: rotation.before.oauth, after: rotation.after.oauth },
+              {
+                before: rotation.before.oauth,
+                after: rotation.after.oauth,
+              },
             ),
           ],
         },
@@ -483,7 +486,6 @@ export const oauthAuthorityDriver: CaseDriver = async ({
         ctx,
         scenario.client,
         scenario.sessionId,
-        harness,
       );
       assertions.push({
         assertion: "no-credential-leak",

@@ -2,12 +2,14 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
   chmod,
   mkdtemp,
+  mkdir,
   writeFile,
   symlink,
   rm,
   readFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:https";
 import { X509Certificate } from "node:crypto";
 import {
@@ -34,7 +36,12 @@ import { Evidence } from "./evidence.ts";
 import { requirePrerequisites } from "./preflight.ts";
 import { safeFailure, validateDrivers } from "./runner.ts";
 import { drivers } from "./run.ts";
-import { isProofFilename, readGuestFile } from "./guest.ts";
+import {
+  isProofFilename,
+  probeOAuthCredentialAbsence,
+  readGuestFile,
+} from "./guest.ts";
+import { guestColdObservation } from "./guest-physical.ts";
 import { parseArgs } from "./cli.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -250,7 +257,10 @@ test("CLI rejects a present empty stage while retaining the full default", () =>
   expect(
     parseArgs(["--context", "/owned/context.json", "--matrix", "all"])
       .selection,
-  ).toEqual({ stage: "matrix", matrix: "all" });
+  ).toEqual({
+    stage: "matrix",
+    matrix: "all",
+  });
 });
 test("zero and missing case results fail", () => {
   expect(() => verifyResults([])).toThrow();
@@ -346,9 +356,13 @@ test("owned file rejects loose permissions and oversize", async () => {
 test("identity headers cannot mix cookie and unattended principals", () => {
   expect(
     credentialHeaders({ kind: "cookie", value: "session=neutral" }),
-  ).toEqual({ cookie: "session=neutral" });
+  ).toEqual({
+    cookie: "session=neutral",
+  });
   expect(credentialHeaders({ kind: "api-key", value: "engk_neutral" })).toEqual(
-    { "x-api-key": "engk_neutral" },
+    {
+      "x-api-key": "engk_neutral",
+    },
   );
   expect(() =>
     credentialHeaders({ kind: "cookie", value: "session=x\r\nx-api-key:bad" }),
@@ -834,7 +848,10 @@ test("guest proof reads use authenticated downloads with bounded verified bytes"
       const uploader = await publicClient(ctx, credential);
       expect(
         await uploader.uploadGuestFile("owned-session", path, fixture),
-      ).toEqual({ sizeBytes: 4096, sha256: sha256(fixture) });
+      ).toEqual({
+        sizeBytes: 4096,
+        sha256: sha256(fixture),
+      });
       expect(uploads.at(-1)).toEqual({
         bytes: fixture,
         size: "4096",
@@ -1623,7 +1640,9 @@ test("observer accepts the production automation task id and retains ownership g
     await writeFile(
       path,
       "postgres://fixture:neutral@database.fixture.example/mcp_unit",
-      { mode: 0o600 },
+      {
+        mode: 0o600,
+      },
     );
   // The pools are lazy. Registering ownership does not send a database query.
   const database = await DatabaseObserver.connect(ctx);
@@ -1674,7 +1693,9 @@ test("selected dispatcher executes only canonical selected cases and preserves a
     await writeFile(
       path,
       "postgres://fixture:neutral@database.fixture.example/mcp_unit",
-      { mode: 0o600 },
+      {
+        mode: 0o600,
+      },
     );
   ctx.endpoints.app.ca.path = join(root, "selection-ca.pem");
   await writeFile(ctx.endpoints.app.ca.path, "unused-neutral-ca", {
@@ -1772,4 +1793,92 @@ test("selected dispatcher executes only canonical selected cases and preserves a
         record.kind === "complete" || record.kind === "stage-complete",
     ),
   ).toBe(false);
+});
+
+// Run the generated guest shell against a private proc tree, with no live guest.
+test("guest process probes identify the staged harness and keep their guards", async () => {
+  const dir = await mkdtemp(join(root, "proc-probe-"));
+  const proc = join(dir, "proc");
+  const shm = join(dir, "shm");
+  const state = join(dir, "state");
+  await mkdir(join(proc, "sys/kernel/random"), { recursive: true });
+  await mkdir(shm);
+  await mkdir(state);
+  await writeFile(join(proc, "mounts"), `tmpfs ${shm} tmpfs rw 0 0\n`);
+  await writeFile(
+    join(proc, "sys/kernel/random/boot_id"),
+    "11111111-1111-4111-8111-111111111111\n",
+  );
+  const ctx = ContextSchema.parse(validContext());
+  const session = "probe-session";
+  await writeFile(
+    join(state, "cold-disk-sentinel"),
+    sha256(`${ctx.runId}:${session}:cold-sentinel`),
+  );
+  async function process(pid: number, argv: string[], env: string[]) {
+    const path = join(proc, String(pid));
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "cmdline"), argv.join("\0") + "\0");
+    await writeFile(join(path, "environ"), env.join("\0") + "\0");
+  }
+  const harness = "/opt/fixture/harness";
+  await process(
+    1,
+    [harness, "--connect", "local", "--session-id", session],
+    ["ENGRAM_TOOLS=manifest"],
+  );
+  await process(2, [ctx.guest.cliPath], []);
+  await process(3, [harness, "mcp-bridge"], ["ENGRAM_TOOLS=manifest"]);
+  await process(4, [harness, "hook-bridge"], ["ENGRAM_TOOLS=manifest"]);
+  async function generated(cold: boolean) {
+    let argv: string[] = [];
+    const client = {
+      sessions: {
+        async *exec(request: { argv: string[] }) {
+          argv = request.argv;
+          yield { event: { case: "started", value: {} } };
+          yield { event: { case: "exit", value: { exitStatus: 1 } } };
+        },
+      },
+    } as Parameters<typeof probeOAuthCredentialAbsence>[1];
+    try {
+      if (cold) await guestColdObservation(ctx, client, session, false);
+      else await probeOAuthCredentialAbsence(ctx, client, session);
+    } catch {
+      /* The stub only captures the command. */
+    }
+    expect(argv.length).toBeGreaterThan(3);
+    const script = argv[2]!
+      .replaceAll("/proc/", proc + "/")
+      .replaceAll("/dev/shm", shm)
+      .replaceAll("/tmp/mcp-stack-fixture", state);
+    return () =>
+      spawnSync(argv[0]!, [argv[1]!, script, ...argv.slice(3)], {
+        encoding: "utf8",
+      });
+  }
+  const oauth = await generated(false);
+  const cold = await generated(true);
+  expect(oauth().status).toBe(0);
+  expect(cold().status).toBe(0);
+  await process(
+    1,
+    [harness, "--vsock-host", "123", "--session-id", session],
+    ["ENGRAM_TOOLS=manifest"],
+  );
+  expect(cold().status).toBe(0);
+  await process(5, [harness, "--connect", "local"], ["ENGRAM_TOOLS=manifest"]);
+  expect(cold().status).toBe(12);
+  await rm(join(proc, "5"), { recursive: true });
+  await process(
+    3,
+    [harness, "mcp-bridge"],
+    ["ENGRAM_TOOLS=manifest", "TOKEN=fixture-access-123"],
+  );
+  expect(oauth().status).toBe(15);
+  await process(3, [harness, "mcp-bridge"], []);
+  expect(oauth().status).toBe(16);
+  await process(3, [harness, "mcp-bridge"], ["ENGRAM_TOOLS=manifest"]);
+  await rm(join(proc, "2"), { recursive: true });
+  expect(oauth().status).toBe(16);
 });
