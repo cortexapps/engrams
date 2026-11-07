@@ -11,7 +11,7 @@
 
 mod engine;
 
-pub use engine::{Config, FillEngine, FillStats, PeerRegistration};
+pub use engine::{Config, FillEngine, FillStats, PeerRegistration, MAX_RANGE, RANGE_ALIGN};
 pub use engram_chunk_store::{Admission, Class, Permit};
 
 /// A host that holds a session's chunks on local disk: the tier between

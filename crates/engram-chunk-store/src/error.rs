@@ -51,6 +51,14 @@ pub enum ChunkStoreError {
     /// Use for "should never reach here" branches that we still want
     /// to surface rather than panic.
     Internal(String),
+
+    /// A ranged read asked for bytes past the end of the chunk.
+    RangeOutOfBounds {
+        hash: String,
+        offset: u64,
+        len: u64,
+        size: u64,
+    },
 }
 
 impl fmt::Display for ChunkStoreError {
@@ -81,6 +89,15 @@ impl fmt::Display for ChunkStoreError {
             Self::Cache(e) => write!(f, "local cache I/O: {e}"),
             Self::Origin(msg) => write!(f, "origin tier: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
+            Self::RangeOutOfBounds {
+                hash,
+                offset,
+                len,
+                size,
+            } => write!(
+                f,
+                "range [{offset}, +{len}) is past the end of chunk {hash} ({size} bytes)"
+            ),
         }
     }
 }
@@ -127,6 +144,17 @@ impl ChunkStoreError {
             Self::Cache(e) => Self::Cache(io(e)),
             Self::Origin(m) => Self::Origin(m.clone()),
             Self::Internal(m) => Self::Internal(m.clone()),
+            Self::RangeOutOfBounds {
+                hash,
+                offset,
+                len,
+                size,
+            } => Self::RangeOutOfBounds {
+                hash: hash.clone(),
+                offset: *offset,
+                len: *len,
+                size: *size,
+            },
         }
     }
 }

@@ -974,6 +974,45 @@ impl ChunkCache {
         Ok(Some(bytes))
     }
 
+    /// `len` bytes at `offset` of a resident chunk: from the bytes of a
+    /// fill that is writing it, else from its file. `None` when the
+    /// cache does not hold the chunk. Like [`Self::read_resident`], it
+    /// trusts what it reads.
+    pub async fn read_resident_range(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Bytes>> {
+        let fetched = self
+            .inner
+            .inflight
+            .lock()
+            .get(&hash)
+            .and_then(|f| f.fetched.clone());
+        if let Some(bytes) = fetched {
+            return slice_chunk_range(hash, &bytes, offset, len).map(Some);
+        }
+        if !self.contains(hash) {
+            return Ok(None);
+        }
+        let path = self.path_for(hash);
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::FileExt;
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            range_in(hash, offset, len, file.metadata()?.len())?;
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, offset)?;
+            Ok(Some(Bytes::from(buf)))
+        })
+        .await
+        .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
+    }
+
     /// [`Self::fill_with`] without a slot taken ahead.
     pub async fn get_with_source<F, Fut>(
         &self,
@@ -1986,6 +2025,25 @@ pub async fn verify_fetched(hash: ChunkHash, bytes: &Bytes) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// `bytes[offset..offset + len]` of chunk `hash`, or
+/// [`ChunkStoreError::RangeOutOfBounds`] when the range runs past `bytes`.
+pub fn slice_chunk_range(hash: ChunkHash, bytes: &Bytes, offset: u64, len: usize) -> Result<Bytes> {
+    Ok(bytes.slice(range_in(hash, offset, len, bytes.len() as u64)?))
+}
+
+/// `offset..offset + len` when it lies within a chunk of `size` bytes.
+fn range_in(hash: ChunkHash, offset: u64, len: usize, size: u64) -> Result<std::ops::Range<usize>> {
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= size => Ok(offset as usize..end as usize),
+        _ => Err(ChunkStoreError::RangeOutOfBounds {
+            hash: hash.to_hex(),
+            offset,
+            len: len as u64,
+            size,
+        }),
+    }
 }
 
 /// `Err(HashMismatch)` unless `bytes` hash to `hash`.

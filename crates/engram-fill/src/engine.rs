@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use engram_chunk_store::cache::FillSource;
+use engram_chunk_store::cache::{slice_chunk_range, FillSource};
 use engram_chunk_store::{Admission, ChunkHash, ChunkStore, Class, Permit, Result};
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
@@ -32,6 +32,15 @@ pub struct Config {
     /// the LAN takes about 1-2 ms.
     pub peer_race_after: Duration,
 }
+
+/// A ranged store GET starts and ends on a multiple of this.
+pub const RANGE_ALIGN: u64 = 64 * 1024;
+
+/// The widest ranged store GET, once aligned. Linux caps one block
+/// request at about 1 MiB by default, so a guest read fits; and a wider
+/// range is a large share of a 16 MiB disk chunk, where one whole-chunk
+/// fetch costs about the same and also serves the reads that follow.
+pub const MAX_RANGE: u64 = 1024 * 1024;
 
 /// The lowest the adaptive limit goes.
 const MIN_IN_FLIGHT: usize = 8;
@@ -248,6 +257,64 @@ impl FillEngine {
             }
         }
         self.fetch_verified(hash, class, None).await
+    }
+
+    /// `len` bytes at `offset` of a chunk, for a reader that needs part of
+    /// a chunk now (a guest disk read):
+    ///
+    /// - A resident chunk (in the cache, or in memory while its fill
+    ///   writes it) serves the range.
+    /// - With a peer, the whole chunk comes through [`Self::get`] at
+    ///   `class` (a peer serves only whole chunks), and the range is cut
+    ///   from it. So does a range wider than [`MAX_RANGE`] once aligned.
+    /// - Otherwise one ranged store GET at `class`, aligned out to
+    ///   [`RANGE_ALIGN`], serves the range, and a whole-chunk fill at
+    ///   `Hydrate` starts beside it (one flight with every other fill of
+    ///   the chunk). Without a cache there is no fill.
+    ///
+    /// The ranged bytes are not hash-checked: only a whole chunk can be.
+    /// They go to the caller only, never to the cache; the cache stores
+    /// the chunk only from the whole-chunk fill, after its hash check.
+    /// A caller that needs checked bytes uses [`Self::get`].
+    pub async fn read_range(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: usize,
+        class: Class,
+    ) -> Result<Bytes> {
+        let cache = self.store().chunk_cache();
+        if let Some(cache) = cache {
+            if let Some(bytes) = cache.read_resident_range(hash, offset, len).await? {
+                return Ok(bytes);
+            }
+        }
+        let lo = offset / RANGE_ALIGN * RANGE_ALIGN;
+        let hi = offset
+            .saturating_add(len as u64)
+            .div_ceil(RANGE_ALIGN)
+            .saturating_mul(RANGE_ALIGN);
+        if self.peer.is_some() || hi - lo > MAX_RANGE {
+            let whole = self.get(hash, class).await?;
+            return slice_chunk_range(hash, &whole, offset, len);
+        }
+        if cache.is_some() {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = engine.get(hash, Class::Hydrate).await {
+                    tracing::debug!(%hash, error = %e, "fill after a ranged read failed");
+                }
+            });
+        }
+        let permit = self.inner.admission.acquire(class).await;
+        metrics::counter!("engram_fill_range_total", "class" => class.as_str()).increment(1);
+        let got = self
+            .store()
+            .resolver()
+            .fetch_chunk_range_unverified(hash, lo, hi - lo)
+            .await;
+        permit.finish(got.as_ref().map(|b| b.len() as u64));
+        slice_chunk_range(hash, &got?, offset - lo, len)
     }
 
     /// Make every chunk in `hashes` resident in the cache at `class`, each

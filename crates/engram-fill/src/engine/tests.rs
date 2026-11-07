@@ -19,7 +19,12 @@ fn fixture() -> Fixture {
     let blob_dir = tempfile::tempdir().unwrap();
     let cache_dir = tempfile::tempdir().unwrap();
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(blob_dir.path()));
-    let cache = ChunkCache::new(ChunkCacheConfig::new(cache_dir.path()));
+    // No eviction: the free-space floor of the test machine's disk must
+    // not remove the chunks a test checks for.
+    let cache = ChunkCache::new(ChunkCacheConfig {
+        eviction_enabled: false,
+        ..ChunkCacheConfig::new(cache_dir.path())
+    });
     Fixture {
         _dirs: (blob_dir, cache_dir),
         blob,
@@ -45,6 +50,7 @@ async fn put(f: &Fixture, body: &[u8]) -> ChunkHash {
 struct Counting {
     inner: BlobStorageResolver,
     calls: AtomicUsize,
+    ranges: AtomicUsize,
     slow_first: Option<Duration>,
 }
 
@@ -62,6 +68,18 @@ impl ChunkResolver for Counting {
         self.inner.fetch_chunk_unverified(hash).await
     }
 
+    async fn fetch_chunk_range_unverified(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes> {
+        self.ranges.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .fetch_chunk_range_unverified(hash, offset, len)
+            .await
+    }
+
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
         self.inner.chunk_exists(hash).await
     }
@@ -71,6 +89,7 @@ fn counting(f: &Fixture, slow_first: Option<Duration>) -> Arc<Counting> {
     Arc::new(Counting {
         inner: BlobStorageResolver::new(f.blob.clone()),
         calls: AtomicUsize::new(0),
+        ranges: AtomicUsize::new(0),
         slow_first,
     })
 }
@@ -507,4 +526,145 @@ async fn a_materialize_through_the_engine_reads_the_peer() {
 
     assert_eq!(std::fs::read(&dest).unwrap(), body);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+}
+
+/// 300 KiB of non-repeating bytes: wider than five range alignments.
+fn wide_body() -> Vec<u8> {
+    (0..300 * 1024u32).map(|i| (i % 251) as u8).collect()
+}
+
+/// Wait (in real time) until the cache holds `hash`.
+async fn wait_resident(f: &Fixture, hash: ChunkHash) {
+    for _ in 0..500 {
+        if f.cache.contains_on_disk(hash) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("the whole-chunk fill never landed");
+}
+
+#[tokio::test]
+async fn a_range_of_a_resident_chunk_takes_no_store_request() {
+    let f = fixture();
+    let body = wide_body();
+    let hash = put(&f, &body).await;
+    f.cache.put(hash, Bytes::from(body.clone())).await.unwrap();
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+
+    let got = engine
+        .read_range(hash, 70_000, 4096, Class::Demand)
+        .await
+        .unwrap();
+
+    assert_eq!(&got[..], &body[70_000..74_096]);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.ranges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_range_miss_is_served_by_a_ranged_get_and_the_whole_chunk_fills() {
+    let f = fixture();
+    let body = wide_body();
+    let hash = put(&f, &body).await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+
+    let got = engine
+        .read_range(hash, 70_000, 4096, Class::Demand)
+        .await
+        .unwrap();
+
+    assert_eq!(&got[..], &body[70_000..74_096]);
+    assert_eq!(resolver.ranges.load(Ordering::SeqCst), 1);
+    wait_resident(&f, hash).await;
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "one whole-chunk fill"
+    );
+}
+
+#[tokio::test]
+async fn ranged_bytes_of_a_corrupt_object_never_reach_the_cache() {
+    let f = fixture();
+    let hash = ChunkHash::of(&wide_body());
+    let mut other = wide_body();
+    other[0] ^= 0xff;
+    f.blob
+        .put(&hash.storage_key(), Bytes::from(other.clone()))
+        .await
+        .unwrap();
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+
+    let got = engine
+        .read_range(hash, 0, 512, Class::Demand)
+        .await
+        .unwrap();
+
+    assert_eq!(&got[..], &other[..512], "the range is not hash-checked");
+    while resolver.calls.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !f.cache.contains_on_disk(hash),
+        "the fill's hash check refused it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_a_peer_a_range_is_cut_from_the_peers_whole_chunk() {
+    let f = fixture();
+    let body: &'static [u8] = b"whole chunk on the peer";
+    let hash = put(&f, body).await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default())
+        .with_peer(peer(Some(body), Duration::from_millis(1)));
+
+    let got = engine.read_range(hash, 6, 5, Class::Demand).await.unwrap();
+
+    assert_eq!(&got[..], b"chunk");
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.ranges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_range_wider_than_the_limit_reads_the_whole_chunk() {
+    let f = fixture();
+    let body: Vec<u8> = (0..(MAX_RANGE as u32 + 1))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let hash = put(&f, &body).await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+
+    let got = engine
+        .read_range(hash, 1, MAX_RANGE as usize, Class::Demand)
+        .await
+        .unwrap();
+
+    assert_eq!(&got[..], &body[1..]);
+    assert_eq!(resolver.ranges.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(f.cache.contains_on_disk(hash));
+}
+
+#[tokio::test]
+async fn a_range_past_the_chunk_end_is_an_error() {
+    let f = fixture();
+    let hash = put(&f, b"short").await;
+    let engine = engine_over(&f, counting(&f, None), Config::default());
+
+    let err = engine
+        .read_range(hash, 3, 10, Class::Demand)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ChunkStoreError::RangeOutOfBounds { size: 5, .. }),
+        "{err:?}"
+    );
 }

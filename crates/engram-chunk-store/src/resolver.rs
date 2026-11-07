@@ -44,8 +44,29 @@ pub trait ChunkResolver: Send + Sync {
         self.fetch_chunk(hash).await
     }
 
+    /// The bytes `[offset, offset + len)` of the chunk's object, fewer
+    /// when the object ends first. Not hash-checked: only a whole chunk
+    /// can be. The default fetches the whole chunk and cuts the range.
+    async fn fetch_chunk_range_unverified(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes> {
+        let bytes = self.fetch_chunk_unverified(hash).await?;
+        Ok(clip(&bytes, offset, len))
+    }
+
     /// Whether the chunk is reachable through this resolver.
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool>;
+}
+
+/// `bytes[offset..offset + len]`, cut short at the end of `bytes`.
+fn clip(bytes: &Bytes, offset: u64, len: u64) -> Bytes {
+    let size = bytes.len() as u64;
+    let start = offset.min(size);
+    let end = offset.saturating_add(len).min(size);
+    bytes.slice(start as usize..end as usize)
 }
 
 /// `ChunkResolver` backed by a `BlobStorage`. Reads from
@@ -78,6 +99,36 @@ impl ChunkResolver for BlobStorageResolver {
 
     async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
         Ok(self.blob.get(&hash.storage_key()).await?)
+    }
+
+    /// `BlobStorage` has no ranged GET, so this streams the object up
+    /// to the range end and drops the rest of the body: it moves
+    /// `offset + len` bytes, not the whole chunk.
+    async fn fetch_chunk_range_unverified(
+        &self,
+        hash: ChunkHash,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes> {
+        use futures::StreamExt as _;
+        let end = offset.saturating_add(len);
+        let mut stream = self.blob.get_streaming(&hash.storage_key()).await?;
+        let mut out = bytes::BytesMut::with_capacity(len as usize);
+        let mut pos = 0u64;
+        while pos < end {
+            let Some(frame) = stream.next().await else {
+                break;
+            };
+            let frame = frame?;
+            let frame_end = pos + frame.len() as u64;
+            if frame_end > offset {
+                let lo = offset.saturating_sub(pos) as usize;
+                let hi = (end.min(frame_end) - pos) as usize;
+                out.extend_from_slice(&frame[lo..hi]);
+            }
+            pos = frame_end;
+        }
+        Ok(out.freeze())
     }
 
     async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
@@ -121,6 +172,26 @@ mod tests {
             Err(ChunkStoreError::HashMismatch { .. }) => {}
             other => panic!("expected HashMismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_ranged_fetch_returns_the_range_cut_short_at_the_object_end() {
+        let (r, blob, _d) = resolver().await;
+        let body: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let hash = ChunkHash::of(&body);
+        blob.put(&hash.storage_key(), Bytes::from(body.clone()))
+            .await
+            .unwrap();
+        let got = r
+            .fetch_chunk_range_unverified(hash, 4096, 100)
+            .await
+            .unwrap();
+        assert_eq!(&got[..], &body[4096..4196]);
+        let tail = r
+            .fetch_chunk_range_unverified(hash, 9_990, 64)
+            .await
+            .unwrap();
+        assert_eq!(&tail[..], &body[9_990..]);
     }
 
     #[tokio::test]
