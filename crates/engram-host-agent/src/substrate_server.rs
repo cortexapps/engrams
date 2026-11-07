@@ -698,7 +698,11 @@ mod tests {
             .await
             .unwrap();
         let mref = ManifestRef::new();
-        store.put_manifest(mref, &manifest).await.unwrap();
+        // Another process wrote the manifest, so the server reads it.
+        ChunkStore::new(blob.clone() as Arc<dyn BlobStorage>)
+            .put_manifest(mref, &manifest)
+            .await
+            .unwrap();
         blob.gets.store(0, Ordering::SeqCst);
         let cache = server.cache.clone();
         let sock = dir.path().join("substrate.sock");
