@@ -58,6 +58,28 @@ pub struct RegionChunkStats {
     pub partial_buffer_high_water: u64,
 }
 
+/// The uploader of a region run. `.await` it for the manifest after the
+/// producer calls [`RegionChunker::finish`]. Dropping it aborts the
+/// uploader and its uploads: no caller can read the manifest any more.
+pub struct RegionUpload(tokio::task::JoinHandle<crate::Result<(Manifest, RegionChunkStats)>>);
+
+impl std::future::Future for RegionUpload {
+    type Output = Result<crate::Result<(Manifest, RegionChunkStats)>, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl Drop for RegionUpload {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One finalized chunk travelling to the uploader. `None` body =
 /// all-zero chunk (progress-counted, never uploaded).
 enum Completed {
@@ -227,9 +249,9 @@ impl RegionChunker {
 impl ChunkStore {
     /// ADR 0093: open a streaming region → chunk pipeline for a
     /// `total_bytes` image. Returns the synchronous [`RegionChunker`]
-    /// (move it into the blocking producer thread) and a handle whose
-    /// `.await` yields the finished manifest after the producer calls
-    /// [`RegionChunker::finish`] and all uploads land.
+    /// (move it into the blocking producer thread) and the
+    /// [`RegionUpload`] whose `.await` yields the finished manifest after
+    /// the producer calls [`RegionChunker::finish`] and all uploads land.
     ///
     /// `progress(done, total)` counts finalized chunks (uploaded,
     /// deduped, and zero-elided alike) so callers get the same
@@ -239,10 +261,7 @@ impl ChunkStore {
         kind: ManifestKind,
         total_bytes: u64,
         progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
-    ) -> (
-        RegionChunker,
-        tokio::task::JoinHandle<crate::Result<(Manifest, RegionChunkStats)>>,
-    ) {
+    ) -> (RegionChunker, RegionUpload) {
         let chunk_size = kind.default_chunk_size();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Completed>(COMPLETED_CHANNEL_DEPTH);
         let chunker = RegionChunker {
@@ -257,7 +276,7 @@ impl ChunkStore {
         };
         let store = self.clone();
         let total_chunks = total_bytes.div_ceil(chunk_size).max(1);
-        let uploader = tokio::spawn(async move {
+        let uploader = RegionUpload(tokio::spawn(async move {
             let mut stats = RegionChunkStats::default();
             let mut chunks: Vec<ChunkRef> = Vec::new();
             // A JoinSet, so an upload error aborts the other uploads.
@@ -313,7 +332,7 @@ impl ChunkStore {
             manifest.chunk_size = ChunkSize::bytes(chunk_size);
             manifest.chunks = chunks;
             Ok((manifest, stats))
-        });
+        }));
         (chunker, uploader)
     }
 }
@@ -391,6 +410,72 @@ mod tests {
         );
         assert_eq!(stats.chunks_uploaded, 3);
         assert_eq!(stats.chunks_elided, 1);
+    }
+
+    /// A blob store whose PUTs never finish.
+    struct HangingPuts;
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::BlobStorage for HangingPuts {
+        async fn put_streaming(
+            &self,
+            _key: &str,
+            _body: engram_core::traits::storage::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            std::future::pending().await
+        }
+        async fn get_streaming(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::storage::ByteStream, engram_core::error::BlobError>
+        {
+            Err(engram_core::error::BlobError::NotFound)
+        }
+        async fn head(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::storage::BlobObjectMeta, engram_core::error::BlobError>
+        {
+            Err(engram_core::error::BlobError::NotFound)
+        }
+        async fn delete(&self, _key: &str) -> Result<(), engram_core::error::BlobError> {
+            Ok(())
+        }
+        async fn list_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Dropping the uploader stops it: the producer's channel closes
+    /// instead of an upload task running on with nobody to read it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_uploader_stops_its_uploads() {
+        let store = ChunkStore::new(Arc::new(HangingPuts));
+        let (mut rc, uploader) = store.region_chunker(ManifestKind::Disk, 8192, None);
+        let mut rc = tokio::task::spawn_blocking(move || {
+            rc.data(0, &pattern(4096, 1)).unwrap();
+            rc
+        })
+        .await
+        .unwrap();
+
+        drop(uploader);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !rc.tx.is_closed() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the aborted uploader closes the channel");
+        let err = tokio::task::spawn_blocking(move || rc.data(4096, &pattern(4096, 2)))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("uploader terminated"), "{err}");
     }
 
     /// Double-covering a byte is a producer bug and must error, not
