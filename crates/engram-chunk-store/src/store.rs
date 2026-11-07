@@ -83,6 +83,34 @@ pub struct ChunkStore {
     /// Shared by every clone, so the uploads of one process to `inner`
     /// see each other.
     uploads: Arc<crate::uploads::Uploads>,
+    /// The manifests this process read or wrote last. A manifest version
+    /// is written once and never changes, so a hit is always current.
+    manifests: Arc<ManifestCache>,
+}
+
+/// The most recent manifests, newest last.
+#[derive(Default)]
+struct ManifestCache(parking_lot::Mutex<std::collections::VecDeque<(ManifestRef, Arc<Manifest>)>>);
+
+impl ManifestCache {
+    const CAPACITY: usize = 16;
+
+    fn get(&self, r: ManifestRef) -> Option<Arc<Manifest>> {
+        let entries = self.0.lock();
+        entries
+            .iter()
+            .find(|(k, _)| *k == r)
+            .map(|(_, m)| m.clone())
+    }
+
+    fn insert(&self, r: ManifestRef, m: Arc<Manifest>) {
+        let mut entries = self.0.lock();
+        entries.retain(|(k, _)| *k != r);
+        if entries.len() == Self::CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((r, m));
+    }
 }
 
 impl ChunkStore {
@@ -101,6 +129,7 @@ impl ChunkStore {
             admission: None,
             class: Class::Prefix,
             uploads: Arc::default(),
+            manifests: Arc::default(),
         }
     }
 
@@ -453,6 +482,7 @@ impl ChunkStore {
         }
         let bytes = serde_json::to_vec(m)?;
         let _ = self.inner.put(&key, Bytes::from(bytes)).await?;
+        self.manifests.insert(r, Arc::new(m.clone()));
         tracing::debug!(
             manifest_id = %r.manifest_id,
             version = r.version,
@@ -464,13 +494,17 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// GET a specific manifest version. Returns `NotFound` if no
-    /// such version was ever written (the version was never
-    /// committed, or was GC'd).
+    /// GET a specific manifest version, from this process's recent
+    /// manifests when it holds it. Returns `NotFound` if no such version
+    /// was ever written, or if it was GC'd and is not held here.
     pub async fn get_manifest(&self, r: ManifestRef) -> Result<Manifest> {
+        if let Some(m) = self.manifests.get(r) {
+            return Ok((*m).clone());
+        }
         let bytes = self.inner.get(&r.storage_key()).await?;
         let m: Manifest = serde_json::from_slice(&bytes)?;
         m.validate()?;
+        self.manifests.insert(r, Arc::new(m.clone()));
         Ok(m)
     }
 
