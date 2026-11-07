@@ -19,7 +19,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use engram_cloud_static::StaticCloud;
 use engram_core::traits::SandboxBackend;
-use engram_host_agent::{HostAgent, HostAgentConfig, HostAgentError};
+use engram_host_agent::{HostAgent, HostAgentConfig, HostAgentError, IdleEvictionHarness};
 
 /// Picks which `SandboxBackend` the host-agent wraps. Mirrors the
 /// production half of `engram-coordinator`'s `--sandbox-backend`
@@ -218,6 +218,17 @@ struct Cli {
     /// when `--ca-source=aws-secrets-manager`.
     #[arg(long, env = "ENGRAM_EGRESS_CA_AWS_KEY_SECRET")]
     ca_aws_key_secret: Option<String>,
+
+    /// What an idle eviction does with the agent in the VM. `keep`
+    /// captures the running agent, and a resume continues the same
+    /// process. `drain` stops the agent before the capture, and a resume
+    /// starts it again from its saved conversation.
+    #[arg(
+        long,
+        env = "ENGRAM_IDLE_EVICTION_HARNESS",
+        default_value_t = IdleEvictionHarness::default()
+    )]
+    idle_eviction_harness: IdleEvictionHarness,
 }
 
 /// Choice of CA-loading backend. Extension points: HashiCorp Vault,
@@ -321,6 +332,7 @@ async fn main() -> Result<(), HostAgentError> {
             BackendChoice::Firecracker => "firecracker".to_string(),
             BackendChoice::Vz => "vz".to_string(),
         },
+        idle_eviction_harness: cli.idle_eviction_harness,
         ..HostAgentConfig::default()
     };
 
