@@ -84,7 +84,7 @@ pub mod page_idle;
 pub mod peer_fill;
 pub mod session_epochs;
 pub mod substrate_server;
-pub use host_client::LocalHostClient;
+pub use host_client::{IdleEvictionHarness, LocalHostClient};
 #[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
@@ -810,9 +810,12 @@ impl HostAgent {
             pooled.set_upload_sink(upload_sink);
             // ADR 0015 M5: warm-pool retired. LocalHostClient is just
             // the cold-create dispatch wrapper now.
-            let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-                crate::host_client::LocalHostClient::new(pooled.clone(), harness_hub.clone()),
-            );
+            let local_host: Arc<dyn engram_core::traits::HostClient> =
+                Arc::new(crate::host_client::LocalHostClient::new(
+                    pooled.clone(),
+                    harness_hub.clone(),
+                    self.cfg.idle_eviction_harness,
+                ));
             // ADR 0009 §2: populate `running_sandboxes` from
             // `backend.list()` on each heartbeat tick. The coord
             // intersects this against expected-active sessions to

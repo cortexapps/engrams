@@ -1096,9 +1096,12 @@ impl AppState {
         host_id: engram_core::HostId,
         sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
     ) {
-        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::new(sandbox, self.harness_hub.clone()),
-        );
+        let client: Arc<dyn engram_core::traits::HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::new(
+                sandbox,
+                self.harness_hub.clone(),
+                engram_host_agent::IdleEvictionHarness::default(),
+            ));
         self.host_registry.register(host_id, client);
     }
 
