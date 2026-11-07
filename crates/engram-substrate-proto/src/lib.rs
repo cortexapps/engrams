@@ -39,9 +39,16 @@
 //! A version-1 fd is opened `O_RDONLY` and holds the whole chunk from
 //! offset 0. A connection without a `Hello` speaks version 1.
 //!
+//! Version 3 is version 2 plus [`ToWriter::Read`]: a request that says
+//! who asks (guest memory or a disk) and may name a byte range of the
+//! chunk. The reply is the same `Filled { len }`, with the range (or the
+//! whole chunk) in `slot[..len]`. A writer refuses `Read` on a version-2
+//! connection.
+//!
 //! A writer that does not speak the requested version replies
-//! `PopulateErr` to the `Hello` and closes the connection; the handler
-//! then dials again with version 1.
+//! `PopulateErr` to the `Hello` and closes the connection; the client
+//! then dials again with the version below (a version-3 client with
+//! version 2, a version-2 handler with version 1).
 
 use std::io::{Read, Write};
 
@@ -50,6 +57,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// The version a current handler asks for first.
 pub const PROTO_VERSION: u32 = 2;
+
+/// The version that adds [`ToWriter::Read`]. Only a client that sends
+/// `Read` asks for it.
+pub const PROTO_VERSION_READ: u32 = 3;
 
 /// The fd-per-reply version. A writer serves it to handlers that an
 /// older host-agent started, and a handler falls back to it against an
@@ -78,8 +89,35 @@ pub enum ToWriter {
         /// pins its chunks in the cache while the connection is open.
         session_manifest: Option<ManifestRef>,
     },
-    /// Make one chunk available and deliver it.
+    /// Make one chunk available and deliver it. Means guest memory and
+    /// the whole chunk.
     Populate { hash: [u8; 32] },
+    /// Version 3: deliver `range` of the chunk (the whole chunk when
+    /// `None`) for `requester`.
+    Read {
+        hash: [u8; 32],
+        requester: Requester,
+        range: Option<ByteRange>,
+    },
+}
+
+/// Who asks for a chunk. Positional on the wire: append only.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Requester {
+    /// A uffd handler, for guest memory. The writer keeps the chunk in
+    /// the cache.
+    Memory,
+    /// A session disk. A whole chunk is not kept in the cache: the
+    /// volume holds it.
+    Disk,
+}
+
+/// `len` bytes from `offset` of a chunk. A ranged read is not
+/// hash-checked and does not go to the cache.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
 }
 
 /// Writer → client. Variants are positional on the wire: append only.
@@ -229,6 +267,19 @@ mod tests {
                 session_manifest: None,
             },
             ToWriter::Populate { hash: [7u8; 32] },
+            ToWriter::Read {
+                hash: [9u8; 32],
+                requester: Requester::Disk,
+                range: Some(ByteRange {
+                    offset: 65_536,
+                    len: 4096,
+                }),
+            },
+            ToWriter::Read {
+                hash: [9u8; 32],
+                requester: Requester::Memory,
+                range: None,
+            },
         ];
         for m in msgs {
             let mut buf = Vec::new();
@@ -274,6 +325,35 @@ mod tests {
             [0, 0, 0, 0]
         );
         assert_eq!(to(&ToWriter::Populate { hash: [0; 32] }), [1, 0, 0, 0]);
+    }
+
+    /// The version-3 read, byte for byte: a disk client in another
+    /// process encodes it by hand.
+    #[test]
+    fn a_read_has_a_fixed_wire_shape() {
+        let read = ToWriter::Read {
+            hash: [0xAB; 32],
+            requester: Requester::Disk,
+            range: Some(ByteRange {
+                offset: 0x0102,
+                len: 0x0304,
+            }),
+        };
+        let mut want = vec![2, 0, 0, 0];
+        want.extend_from_slice(&[0xAB; 32]);
+        want.extend_from_slice(&[1, 0, 0, 0]);
+        want.push(1);
+        want.extend_from_slice(&0x0102u64.to_le_bytes());
+        want.extend_from_slice(&0x0304u64.to_le_bytes());
+        assert_eq!(bincode::serialize(&read).unwrap(), want);
+        let whole = ToWriter::Read {
+            hash: [0; 32],
+            requester: Requester::Memory,
+            range: None,
+        };
+        let bytes = bincode::serialize(&whole).unwrap();
+        assert_eq!(bytes.len(), 4 + 32 + 4 + 1);
+        assert_eq!(&bytes[36..], &[0, 0, 0, 0, 0]);
     }
 
     #[test]

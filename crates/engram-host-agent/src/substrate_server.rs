@@ -20,7 +20,10 @@ use bytes::Bytes;
 use engram_chunk_store::{ChunkCache, ChunkHash};
 use engram_core::types::manifest::ManifestRef;
 use engram_fill::{Class, FillEngine};
-use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION, PROTO_VERSION_V1, SLOT_BYTES};
+use engram_substrate_proto::{
+    ByteRange, FromWriter, Requester, ToWriter, PROTO_VERSION, PROTO_VERSION_READ,
+    PROTO_VERSION_V1, SLOT_BYTES,
+};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -41,6 +44,8 @@ pub struct SubstrateServer {
 
 /// Per-connection state.
 struct Conn {
+    /// The version the client's `Hello` asked for (1 without one).
+    version: u32,
     /// The version-2 slot; `None` on a version-1 connection.
     slot: Option<std::fs::File>,
     /// The engine, scoped to the session manifest's hinted peer.
@@ -103,6 +108,7 @@ impl SubstrateServer {
 
     async fn serve_conn(&self, mut stream: UnixStream) {
         let mut conn = Conn {
+            version: PROTO_VERSION_V1,
             slot: None,
             fill: self.fill.clone(),
             pins: None,
@@ -124,7 +130,7 @@ impl SubstrateServer {
                     // create it is a `PopulateErr` and the handler dials
                     // again with version 1.
                     let slot = match proto_version {
-                        PROTO_VERSION => match new_slot() {
+                        PROTO_VERSION | PROTO_VERSION_READ => match new_slot() {
                             Ok(slot) => Some(slot),
                             Err(e) => {
                                 let msg = format!("create slot: {e}");
@@ -135,7 +141,7 @@ impl SubstrateServer {
                         PROTO_VERSION_V1 => None,
                         other => {
                             let msg = format!(
-                                "proto version mismatch: writer {PROTO_VERSION_V1}..={PROTO_VERSION}, client {other}"
+                                "proto version mismatch: writer {PROTO_VERSION_V1}..={PROTO_VERSION_READ}, client {other}"
                             );
                             write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                             return Ok(());
@@ -152,10 +158,26 @@ impl SubstrateServer {
                         send_fd(stream, slot.as_fd()).await?;
                     }
                     conn.slot = slot;
+                    conn.version = proto_version;
                 }
                 ToWriter::Populate { hash } => {
                     self.populate(stream, conn, ChunkHash::from_bytes(hash))
                         .await?
+                }
+                ToWriter::Read {
+                    hash,
+                    requester,
+                    range,
+                } if conn.version >= PROTO_VERSION_READ => {
+                    self.read(stream, conn, ChunkHash::from_bytes(hash), requester, range)
+                        .await?
+                }
+                ToWriter::Read { .. } => {
+                    let msg = format!(
+                        "read needs protocol version {PROTO_VERSION_READ}; this connection speaks {}",
+                        conn.version
+                    );
+                    write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                 }
             }
         }
@@ -238,6 +260,57 @@ impl SubstrateServer {
             crate::metrics::SUBSTRATE_POPULATE_REQUESTS_TOTAL,
             "outcome" => outcome,
             "proto" => if conn.slot.is_some() { "2" } else { "1" },
+        )
+        .increment(1);
+        Ok(())
+    }
+
+    /// Serve a version-3 read at `Demand`, through the connection's engine
+    /// view (its peer, and the sandbox's `Demand` cap when one is
+    /// registered for the session manifest the `Hello` named).
+    async fn read(
+        &self,
+        stream: &mut UnixStream,
+        conn: &Conn,
+        hash: ChunkHash,
+        requester: Requester,
+        range: Option<ByteRange>,
+    ) -> std::io::Result<()> {
+        let got = match (range, requester) {
+            (Some(range), _) => match usize::try_from(range.len) {
+                Ok(len) => conn
+                    .fill
+                    .read_range(hash, range.offset, len, Class::Demand)
+                    .await
+                    .map_err(|e| format!("read range: {e}")),
+                Err(_) => Err(format!("range of {} bytes is too long", range.len)),
+            },
+            (None, Requester::Memory) => conn
+                .fill
+                .get(hash, Class::Demand)
+                .await
+                .map_err(|e| format!("read: {e}")),
+            (None, Requester::Disk) => conn
+                .fill
+                .read(hash, Class::Demand)
+                .await
+                .map_err(|e| format!("read: {e}")),
+        };
+        let delivered = match got {
+            Ok(bytes) => self.deliver(stream, conn, hash, &bytes).await?,
+            Err(msg) => Err(msg),
+        };
+        let outcome = match delivered {
+            Ok(()) => "read",
+            Err(msg) => {
+                write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
+                "error"
+            }
+        };
+        ::metrics::counter!(
+            crate::metrics::SUBSTRATE_POPULATE_REQUESTS_TOTAL,
+            "outcome" => outcome,
+            "proto" => "3",
         )
         .increment(1);
         Ok(())
@@ -651,6 +724,73 @@ mod tests {
         }
     }
 
+    fn read(stream: &mut StdUnixStream, hash: ChunkHash, range: Option<ByteRange>) -> FromWriter {
+        engram_substrate_proto::write_frame(
+            stream,
+            &ToWriter::Read {
+                hash: *hash.as_bytes(),
+                requester: Requester::Disk,
+                range,
+            },
+        )
+        .unwrap();
+        engram_substrate_proto::read_frame(stream).unwrap()
+    }
+
+    /// Version 3: a disk read of a range lands the range in the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_three_reads_a_range_through_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, bytes) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        let want = bytes.slice(4096..8192);
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION_READ),
+                FromWriter::HelloAck { .. }
+            ));
+            let slot =
+                std::fs::File::from(engram_substrate_proto::recv_fd(stream.as_fd()).unwrap());
+            let range = ByteRange {
+                offset: 4096,
+                len: 4096,
+            };
+            assert_eq!(
+                read(&mut stream, hash, Some(range)),
+                FromWriter::Filled { len: 4096 }
+            );
+            let mut got = vec![0u8; 4096];
+            slot.read_exact_at(&mut got, 0).unwrap();
+            assert_eq!(got, want.as_ref());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_on_a_version_two_connection_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, _) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION),
+                FromWriter::HelloAck { .. }
+            ));
+            let _slot = engram_substrate_proto::recv_fd(stream.as_fd()).unwrap();
+            assert!(matches!(
+                read(&mut stream, hash, None),
+                FromWriter::PopulateErr { .. }
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_version_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -660,7 +800,7 @@ mod tests {
 
         let reply = tokio::task::spawn_blocking(move || {
             let mut stream = StdUnixStream::connect(&sock).expect("connect");
-            hello(&mut stream, PROTO_VERSION + 1)
+            hello(&mut stream, PROTO_VERSION_READ + 1)
         })
         .await
         .unwrap();
