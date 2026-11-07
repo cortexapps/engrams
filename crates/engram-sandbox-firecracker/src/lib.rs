@@ -2140,9 +2140,10 @@ impl FirecrackerBackend {
         uffd_uds: &Path,
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        // ADR 0045 C1: when a migration pre-staged the (not-yet-durable)
-        // session manifest as a local JSON file, the handler reads it
-        // from disk instead of the blob store.
+        // Local copies of the manifests (a migration's not-yet-durable
+        // session manifest, or the host's staged copies): the handler
+        // reads them from disk instead of the blob store.
+        canonical_manifest_json: Option<&Path>,
         session_manifest_json: Option<&Path>,
         prefault_trace_host: Option<uuid::Uuid>,
         publish_trace_host: Option<uuid::Uuid>,
@@ -2173,6 +2174,9 @@ impl FirecrackerBackend {
             .arg(canonical_ref.to_string())
             .arg("--session-manifest")
             .arg(session_ref.to_string());
+        if let Some(path) = canonical_manifest_json {
+            cmd.arg("--canonical-manifest-json").arg(path);
+        }
         if let Some(path) = session_manifest_json {
             cmd.arg("--session-manifest-json").arg(path);
         }
@@ -3283,6 +3287,12 @@ impl FirecrackerBackend {
                     let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
                     let migration_manifest =
                         migration_manifest.exists().then_some(migration_manifest);
+                    let staged = |r| {
+                        let path = staged_manifest_path(snapshot_dir, &r);
+                        path.exists().then_some(path)
+                    };
+                    let session_json = migration_manifest.clone().or_else(|| staged(session_ref));
+                    let canonical_json = staged(canonical_ref);
                     // A post-copy destination also stages the peer spec: the
                     // handler dials the source's page server.
                     let peer_spec: Option<MigrationPeerSpec> = {
@@ -3304,7 +3314,8 @@ impl FirecrackerBackend {
                             &uffd_uds,
                             canonical_ref,
                             session_ref,
-                            migration_manifest.as_deref(),
+                            canonical_json.as_deref(),
+                            session_json.as_deref(),
                             prefault_host,
                             publish_host,
                             trace_key,
@@ -4868,6 +4879,15 @@ enum SocketProbe {
     /// existence poll and kept flaking). The API server tolerates the
     /// probe connection being dropped.
     Accepting,
+}
+
+/// Where a host stages a copy of the memory manifest `r` beside a snapshot,
+/// so the UFFD handler reads it from disk instead of the blob store.
+pub fn staged_manifest_path(
+    snapshot_dir: &Path,
+    r: &engram_core::types::manifest::ManifestRef,
+) -> PathBuf {
+    snapshot_dir.join(format!("manifest-{r}.json"))
 }
 
 /// Wait until either:

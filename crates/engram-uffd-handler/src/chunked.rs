@@ -217,6 +217,15 @@ impl From<engram_chunk_store::ChunkStoreError> for ChunkedBackendError {
     }
 }
 
+/// Local copies of the manifests, which the backend reads from disk
+/// instead of the blob store: a migration's not-yet-durable session
+/// manifest, or the copies the host stages beside a snapshot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalManifests<'a> {
+    pub canonical: Option<&'a Path>,
+    pub session: Option<&'a Path>,
+}
+
 impl ChunkedMemoryBackend {
     /// Build from already-loaded canonical + session manifests, the
     /// read-only cache view, the populate channel to the writer, and
@@ -272,10 +281,10 @@ impl ChunkedMemoryBackend {
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<Self, ChunkedBackendError> {
-        Self::from_blob_with_session_json(
+        Self::from_blob_with_local(
             canonical_ref,
             session_ref,
-            None,
+            LocalManifests::default(),
             blob,
             cache_root,
             populate,
@@ -283,14 +292,8 @@ impl ChunkedMemoryBackend {
         .await
     }
 
-    /// ADR 0045: like [`Self::from_blob`], but when
-    /// `session_manifest_json` is `Some(path)` the SESSION manifest is
-    /// read from that local file instead of the blob store. A migration
-    /// destination restores from a manifest that is deliberately NOT
-    /// yet durable (the catch-up upload publishes it later) — its
-    /// chunks are already resident in the host NVMe cache, so the
-    /// fill path never needs the store for them. The canonical (image
-    /// base) manifest is always durable and store-resolved.
+    /// Like [`Self::from_blob`], but a manifest with a copy in `local` is
+    /// read from that file instead of the blob store.
     /// ADR 0045 D4 fail-open (#1066): build with the supplied canonical,
     /// and when the canonical/session manifests disagree on layout
     /// (guest resized since capture, FC snapshot cutover, ...), retry
@@ -304,15 +307,15 @@ impl ChunkedMemoryBackend {
     pub async fn build_with_canonical_fallback(
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        session_manifest_json: Option<&Path>,
+        local: LocalManifests<'_>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<(Self, bool), ChunkedBackendError> {
-        match Self::from_blob_with_session_json(
+        match Self::from_blob_with_local(
             canonical_ref,
             session_ref,
-            session_manifest_json,
+            local,
             blob.clone(),
             cache_root,
             populate.clone(),
@@ -328,10 +331,13 @@ impl ChunkedMemoryBackend {
                     "canonical/session manifest mismatch; failing open to \
                      canonical == session (session-keyed restore, no shared base)",
                 );
-                Self::from_blob_with_session_json(
+                Self::from_blob_with_local(
                     session_ref,
                     session_ref,
-                    session_manifest_json,
+                    LocalManifests {
+                        canonical: None,
+                        session: local.session,
+                    },
                     blob,
                     cache_root,
                     populate,
@@ -343,10 +349,10 @@ impl ChunkedMemoryBackend {
         }
     }
 
-    pub async fn from_blob_with_session_json(
+    pub async fn from_blob_with_local(
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        session_manifest_json: Option<&Path>,
+        local: LocalManifests<'_>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
@@ -356,37 +362,37 @@ impl ChunkedMemoryBackend {
         // migration restore (no image-base rider), the canonical IS the
         // local file too — store-fetching it would 404 (the v+1 manifest
         // is deliberately unpublished until the catch-up).
-        let canonical = match session_manifest_json {
-            Some(path) if canonical_ref == session_ref => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local canonical manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                m
-            }
-            _ => store.get_manifest(canonical_ref).await?,
+        let read_local = |path: &Path, which: &str| {
+            let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
+            let m: engram_chunk_store::Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                ChunkedBackendError::InvalidManifest(format!(
+                    "parse local {which} manifest {}: {e}",
+                    path.display()
+                ))
+            })?;
+            m.validate().map_err(ChunkedBackendError::Manifest)?;
+            Ok::<_, ChunkedBackendError>(m)
         };
-        let session = match session_manifest_json {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local session manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                let _ = session_ref; // named by ref for logging only
-                m
-            }
-            None => store.get_manifest(session_ref).await?,
-        };
+        // The two reads are independent, so they run together.
+        let (canonical, session) = tokio::try_join!(
+            async {
+                let path = if canonical_ref == session_ref {
+                    local.session
+                } else {
+                    local.canonical
+                };
+                match path {
+                    Some(path) => read_local(path, "canonical"),
+                    None => Ok(store.get_manifest(canonical_ref).await?),
+                }
+            },
+            async {
+                match local.session {
+                    Some(path) => read_local(path, "session"),
+                    None => Ok(store.get_manifest(session_ref).await?),
+                }
+            },
+        )?;
         let reader = ChunkCacheReader::new(cache_root);
         Self::new(&canonical, &session, reader, populate, store)
     }
@@ -609,7 +615,7 @@ mod fallback_tests {
         let (backend, _) = ChunkedMemoryBackend::build_with_canonical_fallback(
             r,
             r,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -637,7 +643,7 @@ mod fallback_tests {
         let (backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             canonical,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -663,7 +669,7 @@ mod fallback_tests {
         let (_backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             canonical,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -684,7 +690,7 @@ mod fallback_tests {
         let (_b, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             session,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
