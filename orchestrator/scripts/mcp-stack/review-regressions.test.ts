@@ -5,6 +5,7 @@ import { toolCompletionEvents } from "./scenario-runtime.ts";
 import { selectColdDenial } from "./case-physical.ts";
 import {
   assertDuplicateWriteUnknown,
+  recoverSettledUnknown,
   assertNewIdWriteDenial,
 } from "./case-recovery.ts";
 import { canonicalJson, parseGuestProofRecords } from "./guest.ts";
@@ -257,4 +258,68 @@ test("duplicate unknown-write proof rejects invented success in either file orde
     assertDuplicateWriteUnknown([...unknown, ...unknown]),
   ).not.toThrow();
   expect(() => assertDuplicateWriteUnknown([])).toThrow();
+});
+
+test("settled unknown recovery does not need a second guest receipt", async () => {
+  const before = {
+    execution: {
+      executionId: "execution-1",
+      state: "outcome_unknown",
+      runId: "run-1",
+      toolCallId: "call-1",
+      connectionId: "connection-1",
+    },
+    result: {
+      state: "outcome_unknown",
+      resultUnavailable: false,
+      resultJson: JSON.stringify({
+        outcome: "outcome_unknown",
+        delivery: "unavailable",
+      }),
+    },
+    outbox: { attempts: 1, relayed: true, acknowledged: true },
+  };
+  let restarts = 0;
+  let reads = 0;
+  const after = await recoverSettledUnknown({
+    before,
+    restart: async () => {
+      restarts++;
+      return { role: "orchestrator" };
+    },
+    readAfter: async () => {
+      reads++;
+      return structuredClone(before);
+    },
+  });
+  expect(restarts).toBe(1);
+  expect(reads).toBe(1);
+  expect(after.snapshot).toEqual(before);
+  for (const change of [
+    { execution: { ...before.execution, executionId: "other" } },
+    { execution: { ...before.execution, runId: "other" } },
+    { execution: { ...before.execution, toolCallId: "other" } },
+    { result: { ...before.result, state: "succeeded" } },
+    { result: { ...before.result, resultUnavailable: true } },
+    { outbox: { ...before.outbox, attempts: 2 } },
+    { outbox: { ...before.outbox, acknowledged: false } },
+    {
+      result: {
+        ...before.result,
+        resultJson: JSON.stringify({
+          outcome: "outcome_unknown",
+          delivery: "unavailable",
+          output: {},
+        }),
+      },
+    },
+  ]) {
+    await expect(
+      recoverSettledUnknown({
+        before,
+        restart: async () => ({}),
+        readAfter: async () => ({ ...structuredClone(before), ...change }),
+      }),
+    ).rejects.toThrow();
+  }
 });

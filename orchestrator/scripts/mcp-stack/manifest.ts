@@ -91,7 +91,7 @@ export const SCENARIOS = [
       "orchestrator-restart",
       "outcome-unknown",
       "one-effect",
-      "duplicate-id-restricted",
+      "settled-unknown-recovery",
       "new-id-restricted",
     ],
   },

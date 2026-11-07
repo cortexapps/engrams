@@ -88,6 +88,61 @@ export function assertDuplicateWriteUnknown(
   );
 }
 
+type SettledUnknownSnapshot = {
+  execution: {
+    executionId: string;
+    state: string;
+    runId: string;
+    toolCallId: string;
+    connectionId: string;
+  };
+  result: { state: string; resultUnavailable: boolean; resultJson?: string };
+  outbox: { attempts: number; relayed: boolean; acknowledged: boolean };
+};
+
+export async function recoverSettledUnknown(input: {
+  before: SettledUnknownSnapshot;
+  restart: () => Promise<unknown>;
+  readAfter: () => Promise<SettledUnknownSnapshot>;
+}) {
+  const validate = (snapshot: SettledUnknownSnapshot) => {
+    requireThat(
+      snapshot.execution.state === "outcome_unknown" &&
+        snapshot.result.state === "outcome_unknown" &&
+        !snapshot.result.resultUnavailable &&
+        snapshot.outbox.attempts >= 1 &&
+        snapshot.outbox.relayed &&
+        snapshot.outbox.acknowledged,
+      "settled_unknown_snapshot",
+    );
+    if (snapshot.result.resultJson) {
+      const receipt = JSON.parse(snapshot.result.resultJson);
+      requireThat(
+        receipt.outcome === "outcome_unknown" &&
+          receipt.delivery === "unavailable" &&
+          receipt.output === undefined,
+        "unknown_has_no_invented_output",
+      );
+    }
+  };
+  validate(input.before);
+  const restart = await input.restart();
+  const snapshot = await input.readAfter();
+  validate(snapshot);
+  requireThat(
+    snapshot.execution.executionId === input.before.execution.executionId &&
+      snapshot.execution.runId === input.before.execution.runId &&
+      snapshot.execution.toolCallId === input.before.execution.toolCallId &&
+      snapshot.execution.connectionId === input.before.execution.connectionId &&
+      snapshot.result.resultJson === input.before.result.resultJson &&
+      snapshot.outbox.attempts === input.before.outbox.attempts &&
+      snapshot.outbox.relayed === input.before.outbox.relayed &&
+      snapshot.outbox.acknowledged === input.before.outbox.acknowledged,
+    "settled_unknown_recovery_changed",
+  );
+  return { restart, snapshot };
+}
+
 export const heldWriteRestartDriver: CaseDriver = async ({
   ctx,
   principals,
@@ -207,14 +262,34 @@ export const heldWriteRestartDriver: CaseDriver = async ({
             record.proof.delivery === "unavailable",
         ),
     );
-    await sendScenarioPrompt(scenario, false, "first", 2);
-    const repeated = await waitFor(
+    assertDuplicateWriteUnknown(first);
+    const outbox = await waitFor(
       ctx,
-      "duplicate_call_guest_receipt",
-      () => completions(ctx, scenario, "held-write-1"),
-      (records) => records.length > first.length,
+      "unknown_guest_ack",
+      () => database.outbox(scenario.sessionId, scenario.input.callId),
+      (row) => row.attempts >= 1 && row.relayed && row.acknowledged,
     );
-    assertDuplicateWriteUnknown(repeated);
+    const recovered = await recoverSettledUnknown({
+      before: { execution: terminal, result, outbox },
+      restart: () => supervisor.restart("orchestrator"),
+      readAfter: async () => {
+        const current = await execution(ctx, scenario);
+        requireThat(current, "settled_unknown_execution_missing");
+        return {
+          execution: current,
+          result: await scenario.reviewClient.integration.getMcpExecutionResult(
+            {
+              sessionId: scenario.sessionId,
+              executionId: current.executionId,
+            },
+          ),
+          outbox: await database.outbox(
+            scenario.sessionId,
+            scenario.input.callId,
+          ),
+        };
+      },
+    });
     await sendScenarioPrompt(scenario, false, "second");
     const denied = await waitFor(
       ctx,
@@ -275,8 +350,21 @@ export const heldWriteRestartDriver: CaseDriver = async ({
         }),
       },
       {
-        assertion: "duplicate-id-restricted",
-        observations: observations("guest-proof", "outcome_unknown", repeated),
+        assertion: "settled-unknown-recovery",
+        observations: [
+          ...observations("guest-proof", "outcome_unknown", first),
+          ...observations("supervisor", "running", recovered.restart),
+          ...observations(
+            "public-rpc",
+            "outcome_unknown",
+            recovered.snapshot.result,
+          ),
+          ...observations(
+            "coordinator-read-only",
+            "relayed",
+            recovered.snapshot.outbox,
+          ),
+        ],
       },
       {
         assertion: "new-id-restricted",
