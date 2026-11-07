@@ -585,6 +585,8 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
+        let span = tracing::info_span!("host.migration_presetup");
+        link_remote_parent(&span, &req);
         check_wire_version(&req)?;
         let r = req.into_inner();
         let id = decode_sandbox_id(&r.uuid)?;
@@ -592,6 +594,7 @@ impl HostService for HostServiceImpl {
         let out = self
             .inner
             .migration_presetup(id, fence)
+            .instrument(span)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(MigrationPresetupResponse {

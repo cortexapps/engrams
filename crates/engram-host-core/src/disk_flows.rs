@@ -3,12 +3,14 @@
 
 use std::io;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use engram_chunk_store::{ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind};
 use engram_fill::{Class, FillEngine};
 
 use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
+use tracing::Instrument as _;
 
 /// Store calls in flight; peak buffered memory is this many chunks.
 const CONCURRENCY: usize = 64;
@@ -52,6 +54,9 @@ impl StageClass for Class {
     }
 }
 
+/// Writes `delta` into `volume`. Records on the current span how many
+/// written chunks the chunk cache held (`cache`) and how many were
+/// fetched (`fetched`: from a peer or the store).
 async fn apply_delta(
     volume: &Volume,
     fill: &FillEngine,
@@ -60,6 +65,8 @@ async fn apply_delta(
 ) -> io::Result<()> {
     let chunk_size = volume.chunk_size;
     let buffered = Arc::new(tokio::sync::Semaphore::new(STAGE_BUFFERED));
+    let cache = fill.store().chunk_cache();
+    let fetched = Arc::new(AtomicU64::new(0));
     let mut tasks = tokio::task::JoinSet::new();
     for c in &delta.write {
         let slot = Arc::clone(&buffered)
@@ -69,6 +76,9 @@ async fn apply_delta(
         let class = class.class();
         let (fill, volume) = (fill.clone(), volume.clone());
         let (hash, index) = (c.hash, ChunkIndex(c.offset / chunk_size));
+        if !cache.is_some_and(|cache| cache.contains(hash)) {
+            fetched.fetch_add(1, Ordering::Relaxed);
+        }
         // One task per chunk, so fetch, hash and write use every core.
         // `read` keeps a miss out of the chunk cache: the volume holds it.
         // The write takes a disk-write slot, so it goes ahead of the bulk
@@ -86,10 +96,21 @@ async fn apply_delta(
     while let Some(done) = tasks.join_next().await {
         done.map_err(io::Error::other)??;
     }
-    for offset in &delta.zero {
-        volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
+    let fetched = fetched.load(Ordering::Relaxed);
+    let span = tracing::Span::current();
+    span.record("cache", delta.write.len() as u64 - fetched);
+    span.record("fetched", fetched);
+    async {
+        for offset in &delta.zero {
+            volume.zero_chunk(ChunkIndex(offset / chunk_size)).await?;
+        }
+        Ok::<_, io::Error>(())
     }
-    Ok(())
+    .instrument(tracing::info_span!(
+        "disk.stage.zero",
+        chunks = delta.zero.len()
+    ))
+    .await
 }
 
 /// A new volume holding `manifest`. With `base` (a volume and the
@@ -121,10 +142,17 @@ pub async fn stage_at(
         Some((base_volume, base_manifest)) => {
             shape_matches(base_volume, base_manifest)?;
             let delta = manifest.delta_from(base_manifest).map_err(store_err)?;
-            (disk.snapshot(base_volume, name).await?, delta)
+            let volume = disk
+                .snapshot(base_volume, name)
+                .instrument(tracing::info_span!("disk.stage.base_snapshot"))
+                .await?;
+            (volume, delta)
         }
         None => {
-            let volume = disk.create(name, manifest.total_bytes).await?;
+            let volume = disk
+                .create(name, manifest.total_bytes)
+                .instrument(tracing::info_span!("disk.stage.create"))
+                .await?;
             let delta = ManifestDelta {
                 write: manifest.chunks.clone(),
                 zero: Vec::new(),
@@ -133,8 +161,27 @@ pub async fn stage_at(
         }
     };
     shape_matches(&volume, manifest)?;
-    apply_delta(&volume, fill, class, &delta).await?;
-    volume.sync().await?;
+    let bytes: u64 = delta
+        .write
+        .iter()
+        .map(|c| volume.chunk_size.min(volume.size_bytes - c.offset))
+        .sum();
+    // `base_held`: listed chunks the base volume already holds.
+    let delta_span = tracing::info_span!(
+        "disk.stage.delta",
+        chunks = delta.write.len(),
+        bytes,
+        base_held = manifest.chunks.len().saturating_sub(delta.write.len()),
+        cache = tracing::field::Empty,
+        fetched = tracing::field::Empty,
+    );
+    apply_delta(&volume, fill, class, &delta)
+        .instrument(delta_span)
+        .await?;
+    volume
+        .sync()
+        .instrument(tracing::info_span!("disk.stage.sync"))
+        .await?;
     Ok(volume)
 }
 

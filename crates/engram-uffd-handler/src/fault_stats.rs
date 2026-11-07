@@ -64,6 +64,7 @@ const BUCKET_LABELS: [&str; 12] = [
 pub struct Histogram {
     buckets: [AtomicU64; 12],
     sum_us: AtomicU64,
+    max_us: AtomicU64,
 }
 
 impl Histogram {
@@ -71,6 +72,7 @@ impl Histogram {
         Self {
             buckets: [const { AtomicU64::new(0) }; 12],
             sum_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
         }
     }
 
@@ -82,6 +84,7 @@ impl Histogram {
             .unwrap_or(BUCKET_US.len());
         self.buckets[slot].fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     pub fn count(&self) -> u64 {
@@ -105,16 +108,17 @@ impl Histogram {
         BUCKET_LABELS[11]
     }
 
-    /// `n=… p50… p90… p99… sum_ms=…`.
+    /// `n=… p50… p90… p99… sum_ms=… max_ms=…`.
     pub fn summary(&self) -> String {
         let counts: [u64; 12] = std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
         let n: u64 = counts.iter().sum();
         format!(
-            "n={n} p50{} p90{} p99{} sum_ms={}",
+            "n={n} p50{} p90{} p99{} sum_ms={} max_ms={}",
             self.quantile(&counts, 0.50),
             self.quantile(&counts, 0.90),
             self.quantile(&counts, 0.99),
             self.sum_us.load(Ordering::Relaxed) / 1000,
+            self.max_us.load(Ordering::Relaxed) / 1000,
         )
     }
 }
@@ -213,11 +217,15 @@ mod tests {
             s.starts_with("n=100 p50<=0.1ms p90<=0.1ms p99<=25ms"),
             "{s}"
         );
+        assert!(s.ends_with(" max_ms=9000"), "{s}");
     }
 
     #[test]
     fn empty_histogram_has_no_quantiles() {
-        assert_eq!(Histogram::new().summary(), "n=0 p50- p90- p99- sum_ms=0");
+        assert_eq!(
+            Histogram::new().summary(),
+            "n=0 p50- p90- p99- sum_ms=0 max_ms=0"
+        );
     }
 
     #[test]

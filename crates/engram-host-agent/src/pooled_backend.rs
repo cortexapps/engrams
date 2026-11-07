@@ -1896,6 +1896,7 @@ impl PooledBackend {
                             self.bundle_file_ext(),
                         )
                         .materialize_if_missing(&pinned)
+                        .instrument(tracing::info_span!("restore.aux_bundles"))
                         .await?
                     }
                     None => tracing::debug!(
@@ -2106,12 +2107,14 @@ impl PooledBackend {
             for role in volumes.roles(id).await.map_err(disk_err)? {
                 let pending = volumes
                     .take_precopy(id, role)
+                    .instrument(tracing::info_span!("presetup.precopy_snapshot", %role))
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
                 taken.push((role, pending));
                 let pending = &taken.last().expect("just pushed").1;
                 let changed = volumes
                     .changed_blocks(pending, MIGRATION_DISK_BLOCK_BYTES)
+                    .instrument(tracing::info_span!("presetup.precopy_diff", %role))
                     .await
                     .map_err(|e| {
                         SandboxError::Snapshot(format!("{role} disk precopy diff: {e}"))
@@ -3514,6 +3517,7 @@ impl PooledBackend {
     ) {
         self.finisher()
             .seed_checkpoint_chain_sparse(id, memory_ref)
+            .instrument(tracing::info_span!("restore.seed_chain", fork = false))
             .await
     }
 
@@ -3524,6 +3528,7 @@ impl PooledBackend {
     ) {
         self.finisher()
             .seed_checkpoint_chain_forked(id, src_ref)
+            .instrument(tracing::info_span!("restore.seed_chain", fork = true))
             .await
     }
 
@@ -5212,9 +5217,13 @@ impl SandboxBackend for PooledBackend {
                 "presetup superseding an abandoned pending presetup",
             );
             if let Some(volumes) = self.volumes.as_ref() {
-                for (_, seal) in stale.precopy {
-                    discard_seal(volumes, seal).await;
+                async {
+                    for (_, seal) in stale.precopy {
+                        discard_seal(volumes, seal).await;
+                    }
                 }
+                .instrument(tracing::info_span!("presetup.discard_stale"))
+                .await;
             }
         }
         // The guest RAM must be a private mapping of a file (the
@@ -5261,6 +5270,7 @@ impl SandboxBackend for PooledBackend {
         let precopy_blocks: u64 = precopy.values().map(|s| s.sealed.len() as u64).sum();
         let out = match self
             .prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), precopy.clone())
+            .instrument(tracing::info_span!("presetup.export"))
             .await
         {
             Ok(out) => out,

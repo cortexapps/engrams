@@ -2593,6 +2593,7 @@ pub fn run_listener(
                         carried_used = stats.carried_used,
                         "first-touch window closed"
                     );
+                    fault_stats::STATS.log("first-touch window");
                 }
             });
     }
@@ -2683,6 +2684,7 @@ pub fn run_listener(
                                 fault_max_us,
                                 "post-copy drain complete"
                             );
+                            fault_stats::STATS.log("drain");
                             if let Some(control) = rt.control.as_ref() {
                                 control.report(engram_migrate_proto::HandlerControl::DrainDone {
                                     pulled: stats.pulled,
