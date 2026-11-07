@@ -398,6 +398,17 @@ impl ChunkedMemoryBackend {
         self.canonical.chunk_size
     }
 
+    /// True when the writer (the host-agent) fills the cache: its
+    /// prefetch lands the chunks, so a producer can wait for them.
+    pub fn has_writer(&self) -> bool {
+        self.populate.is_some()
+    }
+
+    /// True when the local chunk cache holds `hash`.
+    pub fn is_resident(&self, hash: ChunkHash) -> bool {
+        self.reader.contains_on_disk(hash)
+    }
+
     /// Total backing-store size. Should match what FC's UFFD
     /// regions sum to — the runtime's handshake validation does
     /// the cross-check.

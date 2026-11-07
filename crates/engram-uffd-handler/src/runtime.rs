@@ -439,6 +439,10 @@ const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
 /// the window only has to cover that turn.
 const FIRST_TOUCH_WINDOW: Duration = Duration::from_secs(30);
 
+/// How long the eager sweep waits before it goes over the chunks it could
+/// not install yet.
+const SWEEP_RETRY: Duration = Duration::from_millis(250);
+
 /// The work list the drain connections share.
 struct DrainShared {
     /// `(offset, forced)`: a forced chunk is requested even when another
@@ -975,6 +979,13 @@ impl Runtime {
     /// post-teleport guest crawl. Idempotent
     /// against the fault loop via the `installed` bitmap; `wake=false`
     /// (no vCPU waits on a page it hasn't faulted).
+    ///
+    /// With a writer, the sweep never fetches: it installs only chunks
+    /// the cache (or the base shm) already holds, and goes over the rest
+    /// again every [`SWEEP_RETRY`] as the writer's prefetch lands them.
+    /// A fetch here would be a `Demand` request, made one at a time on
+    /// this thread, for a chunk the prefetch has not reached yet. Without
+    /// a writer nothing else fills the cache, so the sweep fetches.
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
         if std::env::var("ENGRAM_UFFD_EAGER_SWEEP")
             .map(|v| v == "0")
@@ -1000,89 +1011,118 @@ impl Runtime {
         let started = std::time::Instant::now();
         let chunk_size = self.backend.chunk_size();
         let total = self.backend.total_bytes();
+        let follow = self.backend.has_writer();
         let mut installed = 0usize;
         let mut deferred = 0usize;
-        // Two passes, divergent first: those are the chunks an
-        // on-demand fault pays a fetch for (the post-teleport crawl);
-        // canonical pages CONTINUE from the (pre-warmed) base for
-        // near-free, and ZERO chunks are skipped entirely — eagerly
-        // installing them would privately materialize every untouched
-        // page of guest RAM (UFFDIO_ZEROPAGE is rejected on the
-        // substrate's MAP_PRIVATE file mapping, so each would COPY a
-        // zeroed buffer), defeating the density the substrate exists
-        // for. A zero fault is already served with no fetch.
-        for pass in ["divergent", "canonical"] {
-            let mut offset: u64 = 0;
-            while offset < total {
-                if started.elapsed() > budget {
-                    tracing::warn!(
-                        pass,
-                        installed,
-                        deferred,
-                        "eager sweep budget exhausted; remaining chunks serve on-demand"
-                    );
-                    return Ok(());
-                }
-                // ADR 0045 C2: a sealed-but-undrained chunk's truth is the
-                // PEER, not the manifest — installing resolve()'s stale
-                // view here would be silent corruption. The drain runs
-                // before this on the producer thread, so normally every
-                // sealed chunk is already installed; this guard is the
-                // belt-and-braces for any other interleaving.
-                if let Some(peer) = self.peer.as_ref() {
-                    let idx = offset / chunk_size;
-                    if peer.seal().get(idx) && !self.chunk_installed(idx as usize) {
+        let mut passes = 0usize;
+        loop {
+            let mut waiting = 0usize;
+            // Two passes, divergent first: those are the chunks an
+            // on-demand fault pays a fetch for (the post-teleport crawl);
+            // canonical pages CONTINUE from the (pre-warmed) base for
+            // near-free, and ZERO chunks are skipped entirely — eagerly
+            // installing them would privately materialize every untouched
+            // page of guest RAM (UFFDIO_ZEROPAGE is rejected on the
+            // substrate's MAP_PRIVATE file mapping, so each would COPY a
+            // zeroed buffer), defeating the density the substrate exists
+            // for. A zero fault is already served with no fetch.
+            for pass in ["divergent", "canonical"] {
+                let mut offset: u64 = 0;
+                while offset < total {
+                    if started.elapsed() > budget {
+                        tracing::warn!(
+                            pass,
+                            installed,
+                            deferred,
+                            "eager sweep budget exhausted; remaining chunks serve on-demand"
+                        );
+                        return Ok(());
+                    }
+                    // ADR 0045 C2: a sealed-but-undrained chunk's truth is the
+                    // PEER, not the manifest — installing resolve()'s stale
+                    // view here would be silent corruption. The drain runs
+                    // before this on the producer thread, so normally every
+                    // sealed chunk is already installed; this guard is the
+                    // belt-and-braces for any other interleaving.
+                    if let Some(peer) = self.peer.as_ref() {
+                        let idx = offset / chunk_size;
+                        if peer.seal().get(idx) && !self.chunk_installed(idx as usize) {
+                            offset += chunk_size;
+                            continue;
+                        }
+                    }
+                    let idx = (offset / chunk_size) as usize;
+                    if self.chunk_installed(idx) {
                         offset += chunk_size;
                         continue;
                     }
-                }
-                if self
-                    .first_touch
-                    .awaits_guest((offset / chunk_size) as usize)
-                {
-                    offset += chunk_size;
-                    continue;
-                }
-                let did = match (pass, self.backend.resolve(offset)) {
-                    ("divergent", Some(ResolvedPage::Chunk { hash })) => {
-                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                        self.install_chunk_at(offset, bytes, false)?
+                    if self.first_touch.awaits_guest(idx) {
+                        waiting += 1;
+                        offset += chunk_size;
+                        continue;
                     }
-                    ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
-                        match self.backend.canonical_chunk_hash(canonical_offset) {
-                            Some(hash) => match self.base_shm.as_ref() {
-                                Some(base) => {
-                                    self.install_canonical_shared(base, offset, hash, false)?
-                                }
+                    let held = |hash| !follow || self.backend.is_resident(hash);
+                    let did = match (pass, self.backend.resolve(offset)) {
+                        ("divergent", Some(ResolvedPage::Chunk { hash })) if held(hash) => {
+                            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
+                            self.install_chunk_at(offset, bytes, false)?
+                        }
+                        ("divergent", Some(ResolvedPage::Chunk { .. })) => {
+                            waiting += 1;
+                            false
+                        }
+                        ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
+                            match self.backend.canonical_chunk_hash(canonical_offset) {
+                                Some(hash) => match self.base_shm.as_ref() {
+                                    Some(base)
+                                        if held(hash)
+                                            || base.is_populated(
+                                                offset,
+                                                chunk_size.min(total - offset),
+                                            ) =>
+                                    {
+                                        self.install_canonical_shared(base, offset, hash, false)?
+                                    }
+                                    None if held(hash) => {
+                                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
+                                        self.install_chunk_at(offset, bytes, false)?
+                                    }
+                                    _ => {
+                                        waiting += 1;
+                                        false
+                                    }
+                                },
                                 None => {
-                                    let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                                    self.install_chunk_at(offset, bytes, false)?
+                                    deferred += usize::from(passes == 0);
+                                    false
                                 }
-                            },
-                            None => {
-                                deferred += 1;
-                                false
                             }
                         }
+                        ("canonical", Some(ResolvedPage::Zero { .. })) => {
+                            // Zero chunks are skipped — installing them would
+                            // privately materialize untouched guest RAM (see
+                            // the pass comment above). Counted once, in the
+                            // canonical pass, as zero_skipped.
+                            deferred += usize::from(passes == 0);
+                            false
+                        }
+                        _ => false,
+                    };
+                    if did {
+                        installed += 1;
                     }
-                    ("canonical", Some(ResolvedPage::Zero { .. })) => {
-                        // Zero chunks are skipped — installing them would
-                        // privately materialize untouched guest RAM (see
-                        // the pass comment above). Counted once, in the
-                        // canonical pass, as zero_skipped.
-                        deferred += 1;
-                        false
-                    }
-                    _ => false,
-                };
-                if did {
-                    installed += 1;
+                    offset += chunk_size;
                 }
-                offset += chunk_size;
             }
+            passes += 1;
+            if waiting == 0 {
+                break;
+            }
+            std::thread::sleep(SWEEP_RETRY);
         }
         tracing::info!(
             installed,
+            passes,
             zero_skipped = deferred,
             elapsed_ms = started.elapsed().as_millis() as u64,
             total_chunks = total.div_ceil(chunk_size),
