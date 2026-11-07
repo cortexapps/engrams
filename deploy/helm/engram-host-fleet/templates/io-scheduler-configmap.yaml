@@ -1,0 +1,11 @@
+{{- if and .Values.nodePrep.enabled .Values.storage.ioScheduler }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}-io-scheduler
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+data:
+  io-scheduler.sh: |
+{{ .Files.Get "files/io-scheduler.sh" | indent 4 }}
+{{- end }}

@@ -198,6 +198,14 @@ storage:
   # stage-node-assets init container on every pod start, and the HostId
   # is re-seeded deterministically from the node name.
   dedicatedDevices: []
+  # The block I/O scheduler node-prep sets on each whole disk under
+  # workDirHostPath: the boot disk, or each dedicatedDevices member. A
+  # disk that does not offer it gets mq-deadline; a disk that offers
+  # neither keeps its scheduler, with a warning, and the node still comes
+  # up. Under bfq (the COS default) one process gets about 3,000 IOPS
+  # from a fast network disk; under `none` it gets the provisioned
+  # limit. "" leaves the scheduler as the node sets it.
+  ioScheduler: none
 
 nodePrep:
   enabled: true
