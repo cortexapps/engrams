@@ -8,8 +8,8 @@ import {
   RunnerFailure,
   type Context,
 } from "./context.ts";
-import { guestExec, guestHarnessPath } from "./guest.ts";
-import { tlsOptions, type PublicClient } from "./transport.ts";
+import { guestExec, guestHarnessPath, type GuestExecClient } from "./guest.ts";
+import { tlsOptions } from "./transport.ts";
 
 /** Verify the real worker rejects a TLS client without a certificate. */
 export async function probeWorkerControl(ctx: Context) {
@@ -71,7 +71,7 @@ export async function probeWorkerControl(ctx: Context) {
 
 export async function probeManagedAuthority(
   ctx: Context,
-  client: PublicClient,
+  client: GuestExecClient,
   sessionId: string,
 ) {
   const fixture = ctx.protocolFixtures.modern;
@@ -119,7 +119,7 @@ timeout 5s openssl s_client -connect "$1" -servername "$2" -tls1_3 < /dev/null >
 /** Fixed sentinels test loss of the old tmpfs state, not removal of every old RAM byte. */
 export async function guestColdObservation(
   ctx: Context,
-  client: PublicClient,
+  client: GuestExecClient,
   sessionId: string,
   prepare: boolean,
 ) {

@@ -1837,13 +1837,17 @@ test("guest process probes identify the staged harness and keep their guards", a
     let argv: string[] = [];
     const client = {
       sessions: {
-        async *exec(request: { argv: string[] }) {
-          argv = request.argv;
-          yield { event: { case: "started", value: {} } };
-          yield { event: { case: "exit", value: { exitStatus: 1 } } };
+        async *exec(request: { argv?: string[] }) {
+          argv = request.argv ?? [];
+          yield create(ExecOutputSchema, {
+            event: { case: "started", value: {} },
+          });
+          yield create(ExecOutputSchema, {
+            event: { case: "exit", value: { exitStatus: 1 } },
+          });
         },
       },
-    } as Parameters<typeof probeOAuthCredentialAbsence>[1];
+    };
     try {
       if (cold) await guestColdObservation(ctx, client, session, false);
       else await probeOAuthCredentialAbsence(ctx, client, session);
@@ -1913,8 +1917,8 @@ test("managed proxy probe uses the fixture IP and SNI without guest DNS", async 
   await executable("getent", "exit 99");
   const client = {
     sessions: {
-      async *exec(request: { argv: string[] }) {
-        const argv = request.argv;
+      async *exec(request: { argv?: string[] }) {
+        const argv = request.argv ?? [];
         calls.push(argv);
         await executable("openssl", `exit ${tlsStatus}`);
         const i = argv.indexOf("-c");
@@ -1923,14 +1927,18 @@ test("managed proxy probe uses the fixture IP and SNI without guest DNS", async 
           ["-c", argv[i + 1]!, ...argv.slice(i + 2)],
           { env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: "utf8" },
         );
-        yield { event: { case: "started", value: {} } };
-        yield { event: { case: "stdout", value: Buffer.from(result.stdout) } };
-        yield {
+        yield create(ExecOutputSchema, {
+          event: { case: "started", value: {} },
+        });
+        yield create(ExecOutputSchema, {
+          event: { case: "stdout", value: Buffer.from(result.stdout) },
+        });
+        yield create(ExecOutputSchema, {
           event: { case: "exit", value: { exitStatus: result.status ?? 255 } },
-        };
+        });
       },
     },
-  } as Parameters<typeof probeManagedAuthority>[1];
+  };
   const result = await probeManagedAuthority(ctx, client, "session");
   expect(result.sni).toBe(managed);
   expect(calls).toHaveLength(1);

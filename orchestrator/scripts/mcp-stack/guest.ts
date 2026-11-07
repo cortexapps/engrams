@@ -195,9 +195,13 @@ export async function readGuestProof(
   );
 }
 
+export type GuestExecClient = {
+  sessions: Pick<PublicClient["sessions"], "exec">;
+};
+
 export async function guestExec(
   ctx: Context,
-  client: PublicClient,
+  client: GuestExecClient,
   sessionId: string,
   argv: string[],
 ) {
@@ -265,7 +269,7 @@ export function guestHarnessPath(ctx: Context) {
 /** Observe live harness/model environments, including inline ENGRAM_TOOLS. This is not a disk scan. */
 export async function probeOAuthCredentialAbsence(
   ctx: Context,
-  client: PublicClient,
+  client: GuestExecClient,
   sessionId: string,
 ) {
   const script = `set -eu
