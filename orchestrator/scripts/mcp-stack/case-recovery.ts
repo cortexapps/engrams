@@ -722,7 +722,7 @@ export const revokeResumeDriver: CaseDriver = async ({
         assertion: "current-binding",
         observations: [
           observation("public-rpc", "current", {
-            hash: recovery.candidate.bindingHash,
+            hash: recovery.finalBindingHash,
             tools: recovery.candidate.bindingTools,
           }),
         ],

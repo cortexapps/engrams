@@ -62,6 +62,51 @@ export async function revokeProfileGrants(
   return updated.profile;
 }
 
+type RebindRequest = {
+  sessionId: string;
+  expectedBindingHash: string;
+  expectedCandidateHash: string;
+};
+
+/** Replay the same reviewed request only while the server reports a typed drain. */
+export async function commitReviewedRebind(
+  ctx: Pick<Context, "deadlines">,
+  request: RebindRequest,
+  commit: (request: RebindRequest) => Promise<{ bindingHash: string }>,
+) {
+  const result = await waitFor(
+    ctx,
+    "managed_rebind_commit_started",
+    async () => {
+      try {
+        return await commit(request);
+      } catch (error) {
+        if (
+          !(error instanceof ConnectError) ||
+          error.code !== Code.FailedPrecondition
+        )
+          throw error;
+        const details = error.findDetails(McpRebindDrainSchema);
+        requireThat(
+          details.length === 1 &&
+            details[0]!.reason === McpRebindDrainReason.DISPATCH_IN_PROGRESS &&
+            Number.isFinite(Date.parse(details[0]!.retryAfter)),
+          "rebind_exact_recovery_pending",
+        );
+        return null;
+      }
+    },
+    (value) => value !== null,
+  );
+  requireThat(
+    result &&
+      /^sha256:[a-f0-9]{64}$/.test(result.bindingHash) &&
+      result.bindingHash !== request.expectedBindingHash,
+    "rebind_final_binding_hash",
+  );
+  return result;
+}
+
 /** The supported managed resume is reviewed cold recovery; ordinary Resume stays fenced. */
 export async function recoverCurrentBinding(
   ctx: Context,
@@ -89,37 +134,24 @@ export async function recoverCurrentBinding(
       candidate.drain === undefined,
     "reviewed_rebind_candidate",
   );
-  try {
-    const committed = await scenario.reviewClient.integration.rebindMcp({
+  const deadline = performance.now() + ctx.deadlines.stepMs;
+  const committed = await commitReviewedRebind(
+    ctx,
+    {
       sessionId: scenario.sessionId,
       expectedBindingHash: old.binding_hash,
       expectedCandidateHash: candidate.bindingHash,
-    });
-    requireThat(
-      committed.bindingHash === candidate.bindingHash,
-      "rebind_committed_candidate",
-    );
-  } catch (error) {
-    if (
-      !(error instanceof ConnectError) ||
-      error.code !== Code.FailedPrecondition
-    )
-      throw error;
-    const details = error.findDetails(McpRebindDrainSchema);
-    // Only the typed asynchronous recovery response may continue to actual observations.
-    requireThat(
-      details.length === 1 &&
-        details[0]!.reason === McpRebindDrainReason.DISPATCH_IN_PROGRESS &&
-        Number.isFinite(Date.parse(details[0]!.retryAfter)),
-      "rebind_exact_recovery_pending",
-    );
-  }
+    },
+    (request) => scenario.reviewClient.integration.rebindMcp(request),
+  );
+  const remainingMs = deadline - performance.now();
+  requireThat(remainingMs > 0, "managed_cold_recovery_deadline");
   const current = await waitFor(
-    ctx,
+    { deadlines: { ...ctx.deadlines, stepMs: remainingMs } },
     "managed_cold_recovery_started",
     () => database.started(scenario.sessionId, ctx.hostId),
     (value) =>
-      value.phase === "started" && value.binding_hash === candidate.bindingHash,
+      value.phase === "started" && value.binding_hash === committed.bindingHash,
   );
   requireThat(
     current.binding_epoch === candidate.bindingEpoch &&
@@ -150,5 +182,11 @@ export async function recoverCurrentBinding(
     "managed_cold_recovery_active",
   );
   await guestReady(ctx, scenario.client, scenario.sessionId);
-  return { old, current, candidate, ordinaryResumeDenied };
+  return {
+    old,
+    current,
+    candidate,
+    finalBindingHash: committed.bindingHash,
+    ordinaryResumeDenied,
+  };
 }

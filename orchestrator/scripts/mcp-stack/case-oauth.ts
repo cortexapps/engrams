@@ -427,8 +427,7 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           "oauth_rebound_current",
           authority,
           (value) =>
-            value.current &&
-            value.bindingHash === recovery.candidate.bindingHash,
+            value.current && value.bindingHash === recovery.finalBindingHash,
         );
         const read = await successfulRead(`${change}-rebound`);
         assertions.push({
