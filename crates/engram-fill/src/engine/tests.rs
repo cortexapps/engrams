@@ -487,6 +487,9 @@ fn config_refuses_a_zero_or_inverted_limit() {
     };
     let cfg = Config::from_vars(vars(&[("ENGRAM_FILL_IN_FLIGHT", "32")])).unwrap();
     assert_eq!((cfg.in_flight, cfg.max_in_flight), (32, 32));
+    assert_eq!(cfg.sandbox_demand_cap, None, "no cap unless one is set");
+    let cfg = Config::from_vars(vars(&[("ENGRAM_FILL_SANDBOX_DEMAND_CAP", "4")])).unwrap();
+    assert_eq!(cfg.sandbox_demand_cap, Some(4));
     for bad in [
         &[("ENGRAM_FILL_IN_FLIGHT", "0")][..],
         &[
@@ -495,6 +498,7 @@ fn config_refuses_a_zero_or_inverted_limit() {
         ][..],
         &[("ENGRAM_FILL_IN_FLIGHT_MAX", "8")][..],
         &[("ENGRAM_FILL_HEDGE_MS", "soon")][..],
+        &[("ENGRAM_FILL_SANDBOX_DEMAND_CAP", "0")][..],
     ] {
         assert!(Config::from_vars(vars(bad)).is_err(), "{bad:?}");
     }
@@ -667,4 +671,115 @@ async fn a_range_past_the_chunk_end_is_an_error() {
         matches!(err, ChunkStoreError::RangeOutOfBounds { size: 5, .. }),
         "{err:?}"
     );
+}
+
+/// Store fetches of the `slow` chunks hang for 30 s.
+struct SlowFor {
+    inner: BlobStorageResolver,
+    slow: HashSet<ChunkHash>,
+}
+
+#[async_trait]
+impl ChunkResolver for SlowFor {
+    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+        self.inner.fetch_chunk(hash).await
+    }
+
+    async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
+        if self.slow.contains(&hash) {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        self.inner.fetch_chunk_unverified(hash).await
+    }
+
+    async fn chunk_exists(&self, hash: ChunkHash) -> Result<bool> {
+        self.inner.chunk_exists(hash).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sandbox_that_floods_demand_leaves_slots_for_another() {
+    let f = fixture();
+    let mut flood = Vec::new();
+    for i in 0..4u8 {
+        flood.push(put(&f, &[b'f', i]).await);
+    }
+    let other = put(&f, b"the other sandbox").await;
+    let resolver = Arc::new(SlowFor {
+        inner: BlobStorageResolver::new(f.blob.clone()),
+        slow: flood.iter().copied().collect(),
+    });
+    let cfg = Config {
+        in_flight: 1,
+        max_in_flight: 1,
+        demand_reserve: 1,
+        hedge_after: None,
+        sandbox_demand_cap: Some(1),
+        ..Config::default()
+    };
+    let engine = engine_over(&f, resolver, cfg);
+    let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+    let _a = engine.register_sandbox(a);
+    let _b = engine.register_sandbox(b);
+    let mut faults = Vec::new();
+    for hash in flood {
+        let engine = engine.for_manifest(a);
+        faults.push(tokio::spawn(async move {
+            engine.get(hash, Class::Demand).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        engine.admission().in_flight(),
+        1,
+        "the flooding sandbox holds only its cap"
+    );
+
+    let started = tokio::time::Instant::now();
+    engine
+        .for_manifest(b)
+        .get(other, Class::Demand)
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    for fault in faults {
+        fault.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_sandbox_cap_a_flood_takes_every_demand_slot() {
+    let f = fixture();
+    let mut flood = Vec::new();
+    for i in 0..4u8 {
+        flood.push(put(&f, &[b'f', i]).await);
+    }
+    let resolver = Arc::new(SlowFor {
+        inner: BlobStorageResolver::new(f.blob.clone()),
+        slow: flood.iter().copied().collect(),
+    });
+    let cfg = Config {
+        in_flight: 1,
+        max_in_flight: 1,
+        demand_reserve: 1,
+        hedge_after: None,
+        ..Config::default()
+    };
+    let engine = engine_over(&f, resolver, cfg);
+    let a = uuid::Uuid::from_u128(1);
+    let _a = engine.register_sandbox(a);
+    let mut faults = Vec::new();
+    for hash in flood {
+        let engine = engine.for_manifest(a);
+        faults.push(tokio::spawn(async move {
+            engine.get(hash, Class::Demand).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(engine.admission().in_flight(), 2);
+    for fault in faults {
+        fault.abort();
+    }
 }

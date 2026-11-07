@@ -7,6 +7,7 @@ use bytes::Bytes;
 use engram_chunk_store::cache::{slice_chunk_range, FillSource};
 use engram_chunk_store::{Admission, ChunkHash, ChunkStore, Class, Permit, Result};
 use parking_lot::Mutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -31,6 +32,11 @@ pub struct Config {
     /// also asks the store; the first correct answer wins. A peer hit on
     /// the LAN takes about 1-2 ms.
     pub peer_race_after: Duration,
+    /// `Demand` fetches in flight for one registered sandbox
+    /// ([`FillEngine::register_sandbox`]), so one cold restore cannot
+    /// take every `Demand` slot from the others. `None`: no cap per
+    /// sandbox; all of them share the limit and the reserve.
+    pub sandbox_demand_cap: Option<usize>,
 }
 
 /// A ranged store GET starts and ends on a multiple of this.
@@ -53,18 +59,21 @@ impl Default for Config {
             demand_reserve: 16,
             hedge_after: Some(Duration::from_millis(200)),
             peer_race_after: Duration::from_millis(20),
+            sandbox_demand_cap: None,
         }
     }
 }
 
 impl Config {
     /// [`Config::default`], with `ENGRAM_FILL_IN_FLIGHT`,
-    /// `ENGRAM_FILL_IN_FLIGHT_MAX`, `ENGRAM_FILL_DEMAND_RESERVE` and
-    /// `ENGRAM_FILL_HEDGE_MS` (0 = off) read when set.
+    /// `ENGRAM_FILL_IN_FLIGHT_MAX`, `ENGRAM_FILL_DEMAND_RESERVE`,
+    /// `ENGRAM_FILL_HEDGE_MS` (0 = off) and
+    /// `ENGRAM_FILL_SANDBOX_DEMAND_CAP` read when set.
     /// `ENGRAM_FILL_IN_FLIGHT` sets the start and the ceiling, so the
     /// limit only backs off from it; `ENGRAM_FILL_IN_FLIGHT_MAX` then
     /// raises the ceiling. A set value that does not parse is an error,
-    /// and so is an in-flight count of 0 or a ceiling below the start.
+    /// and so is an in-flight count or a sandbox cap of 0, or a ceiling
+    /// below the start.
     pub fn from_env() -> std::result::Result<Self, String> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
@@ -88,6 +97,12 @@ impl Config {
         }
         if let Some(ms) = get("ENGRAM_FILL_HEDGE_MS")? {
             cfg.hedge_after = (ms > 0).then(|| Duration::from_millis(ms as u64));
+        }
+        if let Some(cap) = get("ENGRAM_FILL_SANDBOX_DEMAND_CAP")? {
+            if cap == 0 {
+                return Err("ENGRAM_FILL_SANDBOX_DEMAND_CAP must be at least 1".into());
+            }
+            cfg.sandbox_demand_cap = Some(cap);
         }
         if cfg.in_flight == 0 {
             return Err("ENGRAM_FILL_IN_FLIGHT must be at least 1".into());
@@ -122,6 +137,8 @@ pub struct FillEngine {
     inner: Arc<Inner>,
     /// Asked before the store, when this view of the engine has one.
     peer: Option<Arc<dyn PeerSource>>,
+    /// The `Demand` cap of this view's sandbox, when it has one.
+    sandbox_demand: Option<Arc<Semaphore>>,
 }
 
 struct Inner {
@@ -130,14 +147,39 @@ struct Inner {
     hedge_after: Option<Duration>,
     peer_race_after: Duration,
     /// Peers by session manifest id, for fetches that know only which
-    /// manifest they serve (a page fault), each with the id of the
-    /// registration that put it there.
-    peers: Mutex<HashMap<Uuid, Registered>>,
+    /// manifest they serve (a page fault).
+    peers: Registry<Arc<dyn PeerSource>>,
+    /// The `Demand` cap of each registered sandbox, by session manifest id.
+    sandbox_demand: Registry<Arc<Semaphore>>,
+    sandbox_demand_cap: Option<usize>,
     next_registration: AtomicU64,
 }
 
-/// A registered peer and the id of its registration.
-type Registered = (u64, Arc<dyn PeerSource>);
+/// Values by session manifest id, each with the id of the registration
+/// that put it there.
+struct Registry<T>(Mutex<HashMap<Uuid, (u64, T)>>);
+
+impl<T: Clone> Registry<T> {
+    fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+
+    fn insert(&self, manifest: Uuid, id: u64, value: T) {
+        self.0.lock().insert(manifest, (id, value));
+    }
+
+    fn get(&self, manifest: Uuid) -> Option<T> {
+        self.0.lock().get(&manifest).map(|(_, v)| v.clone())
+    }
+
+    /// Remove registration `id`, unless a later one replaced it.
+    fn remove(&self, manifest: Uuid, id: u64) {
+        let mut map = self.0.lock();
+        if map.get(&manifest).is_some_and(|(held, _)| *held == id) {
+            map.remove(&manifest);
+        }
+    }
+}
 
 /// Keeps a peer registered; dropping it unregisters the peer, unless a
 /// later registration for the same manifest replaced it.
@@ -149,12 +191,23 @@ pub struct PeerRegistration {
 
 impl Drop for PeerRegistration {
     fn drop(&mut self) {
-        let mut peers = self.inner.peers.lock();
-        if peers
-            .get(&self.manifest)
-            .is_some_and(|(id, _)| *id == self.id)
-        {
-            peers.remove(&self.manifest);
+        self.inner.peers.remove(self.manifest, self.id);
+    }
+}
+
+/// Keeps a sandbox's `Demand` cap in force; dropping it removes the
+/// cap, unless a later registration for the same manifest replaced it.
+pub struct SandboxRegistration {
+    inner: Arc<Inner>,
+    manifest: Uuid,
+    /// `None` when the engine has no cap per sandbox.
+    id: Option<u64>,
+}
+
+impl Drop for SandboxRegistration {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.inner.sandbox_demand.remove(self.manifest, id);
         }
     }
 }
@@ -177,10 +230,13 @@ impl FillEngine {
                 admission,
                 hedge_after: cfg.hedge_after,
                 peer_race_after: cfg.peer_race_after,
-                peers: Mutex::new(HashMap::new()),
+                peers: Registry::new(),
+                sandbox_demand: Registry::new(),
+                sandbox_demand_cap: cfg.sandbox_demand_cap,
                 next_registration: AtomicU64::new(0),
             }),
             peer: None,
+            sandbox_demand: None,
         }
     }
 
@@ -188,8 +244,8 @@ impl FillEngine {
     /// store.
     pub fn with_peer(&self, peer: Arc<dyn PeerSource>) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
             peer: Some(peer),
+            ..self.clone()
         }
     }
 
@@ -198,7 +254,7 @@ impl FillEngine {
     /// registration for the same manifest replaces this one.
     pub fn register_peer(&self, manifest: Uuid, peer: Arc<dyn PeerSource>) -> PeerRegistration {
         let id = self.inner.next_registration.fetch_add(1, Ordering::Relaxed);
-        self.inner.peers.lock().insert(manifest, (id, peer));
+        self.inner.peers.insert(manifest, id, peer);
         PeerRegistration {
             inner: Arc::clone(&self.inner),
             manifest,
@@ -206,17 +262,49 @@ impl FillEngine {
         }
     }
 
-    /// This engine with the peer registered for `manifest`, if any.
+    /// While the registration lives, the views of session `manifest`
+    /// ([`Self::for_manifest`]) share one cap of
+    /// [`Config::sandbox_demand_cap`] `Demand` fetches in flight. Without
+    /// that cap set, it changes nothing. A later registration for the
+    /// same manifest replaces this one; views taken before it keep the
+    /// cap they took.
+    pub fn register_sandbox(&self, manifest: Uuid) -> SandboxRegistration {
+        let id = self.inner.sandbox_demand_cap.map(|cap| {
+            let id = self.inner.next_registration.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .sandbox_demand
+                .insert(manifest, id, Arc::new(Semaphore::new(cap)));
+            id
+        });
+        SandboxRegistration {
+            inner: Arc::clone(&self.inner),
+            manifest,
+            id,
+        }
+    }
+
+    /// This engine with the peer and the `Demand` cap registered for
+    /// `manifest`, if any.
     pub fn for_manifest(&self, manifest: Uuid) -> Self {
-        let peer = self
-            .inner
-            .peers
-            .lock()
-            .get(&manifest)
-            .map(|(_, peer)| Arc::clone(peer));
         Self {
             inner: Arc::clone(&self.inner),
-            peer,
+            peer: self.inner.peers.get(manifest),
+            sandbox_demand: self.inner.sandbox_demand.get(manifest),
+        }
+    }
+
+    /// A slot of this view's sandbox cap, for a `Demand` fetch. Take it
+    /// before the host slot, so a capped sandbox waits without holding
+    /// one. Hold it for the whole fetch, its hedge and peer race included.
+    async fn sandbox_slot(&self, class: Class) -> Option<OwnedSemaphorePermit> {
+        match (&self.sandbox_demand, class) {
+            (Some(cap), Class::Demand) => Some(
+                Arc::clone(cap)
+                    .acquire_owned()
+                    .await
+                    .expect("the cap semaphore is never closed"),
+            ),
+            _ => None,
         }
     }
 
@@ -306,6 +394,7 @@ impl FillEngine {
                 }
             });
         }
+        let _sandbox_slot = self.sandbox_slot(class).await;
         let permit = self.inner.admission.acquire(class).await;
         metrics::counter!("engram_fill_range_total", "class" => class.as_str()).increment(1);
         let got = self
@@ -346,9 +435,13 @@ impl FillEngine {
                 record(done, &mut stats, &mut first_err);
             }
             // Waiting here, not in the task, keeps the fetch order.
+            let sandbox_slot = self.sandbox_slot(class).await;
             let permit = self.inner.admission.acquire(class).await;
             let engine = self.clone();
-            tasks.spawn(async move { engine.get_admitted(hash, class, Some(permit)).await });
+            tasks.spawn(async move {
+                let _sandbox_slot = sandbox_slot;
+                engine.get_admitted(hash, class, Some(permit)).await
+            });
             while let Some(done) = tasks.try_join_next() {
                 record(done, &mut stats, &mut first_err);
             }
@@ -415,9 +508,13 @@ impl FillEngine {
         class: Class,
         permit: Option<Permit>,
     ) -> Result<(Bytes, FillSource)> {
-        let permit = match permit {
-            Some(p) => p,
-            None => self.inner.admission.acquire(class).await,
+        // A caller that took a host slot ahead took its sandbox slot too.
+        let (permit, _sandbox_slot) = match permit {
+            Some(p) => (p, None),
+            None => {
+                let sandbox_slot = self.sandbox_slot(class).await;
+                (self.inner.admission.acquire(class).await, sandbox_slot)
+            }
         };
         metrics::counter!("engram_fill_fetch_total", "class" => class.as_str()).increment(1);
         let from_store = |permit: Permit| async move {
