@@ -885,10 +885,13 @@ export class Engine {
           "DYNPKG_RELEASE",
           "ENGRAM_MKE2FS",
         ].includes(key) ||
-          (spec.image === this.inputs.images.guard.id && key === "HOME" && value === "/tmp") ||
+          (spec.image === this.inputs.images.guard.id &&
+            key === "HOME" &&
+            value === "/tmp") ||
           (spec.image === this.inputs.images.orchestrator.id &&
             ((key === "BUN_INSTALL_BIN" && value === "/usr/local/bin") ||
-              (key === "BUN_RUNTIME_TRANSPILER_CACHE_PATH" && value === "0"))) ||
+              (key === "BUN_RUNTIME_TRANSPILER_CACHE_PATH" &&
+                value === "0"))) ||
           (spec.image === this.inputs.images.dns.id &&
             key === "SSL_CERT_FILE" &&
             value === "/etc/ssl/certs/ca-certificates.crt"),
@@ -977,7 +980,11 @@ export class Engine {
     await this.inspect(id);
     const state = await this.inspect(id);
     if (state.State?.Running)
-      await this.call(["stop", "--time", "3", id], undefined, 5000);
+      await this.call(
+        ["stop", "--time", role === "host-tls-probe" ? "0" : "3", id],
+        undefined,
+        5000,
+      );
     check(
       (await this.inspect(id)).State?.Running === false &&
         (await this.inspect(id)).State?.Pid === 0,
@@ -1373,14 +1380,7 @@ export class Engine {
     const source = member.IPv4Address.split("/")[0];
     const interfaces = JSON.parse(
       (
-        await this.call([
-          "exec",
-          id,
-          "/usr/sbin/ip",
-          "-j",
-          "address",
-          "show",
-        ])
+        await this.call(["exec", id, "/usr/sbin/ip", "-j", "address", "show"])
       ).toString(),
     );
     const dev = nativeInterface(interfaces, source, member.MacAddress);
@@ -1496,14 +1496,7 @@ export class Engine {
       );
       const interfaces = JSON.parse(
         (
-          await this.call([
-            "exec",
-            id,
-            "/usr/sbin/ip",
-            "-j",
-            "address",
-            "show",
-          ])
+          await this.call(["exec", id, "/usr/sbin/ip", "-j", "address", "show"])
         ).toString(),
       );
       check(
@@ -1850,7 +1843,10 @@ export class Engine {
     }
   }
   async nativeDns(
-    resolve: (name: string, options: { all: true }) => Promise<LookupAddress[]> = lookup,
+    resolve: (
+      name: string,
+      options: { all: true },
+    ) => Promise<LookupAddress[]> = lookup,
   ): Promise<void> {
     for (const [name, expected] of Object.entries(dnsRecords(this.inputs))) {
       let actual: LookupAddress[];

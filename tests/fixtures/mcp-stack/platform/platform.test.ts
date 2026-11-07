@@ -54,6 +54,56 @@ import { parseOperation, startSupervisor, verifyStatus } from "./supervisor.ts";
 import { generateIdentity } from "./identity.ts";
 import { generateConfiguration } from "./configuration.ts";
 
+import { Engine } from "./engine.ts";
+
+test("the disposable host TLS probe stops without delaying other roles", async () => {
+  const runId = "mcp-123456789012345678901234";
+  const id = "a".repeat(64);
+  const engine = new Engine(input(), "/owned", runId);
+  let running = false;
+  const stops: string[][] = [];
+  spyOn(engine, "audit").mockImplementation(async () => ({}));
+  spyOn(engine, "call").mockImplementation(async (args) => {
+    if (args[0] === "create") return Buffer.from(id);
+    if (args[0] === "start") running = true;
+    if (args[0] === "stop") {
+      stops.push(args);
+      running = false;
+    }
+    if (args[0] === "container" && args[1] === "inspect")
+      return Buffer.from(
+        JSON.stringify([
+          {
+            Id: id,
+            Config: { Labels: { "engrams.mcp.run": runId } },
+            State: { Running: running, Pid: running ? 1 : 0 },
+          },
+        ]),
+      );
+    return Buffer.alloc(0);
+  });
+  await engine.create(
+    "host-tls-probe",
+    "guard",
+    [],
+    ["infinity"],
+    "/bin/sleep",
+  );
+  await engine.remove("host-tls-probe");
+  await engine.create(
+    "ordinary-probe",
+    "guard",
+    [],
+    ["infinity"],
+    "/bin/sleep",
+  );
+  await engine.remove("ordinary-probe");
+  expect(stops).toEqual([
+    ["stop", "--time", "0", id],
+    ["stop", "--time", "3", id],
+  ]);
+});
+
 let root: string;
 let contextCount = 0;
 const node = process.execPath;
