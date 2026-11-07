@@ -51,6 +51,13 @@ impl FirstTouch {
         format!("traces/{session}/first-touch.v1")
     }
 
+    /// The store key of the indices a session touched after its published
+    /// prefix, in touch order, encoded as for [`Self::key`]. A build that
+    /// does not know it reads only the prefix.
+    pub fn rest_key(session: Uuid) -> String {
+        format!("traces/{session}/first-touch-rest.v1")
+    }
+
     /// The indices touched up to and including `until_ms`, in order.
     pub fn until(&self, until_ms: i64) -> Vec<u32> {
         self.entries
@@ -197,6 +204,20 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+
+    /// Published keys: other builds read these exact strings.
+    #[test]
+    fn first_touch_keys_are_stable() {
+        let session = Uuid::from_u128(1);
+        assert_eq!(
+            FirstTouch::key(session),
+            "traces/00000000-0000-0000-0000-000000000001/first-touch.v1"
+        );
+        assert_eq!(
+            FirstTouch::rest_key(session),
+            "traces/00000000-0000-0000-0000-000000000001/first-touch-rest.v1"
+        );
+    }
 
     #[test]
     fn first_touch_round_trips_and_rejects_a_torn_record() {
