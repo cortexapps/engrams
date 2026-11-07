@@ -51,6 +51,14 @@ pub struct PostgresStore {
     entropy: Arc<dyn Entropy>,
 }
 
+/// Connections in the store's pool.
+const MAX_CONNECTIONS: u32 = 8;
+
+/// A pool acquire that waits longer than this logs a `sqlx::pool::acquire`
+/// warning in the caller's span: every query waits for a connection when
+/// all [`MAX_CONNECTIONS`] are in use.
+const ACQUIRE_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self, MetaError> {
         // Retry the initial connect with backoff. In prod PG (Cloud SQL)
@@ -66,7 +74,12 @@ impl PostgresStore {
         let mut attempt = 0;
         let pool = loop {
             attempt += 1;
-            match PgPoolOptions::new().max_connections(8).connect(url).await {
+            match PgPoolOptions::new()
+                .max_connections(MAX_CONNECTIONS)
+                .acquire_slow_threshold(ACQUIRE_SLOW_THRESHOLD)
+                .connect(url)
+                .await
+            {
                 Ok(pool) => break pool,
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     tracing::warn!(
