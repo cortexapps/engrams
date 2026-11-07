@@ -48,9 +48,31 @@ struct Conn {
     version: u32,
     /// The version-2 slot; `None` on a version-1 connection.
     slot: Option<std::fs::File>,
+    /// The length of the last reply in the slot.
+    slot_used: u64,
     /// The engine, scoped to the session manifest's hinted peer.
     fill: FillEngine,
     pins: Option<Arc<SessionPins>>,
+}
+
+/// A slot reply longer than this has its pages freed once the client is
+/// done with it: a 512 KiB memory chunk stays, a 16 MiB disk chunk goes.
+const SLOT_PUNCH_ABOVE: u64 = 1024 * 1024;
+
+impl Conn {
+    /// Free the pages of the last reply when it was long. Called when a
+    /// frame arrives: the exchange is strictly request/response, and the
+    /// client reads the slot only between a reply and its next request,
+    /// so by then it is done with the bytes.
+    fn release_slot(&mut self) {
+        let used = std::mem::take(&mut self.slot_used);
+        let Some(slot) = self.slot.as_ref().filter(|_| used > SLOT_PUNCH_ABOVE) else {
+            return;
+        };
+        if let Err(e) = engram_host_core::disk::punch_hole(slot, 0, used) {
+            tracing::debug!(error = %e, used, "substrate slot pages not freed");
+        }
+    }
 }
 
 /// A session manifest's chunks, pinned while a connection holds this
@@ -110,6 +132,7 @@ impl SubstrateServer {
         let mut conn = Conn {
             version: PROTO_VERSION_V1,
             slot: None,
+            slot_used: 0,
             fill: self.fill.clone(),
             pins: None,
         };
@@ -120,6 +143,7 @@ impl SubstrateServer {
 
     async fn serve_frames(&self, stream: &mut UnixStream, conn: &mut Conn) -> std::io::Result<()> {
         while let Some(msg) = read_frame(stream).await? {
+            conn.release_slot();
             match msg {
                 ToWriter::Hello {
                     proto_version,
@@ -240,7 +264,7 @@ impl SubstrateServer {
     async fn populate(
         &self,
         stream: &mut UnixStream,
-        conn: &Conn,
+        conn: &mut Conn,
         hash: ChunkHash,
     ) -> std::io::Result<()> {
         let already = self.cache.contains_on_disk(hash);
@@ -271,7 +295,7 @@ impl SubstrateServer {
     async fn read(
         &self,
         stream: &mut UnixStream,
-        conn: &Conn,
+        conn: &mut Conn,
         hash: ChunkHash,
         requester: Requester,
         range: Option<ByteRange>,
@@ -322,7 +346,7 @@ impl SubstrateServer {
     async fn deliver(
         &self,
         stream: &mut UnixStream,
-        conn: &Conn,
+        conn: &mut Conn,
         hash: ChunkHash,
         bytes: &Bytes,
     ) -> std::io::Result<Result<(), String>> {
@@ -334,7 +358,9 @@ impl SubstrateServer {
                 )));
             }
             // A copy into shared memory, not disk I/O.
-            if let Err(e) = slot.write_all_at(bytes, 0) {
+            let written = slot.write_all_at(bytes, 0);
+            conn.slot_used = len;
+            if let Err(e) = written {
                 return Ok(Err(format!("write slot: {e}")));
             }
             write_frame(stream, &FromWriter::Filled { len }).await?;
@@ -769,6 +795,41 @@ mod tests {
         .unwrap();
     }
 
+    /// The pages of a long reply are freed when the next request comes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_next_request_frees_a_long_reply() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, small, _) = server_fixture(dir.path()).await;
+        let long = bytes::Bytes::from(vec![7u8; 4 * 1024 * 1024]);
+        let long = server.fill.store().put_chunk(&long).await.unwrap();
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION_READ),
+                FromWriter::HelloAck { .. }
+            ));
+            let slot =
+                std::fs::File::from(engram_substrate_proto::recv_fd(stream.as_fd()).unwrap());
+            let held = |slot: &std::fs::File| slot.metadata().unwrap().blocks() * 512;
+            assert!(matches!(
+                populate(&mut stream, long),
+                FromWriter::Filled { .. }
+            ));
+            assert!(held(&slot) >= 4 * 1024 * 1024);
+            assert!(matches!(
+                populate(&mut stream, small),
+                FromWriter::Filled { .. }
+            ));
+            assert!(held(&slot) < 1024 * 1024, "held {}", held(&slot));
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_on_a_version_two_connection_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -798,12 +859,17 @@ mod tests {
         let sock = dir.path().join("substrate.sock");
         let _accept = server.spawn(sock.clone()).unwrap();
 
-        let reply = tokio::task::spawn_blocking(move || {
+        // A writer older than version 3 answers a version-3 Hello the same
+        // way: an error, then the end of the connection.
+        let (reply, after) = tokio::task::spawn_blocking(move || {
             let mut stream = StdUnixStream::connect(&sock).expect("connect");
-            hello(&mut stream, PROTO_VERSION_READ + 1)
+            let reply = hello(&mut stream, PROTO_VERSION_READ + 1);
+            let after = engram_substrate_proto::read_frame::<_, FromWriter>(&mut stream);
+            (reply, after)
         })
         .await
         .unwrap();
         assert!(matches!(reply, FromWriter::PopulateErr { .. }));
+        assert_eq!(after.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }
