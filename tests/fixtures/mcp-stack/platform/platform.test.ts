@@ -593,6 +593,23 @@ test("real private TLS leaves and normal/zone configs pass production validators
     `sha256:${hash(await readOwned(configs.candidateFile.path))}`,
   );
   const c = JSON.parse((await readOwned(configs.coordinator.path)).toString());
+  const modern = normal.registrations.find(
+    (entry: { id: string }) => entry.id === "fixture-modern",
+  );
+  expect(modern.scopes).toEqual(["tools:read"]);
+  expect(c.registry.registrations["fixture-modern"].scopes).toEqual([
+    "tools:read",
+  ]);
+  expect(c.registry.registrations["fixture-modern"].accountField).toBe(
+    "fixture_account",
+  );
+  expect(c.registry.registrations["fixture-legacy"].scopes).toEqual([
+    "tools:read",
+    "tools:write",
+  ]);
+  expect(c.registry.registrations["fixture-legacy"].accountField).toBe(
+    "fixture_account",
+  );
   expect(c.registry.zones[configs.zone.id].policyDigest).toHaveLength(64);
   expect(c.registry.zones[configs.zone.id].endpoints).toContain(
     "https://token.modern.fixture.example:8443/token",

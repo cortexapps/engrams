@@ -108,7 +108,8 @@ export async function generateConfiguration(
       zoneId: zone.id,
       endpoint: `https://resource.${protocol}.fixture.example:8443/mcp`,
     },
-    scopes: ["tools:read", "tools:write"],
+    scopes:
+      protocol === "modern" ? ["tools:read"] : ["tools:read", "tools:write"],
   }));
   const runtime = {
     version: 1,
@@ -197,7 +198,7 @@ export async function generateConfiguration(
                 `https://token.${protocol}.fixture.example:8443/token`,
               ),
               issuerParameterRequired: true,
-              accountField: "account",
+              accountField: "fixture_account",
             },
           ];
         }),
