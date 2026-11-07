@@ -3,8 +3,9 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { chmod, lstat, unlink } from "node:fs/promises";
-import { dirname, sep } from "node:path";
+import { constants } from "node:fs";
+import { chmod, lstat, open, unlink } from "node:fs/promises";
+import { dirname, join, sep } from "node:path";
 import {
   ROLES,
   StatusSchema,
@@ -161,9 +162,44 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
   let busy = false,
     closing = false;
   let active:
-    | { controller: AbortController; settled: Promise<void> }
+    | {
+        controller: AbortController;
+        settled: Promise<void>;
+        diagnosed: Promise<void>;
+      }
     | undefined;
   const sockets = new Set<import("node:net").Socket>();
+  let failureNumber = 0;
+  const safeSeams = new Set([
+    "role_readiness",
+    "engine_command",
+    "engine_deadline",
+    "container_stop",
+    "container_survivor",
+    "role_start",
+    "role_configuration",
+    "role_handle",
+    "role_identity",
+    "role_running",
+    "running_artifact",
+    "artifact_identity",
+    "artifact_hash",
+    "supervisor_configuration",
+    "roles_before_restart",
+    "restart_network",
+    "restart_scope",
+    "restart_identity",
+    "stop_identity",
+    "supervisor_identity",
+    "supervisor_roles",
+    "supervisor_hash",
+    "control_aborted",
+    "worker_readiness_status",
+    "worker_readiness_tls",
+    "worker_readiness_identity",
+    "orchestrator_readiness",
+    "coordinator_readiness",
+  ]);
   function reply(res: ServerResponse, status: number, body: unknown) {
     if (res.destroyed) return;
     const bytes = JSON.stringify(body);
@@ -208,7 +244,11 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
     const settled = new Promise<void>((resolve) => {
       settle = resolve;
     });
-    active = { controller, settled };
+    let finishDiagnostic!: () => void;
+    const diagnosed = new Promise<void>((resolve) => {
+      finishDiagnostic = resolve;
+    });
+    active = { controller, settled, diagnosed };
     const aborted = new Promise<never>((_resolve, reject) => {
       signal.addEventListener(
         "abort",
@@ -216,12 +256,24 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         { once: true },
       );
     });
-    const timer = setTimeout(() => controller.abort(), ctx.deadlines.requestMs);
+    const timer = setTimeout(
+      () => controller.abort("deadline"),
+      ctx.deadlines.requestMs,
+    );
     const disconnect = () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) controller.abort("disconnect");
     };
     res.once("close", disconnect);
     let lifecycleStarted = false;
+    let operation: Operation | undefined;
+    let phase:
+      | "request"
+      | "configuration"
+      | "before_status"
+      | "lifecycle"
+      | "after_status"
+      | "transition"
+      | "reply" = "request";
     async function execute() {
       const chunks: Buffer[] = [];
       let length = 0;
@@ -233,11 +285,12 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         chunks.push(bytes);
       }
       check(length === Number(req.headers["content-length"]), "body_length");
-      const operation = parseOperation(
+      operation = parseOperation(
         JSON.parse(Buffer.concat(chunks).toString("utf8")),
         ctx,
       );
       if (operation.operation === "restart") {
+        phase = "configuration";
         const configuration =
           operation.role === "orchestrator"
             ? ctx.supervisor.configurations.orchestrator[
@@ -249,23 +302,33 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
       }
       signal.throwIfAborted();
       lifecycleStarted = true;
+      phase = "before_status";
       const before = verifyStatus(ctx, await lifecycle.status(signal));
       signal.throwIfAborted();
-      if (operation.operation === "status") return reply(res, 200, before);
+      if (operation.operation === "status") {
+        phase = "reply";
+        return reply(res, 200, before);
+      }
       if (operation.operation === "restart") {
         check(
           before.roles.every((r) => r.state === "running"),
           "roles_before_restart",
         );
+        phase = "lifecycle";
         await lifecycle.restart(
           operation.role,
           operation.configurationId,
           signal,
         );
-      } else await lifecycle.stop(operation.role, signal);
+      } else {
+        phase = "lifecycle";
+        await lifecycle.stop(operation.role, signal);
+      }
       signal.throwIfAborted();
+      phase = "after_status";
       const after = verifyStatus(ctx, await lifecycle.status(signal));
       signal.throwIfAborted();
+      phase = "transition";
       check(
         before.network.generation === after.network.generation &&
           before.network.enforcementSha256 === after.network.enforcementSha256,
@@ -290,17 +353,60 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
           );
         else check(current.state === "stopped", "stop_identity");
       }
+      phase = "reply";
       reply(res, 200, after);
     }
     const execution = execute().finally(settle);
     try {
       await Promise.race([execution, aborted]);
-    } catch {
+    } catch (error) {
       // A timed-out or failed lifecycle can have changed state. Refuse further controls.
       if (lifecycleStarted) closing = true;
       if (signal.aborted) req.destroy();
-      else reply(res, 400, { error: "control_failed" });
+      if (operation) {
+        const reason =
+          signal.aborted &&
+          ["deadline", "disconnect", "shutdown"].includes(signal.reason)
+            ? (signal.reason as "deadline" | "disconnect" | "shutdown")
+            : undefined;
+        const known =
+          error instanceof PlatformFailure &&
+          ["FAILED", "INVALID_CONTEXT", "NEEDS_CONTEXT"].includes(error.code) &&
+          safeSeams.has(error.seam);
+        const diagnostic = {
+          version: 1,
+          operation: operation.operation,
+          ...(operation.operation === "status" ? {} : { role: operation.role }),
+          phase,
+          ...(reason
+            ? { failure: reason, seam: "control_aborted" }
+            : {
+                failure: known ? error.code : "OTHER",
+                seam: known ? error.seam : "other",
+              }),
+        };
+        try {
+          const file = await open(
+            join(ctx.runRoot, `supervisor-failure-${++failureNumber}.json`),
+            constants.O_WRONLY |
+              constants.O_CREAT |
+              constants.O_EXCL |
+              constants.O_NOFOLLOW,
+            0o600,
+          );
+          try {
+            await file.writeFile(JSON.stringify(diagnostic) + "\n");
+            await file.sync();
+          } finally {
+            await file.close();
+          }
+        } catch {
+          /* Diagnostics must not change the control response. */
+        }
+      }
+      if (!signal.aborted) reply(res, 400, { error: "control_failed" });
     } finally {
+      finishDiagnostic();
       clearTimeout(timer);
       res.off("close", disconnect);
       if (!lifecycleStarted || !signal.aborted) active = undefined;
@@ -335,7 +441,7 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
   return {
     async close() {
       closing = true;
-      active?.controller.abort();
+      active?.controller.abort("shutdown");
       for (const socket of sockets) socket.destroy();
       // Closing a Unix listener can unlink its pathname. Check before that operation.
       // On substitution retain the descriptor until process exit; report failure, not cleanup.
@@ -358,7 +464,7 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           await Promise.race([
-            active.settled,
+            Promise.all([active.settled, active.diagnosed]),
             new Promise<never>((_resolve, reject) => {
               timer = setTimeout(
                 () => reject(new PlatformFailure("FAILED", "control_cleanup")),

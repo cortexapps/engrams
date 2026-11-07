@@ -726,6 +726,8 @@ async function control(
         (res) => {
           const chunks: Buffer[] = [];
           res.on("data", (v) => chunks.push(v));
+          res.on("error", reject);
+          res.on("aborted", () => reject(new Error("response aborted")));
           res.on("end", () =>
             resolve({
               code: res.statusCode!,
@@ -739,6 +741,155 @@ async function control(
     },
   );
 }
+
+test("supervisor retains a safe diagnostic for a failed restart", async () => {
+  const ctx = await context();
+  ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+  ctx.supervisor.socket = join(ctx.runRoot, "s");
+  const server = await startSupervisor(ctx, {
+    status: async () => status(ctx),
+    restart: async () => {
+      throw new PlatformFailure("FAILED", "role_readiness");
+    },
+    stop: async () => {},
+  });
+  try {
+    const response = await control(ctx, {
+      version: 1,
+      runId: ctx.runId,
+      operation: "restart",
+      role: "worker",
+      configurationId: "normal",
+    });
+    expect(response.code).toBe(400);
+    const diagnostic = JSON.parse(
+      await readFile(join(ctx.runRoot, "supervisor-failure-1.json"), "utf8"),
+    );
+    expect(diagnostic).toEqual({
+      version: 1,
+      operation: "restart",
+      role: "worker",
+      phase: "lifecycle",
+      failure: "FAILED",
+      seam: "role_readiness",
+    });
+    expect(
+      (
+        await control(ctx, {
+          version: 1,
+          runId: ctx.runId,
+          operation: "status",
+        })
+      ).code,
+    ).toBe(503);
+  } finally {
+    await server.close();
+  }
+});
+
+test("supervisor records a disconnected client without its request contents", async () => {
+  const ctx = await context();
+  ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+  ctx.supervisor.socket = join(ctx.runRoot, "s");
+  let entered!: () => void, aborted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const stopped = new Promise<void>((resolve) => {
+    aborted = resolve;
+  });
+  const server = await startSupervisor(ctx, {
+    status: async (signal) => {
+      entered();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener(
+          "abort",
+          () => {
+            aborted();
+            resolve();
+          },
+          { once: true },
+        ),
+      );
+      return status(ctx);
+    },
+    restart: async () => {},
+    stop: async () => {},
+  });
+  const token = (await readOwned(ctx.supervisor.tokenFile)).toString();
+  const payload = JSON.stringify({
+    version: 1,
+    runId: ctx.runId,
+    operation: "status",
+  });
+  const req = request({
+    socketPath: ctx.supervisor.socket,
+    method: "POST",
+    path: "/v1/control",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(payload),
+    },
+  });
+  req.on("error", () => {});
+  req.end(payload);
+  await started;
+  req.destroy();
+  await stopped;
+  await server.close();
+  const diagnostic = JSON.parse(
+    await readFile(join(ctx.runRoot, "supervisor-failure-1.json"), "utf8"),
+  );
+  expect(diagnostic).toEqual({
+    version: 1,
+    operation: "status",
+    phase: "before_status",
+    failure: "disconnect",
+    seam: "control_aborted",
+  });
+  expect(JSON.stringify(diagnostic)).not.toContain(token);
+});
+
+test("supervisor records transition validation failure without changing control behavior", async () => {
+  const ctx = await context();
+  ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+  ctx.supervisor.socket = join(ctx.runRoot, "s");
+  const current = status(ctx);
+  const server = await startSupervisor(ctx, {
+    status: async () => structuredClone(current),
+    restart: async (role) => {
+      current.roles.find((entry) => entry.role === role)!.bootId += "-next";
+      current.roles.find((entry) => entry.role === "fixture-modern")!.bootId +=
+        "-wrong";
+    },
+    stop: async () => {},
+  });
+  try {
+    const response = await control(ctx, {
+      version: 1,
+      runId: ctx.runId,
+      operation: "restart",
+      role: "worker",
+      configurationId: "normal",
+    });
+    expect(response.code).toBe(400);
+    expect(
+      JSON.parse(
+        await readFile(join(ctx.runRoot, "supervisor-failure-1.json"), "utf8"),
+      ),
+    ).toEqual({
+      version: 1,
+      operation: "restart",
+      role: "worker",
+      phase: "transition",
+      failure: "INVALID_CONTEXT",
+      seam: "restart_scope",
+    });
+  } finally {
+    await server.close();
+  }
+});
 
 test("supervisor refuses duplicate authentication and oversized bodies before lifecycle access", async () => {
   const ctx = await context();
@@ -868,6 +1019,8 @@ test("supervisor reports bounded cleanup failure if a lifecycle ignores cancella
 
 test("supervisor does not expose lifecycle errors or permit later mutation", async () => {
   const ctx = await context();
+  ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+  ctx.supervisor.socket = join(ctx.runRoot, "s");
   let mutations = 0;
   const server = await startSupervisor(ctx, {
     status: async () => {
@@ -889,6 +1042,18 @@ test("supervisor does not expose lifecycle errors or permit later mutation", asy
     };
     const result = await control(ctx, body);
     expect(result).toEqual({ code: 400, text: '{"error":"control_failed"}' });
+    const diagnostic = JSON.parse(
+      await readFile(join(ctx.runRoot, "supervisor-failure-1.json"), "utf8"),
+    );
+    expect(diagnostic).toEqual({
+      version: 1,
+      operation: "stop",
+      role: "worker",
+      phase: "before_status",
+      failure: "OTHER",
+      seam: "other",
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private credential");
     expect((await control(ctx, body)).code).toBe(503);
     expect(mutations).toBe(0);
   } finally {
@@ -921,6 +1086,8 @@ test("supervisor cleanup refuses a substituted socket path and preserves the for
 
 test("supervisor request deadline cancels status and refuses all later controls", async () => {
   const ctx = await context();
+  ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+  ctx.supervisor.socket = join(ctx.runRoot, "s");
   ctx.deadlines.requestMs = 50;
   let aborted = false;
   const server = await startSupervisor(ctx, {
@@ -948,6 +1115,17 @@ test("supervisor request deadline cancels status and refuses all later controls"
   } finally {
     await server.close();
   }
+  expect(
+    JSON.parse(
+      await readFile(join(ctx.runRoot, "supervisor-failure-1.json"), "utf8"),
+    ),
+  ).toEqual({
+    version: 1,
+    operation: "status",
+    phase: "before_status",
+    failure: "deadline",
+    seam: "control_aborted",
+  });
 });
 
 test("bounded command rejects failed, oversized and timed-out children without error output", async () => {
