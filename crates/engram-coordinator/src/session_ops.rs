@@ -24,6 +24,7 @@ use engram_core::types::SessionState;
 use engram_core::SessionId;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
+use tracing::Instrument as _;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -114,6 +115,7 @@ impl OpCtx<'_> {
             .services
             .meta
             .op_record_step(self.op.id, self.epoch, step)
+            .instrument(tracing::info_span!("coord.op.step", step))
             .await
         {
             Ok(true) => true,
@@ -192,11 +194,14 @@ pub async fn enqueue(
         // Drive detached from the caller's (possibly wire-lifetime)
         // future: the op row is the durable owner, this spawn is just
         // compute. A cancelled request cancels nothing but its own
-        // observation; a dead pod's op is reclaimed by the sweep.
+        // observation; a dead pod's op is reclaimed by the sweep. The
+        // claimed op joins the enqueuer's trace; the ops the completion
+        // re-drive claims after it start their own.
         let state = state.clone();
         let op = op.clone();
+        let parent = tracing::Span::current();
         tokio::spawn(async move {
-            drive_claimed(&state, op).await;
+            drive_claimed_under(&state, op, parent).await;
         });
     }
     Ok(outcome)
@@ -786,8 +791,13 @@ pub async fn drive_session(state: &SharedState, session_id: SessionId) {
 /// Drive an ALREADY-CLAIMED op (the reclaim sweep's continuation).
 /// `pub` so the DST harness mirrors the sweep (engram-dst, ADR 0098 D5).
 pub async fn drive_claimed(state: &SharedState, op: SessionOp) {
+    drive_claimed_under(state, op, tracing::Span::current()).await;
+}
+
+/// [`drive_claimed`] with the claimed op's span parented on `parent`.
+async fn drive_claimed_under(state: &SharedState, op: SessionOp, parent: tracing::Span) {
     let session_id = op.session_id;
-    drive_one(state, op).await;
+    drive_one(state, op).instrument(parent).await;
     // Completion re-drive — iterative (review finding #13).
     drive_session(state, session_id).await;
 }
@@ -795,6 +805,11 @@ pub async fn drive_claimed(state: &SharedState, op: SessionOp) {
 /// Drive exactly one CLAIMED op to its terminal row state. No re-drive —
 /// the caller ([`drive_session`]'s loop, or [`drive_claimed`]) owns
 /// continuation.
+#[tracing::instrument(
+    name = "coord.op",
+    skip_all,
+    fields(op_id = op.id, kind = op.kind.as_str(), session_id = %op.session_id, attempts = op.attempts),
+)]
 async fn drive_one(state: &SharedState, op: SessionOp) {
     let epoch = op.epoch.expect("claimed op carries its epoch");
     // Enqueue→claim latency, from when the row became CLAIMABLE — for a
