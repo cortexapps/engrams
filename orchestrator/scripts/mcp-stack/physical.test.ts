@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createServer } from "node:tls";
+import {
+  TEST_CA,
+  TEST_CERT,
+  TEST_KEY,
+} from "../../../mcp-worker/test/fixtures/tls.ts";
 import { X509Certificate } from "node:crypto";
 import { sha256 } from "./context.ts";
 import {
@@ -9,7 +17,8 @@ import {
   verifyColdChain,
   verifyPhysicalBoot,
 } from "./host-observer.ts";
-import { parseWorkerTlsDenial } from "./guest-physical.ts";
+import { probeWorkerControl } from "./guest-physical.ts";
+import type { Context } from "./context.ts";
 
 const id = (n: number) =>
   `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -337,38 +346,61 @@ test("proxy denial requires exact newly flushed host/session/SNI event", () => {
     ),
   ).toThrow();
 });
-test("TLS denial requires pinned first leaf, verified TLS 1.3 and actual alert 116", async () => {
-  // Read only the neutral public certificate; do not execute or import the fixture's key module.
-  const fixture = await readFile(
-    new URL("../../../mcp-worker/test/fixtures/tls.ts", import.meta.url),
-    "utf8",
+test("worker TLS requires a verified server and certificate-required alert", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "worker-tls-test-")),
   );
-  const pem = fixture.match(/export const TEST_CERT = `([^`]+)`/)?.[1];
-  expect(pem).toBeDefined();
-  const cert = new X509Certificate(pem!);
-  const transcript = Buffer.from(
-    `OpenSSL 3.0.0\n${pem}\nNew, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\nVerify return code: 0 (ok)\nerror:tlsv13 alert certificate required\nSSL alert number 116\n`,
-  );
-  expect(
-    parseWorkerTlsDenial(transcript, 1, cert.fingerprint256).classification,
-  ).toBe("mtls_authentication_denial");
-  expect(() =>
-    parseWorkerTlsDenial(transcript, 124, cert.fingerprint256),
-  ).toThrow();
-  expect(() =>
-    parseWorkerTlsDenial(transcript, 1, Array(32).fill("AA").join(":")),
-  ).toThrow();
-  for (const part of [
-    "TLSv1.3",
-    "Verify return code: 0 (ok)",
-    "tlsv13 alert certificate required",
-    "SSL alert number 116",
-  ])
-    expect(() =>
-      parseWorkerTlsDenial(
-        Buffer.from(transcript.toString().replaceAll(part, "missing")),
-        1,
-        cert.fingerprint256,
-      ),
-    ).toThrow();
+  const caPath = join(root, "ca.pem");
+  await writeFile(caPath, TEST_CA, { mode: 0o600 });
+  const server = createServer({
+    key: TEST_KEY,
+    cert: TEST_CERT,
+    ca: TEST_CA,
+    requestCert: true,
+    rejectUnauthorized: true,
+    minVersion: "TLSv1.3",
+    maxVersion: "TLSv1.3",
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const endpoint = {
+    origin: `https://localhost:${port}`,
+    ca: { path: caPath, sha256: sha256(Buffer.from(TEST_CA)) },
+    serverFingerprint: new X509Certificate(TEST_CERT).fingerprint256,
+  };
+  const ctx = {
+    runRoot: root,
+    deadlines: { requestMs: 6000 },
+    endpoints: { workerControl: endpoint },
+  } as Context;
+  try {
+    expect((await probeWorkerControl(ctx)).classification).toBe(
+      "mtls_authentication_denial",
+    );
+    endpoint.serverFingerprint = Array(32).fill("AA").join(":");
+    await expect(probeWorkerControl(ctx)).rejects.toThrow();
+    endpoint.serverFingerprint = new X509Certificate(TEST_CERT).fingerprint256;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const permissive = createServer(
+      {
+        key: TEST_KEY,
+        cert: TEST_CERT,
+        minVersion: "TLSv1.3",
+        maxVersion: "TLSv1.3",
+      },
+      (socket) => socket.destroy(),
+    );
+    await new Promise<void>((resolve) =>
+      permissive.listen(port, "127.0.0.1", resolve),
+    );
+    try {
+      await expect(probeWorkerControl(ctx)).rejects.toThrow();
+    } finally {
+      await new Promise<void>((resolve) => permissive.close(() => resolve()));
+    }
+  } finally {
+    if (server.listening)
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
 });

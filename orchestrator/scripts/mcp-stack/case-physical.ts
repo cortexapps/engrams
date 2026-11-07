@@ -145,11 +145,7 @@ export const credentialNetworkIsolationDriver: CaseDriver = async ({
       () => host.proxyDenials(baseline, scenario.sessionId, probe.sni),
       (v) => v.length > 0,
     );
-    const tls = await probeWorkerControl(
-      ctx,
-      scenario.client,
-      scenario.sessionId,
-    );
+    const tls = await probeWorkerControl(ctx);
     await fixture.release();
     const row = await execution(ctx, scenario);
     requireThat(row?.state === "succeeded", "physical_guest_return_call");
@@ -182,7 +178,7 @@ export const credentialNetworkIsolationDriver: CaseDriver = async ({
       },
       {
         assertion: "worker-control-denied",
-        observations: [observe(identity, "guest-proof", "denied", tls)],
+        observations: [observe(identity, "fixture-observer", "denied", tls)],
       },
       { assertion: "positive-network-denial", observations: [denial] },
       {

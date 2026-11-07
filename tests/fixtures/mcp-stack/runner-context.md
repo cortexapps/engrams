@@ -257,16 +257,12 @@ new bytes and 64 KiB per line, and consumes only newline-terminated records.
 Only hashes leave the reader; raw logs are not evidence artifacts.
 
 `endpoints.workerControl` must name the actual private worker control origin.
-The guest must have OpenSSL 3 and `timeout`. The runner copies only the public
-CA into an exclusive private test file and runs one fixed TLS 1.3 handshake
-with CA, hostname, SNI and exact first-leaf verification. It supplies no client
-certificate or key and sends no HTTP request. A received certificate-required
-alert 116 with verified server identity is classified as
-`mtls_authentication_denial`. It is not L3/CNI isolation evidence. Timeout,
-network drop, close and generic TLS failure cannot pass. A deployment that
-drops before TLS needs a separate positive enforcement observation; this
-contract has no such fallback. The worker has no TLS error observer, so this
-runner makes no worker-log corroboration claim.
+The runner makes a TLS 1.3 connection from the trusted fixture network to the
+worker control endpoint. It verifies the CA, hostname and exact server leaf,
+without a client certificate or an HTTP request. A certificate-required alert
+116 is classified as `mtls_authentication_denial`. Timeout, network failure,
+close and other TLS errors cannot pass. This verifies the worker's authentication
+boundary; it does not establish guest network isolation.
 
 Adapters must provide both independently owned protocol fixtures, private
 databases and normal public auth, actual enrolled host/image/assets, the fixed

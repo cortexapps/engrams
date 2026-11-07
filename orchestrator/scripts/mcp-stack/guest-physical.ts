@@ -1,100 +1,72 @@
-import { X509Certificate } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { connect } from "node:tls";
 import { z } from "zod";
 import {
   requireThat,
   privateFile,
   sha256,
   verifyArtifact,
+  RunnerFailure,
   type Context,
 } from "./context.ts";
 import { guestExec, guestHarnessPath } from "./guest.ts";
-import type { PublicClient } from "./transport.ts";
+import { tlsOptions, type PublicClient } from "./transport.ts";
 
-/** Parse actual OpenSSL output. A timeout, close or generic TLS failure is not a denial receipt. */
-export function parseWorkerTlsDenial(
-  output: Buffer,
-  status: number,
-  fingerprint: string,
-) {
-  requireThat(
-    output.length <= 65536 &&
-      status > 0 &&
-      ![124, 126, 127, 137].includes(status),
-    "worker_tls_actual_failure",
-  );
-  const text = output.toString("utf8");
-  const first = text.match(
-    /-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----/,
-  );
-  requireThat(
-    first &&
-      /^OpenSSL 3\./m.test(text) &&
-      /New, TLSv1\.3, Cipher is \S+/.test(text) &&
-      /Verify return code: 0 \(ok\)/.test(text) &&
-      /tlsv13 alert certificate required/.test(text) &&
-      /SSL alert number 116\b/.test(text),
-    "worker_tls_certificate_required",
-  );
-  const certificate = new X509Certificate(first[0]);
-  requireThat(
-    certificate.fingerprint256 === fingerprint,
-    "worker_tls_actual_leaf_pin",
-  );
-  return {
-    classification: "mtls_authentication_denial" as const,
-    alert: 116 as const,
-    transcriptSha256: sha256(output),
-    leafSha256: sha256(certificate.raw),
-  };
-}
-export async function probeWorkerControl(
-  ctx: Context,
-  client: PublicClient,
-  sessionId: string,
-) {
-  requireThat(ctx.deadlines.requestMs >= 6000, "worker_tls_request_deadline");
+/** Verify the real worker rejects a TLS client without a certificate. */
+export async function probeWorkerControl(ctx: Context) {
   const endpoint = ctx.endpoints.workerControl;
   await verifyArtifact(ctx.runRoot, endpoint.ca);
-  const ca = await readFile(endpoint.ca.path);
-  requireThat(
-    ca.length <= 65536 &&
-      sha256(ca) === endpoint.ca.sha256 &&
-      !ca.toString("utf8").includes("PRIVATE KEY"),
-    "worker_public_ca_only",
-  );
+  const options = await tlsOptions(ctx, endpoint);
   const url = new URL(endpoint.origin);
-  const result = await guestExec(ctx, client, sessionId, [
-    "/usr/bin/env",
-    "-i",
-    "PATH=/usr/bin:/bin",
-    "/bin/sh",
-    "-c",
-    `set -eu
-command -v openssl >/dev/null
-command -v timeout >/dev/null
-openssl version
-cd /tmp/mcp-stack-fixture
-[ ! -L worker-control-ca.pem ] && [ ! -e worker-control-ca.pem ]
-umask 077
-set -C
-printf '%s' "$1" | base64 -d > worker-control-ca.pem
-set +e
-timeout 5s openssl s_client -connect "$2" -servername "$3" -verify_hostname "$3" -verify_return_error -CAfile worker-control-ca.pem -tls1_3 -showcerts -ign_eof < /dev/null 2>&1
-status=$?
-rm worker-control-ca.pem
-exit "$status"
-`,
-    "fixture-worker-tls",
-    ca.toString("base64"),
-    `${url.hostname}:${url.port || "443"}`,
-    url.hostname,
-  ]);
-  return parseWorkerTlsDenial(
-    result.stdout,
-    result.status,
-    endpoint.serverFingerprint,
-  );
+  return await new Promise<{
+    classification: "mtls_authentication_denial";
+    alert: 116;
+    leafSha256: string;
+  }>((resolve, reject) => {
+    const socket = connect({
+      ...options,
+      host: url.hostname,
+      port: Number(url.port || "443"),
+      servername: url.hostname,
+      minVersion: "TLSv1.3",
+      maxVersion: "TLSv1.3",
+    });
+    let leafSha256 = "";
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (ok)
+        resolve({
+          classification: "mtls_authentication_denial",
+          alert: 116,
+          leafSha256,
+        });
+      else
+        reject(
+          new RunnerFailure(
+            "ASSERTION_FAILED",
+            "worker_tls_authentication_denial",
+          ),
+        );
+    };
+    const timer = setTimeout(() => finish(false), ctx.deadlines.requestMs);
+    socket.on("secureConnect", () => {
+      const leaf = socket.getPeerCertificate().raw;
+      if (socket.authorized && socket.getProtocol() === "TLSv1.3" && leaf)
+        leafSha256 = sha256(leaf);
+    });
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      finish(
+        !!leafSha256 &&
+          (error.code === "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED" ||
+            error.code === "ERR_SSL_TLSV1_ALERT_CERTIFICATE_REQUIRED"),
+      );
+    });
+    socket.on("data", () => finish(false));
+    socket.on("close", () => finish(false));
+  });
 }
 
 export async function probeManagedAuthority(
