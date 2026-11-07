@@ -387,13 +387,6 @@ async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
     serde_json::from_value(value.get("trace_lineage_id")?.clone()).ok()
 }
 
-/// The store key of the chunk indices a session touched after its
-/// published prefix, in touch order (little-endian `u32`s). A build that
-/// does not know it reads only the prefix.
-fn first_touch_rest_key(session: SessionId) -> String {
-    format!("traces/{}/first-touch-rest.v1", session.as_uuid())
-}
-
 /// The chunk indices under `key` as this manifest's chunk hashes, in
 /// order. Positions the manifest leaves out are zero pages and need no
 /// fetch.
@@ -493,7 +486,7 @@ async fn publish_first_touch(
     let encode = engram_chunk_store::FirstTouch::encode_indices;
     let blob = store.blob_storage();
     let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
-    let rest_key = first_touch_rest_key(session);
+    let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
     match tokio::try_join!(
         blob.put(&key, encode(&prefix).into()),
         blob.put(&rest_key, encode(&rest).into()),
@@ -3827,7 +3820,7 @@ impl PooledBackend {
         let mut order = match first {
             Some(session) => {
                 let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
-                let rest_key = first_touch_rest_key(session);
+                let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
                 let (prefix, rest) = tokio::join!(
                     first_touch_hashes(fill.store(), session, &key, &manifest),
                     first_touch_hashes(fill.store(), session, &rest_key, &manifest),
