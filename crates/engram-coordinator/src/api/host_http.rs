@@ -25,7 +25,7 @@
 //! body stay authoritative.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus};
@@ -34,6 +34,7 @@ use engram_core::{HostId, SandboxId, SessionId, SessionState};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
@@ -1555,8 +1556,11 @@ pub struct HarnessEventRequest {
 pub async fn harness_event_ingest(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
+    headers: HeaderMap,
     Json(req): Json<HarnessEventRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
+    let span = ingest_span(session_id, &req, traceparent);
     // Same call the WS supervisor makes
     // (`api/hosts.rs:357-360`). Existing `state.emit` semantics
     // de-dupe back-to-back duplicate harness-idle events; out-of-
@@ -1570,8 +1574,32 @@ pub async fn harness_event_ingest(
         req.at,
         req.delivery,
     )
+    .instrument(span)
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The `coord.ingest_harness_event` span, parented on the host's POST
+/// span. The host samples agent-message chunks and sends no trace
+/// context for the chunks it skips, so a chunk without one gets no span.
+fn ingest_span(
+    session_id: SessionId,
+    req: &HarnessEventRequest,
+    traceparent: Option<&str>,
+) -> tracing::Span {
+    if traceparent.is_none() && matches!(req.event, HarnessEvent::AgentMessageChunk { .. }) {
+        return tracing::Span::none();
+    }
+    let span = tracing::info_span!(
+        "coord.ingest_harness_event",
+        %session_id,
+        kind = req.event.kind(),
+        seq = req.delivery.as_ref().map(|d| d.seq),
+    );
+    if let Some(tp) = traceparent {
+        engram_telemetry::set_parent_from_traceparent(&span, tp);
+    }
+    span
 }
 
 // ---- POST /api/sessions/:session_id/integration-asset (ADR 0056 Phase 4) ----
@@ -1899,6 +1927,31 @@ mod tests {
             .get(&state)
             .await
             .expect("the failed read was not kept");
+    }
+
+    /// The host decides which chunks are traced: a chunk without trace
+    /// context gets no ingest span, and every other event gets one.
+    #[test]
+    fn ingest_span_follows_the_host_chunk_sampling() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let request = |event| HarnessEventRequest {
+            delivery: None,
+            sandbox_id: SandboxId::new(),
+            event,
+            at: Utc::now(),
+        };
+        let chunk = request(HarnessEvent::AgentMessageChunk {
+            run_id: "r1".into(),
+            message_id: "m1".into(),
+            chunk: "token".into(),
+        });
+        let idle = request(HarnessEvent::Idle);
+        let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let session_id = SessionId::new();
+
+        assert!(ingest_span(session_id, &chunk, None).is_none());
+        assert!(!ingest_span(session_id, &chunk, Some(traceparent)).is_none());
+        assert!(!ingest_span(session_id, &idle, None).is_none());
     }
 
     /// ADR 0116 A-D2 wire pin: the coordinator's `HandoffMarker` mirror
