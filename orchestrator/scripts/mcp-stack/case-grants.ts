@@ -1,4 +1,4 @@
-import { Code } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { z } from "zod";
 import { ProfileIntegrationGrantSchema } from "../../src/gen/engram/app/v1/profile_pb.ts";
@@ -1034,6 +1034,21 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
       input: { ...parent.input, callId: "policy-child" },
     };
     database.own(child.taskId, child.sessionId);
+    await waitFor(
+      ctx,
+      "child_public_active",
+      async () => {
+        try {
+          return await principals.owner.sessions.getSession({
+            sessionId: child!.sessionId,
+          });
+        } catch (error) {
+          if (error instanceof ConnectError && error.code === Code.NotFound) return undefined;
+          throw error;
+        }
+      },
+      (value) => value?.session?.status === "active" && value.session.hostId === ctx.hostId,
+    );
     const started = await waitFor(
       ctx,
       "child_actual_started",
