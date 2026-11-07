@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   assertStableAuthority,
+  assertRejectedRefreshAuthority,
   assertOAuthRefusal,
   assertOAuthRefreshFailure,
   assertInvalidatedAuthority,
@@ -136,7 +137,11 @@ test("each authority change has a distinct immutable stale refusal call before r
   for (const change of ["account", "scope", "reconnect"]) {
     const trigger = plan.steps.find((step) => step.marker === change);
     const refusal = plan.steps.find(
-      (step) => step.marker === `${change}-stale`,
+      (step) =>
+        step.marker ===
+        (change === "reconnect"
+          ? `${change}-stale`
+          : `${change}-reauthorized-stale`),
     );
     expect(refusal).toBeDefined();
     expect(refusal?.callId).not.toBe(trigger?.callId);
@@ -146,5 +151,43 @@ test("each authority change has a distinct immutable stale refusal call before r
     expect(plan.steps.indexOf(refusal!)).toBeLessThan(
       plan.steps.findIndex((step) => step.marker === `${change}-rebound`),
     );
+  }
+});
+
+test("a rejected refresh leaves accepted identity unchanged but credential broken", () => {
+  const before = {
+    bindingHash: "old",
+    current: true,
+    authGeneration: 3,
+    credentialIdentity: "identity",
+  };
+  const after = { ...before, credentialStatus: "broken" };
+  expect(() => assertRejectedRefreshAuthority(before, after)).not.toThrow();
+  expect(() =>
+    assertRejectedRefreshAuthority(before, { ...after, current: false }),
+  ).not.toThrow();
+  for (const invalid of [
+    { ...after, credentialStatus: "active" },
+    { ...after, bindingHash: "new" },
+    { ...after, authGeneration: 4 },
+    { ...after, credentialIdentity: "other" },
+  ])
+    expect(() => assertRejectedRefreshAuthority(before, invalid)).toThrow();
+});
+
+test("rejected refresh is retried before reauthorization and stale refusal", () => {
+  const plan = oauthCallPlan("mcp_fixture");
+  for (const change of ["account", "scope"]) {
+    const names = [
+      `${change}-stale`,
+      `${change}-reauthorized-stale`,
+      `${change}-rebound`,
+    ];
+    const positions = names.map((marker) =>
+      plan.steps.findIndex((step) => step.marker === marker),
+    );
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions[0]!).toBeLessThan(positions[1]!);
+    expect(positions[1]!).toBeLessThan(positions[2]!);
   }
 });

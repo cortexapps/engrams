@@ -69,6 +69,18 @@ export function assertStableAuthority(before: Authority, after: Authority) {
     "same_oauth_authority_binding_stable",
   );
 }
+export function assertRejectedRefreshAuthority(
+  before: Authority,
+  after: Authority & { credentialStatus: string },
+) {
+  requireThat(
+    after.bindingHash === before.bindingHash &&
+      after.authGeneration === before.authGeneration &&
+      after.credentialIdentity === before.credentialIdentity &&
+      after.credentialStatus === "broken",
+    "oauth_rejected_refresh_authority",
+  );
+}
 export function assertInvalidatedAuthority(
   oldHash: string,
   after: { bindingHash: string; current: boolean; staleReasons: string[] },
@@ -87,9 +99,11 @@ export function oauthCallPlan(alias: string): CallPlan {
       "rotation",
       "account",
       "account-stale",
+      "account-reauthorized-stale",
       "account-rebound",
       "scope",
       "scope-stale",
+      "scope-reauthorized-stale",
       "scope-rebound",
       "reconnect",
       "reconnect-stale",
@@ -169,7 +183,9 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           connectionId: scenario.connection.id,
         });
         requireThat(
-          state.bindingReceipt && setup.current?.connection,
+          state.bindingReceipt &&
+            setup.current?.connection &&
+            setup.current.credential,
           "oauth_actual_binding_and_connection",
         );
         return {
@@ -178,6 +194,7 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           staleReasons: state.bindingReceipt.staleReasons,
           authGeneration: setup.current.connection.authGeneration,
           credentialIdentity: setup.current.connection.credentialIdentity,
+          credentialStatus: setup.current.credential.status,
         };
       };
       const successfulRead = async (marker: string) => {
@@ -354,6 +371,53 @@ export const oauthAuthorityDriver: CaseDriver = async ({
             });
           assertOAuthRefreshFailure(proofs[0]!.proof, result);
         }
+        const after = await fixture.observe();
+        assertNoDispatch(before, after);
+        let repeatedHash: string | undefined;
+        if (change !== "reconnect") {
+          requireThat(
+            after.oauth.rotations > before.oauth.rotations,
+            "changed_authority_actual_refresh_attempt",
+          );
+          const rejected = await waitFor(
+            ctx,
+            "oauth_refresh_credential_broken",
+            authority,
+            (value) => value.credentialStatus === "broken",
+          );
+          assertRejectedRefreshAuthority(old, rejected);
+          // A broken credential fails closed without another rotating exchange.
+          await sendScenarioPrompt(scenario, false, `${change}-stale`);
+          const repeated = await pollProof(ctx, scenario, {
+            callId: `oauth-${change}-stale`,
+            tool: scenario.alias,
+            planSha256: scenario.planSha256,
+          });
+          requireThat(repeated.length === 1, "single_broken_oauth_failure");
+          const retry = await execution(
+            ctx,
+            scenario,
+            true,
+            `oauth-${change}-stale`,
+          );
+          requireThat(retry?.state === "failed", "oauth_broken_retry_failed");
+          const retryResult =
+            await scenario.reviewClient.integration.getMcpExecutionResult({
+              sessionId: scenario.sessionId,
+              executionId: retry.executionId,
+            });
+          assertOAuthRefreshFailure(repeated[0]!.proof, retryResult);
+          repeatedHash = repeated[0]!.sha256;
+          const afterRetry = await fixture.observe();
+          assertNoDispatch(after, afterRetry);
+          requireThat(
+            afterRetry.oauth.rotations === after.oauth.rotations,
+            "broken_oauth_does_not_refresh_again",
+          );
+          assertRejectedRefreshAuthority(old, await authority());
+          if (change === "scope") await fixture.oauth({ scope: "tools:read" });
+          await authorizeOAuth(ctx, principals.admin, scenario.connection.id);
+        }
         const stale = await waitFor(
           ctx,
           "oauth_binding_invalidated",
@@ -361,18 +425,13 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           (value) => !value.current,
         );
         assertInvalidatedAuthority(old.bindingHash, stale);
-        const after = await fixture.observe();
-        assertNoDispatch(before, after);
-        if (change !== "reconnect") {
-          requireThat(
-            after.oauth.rotations > before.oauth.rotations,
-            "changed_authority_actual_refresh_attempt",
-          );
-        }
-        // After trusted invalidation, require a separate available refusal from a new call.
-        await sendScenarioPrompt(scenario, false, `${change}-stale`);
+        const refusalMarker =
+          change === "reconnect"
+            ? `${change}-stale`
+            : `${change}-reauthorized-stale`;
+        await sendScenarioPrompt(scenario, false, refusalMarker);
         const refusals = await pollProof(ctx, scenario, {
-          callId: `oauth-${change}-stale`,
+          callId: `oauth-${refusalMarker}`,
           tool: scenario.alias,
           planSha256: scenario.planSha256,
         });
@@ -385,11 +444,6 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           "stale_oauth_refusal_does_not_refresh_again",
         );
         assertInvalidatedAuthority(old.bindingHash, await authority());
-        if (change !== "reconnect") {
-          // Restore the reviewed scope for a new explicit authorization.
-          if (change === "scope") await fixture.oauth({ scope: "tools:read" });
-          await authorizeOAuth(ctx, principals.admin, scenario.connection.id);
-        }
         // The new credential requires a new reviewed catalog and an explicit human rebind.
         const current = await principals.admin.integration.getMcpSetup({
           connectionId: scenario.connection.id,
@@ -458,6 +512,16 @@ export const oauthAuthorityDriver: CaseDriver = async ({
                 delivery: change === "reconnect" ? "available" : "unavailable",
               },
             ),
+            ...(repeatedHash
+              ? [
+                  policyObservation(
+                    "guest-proof",
+                    scenario.sessionId,
+                    "failed",
+                    { hash: repeatedHash },
+                  ),
+                ]
+              : []),
             policyObservation("guest-proof", scenario.sessionId, "denied", {
               hash: refusals[0]!.sha256,
             }),
