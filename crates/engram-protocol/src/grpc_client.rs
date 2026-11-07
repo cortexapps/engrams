@@ -92,6 +92,18 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
+/// ADR 0079: build the shared fenced request for the
+/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
+/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
+/// without advancing).
+fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
+    FencedSandboxRequest {
+        uuid: id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: fence.epoch,
+        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+    }
+}
+
 /// Deadline applied (via the gRPC `grpc-timeout` header) to the
 /// snapshot-restore RPCs — `restore` (resume),
 /// `restore_base_for_session` (cold-create-via-restore), and
@@ -107,18 +119,6 @@ impl Interceptor for TraceparentInjector {
 /// rides the gRPC deadline header, the *host* side observes it too and
 /// can abort its own work. Override via
 /// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
-/// ADR 0079: build the shared fenced request for the
-/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
-/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
-/// without advancing).
-fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
-    FencedSandboxRequest {
-        uuid: id.as_uuid().as_bytes().to_vec(),
-        fencing_epoch: fence.epoch,
-        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
-    }
-}
-
 fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
