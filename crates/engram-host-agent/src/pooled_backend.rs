@@ -1891,7 +1891,7 @@ impl PooledBackend {
         staged_refs.dedup();
         let mut staged_manifests = match (memory_is_lazy, self.fill.clone()) {
             (true, Some(fill)) => Some(AbortTaskOnDrop(tokio::spawn(
-                stage_memory_manifests(fill, src.clone(), staged_refs.clone())
+                stage_memory_manifests(fill, src.clone(), id, staged_refs.clone())
                     .instrument(tracing::info_span!("restore.stage_manifests")),
             ))),
             _ => None,
@@ -1909,6 +1909,7 @@ impl PooledBackend {
             {
                 Ok(disks) => Some(disks),
                 Err(error) => {
+                    remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
                     self.drop_failed_restore(id);
                     return Err(error);
                 }
@@ -2018,13 +2019,7 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
         }
         .await;
-        if let Some(staged) = staged_manifests {
-            drop(staged);
-            for r in &staged_refs {
-                let _ = fs::remove_file(engram_sandbox_firecracker::staged_manifest_path(&src, r))
-                    .await;
-            }
-        }
+        remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
         if restore.is_err() {
             self.drop_failed_restore(id);
             if let Some(volumes) = self.volumes.as_ref() {
@@ -3983,6 +3978,7 @@ impl PooledBackend {
 async fn stage_memory_manifests(
     fill: FillEngine,
     dir: PathBuf,
+    sandbox_id: SandboxId,
     refs: Vec<engram_core::types::manifest::ManifestRef>,
 ) {
     let stage = |r| {
@@ -3994,7 +3990,7 @@ async fn stage_memory_manifests(
                 .await
                 .map_err(|e| e.to_string())?;
             let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
-            let path = engram_sandbox_firecracker::staged_manifest_path(&dir, &r);
+            let path = engram_sandbox_firecracker::staged_manifest_path(&dir, sandbox_id, &r);
             let tmp = path.with_extension("json.tmp");
             fs::write(&tmp, bytes).await.map_err(|e| e.to_string())?;
             fs::rename(&tmp, &path).await.map_err(|e| e.to_string())
@@ -4007,6 +4003,29 @@ async fn stage_memory_manifests(
         if let Err(error) = result {
             tracing::warn!(manifest = %r, %error, "manifest copy not staged; the handler reads the store");
         }
+    }
+}
+
+/// Wait for the staging task of a restore, then remove its manifest
+/// copies. The wait comes first: a blocking file write outlives an abort.
+/// A lazy restore has already awaited the task, and a `JoinHandle` must
+/// not be polled again after it completes.
+async fn remove_staged_manifests(
+    staging: Option<AbortTaskOnDrop>,
+    dir: &Path,
+    sandbox_id: SandboxId,
+    refs: &[engram_core::types::manifest::ManifestRef],
+) {
+    let Some(mut staging) = staging else {
+        return;
+    };
+    if !staging.0.is_finished() {
+        let _ = (&mut staging.0).await;
+    }
+    for r in refs {
+        let path = engram_sandbox_firecracker::staged_manifest_path(dir, sandbox_id, r);
+        let _ = fs::remove_file(path.with_extension("json.tmp")).await;
+        let _ = fs::remove_file(path).await;
     }
 }
 
@@ -7206,6 +7225,25 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_host_core::ChunkIndex;
     use engram_sandbox_process::ProcessBackend;
+
+    /// A lazy restore awaits the staging task before the handler starts,
+    /// so the cleanup after the restore sees a task that has completed.
+    #[tokio::test]
+    async fn staged_copies_are_removed_after_the_restore_awaited_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let r = engram_core::types::manifest::ManifestRef::new();
+        let path = engram_sandbox_firecracker::staged_manifest_path(tmp.path(), id, &r);
+        let staged_path = path.clone();
+        let mut staging = AbortTaskOnDrop(tokio::spawn(async move {
+            fs::write(&staged_path, b"{}").await.unwrap();
+        }));
+        (&mut staging.0).await.unwrap();
+        assert!(path.exists());
+
+        remove_staged_manifests(Some(staging), tmp.path(), id, &[r]).await;
+        assert!(!path.exists(), "the staged copy is removed");
+    }
 
     /// 2026-08-03 `chain_poisoned` alert regression: once the SIGTERM
     /// capture quiesce is raised, `capture_phase` must refuse BEFORE the
