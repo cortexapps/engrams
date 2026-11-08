@@ -28,7 +28,7 @@ use engram_core::traits::{BlobStorage, ByteStream};
 
 /// A key prefix unique to this call within the process and across
 /// concurrent test invocations sharing an emulator: wall-clock nanos
-/// plus a process-local counter.
+/// plus the process id and a process-local counter.
 pub fn unique_prefix(ns: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -36,7 +36,8 @@ pub fn unique_prefix(ns: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("engram/conformance/{ns}/{nanos}-{seq}")
+    let pid = std::process::id();
+    format!("engram/conformance/{ns}/{nanos}-{pid}-{seq}")
 }
 
 /// The standard small test body: larger than one TCP frame so real
