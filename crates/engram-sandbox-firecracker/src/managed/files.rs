@@ -25,7 +25,9 @@ fn verify_file(path: &Path, digest: &str, size: Option<u64>) -> io::Result<()> {
 
 pub(super) struct PinnedFiles {
     pub(super) retain: std::sync::atomic::AtomicBool,
+    pub(super) capture_ready: std::sync::atomic::AtomicBool,
     pub path: std::path::PathBuf,
+    pub(super) disks: Option<super::disk::Disks>,
 }
 impl PinnedFiles {
     pub fn prepare(
@@ -47,13 +49,15 @@ impl PinnedFiles {
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         let files = Self {
             path,
+            disks: None,
+            capture_ready: std::sync::atomic::AtomicBool::new(false),
             retain: std::sync::atomic::AtomicBool::new(false),
         };
         files.pin(
             spec.rootfs_source
                 .as_deref()
                 .ok_or_else(|| io::Error::other("missing selected disk"))?,
-            "rootfs.ext4",
+            "selected.ext4",
             &request.disk.sha256,
             Some(request.disk.size_bytes),
         )?;
@@ -73,12 +77,46 @@ impl PinnedFiles {
                 files.pin(&cfg.bundle_dir.join(&name), &name, hash, None)?;
             }
         }
-        if let Some(mib) = spec.swap_mib.filter(|n| *n > 0) {
-            std::fs::File::create_new(files.path.join("swap.img"))?
-                .set_len(u64::from(mib) * 1024 * 1024)?;
-        }
         Ok(files)
     }
+    pub async fn export_capture(&self, destination: &Path) -> io::Result<()> {
+        self.disks
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed disk owner missing"))?
+            .export(destination)
+            .await?;
+        self.capture_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    pub fn capture_stored(&self) -> io::Result<()> {
+        if !self
+            .capture_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(io::Error::other("managed capture export incomplete"));
+        }
+        self.retain
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub async fn close(&self, destroy: bool, uncertain: bool) -> io::Result<()> {
+        if self.retain.load(std::sync::atomic::Ordering::Acquire) && (!destroy || uncertain) {
+            return Err(io::Error::other("managed capture source retained"));
+        }
+        // Disk retention independently protects an incomplete capture, including
+        // a failure before the snapshot operation starts.
+        self.disks
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed disk owner missing"))?
+            .release()
+            .await?;
+        self.retain
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     fn pin(&self, source: &Path, name: &str, hash: &str, size: Option<u64>) -> io::Result<()> {
         // File input only. A pooled block device must be materialized at the
         // exact selected version before entering this cold constructor.
@@ -93,6 +131,9 @@ impl PinnedFiles {
 impl Drop for PinnedFiles {
     fn drop(&mut self) {
         if self.retain.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(disks) = &self.disks {
+                disks.retain_source();
+            }
             return;
         }
         let _ = std::fs::remove_dir_all(&self.path);
@@ -169,13 +210,31 @@ pub(super) mod tests {
             if valid {
                 let files = result.unwrap();
                 assert_eq!(
-                    std::fs::read(files.path.join("rootfs.ext4")).unwrap(),
+                    std::fs::read(files.path.join("selected.ext4")).unwrap(),
                     b"disk-a"
                 );
             } else {
                 assert!(result.is_err());
             }
         }
+    }
+
+    #[test]
+    fn managed_root_disk_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, spec) = inputs(dir.path());
+        let files = PinnedFiles::prepare(
+            &dir.path().join("owned"),
+            &cfg,
+            &request,
+            &spec,
+            tempfile::tempdir().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !files.path.join("rootfs.ext4").exists(),
+            "managed Firecracker must attach a session volume"
+        );
     }
 
     #[test]
@@ -195,7 +254,10 @@ pub(super) mod tests {
             .retain
             .store(true, std::sync::atomic::Ordering::Release);
         drop(files);
-        assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
+        assert_eq!(
+            std::fs::read(path.join("selected.ext4")).unwrap(),
+            b"disk-a"
+        );
     }
     #[test]
     fn uuid_boot_attempt_fits_native_control_socket_path() {
@@ -228,7 +290,10 @@ pub(super) mod tests {
                 .unwrap();
         let owned = files.path.clone();
         std::fs::write(dir.path().join("disk"), b"disk-b").unwrap();
-        assert_eq!(std::fs::read(owned.join("rootfs.ext4")).unwrap(), b"disk-a");
+        assert_eq!(
+            std::fs::read(owned.join("selected.ext4")).unwrap(),
+            b"disk-a"
+        );
         assert!(
             PinnedFiles::prepare(&work, &cfg, &request, &spec, tempfile::tempdir().unwrap())
                 .is_err()

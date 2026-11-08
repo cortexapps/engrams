@@ -33,7 +33,10 @@ fn invalid(_: impl std::fmt::Display) -> SandboxError {
 #[derive(Clone)]
 pub enum ManagedBackend {
     #[cfg(target_os = "linux")]
-    Firecracker(Arc<engram_sandbox_firecracker::FirecrackerBackend>),
+    Firecracker {
+        backend: Arc<engram_sandbox_firecracker::FirecrackerBackend>,
+        disk: Arc<dyn engram_host_core::SessionDisk>,
+    },
     #[cfg(target_os = "macos")]
     Vz {
         backend: Arc<engram_sandbox_vz::VzBackend>,
@@ -50,9 +53,15 @@ impl ManagedBackend {
     ) -> Result<Owner, SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Firecracker(backend) => Ok(Owner::Firecracker(Box::new(
+            Self::Firecracker { backend, disk } => Ok(Owner::Firecracker(Box::new(
                 backend
-                    .prepare_managed_cold(request.cold.clone(), spec, network, staging)
+                    .prepare_managed_cold(
+                        request.cold.clone(),
+                        spec,
+                        network,
+                        staging,
+                        disk.clone(),
+                    )
                     .await?,
             ))),
             #[cfg(target_os = "macos")]
@@ -213,10 +222,26 @@ impl Owner {
             Self::Vz(owner) => owner.retire_disk(path).await,
         }
     }
-    async fn close(self) -> Result<(), SandboxError> {
+    fn capture_stored(&mut self) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(test)]
+            Self::ExecTest(owner) => {
+                owner
+                    .capture_acks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::Firecracker(owner) => owner.capture_stored(),
+            #[cfg(target_os = "macos")]
+            Self::Vz(_) => Ok(()),
+        }
+    }
+    async fn close(self, destroy: bool) -> Result<(), SandboxError> {
         match self {
             #[cfg(test)]
             Self::ExecTest(mut owner) => {
+                owner.close_intents.lock().unwrap().push(destroy);
                 if let Some(wait) = owner.close_wait.take() {
                     let _ = wait.await;
                 }
@@ -227,9 +252,19 @@ impl Owner {
                 }
             }
             #[cfg(target_os = "linux")]
-            Self::Firecracker(owner) => (*owner).close().await,
+            Self::Firecracker(owner) => {
+                if destroy {
+                    (*owner).destroy().await
+                } else {
+                    (*owner).close().await
+                }
+            }
             #[cfg(target_os = "macos")]
-            Self::Vz(owner) => (*owner).close().await,
+            Self::Vz(owner) => {
+                // VZ uses its existing close policy for both caller intents.
+                let _ = destroy;
+                (*owner).close().await
+            }
         }
     }
 }
@@ -375,7 +410,7 @@ impl ManagedBootHost {
         }
         let (backend, kernel, bundles) = match &self.backend {
             #[cfg(target_os = "linux")]
-            ManagedBackend::Firecracker(backend) => (
+            ManagedBackend::Firecracker { backend, .. } => (
                 ManagedColdBackend::Firecracker,
                 backend.config().kernel_image_path.as_path(),
                 backend.bundle_dir(),
@@ -496,7 +531,7 @@ impl ManagedBootHost {
             self.hub.unbind_session(key.creation.session_id);
         }
     }
-    async fn close_resources(&self, entry: &mut Entry) -> Result<(), SandboxError> {
+    async fn close_resources(&self, entry: &mut Entry, destroy: bool) -> Result<(), SandboxError> {
         entry.transfer_stop.send_replace(());
         if entry.close_failed {
             return Err(invalid("prior owner cleanup was uncertain"));
@@ -504,7 +539,7 @@ impl ManagedBootHost {
         if let Some(owner) = entry.owner.take() {
             // A retry must not treat a consumed, failed owner as a clean absence.
             entry.close_failed = true;
-            owner.close().await?;
+            owner.close(destroy).await?;
             entry.close_failed = false;
         }
         let Some(allocation) = &entry.record.allocation else {
@@ -549,7 +584,7 @@ impl ManagedBootHost {
         entry.agent = None;
         let _ = self.persist(&entry.record);
         self.unbind_owned(&entry.record.request.key);
-        let _ = self.close_resources(entry).await;
+        let _ = self.close_resources(entry, false).await;
     }
     pub async fn prepare(
         self: &Arc<Self>,
@@ -1073,7 +1108,12 @@ impl ManagedBootHost {
             receipt: Box::new(receipt),
         };
         self.persist(&entry.record)?;
-        self.close_resources(entry).await?;
+        entry
+            .owner
+            .as_mut()
+            .ok_or_else(|| invalid("retirement owner"))?
+            .capture_stored()?;
+        self.close_resources(entry, false).await?;
         Ok(())
     }
     async fn verify_retired(&self, record: &Record) -> Result<(), SandboxError> {
@@ -1397,6 +1437,11 @@ impl ManagedBootHost {
             if hash_file(&path).await? != (hash.clone(), size) {
                 return Err(invalid("capture integrity"));
             }
+            if entry.record.retired.is_none() {
+                if let Some(owner) = entry.owner.as_mut() {
+                    owner.capture_stored()?;
+                }
+            }
             let manifest = self
                 .chunks
                 .chunk_file(&path, engram_chunk_store::ManifestKind::Disk, None)
@@ -1422,7 +1467,7 @@ impl ManagedBootHost {
             authority.validate().map_err(invalid)?;
             // Replacement authority is durable only after exact owner and
             // proxy cleanup succeed. A failed attempt leaves an artifact to retry.
-            self.close_resources(&mut entry).await?;
+            self.close_resources(&mut entry, false).await?;
             progress.authority = Some(authority.clone());
             entry.record.capture = Some(progress);
             entry.record.state = ManagedBootHostState::Captured {
@@ -1496,7 +1541,7 @@ impl ManagedBootHost {
             )
         {
             // The physical source is already gone. Preserve its durable proof.
-            return self.close_resources(entry).await;
+            return self.close_resources(entry, true).await;
         }
         entry.attach_owner = None;
         entry.record.state = ManagedBootHostState::Failed {
@@ -1505,7 +1550,7 @@ impl ManagedBootHost {
         self.persist(&entry.record)?;
         entry.agent = None;
         self.unbind_owned(&entry.record.request.key);
-        self.close_resources(entry).await
+        self.close_resources(entry, true).await
     }
     pub fn ordinary_spec(
         &self,
@@ -1857,6 +1902,8 @@ mod tests {
     }
     pub(super) struct ExecOwner {
         pub(super) close_fails: bool,
+        pub(super) close_intents: Arc<std::sync::Mutex<Vec<bool>>>,
+        pub(super) capture_acks: Arc<std::sync::atomic::AtomicUsize>,
         pub(super) close_wait: Option<tokio::sync::oneshot::Receiver<()>>,
         epoch: u64,
         live: bool,
@@ -1977,6 +2024,8 @@ mod tests {
             attach_owner: Some(host.hub.managed_owner(intent)),
             owner: Some(Owner::ExecTest(Box::new(ExecOwner {
                 close_fails: false,
+                close_intents: Arc::new(std::sync::Mutex::new(Vec::new())),
+                capture_acks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 close_wait: None,
                 epoch: 1,
                 live: true,
@@ -2320,6 +2369,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn started_destroy_grants_disk_release_but_failure_cleanup_does_not() {
+        for destroy in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (host, request) = fixture(temp.path());
+            let entry = install_exec_owner(&host, &request);
+            let intents = match &entry.lock().await.owner {
+                Some(Owner::ExecTest(owner)) => owner.close_intents.clone(),
+                _ => panic!("execution owner missing"),
+            };
+            if destroy {
+                host.destroy_tombstoned(request.cold.sandbox_id)
+                    .await
+                    .unwrap();
+            } else {
+                host.fail(&mut *entry.lock().await).await;
+            }
+            assert_eq!(*intents.lock().unwrap(), vec![destroy]);
+            assert!(!entry.lock().await.close_failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_drop_an_authorized_destroy_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, request) = fixture(temp.path());
+        let entry = install_exec_owner(&host, &request);
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let intents = match entry.lock().await.owner.as_mut() {
+            Some(Owner::ExecTest(owner)) => {
+                owner.close_wait = Some(wait);
+                owner.close_intents.clone()
+            }
+            _ => panic!("execution owner missing"),
+        };
+        let call = tokio::spawn({
+            let host = host.clone();
+            async move { host.destroy_tombstoned(request.cold.sandbox_id).await }
+        });
+        while intents.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        call.abort();
+        let _ = call.await;
+        finish.send(()).unwrap();
+        let entry = entry.lock().await;
+        assert!(entry.owner.is_none());
+        assert!(!entry.close_failed);
+        assert_eq!(*intents.lock().unwrap(), vec![true]);
+    }
+
+    #[tokio::test]
     async fn tombstone_uncertain_native_close_remains_in_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let (host, request) = fixture(temp.path());
@@ -2657,7 +2757,7 @@ mod tests {
         if let Some(Owner::ExecTest(owner)) = &mut entry.owner {
             owner.close_wait = Some(native_close);
         }
-        let mut close = Box::pin(host.close_resources(&mut entry));
+        let mut close = Box::pin(host.close_resources(&mut entry, false));
         tokio::select! {
             result = &mut close => panic!("native close must wait: {result:?}"),
             _ = tokio::task::yield_now() => {},
@@ -2699,7 +2799,7 @@ mod tests {
         }
         let (_, mut stream) = local.read_file(id, file_spec().path).await.unwrap();
         let mut entry = entry.lock().await;
-        let mut close = Box::pin(host.close_resources(&mut entry));
+        let mut close = Box::pin(host.close_resources(&mut entry, false));
         tokio::select! {
             result = &mut close => panic!("native close must wait: {result:?}"),
             _ = tokio::task::yield_now() => {},
@@ -2811,14 +2911,19 @@ mod tests {
             },
         };
         #[cfg(target_os = "linux")]
-        let backend = ManagedBackend::Firecracker(Arc::new(
-            engram_sandbox_firecracker::FirecrackerBackend::new(path.join("native"), {
-                let mut config =
-                    engram_sandbox_firecracker::FirecrackerConfig::with_kernel(path.join("kernel"));
-                config.bundle_dir = path.to_owned();
-                config
-            }),
-        ));
+        let backend = ManagedBackend::Firecracker {
+            backend: Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
+                path.join("native"),
+                {
+                    let mut config = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(
+                        path.join("kernel"),
+                    );
+                    config.bundle_dir = path.to_owned();
+                    config
+                },
+            )),
+            disk: Arc::new(engram_host_core::FileDisk::new(path.join("volumes"), 4096).unwrap()),
+        };
         let ordinary = Arc::new(engram_sandbox_process::ProcessBackend::new(
             path.join("ordinary"),
         ));
@@ -3002,7 +3107,8 @@ mod tests {
         // the next removal, whose drain is still held by the daemon.
         let h = host.clone();
         let e = entry.clone();
-        let first = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+        let first =
+            tokio::spawn(async move { h.close_resources(&mut *e.lock().await, false).await });
         let late = removals.recv().await.unwrap();
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(11)).await;
@@ -3012,7 +3118,8 @@ mod tests {
         late.send(FromProxyd::Ok).unwrap();
         let h = host.clone();
         let e = entry.clone();
-        let mut second = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+        let mut second =
+            tokio::spawn(async move { h.close_resources(&mut *e.lock().await, false).await });
         let held = removals.recv().await.unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(1), &mut second)
@@ -3026,7 +3133,8 @@ mod tests {
         for succeed in [false, true] {
             let h = host.clone();
             let e = entry.clone();
-            let close = tokio::spawn(async move { h.close_resources(&mut *e.lock().await).await });
+            let close =
+                tokio::spawn(async move { h.close_resources(&mut *e.lock().await, false).await });
             let reply = tokio::time::timeout(std::time::Duration::from_secs(5), removals.recv())
                 .await
                 .unwrap()
@@ -3102,6 +3210,10 @@ mod tests {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let (host, request) = fixture(temp.path());
         let entry = install_exec_owner(&host, &request);
+        let capture_acks = match &entry.lock().await.owner {
+            Some(Owner::ExecTest(owner)) => owner.capture_acks.clone(),
+            _ => panic!("missing owner"),
+        };
         let capture = ManagedCaptureRequest {
             key: request.key.clone(),
             capture_id: engram_core::SnapshotId::new(),
@@ -3124,6 +3236,7 @@ mod tests {
         let c = capture.clone();
         let first = tokio::spawn(async move { h.capture(c).await });
         let late = removals.recv().await.unwrap();
+        assert_eq!(capture_acks.load(std::sync::atomic::Ordering::SeqCst), 1);
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(11)).await;
         tokio::time::resume();
@@ -3200,12 +3313,12 @@ mod tests {
         entry.record.incarnation = "old-host".into();
         entry.record.allocation.as_mut().unwrap().host_incarnation = "old-host".into();
         assert!(
-            host.close_resources(&mut entry).await.is_err(),
+            host.close_resources(&mut entry, false).await.is_err(),
             "recovery cannot assume missing cleanup proof"
         );
         assert!(host.networks.lock().unwrap().contains(generation));
         let (server, mut removals, _) = cleanup_proxy(temp.path());
-        let cleanup = host.close_resources(&mut entry);
+        let cleanup = host.close_resources(&mut entry, false);
         let ack = async {
             removals
                 .recv()

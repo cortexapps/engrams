@@ -1892,17 +1892,35 @@ impl PooledBackend {
     /// awaiting an eviction finalize. Runs once at startup, after the
     /// reattach pass fixes the live set and before anything can
     /// provision a sandbox.
-    pub async fn reconcile_volumes(&self) {
+    pub async fn reconcile_volumes(&self, bindings: &crate::bindings::BindingStore) {
         let Some(volumes) = &self.volumes else {
             return;
         };
-        let live = match self.inner.list().await {
+        let mut live = match self.inner.list().await {
             Ok(ids) => ids,
             Err(error) => {
                 tracing::warn!(%error, "volume reconcile skipped: cannot list sandboxes");
                 return;
             }
         };
+        // Managed owners are absent from the ordinary backend map. Durable
+        // markers reserve their live and transient volumes after a restart.
+        // This does not adopt them or prove that their former VM was reaped.
+        let protected = async {
+            for name in volumes.disk().list().await? {
+                if let Some(parsed) = engram_host_core::session_volumes::parse(&name) {
+                    if bindings.managed_sandbox_required(parsed.sandbox)? {
+                        live.push(parsed.sandbox);
+                    }
+                }
+            }
+            Ok::<_, std::io::Error>(())
+        }
+        .await;
+        if let Err(error) = protected {
+            tracing::warn!(%error, "volume reconcile skipped: managed ownership unavailable");
+            return;
+        }
         let finalizer = self.eviction_finalizer();
         match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
             Ok(report) => {
@@ -12788,5 +12806,65 @@ mod tests {
         assert!(!pooled.held_snapshots.contains_key(&id));
         assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(inner.inner.destroy_calls.lock().as_slice(), &[id]);
+    }
+}
+
+#[cfg(test)]
+mod managed_volume_reconcile_tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+    use super::*;
+    use engram_host_core::{
+        disk::SessionDisk,
+        session_volumes::{live_name, transient_name},
+        FileDisk,
+    };
+
+    #[tokio::test]
+    async fn startup_keeps_managed_volumes_and_sweeps_unowned_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bindings = crate::bindings::BindingStore::open(dir.path().join("bindings")).unwrap();
+        let managed = SandboxId::new();
+        let ordinary = SandboxId::new();
+        std::fs::write(
+            bindings
+                .directory()
+                .join(format!("{managed}.managed-sandbox")),
+            b"1",
+        )
+        .unwrap();
+        let disk = Arc::new(FileDisk::new(dir.path().join("volumes"), 4096).unwrap());
+        let managed_root = live_name(managed, DiskRole::Root);
+        let managed_cut = transient_name(managed, DiskRole::Root);
+        let dead_root = live_name(ordinary, DiskRole::Root);
+        for name in [&managed_root, &managed_cut, &dead_root] {
+            disk.create(name, 4096).await.unwrap();
+        }
+        let volumes = Arc::new(SessionVolumes::new(
+            disk.clone(),
+            engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(dir.path().join("blob")),
+            )),
+        ));
+        let backend = PooledBackend::new(Arc::new(engram_sandbox_process::ProcessBackend::new(
+            dir.path().join("ordinary"),
+        )))
+        .with_session_volumes(volumes);
+        backend.reconcile_volumes(&bindings).await;
+        assert!(disk.open(&managed_root).await.is_ok());
+        assert!(disk.open(&managed_cut).await.is_ok());
+        assert!(disk.open(&dead_root).await.is_err());
+
+        // A corrupt association cannot authorize deleting any unowned disk.
+        disk.create(&dead_root, 4096).await.unwrap();
+        std::fs::write(
+            bindings.directory().join("invalid.managed-required"),
+            b"invalid",
+        )
+        .unwrap();
+        backend.reconcile_volumes(&bindings).await;
+        assert!(disk.open(&dead_root).await.is_ok());
+        assert!(disk.open(&managed_root).await.is_ok());
+        assert!(disk.open(&managed_cut).await.is_ok());
     }
 }

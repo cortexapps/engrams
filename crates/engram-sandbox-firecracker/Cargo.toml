@@ -19,6 +19,7 @@ unsafe_code = "allow"
 tempfile = "3"
 engram-chunk-store.workspace = true
 engram-core.workspace = true
+engram-host-core.workspace = true
 engram-egress-proto.workspace = true
 sha2.workspace = true
 hex.workspace = true

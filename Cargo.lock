@@ -2952,6 +2952,7 @@ dependencies = [
  "engram-egress-proto",
  "engram-egress-proxy",
  "engram-harness-proto",
+ "engram-host-core",
  "engram-oci",
  "engram-rootfs-materializer",
  "engram-storage-local",

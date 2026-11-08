@@ -138,9 +138,13 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
         let mut config =
             engram_sandbox_firecracker::FirecrackerConfig::with_kernel(dir.join("kernel"));
         config.bundle_dir = dir.to_owned();
-        ManagedBackend::Firecracker(Arc::new(
-            engram_sandbox_firecracker::FirecrackerBackend::new(dir.join("native"), config),
-        ))
+        ManagedBackend::Firecracker {
+            backend: Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
+                dir.join("native"),
+                config,
+            )),
+            disk: Arc::new(engram_host_core::FileDisk::new(dir.join("volumes"), 4096).unwrap()),
+        }
     };
     let chunks = engram_chunk_store::ChunkStore::new(Arc::new(
         engram_storage_local::LocalBlobStorage::new(dir.join("blob")),

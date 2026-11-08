@@ -495,11 +495,6 @@ async fn main() -> Result<(), HostAgentError> {
                      iptables/ip are on PATH."
                 );
             }
-            #[cfg(target_os = "linux")]
-            if cfg.managed_tls.is_some() {
-                managed_backend =
-                    Some(engram_host_agent::managed_boot::ManagedBackend::Firecracker(fc.clone()));
-            }
             fc_for_reattach = Some(fc.clone());
             fc
         }
@@ -620,6 +615,17 @@ async fn main() -> Result<(), HostAgentError> {
             Arc::new(disk)
         }
     };
+    #[cfg(target_os = "linux")]
+    if cfg.managed_tls.is_some() {
+        if let Some(backend) = fc_for_reattach.as_ref() {
+            managed_backend = Some(
+                engram_host_agent::managed_boot::ManagedBackend::Firecracker {
+                    backend: backend.clone(),
+                    disk: session_disk.clone(),
+                },
+            );
+        }
+    }
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
     // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute

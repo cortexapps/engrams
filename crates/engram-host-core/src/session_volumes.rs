@@ -86,7 +86,7 @@ pub fn checkpoint_name(sandbox: SandboxId, role: DiskRole, manifest: ManifestRef
     .expect("a checkpoint volume name is at most 100 bytes of [a-z0-9-]")
 }
 
-fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
+pub fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     VolumeName::new(format!(
         "{TRANSIENT_PREFIX}{}-{}",
         sandbox.as_uuid().simple(),

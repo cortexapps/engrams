@@ -6,6 +6,8 @@ mod child;
 #[cfg(any(target_os = "linux", test))]
 mod configure;
 #[cfg(any(target_os = "linux", test))]
+mod disk;
+#[cfg(any(target_os = "linux", test))]
 mod files;
 mod network;
 #[cfg(target_os = "linux")]
@@ -64,6 +66,7 @@ impl crate::FirecrackerBackend {
         spec: SandboxSpec,
         network: RegisteredPrivateNetwork,
         staging: tempfile::TempDir,
+        session_disk: std::sync::Arc<dyn engram_host_core::SessionDisk>,
     ) -> Result<PreparedManagedFc, SandboxError> {
         request.validate(&spec).map_err(SandboxError::InvalidSpec)?;
         let allocation = network.allocation();
@@ -78,11 +81,11 @@ impl crate::FirecrackerBackend {
         let shape = network::NetworkShape::new(allocation.guest_ip, allocation.gateway_ip)?;
         #[cfg(target_os = "linux")]
         {
-            prepare(self, request, spec, network, shape, staging).await
+            prepare(self, request, spec, network, shape, staging, session_disk).await
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (shape, staging);
+            let _ = (shape, staging, session_disk);
             Err(SandboxError::InvalidSpec(
                 "managed Firecracker preparation requires Linux".into(),
             ))
@@ -158,7 +161,7 @@ impl PreparedManagedFc {
         }
         self.inner.started = true;
         // An issued start can change the disk before its reply. Preserve the
-        // exact private lineage through cancellation, Drop and terminal close.
+        // exact private lineage through cancellation, Drop and failure cleanup.
         self.inner
             .files
             .retain
@@ -296,6 +299,12 @@ impl PreparedManagedFc {
             .files
             .retain
             .store(true, std::sync::atomic::Ordering::Release);
+        self.inner
+            .files
+            .disks
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("managed disk owner missing"))?
+            .retain_source();
         if !self.inner.started {
             if let Some(epoch) = self.inner.released_epoch {
                 self.check_ready(epoch).await?;
@@ -310,32 +319,40 @@ impl PreparedManagedFc {
         self.inner.streams.shutdown().await;
         self.inner.adapter.close().await?;
         self.inner.process.close().await?;
-        let source = self.inner.files.path.join("rootfs.ext4");
-        let destination = destination.to_owned();
-        tokio::task::spawn_blocking(move || {
-            std::fs::File::open(&source)?.sync_all()?;
-            std::fs::copy(&source, &destination)?;
-            std::fs::File::open(&destination)?.sync_all()
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+        self.inner.files.export_capture(destination).await?;
+        Ok(())
+    }
+    /// The host has durably recorded the exported file's exact hash and size.
+    #[cfg(target_os = "linux")]
+    pub fn capture_stored(&mut self) -> Result<(), SandboxError> {
+        self.inner.files.capture_stored()?;
         Ok(())
     }
     /// Wait for adapter and VM cleanup. Drop initiates cleanup only.
-    pub async fn close(mut self) -> Result<(), SandboxError> {
+    pub async fn close(self) -> Result<(), SandboxError> {
+        self.close_inner(false).await
+    }
+    /// An authenticated delete may discard a known live source after reaping.
+    /// It cannot discard an uncertain start or an incomplete capture.
+    pub async fn destroy(self) -> Result<(), SandboxError> {
+        self.close_inner(true).await
+    }
+    async fn close_inner(mut self, destroy: bool) -> Result<(), SandboxError> {
         #[cfg(target_os = "linux")]
         {
+            let uncertain = self.inner.failed;
             self.inner.failed = true;
             self.inner.streams.shutdown().await;
             let network = self.inner.adapter.close().await;
             let process = self.inner.process.close().await;
             network?;
             process?;
+            self.inner.files.close(destroy, uncertain).await?;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = &mut self;
+            let _ = (&mut self, destroy);
             Ok(())
         }
     }
@@ -369,6 +386,7 @@ async fn prepare(
     registered: RegisteredPrivateNetwork,
     shape: network::NetworkShape,
     staging: tempfile::TempDir,
+    session_disk: std::sync::Arc<dyn engram_host_core::SessionDisk>,
 ) -> Result<PreparedManagedFc, SandboxError> {
     use std::{io, sync::Arc};
     let allocation = registered.allocation().clone();
@@ -378,9 +396,29 @@ async fn prepare(
         let cfg = backend.config.clone();
         let req = request.clone();
         let spec = spec.clone();
-        let pin = tokio::task::spawn_blocking(move || {
-            // A cancelled prepare cannot remove input still used by this task.
-            files::PinnedFiles::prepare(&work, &cfg, &req, &spec, staging)
+        // Own creation through completion: cancellation cannot abandon an ioctl
+        // after it creates a volume but before the owner records its name.
+        let pin = tokio::spawn(async move {
+            let pin_request = req.clone();
+            let pin_spec = spec.clone();
+            let mut files = tokio::task::spawn_blocking(move || {
+                files::PinnedFiles::prepare(&work, &cfg, &pin_request, &pin_spec, staging)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            files.disks = Some(disk::Disks::new(session_disk, req.sandbox_id));
+            files
+                .disks
+                .as_ref()
+                .expect("disk owner installed")
+                .install(
+                    &files.path,
+                    &req.disk.sha256,
+                    req.disk.size_bytes,
+                    spec.swap_mib,
+                )
+                .await?;
+            Ok::<_, io::Error>(files)
         });
         tokio::select! { biased;
             _ = wait_for_stop(&private) => return Err(io::Error::other("private allocation stopped").into()),

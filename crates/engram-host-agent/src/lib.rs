@@ -390,7 +390,10 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
-                arc.reconcile_volumes().await;
+                let bindings =
+                    crate::bindings::BindingStore::open(self.cfg.work_dir.join("bindings"))
+                        .map_err(HostAgentError::Io)?;
+                arc.reconcile_volumes(&bindings).await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
