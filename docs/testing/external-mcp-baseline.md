@@ -14,10 +14,32 @@ The feature must stay disabled until the release gates pass.
 | Firecracker production          | Not established                    | No real production run; fork runners are not provisioned |
 
 The full Postgres suite failed in `sandbox.test.ts`: the deep-recursion case
-expected a QuickJS `SandboxError`, but observed a stack error mismatch. The
+expected a stack error (`StackError`, `InternalError`, or `RangeError`), but
+observed `SandboxError`. The
 focused file then passed all 15 tests. A 100-repeat recursion probe observed
 `StackError`. This is an unrelated known baseline issue. Keep its assertion and
 suite intact; do not use the focused pass to describe the full suite as green.
+
+## Verification on 2026-11-08
+
+At source `c8154095`, the unchanged sandbox file passed 15 tests in one run
+with Bun 1.4.4. One complete orchestrator run then passed 3,248 tests, skipped
+18, and failed none across 300 files. Its command was
+`bun --no-env-file --no-install test`, with no filter or concurrency override.
+The deep-recursion assertion passed in that full run. The tracked orchestrator
+files did not change during the run.
+
+The full run used two new isolated databases on the owned loopback test
+cluster: one application database and one separate DBOS test database. The
+existing helper verified both identities before migration or test writes.
+Only those new databases were migrated or used for this check. Both were
+removed after the test process and its children stopped.
+
+This is no reproduction of the earlier failure, not a repair claim. The
+original failure remains in the baseline above, and its assertion and suite
+are unchanged. The local Node version was 24.13.0; CI pins 24.22.2. This local
+result does not establish current-head remote CI, provider behavior, or physical
+Firecracker acceptance.
 
 The new `mcp-worker` package uses Node 24. Its deterministic local fixture has
 real TLS and the pinned official MCP client. It covers modern and legacy
@@ -37,9 +59,9 @@ npm test --prefix mcp-worker
 npm run build --prefix mcp-worker
 ```
 
-The rollout/CI task must wire these commands into the path detector and required
-`CI Gate` dependency graph before the feature ships. The fixture foundation does
-not modify the workflow or enable any production dispatch path.
+The current worker CI job runs these commands, is selected by the path detector,
+and participates in the required `CI Gate`. Workflow wiring does not establish
+a passing current-head result or enable production dispatch.
 
 ## Unreleased migration numbering
 
