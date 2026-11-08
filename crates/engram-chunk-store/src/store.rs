@@ -83,8 +83,10 @@ pub struct ChunkStore {
     /// Shared by every clone, so the uploads of one process to `inner`
     /// see each other.
     uploads: Arc<crate::uploads::Uploads>,
-    /// The manifests this process read or wrote last. A manifest version
-    /// is written once and never changes, so a hit is always current.
+    /// The manifests this process read last. A manifest version is written
+    /// once, so a hit is current. A PUT does not fill it: the existence
+    /// check before a PUT is not atomic, and only a read shows what the
+    /// store holds.
     manifests: Arc<ManifestCache>,
 }
 
@@ -482,7 +484,6 @@ impl ChunkStore {
         }
         let bytes = serde_json::to_vec(m)?;
         let _ = self.inner.put(&key, Bytes::from(bytes)).await?;
-        self.manifests.insert(r, Arc::new(m.clone()));
         tracing::debug!(
             manifest_id = %r.manifest_id,
             version = r.version,
