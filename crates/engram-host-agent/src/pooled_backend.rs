@@ -1891,7 +1891,7 @@ impl PooledBackend {
         staged_refs.dedup();
         let mut staged_manifests = match (memory_is_lazy, self.fill.clone()) {
             (true, Some(fill)) => Some(AbortTaskOnDrop(tokio::spawn(
-                stage_memory_manifests(fill, src.clone(), staged_refs.clone())
+                stage_memory_manifests(fill, src.clone(), id, staged_refs.clone())
                     .instrument(tracing::info_span!("restore.stage_manifests")),
             ))),
             _ => None,
@@ -1909,6 +1909,7 @@ impl PooledBackend {
             {
                 Ok(disks) => Some(disks),
                 Err(error) => {
+                    remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
                     self.drop_failed_restore(id);
                     return Err(error);
                 }
@@ -2018,13 +2019,7 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
         }
         .await;
-        if let Some(staged) = staged_manifests {
-            drop(staged);
-            for r in &staged_refs {
-                let _ = fs::remove_file(engram_sandbox_firecracker::staged_manifest_path(&src, r))
-                    .await;
-            }
-        }
+        remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
         if restore.is_err() {
             self.drop_failed_restore(id);
             if let Some(volumes) = self.volumes.as_ref() {
@@ -3983,6 +3978,7 @@ impl PooledBackend {
 async fn stage_memory_manifests(
     fill: FillEngine,
     dir: PathBuf,
+    sandbox_id: SandboxId,
     refs: Vec<engram_core::types::manifest::ManifestRef>,
 ) {
     let stage = |r| {
@@ -3994,7 +3990,7 @@ async fn stage_memory_manifests(
                 .await
                 .map_err(|e| e.to_string())?;
             let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
-            let path = engram_sandbox_firecracker::staged_manifest_path(&dir, &r);
+            let path = engram_sandbox_firecracker::staged_manifest_path(&dir, sandbox_id, &r);
             let tmp = path.with_extension("json.tmp");
             fs::write(&tmp, bytes).await.map_err(|e| e.to_string())?;
             fs::rename(&tmp, &path).await.map_err(|e| e.to_string())
@@ -4007,6 +4003,25 @@ async fn stage_memory_manifests(
         if let Err(error) = result {
             tracing::warn!(manifest = %r, %error, "manifest copy not staged; the handler reads the store");
         }
+    }
+}
+
+/// Wait for the staging task of a restore, then remove its manifest
+/// copies. The wait comes first: a blocking file write outlives an abort.
+async fn remove_staged_manifests(
+    staging: Option<AbortTaskOnDrop>,
+    dir: &Path,
+    sandbox_id: SandboxId,
+    refs: &[engram_core::types::manifest::ManifestRef],
+) {
+    let Some(mut staging) = staging else {
+        return;
+    };
+    let _ = (&mut staging.0).await;
+    for r in refs {
+        let path = engram_sandbox_firecracker::staged_manifest_path(dir, sandbox_id, r);
+        let _ = fs::remove_file(path.with_extension("json.tmp")).await;
+        let _ = fs::remove_file(path).await;
     }
 }
 
