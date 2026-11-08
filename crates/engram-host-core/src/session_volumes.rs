@@ -289,33 +289,33 @@ impl SessionVolumes {
         // A sandbox resumed on this host is live again: its kept
         // checkpoint is no longer the reap's to purge.
         self.kept.lock().unwrap().retain(|s| *s != sandbox);
-        // The roles use separate volumes, so they provision together.
-        let provisioned = async {
-            let swap = async {
-                match swap {
-                    Some(source) => self
-                        .provision_role(&fill, sandbox, DiskRole::Swap, source)
-                        .await
-                        .map(|(path, manifest)| (Some(path), Some(manifest))),
-                    None => Ok((None, None)),
-                }
-            };
-            let ((root, root_manifest), (swap, swap_manifest)) = tokio::try_join!(
-                self.provision_role(&fill, sandbox, DiskRole::Root, root),
-                swap
-            )?;
-            Ok(Provisioned {
+        // The roles use separate volumes, so they provision together. Both
+        // run to the end before a purge: a role dropped mid-way can still
+        // make a thin volume that has no name, which the purge cannot find.
+        let swap = async {
+            match swap {
+                Some(source) => self
+                    .provision_role(&fill, sandbox, DiskRole::Swap, source)
+                    .await
+                    .map(|(path, manifest)| (Some(path), Some(manifest))),
+                None => Ok((None, None)),
+            }
+        };
+        match tokio::join!(
+            self.provision_role(&fill, sandbox, DiskRole::Root, root),
+            swap
+        ) {
+            (Ok((root, root_manifest)), Ok((swap, swap_manifest))) => Ok(Provisioned {
                 root,
                 root_manifest,
                 swap,
                 swap_manifest,
-            })
+            }),
+            (Err(error), _) | (_, Err(error)) => {
+                let _ = self.purge(sandbox).await;
+                Err(error)
+            }
         }
-        .await;
-        if provisioned.is_err() {
-            let _ = self.purge(sandbox).await;
-        }
-        provisioned
     }
 
     /// The checkpoint volume first, under the transient name until its
