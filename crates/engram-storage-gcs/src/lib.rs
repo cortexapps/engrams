@@ -490,14 +490,6 @@ mod tests {
         blob_conformance::streaming_round_trip(&store, 64 * 1024, 1024).await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn conformance_ranged_get_against_emulator() {
-        let Some(store) = emulator_store().await else {
-            return;
-        };
-        blob_conformance::ranged_get(&store).await;
-    }
-
     #[test]
     fn a_gcs_range_names_the_first_and_last_byte() {
         let range = gcs_range(65_536, 65_536).unwrap();

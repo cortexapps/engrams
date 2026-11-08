@@ -394,6 +394,25 @@ mod tests {
         FaultPlan, FaultyBlobStorage, GetFault, GetFaultKind, InjectedError, KeyMatch, When,
     };
 
+    /// GCS's ranged GET through the client that wraps every store. The
+    /// emulator closes its connection after a 416 without a
+    /// `Connection: close`, so a request on the pooled connection can fail
+    /// in transport; the client retries it, as it does in production.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_ranged_get_against_emulator() {
+        if std::env::var("STORAGE_EMULATOR_HOST").is_err() {
+            return;
+        }
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+        let gcs = engram_storage_gcs::GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+        let client = BlobClient::wrap(Arc::new(gcs));
+        engram_testkit::blob_conformance::ranged_get(&client).await;
+    }
+
     fn test_policy() -> ClientPolicy {
         ClientPolicy {
             attempts: 3,

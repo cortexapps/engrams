@@ -333,9 +333,11 @@ pub async fn ranged_get(store: &dyn BlobStorage) {
         );
     }
     let missing = format!("{}/absent.bin", unique_prefix("ranged"));
-    assert!(matches!(
-        store.get_range(&missing, 0, 1).await,
-        Err(BlobError::NotFound)
-    ));
+    let got = store.get_range(&missing, 0, 1).await;
+    assert!(
+        matches!(got, Err(BlobError::NotFound)),
+        "a missing key must be NotFound, got {:?}",
+        got.map(|b| b.len())
+    );
     store.delete(&key).await.expect("delete");
 }
