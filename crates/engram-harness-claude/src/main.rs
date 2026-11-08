@@ -1,32 +1,15 @@
 //! Harness adapter for the `claude` CLI.
 //!
-//! Lives at `/sbin/engram-harness-claude` inside the rootfs (or
-//! cargo-target/.../engram-harness-claude on the dev-mode
-//! ProcessBackend path). Exec'd by `engram-agentd`'s harness
-//! supervisor after the host pushes a `SpawnHarness` request
-//! describing this binary.
+//! `engram-agentd` starts this binary from a `SpawnHarness` request.
+//! One persistent `claude --print --input-format stream-json
+//! --output-format stream-json --verbose` process serves each session.
+//! The adapter keeps stdin open and sends a user record for each prompt.
+//! Explicit result records delimit turns; EOF during a turn triggers
+//! crash recovery. Generated PreToolUse settings route native tool
+//! requests through the harness.
 //!
-//! Strategy: a single **persistent streaming** `claude` process per
-//! session. The wrapper spawns `claude --print --input-format
-//! stream-json --output-format stream-json --verbose
-//! --dangerously-skip-permissions [--resume <claude_id>]` ONCE, holds
-//! its stdin open, and writes one newline-delimited `user` message per
-//! prompt. Turn boundaries come from claude's explicit `result` line on
-//! the stream — NOT from process EOF — so a clean turn-end and a crash
-//! are now unambiguous (EOF mid-turn = a real crash, auto-recovered by
-//! respawning `--resume`). This is the root-cause fix for the
-//! child-per-prompt EOF-inference wedge (ADR 0052).
-//!
-//! `--dangerously-skip-permissions` is mandatory: there's no human in
-//! the VM to answer permission prompts, and `--print` mode aborts
-//! with exit 1 the first time a tool needs approval otherwise. The
-//! sandbox is the safety boundary, not Claude's per-tool consent.
-//!
-//! Each turn's `system`/`init` line carries Claude's session id, which
-//! we stash in `/workspace/.engrams/claude-session-id` so a respawn
-//! (idle-resume or crash recovery) can `--resume` into the same
-//! conversation. Lost on cold death (Dead status); a forked session
-//! gets a fresh Claude conversation.
+//! The system/init record supplies Claude's conversation ID. The adapter
+//! saves it in `/workspace/.engrams/claude-session-id` for `--resume`.
 
 // Cross-platform stub — vsock dialing is Linux-only, and the
 // adapter only ships inside FC rootfs / Linux ProcessBackend.
@@ -324,12 +307,8 @@ mod adapter {
         #[arg(long, default_value_t = 600)]
         pub max_tool_call_secs: u64,
 
-        /// Whole-run wall-clock cap (seconds). After this the
-        /// adapter SIGTERMs `claude` and emits
-        /// `RunCompleted{ok:false}`. Default is 24h: an autonomous
-        /// agent in an isolated VM is expected to be able to grind
-        /// on a task for many hours without the wrapper killing it
-        /// out from under it. Tighten per-deployment if needed.
+        /// Whole-run wall-clock cap (seconds). On expiry, kill Claude
+        /// and report a failed completion. Default is 24 hours.
         #[arg(long, default_value_t = 86_400)]
         pub max_run_secs: u64,
 
@@ -1270,11 +1249,9 @@ mod adapter {
         }
     }
 
-    /// ADR 0089 P2: disposable stdio MCP frontend. Claude owns this process's
-    /// lifetime, so it keeps no correlation state: initialize and tools/list
-    /// are answered from the inherited manifest, while each tools/call blocks
-    /// on the long-lived harness main process over a one-line unix-socket
-    /// request/response.
+    /// Stdio MCP frontend owned by Claude. It answers discovery from the
+    /// inherited manifest and tracks pending request IDs for cancellation.
+    /// Tool calls use the long-lived harness over a Unix socket.
     pub mod mcp_bridge {
         use super::{
             browser_view, injected_tools, manifest_from_env, BufReader, McpToolResult,
@@ -1551,11 +1528,9 @@ mod adapter {
         }
     }
 
-    /// ADR 0089 P2: long-lived MCP server half owned by `run_engine`. Each
-    /// bridge connection represents one blocking MCP tools/call. A result
-    /// already in hand is consumed immediately (the deferred re-fire path);
-    /// otherwise the connection is parked in a oneshot table and the generic
-    /// request event is emitted exactly once.
+    /// Long-lived MCP server owned by `run_engine`. Pending connections park
+    /// in a oneshot table and emit requests. A new socket can replace the
+    /// same call's owner; a stashed result returns without a new request.
     pub mod mcp_server {
         use super::{emit, hook_server, BufReader, HarnessEvent, ResultFormat, ToolManifest};
         use serde::{Deserialize, Serialize};
@@ -1812,7 +1787,10 @@ mod adapter {
                     .get_mut(&call_id)
                     .filter(|call| Arc::ptr_eq(&call.socket_owner, socket_owner))
                     // Keep identity after disconnect for late host results.
-                    .is_some_and(|call| call.sender.take().is_some())
+                    .is_some_and(|call| {
+                        let disconnected = call.sender.take().is_some();
+                        disconnected && call.result_format == ResultFormat::Mcp
+                    })
             };
             // A re-fire can replace this ID while the old socket waits for
             // the map lock. Only the socket that still owns it may cancel.
@@ -2406,14 +2384,22 @@ mod adapter {
         ]
     }
 
+    /// Deferred completion grants dispatch authority only to MCP-format calls.
     fn unresolved_deferred_ids(
         run_id: &str,
         calls: &HashMap<String, hook_server::DeferredCall>,
         results: &HashMap<String, String>,
+        manifest: &[ManifestTool],
     ) -> Vec<String> {
         let mut ids: Vec<_> = calls
             .iter()
-            .filter(|(id, call)| call.run_id == run_id && !results.contains_key(*id))
+            .filter(|(id, call)| {
+                call.run_id == run_id
+                    && !results.contains_key(*id)
+                    && manifest.iter().any(|tool| {
+                        tool.name == call.tool_name && tool.result_format == ResultFormat::Mcp
+                    })
+            })
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
@@ -2997,7 +2983,7 @@ mod adapter {
                                         let results = results_in_hand.lock().await;
                                         if !is_delivery_resume || results.is_empty() {
                                             let calls = deferred_calls.lock().await;
-                                            deferred_ids = unresolved_deferred_ids(&run_id, &calls, &results);
+                                            deferred_ids = unresolved_deferred_ids(&run_id, &calls, &results, &cli.tool_manifest);
                                         }
                                     }
                                     let invalid_deferred_ids = deferred_ids.len() > 128
@@ -5240,12 +5226,22 @@ mod adapter {
             let deferred: hook_server::DeferredCalls =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let (evt_tx, evt_rx) = mpsc::channel(16);
+            let mut manifest = vec![
+                generic_tool("save_memory", ToolExecution::Sync),
+                native_question_tool(),
+                generic_tool("exit_plan_mode", ToolExecution::Deferred),
+            ];
+            for name in ["mcp_inventory_01234567890123456789", "remote_inventory"] {
+                let mut tool = generic_tool(name, ToolExecution::Sync);
+                tool.result_format = ResultFormat::Mcp;
+                manifest.push(tool);
+            }
             tokio::spawn(mcp_server::serve(
                 listener,
                 mcp_server::State {
                     results_in_hand: results.clone(),
                     parked_calls: parked.clone(),
-                    manifest: Arc::new(Vec::new()),
+                    manifest: Arc::new(manifest),
                     deferred_calls: deferred.clone(),
                     current_run_id: run_id.clone(),
                     evt_tx,
@@ -5322,6 +5318,67 @@ mod adapter {
             );
             assert!(results.lock().await.is_empty());
             let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
+        async fn ordinary_bridge_disconnect_preserves_predecessor_events() {
+            for name in [
+                "ask_user_question",
+                "exit_plan_mode",
+                "save_memory",
+                "unknown_tool",
+            ] {
+                let (sock, results, parked, mut events, _) = spawn_main_mcp_server().await;
+                let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+                let request =
+                    serde_json::json!({"name":name,"args":{},"tool_use_id":"ordinary-call"});
+                stream
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { .. })
+                ));
+                drop(stream);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if parked
+                            .lock()
+                            .await
+                            .get("ordinary-call")
+                            .is_some_and(|call| call.sender.is_none())
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    events.try_recv().is_err(),
+                    "ordinary {name} cannot emit a new event variant"
+                );
+                assert!(
+                    !mcp_server::route_tool_result(
+                        "ordinary-call",
+                        "late".into(),
+                        &parked,
+                        &results
+                    )
+                    .await
+                );
+                assert_eq!(
+                    results
+                        .lock()
+                        .await
+                        .get("ordinary-call")
+                        .map(String::as_str),
+                    Some("late")
+                );
+                tokio::fs::remove_file(sock).await.unwrap();
+            }
         }
 
         #[tokio::test]
@@ -8776,10 +8833,128 @@ mod adapter {
             let results = [("received".to_string(), "{}".to_string())]
                 .into_iter()
                 .collect();
+            let mut tool = generic_tool("save_memory", ToolExecution::Deferred);
+            tool.result_format = ResultFormat::Mcp;
             assert_eq!(
-                unresolved_deferred_ids("run-a", &calls, &results),
+                unresolved_deferred_ids("run-a", &calls, &results, &[tool]),
                 ["current"]
             );
+        }
+
+        #[tokio::test]
+        async fn deferred_event_contract_distinguishes_ordinary_and_mcp_calls() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut mismatches = Vec::new();
+            for (case, hooks, expected_ids) in [
+                ("question", vec![("question", "AskUserQuestion")], vec![]),
+                ("plan", vec![("plan", "ExitPlanMode")], vec![]),
+                (
+                    "generic",
+                    vec![("generic", "mcp__engrams__save_memory")],
+                    vec![],
+                ),
+                (
+                    "mcp",
+                    vec![("managed", "mcp__engrams__remote_inventory")],
+                    vec!["managed"],
+                ),
+                (
+                    "mixed",
+                    vec![
+                        ("question", "AskUserQuestion"),
+                        ("plan", "ExitPlanMode"),
+                        ("managed-b", "mcp__engrams__remote_inventory"),
+                        ("managed-a", "mcp__engrams__remote_write"),
+                    ],
+                    vec!["managed-a", "managed-b"],
+                ),
+                (
+                    "mixed-invalid-ordinary",
+                    vec![
+                        ("", "AskUserQuestion"),
+                        ("managed", "mcp__engrams__remote_inventory"),
+                    ],
+                    vec!["managed"],
+                ),
+            ] {
+                let base =
+                    std::env::temp_dir().join(format!("event-contract-{}", uuid::Uuid::new_v4()));
+                let script = base.with_extension("sh");
+                let gate = base.with_extension("gate");
+                let body = format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\nIFS= read -r _prompt\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\nwhile IFS= read -r _line; do :; done\n",
+                    gate.display(),
+                );
+                tokio::fs::write(&script, body).await.unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let (mut cli, hook, _) = deferred_engine_cli(script.to_string_lossy().into_owned());
+                let mut plan = generic_tool("exit_plan_mode", ToolExecution::Deferred);
+                plan.native_bindings.claude = Some("ExitPlanMode".into());
+                let mut external = generic_tool("remote_inventory", ToolExecution::Deferred);
+                external.result_format = ResultFormat::Mcp;
+                let mut write = external.clone();
+                write.name = "remote_write".into();
+                cli.tool_manifest
+                    .extend([native_question_tool(), plan, external, write]);
+                let (cmd_tx, cmd_rx) = mpsc::channel(8);
+                let (evt_tx, mut events) = mpsc::channel(64);
+                let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+                assert!(matches!(events.recv().await, Some(HarnessEvent::Idle)));
+                cmd_tx
+                    .send(HarnessCommand::Prompt {
+                        prompt_id: case.into(),
+                        text: "test".into(),
+                        mode: None,
+                    })
+                    .await
+                    .unwrap();
+                let run_id = expect_run_started(&mut events).await;
+                for (id, name) in hooks {
+                    assert!(matches!(hook_fire_named(&hook, id, name, serde_json::json!({"call":id,"questions":[{"question":"Pick one","header":"Pick","multiSelect":false,"options":[{"label":"A","description":"A"}]}]})).await, hook_server::HookVerdict::Defer));
+                    assert!(
+                        matches!(tokio::time::timeout(Duration::from_secs(1), events.recv()).await.expect(case), Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == id)
+                    );
+                }
+                tokio::fs::write(&gate, "go").await.unwrap();
+                let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match events.recv().await {
+                            Some(event @ HarnessEvent::RunCompleted { .. })
+                            | Some(event @ HarnessEvent::RunDeferred { .. }) => break event,
+                            Some(_) => {}
+                            None => panic!("engine closed for {case}"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                cmd_tx
+                    .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), engine)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::fs::remove_file(script).await.unwrap();
+                tokio::fs::remove_file(gate).await.unwrap();
+                let expected = if expected_ids.is_empty() {
+                    HarnessEvent::RunCompleted { run_id, ok: true }
+                } else {
+                    HarnessEvent::RunDeferred {
+                        run_id,
+                        deferred_tool_call_ids: expected_ids
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                    }
+                };
+                if terminal != expected {
+                    mismatches.push(format!("{case}: expected {expected:?}, got {terminal:?}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
         }
 
         #[tokio::test]
@@ -8803,7 +8978,8 @@ mod adapter {
                 );
                 tokio::fs::write(&script, body).await.unwrap();
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-                let (cli, hook, _) = deferred_engine_cli(script.to_string_lossy().into_owned());
+                let (mut cli, hook, _) = deferred_engine_cli(script.to_string_lossy().into_owned());
+                cli.tool_manifest[0].result_format = ResultFormat::Mcp;
                 let (cmd_tx, cmd_rx) = mpsc::channel(8);
                 let (evt_tx, mut evt_rx) = mpsc::channel(64);
                 let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -8929,7 +9105,7 @@ mod adapter {
             assert_eq!(
                 terminal,
                 Some(serde_json::json!({
-                    "RunDeferred": {"run_id": deferred_run, "deferred_tool_call_ids": ["toolu_deferred"]}
+                    "RunCompleted": {"run_id": deferred_run, "ok": true}
                 }))
             );
 
