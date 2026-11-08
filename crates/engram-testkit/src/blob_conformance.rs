@@ -324,12 +324,11 @@ pub async fn ranged_get(store: &dyn BlobStorage) {
         );
     }
     for (offset, len) in [(size - 5, 6), (size, 1), (size + 10, 1), (0, 0)] {
+        let got = store.get_range(&key, offset, len).await;
         assert!(
-            matches!(
-                store.get_range(&key, offset, len).await,
-                Err(BlobError::RangeOutOfBounds { .. })
-            ),
-            "range [{offset}, +{len}) must be out of bounds"
+            matches!(got, Err(BlobError::RangeOutOfBounds { .. })),
+            "range [{offset}, +{len}) must be out of bounds, got {:?}",
+            got.map(|b| b.len())
         );
     }
     let missing = format!("{}/absent.bin", unique_prefix("ranged"));
