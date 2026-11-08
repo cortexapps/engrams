@@ -502,7 +502,12 @@ export const oauthAuthorityDriver: CaseDriver = async ({
           scenario.connection.id,
           current.current.connection.configRevision,
         );
-        const recovery = await recoverCurrentBinding(ctx, scenario, database);
+        const recovery = await recoverCurrentBinding(
+          ctx,
+          scenario,
+          database,
+          change,
+        );
         requireThat(
           recovery.old.binding_hash === old.bindingHash,
           "oauth_recovery_old_binding",
