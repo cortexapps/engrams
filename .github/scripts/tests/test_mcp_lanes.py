@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -114,6 +115,8 @@ class McpLanes(unittest.TestCase):
                      'tests/fixtures/mcp-stack/platform/supervisor.ts',
                      'tests/fixtures/mcp-stack/platform/platform.test.ts',
                      'tests/fixtures/mcp-stack/platform/composition.test.ts',
+                     'tests/fixtures/mcp-stack/platform/fc-thin.ts',
+                     'tests/fixtures/mcp-stack/platform/fc-thin.test.ts',
                      'tests/fixtures/mcp-stack/platform/tsconfig.json']:
             with self.subTest(path=path):
                 result = detect(path)
@@ -158,8 +161,34 @@ class McpLanes(unittest.TestCase):
         for lane in ['orchestrator', 'mcp-worker', 'test-linux', 'test-macos']:
             self.assertIn(f'      - {lane}\n', gate)
 
+    def test_fc_boot_manifest_is_an_optional_literal_argument_from_admin_environment(self):
+        workflow = (SCRIPT.parents[1] / 'workflows/ci.yml').read_text()
+        lane = workflow.split('  mcp-physical-fc:', 1)[1].split('  mcp-physical-vz:', 1)[0]
+        self.assertIn('MCP_FC_BOOT_ARTIFACTS: ${{ vars.MCP_FC_BOOT_ARTIFACTS }}', lane)
+        run = lane.split('        run: |\n', 1)[1].split('      - uses:', 1)[0]
+        self.assertNotIn('${{', run)
+        argv = run[run.index('          args=('):]
+        script = 'set -euo pipefail\nroot=/owned/run\nsudo() { printf "%s\\0" "$@"; }\n' + argv
+        expected = ['--preserve-env=GITHUB_TOKEN', 'python3', '-I', '.github/scripts/mcp-stack-assets.py',
+                    '--backend', 'firecracker', '--operator', '/etc/engrams/mcp-physical-firecracker.json',
+                    '--work-root', '/owned/run']
+        for manifest in [None, '', '/owned/manifest with spaces.json', '/owned/$(false);manifest.json']:
+            with self.subTest(manifest=manifest):
+                env = {'PATH': '/usr/bin:/bin'}
+                if manifest is not None:
+                    env['MCP_FC_BOOT_ARTIFACTS'] = manifest
+                result = subprocess.run(['/bin/bash', '-c', script], env=env, capture_output=True, check=True)
+                actual = result.stdout.decode().rstrip('\0').split('\0')
+                self.assertEqual(actual, expected + (['--boot-artifacts', manifest] if manifest else []))
+        self.assertIn('runs-on: [self-hosted, Linux, X64, engram-mcp-firecracker]', lane)
+        self.assertIn('cancel-in-progress: false', lane)
+        self.assertIn('MCP physical Firecracker (24 cases)', lane)
+        self.assertIn('      - mcp-physical-fc\n', workflow.split('  ci-gate:', 1)[1])
+
     def test_complete_physical_producer_selector(self):
-        for path in ['tests/fixtures/mcp-stack/platform/ci/linux-assets.Dockerfile',
+        for path in ['tests/fixtures/mcp-stack/platform/fc-thin.ts',
+                     'tests/fixtures/mcp-stack/platform/fc-thin.test.ts',
+                     'tests/fixtures/mcp-stack/platform/ci/linux-assets.Dockerfile',
                      '.github/scripts/mcp-stack-assets.py', '.github/scripts/mcp-stack-inputs.mts',
                      '.github/scripts/mcp-stack-fc.sh', 'docker/coordinator.Dockerfile',
                      'deploy/bundles/agentd/build.sh', 'deploy/demo/Dockerfile',

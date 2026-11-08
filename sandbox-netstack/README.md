@@ -2,8 +2,8 @@
 
 This artifact provides one IPv4 netstack per VM. It has no host IP listener,
 route mutation, external resolver, destination dial, switch, or NAT. It does not
-activate a backend or supply a final managed-policy proof. Creation remains
-blocked until the backend and durable boot producer supply their own checks.
+activate a backend or supply a final managed-policy proof. Managed creation also
+requires the backend and durable boot checks.
 
 Build with Go **1.26.2**, `GOTOOLCHAIN=local`. The exact module closure is in
 `go.mod` and `go.sum`. The gVisor pin is
@@ -25,8 +25,9 @@ The optional second argument selects an owned output directory. The default is
 for every Go cache and temporary file. The build writes
 `engram-sandbox-netstack` there, with `CGO_ENABLED=0` and `-trimpath`. The race gate
 uses `CGO_ENABLED=1` and needs a native C compiler. The tests build and execute the
-real helper, so the Go tool must be available when tests run. Packaging and CI
-must run these commands explicitly; Cargo does not run this module.
+real helper, so the Go tool must be available when tests run. The `netstack` CI
+lane runs these commands on Linux and macOS and publishes checksummed binaries.
+Cargo does not build this module.
 
 ## Descriptor and startup contract
 
@@ -158,19 +159,25 @@ failed cleanup as a failed enforcement receipt and replace the proxy before
 recovery. A helper OPEN or CLOSE response is never the final enforcement ACK.
 Bytes already delivered before the cleanup barrier cannot be revoked.
 
-## Closed VZ preparation
+## Managed VZ lifecycle
 
 `VzBackend::prepare_managed_cold` accepts this registered owner plus exact trusted
 cold disk and boot inputs and a selected helper artifact path/digest. It pins
 private copies, builds a fresh stopped machine with a file-handle attachment,
 and returns an opaque `PreparedManagedVz` outside the ordinary sandbox map.
-It does not load saved memory, start the machine, open the helper, publish a
-network enforcement proof, or return a final policy acknowledgement. Its only
-public lifecycle operations check closed readiness or asynchronously close and
-reap the owner. Drop starts cleanup without waiting. A thread reserved before
-helper creation owns cleanup through reaping, so an unresponsive child cannot
-block other allocations on the async executor. Canceling a close wait does not
-cancel cleanup or discard its result while the owner remains live.
+Preparation does not load saved memory, start the machine, open the helper,
+publish a network enforcement proof, or return a final policy acknowledgement.
+The owner can release the helper for the exact placement epoch, check current
+readiness, and start the harness once in the fresh VM. After start, it supports
+authenticated execution, file transfer and execution cancellation. Disk
+retirement stops the VM, closes the bridge and helper, and copies and syncs the
+root disk to the capture destination. It does not capture memory or device state.
+
+The owner also closes and reaps its resources asynchronously. Drop starts cleanup
+without waiting. A thread reserved before helper creation owns cleanup through
+reaping, so an unresponsive child cannot block other allocations on the async
+executor. Canceling a close wait does not cancel cleanup or discard its result
+while the owner remains live.
 
 The helper inherits only descriptors 0, 1 and 2 through native close-by-default
 spawn actions, an empty environment and no arguments. The selected native
@@ -178,13 +185,11 @@ attachment is retained and checked again on the VM queue. A helper cleanup
 failure remains failed after forced reaping. Only the proxy owns the stable
 session poison and final drain acknowledgement.
 
-The later start producer must supply trusted capture eligibility and exact
-artifact provenance, actual placement and a durable start intent, final policy
-and manifest checks, and all generic lifecycle gates. It must also install
-managed guest resolver setup for the exact gateway, including a pre-existing
-resolver file; the current image init uses legacy fixed resolver addresses.
-This guest setup does not supply enforcement proof. Real guest DNS and packet
-acceptance still require separate VM tests.
+The host's managed boot path validates capture eligibility, pinned artifacts,
+placement, final policy and manifest identity, and durable finalization before
+start. The host records the retired disk's hash and size before it closes the
+capture owner. Helper readiness alone does not establish these checks or prove
+guest DNS and packet enforcement. That proof requires actual VM acceptance.
 
 The backend-local process fixture uses the packaged helper explicitly:
 
@@ -194,5 +199,7 @@ ENGRAM_SANDBOX_NETSTACK_TEST_BIN=/path/to/verified/engram-sandbox-netstack \
   actual_helper_closed_lifetime_and_descriptor_isolation -- --ignored
 ```
 
-A missing fixture binary fails. CI must stage and verify that native artifact
-before invoking the target; Cargo alone does not build the Go helper.
+A missing fixture binary fails. The `vz` CI lane verifies the native artifact
+from `netstack`, then invokes all three packaged-helper tests through
+`.github/scripts/mcp-acceptance-helper.sh`. These process tests do not establish
+physical VM acceptance or a current-head CI result.

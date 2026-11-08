@@ -5,6 +5,8 @@ import io
 import json
 import os
 import signal
+import shutil
+import struct
 import time
 from pathlib import Path
 import socket
@@ -24,6 +26,333 @@ SPEC.loader.exec_module(assets)
 
 
 class PhysicalGates(unittest.TestCase):
+    @contextmanager
+    def boot_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            p, source, git = self.source_fixture(root)
+            git('update-index', '--add', '--cacheinfo', '160000,' + 'a' * 40 + ',third_party/firecracker')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture fork')
+            p.backend, p.arch = 'firecracker', 'amd64'
+            p.files = p.root / 'files'
+            p.files.mkdir(mode=0o700)
+            p.tools = {'gh': 'forbidden-gh', 'oras': 'forbidden-oras'}
+            call = p.call
+            def git_only(argv, **kwargs):
+                self.assertEqual(argv[0], '/usr/bin/git', 'Boot input must not start a download or executable')
+                return call(argv, **kwargs)
+            p.call = git_only
+            bundle = root / 'boot'
+            bundle.mkdir(mode=0o700)
+            ident = b'\x7fELF\x02\x01\x01' + bytes(9)
+            elf = struct.pack('<16sHHIQQQIHHHHHH', ident, 2, 62, 1, 0x400000, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+            elf += struct.pack('<IIQQQQQQ', 1, 5, 0, 0x400000, 0, 120, 120, 4096)
+            blobs = {'firecracker': elf, 'kernel': b'fixture kernel bytes',
+                     'kernelChecksum': (hashlib.sha256(b'fixture kernel bytes').hexdigest() +
+                                        '  vmlinux-engram-6.1.102-1\n').encode(),
+                     'provenance': json.dumps({'version': 1, 'kind': 'operator-built-firecracker',
+                                              'forkGitlink': 'a' * 40,
+                                              'target': 'x86_64-unknown-linux-musl', 'profile': 'release',
+                                              'firecrackerSha256': hashlib.sha256(elf).hexdigest()}).encode()}
+            names = {'firecracker': 'firecracker', 'kernel': 'vmlinux-engram-6.1.102-1',
+                     'kernelChecksum': 'vmlinux-engram-6.1.102-1.sha256', 'provenance': 'provenance.json'}
+            manifest = {'version': 1, 'kind': 'mcp-physical-boot-assets', 'backend': 'firecracker',
+                        'architecture': 'amd64', 'forkGitlink': 'a' * 40, 'kernelRelease': 'fc-kernel-6.1.102-1'}
+            for key, data in blobs.items():
+                path = bundle / names[key]
+                path.write_bytes(data)
+                path.chmod(0o400)
+                manifest[key] = {'path': str(path), 'sha256': hashlib.sha256(data).hexdigest()}
+            path = bundle / 'manifest.json'
+            def save():
+                if path.exists():
+                    path.chmod(0o600)
+                path.write_text(json.dumps(manifest))
+                path.chmod(0o400)
+            save()
+            yield p, path, manifest, save
+
+    def test_boot_artifacts_stage_exact_reviewed_bytes_without_download_or_execution(self):
+        with self.boot_fixture() as (p, path, manifest, _):
+            kernel, fork = p.acquire_boot(str(path))
+            for key, staged in [('kernel', Path(kernel['path'])), ('firecracker', fork)]:
+                self.assertEqual(hashlib.sha256(staged.read_bytes()).hexdigest(), manifest[key]['sha256'])
+                self.assertNotEqual(staged.stat().st_ino, Path(manifest[key]['path']).stat().st_ino)
+                self.assertTrue(staged.is_relative_to(p.root))
+            receipt = json.loads((p.root / 'fork-provenance.json').read_bytes())
+            self.assertEqual(receipt['kind'], 'operator-built')
+            self.assertEqual(receipt['gitlink'], manifest['forkGitlink'])
+            self.assertEqual(receipt['firecrackerSha256'], manifest['firecracker']['sha256'])
+            self.assertNotIn('manifest', receipt)
+            self.assertFalse((p.root / 'gh-config').exists())
+            self.assertFalse((p.root / 'fork-registry.json').exists())
+
+    def test_boot_artifacts_reject_invalid_manifest_and_never_download_fallback(self):
+        cases = [('extra', True), ('version', True), ('kind', 'other'), ('backend', 'vz'),
+                 ('architecture', 'arm64'), ('forkGitlink', 'b' * 40), ('kernelRelease', 'other'),
+                 ('firecracker', {'path': '/invalid', 'sha256': 'z' * 64}),
+                 ('kernel', {'path': '/invalid', 'sha256': 'a' * 64, 'extra': True})]
+        for key, value in cases:
+            with self.subTest(key=key), self.boot_fixture() as (p, path, manifest, save):
+                manifest[key] = value
+                save()
+                with self.assertRaises(RuntimeError):
+                    p.acquire_boot(str(path))
+                self.assertFalse((p.root / 'gh-config').exists())
+
+    def test_boot_artifacts_reject_duplicate_keys_in_manifest_pin_and_provenance(self):
+        for where in ['manifest', 'pin', 'provenance']:
+            with self.subTest(where=where), self.boot_fixture() as (p, path, manifest, save):
+                if where == 'provenance':
+                    receipt = Path(manifest['provenance']['path'])
+                    receipt.chmod(0o600)
+                    receipt.write_bytes(receipt.read_bytes().replace(b'"version": 1', b'"version": 1, "version": 1'))
+                    receipt.chmod(0o400)
+                    manifest['provenance']['sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                    save()
+                else:
+                    path.chmod(0o600)
+                    data = path.read_text()
+                    data = data.replace('"version": 1', '"version": 1, "version": 1', 1) if where == 'manifest' else data.replace(
+                        '"path": ', '"path": "/duplicate", "path": ', 1)
+                    path.write_text(data)
+                    path.chmod(0o400)
+                with self.assertRaisesRegex(RuntimeError, 'boot_json_duplicate'):
+                    p.acquire_boot(str(path))
+
+    def test_boot_artifacts_reject_unreviewed_receipt_identity_and_unknown_fields(self):
+        for key, value in [('version', True), ('kind', 'other'), ('forkGitlink', 'b' * 40),
+                           ('target', 'aarch64-unknown-linux-musl'), ('profile', 'debug'),
+                           ('firecrackerSha256', 'c' * 64), ('pass', True), ('command', 'arbitrary')]:
+            with self.subTest(key=key), self.boot_fixture() as (p, path, manifest, save):
+                receipt = Path(manifest['provenance']['path'])
+                data = json.loads(receipt.read_bytes())
+                data[key] = value
+                receipt.chmod(0o600)
+                receipt.write_text(json.dumps(data))
+                receipt.chmod(0o400)
+                manifest['provenance']['sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                save()
+                with self.assertRaisesRegex(RuntimeError, 'boot_provenance'):
+                    p.acquire_boot(str(path))
+
+    def test_boot_artifacts_reject_modified_pins_sidecar_and_nonstatic_elf(self):
+        cases = ['fork_hash', 'kernel_hash', 'receipt_hash', 'checksum_hash', 'sidecar_value',
+                 'sidecar_name', 'elf_arch', 'elf_class', 'elf_interp', 'elf_needed', 'elf_truncated']
+        for case in cases:
+            with self.subTest(case=case), self.boot_fixture() as (p, path, manifest, save):
+                key = {'fork_hash': 'firecracker', 'kernel_hash': 'kernel', 'receipt_hash': 'provenance',
+                       'checksum_hash': 'kernelChecksum'}.get(case, 'kernelChecksum' if case.startswith('sidecar') else 'firecracker')
+                target = Path(manifest[key]['path'])
+                data = bytearray(target.read_bytes())
+                if case.endswith('_hash'):
+                    data[-1] ^= 1
+                elif case == 'sidecar_value':
+                    data = bytearray(('b' * 64 + '  vmlinux-engram-6.1.102-1\n').encode())
+                elif case == 'sidecar_name':
+                    data = bytearray(data.replace(b'vmlinux-engram-', b'wrong-kernel-'))
+                elif case == 'elf_arch':
+                    struct.pack_into('<H', data, 18, 183)
+                elif case == 'elf_class':
+                    data[4] = 1
+                elif case == 'elf_interp':
+                    struct.pack_into('<I', data, 64, 3)
+                elif case == 'elf_needed':
+                    struct.pack_into('<H', data, 56, 2)
+                    data += struct.pack('<IIQQQQQQ', 2, 4, 176, 0, 0, 16, 16, 8)
+                    data += struct.pack('<qQ', 1, 0)
+                else:
+                    data = data[:80]
+                target.chmod(0o600)
+                target.write_bytes(data)
+                target.chmod(0o400)
+                if not case.endswith('_hash'):
+                    manifest[key]['sha256'] = hashlib.sha256(data).hexdigest()
+                    if key == 'firecracker':
+                        receipt = Path(manifest['provenance']['path'])
+                        provenance = json.loads(receipt.read_bytes())
+                        provenance['firecrackerSha256'] = manifest[key]['sha256']
+                        receipt.chmod(0o600)
+                        receipt.write_text(json.dumps(provenance))
+                        receipt.chmod(0o400)
+                        manifest['provenance']['sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                save()
+                with self.assertRaises(RuntimeError):
+                    p.acquire_boot(str(path))
+
+    def test_boot_artifacts_reject_modes_links_nonprivate_parent_and_oversized_files(self):
+        cases = ['manifest_writable', 'pin_writable', 'parent_public', 'symlink', 'hardlink',
+                 'outside_bundle', 'fifo', 'oversized_manifest', 'oversized_fork', 'foreign_owner']
+        for case in cases:
+            with self.subTest(case=case), self.boot_fixture() as (p, path, manifest, save):
+                target = Path(manifest['firecracker']['path'])
+                if case == 'manifest_writable':
+                    path.chmod(0o600)
+                elif case == 'pin_writable':
+                    target.chmod(0o600)
+                elif case == 'parent_public':
+                    path.parent.chmod(0o755)
+                elif case == 'symlink':
+                    target.rename(target.with_name('original'))
+                    target.symlink_to(target.with_name('original'))
+                elif case == 'hardlink':
+                    os.link(target, target.with_name('alias'))
+                elif case == 'outside_bundle':
+                    destination = path.parent.parent / 'outside'
+                    target.rename(destination)
+                    manifest['firecracker']['path'] = str(destination)
+                    save()
+                elif case == 'fifo':
+                    target.unlink()
+                    os.mkfifo(target, 0o400)
+                elif case.startswith('oversized'):
+                    target = path if case == 'oversized_manifest' else target
+                    target.chmod(0o600)
+                    with target.open('r+b') as out:
+                        out.truncate(16385 if case == 'oversized_manifest' else 256 * 1024 * 1024 + 1)
+                    target.chmod(0o400)
+                with patch.object(assets.os, 'getuid', return_value=os.getuid() + 1) if case == 'foreign_owner' else patch.dict(os.environ, {}):
+                    with self.assertRaises((RuntimeError, OSError)):
+                        p.acquire_boot(str(path))
+
+    def test_boot_artifacts_reexec_carries_only_argument_and_no_artifact_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p = object.__new__(assets.Producer)
+            p.root, p.backend, p.operator_path = Path(directory), 'firecracker', '/owned/operator.json'
+            p.env = {'PATH': '/usr/bin:/bin'}
+            p.private_checkout = lambda source: (assets.REPO, 'a' * 40)
+            calls = []
+            def call(argv, **kwargs):
+                calls.append((list(map(str, argv)), kwargs))
+                nested = object.__new__(assets.Producer)
+                nested.root, nested.backend, nested.head = p.root / 'execution', p.backend, 'a' * 40
+                nested.root.mkdir()
+                (nested.root / 'inputs.json').write_text('{"version":1}')
+                nested.dispatch(prepare_only=True)
+            p.call = call
+            with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-token', 'BOOT_ARTIFACTS': '/poison'}):
+                p.run_private_checkout(prepare_only=True, boot_artifacts='/owned/boot/manifest.json')
+            argv, kwargs = calls[0]
+            self.assertIn('--boot-artifacts', argv)
+            self.assertEqual(argv[argv.index('--boot-artifacts') + 1], '/owned/boot/manifest.json')
+            self.assertEqual(kwargs['env'], p.env)
+
+    def test_boot_artifacts_cli_rejects_vz_before_creating_work_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / 'work'
+            result = subprocess.run([sys.executable, '-I', str(ROOT / '.github/scripts/mcp-stack-assets.py'),
+                                     '--backend', 'vz', '--operator', '/absent/operator', '--work-root', str(work),
+                                     '--boot-artifacts', '/absent/manifest'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(work.exists())
+
+    def test_boot_artifacts_reject_open_read_and_directory_replacement_races(self):
+        for case in ['before_open', 'during_read', 'directory_replaced']:
+            with self.subTest(case=case), self.boot_fixture() as (p, path, manifest, _):
+                target = Path(manifest['firecracker']['path'])
+                inode = target.stat().st_ino
+                original_open, original_read = os.open, os.read
+                changed = False
+                def opening(name, flags, *args, **kwargs):
+                    nonlocal changed
+                    if case == 'before_open' and name == target.name and 'dir_fd' in kwargs:
+                        target.rename(target.with_name('previous'))
+                        target.write_bytes(target.with_name('previous').read_bytes())
+                        target.chmod(0o400)
+                        changed = True
+                    return original_open(name, flags, *args, **kwargs)
+                def reading(fd, size):
+                    nonlocal changed
+                    data = original_read(fd, size)
+                    if case != 'before_open' and not changed and os.fstat(fd).st_ino == inode:
+                        changed = True
+                        if case == 'during_read':
+                            target.chmod(0o600)
+                            target.write_bytes(target.read_bytes())
+                            target.chmod(0o400)
+                        else:
+                            previous = path.parent.with_name('previous-directory')
+                            path.parent.rename(previous)
+                            shutil.copytree(previous, path.parent)
+                    return data
+                with patch.object(assets.os, 'open', side_effect=opening), patch.object(assets.os, 'read', side_effect=reading):
+                    with self.assertRaisesRegex(RuntimeError, 'boot_file_changed|boot_directory_changed'):
+                        p.acquire_boot(str(path))
+                self.assertTrue(changed)
+                self.assertFalse((p.root / 'boot-download').exists())
+
+    def test_boot_artifacts_reject_input_inside_source_context(self):
+        with self.boot_fixture() as (p, path, _, _):
+            p.source.mkdir()
+            target = p.source / 'private-boot'
+            path.parent.rename(target)
+            with self.assertRaisesRegex(RuntimeError, 'boot_source_context'):
+                p.acquire_boot(str(target / path.name))
+
+    def test_boot_artifacts_static_check_bounds_dynamic_table_work(self):
+        with self.boot_fixture() as (_, _, manifest, _):
+            data = bytearray(Path(manifest['firecracker']['path']).read_bytes())
+            struct.pack_into('<H', data, 56, 2)
+            data += struct.pack('<IIQQQQQQ', 2, 4, 176, 0, 0, 65552, 65552, 8)
+            data += bytes(65552)
+            with self.assertRaisesRegex(RuntimeError, 'boot_fork_static'):
+                assets.static_amd64_firecracker(data)
+
+    def test_boot_artifacts_admission_fails_before_image_or_dependency_work(self):
+        with self.native_sdk_fixture('firecracker') as (p, _, _, snapshot):
+            snapshot.side_effect = None
+            original_canonical = assets.canonical
+            def device_path(path, *args, **kwargs):
+                return Path('/dev/null') if path in {'/dev/kvm', '/dev/net/tun'} else original_canonical(path, *args, **kwargs)
+            with patch.object(assets.os, 'getuid', return_value=0), \
+                 patch.object(assets, 'canonical', side_effect=device_path), \
+                 patch.object(p, 'acquire_boot', side_effect=RuntimeError('invalid_boot_bundle')) as acquire, \
+                 patch.object(p, 'archive') as archive, patch.object(p, 'skopeo') as skopeo:
+                with self.assertRaisesRegex(RuntimeError, 'invalid_boot_bundle'):
+                    p.produce(boot_artifacts='/private/manifest.json')
+            acquire.assert_called_once_with('/private/manifest.json')
+            archive.assert_not_called()
+            skopeo.assert_not_called()
+
+    def test_boot_artifacts_absent_keeps_fixed_fc_registry_and_vz_kernel_paths(self):
+        for backend in ['firecracker', 'vz']:
+            with self.subTest(backend=backend), self.boot_fixture() as (p, _, _, _):
+                p.backend, p.arch = backend, 'amd64' if backend == 'firecracker' else 'arm64'
+                call, commands = p.call, []
+                def download(argv, **kwargs):
+                    commands.append((list(map(str, argv)), kwargs))
+                    if argv[0] == '/usr/bin/git':
+                        return call(argv, **kwargs)
+                    if argv[0] == 'forbidden-gh':
+                        target = Path(argv[-1])
+                        target.write_bytes((hashlib.sha256(b'kernel').hexdigest() + '\n').encode()
+                                           if str(target).endswith('.sha256') else b'kernel')
+                    elif argv[1] == 'resolve':
+                        return ('sha256:' + 'b' * 64).encode()
+                    elif argv[1] == 'pull':
+                        target = Path(argv[-1])
+                        target.mkdir()
+                        (target / 'firecracker').write_bytes(b'registry fork bytes')
+                    return b''
+                p.call = download
+                with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-token'}):
+                    kernel, fork = p.acquire_boot()
+                self.assertEqual(Path(kernel['path']).read_bytes(), b'kernel')
+                gh = [argv for argv, _ in commands if argv[0] == 'forbidden-gh']
+                self.assertEqual(len(gh), 2)
+                self.assertIn('vmlinux-engram-6.1.102-1' if backend == 'firecracker' else 'Image-engram-6.1.102-1', gh[0])
+                oras = [argv for argv, _ in commands if argv[0] == 'forbidden-oras']
+                if backend == 'firecracker':
+                    self.assertIn('ghcr.io/cortexapps/engrams/firecracker:' + 'a' * 40, oras[1])
+                    self.assertIn('ghcr.io/cortexapps/engrams/firecracker@sha256:' + 'b' * 64, oras[2])
+                    self.assertEqual(fork.read_bytes(), b'registry fork bytes')
+                    self.assertEqual(json.loads((p.root / 'fork-provenance.json').read_bytes()),
+                                     {'gitlink': 'a' * 40, 'manifest': 'sha256:' + 'b' * 64})
+                else:
+                    self.assertIsNone(fork)
+                    self.assertEqual(oras, [])
+
     def test_guard_apt_retries_are_bounded_and_failed_update_blocks_install(self):
         source = (ROOT / 'tests/fixtures/mcp-stack/platform/guard.Dockerfile').read_text()
         commands = source.split('> /etc/apt/sources.list; \\\n', 1)[1].split(
@@ -66,6 +395,24 @@ class PhysicalGates(unittest.TestCase):
                                                    '-o', 'Acquire::http::Timeout=30'])
                         if call['operation'] == 'update':
                             self.assertEqual(args[4:], ['--error-on=any', 'update'])
+
+    def test_thin_pool_operator_rejects_unknown_keys_names_paths_and_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            valid = {'name': 'suite', 'directory': str(root)}
+            self.assertEqual(assets.validate_thin_pool(valid), valid)
+            for value in [None, {}, {**valid, 'extra': True}, {**valid, 'name': 'a' * 128},
+                          {**valid, 'name': '../pool'}, {**valid, 'name': 'pool;true'},
+                          {**valid, 'directory': str(root) + '/..'}]:
+                with self.subTest(value=value), self.assertRaises((RuntimeError, TypeError)):
+                    assets.validate_thin_pool(value)
+            root.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, 'operator_thin_pool_mode'):
+                assets.validate_thin_pool(valid)
+            root.chmod(0o700)
+            with patch.object(assets.os, 'getuid', return_value=os.getuid() + 1):
+                with self.assertRaisesRegex(RuntimeError, 'path_owner'):
+                    assets.validate_thin_pool(valid)
 
     def test_source_context_rejects_secrets(self):
         assets.source_paths(['docker/host-agent.Dockerfile', '.env.example', 'orchestrator/src/index.ts'])
@@ -623,7 +970,8 @@ else:
                 tool.chmod(0o700)
                 config = {'version': 1, 'backend': 'firecracker', 'engineSocket': str(root / 'engine.sock'),
                           'nativeHostIp': '192.168.1.2', 'subnet': '10.88.2.0/24', 'registryPort': 30000,
-                          'buildRegistryPort': 31000, 'tools': {key: str(tool) for key in assets.TOOLS}}
+                          'buildRegistryPort': 31000, 'tools': {key: str(tool) for key in assets.TOOLS},
+                          'thinPool': {'name': 'suite', 'directory': str(root)}}
                 path = root / 'operator.json'
                 path.write_text(json.dumps(config))
                 path.chmod(0o600)

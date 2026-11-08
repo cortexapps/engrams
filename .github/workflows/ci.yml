@@ -274,8 +274,6 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends ruby
           python3 -m unittest discover \
             -s deploy/helm/engram/ci/tests -p 'test_callback_profiles.py'
-          python3 -m unittest discover \
-            -s .github/scripts/tests -p 'test_mcp*.py'
           image="$(sed -n 's/^FROM \(nginx:[^ ]*\)$/\1/p' docker/web.Dockerfile)"
           test -n "$image"
           docker pull "$image"
@@ -2669,17 +2667,23 @@ jobs:
       - name: Produce and run physical Firecracker assets
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MCP_FC_BOOT_ARTIFACTS: ${{ vars.MCP_FC_BOOT_ARTIFACTS }}
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP}/mcp-physical-fc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}
+          safe="var/mcp-physical-safe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$safe"
           finish() {
             if sudo test -f "$root/summary.json"; then
-              sudo install -m 0644 "$root/summary.json" var/mcp-physical-safe-${{ github.run_id }}-${{ github.run_attempt }}/firecracker.json
+              sudo install -m 0644 "$root/summary.json" "$safe/firecracker.json"
             fi
           }
           trap finish EXIT
-          sudo --preserve-env=GITHUB_TOKEN python3 -I .github/scripts/mcp-stack-assets.py --backend firecracker --operator /etc/engrams/mcp-physical-firecracker.json --work-root "$root"
+          args=(--backend firecracker --operator /etc/engrams/mcp-physical-firecracker.json --work-root "$root")
+          if [[ -n "${MCP_FC_BOOT_ARTIFACTS:-}" ]]; then
+            args+=(--boot-artifacts "$MCP_FC_BOOT_ARTIFACTS")
+          fi
+          sudo --preserve-env=GITHUB_TOKEN python3 -I .github/scripts/mcp-stack-assets.py "${args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

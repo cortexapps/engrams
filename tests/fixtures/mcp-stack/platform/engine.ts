@@ -638,6 +638,7 @@ export class Engine {
           "fc_engine_pid_namespace",
         );
       }
+      if (host) await this.fc!.beforeHostStart();
       await this.call([
         "exec",
         id,
@@ -740,7 +741,10 @@ export class Engine {
             )
             .sort(),
         ) === JSON.stringify(values("--device").sort()) &&
-        (h.DeviceRequests ?? []).length === 0,
+        (h.DeviceRequests ?? []).length === 0 &&
+        JSON.stringify([...(h.DeviceCgroupRules ?? [])].sort()) ===
+          JSON.stringify(values("--device-cgroup-rule").sort()) &&
+        (spec.host || values("--device-cgroup-rule").length === 0),
       "container_authority",
     );
     const publications: Record<string, { HostIp: string; HostPort: string }[]> =
@@ -1873,7 +1877,7 @@ export class Engine {
             reason:
               error instanceof PlatformFailure
                 ? error.seam
-                : "nbd_state_unknown",
+                : "thin_pool_state_unknown",
           }),
         );
         throw error;

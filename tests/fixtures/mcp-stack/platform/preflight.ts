@@ -59,6 +59,7 @@ export interface ImagePin {
   id: string;
   manifestDigest: string;
 }
+import { parseThinPool, type ThinPoolInput } from "./fc-thin.ts";
 export interface Inputs {
   version: 1;
   backend: "firecracker" | "vz";
@@ -73,6 +74,7 @@ export interface Inputs {
   binaries: Record<(typeof BINARIES)[number], Pin>;
   images: Record<(typeof IMAGES)[number], ImagePin> & { hostAgent?: ImagePin };
   firecracker?: Pin;
+  thinPool?: ThinPoolInput;
   proxy: Pin;
   nativeProbe?: Pin;
 }
@@ -107,7 +109,7 @@ export function parseInputs(
       "images",
       "proxy",
     ],
-    ["firecracker", "nativeProbe"],
+    ["firecracker", "nativeProbe", "thinPool"],
   );
   check(
     o.version === 1 &&
@@ -117,10 +119,16 @@ export function parseInputs(
   );
   if (backend === "vz")
     check(
-      o.architecture === "arm64" && !o.firecracker && o.nativeProbe,
+      o.architecture === "arm64" &&
+        !o.firecracker &&
+        o.nativeProbe &&
+        !("thinPool" in o),
       "vz_architecture",
     );
-  else check(o.firecracker && !o.nativeProbe, "fc_artifacts");
+  else {
+    check(o.firecracker && !o.nativeProbe, "fc_artifacts");
+    check(o.thinPool, "fc_pool_required");
+  }
   check(
     Number.isInteger(o.registryPort) &&
       Number(o.registryPort) >= 20000 &&
@@ -193,7 +201,7 @@ export function parseInputs(
     images,
     proxy: pin(o.proxy),
     ...(backend === "firecracker"
-      ? { firecracker: pin(o.firecracker) }
+      ? { firecracker: pin(o.firecracker), thinPool: parseThinPool(o.thinPool) }
       : { nativeProbe: pin(o.nativeProbe) }),
   };
 }

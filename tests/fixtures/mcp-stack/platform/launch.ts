@@ -140,6 +140,8 @@ export class Stack {
   async prepare(): Promise<Context> {
     const work = join(this.root, "host");
     await mkdir(work, { mode: 0o700 });
+    if (this.inputs.backend === "firecracker")
+      await mkdir(join(this.root, "thin-nodes"), { mode: 0o700 });
     await put(join(work, "host_id"), this.identity.hostId);
     await put(join(work, "host.jsonl"), "");
     await put(join(work, "egress-proxyd.log"), "");

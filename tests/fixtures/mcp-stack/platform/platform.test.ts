@@ -1,3 +1,4 @@
+import { poolFixture } from "./fc-thin-fixture.ts";
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import {
   chmod,
@@ -1417,9 +1418,11 @@ test("command waits for retained same-group descendants after leader exit", asyn
       try {
         process.kill(-Number(group), "SIGKILL");
       } catch (error) {
-        if (
-          !(error instanceof Error && "code" in error && error.code === "ESRCH")
-        )
+        if (!(
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ESRCH"
+        ))
           throw error;
       }
       const deadline = performance.now() + 1500;
@@ -1488,23 +1491,9 @@ test("FC executable prerequisites reject invalid headers, architecture, platform
   expect(rejected).toEqual(Array(8).fill(true));
 });
 
-test("FC whole-module inventory rejects invalid counts and uses kernel device numbers and process birth", async () => {
-  const { nbdCount, linuxDevice, procBirth, FcRuntime } =
-    await import("./fc-runtime.ts");
-  expect(nbdCount("1\n")).toBe(1);
-  expect(nbdCount("4096\n")).toBe(4096);
-  for (const count of [
-    "0\n",
-    "4097\n",
-    "8192\n",
-    "01\n",
-    "16x",
-    "-1",
-    "16\nextra",
-  ])
-    expect(() => nbdCount(count)).toThrow("fc_nbd_module_count");
+test("FC thin device contract uses kernel numbers and process birth", async () => {
+  const { linuxDevice, procBirth, FcRuntime } = await import("./fc-runtime.ts");
   expect(linuxDevice(11008n)).toBe("43:0");
-  expect(linuxDevice(11009n)).toBe("43:1");
   const fields = ["S", ...Array.from({ length: 18 }, () => "0"), "123456", "0"];
   expect(procBirth(`42 (a name ) with spaces) ${fields.join(" ")}`, 42)).toBe(
     "123456",
@@ -1512,27 +1501,20 @@ test("FC whole-module inventory rejects invalid counts and uses kernel device nu
   expect(() => procBirth(`41 (name) ${fields.join(" ")}`, 42)).toThrow();
   const inventory = {
     bootId: "11111111-1111-4111-8111-111111111111",
-    readSectors: { "/dev/nbd0": "0" },
     release: "fixed",
     pidNamespace: "pid:[1]",
-    slots: [
-      { path: "/dev/nbd0", ino: "10", rdev: "11008", device: "43:0", uid: 0 },
-    ],
+    pool: poolFixture(),
   };
   const runtime = new FcRuntime(
     inventory,
     {} as import("./preflight.ts").Inputs,
     "/owned/run",
   );
-  expect(runtime.deviceOptions()).toEqual([
-    "--device",
-    "/dev/nbd0:/dev/nbd0:rw",
-  ]);
-  expect(runtime.environment()).toEqual({
-    ENGRAM_NBD_FIRST_SLOT: "0",
-    ENGRAM_NBD_MAX_SLOTS: "1",
-    ENGRAM_NBD_WARM_SLOTS: "1",
-  });
+  expect(runtime.deviceOptions()).toContain("b 253:* rwm");
+  expect(runtime.deviceOptions()).toContain(
+    "/dev/mapper/control:/dev/mapper/control:rw",
+  );
+  expect(runtime.environment()).toEqual({ ENGRAM_THIN_POOL: "suite" });
 });
 
 test("guest enable accepts an unobserved queued digest and verifies the ready image", async () => {
@@ -1772,3 +1754,126 @@ test("platform validates stage selectors before resource creation and defaults t
   ])
     expect(() => cli([...base, ...extra])).toThrow();
 });
+
+test("FC inputs require a strict owned thin pool and VZ refuses that field", async () => {
+  const vz = input();
+  const fc = {
+    ...vz,
+    backend: "firecracker",
+    architecture: "amd64",
+    nativeProbe: undefined,
+    firecracker: vz.proxy,
+    images: { ...vz.images, hostAgent: vz.images.guest },
+    thinPool: { name: "suite", directory: root },
+  };
+  expect(parseInputs(fc, "firecracker").thinPool).toEqual(fc.thinPool);
+  for (const thinPool of [
+    undefined,
+    null,
+    {},
+    { ...fc.thinPool, extra: true },
+    { ...fc.thinPool, name: "a".repeat(128) },
+    { ...fc.thinPool, name: "../pool" },
+    { ...fc.thinPool, name: "pool;true" },
+    { ...fc.thinPool, directory: root + "/.." },
+  ])
+    expect(() => parseInputs({ ...fc, thinPool }, "firecracker")).toThrow();
+  expect(() => parseInputs({ ...vz, thinPool: fc.thinPool }, "vz")).toThrow();
+  expect(() => parseInputs({ ...vz, thinPool: undefined }, "vz")).toThrow();
+  const dir = await mkdtemp(join(root, "pool-mode-"));
+  await chmod(dir, 0o755);
+  expect(() =>
+    parseInputs(
+      { ...fc, thinPool: { name: "suite", directory: dir } },
+      "firecracker",
+    ),
+  ).toThrow("fc_pool_directory_owner_mode");
+});
+
+test("FC infrastructure checkpoint has no caller-selected facts and invokes the physical check", async () => {
+  const { Supervisor } =
+    await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+  const ctx = await context();
+  ctx.backend = "firecracker";
+  const base = {
+    version: 1,
+    runId: ctx.runId,
+    operation: "infrastructure-ready",
+  } as const;
+  expect(parseOperation(base, ctx)).toEqual(base);
+  for (const extra of [
+    { role: "host-agent" },
+    { PASS: true },
+    { pool: "foreign" },
+    { configurationId: "normal" },
+  ])
+    expect(() => parseOperation({ ...base, ...extra }, ctx)).toThrow();
+  for (const fail of [false, true]) {
+    let inspected = 0;
+    const server = await startSupervisor(ctx, {
+      status: async () => ({
+        ...status(ctx),
+        roles: status(ctx).roles.map((r) =>
+          r.role === "host-agent" && inspected && !fail
+            ? { ...r, bootId: "host-restarted" }
+            : r,
+        ),
+      }),
+      restart: async () => {},
+      stop: async () => {},
+      infrastructureReady: async () => {
+        inspected++;
+        if (fail) throw Error("physical check failed");
+      },
+    });
+    try {
+      const call = new Supervisor(ctx).infrastructureReady();
+      if (fail) await expect(call).rejects.toThrow();
+      else {
+        const after = await call;
+        expect(after.backend).toBe("firecracker");
+        expect(after.roles.find((r) => r.role === "host-agent")?.bootId).toBe(
+          "host-restarted",
+        );
+      }
+      expect(inspected).toBe(1);
+    } finally {
+      await server.close();
+    }
+  }
+});
+
+for (const change of ["missing-host-restart", "other-role", "network"] as const)
+  test(`FC infrastructure checkpoint rejects an invalid restart transition (${change})`, async () => {
+    const { Supervisor } =
+      await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+    const ctx = await context();
+    ctx.backend = "firecracker";
+    let inspected = false;
+    const server = await startSupervisor(ctx, {
+      status: async () => {
+        const current = status(ctx);
+        if (inspected) {
+          if (change !== "missing-host-restart")
+            current.roles.find((r) => r.role === "host-agent")!.bootId =
+              "host-restarted";
+          if (change === "other-role")
+            current.roles.find((r) => r.role === "worker")!.bootId =
+              "worker-restarted";
+          if (change === "network")
+            current.network.generation = "changed-network";
+        }
+        return current;
+      },
+      restart: async () => {},
+      stop: async () => {},
+      infrastructureReady: async () => {
+        inspected = true;
+      },
+    });
+    try {
+      await expect(new Supervisor(ctx).infrastructureReady()).rejects.toThrow();
+    } finally {
+      await server.close();
+    }
+  });

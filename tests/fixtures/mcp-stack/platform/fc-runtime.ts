@@ -1,19 +1,34 @@
-import { constants } from "node:fs";
 import { randomBytes } from "node:crypto";
 import {
   lstat,
-  open,
   readFile,
   readdir,
   readlink,
-  realpath,
   stat,
   appendFile,
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { check, hash, put, readOwned } from "./owned.ts";
 import type { Inputs } from "./preflight.ts";
-import { parseHostRecord } from "../../../../orchestrator/scripts/mcp-stack/host-observer.ts";
+import {
+  admitPool,
+  OfflinePoolAccess,
+  verifyThinIds,
+  requirePoolBudget,
+  verifyBootDevice,
+  verifyReleasedMappings,
+  inspectPool,
+  verifyPoolIdentity,
+  deviceNode,
+  type PoolInventory,
+  type DeviceNode,
+  type Backing,
+} from "./fc-thin.ts";
+export { linuxDevice } from "./fc-thin.ts";
+import {
+  parseHostRecord,
+  type HostRecord,
+} from "../../../../orchestrator/scripts/mcp-stack/host-observer.ts";
 
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const absent = (error: unknown) =>
@@ -21,20 +36,6 @@ const absent = (error: unknown) =>
   typeof error === "object" &&
   "code" in error &&
   error.code === "ENOENT";
-async function optional(path: string) {
-  try {
-    return await readFile(path, "utf8");
-  } catch (error) {
-    if (absent(error)) return undefined;
-    throw error;
-  }
-}
-export function nbdCount(value: string): number {
-  check(/^[1-9][0-9]{0,3}\n?$/.test(value), "fc_nbd_module_count");
-  const count = Number(value.trim());
-  check(count <= 4096, "fc_nbd_module_count");
-  return count;
-}
 export function procBirth(value: string, pid: number): string {
   const close = value.lastIndexOf(")");
   const fields = value
@@ -49,9 +50,6 @@ export function procBirth(value: string, pid: number): string {
   );
   return fields[19]!;
 }
-export function linuxDevice(value: bigint): string {
-  return `${((value >> 8n) & 0xfffn) | ((value >> 32n) & 0xfffff000n)}:${(value & 0xffn) | ((value >> 12n) & 0xffffff00n)}`;
-}
 export type FcProcess = {
   pid: number;
   bootId: string;
@@ -61,19 +59,100 @@ export type FcProcess = {
   cgroup: string;
   sha256: string;
 };
-export type NbdSlot = {
-  path: string;
-  ino: string;
-  rdev: string;
-  device: string;
-  uid: number;
-};
 export type FcInventory = {
   bootId: string;
   release: string;
   pidNamespace: string;
-  slots: NbdSlot[];
-  readSectors: Record<string, string>;
+  pool: PoolInventory;
+};
+function managedNeedsIo(
+  record: Pick<HostRecord, "finalization" | "state" | "capture">,
+) {
+  check(
+    [
+      "missing",
+      "prepared",
+      "finalized",
+      "start_pending",
+      "started",
+      "failed",
+      "captured",
+      "retired",
+    ].includes(String(record.state.state)),
+    "fc_managed_boot_state",
+  );
+  // Finalization is persisted before start and is never cleared on failure,
+  // retirement or capture. Terminal state alone cannot prove never-started.
+  return (
+    record.finalization !== null ||
+    record.capture !== null ||
+    ["finalized", "start_pending", "started", "captured"].includes(
+      String(record.state.state),
+    )
+  );
+}
+export function requireManagedBootCoverage(
+  required: Set<string>,
+  observed: ReadonlySet<string>,
+  key: string,
+  record: Pick<HostRecord, "finalization" | "state" | "capture">,
+) {
+  if (managedNeedsIo(record)) required.add(key);
+  check(!required.has(key) || observed.has(key), "fc_physical_boot_unobserved");
+}
+export function managedBootPaths(
+  work: string,
+  sandbox: string,
+  attempt: string,
+) {
+  check(
+    uuid.test(sandbox) && /^[A-Za-z0-9-]{1,128}$/.test(attempt),
+    "fc_managed_boot_identity",
+  );
+  const directory = join(
+    work,
+    `m-${hash(`${sandbox}\0${attempt}`).slice(0, 24)}`,
+  );
+  return {
+    directory,
+    apiSocket: join(directory, "firecracker.sock"),
+    rootfsCanonical: join(directory, "rootfs.ext4"),
+    volume: `sb-${sandbox.replaceAll("-", "")}-root`,
+  };
+}
+export function selectManagedProcess(
+  candidates: { process: FcProcess; args: string[] }[],
+  apiSocket: string,
+): FcProcess | undefined {
+  const matches = candidates.filter((candidate) =>
+    candidate.args.includes(apiSocket),
+  );
+  check(matches.length <= 1, "fc_managed_process_duplicate");
+  const match = matches[0];
+  if (!match) return undefined;
+  check(
+    JSON.stringify(match.args) ===
+      JSON.stringify(["/usr/local/bin/firecracker", "--api-sock", apiSocket]),
+    "fc_managed_process_arguments",
+  );
+  return match.process;
+}
+async function processArguments(pid: number) {
+  const value = await readFile(`/proc/${pid}/cmdline`);
+  check(
+    value.length > 0 && value.length <= 4096 && value.at(-1) === 0,
+    "fc_process_arguments",
+  );
+  return value.subarray(0, -1).toString().split("\0");
+}
+type BootCandidate = {
+  name: string;
+  process: FcProcess;
+  rootfsCanonical: string;
+  boot?: HostRecord;
+  bootBytes?: Buffer;
+  sandboxManifest?: string;
+  apiSocket?: string;
 };
 export function verifyFcProcessIdentity(
   expected: FcProcess,
@@ -140,35 +219,11 @@ async function processIdentity(
     throw error;
   }
 }
-async function slotIdentity(index: number): Promise<NbdSlot> {
-  const path = `/dev/nbd${index}`;
-  const node = await lstat(path, { bigint: true });
-  const device = (await readFile(`/sys/block/nbd${index}/dev`, "utf8")).trim();
-  check(
-    node.isBlockDevice() &&
-      !node.isSymbolicLink() &&
-      node.uid === 0n &&
-      (await realpath(path)) === path &&
-      /^[0-9]+:[0-9]+$/.test(device) &&
-      linuxDevice(node.rdev) === device,
-    "fc_nbd_device_identity",
-  );
-  return {
-    path,
-    ino: String(node.ino),
-    rdev: String(node.rdev),
-    device,
-    uid: Number(node.uid),
-  };
-}
-async function assertSlotIdentity(slot: NbdSlot) {
-  const actual = await slotIdentity(Number(slot.path.slice(8)));
-  check(
-    JSON.stringify(actual) === JSON.stringify(slot),
-    "fc_nbd_device_changed",
-  );
-}
-async function deviceFds(slots: NbdSlot[], processes: number[]) {
+async function deviceFds(
+  slots: DeviceNode[],
+  processes: number[],
+  files: Backing[] = [],
+) {
   const devices = new Set(slots.map((v) => v.rdev));
   const found: { pid: number; fd: string; rdev: string }[] = [];
   for (const pid of processes) {
@@ -184,7 +239,16 @@ async function deviceFds(slots: NbdSlot[], processes: number[]) {
       check(/^[0-9]+$/.test(fd), "fc_fd_identity");
       try {
         const state = await stat(`/proc/${pid}/fd/${fd}`, { bigint: true });
-        if (state.isBlockDevice() && devices.has(String(state.rdev)))
+        if (
+          ((state.isBlockDevice() || state.isCharacterDevice()) &&
+            devices.has(String(state.rdev))) ||
+          (state.isFile() &&
+            files.some(
+              (file) =>
+                String(state.dev) === file.fileDev &&
+                String(state.ino) === file.fileIno,
+            ))
+        )
           found.push({ pid, fd, rdev: String(state.rdev) });
       } catch (error) {
         if (!absent(error)) throw error;
@@ -193,43 +257,29 @@ async function deviceFds(slots: NbdSlot[], processes: number[]) {
   }
   return found;
 }
-async function assertFree(slot: NbdSlot) {
-  await assertSlotIdentity(slot);
-  const sys = `/sys/block/${basename(slot.path)}`;
-  check(
-    (await optional(`${sys}/pid`)) === undefined &&
-      (await readFile(`${sys}/size`, "utf8")).trim() === "0" &&
-      (await readdir(`${sys}/holders`)).length === 0,
-    "fc_nbd_busy",
-  );
-  // Linux block devices honor O_EXCL without O_CREAT. A failed open is a hard
-  // boundary; this code never changes node modes or disconnects a binding.
-  const file = await open(
-    slot.path,
-    constants.O_RDWR | constants.O_EXCL | constants.O_NOFOLLOW,
-  );
-  try {
-    const actual = await file.stat({ bigint: true });
-    check(
-      actual.isBlockDevice() &&
-        String(actual.ino) === slot.ino &&
-        String(actual.rdev) === slot.rdev,
-      "fc_nbd_exclusive_identity",
-    );
-  } finally {
-    await file.close();
-  }
-  check(
-    (await optional(`${sys}/pid`)) === undefined &&
-      (await readFile(`${sys}/size`, "utf8")).trim() === "0",
-    "fc_nbd_busy",
-  );
-}
 export async function inspectFcInventory(
-  inputs: Pick<Inputs, "binaries" | "proxy" | "firecracker">,
+  inputs: Pick<Inputs, "binaries" | "proxy" | "firecracker" | "thinPool">,
 ): Promise<FcInventory> {
   const identity = await kernelIdentity();
-  const processes = await pids();
+  check(inputs.thinPool, "fc_pool_required");
+  const initial = await inspectPool(inputs.thinPool);
+  const pool = await new OfflinePoolAccess().inspect(
+    () => requireStorageQuiescence(inputs, identity.bootId, initial),
+    (lease) => inspectPool(initial, lease),
+  );
+  pool.fds = await deviceFds(
+    [pool.data, pool.metadata, await deviceNode(pool.path)],
+    await pids(),
+    [pool.data, pool.metadata],
+  );
+  admitPool(pool);
+  return { ...identity, pool };
+}
+async function requireStorageQuiescence(
+  inputs: Pick<Inputs, "binaries" | "proxy" | "firecracker">,
+  bootId: string,
+  pool: PoolInventory,
+) {
   const names = new Set([
     "engram-host-agent",
     "firecracker",
@@ -240,81 +290,127 @@ export async function inspectFcInventory(
     basename(inputs.proxy.path),
     ...(inputs.firecracker ? [basename(inputs.firecracker.path)] : []),
   ]);
+  const processes = await pids();
   for (const pid of processes) {
-    const current = await processIdentity(pid, identity.bootId);
+    const current = await processIdentity(pid, bootId);
     check(
       !current || !names.has(basename(current.executable)),
-      "fc_runner_not_exclusive",
+      "fc_storage_process_live",
     );
-  }
-  const count = nbdCount(
-    await readFile("/sys/module/nbd/parameters/nbds_max", "utf8"),
-  );
-  const slots: NbdSlot[] = [];
-  for (let i = 0; i < count; i++) {
-    const slot = await slotIdentity(i);
-    await assertFree(slot);
-    slots.push(slot);
   }
   check(
-    (await deviceFds(slots, await pids())).length === 0,
-    "fc_nbd_foreign_fd",
+    (
+      await deviceFds(
+        [pool.control, pool.data, pool.metadata, pool.node],
+        processes,
+        [pool.data, pool.metadata],
+      )
+    ).length === 0,
+    "fc_storage_fd_live",
   );
-  const readSectors: Record<string, string> = {};
-  for (const slot of slots) {
-    const fields = (
-      await readFile(`/sys/block/${basename(slot.path)}/stat`, "utf8")
-    )
-      .trim()
-      .split(/\s+/);
-    check(
-      fields.length >= 11 && /^[0-9]+$/.test(fields[2]!),
-      "fc_nbd_read_counter",
-    );
-    readSectors[slot.path] = fields[2]!;
-  }
-  return { ...identity, slots, readSectors };
 }
-/** Read-only proof for the dedicated whole kernel. Device cgroups do not
- * isolate NBD netlink control. Runner exclusivity is an operator prerequisite. */
+
+/** The runner owns the whole disposable kernel. Device cgroups cannot
+ * isolate device-mapper control from other host workloads. */
 export class FcRuntime {
+  private readonly storageAccess = new OfflinePoolAccess();
   private readonly cgroups = new Set<string>();
   private readonly processes = new Map<string, FcProcess>();
   private readonly observations = new Set<string>();
+  private readonly requiredBoots = new Set<string>();
+  private readonly observationKinds = new Set<"ordinary" | "managed">();
   private evidenceWriteFailed = false;
+  private observation: Promise<void> = Promise.resolve();
   private host: FcProcess | undefined;
-  private readonly readBaseline = new Map<string, string>();
-  private readonly deviceOwners = new Map<string, string>();
-  private readonly deviceBoots = new Map<string, string>();
+  private readonly bootDevices = new Map<string, string>();
+  private readonly bootReads = new Map<string, bigint>();
+  private readonly ownedSandboxes = new Set<string>();
+  private readonly retainedVolumes = new Map<string, string>();
   constructor(
     readonly inventory: FcInventory,
     private readonly inputs: Inputs,
     private readonly root: string,
     private readonly appendEvidence = (path: string, bytes: string) =>
       appendFile(path, bytes, { mode: 0o600 }),
-  ) {
-    for (const [path, reads] of Object.entries(inventory.readSectors))
-      this.readBaseline.set(path, reads);
-  }
+  ) {}
   deviceOptions() {
-    return this.inventory.slots.flatMap((slot) => [
+    const p = this.inventory.pool;
+    return [
       "--device",
-      `${slot.path}:${slot.path}:rw`,
-    ]);
+      "/dev/mapper/control:/dev/mapper/control:rw",
+      "--device",
+      `${p.metadata.path}:${p.metadata.path}:r`,
+      "--device",
+      `${p.path}:${p.path}:rw`,
+      "--device-cgroup-rule",
+      `b ${p.major}:* rwm`,
+      "--cap-add",
+      "MKNOD",
+      "--mount",
+      `type=bind,src=${join(this.root, "thin-nodes")},dst=/dev/engram`,
+    ];
   }
   environment() {
-    return {
-      ENGRAM_NBD_FIRST_SLOT: "0",
-      ENGRAM_NBD_MAX_SLOTS: String(this.inventory.slots.length),
-      ENGRAM_NBD_WARM_SLOTS: "1",
-    };
+    return { ENGRAM_THIN_POOL: this.inventory.pool.name };
+  }
+  private async proveStorageQuiescent() {
+    // The offline lease stops new samples. Drain any table-reading subprocess
+    // before checking control-device FDs, then inspect the actual kernel state.
+    await this.observation.catch(() => {});
+    check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
+    await requireStorageQuiescence(
+      this.inputs,
+      this.inventory.bootId,
+      this.inventory.pool,
+    );
+  }
+  async beforeHostStart() {
+    const prove = () => this.proveStorageQuiescent();
+    await this.storageAccess.stopped(prove);
+    const current = await this.storageAccess.inspect(prove, (lease) =>
+      inspectPool(this.inventory.pool, lease),
+    );
+    verifyPoolIdentity(this.inventory.pool, current);
+    if (!this.host) {
+      current.fds = await deviceFds(
+        [current.data, current.metadata, await deviceNode(current.path)],
+        await pids(),
+        [current.data, current.metadata],
+      );
+      admitPool(current);
+    } else {
+      // ThinPoolDisk::open removes inactive orphans even on restart.
+      // Reject any inactive id before the replacement host can open the pool.
+      check(
+        current.thinIds.every((id) =>
+          current.mappings.some((m) => m.id === id),
+        ) && current.thinIds.length === current.mappings.length,
+        "fc_restart_inactive_thin",
+      );
+      await this.validateMappings(current);
+    }
+    // The engine releases the host's start barrier only after this hook returns.
+    this.storageAccess.start();
+  }
+  private async validateMappings(pool: PoolInventory) {
+    for (const m of pool.mappings) {
+      check(m.name.startsWith(pool.name + "."), "fc_foreign_thin_name");
+      const volume = m.name.slice(pool.name.length + 1);
+      const sandbox =
+        /^(?:tmp-)?sb-([a-f0-9]{32})-(?:root|swap)(?:-pre|-ckpt-[a-f0-9]{32}-v[0-9]+)?$/.exec(
+          volume,
+        );
+      const image = /^(?:tmp-)?img-[a-f0-9]{32}-v[0-9]+$/.test(volume);
+      check(
+        image || (sandbox && this.ownedSandboxes.has(sandbox[1]!)),
+        "fc_foreign_thin_owner",
+      );
+    }
   }
   async qualifyKernel(pid: number) {
-    check(
-      nbdCount(
-        await readFile("/sys/module/nbd/parameters/nbds_max", "utf8"),
-      ) === this.inventory.slots.length,
-      "fc_nbd_module_changed",
+    verifyPoolIdentity(
+      this.inventory.pool,
+      await inspectPool(this.inventory.pool),
     );
     const mounts = (await readFile(`/proc/${pid}/mountinfo`, "utf8"))
       .trim()
@@ -343,6 +439,21 @@ export class FcRuntime {
           (await readlink("/proc/self/ns/cgroup")),
       "fc_host_kernel_namespace",
     );
+    const status = await readFile(`/proc/${pid}/status`, "utf8");
+    const capabilities = (1n << 12n) | (1n << 21n) | (1n << 27n);
+    for (const field of ["CapEff", "CapPrm", "CapBnd"]) {
+      const value = new RegExp(`^${field}:\\s+([a-f0-9]+)$`, "m").exec(
+        status,
+      )?.[1];
+      check(
+        value && BigInt("0x" + value) === capabilities,
+        "fc_host_effective_capabilities",
+      );
+    }
+    check(
+      /^NoNewPrivs:\s+1$/m.test(status) && /^Seccomp:\s+2$/m.test(status),
+      "fc_host_effective_confinement",
+    );
     const current = await processIdentity(pid, this.inventory.bootId);
     check(
       current && current.uid === 0 && current.cgroup !== "/",
@@ -350,17 +461,40 @@ export class FcRuntime {
     );
     this.cgroups.add(current.cgroup);
     this.processes.set(`${pid}:${current.birth}`, current);
-    for (const slot of this.inventory.slots) {
-      await assertSlotIdentity(slot);
-      const projected = await lstat(`/proc/${pid}/root${slot.path}`, {
+    const nodeMount = mounts.find((fields) => fields[4] === "/dev/engram");
+    check(
+      nodeMount &&
+        nodeMount[5]?.split(",").includes("rw") &&
+        !nodeMount[5]?.split(",").includes("nodev"),
+      "fc_host_nodes_mount",
+    );
+    const pool = this.inventory.pool;
+    for (const expected of [
+      pool.control,
+      pool.metadata,
+      await deviceNode(pool.path),
+    ]) {
+      const projected = await lstat(`/proc/${pid}/root${expected.path}`, {
         bigint: true,
       });
       check(
-        projected.isBlockDevice() && String(projected.rdev) === slot.rdev,
+        String(projected.rdev) === expected.rdev &&
+          (expected.path === pool.control.path
+            ? projected.isCharacterDevice()
+            : projected.isBlockDevice()),
         "fc_host_device_projection",
       );
     }
+    const nodes = await lstat(`/proc/${pid}/root/dev/engram`, { bigint: true });
+    const source = await lstat(join(this.root, "thin-nodes"), { bigint: true });
+    check(
+      nodes.isDirectory() &&
+        nodes.dev === source.dev &&
+        nodes.ino === source.ino,
+      "fc_host_nodes_projection",
+    );
   }
+
   async adoptHost(pid: number) {
     await this.qualifyKernel(pid);
     const host = await processIdentity(pid, this.inventory.bootId, true);
@@ -391,6 +525,17 @@ export class FcRuntime {
     );
   }
   async observe() {
+    if (this.storageAccess.inspectionActive) {
+      await this.observation.catch(() => {});
+      check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
+      return;
+    }
+    const previous = this.observation;
+    const current = previous.catch(() => {}).then(() => this.observeOnce());
+    this.observation = current;
+    return current;
+  }
+  private async observeOnce() {
     check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
     if (!this.host) return;
     const identities = new Map<number, FcProcess>();
@@ -403,53 +548,35 @@ export class FcRuntime {
       identities.set(pid, full);
       this.processes.set(`${pid}:${full.birth}`, full);
     }
-    const fds = await deviceFds(this.inventory.slots, all);
+    const pool = await inspectPool(this.inventory.pool);
+    verifyPoolIdentity(this.inventory.pool, pool);
+    const nodes = await Promise.all(
+      pool.mappings.map(async (m) => {
+        const name = /^DEVNAME=(dm-[0-9]+)$/m.exec(
+          await readFile(`/sys/dev/block/${m.device}/uevent`, "utf8"),
+        )?.[1];
+        check(name, "fc_thin_device_name");
+        return deviceNode(`/dev/${name}`);
+      }),
+    );
+    const fds = await deviceFds(nodes, all);
     check(
       fds.every((fd) => identities.has(fd.pid)),
-      "fc_nbd_foreign_fd",
+      "fc_thin_foreign_fd",
     );
-    for (const slot of this.inventory.slots) {
-      const sys = `/sys/block/${basename(slot.path)}`;
-      if ((await optional(`${sys}/pid`)) !== undefined) continue;
-      const fields = (await readFile(`${sys}/stat`, "utf8"))
-        .trim()
-        .split(/\s+/);
-      check(
-        fields.length >= 11 && /^[0-9]+$/.test(fields[2]!),
-        "fc_nbd_read_counter",
-      );
-      this.readBaseline.set(slot.path, fields[2]!);
-      this.deviceOwners.delete(slot.path);
-      this.deviceBoots.delete(slot.path);
-    }
+    const seenProcesses = new Set<number>();
     const work = join(this.root, "host");
+    const candidates: BootCandidate[] = [];
     for (const name of (await readdir(work)).filter((v) => uuid.test(v))) {
-      let bootBytes: Buffer | undefined;
-      try {
-        bootBytes = await readOwned(
-          join(work, "managed-boots", `${name}.boot`),
-          16 * 1024 * 1024,
-        );
-      } catch (error) {
-        if (!absent(error)) throw error;
-      }
-      if (!bootBytes) continue;
-      const boot = parseHostRecord(bootBytes, name).record;
-      check(
-        boot.request.key.context.target.host_id ===
-          (await readOwned(join(work, "host_id"))).toString(),
-        "fc_managed_host_identity",
-      );
-      let raw: string | undefined;
+      let raw: string;
       try {
         raw = (
           await readOwned(join(work, name, "sandbox.json"), 1024 * 1024, false)
         ).toString();
       } catch (error) {
-        if (!absent(error)) throw error;
+        if (absent(error)) continue;
+        throw error;
       }
-      if (raw === undefined) continue;
-      check(raw.length <= 1024 * 1024, "fc_sandbox_manifest_bound");
       const manifest = JSON.parse(raw);
       check(
         manifest.schema_version === 3 &&
@@ -459,13 +586,9 @@ export class FcRuntime {
       );
       const fc = manifest.firecracker;
       const process = identities.get(fc?.pid);
-      if (!process) continue; // A normal destroy may have removed the process first.
+      if (!process) continue;
       check(
-        this.inputs.firecracker &&
-          process.sha256 === this.inputs.firecracker.sha256 &&
-          process.uid === 0 &&
-          process.birth === String(fc.start_time_jiffies) &&
-          process.executable === "/usr/local/bin/firecracker",
+        process.birth === String(fc.start_time_jiffies),
         "fc_sandbox_process",
       );
       check(
@@ -474,81 +597,200 @@ export class FcRuntime {
           /^[a-f0-9-]{36}\.dev$/.test(basename(fc.rootfs_canonical)),
         "fc_rootfs_path",
       );
-      const device = await realpath(fc.rootfs_canonical);
-      const slot = this.inventory.slots.find((v) => v.path === device);
-      check(slot, "fc_rootfs_not_nbd");
-      await assertSlotIdentity(slot);
-      const sys = `/sys/block/${basename(device)}`;
-      const binding = (await optional(`${sys}/pid`))?.trim();
-      const sectors = (await readFile(`${sys}/size`, "utf8")).trim();
-      const io = (await readFile(`${sys}/stat`, "utf8")).trim().split(/\s+/);
-      check(
-        binding &&
-          /^[1-9][0-9]*$/.test(binding) &&
-          identities.has(Number(binding)) &&
-          /^[1-9][0-9]*$/.test(sectors) &&
-          io.length >= 11 &&
-          /^[0-9]+$/.test(io[2]!),
-        "fc_nbd_binding",
+      candidates.push({
+        name,
+        process,
+        rootfsCanonical: fc.rootfs_canonical,
+        sandboxManifest: raw,
+      });
+    }
+    const commands: { process: FcProcess; args: string[] }[] = [];
+    for (const process of identities.values()) {
+      if (process.executable !== "/usr/local/bin/firecracker") continue;
+      try {
+        commands.push({ process, args: await processArguments(process.pid) });
+      } catch (error) {
+        if (!absent(error)) throw error;
+      }
+    }
+    const records = await readdir(join(work, "managed-boots"));
+    check(records.length <= 8192, "fc_managed_record_bound");
+    for (const file of records.filter((v) => /^[a-f0-9-]{36}\.boot$/.test(v))) {
+      const name = file.slice(0, -5);
+      const bootBytes = await readOwned(
+        join(work, "managed-boots", file),
+        16 * 1024 * 1024,
       );
+      const boot = parseHostRecord(bootBytes, name).record;
       check(
-        fds.some((fd) => fd.pid === process.pid && fd.rdev === slot.rdev),
-        "fc_rootfs_device_fd",
+        boot.request.key.context.target.host_id ===
+          (await readOwned(join(work, "host_id"))).toString(),
+        "fc_managed_host_identity",
       );
-      const owner = (
-        await readOwned(join(work, "nbd-owners", basename(device)), 1024, false)
-      )
-        .toString()
-        .trim();
-      check(owner === name, "fc_nbd_durable_owner");
-      const key = `${name}:${boot.request.key.boot_attempt}`;
-      const previousOwner = this.deviceOwners.get(slot.path);
-      const previousBoot = this.deviceBoots.get(slot.path);
-      if (
-        (previousOwner && previousOwner !== owner) ||
-        (previousBoot && previousBoot !== key)
-      )
-        this.readBaseline.set(slot.path, io[2]!);
-      this.deviceOwners.set(slot.path, owner);
-      this.deviceBoots.set(slot.path, key);
-      const readSectorsBefore = this.readBaseline.get(slot.path);
+      // A verified durable request owns staging/transient volumes even before
+      // its Firecracker process is started.
+      this.ownedSandboxes.add(name.replaceAll("-", ""));
+      const paths = managedBootPaths(work, name, boot.request.key.boot_attempt);
+      if (managedNeedsIo(boot))
+        this.requiredBoots.add(`${name}:${boot.request.key.boot_attempt}`);
+      const process = selectManagedProcess(commands, paths.apiSocket);
+      if (!process) continue;
+      candidates.push({
+        name,
+        process,
+        rootfsCanonical: paths.rootfsCanonical,
+        apiSocket: paths.apiSocket,
+        boot,
+        bootBytes,
+      });
+    }
+    for (const candidate of candidates) {
+      const { name, process, rootfsCanonical, boot, bootBytes, apiSocket } =
+        candidate;
       check(
-        readSectorsBefore && /^[0-9]+$/.test(readSectorsBefore),
-        "fc_nbd_read_baseline",
+        this.inputs.firecracker &&
+          process.sha256 === this.inputs.firecracker.sha256 &&
+          process.uid === 0 &&
+          process.executable === "/usr/local/bin/firecracker",
+        "fc_sandbox_process",
       );
-      if (BigInt(io[2]!) <= BigInt(readSectorsBefore)) continue;
+      check(!seenProcesses.has(process.pid), "fc_boot_process_duplicate");
+      // The symlink target exists inside the trusted host's device mount.
+      check(
+        (await lstat(rootfsCanonical)).isSymbolicLink(),
+        "fc_rootfs_not_thin",
+      );
+      const target = await readlink(rootfsCanonical);
+      const volume = `sb-${name.replaceAll("-", "")}-root`;
+      const expectedName = `${pool.name}.${volume}`;
+      check(target === `/dev/engram/${expectedName}`, "fc_rootfs_volume_name");
+      const mapping = pool.mappings.find((m) => m.name === expectedName);
+      check(mapping, "fc_rootfs_not_thin");
+      const node = await deviceNode(
+        join(this.root, "thin-nodes", expectedName),
+      );
+      check(node.device === mapping.device, "fc_rootfs_device_changed");
+      seenProcesses.add(process.pid);
+      this.ownedSandboxes.add(name.replaceAll("-", ""));
+      const rootBytes = BigInt(mapping.table.split(" ")[1]!) * 512n;
+      if (boot)
+        check(
+          rootBytes === BigInt(boot.request.cold.disk.size_bytes),
+          "fc_boot_volume_size",
+        );
+      const largest = (pattern: RegExp) =>
+        pool.mappings
+          .filter((m) => pattern.test(m.name))
+          .map((m) => BigInt(m.table.split(" ")[1]!) * 512n)
+          .reduce((a, b) => (a > b ? a : b), 0n);
+      requirePoolBudget(
+        pool,
+        rootBytes,
+        largest(/-swap(?:-|$)/),
+        largest(/\.(?:tmp-)?img-/),
+      );
+      const identity = JSON.stringify({
+        mapping: {
+          name: mapping.name,
+          device: mapping.device,
+          table: mapping.table,
+          id: mapping.id,
+        },
+        node,
+        process,
+      });
+      const bootAttempt =
+        boot?.request.key.boot_attempt ?? `ordinary-${process.birth}`;
+      const key = `${name}:${bootAttempt}`;
+      const needsIo = !boot || managedNeedsIo(boot);
+      if (needsIo) this.requiredBoots.add(key);
+      const prior = this.bootDevices.get(key);
+      verifyBootDevice(prior, identity);
+      this.bootDevices.set(key, identity);
+      const io = (await readFile(`/sys/dev/block/${node.device}/stat`, "utf8"))
+        .trim()
+        .split(/\s+/);
+      check(io.length >= 11 && /^[0-9]+$/.test(io[2]!), "fc_thin_io_counter");
+      const deviceFd = fds.find(
+        (fd) => fd.pid === process.pid && fd.rdev === node.rdev,
+      );
+      check(deviceFd, "fc_rootfs_device_fd");
+      // A newly allocated thin device starts counters at zero. Bind the
+      // counters to this boot's exact table, thin id and process birth.
+      const readSectorsBefore = this.bootReads.get(key);
+      if (readSectorsBefore === undefined) {
+        this.bootReads.set(key, BigInt(io[2]!));
+        continue;
+      }
+      if (!needsIo || BigInt(io[2]!) <= readSectorsBefore) continue;
+      const finalFd = await stat(`/proc/${process.pid}/fd/${deviceFd.fd}`, {
+        bigint: true,
+      });
+      check(
+        finalFd.isBlockDevice() && String(finalFd.rdev) === node.rdev,
+        "fc_rootfs_device_fd_changed",
+      );
+      verifyFcProcessIdentity(
+        process,
+        await processIdentity(process.pid, this.inventory.bootId, true),
+      );
+      if (apiSocket) {
+        const finalArgs = await processArguments(process.pid);
+        check(
+          selectManagedProcess([{ process, args: finalArgs }], apiSocket),
+          "fc_managed_process_arguments_changed",
+        );
+      }
       if (this.observations.has(key)) continue;
-      const finalProcess = await processIdentity(
-        process.pid,
-        this.inventory.bootId,
-        true,
-      );
-      const bindingProcess = await processIdentity(
-        Number(binding),
-        this.inventory.bootId,
-        true,
-      );
-      verifyFcProcessIdentity(process, finalProcess);
-      const expectedBinding = identities.get(Number(binding));
-      check(expectedBinding, "fc_nbd_binding_process");
-      verifyFcProcessIdentity(expectedBinding, bindingProcess);
       await this.retainObservation(
         key,
         JSON.stringify({
           sandboxId: name,
-          sessionId: boot.request.cold.session_id,
-          bootAttempt: boot.request.key.boot_attempt,
+          ...(boot ? { sessionId: boot.request.cold.session_id } : {}),
+          bootAttempt,
+          kind: boot ? "managed" : "ordinary",
           process,
-          slot,
-          bindingPid: Number(binding),
-          sizeSectors: sectors,
-          readSectorsBefore,
+          pool: { name: pool.name, device: pool.device, table: pool.table },
+          mapping,
+          deviceFd,
+          node,
+          volume,
+          readSectorsBefore: String(readSectorsBefore),
           readSectors: io[2],
-          owner,
-          rootfsCanonical: fc.rootfs_canonical,
-          bootRecordSha256: hash(bootBytes),
+          rootfsCanonical,
+          ...(apiSocket ? { apiSocket } : {}),
+          ...(bootBytes ? { bootRecordSha256: hash(bootBytes) } : {}),
+          ...(candidate.sandboxManifest
+            ? { sandboxManifestSha256: hash(candidate.sandboxManifest) }
+            : {}),
         }) + "\n",
       );
+      this.observationKinds.add(boot ? "managed" : "ordinary");
+    }
+    check(
+      [...identities.values()]
+        .filter((p) => p.executable === "/usr/local/bin/firecracker")
+        .every((p) => seenProcesses.has(p.pid)),
+      "fc_unobserved_process",
+    );
+    await this.validateMappings(pool);
+    for (const name of this.retainedVolumes.keys())
+      if (!pool.mappings.some((m) => m.name === name))
+        this.retainedVolumes.delete(name);
+    for (const mapping of pool.mappings) {
+      if (/\.(?:img-|sb-.*-ckpt-)/.test(mapping.name)) {
+        const previous = this.retainedVolumes.get(mapping.name);
+        if (previous) {
+          const prior = JSON.parse(previous);
+          check(
+            prior.id === mapping.id &&
+              prior.device === mapping.device &&
+              prior.table === mapping.table,
+            "fc_retained_volume_replaced",
+          );
+        }
+        this.retainedVolumes.set(mapping.name, JSON.stringify(mapping));
+      }
     }
   }
   // The path is fixed. This seam permits controlled write-failure tests;
@@ -568,6 +810,8 @@ export class FcRuntime {
   }
   async requireCoverage() {
     check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
+    for (const key of this.requiredBoots)
+      check(this.observations.has(key), "fc_physical_boot_unobserved");
     const files = await readdir(join(this.root, "host/managed-boots"));
     const boots = files.filter((v) => /^[a-f0-9-]{36}\.boot$/.test(v));
     check(boots.length > 0 && boots.length <= 4096, "fc_physical_boot_count");
@@ -577,23 +821,92 @@ export class FcRuntime {
         await readOwned(join(this.root, "host/managed-boots", file)),
         id,
       ).record;
-      check(
-        this.observations.has(`${id}:${boot.request.key.boot_attempt}`),
-        "fc_physical_boot_unobserved",
+      requireManagedBootCoverage(
+        this.requiredBoots,
+        this.observations,
+        `${id}:${boot.request.key.boot_attempt}`,
+        boot,
       );
     }
   }
-  async requireReleased() {
+  async requireInfrastructure(lifecycle: {
+    stop(): Promise<void>;
+    restart(): Promise<void>;
+  }) {
+    await this.observe();
     check(
-      nbdCount(
-        await readFile("/sys/module/nbd/parameters/nbds_max", "utf8"),
-      ) === this.inventory.slots.length,
-      "fc_nbd_module_changed",
+      this.observationKinds.has("ordinary") &&
+        this.observationKinds.has("managed"),
+      "fc_infrastructure_boot_evidence",
     );
-    for (const slot of this.inventory.slots) await assertFree(slot);
+    await this.requireCoverage();
+    const deadline = performance.now() + 10000;
+    for (;;) {
+      try {
+        await this.requireReleased();
+        break;
+      } catch (error) {
+        if (performance.now() >= deadline) throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await this.observe();
+    }
+    // The live checks above require normal deletion while the host is alive.
+    // Metadata inspection starts only after that exact host and its VMs stop.
+    await lifecycle.stop();
+    await this.requireStopped();
+    await lifecycle.restart();
+    await put(
+      join(this.root, "fc-infrastructure.json"),
+      JSON.stringify({
+        bootKeys: [...this.observations],
+        pool: this.inventory.pool,
+        release: "verified",
+      }),
+    );
+  }
+  async requireReleased() {
+    const pool = await inspectPool(this.inventory.pool);
+    await this.checkReleased(pool, false);
+  }
+  private async checkReleased(pool: PoolInventory, metadata: boolean) {
+    verifyPoolIdentity(this.inventory.pool, pool);
+    await this.validateMappings(pool);
+    verifyReleasedMappings(pool, this.retainedVolumes);
+    for (const m of pool.mappings) {
+      const path = join(this.root, "thin-nodes", m.name);
+      const node = await deviceNode(path);
+      check(
+        node.device === m.device &&
+          (await readdir(`/sys/dev/block/${m.device}/holders`)).length === 0,
+        "fc_thin_remaining_holder",
+      );
+      check(
+        (await deviceFds([node], await pids())).length === 0,
+        "fc_thin_remaining_fd",
+      );
+    }
+    const nodeNames = (
+      await readdir(join(this.root, "thin-nodes")).catch((error) => {
+        if (!this.host && absent(error)) return [];
+        throw error;
+      })
+    ).sort();
     check(
-      (await deviceFds(this.inventory.slots, await pids())).length === 0,
-      "fc_nbd_remaining_fd",
+      JSON.stringify(nodeNames) ===
+        JSON.stringify(pool.mappings.map((m) => m.name).sort()),
+      "fc_unreleased_device_node",
+    );
+    await put(
+      join(
+        this.root,
+        `fc-volume-cleanup-${randomBytes(8).toString("hex")}.json`,
+      ),
+      JSON.stringify({
+        metadataInspected: metadata,
+        pool,
+        retained: pool.mappings.map((m) => m.name),
+      }),
     );
   }
   async requireStopped() {
@@ -610,6 +923,12 @@ export class FcRuntime {
       JSON.stringify({ observed: [...this.processes.values()], survivors }),
     );
     check(survivors.length === 0, "fc_owned_process_survivor");
-    await this.requireReleased();
+    const prove = () => this.proveStorageQuiescent();
+    await this.storageAccess.stopped(prove);
+    await this.storageAccess.inspect(prove, async (lease) => {
+      const pool = await inspectPool(this.inventory.pool, lease);
+      verifyThinIds(pool);
+      await this.checkReleased(pool, true);
+    });
   }
 }

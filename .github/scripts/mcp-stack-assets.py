@@ -13,6 +13,7 @@ import secrets
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -55,14 +56,25 @@ def canonical(path, kind='file', owner=True):
     return p
 
 
+def validate_thin_pool(value):
+    require(isinstance(value, dict) and set(value) == {'name', 'directory'}, 'operator_thin_pool_keys')
+    require(isinstance(value['name'], str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,126}', value['name']), 'operator_thin_pool_name')
+    require(isinstance(value['directory'], str), 'operator_thin_pool_directory')
+    directory = canonical(value['directory'], 'directory')
+    require(directory.stat().st_mode & 0o777 == 0o700, 'operator_thin_pool_mode')
+    return value
+
+
 def read_operator(path, backend):
     p = canonical(path, owner=False)
     s = p.stat()
     require(s.st_uid in {0, os.getuid()} and s.st_mode & 0o022 == 0 and s.st_size <= 16384, 'operator_file')
     o = json.loads(p.read_bytes())
     require(set(o) == {'version', 'backend', 'engineSocket', 'nativeHostIp', 'subnet',
-                       'registryPort', 'buildRegistryPort', 'tools'}, 'operator_keys')
+                       'registryPort', 'buildRegistryPort', 'tools'} | ({'thinPool'} if backend == 'firecracker' else set()), 'operator_keys')
     require(o['version'] == 1 and o['backend'] == backend, 'operator_backend')
+    if backend == 'firecracker':
+        validate_thin_pool(o['thinPool'])
     need = TOOLS | ({'cargo', 'rustc', 'cc', 'go'} if backend == 'vz' else set())
     require(isinstance(o['tools'], dict) and set(o['tools']) == need, 'operator_tools')
     for path in o['tools'].values():
@@ -95,6 +107,78 @@ def source_paths(names):
 
 def digest(data):
     return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+
+def boot_json(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'boot_json_duplicate')
+            result[key] = value
+        return result
+    value = json.loads(data, object_pairs_hook=unique)
+    require(isinstance(value, dict), 'boot_json_object')
+    return value
+
+
+def boot_file(path, directory, limit):
+    require(isinstance(path, str) and Path(path).parent == directory, 'boot_file_directory')
+    p = canonical(path)
+    parent = canonical(str(directory), 'directory')
+    parent_before = parent.stat()
+    require(parent_before.st_mode & 0o7777 == 0o700, 'boot_directory_mode')
+    before = p.lstat()
+    require(before.st_mode & 0o7777 == 0o400, 'boot_file_mode')
+    require(0 < before.st_size <= limit, 'boot_file_size')
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode, s.st_nlink,
+                          s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    # Open through the retained private directory and compare named/opened
+    # identities, as the existing Inputs pin reader does for staged files.
+    folder = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened_parent = os.fstat(folder)
+        require((opened_parent.st_dev, opened_parent.st_ino, opened_parent.st_uid, opened_parent.st_mode) ==
+                (parent_before.st_dev, parent_before.st_ino, parent_before.st_uid, parent_before.st_mode), 'boot_directory_changed')
+        fd = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+        try:
+            require(identity(os.fstat(fd)) == identity(before), 'boot_file_changed')
+            chunks, size = [], 0
+            while True:
+                chunk = os.read(fd, min(1024 * 1024, limit + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                require(size <= limit, 'boot_file_size')
+            require(size == before.st_size and identity(os.fstat(fd)) == identity(before), 'boot_file_changed')
+            require(identity(canonical(path).lstat()) == identity(before), 'boot_file_changed')
+            current_parent = canonical(str(directory), 'directory').stat()
+            require((current_parent.st_dev, current_parent.st_ino, current_parent.st_uid, current_parent.st_mode) ==
+                    (opened_parent.st_dev, opened_parent.st_ino, opened_parent.st_uid, opened_parent.st_mode), 'boot_directory_changed')
+            return b''.join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(folder)
+
+
+def static_amd64_firecracker(data):
+    require(len(data) >= 64 and data[:7] == b'\x7fELF\x02\x01\x01', 'boot_fork_elf')
+    (_, kind, machine, version, entry, offset, _, _, header_size, program_size,
+     count, _, _, _) = struct.unpack_from('<16sHHIQQQIHHHHHH', data)
+    require(kind in {2, 3} and machine == 62 and version == 1 and header_size == 64 and
+            program_size == 56 and 0 < count <= 1024 and offset >= 64 and
+            offset + count * program_size <= len(data), 'boot_fork_elf')
+    executable = False
+    for i in range(count):
+        kind, flags, start, address, _, size, memory_size, _ = struct.unpack_from('<IIQQQQQQ', data, offset + i * program_size)
+        require(start + size <= len(data) and kind != 3, 'boot_fork_static')
+        if kind == 1 and flags & 1 and memory_size >= size and address <= entry < address + memory_size:
+            executable = True
+        if kind == 2:
+            require(size <= 65536 and size % 16 == 0 and not any(struct.unpack_from('<qQ', data, j)[0] == 1
+                    for j in range(start, start + size, 16)), 'boot_fork_static')
+    require(executable, 'boot_fork_elf')
 
 
 def image_facts(raw, config, architecture):
@@ -297,17 +381,18 @@ class Producer:
                     for key in config), 'private_checkout_config')
         return checkout, head
 
-    def run_private_checkout(self, prepare_only=False):
+    def run_private_checkout(self, prepare_only=False, boot_artifacts=None):
         checkout, head = self.private_checkout(REPO)
         script = '.github/scripts/mcp-stack-assets.py'
         require((checkout / script).read_bytes() == Path(__file__).read_bytes(), 'producer_source_changed')
         self.nested_started = True
         env = dict(self.env)
-        if os.environ.get('GITHUB_TOKEN'):
+        if boot_artifacts is None and os.environ.get('GITHUB_TOKEN'):
             env['GITHUB_TOKEN'] = os.environ['GITHUB_TOKEN']
         self.call([sys.executable, '-I', checkout / script, '--backend', self.backend,
                    '--operator', self.operator_path, '--work-root', self.root / 'execution',
-                   '--private-checkout', *(['--prepare-only'] if prepare_only else [])], env=env, cwd=checkout, grace=240)
+                   '--private-checkout', *(['--prepare-only'] if prepare_only else []),
+                   *(['--boot-artifacts', boot_artifacts] if boot_artifacts is not None else [])], env=env, cwd=checkout, grace=240)
         return prepared_result(self.root / 'execution', self.backend, head) if prepare_only else matrix_result(self.root / 'execution/run', self.backend, head)
 
     def engine(self, *args, cleanup=False):
@@ -470,7 +555,60 @@ class Producer:
                      'tests/fixtures/mcp-stack/platform/host-agent.Dockerfile']:
             require((self.source / role).is_file(), 'source_recipe')
 
-    def acquire_boot(self):
+    def fork_gitlink(self):
+        gitlink = self.call(['/usr/bin/git', 'ls-tree', 'HEAD', 'third_party/firecracker']).decode().split()
+        require(len(gitlink) == 4 and gitlink[0] == '160000' and gitlink[1] == 'commit' and
+                re.fullmatch('[a-f0-9]{40}', gitlink[2]) and gitlink[3] == 'third_party/firecracker', 'fork_gitlink')
+        return gitlink[2]
+
+    def acquire_boot_artifacts(self, path):
+        require(self.backend == 'firecracker' and self.arch == 'amd64', 'boot_artifacts_backend')
+        directory = Path(path).parent
+        require(not directory.is_relative_to(REPO) and not directory.is_relative_to(self.source), 'boot_source_context')
+        raw = boot_file(path, directory, 16384)
+        manifest = boot_json(raw)
+        pins = {'firecracker': 256 * 1024 * 1024, 'kernel': 128 * 1024 * 1024,
+                'kernelChecksum': 4096, 'provenance': 16384}
+        require(set(manifest) == {'version', 'kind', 'backend', 'architecture', 'forkGitlink', 'kernelRelease'} | pins.keys(),
+                'boot_manifest_keys')
+        require(type(manifest['version']) is int and manifest['version'] == 1 and
+                manifest['kind'] == 'mcp-physical-boot-assets' and manifest['backend'] == 'firecracker' and
+                manifest['architecture'] == 'amd64' and manifest['kernelRelease'] == 'fc-kernel-6.1.102-1', 'boot_manifest_identity')
+        require(manifest['forkGitlink'] == self.fork_gitlink(), 'boot_fork_gitlink')
+        blobs = {}
+        for key, limit in pins.items():
+            pin = manifest[key]
+            require(isinstance(pin, dict) and set(pin) == {'path', 'sha256'} and
+                    isinstance(pin['sha256'], str) and re.fullmatch('[a-f0-9]{64}', pin['sha256']), 'boot_pin')
+            blobs[key] = boot_file(pin['path'], directory, limit)
+            require(hashlib.sha256(blobs[key]).hexdigest() == pin['sha256'], 'boot_pin_hash')
+        static_amd64_firecracker(blobs['firecracker'])
+        checksum = blobs['kernelChecksum'].decode('ascii').split()
+        require(len(checksum) in {1, 2} and checksum[0] == manifest['kernel']['sha256'] and
+                (len(checksum) == 1 or checksum[1] in {'vmlinux-engram-6.1.102-1', '*vmlinux-engram-6.1.102-1'}),
+                'boot_kernel_checksum')
+        receipt = boot_json(blobs['provenance'])
+        require(set(receipt) == {'version', 'kind', 'forkGitlink', 'target', 'profile', 'firecrackerSha256'} and
+                type(receipt['version']) is int and receipt['version'] == 1 and
+                receipt['kind'] == 'operator-built-firecracker' and receipt['forkGitlink'] == manifest['forkGitlink'] and
+                receipt['target'] == 'x86_64-unknown-linux-musl' and receipt['profile'] == 'release' and
+                receipt['firecrackerSha256'] == manifest['firecracker']['sha256'], 'boot_provenance')
+        downloads = self.root / 'boot-download'
+        downloads.mkdir(mode=0o700)
+        for key, data in {'manifest': raw, **blobs}.items():
+            target = downloads / key
+            self.put(target, data)
+            require(hashlib.sha256(target.read_bytes()).hexdigest() == hashlib.sha256(data).hexdigest(), 'boot_staged_hash')
+        self.put(self.root / 'fork-provenance.json', json.dumps({
+            'kind': 'operator-built', 'gitlink': manifest['forkGitlink'],
+            'firecrackerSha256': manifest['firecracker']['sha256'],
+            'manifestSha256': hashlib.sha256(raw).hexdigest(),
+            'provenanceSha256': manifest['provenance']['sha256']}).encode())
+        return self.stage(downloads / 'kernel', 'kernel'), downloads / 'firecracker'
+
+    def acquire_boot(self, boot_artifacts=None):
+        if boot_artifacts is not None:
+            return self.acquire_boot_artifacts(boot_artifacts)
         downloads = self.root / 'boot-download'
         downloads.mkdir(mode=0o700)
         ghconfig = self.root / 'gh-config'
@@ -492,20 +630,19 @@ class Producer:
         if self.backend != 'firecracker':
             shutil.rmtree(ghconfig)
             return kernel, None
-        gitlink = self.call(['/usr/bin/git', 'ls-tree', 'HEAD', 'third_party/firecracker']).decode().split()
-        require(len(gitlink) >= 4 and gitlink[0] == '160000' and re.fullmatch('[a-f0-9]{40}', gitlink[2]), 'fork_gitlink')
+        gitlink = self.fork_gitlink()
         auth = self.root / 'fork-registry.json'
         self.put(auth, b'{"auths":{}}')
         try:
             if token:
                 self.call([self.tools['oras'], 'login', '--registry-config', auth, '--username', 'x-access-token',
                            '--password-stdin', 'ghcr.io'], data=token.encode())
-            reference = 'ghcr.io/cortexapps/engrams/firecracker:' + gitlink[2]
+            reference = 'ghcr.io/cortexapps/engrams/firecracker:' + gitlink
             immutable = self.call([self.tools['oras'], 'resolve', '--registry-config', auth, reference]).decode().strip()
             require(DIGEST.fullmatch(immutable), 'fork_manifest')
             self.call([self.tools['oras'], 'pull', '--registry-config', auth,
                        reference.split(':')[0] + '@' + immutable, '--output', downloads / 'fork'])
-            self.put(self.root / 'fork-provenance.json', json.dumps({'gitlink': gitlink[2], 'manifest': immutable}).encode())
+            self.put(self.root / 'fork-provenance.json', json.dumps({'gitlink': gitlink, 'manifest': immutable}).encode())
         finally:
             auth.unlink(missing_ok=True)
             # gh may create config state. Delete only this new task-owned config directory.
@@ -604,7 +741,7 @@ class Producer:
         helper = self.stage(build / 'netstack/engram-sandbox-netstack', 'helper', True)
         return {'hostAgent': host, 'proxy': proxy, 'helper': helper, 'nativeProbe': {'path': str(self.files / 'nativeProbe')}}
 
-    def produce(self, prepare_only=False):
+    def produce(self, prepare_only=False, boot_artifacts=None):
         require(platform.system() == ('Linux' if self.backend == 'firecracker' else 'Darwin') and
                 platform.machine() in (['x86_64'] if self.backend == 'firecracker' else ['arm64']), 'physical_platform')
         require(self.backend != 'firecracker' or os.getuid() == 0, 'fc_root')
@@ -632,6 +769,7 @@ class Producer:
             'id': info['ID'], 'os': info['OSType'], 'architecture': info['Architecture'],
             'socketDevice': self.socket.st_dev, 'socketInode': self.socket.st_ino}).encode())
         self.snapshot()
+        boot = self.acquire_boot(boot_artifacts) if boot_artifacts is not None else None
         bins = {name: self.stage(self.tools[name], name, True) for name in ['node', 'bun', 'docker', 'openssl']}
         upstream = json.loads((self.source / CI / 'upstream-images.json').read_bytes())
         for role, value in upstream.items():
@@ -656,7 +794,7 @@ class Producer:
         self.put(self.files / 'guestInit', match.group(1).encode())
         (self.files / 'guestInit').chmod(0o700)
         bins['guestInit'] = {'path': str(self.files / 'guestInit')}
-        bins['kernel'], fork = self.acquire_boot()
+        bins['kernel'], fork = boot if boot is not None else self.acquire_boot()
         host = self.final_host(fork) if self.backend == 'firecracker' else self.native_host()
         for key in ['hostAgent', 'helper']:
             bins[key] = host.pop(key)
@@ -664,7 +802,8 @@ class Producer:
                     'engineSocket': self.o['engineSocket'], 'engineConfig': str(self.adapter_config),
                     'engineId': self.engine_identity, 'registryPort': self.o['registryPort'],
                     'subnet': self.o['subnet'], 'nativeHostIp': self.o['nativeHostIp'],
-                    'binaries': bins, 'images': self.images, **host}
+                    'binaries': bins, 'images': self.images, **host,
+                    **({'thinPool': self.o['thinPool']} if self.backend == 'firecracker' else {})}
         self.put(self.root / 'template.json', json.dumps(template).encode())
         self.call([bins['node']['path'], '--experimental-transform-types', REPO / '.github/scripts/mcp-stack-inputs.mts',
                    '--backend', self.backend, '--template', self.root / 'template.json', '--output', self.root / 'inputs.json'])
@@ -757,8 +896,10 @@ def main():
     parser.add_argument('--operator', required=True)
     parser.add_argument('--work-root', required=True)
     parser.add_argument('--prepare-only', action='store_true', help='Prepare pinned assets without starting the acceptance adapter')
+    parser.add_argument('--boot-artifacts', help='Use a private, pinned Firecracker boot manifest instead of downloading boot artifacts')
     parser.add_argument('--private-checkout', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    require(args.boot_artifacts is None or args.backend == 'firecracker', 'boot_artifacts_backend')
     os.umask(0o077)
     root = Path(args.work_root)
     require(root.is_absolute() and root.resolve() == root and root.parent.resolve() == root.parent and not root.exists() and
@@ -781,7 +922,7 @@ def main():
         signal.signal(signal.SIGTERM, cancel)
         signal.signal(signal.SIGINT, cancel)
         try:
-            passed = producer.produce(args.prepare_only) if args.private_checkout else producer.run_private_checkout(args.prepare_only)
+            passed = producer.produce(args.prepare_only, args.boot_artifacts) if args.private_checkout else producer.run_private_checkout(args.prepare_only, args.boot_artifacts)
             completed = True
         finally:
             # Drain the interrupted child in call() before owned-resource cleanup.

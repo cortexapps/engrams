@@ -48,11 +48,11 @@ export type SupervisorStatus = z.infer<typeof StatusSchema>;
 export class Supervisor {
   constructor(private readonly ctx: Context) {}
   private async call(
-    operation: "status" | "restart" | "stop",
+    operation: "status" | "restart" | "stop" | "infrastructure-ready",
     role?: MutableRole,
     configurationId?: ConfigurationId,
   ): Promise<SupervisorStatus> {
-    if (operation !== "status" && !role)
+    if ((operation === "restart" || operation === "stop") && !role)
       throw new RunnerFailure("INVALID_CONTEXT", "restart_domain");
     const token = (
       await privateFile(this.ctx.runRoot, this.ctx.supervisor.tokenFile)
@@ -168,6 +168,9 @@ export class Supervisor {
       }
     }
     return state;
+  }
+  async infrastructureReady() {
+    return this.call("infrastructure-ready");
   }
   async status() {
     return this.call("status");

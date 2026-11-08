@@ -42,39 +42,50 @@ Missing or invalid metadata or image facts stop the producer before save.
 The local-directory export path stays unchanged. No tag or new builder is used.
 Do not start Docker Desktop, Lima, Colima or another engine from the job.
 
-For FC reserve the entire dedicated Linux kernel for this job. Preload the
-production NBD module and its complete device set before CI. There must be no
-other NBD users, host agents, Firecracker or proxy instances on that kernel.
-The adapter must verify that the selected engine and native runner share the
-same kernel/boot and initial PID namespace, discover nbds_max1..4096, and
-qualify every existing slot as usable and free. It reserves the whole verified
-set across restarts (FIRST0/MAXactualcount/WARM1). Capacity exhaustion fails;
-File-memory restore does not remove the NBD rootfs requirement. The workflow
-serializes FC jobs per repository; the operator must also reserve the entire
-runner/kernel across other repositories, services and runner registrations.
+For FC reserve the entire dedicated Linux x86-64 kernel. Prepare a fresh,
+exclusive dm-thin pool with the production node helper before running the job:
 
-Only the trusted FC host uses the host PID namespace for production NBD PID
-semantics. Its mount, cgroup and guard network namespaces stay private, with
-read-only root/proc/sys/sysfs/cgroup, default seccomp and only the exact required
-capabilities/devices. It receives verified individual NBD block devices plus
-KVM/TUN. It receives no broad /dev mount or SYS_MODULE. The worker and every
-other container retain private PID and their existing authority. The trusted
-host can observe kernel PIDs and has global NBD netlink authority; device
-cgroups do not isolate that control plane. Exclusive kernel reservation is an
-operator prerequisite, not a supplied PASS flag.
+```sh
+install -d -m 0700 /work/mcp-thin/acceptance
+POOL_NAME=mcp-acceptance POOL_DIR=/work/mcp-thin/acceptance \
+  POOL_DATA_SIZE=96G POOL_META_SIZE=2G POOL_RESERVE=16G \
+  sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+```
 
-Normal cleanup destroys only the run's real sessions through supported APIs
-while the host is alive. The adapter must observe VM exit and complete NBD
-release, then stop the host and prove no owned host/FC/UFFD/proxy process
-survives. A stale binding or unexpected host death is cleanup failure and needs
-identity-scoped operator recovery. CI never forcibly disconnects NBD, resets
-the module, or deletes authoritative history to manufacture cleanup.
+This is explicit node preparation, never a preflight action. Use an empty,
+disposable directory and no `POOL_CACHE_DIR`. A pool name alone does not isolate
+DM control. No other host agent, Firecracker, proxy, or storage job may run.
+Install `/usr/sbin/dmsetup`, `/usr/sbin/losetup` and `/usr/sbin/thin_dump`.
+The adapter verifies full allocation and actual backing identities, active and
+inactive IDs, capacity and holders before the production host can open the pool.
+The 96 GiB allocation is an operator estimate. Capacity is checked against
+actual installed image/session/swap overlap before infrastructure passes;
+a larger image can require more capacity. Keep 16 GiB of filesystem space free
+in addition to pool data and metadata. Source tests do not prove these minima
+are sufficient for a particular installed image.
+
+The trusted host alone receives SYS_ADMIN, NET_ADMIN, MKNOD, mapper control,
+the admitted pool and read-only metadata devices, and an `rwm` device rule for
+the kernel's observed DM major. Only its private node directory binds at
+`/dev/engram`; there is no broad `/dev` mount. Other roles retain their existing
+device denial and private PID namespaces. The real infrastructure stage must
+create, use and release production dm-thin session volumes under this effective
+policy before MCP cases start. Missing capability fails without a retry that
+adds authority. A device rule cannot isolate global mapper control; kernel
+exclusivity is required.
+
+Cleanup uses normal session deletion while the host is alive, then verifies
+closed FDs and removal of live/transient volumes. Recorded images/checkpoints
+can remain, with exact table/ID/device and zero opens. Any unexplained survivor,
+foreign change or inactive ID fails cleanup. No forced DM removal, pool reset,
+cache clearing or history deletion is allowed. Retain restricted evidence for
+identity-scoped recovery on a failed run.
 
 Provision native private DNS and routes for the exact fixture hosts and the
 selected bridge subnet. Native host processes must reach container IPs, and
 containers must reach the native host address. Provide real KVM and TUN access
 on Linux, and real hardware virtualization on native arm64 macOS. Production
-Firecracker also uses the Linux NBD rootfs path; the platform's reviewed native
+Firecracker uses the production dm-thin rootfs path; the platform's reviewed native
 capability preflight must qualify that path before a VM starts. No workflow
 changes modules, device permissions, sysctl, routes or global DNS. A failed
 capability probe is a failure. The VZ host is built and ad-hoc signed with the
@@ -98,6 +109,10 @@ addresses with the provisioned facts):
   "subnet": "10.88.2.0/24",
   "registryPort": 30000,
   "buildRegistryPort": 31000,
+  "thinPool": {
+    "name": "mcp-acceptance",
+    "directory": "/work/mcp-thin/acceptance"
+  },
   "tools": {
     "node": "/opt/mcp/node/bin/node",
     "bun": "/opt/mcp/bun/bin/bun",
@@ -111,7 +126,35 @@ addresses with the provisioned facts):
 }
 ```
 
-VZ sets backend`vz` and additionally supplies canonical executable paths for
+An administrator can set the optional repository variable `MCP_FC_BOOT_ARTIFACTS`
+to an absolute path such as `/etc/engrams/mcp-boot/manifest.json` on the dedicated
+FC runner. With this variable absent or empty, CI keeps the strict existing boot
+artifact download path. A download failure does not select another source. With
+an explicit value, CI passes it as one quoted `--boot-artifacts` argument. The
+variable contains a path, never a command, credential, or supplied result.
+
+Before the job, the operator must install that manifest and its four pinned
+files in the same canonical private directory outside the checkout and exported
+source. The directory must be owned by root and mode 0700. The manifest and each
+file must be root-owned, single-link, mode 0400, and have no symlink components.
+Do not generate this custody record in the workflow. The manifest pins the
+Firecracker executable, kernel, companion kernel checksum, and build provenance
+with exact `{ "path": "...", "sha256": "..." }` objects. Its fixed identity is
+version 1, kind `mcp-physical-boot-assets`, backend `firecracker`, architecture
+`amd64`, and kernel release `fc-kernel-6.1.102-1`. `forkGitlink` must match
+`third_party/firecracker` in the checkout. The provenance must identify a release
+build for `x86_64-unknown-linux-musl` from that exact fork revision and bind the
+executable hash. The producer checks the actual static x86-64 executable, all
+pins and the kernel checksum before the build. It stages verified copies in the
+private run directory. It rejects unknown fields, substituted files and invalid
+provenance. VZ does not accept this option.
+
+The repository variable and preinstalled files are administrator-controlled
+runner preparation. This source change does not set the variable or provision a
+runner. The same serialized FC job, 24 common cases, cleanup checks and `CI Gate`
+remain required with either explicit source selection.
+
+VZ omits `thinPool`, sets backend`vz` and additionally supplies canonical executable paths for
 `cargo`, `rustc`, `cc` and `go` under tools. Supply actual Rust1.99.0 toolchain
 binaries, not rustup shims. Supply Go1.26.2, Node24 (CI source uses24.22.2),
 Bun matching `.bun-version`, OpenSSL3 and the native build prerequisites,

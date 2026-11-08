@@ -659,8 +659,9 @@ test("native barrier and absent denial records cannot masquerade as result recei
 });
 
 test("grant replacement preserves public profile state and exact publication CAS", async () => {
-  const { ProfileSchema, UpdateProfileRequestSchema } =
-    await import("../../src/gen/engram/app/v1/profile_pb.ts");
+  const { ProfileSchema, UpdateProfileRequestSchema } = await import(
+    "../../src/gen/engram/app/v1/profile_pb.ts"
+  );
   const { grantUpdateRequest } = await import("./rebind.ts");
   const profile = create(ProfileSchema, {
     id: "profile-1",
@@ -1968,4 +1969,45 @@ test("managed proxy probe uses the fixture IP and SNI without guest DNS", async 
       probeManagedAuthority(ctx, client, "session"),
     ).rejects.toThrow();
   }
+});
+
+test("FC storage checkpoint must pass before infrastructure evidence permits cases", async () => {
+  const { completeInfrastructure } = await import("./runner.ts");
+  for (const failure of [false, true]) {
+    const order: string[] = [];
+    const checkpoint = async () => {
+      order.push("physical");
+      if (failure) throw Error("physical storage failure");
+    };
+    const evidence = {
+      infrastructure: async () => {
+        order.push("evidence");
+      },
+    };
+    const task = completeInfrastructure(
+      "firecracker",
+      infrastructureRows(),
+      evidence,
+      { infrastructureReady: checkpoint },
+    );
+    if (failure) {
+      await expect(task).rejects.toThrow("physical storage failure");
+      expect(order).toEqual(["physical"]);
+    } else {
+      await task;
+      expect(order).toEqual(["physical", "evidence"]);
+    }
+  }
+  let called = false;
+  await completeInfrastructure(
+    "vz",
+    infrastructureRows(),
+    { infrastructure: async () => {} },
+    {
+      infrastructureReady: async () => {
+        called = true;
+      },
+    },
+  );
+  expect(called).toBe(false);
 });

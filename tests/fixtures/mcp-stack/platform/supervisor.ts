@@ -29,6 +29,7 @@ import {
 
 export type Operation = { version: 1; runId: string } & (
   | { operation: "status" }
+  | { operation: "infrastructure-ready" }
   | { operation: "stop"; role: MutableRole }
   | {
       operation: "restart";
@@ -43,9 +44,12 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
     ["role", "configurationId"],
   );
   check(base.version === 1 && base.runId === ctx.runId, "supervisor_run");
-  if (base.operation === "status") {
+  if (
+    base.operation === "status" ||
+    base.operation === "infrastructure-ready"
+  ) {
     record(base, ["version", "runId", "operation"]);
-    return { version: 1, runId: ctx.runId, operation: "status" };
+    return { version: 1, runId: ctx.runId, operation: base.operation };
   }
   check(
     base.operation === "restart" || base.operation === "stop",
@@ -93,6 +97,7 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
 // Only this fixed lifecycle is callable. The adapter supplies owned handles, never request-defined commands.
 export type Lifecycle = {
   status(signal: AbortSignal): Promise<SupervisorStatus>;
+  infrastructureReady?(signal: AbortSignal): Promise<void>;
   restart(
     role: MutableRole,
     configuration: ConfigurationId,
@@ -309,7 +314,18 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         phase = "reply";
         return reply(res, 200, before);
       }
-      if (operation.operation === "restart") {
+      if (operation.operation === "infrastructure-ready") {
+        check(
+          ctx.backend === "firecracker" && lifecycle.infrastructureReady,
+          "supervisor_storage_checkpoint",
+        );
+        check(
+          before.roles.every((r) => r.state === "running"),
+          "roles_before_restart",
+        );
+        phase = "lifecycle";
+        await lifecycle.infrastructureReady(signal);
+      } else if (operation.operation === "restart") {
         check(
           before.roles.every((r) => r.state === "running"),
           "roles_before_restart",
@@ -336,7 +352,11 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
       );
       for (const prior of before.roles) {
         const current = after.roles.find((r) => r.role === prior.role)!;
-        if (current.role !== operation.role)
+        const changedRole =
+          operation.operation === "infrastructure-ready"
+            ? "host-agent"
+            : operation.role;
+        if (current.role !== changedRole)
           check(
             current.bootId === prior.bootId &&
               current.state === prior.state &&
@@ -344,11 +364,14 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
               current.configurationSha256 === prior.configurationSha256,
             "restart_scope",
           );
-        else if (operation.operation === "restart")
+        else if (operation.operation !== "stop")
           check(
             current.state === "running" &&
               current.bootId !== prior.bootId &&
-              current.configurationId === operation.configurationId,
+              current.configurationId ===
+                (operation.operation === "infrastructure-ready"
+                  ? "normal"
+                  : operation.configurationId),
             "restart_identity",
           );
         else check(current.state === "stopped", "stop_identity");
@@ -376,7 +399,7 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         const diagnostic = {
           version: 1,
           operation: operation.operation,
-          ...(operation.operation === "status" ? {} : { role: operation.role }),
+          ...("role" in operation ? { role: operation.role } : {}),
           phase,
           ...(reason
             ? { failure: reason, seam: "control_aborted" }

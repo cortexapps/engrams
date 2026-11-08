@@ -184,8 +184,8 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
-- Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
+- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each ordinary session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
+- Drive ordinary sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
 - Enforce per-VM resource limits via the production backend (Firecracker enforces RAM/CPU/disk at the VMM boundary; the dev backend ignores them with a documented caveat).
@@ -203,10 +203,12 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 A session's disk is a volume the kernel owns. On Linux it is a thin volume in a
 device-mapper pool that node-prep builds (`thinPool` in the host-fleet chart; a Firecracker
 host agent refuses to start without one); on macOS
-it is a sparse file under the work dir. Both sit behind `engram_host_core::SessionDisk`
-and the two flows in `engram_host_core::disk_flows`: `stage` turns a chunk-store manifest
-into a volume, and `checkpoint` turns a volume into a manifest. The guard for each fact is
-the test named beside it.
+it is a sparse file under the work dir. Ordinary FC and VZ sessions use
+`engram_host_core::SessionDisk` and the two flows in `engram_host_core::disk_flows`:
+`stage` turns a chunk-store manifest into a volume, and `checkpoint` turns a volume
+into a manifest. The facts below describe ordinary session lifecycles and shared pool
+behavior. Managed external-MCP sessions have the narrower lifecycle described after
+these facts. The guard for each fact is the test named beside it.
 
 - No userspace process is in the data path. The host agent holds a volume only while it
   stages or checkpoints it; a volume outlives every handle to it and reopens by name
@@ -291,7 +293,36 @@ the test named beside it.
 
 ADR 0125 records the decision and what it replaced.
 
+**Managed external-MCP sessions:** Managed Firecracker uses the same production
+`SessionDisk` instance, but imports the exact verified cold disk into a new root
+volume and attaches its block device. Capture stops and reaps the VM before it
+exports a transient volume snapshot. The host durably records the exported file's
+hash and size before it can release the source
+(`exported_capture_keeps_source_until_host_records_its_hash_and_size`).
+
+Both managed backends permit only explicit disk-only cold recovery with the exact
+stored capture authority. They do not restore saved memory or device state, or
+replay pending external effects. Ordinary checkpoint, eviction, resume, and migration
+paths remain closed. A missing managed owner fails closed; a host restart does not
+adopt that owner. Durable markers protect managed FC volumes from the ordinary
+startup sweep (`startup_keeps_managed_volumes_and_sweeps_unowned_volumes`). Failed
+or uncertain capture retains its source; an authorized normal FC destroy releases
+its volumes only after owner cleanup succeeds
+(`started_normal_destroy_releases_disks_but_uncertain_capture_does_not`).
+
+An incompatible-upgrade drain stops before deployment changes if it cannot
+checkpoint or evict a managed session. An unchanged reattach generation and wire
+version checks do not establish managed-session upgrade or adoption support.
+External MCP remains disabled pending its upgrade and recovery gates, source-matched
+Firecracker acceptance and cleanup, current-head CI, and final acceptance review.
+The shared wire version also affects ordinary sessions; disabling MCP does not
+isolate that change. Exact-version refusal and an unchanged reattach generation
+do not establish previous-release wire readability or safe rolling upgrades and
+rollback. VZ parity is a separate gate. ADR 0127 records these limits.
+
 ### Snapshot manager (lives inside host agent)
+
+The snapshot and eviction flows in this section apply to ordinary sessions.
 
 **Two tiers (ADR 0005)**: hot tier on local NVMe for same-host fast resume, cold tier in `BlobStorage` for cross-host durability. ADR 0001 retired the cold tier; ADR 0005 reintroduced it once the premise shifted from "30-second-preemption replication" (infeasible math) to "minutes-budget disk-pressure flush" (trivial math).
 

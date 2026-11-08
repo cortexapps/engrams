@@ -125,30 +125,49 @@ and entrypoint. Pin the derivative archive/manifest/config. Extract the final
 host, UFFD, and proxy bytes for their binary pins; the launcher checks all four
 baked executable hashes before releasing the host entrypoint.
 
-FC requires a dedicated, exclusive whole Linux/KVM runner and kernel. No other
-NBD user, host agent, Firecracker, or egress proxy can share it. Serialize runs
-on that runner. The launcher verifies the initial PID namespace, same native
-and engine kernel release, and every existing NBD module slot. The module must
-already expose 1 through 4096 usable block devices. Each must have its exact
-kernel major/minor identity, root owner, canonical path, no binding or holders,
-zero size, no process FD, and a successful exclusive read/write open. The
-launcher does not load modules, change device modes, or disconnect a binding.
+FC requires one exclusive disposable Linux x86-64/KVM runner. No other host
+agent, Firecracker, proxy, or storage job can share its kernel. The operator
+must prepare a fresh dedicated dm-thin pool before the job. The strict FC-only
+`thinPool` input has exactly `name` and `directory`. Names match
+`[A-Za-z][A-Za-z0-9_.-]{0,126}`; physical admission also requires at most 26
+characters so production checkpoint names fit the kernel's 127-byte limit.
+The directory is canonical, owned by the job UID, mode 0700, and has no symlink
+components. VZ rejects this field.
 
-Only the trusted FC host joins the host PID namespace. It retains a private
-cgroup v2 and mount namespace, C's owned network namespace, default seccomp,
-read-only root/proc-sys/sysfs/cgroup mounts, NET_ADMIN and SYS_ADMIN, and bounded
-resources. Exact verified NBD devices plus KVM and TUN are mapped read/write.
-NBD netlink control remains global; device cgroups do not isolate that control.
-The dedicated runner requirement is an infrastructure assumption, not a proof
-receipt. All other services retain private PID namespaces; worker authority is
-unchanged. No host network, engine socket, or host root is mounted.
+Admission checks the real pool table/device, metadata/data loop devices and
+backing file inodes/devices, full file allocation, holders and open FDs. It
+checks all active and inactive thin IDs before the host can open the pool.
+Production host startup deletes inactive orphan IDs; it must never open an
+unqualified shared pool. Metadata inventory runs only after kernel process and
+device-FD checks prove
+that the host and its VMs have stopped. An offline lease blocks every owned
+host start until the metadata snapshot is released. A pre-existing reservation
+is refused, and an uncertain release stops further inventory. Live observation
+and live release checks read tables and FDs without reserving metadata. No job
+loads modules, creates or formats a
+pool, changes node modes, clears caches, or force-removes devices.
 
-The fixed slot range is FIRST_SLOT=0, MAX_SLOTS=the verified module count, and
-WARM_SLOTS=1. Capacity must cover each live root device, optional swap, and
-source/destination restore overlap. The number of matrix cases is not peak
-capacity. Exhaustion fails the run. Rootfs NBD is required even with the actual
-production default File memory restore mode. UFFD helper bytes stay pinned;
-this fixture does not claim UFFD runtime qualification or enable another mode.
+Only the trusted FC host joins the initial host PID namespace. It retains a
+private cgroup and mount namespace, C's owned network namespace, default
+seccomp, read-only root/proc-sys/sysfs/cgroup mounts, and bounded resources.
+It has NET_ADMIN, SYS_ADMIN and MKNOD. Exact KVM, TUN, mapper control, pool,
+and read-only metadata nodes are projected. A block-device cgroup rule grants
+`rwm` only for the running kernel's DM major; `/dev/engram` binds one private
+run-owned node directory. This is global DM control on the exclusive runner.
+All other roles, including the worker, retain private PID namespaces and no
+DM authority. No broad `/dev`, host root, engine socket, or host network mount
+is allowed. Effective container inspection and the real infrastructure smoke
+must prove this contract; source tests do not establish installed capability.
+
+`ENGRAM_THIN_POOL` selects the qualified pool. Admission requires healthy data/metadata fractions, metadata capacity from
+the installed data-block count (48 bytes per block plus 25% reserve), fully
+allocated backing files, and a separate
+16 GiB filesystem reserve. Actual image/root/swap sizes are then checked against
+two live roots, two checkpoints, two in-flight roots, corresponding swap overlap,
+one staged image, and 25% data reserve before infrastructure can pass. This is
+a serial-suite budget, not a volume count based on the 24 cases. A larger sparse
+file cannot satisfy it. The production File memory restore mode stays unchanged;
+UFFD helper bytes remain pinned without a claim of UFFD runtime qualification.
 
 FC's listener is `0.0.0.0:9101` only inside its owned namespace. C's guard
 publishes only the verified `nativeHostIp:9101`. The advertised TLS authority
@@ -234,23 +253,31 @@ Signals and deadlines stop and drain the common runner and supervisor. Final
 teardown uses the authenticated public SessionService DeleteSession path for
 bounded, verified run-owned sessions while the host is alive. It retains task,
 session, operation, journal, capture, and effect history. An API return does
-not prove teardown: the launcher waits for actual VM stop and all reserved NBD
-devices to have no binding, holders, size, or process FDs and to permit exclusive
-open before stopping the FC host. Unknown or stale state fails cleanup and
-retains the host for identity-scoped operator recovery. No blind disconnect,
-module reset, forced adoption, or history deletion is performed.
+not prove teardown: the launcher verifies that live and transient thin volumes
+are removed by the production delete path, VM/device FDs are closed, and no
+live/transient mappings or device holders remain before stopping the host.
+After reaping the owned processes, it also checks metadata for unknown thin IDs.
+Recorded image and
+checkpoint volumes can remain with their exact device, table and thin ID and
+zero opens. Unknown, busy or changed state fails cleanup. No forced DM remove,
+pool erasure, forced adoption, or history deletion manufactures success.
 
-Deliberate matrix host stop/restart retains sessions and devices and exercises
-real recovery. That path does not use final teardown to make recovery pass.
-Whole-module reservation and old-generation process/cgroup observations remain
-across restarts. Container stop alone does not release persistent NBD bindings.
+Host restart retains the admitted pool/backing identity and append-only physical
+boot evidence. It inventories inactive IDs before allowing the replacement host
+to open the pool. Each physical boot binds its rootfs symlink, exact session
+volume, thin table/ID and pool, canonical device number, real Firecracker FD,
+process birth/hash/cgroup, and an increase in kernel read sectors sampled during
+that boot. Prior-boot counters cannot qualify a new boot. Missing or failed
+observation writes fail acceptance.
 
-A read-only FC observer records actual managed boot records, sandbox manifests,
-root NBD paths, binding PIDs, size/read counters, durable device owners, actual
-FC device FDs, and boot/birth/executable/hash/UID/cgroup identities. A successful
-matrix also requires an observation for every managed boot. These observations
-complement the unchanged guest physical return assertions. Final cleanup scans
-retained cgroups and devices after removal; State.Pid=0 alone is insufficient.
+The common infrastructure stage performs real guest create/use/delete before
+MCP cases. Its fixed authenticated `infrastructure-ready` checkpoint requires
+physical boot observations and normal thin release. It then stops the owned
+host, verifies process and FD quiescence, inspects metadata, and restarts the host
+under the same lifecycle lock. The returned status must show a new host boot and
+unchanged identities for every other role. The worker cannot supply these facts. The same path runs in the full matrix; no second runner framework
+or mocked PASS replaces it. Final cleanup checks retained processes and pool
+state again after owned processes stop.
 
 Engine CLI cancellation uses the retained process group's TERM/KILL/wait path.
 Cleanup recovers exact planned container and network names after a lost create

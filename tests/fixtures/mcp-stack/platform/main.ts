@@ -331,14 +331,12 @@ export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
       );
       actors.add(identity.userId);
     } catch (error) {
-      if (
-        !(
-          error &&
-          typeof error === "object" &&
-          "code" in error &&
-          error.code === "ENOENT"
-        )
-      )
+      if (!(
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ))
         throw error;
     }
   }
@@ -355,14 +353,12 @@ export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
       check(identity.userId, "cleanup_key_identity");
       actors.add(identity.userId);
     } catch (error) {
-      if (
-        !(
-          error &&
-          typeof error === "object" &&
-          "code" in error &&
-          error.code === "ENOENT"
-        )
-      )
+      if (!(
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ))
         throw error;
     }
   }
@@ -513,7 +509,7 @@ export async function cleanupPlatform({
               await new Promise((resolve) => setTimeout(resolve, 100));
             }
           }
-          check(released, "cleanup_nbd_release_deadline");
+          check(released, "cleanup_thin_release_deadline");
         }
       },
     ],
@@ -631,6 +627,14 @@ export async function main(args: string[]) {
       const uri = await publishGuest(inputs, root, engine!);
       await enableGuest(ctx, identity, uri, inputs.images.guest.manifestDigest);
       supervisor = await startContextSupervisor(ctx, {
+        infrastructureReady: (signal) =>
+          engine!.controlled(signal, async () => {
+            check(engine!.fc, "fc_inventory_missing");
+            await engine!.fc.requireInfrastructure({
+              stop: () => stack!.stop("host-agent"),
+              restart: () => stack!.restart(ctx, "host-agent", "normal"),
+            });
+          }),
         status: (signal) =>
           engine!.controlled(signal, () => stack!.status(ctx)),
         restart: (role, configuration, signal) =>

@@ -1,3 +1,4 @@
+import { poolFixture } from "./fc-thin-fixture.ts";
 import { test, expect, spyOn } from "bun:test";
 import {
   mkdtemp,
@@ -891,8 +892,9 @@ test("effective container audit rejects added authority and environment", async 
 
 test("platform output keeps only approved runner failure classifications", async () => {
   const { platformFailureLabel } = await import("./main.ts");
-  const { RunnerFailure } =
-    await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
+  const { RunnerFailure } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/failure.ts"
+  );
   for (const [code, seam, label] of [
     [
       "INVALID_CONTEXT",
@@ -963,10 +965,12 @@ test("platform output keeps only approved runner failure classifications", async
 for (const kind of ["modern", "legacy"] as const) {
   test(`fixture ${kind} readiness gives unknown errors a fixed phase label`, async () => {
     const { Stack } = await import("./launch.ts");
-    const { FixtureObserver } =
-      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
-    const { RunnerFailure } =
-      await import("../../../../orchestrator/scripts/mcp-stack/failure.ts");
+    const { FixtureObserver } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/observer.ts"
+    );
+    const { RunnerFailure } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/failure.ts"
+    );
     const inputs = {
       images: { fixture: { id: "fixture-image" } },
     } as Inputs;
@@ -1093,8 +1097,9 @@ for (const failedLookup of [false, true]) {
   test(`real startup prefix checks DNS after dependencies and stops on failure (${failedLookup})`, async () => {
     const { bootPlatform } = await import("./main.ts");
     const { Stack } = await import("./launch.ts");
-    const { FixtureObserver } =
-      await import("../../../../orchestrator/scripts/mcp-stack/observer.ts");
+    const { FixtureObserver } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/observer.ts"
+    );
     const inputs = {
       backend: "vz",
       images: { fixture: { id: "fixture-image" } },
@@ -1508,6 +1513,7 @@ test("FC launch uses the declared configuration, private namespace and original 
         nativeHostIp: "10.42.4.1",
         proxy: pin,
         firecracker: pin,
+        thinPool: { name: "suite", directory: root },
         binaries: {
           ...Object.fromEntries(BINARIES.map((key) => [key, pin])),
           openssl: { path: openssl, sha256: hash(await readFile(openssl)) },
@@ -1587,13 +1593,9 @@ test("FC launch uses the declared configuration, private namespace and original 
     }
     const engine = new LaunchEngine(inputs, root, identity.runId, {
       bootId: "11111111-1111-4111-8111-111111111111",
-      readSectors: { "/dev/nbd0": "0", "/dev/nbd1": "0" },
       release: "test-kernel",
       pidNamespace: "pid:[1]",
-      slots: [
-        { path: "/dev/nbd0", ino: "41", rdev: "11008", device: "43:0", uid: 0 },
-        { path: "/dev/nbd1", ino: "42", rdev: "11009", device: "43:1", uid: 0 },
-      ],
+      pool: poolFixture(),
     });
     engine.guardIds.set("coordinator", "e".repeat(64));
     const stack = new Stack(
@@ -1619,8 +1621,10 @@ test("FC launch uses the declared configuration, private namespace and original 
     expect(launch.options[launch.options.indexOf("--cgroupns") + 1]).toBe(
       "private",
     );
-    expect(launch.options).toContain("/dev/nbd0:/dev/nbd0:rw");
-    expect(launch.options).toContain("/dev/nbd1:/dev/nbd1:rw");
+    expect(launch.options).toContain(
+      "/dev/mapper/control:/dev/mapper/control:rw",
+    );
+    expect(launch.options).toContain("b 253:* rwm");
     expect(launch.options).toContain("/dev/kvm:/dev/kvm:rw");
     expect(launch.options).toContain("/dev/net/tun:/dev/net/tun:rw");
     const envPath = launch.options[launch.options.indexOf("--env-file") + 1]!;
@@ -2193,8 +2197,9 @@ test("cleanup recovers only a planned owned container after a lost create respon
 });
 
 async function handoffFixture(root: string) {
-  const { ContextSchema } =
-    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
+  const { ContextSchema } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/context.ts"
+  );
   const { put } = await import("./owned.ts");
   const pin = await put(join(root, "artifact"), "a".repeat(40));
   const endpoint = (name: string) => ({
@@ -2311,8 +2316,9 @@ async function handoffFixture(root: string) {
 
 test("runner handoff validates the complete context with a real private supervisor socket", async () => {
   const { startContextSupervisor } = await import("./main.ts");
-  const { loadContext } =
-    await import("../../../../orchestrator/scripts/mcp-stack/context.ts");
+  const { loadContext } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/context.ts"
+  );
   const { lstat } = await import("node:fs/promises");
   const root = await mkdtemp(
     join(process.cwd(), "var/mcp-platform-composition/h-"),
@@ -2615,8 +2621,9 @@ test("native-host TLS qualification pins the actual first leaf and removes its p
 });
 
 test("FC sysctls belong only to its C guard and actual firewall order stays production exact", async () => {
-  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } =
-    await import("./engine.ts");
+  const { fcGuardSysctls, fcHostFirewall, verifyFcHostFirewall } = await import(
+    "./engine.ts"
+  );
   expect(fcGuardSysctls("firecracker", "coordinator-guard")).toEqual({
     "net.ipv4.ip_forward": "1",
     "net.ipv4.conf.all.route_localnet": "1",
@@ -2861,22 +2868,31 @@ test("cleanup selects only authenticated fixture or managed-principal sessions o
 });
 
 test("session teardown ignores a deleted old automation task and cleans the exact pending session", async () => {
-  const { create } =
-    await import("../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js");
-  const { WhoAmIResponseSchema } =
-    await import("../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts");
-  const { GetAutomationResponseSchema, GetRunResponseSchema } =
-    await import("../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts");
-  const { GetTaskResponseSchema } =
-    await import("../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts");
+  const { create } = await import(
+    "../../../../orchestrator/node_modules/@bufbuild/protobuf/dist/esm/index.js"
+  );
+  const { WhoAmIResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/api_key_pb.ts"
+  );
+  const { GetAutomationResponseSchema, GetRunResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/automation_pb.ts"
+  );
+  const { GetTaskResponseSchema } = await import(
+    "../../../../orchestrator/src/gen/engram/app/v1/task_pb.ts"
+  );
   const { ListSessionsResponseSchema, DeleteSessionResponseSchema } =
-    await import("../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts");
-  const { recordOwnedAutomation } =
-    await import("../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts");
-  const { canonicalJson } =
-    await import("../../../../orchestrator/scripts/mcp-stack/guest.ts");
-  const { publicClient } =
-    await import("../../../../orchestrator/scripts/mcp-stack/transport.ts");
+    await import(
+      "../../../../orchestrator/src/gen/engram/app/v1/session_pb.ts"
+    );
+  const { recordOwnedAutomation } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/automation-ownership.ts"
+  );
+  const { canonicalJson } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/guest.ts"
+  );
+  const { publicClient } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/transport.ts"
+  );
   const { destroyRunSessions } = await import("./main.ts");
   const root = await mkdtemp(
     join(process.cwd(), "var/mcp-platform-composition/automation-cleanup-"),
@@ -3329,8 +3345,7 @@ for (const partial of [false, true])
         bootId: "controlled",
         release: "controlled",
         pidNamespace: "pid:[1]",
-        slots: [],
-        readSectors: {},
+        pool: poolFixture(),
       },
       {} as Inputs,
       root,
@@ -3396,10 +3411,12 @@ async function receiptFixture(
   root: string,
   selection: import("../../../../orchestrator/scripts/mcp-stack/manifest.ts").RunSelection,
 ) {
-  const { Evidence } =
-    await import("../../../../orchestrator/scripts/mcp-stack/evidence.ts");
-  const { selectedCases } =
-    await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+  const { Evidence } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/evidence.ts"
+  );
+  const { selectedCases } = await import(
+    "../../../../orchestrator/scripts/mcp-stack/manifest.ts"
+  );
   const ctx = await handoffFixture(root);
   const evidence = await Evidence.create(ctx, selection);
   const hash = "a".repeat(64);
@@ -3459,8 +3476,9 @@ for (const mode of [
 ] as const) {
   test(`adapter completion validates real ${mode} Evidence writer output`, async () => {
     const { verifyRunnerCompletion } = await import("./main.ts");
-    const { REQUIRED_CASES } =
-      await import("../../../../orchestrator/scripts/mcp-stack/manifest.ts");
+    const { REQUIRED_CASES } = await import(
+      "../../../../orchestrator/scripts/mcp-stack/manifest.ts"
+    );
     const root = await mkdtemp(
       join(process.cwd(), "var/mcp-platform-composition/receipt-"),
     );

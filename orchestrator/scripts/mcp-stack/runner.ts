@@ -13,6 +13,7 @@ import {
   type CaseDriver,
   type DriverInput,
 } from "./driver.ts";
+import { Supervisor } from "./supervisor.ts";
 import { Evidence } from "./evidence.ts";
 import { canonicalJson } from "./guest.ts";
 import { runInfrastructure } from "./infrastructure.ts";
@@ -99,6 +100,17 @@ export async function runSelectedCases(
   }
 }
 
+/** Physical release is checked before infrastructure can permit MCP cases. */
+export async function completeInfrastructure(
+  backend: Context["backend"],
+  rows: Awaited<ReturnType<typeof runInfrastructure>>,
+  evidence: Pick<Evidence, "infrastructure">,
+  supervisor: { infrastructureReady(): Promise<unknown> },
+) {
+  if (backend === "firecracker") await supervisor.infrastructureReady();
+  await evidence.infrastructure(rows);
+}
+
 /** A failed or missing case leaves an incomplete artifact and stops the matrix. */
 export async function runMatrix(
   ctx: Context,
@@ -120,8 +132,11 @@ export async function runMatrix(
       publicationSha256: sha256(canonicalJson(publication)),
       publicStateSha256: sha256(canonicalJson(ready)),
     });
-    await evidence.infrastructure(
+    await completeInfrastructure(
+      ctx.backend,
       await runInfrastructure(ctx, principals, database),
+      evidence,
+      new Supervisor(ctx),
     );
     await runSelectedCases(
       drivers,

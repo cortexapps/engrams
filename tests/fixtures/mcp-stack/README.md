@@ -13,8 +13,10 @@ The launcher supplies the certificates, key, neutral credentials, run directory,
 DNS, routes, and process handles. Use one fixture process per run directory. The
 launcher must keep the control listener outside guest and worker reach. The
 fixture does not create networks or install DNS entries. Local tests bind only
-loopback and use ephemeral ports. A future networked launcher can bind an exact
-non-loopback IP without a source change.
+loopback and use ephemeral ports. The [platform adapter](platform/README.md)
+starts independent modern and legacy fixture containers on its private network,
+supplies their exact listener addresses and files, and checks authenticated
+readiness. Native DNS and routes are operator prerequisites.
 
 ## Config version 1
 
@@ -84,8 +86,8 @@ Old shared-fixture tests retain their default `<origin>/callback` URL.
 Supply a PEM leaf certificate signed directly by the supplied PEM CA, plus its
 matching key. The leaf SANs must cover all data DNS names and the control DNS
 name. The listener uses the supplied identity. Client code must trust that CA
-and use ordinary DNS and HTTPS. No fixture fetch adapter or resolver is part of
-the standalone server or the future acceptance transport.
+and use ordinary DNS and HTTPS. Neither the standalone server nor the platform
+acceptance transport substitutes a fixture fetch adapter or resolver.
 
 `protocol` accepts `2026-07-28`, `2025-11-25`, or `2025-06-18` and stays fixed for
 the process lifetime. Legacy sessions retain credential binding and explicit
@@ -217,8 +219,19 @@ committed barrier, SIGKILL/reopen persistence, repeated-ID increments, API-key
 and OAuth flow, observer authentication, invalid config/state, cancellation,
 and graceful shutdown while held.
 
-This is fixture unit/process proof. It is not worker routing, guest isolation,
-CNI, Firecracker, VZ, provider, or full-stack proof. The integration owner must
-invoke this focused command in the applicable CI lane and supply real network
-and process supervision for physical acceptance. Production enable defaults
-are unchanged.
+The `mcp-worker` CI lane runs the shared fixture tests through `npm test`, then
+invokes the standalone `durable.test.mts` and `process.test.mts` command above.
+The `orchestrator` lane typechecks and tests the common matrix runner and
+platform adapter.
+
+These are source and process checks. They do not establish guest isolation,
+Firecracker, VZ, provider, or full-stack acceptance. The separate
+`mcp-physical-fc` and `mcp-physical-vz` jobs use
+`.github/scripts/mcp-stack-assets.py` to prepare source-matched assets and invoke
+the backend wrapper. The platform adapter supplies network and process
+supervision and runs the common 24-case matrix. See
+[physical CI prerequisites](platform/ci/README.md).
+
+Workflow wiring does not establish a successful physical run or a current-head
+CI result. Current-source physical acceptance remains unverified. Production
+enable defaults remain disabled.
