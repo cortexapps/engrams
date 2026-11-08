@@ -2023,15 +2023,10 @@ mod tests {
 
     #[test]
     fn wire_version_skewed_host_is_drained_from_scheduling() {
-        // Issue #229: a host reporting a NONZERO wire version that differs
-        // from the coordinator's is excluded from placement, so a
-        // non-atomic rolling deploy drains off stale hosts instead of
-        // hard-failing sessions on them. A version of 0 (not yet reported)
-        // and the coordinator's own version both stay schedulable.
-        let coord = engram_protocol::WIRE_VERSION;
-
+        // Ordinary hosts remain eligible through the wire 38 release window.
+        // A managed protocol marker is not an ordinary placement version.
         let mut skewed = host(1);
-        skewed.wire_version = coord + 1;
+        skewed.wire_version = 43;
         assert!(
             !host_wire_version_ok(&skewed),
             "a nonzero mismatched version must be excluded",
@@ -2047,7 +2042,7 @@ mod tests {
         assert!(host_is_schedulable(&not_reported, Utc::now(), TTL));
 
         let mut matched = host(3);
-        matched.wire_version = coord;
+        matched.wire_version = 38;
         assert!(host_wire_version_ok(&matched));
         assert!(host_is_schedulable(&matched, Utc::now(), TTL));
 

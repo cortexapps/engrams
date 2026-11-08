@@ -247,28 +247,22 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
         )]),
     };
     let connect = |config: &HostClientTls| {
-        GrpcHostClient::new(
-            config
-                .endpoint(
-                    host_id,
-                    &address,
-                    tonic::transport::Endpoint::from_shared(address.clone()).unwrap(),
-                )
-                .unwrap()
-                .connect_lazy(),
-        )
+        let pool = engram_protocol::grpc_pool::GrpcHostPool::new().with_tls(config.clone());
+        let address = address.clone();
+        async move { pool.get_or_warm(host_id, address).await.unwrap() }
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         std::panic::AssertUnwindSafe(async {
             loop {
-                if connect(&tls).ping().await.is_ok() {
+                if connect(&tls).await.ping().await.is_ok() {
                     break;
                 }
                 assert!(!server.is_finished());
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let receipt = connect(&tls)
+                .await
                 .read_managed_cold_assets(request.clone())
                 .await
                 .unwrap();
@@ -282,12 +276,14 @@ async fn cold_assets_actual_files_require_pinned_mutual_tls() {
             let mut changed = request.clone();
             changed.host_id = HostId::new();
             assert!(connect(&tls)
+                .await
                 .read_managed_cold_assets(changed)
                 .await
                 .is_err());
             tls.client_certificate = dir.join("other.pem");
             tls.client_key = dir.join("other.key");
             assert!(connect(&tls)
+                .await
                 .read_managed_cold_assets(request.clone())
                 .await
                 .is_err());

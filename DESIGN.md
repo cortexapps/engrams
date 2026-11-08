@@ -315,10 +315,14 @@ checkpoint or evict a managed session. An unchanged reattach generation and wire
 version checks do not establish managed-session upgrade or adoption support.
 External MCP remains disabled pending its upgrade and recovery gates, source-matched
 Firecracker acceptance and cleanup, current-head CI, and final acceptance review.
-The shared wire version also affects ordinary sessions; disabling MCP does not
-isolate that change. Exact-version refusal and an unchanged reattach generation
-do not establish previous-release wire readability or safe rolling upgrades and
-rollback. VZ parity is a separate gate. ADR 0127 records these limits.
+Ordinary coordinator/host traffic uses the version-38 policy contract. Its wire
+conversion refuses managed deny data. Dedicated managed RPCs additionally require
+the exact managed protocol-43 marker and pinned mTLS; neither the ordinary
+version nor that marker supplies authority. The ordinary mixed-release path
+keeps its existing transport with managed creation disabled. A TLS-only managed
+listener cutover and managed-session rollback require separate qualification.
+Proxy replacement can preserve a VM while closing its active proxy streams.
+VZ parity is a separate gate. ADR 0127 records these limits.
 
 ### Snapshot manager (lives inside host agent)
 
@@ -351,7 +355,7 @@ The snapshot and eviction flows in this section apply to ordinary sessions.
 
 ADR 0080 retired the `engram-image-builder` bake path: a session image is now a plain `docker build && docker push` of a standard OCI image, and the OCI→rootfs conversion moved host-side, off the per-session path.
 
-- Runs at **enable/rebase time** as the `MaterializeImage` host RPC (a sibling of `build_base_snapshot`), never per-session — so per-session latency is zero.
+- Runs at **enable/rebase time** as the `MaterializeImage` host RPC, outside the per-session path.
 - Pulls the standard OCI/Docker image (platform by host arch), whiteout-aware-flattens the layers (xattrs / hardlinks / setuid / ownership, `FollowSymlinkInScope` semantics), extracts the OCI config blob → `OciRuntimeDefaults` (Dockerfile `ENV`/`WORKDIR`), declares the stage-1 `/sbin/engram-init` shim, seals a deterministic pure-Rust ext4 layout (`mkext4`, ADR 0093), and stream-fills the result into the host chunk store / `BlobStorage`.
 - Host safeguards keep host disk bounded: ADR 0078 disk-veto host pick, a ~2.5× image-size scratch budget integrated with chunk-cache accounting, scrub on all exit paths, an enable-time image-size cap, and ≤1 concurrent materialize per host.
 - The only engrams-owned file it bakes into the rootfs is the init shim; agentd, the harness, and ttyd ride host-staged bundle slots and are swapped in per-session (zero image re-bakes when they change).
@@ -830,7 +834,7 @@ A small set of Dockerfile concepts don't translate cleanly to a microVM rootfs, 
 
 ### Materialization (`engram-rootfs-materializer` + `MaterializeImage`)
 
-There is no bake step and no `engram-image-builder` (ADR 0080). The OCI→rootfs conversion runs **host-side, at enable/rebase time** as the server-streaming `MaterializeImage` host RPC (a sibling of `build_base_snapshot`), off the per-session path:
+The OCI→rootfs conversion runs **host-side, at enable/rebase time** as the server-streaming `MaterializeImage` host RPC, outside the per-session path:
 
 1. **Pull** the standard OCI/Docker image, platform-selected by host arch.
 2. **Flatten** the layers, whiteout-aware (`.wh.` / opaque dirs, xattrs / hardlinks / setuid, ownership; `FollowSymlinkInScope` symlink resolution).

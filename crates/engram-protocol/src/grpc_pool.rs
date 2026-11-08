@@ -103,22 +103,15 @@ impl GrpcHostPool {
             self.keepalive_interval,
             self.keepalive_timeout,
         )?;
-        let endpoint = match &self.tls {
-            Some(tls) => tls
-                .endpoint(host_id, &host_addr, endpoint)
-                .map_err(SandboxError::InvalidSpec)?,
+        let client = match &self.tls {
+            Some(tls) => GrpcHostClient::with_pinned_tls(host_id, &host_addr, endpoint, tls)?,
             None if host_addr.starts_with("https://") => {
                 return Err(SandboxError::InvalidSpec(
                     "host TLS identity is not configured".into(),
-                ))
+                ));
             }
-            None => endpoint,
+            None => GrpcHostClient::new(endpoint.connect_lazy()),
         };
-        // `connect_lazy` returns immediately; the first RPC pays the
-        // TCP+H2 handshake. We follow up with `ping` below to force
-        // the handshake before the first real RPC.
-        let channel = endpoint.connect_lazy();
-        let client = GrpcHostClient::new(channel);
 
         self.entries.insert(
             host_id,

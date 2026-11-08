@@ -274,9 +274,18 @@ A successful model turn can suspend on deferred calls. The harness records their
 exact call IDs atomically with completion; this does not grant access. The fence
 still requires the same current run and unresolved request. Ordinary or failed
 completion, interruption, a newer run, and invalid associations remain stale.
-The shared wire contract requires matching version 43 coordinator, host, and guest
-artifacts. Older hosts refuse the new wire version. This refusal is not proof of
-rolling-upgrade compatibility.
+Ordinary coordinator/host traffic retains wire version 38 and its exact policy
+payload shape. The ordinary conversion rejects every managed deny value; it
+never drops authority to reach an older peer. Dedicated managed RPCs require
+the exact managed protocol 43 marker and pinned mTLS before payload decoding or
+effects. A protocol marker does not grant authorization. Registration and
+placement continue to advertise the ordinary contract.
+
+The guest harness emits new cancellation and deferred events only for the MCP
+contract. Ordinary tools retain predecessor-supported event behavior. The
+explicit ordinary wire type is the single ordinary contract, not a temporary
+second transport stack. Predecessor fixtures advance with the supported release
+window; deny rejection and managed authentication remain required.
 
 Keep the authoritative call journal separate from the UI pending projection.
 Use unique `(session_id, tool_call_id)` and immutable request digests. Enforce
@@ -349,6 +358,14 @@ drain therefore stops before changing the deployment when it encounters a manage
 session it cannot checkpoint or evict. Do not enable managed sessions until their
 upgrade and recovery paths preserve the same authority and network fences. The
 current reattach generation does not establish managed-session adoption support.
+
+The ordinary mixed-release transition retains the existing ordinary transport
+with managed creation disabled. Activating a pinned TLS-only host listener is a
+separate cutover: an unchanged plaintext predecessor cannot use it. Managed
+rollback to a predecessor that does not understand its owner and policy records
+is not established by ordinary wire compatibility. Keep those release gates
+closed. Proxy replacement can preserve a VM while ending its active proxy
+streams; it does not provide uninterrupted networking.
 
 Changes to host storage, materialization, and the shared wire contract require new
 source-matched builds and physical acceptance. Earlier VZ evidence remains evidence
@@ -642,7 +659,7 @@ publishes the new policy and acquires the exact current lease before ACK. An
 unrelated close, poison, cancellation or unknown outcome leaves admission
 closed. No transfer is permitted after Bind. Ordinary policy replacement keeps
 its existing drain and terminal-owner semantics. The private control protocol
-is version 4; mixed binaries cannot be adopted.
+is version 5; mixed binaries cannot be adopted.
 
 The guest remains stopped through this transfer. VZ requires the actual helper
 Bind ACK for the exact epoch and the retained native descriptor, MAC and MTU.

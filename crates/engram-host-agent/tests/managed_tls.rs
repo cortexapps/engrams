@@ -214,12 +214,113 @@ async fn managed_host_requires_pinned_mutual_tls() {
     })
     .await
     .unwrap();
-    let remote = GrpcHostClient::new(connect(&client));
+    assert!(matches!(
+        GrpcHostClient::new(connect(&client))
+            .read_managed_policy(target.clone())
+            .await,
+        Err(engram_core::SandboxError::Unsupported(_))
+    ));
+    let calls_before = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+    for marker in [None, Some("38"), Some("44"), Some("043"), Some("invalid")] {
+        let mut raw =
+            engram_protocol::grpc::host_service_client::HostServiceClient::new(connect(&client));
+        macro_rules! refused {
+            ($method:ident, $message:expr) => {{
+                let mut request = tonic::Request::new($message);
+                request
+                    .metadata_mut()
+                    .insert("x-engram-wire-version", "38".parse().unwrap());
+                if let Some(marker) = marker {
+                    request
+                        .metadata_mut()
+                        .insert("x-engram-managed-protocol", marker.parse().unwrap());
+                }
+                assert_eq!(
+                    raw.$method(request).await.unwrap_err().code(),
+                    tonic::Code::FailedPrecondition,
+                    stringify!($method)
+                );
+            }};
+        }
+        use engram_protocol::grpc::{
+            ApplyManagedPolicyRequest, ManagedBootRequest, ReadManagedColdAssetsRequest,
+            ReadManagedPolicyRequest,
+        };
+        refused!(
+            read_managed_policy,
+            ReadManagedPolicyRequest {
+                target_bincode: bincode::serialize(&target).unwrap()
+            }
+        );
+        refused!(
+            apply_managed_policy,
+            ApplyManagedPolicyRequest {
+                request_bincode: vec![255]
+            }
+        );
+        refused!(
+            read_managed_cold_assets,
+            ReadManagedColdAssetsRequest {
+                payload_json: vec![255]
+            }
+        );
+        refused!(
+            capture_managed_boot,
+            ManagedBootRequest {
+                payload_json: vec![255]
+            }
+        );
+        refused!(
+            prepare_managed_boot,
+            ManagedBootRequest {
+                payload_json: vec![255]
+            }
+        );
+        refused!(
+            read_managed_boot,
+            ManagedBootRequest {
+                payload_json: vec![255]
+            }
+        );
+        refused!(
+            finalize_managed_boot,
+            ManagedBootRequest {
+                payload_json: vec![255]
+            }
+        );
+        refused!(
+            start_managed_boot,
+            ManagedBootRequest {
+                payload_json: vec![255]
+            }
+        );
+    }
+    assert_eq!(
+        backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_before
+    );
+    let remote = engram_protocol::grpc_pool::GrpcHostPool::new()
+        .with_tls(client.clone())
+        .get_or_warm(host_id, address.clone())
+        .await
+        .unwrap();
     assert!(remote
         .read_managed_policy(target.clone())
         .await
         .unwrap()
         .is_none());
+    let capture: engram_core::types::managed_boot::ManagedCaptureRequest = serde_json::from_slice(
+        include_bytes!("../../engram-protocol/tests/golden/managed_capture.json"),
+    )
+    .unwrap();
+    assert!(matches!(
+        remote.capture_managed_boot(capture.clone()).await,
+        Err(engram_core::SandboxError::InvalidSpec(message)) if message.contains("managed boot unavailable")
+    ));
+    assert!(matches!(
+        remote.read_managed_boot(capture.key).await,
+        Err(engram_core::SandboxError::InvalidSpec(message)) if message.contains("managed boot unavailable")
+    ));
     let context = ManagedPolicyContext {
         target: target.clone(),
         operator_generation: 1,

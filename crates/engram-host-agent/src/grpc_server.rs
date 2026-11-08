@@ -88,16 +88,36 @@ impl HostServiceImpl {
         }
     }
 
+    fn check_managed_protocol<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        check_wire_version(request)?;
+        let exact = |key, expected: u32| {
+            request.metadata().get(key).and_then(|v| v.to_str().ok())
+                == Some(expected.to_string().as_str())
+        };
+        if !self.managed_tls
+            || !exact(
+                engram_protocol::wire::WIRE_VERSION_METADATA_KEY,
+                engram_protocol::WIRE_VERSION,
+            )
+            || !exact(
+                engram_protocol::wire::MANAGED_PROTOCOL_METADATA_KEY,
+                engram_protocol::wire::MANAGED_PROTOCOL_VERSION,
+            )
+        {
+            return Err(Status::failed_precondition(
+                "managed RPC requires authenticated host mode and exact protocol",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn with_peer_serve(mut self, peer: Arc<crate::peer_fill::PeerServe>) -> Self {
         self.peer = Some(peer);
         self
     }
 
-    /// ADR 0079: the fencing-epoch gate, called at the top of every
-    /// session-scoped lifecycle handler right after [`check_wire_version`]
-    /// (the same transport-level-gate move). Rejections are
-    /// `failed_precondition` carrying stored vs incoming so the
-    /// coordinator sees an explicit fence, never a decode error.
+    /// Check the session fence before a lifecycle operation reaches the backend.
+    /// Rejections carry the stored and incoming epochs as `failed_precondition`.
     ///
     /// Returns the decoded [`SessionFence`] so the handler can thread it
     /// to the inner `HostClient` without re-decoding.
@@ -814,13 +834,7 @@ impl HostService for HostServiceImpl {
         .await
     }
 
-    /// ADR 0080 §C (wire v14): server-streaming, the exact two-task
-    /// shape of `build_base_snapshot` above — a dedicated task drives
-    /// the backend call while THIS task drains its progress channel
-    /// onto the outer gRPC stream, and only once that channel closes
-    /// (the backend call returned, all `Sender`s dropped) do we await
-    /// the result and emit exactly one terminal `done`/`failed` frame.
-    /// Every progress frame therefore strictly precedes the terminal.
+    /// Drain backend progress before sending its single terminal result.
     async fn materialize_image(
         &self,
         req: Request<MaterializeImageRequest>,
@@ -1071,12 +1085,7 @@ impl HostService for HostServiceImpl {
         req: tonic::Request<engram_protocol::grpc::ReadManagedColdAssetsRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ReadManagedColdAssetsResponse>, tonic::Status>
     {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed cold assets require authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1094,12 +1103,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed boot requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1117,12 +1121,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed boot requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1140,12 +1139,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed boot requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1163,12 +1157,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed boot requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1186,12 +1175,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
     ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed boot requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         let request = engram_protocol::managed_boot::decode(&req.into_inner().payload_json)
             .map_err(sandbox_to_status)?;
         let result = self
@@ -1209,12 +1193,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<engram_protocol::grpc::ReadManagedPolicyRequest>,
     ) -> Result<Response<engram_protocol::grpc::ReadManagedPolicyResponse>, Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed policy requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         if req.get_ref().target_bincode.len() > 4096 {
             return Err(Status::resource_exhausted("managed request too large"));
         }
@@ -1236,12 +1215,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<engram_protocol::grpc::ApplyManagedPolicyRequest>,
     ) -> Result<Response<engram_protocol::grpc::ApplyManagedPolicyResponse>, Status> {
-        check_wire_version(&req)?;
-        if !self.managed_tls {
-            return Err(Status::failed_precondition(
-                "managed policy requires authenticated host mode",
-            ));
-        }
+        self.check_managed_protocol(&req)?;
         if req.get_ref().request_bincode.len() > 4 * 1024 * 1024 {
             return Err(Status::resource_exhausted("managed request too large"));
         }
@@ -1271,10 +1245,11 @@ impl HostService for HostServiceImpl {
         check_wire_version(&req)?;
         async move {
             let r = req.into_inner();
-            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
             let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
-            let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
+            let policy = engram_protocol::ordinary_policy::decode(&r.policy_bincode)
+                .map_err(sandbox_to_status)?;
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let phase_start = crate::time_source::metrics_now();
             let result = self
                 .inner
@@ -1829,21 +1804,8 @@ fn encode_bincode<T: serde::Serialize>(value: &T, kind: &'static str) -> Result<
     bincode::serialize(value).map_err(|e| Status::internal(format!("bincode encode {kind}: {e}")))
 }
 
-/// Issue #229: reject a coord→host RPC whose stamped wire version differs
-/// from ours BEFORE any bincode decode. The coordinator's
-/// `TraceparentInjector` puts its `WIRE_VERSION` in the
-/// [`engram_protocol::wire::WIRE_VERSION_METADATA_KEY`] metadata header
-/// on every request; a mismatch means a mixed-version fleet mid rolling
-/// deploy, where a bincode decode would otherwise EOF and surface to the
-/// user as a misleading 400 "invalid sandbox spec". We return
-/// `failed_precondition` with the skew marker so the coord maps it to a
-/// retryable 503 (`SandboxError::WireSkew`).
-///
-/// A request with NO version header (a coordinator that predates this
-/// field) is tolerated — we can't compare what we didn't receive, and
-/// the decode path is the same as before this fix. A header we can't
-/// parse is likewise tolerated (fail-open) rather than blocking traffic
-/// on a malformed value.
+/// Reject an explicit incompatible version before decoding a payload.
+/// An absent header retains the ordinary HTTP/2 predecessor contract.
 fn check_wire_version<T>(req: &Request<T>) -> Result<(), Status> {
     let Some(raw) = req
         .metadata()
@@ -1852,7 +1814,7 @@ fn check_wire_version<T>(req: &Request<T>) -> Result<(), Status> {
         return Ok(());
     };
     let Some(coord) = raw.to_str().ok().and_then(|s| s.parse::<u32>().ok()) else {
-        return Ok(());
+        return Err(Status::failed_precondition("invalid host protocol version"));
     };
     let host = engram_protocol::WIRE_VERSION;
     if coord == host {
@@ -2177,6 +2139,13 @@ mod wire_version_tests {
                 WIRE_VERSION_METADATA_KEY,
                 engram_protocol::WIRE_VERSION.to_string().parse().unwrap(),
             );
+            request.metadata_mut().insert(
+                engram_protocol::wire::MANAGED_PROTOCOL_METADATA_KEY,
+                engram_protocol::wire::MANAGED_PROTOCOL_VERSION
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+            );
             request
         };
         assert_eq!(
@@ -2299,12 +2268,12 @@ mod wire_version_tests {
     }
 
     #[test]
-    fn unparseable_version_header_fails_open() {
-        // A malformed header value must not wedge traffic — fail open.
+    fn unparseable_version_header_is_rejected() {
+        // A declared version must be parseable before payload decoding.
         let mut req = Request::new(());
         req.metadata_mut()
             .insert(WIRE_VERSION_METADATA_KEY, "not-a-number".parse().unwrap());
-        assert!(check_wire_version(&req).is_ok());
+        assert!(check_wire_version(&req).is_err());
     }
 
     #[test]

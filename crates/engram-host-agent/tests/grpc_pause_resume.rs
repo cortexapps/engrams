@@ -1,12 +1,4 @@
-//! gRPC-layer wiring test for ADR 0045 Phase F pause / resume.
-//!
-//! Pause/resume are thin passthroughs (proto `PauseSandbox`/`ResumeSandbox`
-//! → host gRPC server → `HostClient::pause`/`resume` → the backend). The
-//! risk in that plumbing is a wiring mismatch — the RPC bound to the wrong
-//! handler, or pause/resume swapped. This stands up the real gRPC server
-//! with a stub host that records which method it was asked to run for which
-//! sandbox, drives it through the real `GrpcHostClient`, and asserts each
-//! verb reaches the host with the right sandbox id, in order.
+//! Real gRPC lifecycle, cancellation, and predecessor wire 38 compatibility tests.
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
@@ -24,13 +16,19 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxId, SessionId};
 use parking_lot::Mutex;
 
-/// Records the (verb, sandbox_id) of every pause/resume the gRPC server
-/// forwarded. File reads supply a stalled source for cancellation tests.
-/// Other operations fail if a test calls them.
+/// Records lifecycle calls and supplies a stalled file source for cancellation.
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<(&'static str, SandboxId)>>,
+    starts: Mutex<Vec<StartCall>>,
     file_drop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+struct StartCall {
+    sandbox: SandboxId,
+    agent: AgentSpec,
+    policy: SessionEgressPolicy,
+    fence: SessionFence,
 }
 
 #[async_trait]
@@ -99,12 +97,18 @@ impl HostClient for FakeHost {
     }
     async fn start_agent(
         &self,
-        _: SandboxId,
-        _: AgentSpec,
-        _: SessionEgressPolicy,
-        _: SessionFence,
+        sandbox: SandboxId,
+        agent: AgentSpec,
+        policy: SessionEgressPolicy,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
-        unreachable!()
+        self.starts.lock().push(StartCall {
+            sandbox,
+            agent,
+            policy,
+            fence,
+        });
+        Ok(())
     }
     async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
@@ -254,4 +258,106 @@ async fn dropping_stalled_file_response_drops_host_source() {
         .await
         .expect("downstream cancellation must drop the stalled host source")
         .unwrap();
+}
+
+// These bytes come directly from ec526661, before managed authority was added.
+const OLD_POLICY: &[u8] = include_bytes!(
+    "../../engram-protocol/tests/golden/ordinary_v38/session_egress_policy_minted.bin"
+);
+const OLD_AGENT: &[u8] =
+    include_bytes!("../../engram-protocol/tests/golden/ordinary_v38/agent_spec.bin");
+
+#[tokio::test]
+async fn predecessor_38_caller_reaches_new_host_with_exact_policy_and_fence() {
+    use engram_protocol::grpc::{host_service_client::HostServiceClient, StartAgentRequest};
+    let host = Arc::new(FakeHost::default());
+    let addr = boot_grpc_server(host.clone()).await;
+    let mut client = HostServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let expected: SessionEgressPolicy = bincode::deserialize(include_bytes!(
+        "../../engram-protocol/tests/golden/session_egress_policy_minted.bin"
+    ))
+    .unwrap();
+    let message = StartAgentRequest {
+        sandbox_id: expected.sandbox_id.as_uuid().as_bytes().to_vec(),
+        agent_bincode: OLD_AGENT.to_vec(),
+        policy_bincode: OLD_POLICY.to_vec(),
+        session_id: expected.session_id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: 7,
+    };
+    let request = |message: StartAgentRequest, version: &str| {
+        let mut req = tonic::Request::new(message);
+        req.set_timeout(Duration::from_secs(3));
+        req.metadata_mut()
+            .insert("x-engram-wire-version", version.parse().unwrap());
+        req
+    };
+    client
+        .start_agent(request(message.clone(), "38"))
+        .await
+        .unwrap();
+    {
+        let starts = host.starts.lock();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].sandbox, expected.sandbox_id);
+        assert_eq!(starts[0].policy, expected);
+        assert_eq!(bincode::serialize(&starts[0].agent).unwrap(), OLD_AGENT);
+        assert_eq!(starts[0].fence.session_id, expected.session_id);
+        assert_eq!(starts[0].fence.epoch, 7);
+    }
+    for version in ["0", "43", "unknown"] {
+        assert_eq!(
+            client
+                .start_agent(request(message.clone(), version))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    for bad_bytes in [
+        OLD_POLICY[..OLD_POLICY.len() - 1].to_vec(),
+        [OLD_POLICY, &[0]].concat(),
+        include_bytes!("../../engram-protocol/tests/golden/session_egress_policy_managed.bin")
+            .to_vec(),
+    ] {
+        let mut bad = message.clone();
+        bad.policy_bincode = bad_bytes;
+        bad.fencing_epoch = 8;
+        assert_eq!(
+            client
+                .start_agent(request(bad, "38"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let mut stale = message;
+    stale.fencing_epoch = 6;
+    assert_eq!(
+        client
+            .start_agent(request(stale, "38"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        host.starts.lock().len(),
+        1,
+        "refusals must not reach the backend"
+    );
+    let mut pause = tonic::Request::new(engram_protocol::grpc::FencedSandboxRequest {
+        uuid: expected.sandbox_id.as_uuid().as_bytes().to_vec(),
+        session_id: expected.session_id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: 7,
+    });
+    pause.set_timeout(Duration::from_secs(3));
+    pause
+        .metadata_mut()
+        .insert("x-engram-wire-version", "38".parse().unwrap());
+    client.pause_sandbox(pause).await.unwrap();
+    assert_eq!(*host.calls.lock(), vec![("pause", expected.sandbox_id)]);
 }

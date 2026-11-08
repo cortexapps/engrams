@@ -9,25 +9,18 @@
 //! idle-eviction-candidates, register) is plain HTTP/JSON — the
 //! payload types ([`heartbeat::HostCapacityReport`] etc.) are
 //! defined here for sharing across both sides.
-//!
-//! Pre-ADR-0013 this crate held a full bincode-over-WebSocket
-//! frame protocol; that's been retired and only the shared
-//! payload shapes remain.
 
 pub mod app;
 pub mod grpc;
 pub mod grpc_client;
 pub mod grpc_pool;
 pub mod heartbeat;
+pub mod host_tls;
+pub mod managed_boot;
+pub mod managed_policy;
+pub mod mcp;
+pub mod ordinary_policy;
 pub mod wire;
 
 pub use heartbeat::*;
 pub use wire::{WireExecRequest, REATTACH_GENERATION, WIRE_VERSION};
-
-pub mod mcp;
-
-pub mod host_tls;
-
-pub mod managed_policy;
-
-pub mod managed_boot;
