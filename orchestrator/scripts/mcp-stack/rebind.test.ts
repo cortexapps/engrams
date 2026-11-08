@@ -104,6 +104,26 @@ test("reports only fixed precondition categories without retrying unexpected det
       seam: "rebind_precondition_details_many_reason_none_retry_na_category_other",
     },
   ];
+  for (const [message, category] of [
+    ["external MCP service is not configured", "service_unconfigured"],
+    ["managed boot authority changed or unavailable", "boot_authority"],
+    ["session policy changed or unavailable", "policy_changed"],
+    ["host policy unavailable", "host_policy"],
+    ["retained policy unavailable", "retained_policy"],
+    ["managed guest identity unavailable", "guest_identity"],
+    ["managed egress source unavailable", "egress_source"],
+    ["managed policy does not support tunnels", "tunnels"],
+    ["desired policy changed", "desired_policy"],
+    ["managed guest identity changed", "guest_identity_changed"],
+    ["host acknowledgement mismatch", "host_ack"],
+    ["physical placement changed", "placement"],
+    ["managed creation authority changed", "creation_authority"],
+  ] as const) {
+    cases.push({
+      error: new ConnectError(message, Code.FailedPrecondition),
+      seam: `rebind_precondition_details_0_reason_none_retry_na_category_${category}`,
+    });
+  }
   for (const { error, seam } of cases) {
     let calls = 0;
     try {

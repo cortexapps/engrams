@@ -112,14 +112,33 @@ export async function commitReviewedRebind(
           const retry =
             details.length === 1 ? (validRetry ? "valid" : "invalid") : "na";
           const category =
-            error.rawMessage === "MCP calls are still draining"
-              ? "draining"
-              : error.rawMessage ===
-                  "An administrator must publish MCP grants before rebind"
-                ? "publication"
-                : error.rawMessage === "MCP operation could not be completed"
-                  ? "operation"
-                  : "other";
+            new Map([
+              ["MCP calls are still draining", "draining"],
+              [
+                "An administrator must publish MCP grants before rebind",
+                "publication",
+              ],
+              ["MCP operation could not be completed", "operation"],
+              [
+                "external MCP service is not configured",
+                "service_unconfigured",
+              ],
+              [
+                "managed boot authority changed or unavailable",
+                "boot_authority",
+              ],
+              ["session policy changed or unavailable", "policy_changed"],
+              ["host policy unavailable", "host_policy"],
+              ["retained policy unavailable", "retained_policy"],
+              ["managed guest identity unavailable", "guest_identity"],
+              ["managed egress source unavailable", "egress_source"],
+              ["managed policy does not support tunnels", "tunnels"],
+              ["desired policy changed", "desired_policy"],
+              ["managed guest identity changed", "guest_identity_changed"],
+              ["host acknowledgement mismatch", "host_ack"],
+              ["physical placement changed", "placement"],
+              ["managed creation authority changed", "creation_authority"],
+            ]).get(error.rawMessage) ?? "other";
           throw new RunnerFailure(
             "ASSERTION_FAILED",
             `rebind_precondition_details_${count}_reason_${reason}_retry_${retry}_category_${category}`,
