@@ -8,6 +8,7 @@ import { bindingSnapshotColumns } from "../mcp/binding-store.ts";
 import { reviewContext } from "../mcp/journal-review.ts";
 import { type McpCallAuthorization, makeMcpJournal } from "../mcp/journal.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
+import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 
 const reachable = process.env.ORCHESTRATOR_DATABASE_URL ? await checkDb() : false;
 const tool = {
@@ -113,12 +114,16 @@ describe("MCP durable authority", () => {
         ),
       );
       expect(outcomes.filter((o) => o.status === "fulfilled")).toHaveLength(1);
-      await f.repo.updateConfig(
+      const credentials = makeCredentialMetadataStore(f.db);
+      const claim = await credentials.claim(
         f.row.id,
         1,
-        { alias: f.row.alias, displayName: "Tools", config },
+        f.input.authGeneration,
+        "admin",
+        config,
         f.now,
       );
+      await credentials.publish(claim, config, undefined, f.now);
       await expect(
         f.repo.publish(
           f.row.id,
@@ -448,26 +453,6 @@ test.skipIf(!reachable)("replicas share connection and deployment admission ceil
     for (const f of fixtures) await f.cleanup();
   }
 });
-
-test.skipIf(!reachable)(
-  "credential completion cannot authorize a connection edited during the flow",
-  async () => {
-    const f = await fixture();
-    try {
-      await f.repo.updateConfig(
-        f.row.id,
-        1,
-        { alias: f.row.alias, displayName: "Edited", config },
-        f.now,
-      );
-      await expect(
-        f.repo.setAuthorization(f.row.id, 1, f.input.authGeneration, "account-b", f.now),
-      ).rejects.toThrow("stale");
-    } finally {
-      await f.cleanup();
-    }
-  },
-);
 
 test.skipIf(!reachable)(
   "recovers calls after a crash before approval or admission is recorded",

@@ -1,103 +1,14 @@
 import { notifyMcpAuthorityChanged } from "./authority-notification.ts";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import { integrationConnection as connection, mcpCatalog as catalog } from "../db/schema.ts";
 import { assertSchemaShape, reviewCatalog } from "./catalog.ts";
-import { validateMcpConfig } from "./config.ts";
 import { canonicalDigest, canonicalJson } from "./hash.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import type { McpConnectionState, McpDiscoveredTool } from "./types.ts";
 
 export function makeMcpRepository(db = getDb()) {
   return {
-    async updateConfig(
-      id: string,
-      expectedRevision: number,
-      input: { alias: string; displayName: string; config: unknown },
-      now: Date,
-    ) {
-      const config = validateMcpConfig(input.config);
-      const rows = await db
-        .update(connection)
-        .set({
-          alias: input.alias,
-          displayName: input.displayName,
-          config,
-          configRevision: sql`${connection.configRevision} + 1`,
-          enabled: false,
-          testedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(connection.id, id),
-            eq(connection.provider, "mcp"),
-            sql`${connection.mcpCredential}->'transition' IS NULL`,
-            eq(connection.configRevision, expectedRevision),
-          ),
-        )
-        .returning();
-      if (!rows[0]) throw new Error("stale connection revision");
-      notifyMcpAuthorityChanged();
-      return rows[0];
-    },
-    /** Only a verified credential exchange may call this method. Refresh does not call it. */
-    async setAuthorization(
-      id: string,
-      expectedConfigRevision: number,
-      expectedGeneration: number,
-      credentialIdentity: string,
-      now: Date,
-    ) {
-      if (!credentialIdentity || credentialIdentity.length > 512)
-        throw new Error("credential identity is required");
-      const rows = await db
-        .update(connection)
-        .set({
-          credentialIdentity,
-          authGeneration: sql`${connection.authGeneration} + 1`,
-          revoked: false,
-          enabled: false,
-          testedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(connection.id, id),
-            eq(connection.provider, "mcp"),
-            sql`${connection.mcpCredential}->'transition' IS NULL`,
-            eq(connection.authGeneration, expectedGeneration),
-            eq(connection.configRevision, expectedConfigRevision),
-          ),
-        )
-        .returning();
-      if (!rows[0]) throw new Error("stale authorization generation");
-      notifyMcpAuthorityChanged();
-      return rows[0];
-    },
-    async disconnect(id: string, expectedGeneration: number, now: Date) {
-      const rows = await db
-        .update(connection)
-        .set({
-          revoked: true,
-          enabled: false,
-          testedAt: null,
-          authGeneration: sql`${connection.authGeneration} + 1`,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(connection.id, id),
-            eq(connection.provider, "mcp"),
-            sql`${connection.mcpCredential}->'transition' IS NULL`,
-            eq(connection.authGeneration, expectedGeneration),
-          ),
-        )
-        .returning();
-      if (!rows[0]) throw new Error("stale authorization generation");
-      notifyMcpAuthorityChanged();
-      return rows[0];
-    },
     async setEnabled(id: string, expectedRevision: number, enabled: boolean, now: Date) {
       const result = await db.transaction(async (tx) => {
         const [row] = await tx

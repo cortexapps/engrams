@@ -1,8 +1,10 @@
 import { unwrapCredentialControlClient } from "../mcp/control-client.ts";
 import { expect, test } from "bun:test";
-import { createClient, createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { create, toJson } from "@bufbuild/protobuf";
-import { checkDb } from "../db/client.ts";
+import { checkDb, getDb } from "../db/client.ts";
+import { eq, sql } from "drizzle-orm";
+import { integrationConnection, mcpCatalog } from "../db/schema.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 import { makeCredentialAdmin } from "../mcp/credential-admin.ts";
@@ -106,6 +108,7 @@ async function fixture() {
       lostRevoke = true;
     },
     async cleanup() {
+      await getDb().delete(mcpCatalog).where(eq(mcpCatalog.connectionId, row.id));
       await connections.delete(row.id);
     },
   };
@@ -434,6 +437,169 @@ test.skipIf(!reachable)(
       });
       expect(f.calls.filter((x) => x === "put")).toHaveLength(1);
     } finally {
+      await f.cleanup();
+    }
+  },
+);
+
+for (const discovered of [true, false]) {
+  test.skipIf(!reachable)(
+    discovered
+      ? "public removal preserves a discovered connection and its credential authority"
+      : "public removal deletes an unused connection after credential revocation",
+    async () => {
+      const f = await fixture();
+      try {
+        const { registerIntegration } = await import("../rpc/integration.ts");
+        const { makeMcpRepository } = await import("../mcp/repository.ts");
+        const { makeMcpJournal } = await import("../mcp/journal.ts");
+        const { IntegrationService } = await import("../gen/engram/app/v1/integration_pb.ts");
+        const client = createClient(
+          IntegrationService,
+          createRouterTransport((router) =>
+            registerIntegration(router, {
+              getSession: async () => ({ user: { id: "admin", role: "admin" } }),
+              connections: f.connections,
+              mcp: {
+                enabled: true,
+                credentials: f.admin,
+                repository: makeMcpRepository(),
+                journal: makeMcpJournal(),
+                discovery: {
+                  discover: async () => [
+                    {
+                      upstreamName: "Read.Record",
+                      description: "Read a record",
+                      inputSchema: { type: "object" },
+                    },
+                  ],
+                },
+              },
+            }),
+          ),
+        );
+        await client.putMcpCredential({
+          connectionId: f.row.id,
+          expectedRevision: 1,
+          expectedGeneration: 1,
+          kind: "api_key",
+          header: "x-api-key",
+          value: "test-secret",
+        });
+        const before = await f.store.get(f.row.id);
+        const catalog = discovered
+          ? (await client.discoverMcp({ connectionId: f.row.id, expectedRevision: 2 })).catalog
+          : undefined;
+        let error: unknown;
+        let deleted: boolean | undefined;
+        try {
+          deleted = (
+            await client.deleteConnection({
+              id: f.row.id,
+              expectedRevision: before.configRevision,
+              expectedGeneration: before.authGeneration,
+            })
+          ).deleted;
+        } catch (caught) {
+          error = caught;
+        }
+        if (discovered) {
+          // Refusal must precede both durable transition and external revocation.
+          expect(await f.store.get(f.row.id)).toEqual(before);
+          expect(f.calls).toEqual(["put"]);
+          expect((await f.admin.status(f.row.id)).status?.status).toBe("connected");
+          expect(error).toBeInstanceOf(ConnectError);
+          expect((error as ConnectError).code).toBe(Code.FailedPrecondition);
+          expect((error as ConnectError).rawMessage).toContain("disable or disconnect");
+          expect((await client.getMcpCatalogs({ connectionId: f.row.id })).draft?.id).toBe(
+            catalog!.id,
+          );
+        } else {
+          expect(error).toBeUndefined();
+          expect(deleted).toBe(true);
+          expect(await f.connections.get(f.row.id)).toBeNull();
+          expect(f.calls).toEqual(["put", "revoke"]);
+        }
+      } finally {
+        await f.cleanup();
+      }
+    },
+  );
+}
+
+test.skipIf(!reachable)(
+  "removal checks history after a concurrent catalog writer commits",
+  async () => {
+    const f = await fixture();
+    const db = getDb();
+    const locked = Promise.withResolvers<number>();
+    const release = Promise.withResolvers<void>();
+    let writer: Promise<void> | undefined;
+    let removal: Promise<unknown> | undefined;
+    try {
+      await f.admin.putSecret(
+        f.row.id,
+        1,
+        1,
+        "admin",
+        CredentialKind.API_KEY,
+        "x-api-key",
+        "test-secret",
+      );
+      const before = await f.store.get(f.row.id);
+      writer = db.transaction(async (tx) => {
+        await tx
+          .select()
+          .from(integrationConnection)
+          .where(eq(integrationConnection.id, f.row.id))
+          .for("update");
+        const pid = await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`);
+        locked.resolve(pid.rows[0]!.pid);
+        await release.promise;
+        // A catalog producer commits its history while it owns the connection lock.
+        await tx.insert(mcpCatalog).values({
+          id: crypto.randomUUID(),
+          connectionId: f.row.id,
+          kind: "draft",
+          revision: 0,
+          configRevision: before.configRevision,
+          authGeneration: before.authGeneration,
+          credentialIdentity: before.credentialIdentity,
+          tools: [],
+          fingerprint: "fixture",
+          actorId: "admin",
+          createdAt: new Date(),
+        });
+      });
+      const blocker = await locked.promise;
+      removal = f.admin
+        .remove(f.row.id, before.configRevision, before.authGeneration, "admin")
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      const deadline = Date.now() + 1000;
+      let waiting = false;
+      while (Date.now() < deadline) {
+        const result = await db.execute<{ waiting: boolean }>(sql`
+        SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+          WHERE ${blocker} = ANY(pg_blocking_pids(pid))) AS waiting`);
+        if (result.rows[0]?.waiting) {
+          waiting = true;
+          break;
+        }
+        await Bun.sleep(5);
+      }
+      expect(waiting).toBe(true);
+      release.resolve();
+      await writer;
+      expect(await removal).toBeInstanceOf(ConnectError);
+      expect(await f.store.get(f.row.id)).toEqual(before);
+      expect(f.calls).toEqual(["put"]);
+    } finally {
+      release.resolve();
+      await writer;
+      await removal;
       await f.cleanup();
     }
   },

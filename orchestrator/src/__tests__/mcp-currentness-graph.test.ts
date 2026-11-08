@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { verifyMcpTestDatabases } from "./helpers/mcp-test-isolation.ts";
-import { reviewFixture } from "./mcp-review-fixture.ts";
+import { reviewFixture, seedReviewConnectionAuthority } from "./mcp-review-fixture.ts";
 import { task, taskSession, profile, mcpCatalog } from "../db/schema.ts";
 import {
   bindingSnapshotColumns,
@@ -27,7 +27,7 @@ test("currentness reads a deep multi-connection graph within the one-second fenc
         config: f.connection.config,
       });
       connectionIds.push(connection.id);
-      await f.repository.setAuthorization(connection.id, 1, 1, "test-account", f.now);
+      await seedReviewConnectionAuthority(connection.id, f.db, f.now);
       const row = (await f.connections.get(connection.id))!;
       const tools = [
         {
@@ -72,24 +72,20 @@ test("currentness reads a deep multi-connection graph within the one-second fenc
         bindingEpoch: 1,
         ...(parent ? { parentAuthority: parent } : {}),
       });
-      await f.db
-        .insert(task)
-        .values({
-          id: taskId,
-          type: "chat",
-          createdByUserId: f.actorId,
-          ...(parent ? { spawningSessionId: parent.sessionId } : {}),
-        });
+      await f.db.insert(task).values({
+        id: taskId,
+        type: "chat",
+        createdByUserId: f.actorId,
+        ...(parent ? { spawningSessionId: parent.sessionId } : {}),
+      });
       taskIds.push(taskId);
-      await f.db
-        .insert(taskSession)
-        .values({
-          taskId,
-          sessionId,
-          profileId: f.profileId,
-          integrationPrincipalId: f.actorId,
-          ...bindingSnapshotColumns(snapshot, connections),
-        });
+      await f.db.insert(taskSession).values({
+        taskId,
+        sessionId,
+        profileId: f.profileId,
+        integrationPrincipalId: f.actorId,
+        ...bindingSnapshotColumns(snapshot, connections),
+      });
       parent = { sessionId, snapshot };
     }
     let externalReads = 0;

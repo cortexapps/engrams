@@ -2,7 +2,15 @@ import { operatorPublication } from "./mcp-binding-fixture.ts";
 import { create } from "@bufbuild/protobuf";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
-import { user, task, taskSession, profile, mcpCatalog, mcpAdmissionScope } from "../db/schema.ts";
+import {
+  user,
+  task,
+  taskSession,
+  profile,
+  mcpCatalog,
+  mcpAdmissionScope,
+  integrationConnection,
+} from "../db/schema.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { makeMcpRepository } from "../mcp/repository.ts";
 import { makeMcpJournal } from "../mcp/journal.ts";
@@ -10,6 +18,21 @@ import { compileSessionBindings } from "../mcp/session-bindings.ts";
 import { bindingSnapshotColumns } from "../mcp/binding-store.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
 import { McpWritePolicyRefSchema } from "../gen/engram/app/v1/session_pb.ts";
+
+/** Local authority fixture only; no coordinator credential has been issued. */
+export async function seedReviewConnectionAuthority(id: string, db = getDb(), now = new Date()) {
+  await db
+    .update(integrationConnection)
+    .set({
+      credentialIdentity: "test-account",
+      authGeneration: 2,
+      revoked: false,
+      enabled: false,
+      testedAt: null,
+      updatedAt: now,
+    })
+    .where(eq(integrationConnection.id, id));
+}
 
 /** The stored binding and policy are test fixtures. No host ACK or VM enforcement is claimed. */
 export async function reviewFixture(documents: Record<string, unknown>[] = [], toolCount = 1) {
@@ -41,7 +64,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     displayName: "Test tools",
     config,
   });
-  await repository.setAuthorization(connection.id, 1, 1, "test-account", now);
+  await seedReviewConnectionAuthority(connection.id, db, now);
   const current = (await connections.get(connection.id))!;
   const tool = {
     upstreamName: "Write.Record",

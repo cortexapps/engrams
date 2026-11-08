@@ -2,13 +2,25 @@ import { notifyMcpAuthorityChanged } from "./authority-notification.ts";
 import { and, eq, sql } from "drizzle-orm";
 import { create, fromJson, toJson, type JsonObject } from "@bufbuild/protobuf";
 import { getDb } from "../db/client.ts";
-import { integrationConnection as connection } from "../db/schema.ts";
+import {
+  integrationConnection as connection,
+  mcpCatalog,
+  mcpExecution,
+  mcpAdmission,
+  mcpDiscoveryAdmission,
+} from "../db/schema.ts";
 import {
   CredentialKind,
   CredentialStatusSchema,
   AuthorityContextSchema,
 } from "../gen/engram/mcp/v1/control_pb.ts";
 import { validateMcpConfig, type McpConfig } from "./config.ts";
+
+export class McpConnectionHasHistory extends Error {
+  constructor() {
+    super("MCP connection has retained history; disable or disconnect it instead");
+  }
+}
 
 /** Only coordinator metadata. Secret values, callback codes and state never enter this type. */
 export interface CredentialMetadata {
@@ -86,8 +98,9 @@ export function makeCredentialMetadataStore(db = getDb()) {
     actorId: string,
     config: unknown,
     now: Date,
-    callbackId?: string,
+    intent?: { kind: "callback"; flowId: string } | { kind: "remove" },
   ) {
+    const callbackId = intent?.kind === "callback" ? intent.flowId : undefined;
     const target = validateMcpConfig(config);
     const result = await db.transaction(async (tx) => {
       const [row] = await tx
@@ -109,6 +122,18 @@ export function makeCredentialMetadataStore(db = getDb()) {
           row.mcpCredential.flow.expiresAt <= now.getTime())
       )
         throw new Error("stale authorization flow");
+      if (intent?.kind === "remove") {
+        // Producers lock this connection before inserting history. The claim then
+        // advances its revision and revokes it, so later producers cannot insert.
+        for (const history of [mcpCatalog, mcpExecution, mcpAdmission, mcpDiscoveryAdmission]) {
+          const retained = await tx
+            .select({ connectionId: history.connectionId })
+            .from(history)
+            .where(eq(history.connectionId, id))
+            .limit(1);
+          if (retained.length) throw new McpConnectionHasHistory();
+        }
+      }
       const metadata = checkedMetadata(row.mcpCredential);
       metadata.transition = { id: crypto.randomUUID(), actorId, startedAt: now.getTime() };
       // Keep the exact pending attempt until the lifecycle adapter has durably

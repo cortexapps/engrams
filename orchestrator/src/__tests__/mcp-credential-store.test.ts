@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 import { getDb, checkDb } from "../db/client.ts";
-import { makeMcpRepository } from "../mcp/repository.ts";
 const reachable = process.env.ORCHESTRATOR_DATABASE_URL ? await checkDb() : false;
 const config = {
   endpoint: "https://tools.example.test/mcp",
@@ -33,12 +32,7 @@ test.skipIf(!reachable)(
       const stale = (await connections.get(row.id))!;
       expect(stale.mcp!.revoked).toBe(true);
       await expect(
-        makeMcpRepository().updateConfig(
-          row.id,
-          stale.mcp!.configRevision,
-          { alias: row.alias, displayName: "Tools", config },
-          now,
-        ),
+        b.claim(row.id, stale.mcp!.configRevision, stale.mcp!.authGeneration, "admin", config, now),
       ).rejects.toThrow("stale");
       const status = {
         protocol: 1,

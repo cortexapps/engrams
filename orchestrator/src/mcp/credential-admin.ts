@@ -12,6 +12,7 @@ import {
   type CredentialMetadataStore,
   type CredentialClaim,
   statusMetadata,
+  McpConnectionHasHistory,
 } from "./credential-store.ts";
 import { validateMcpConfig, type McpConfig } from "./config.ts";
 
@@ -394,15 +395,10 @@ export function makeCredentialAdmin(deps: {
         (input.issuer !== undefined && input.issuer !== r.issuer)
       )
         throw new Error("invalid authorization callback");
-      const claim = await store.claim(
-        id,
-        revision,
-        generation,
-        actorId,
-        config,
-        now(),
-        input.flowId,
-      );
+      const claim = await store.claim(id, revision, generation, actorId, config, now(), {
+        kind: "callback",
+        flowId: input.flowId,
+      });
       const flow = claim.metadata.flow!;
       if (flow.registrationId !== r.id) throw new Error("stale authorization registration");
       const result = await control.completeAuthorization({
@@ -447,7 +443,19 @@ export function makeCredentialAdmin(deps: {
       await store.publish(claim, config, undefined, now(), names);
     },
     async remove(id: string, revision: number, generation: number, actorId: string) {
-      const claim = await claimCurrent(id, revision, generation, actorId);
+      const row = await store.get(id);
+      let claim: CredentialClaim;
+      try {
+        claim = await store.claim(id, revision, generation, actorId, row.config, now(), {
+          kind: "remove",
+        });
+      } catch (error) {
+        if (error instanceof McpConnectionHasHistory)
+          throw new ConnectError(error.message, Code.FailedPrecondition);
+        throw error;
+      }
+      await cancelPending(claim, actorId);
+      delete claim.metadata.flow;
       await revoke(claim, "status", actorId);
       await revoke(claim, "clientSecret", actorId);
       return store.remove(claim);

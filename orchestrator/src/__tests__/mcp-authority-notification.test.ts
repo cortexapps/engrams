@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { effectFixture } from "./mcp-effect-fixture.ts";
-import { makeMcpRepository } from "../mcp/repository.ts";
+import { makeCredentialMetadataStore } from "../mcp/credential-store.ts";
 import { observeMcpAuthorityChanges } from "../mcp/authority-notification.ts";
 
 test("a committed authority mutation requests reconciliation and notification failure does not undo it", async () => {
@@ -13,20 +13,30 @@ test("a committed authority mutation requests reconciliation and notification fa
     throw Error("unavailable");
   });
   try {
-    const repository = makeMcpRepository(f.db);
+    const credentials = makeCredentialMetadataStore(f.db);
     const [current] = await f.db
       .select()
       .from(integrationConnection)
       .where(eq(integrationConnection.id, f.connection.id));
-    const updated = await repository.disconnect(
+    await credentials.claim(
       f.connection.id,
+      current!.configRevision,
       current!.authGeneration,
+      f.actorId,
+      current!.config,
       new Date(),
     );
-    expect(updated.revoked).toBe(true);
+    expect((await credentials.get(f.connection.id)).revoked).toBe(true);
     expect(calls).toBe(1);
     await expect(
-      repository.disconnect(f.connection.id, current!.authGeneration, new Date()),
+      credentials.claim(
+        f.connection.id,
+        current!.configRevision,
+        current!.authGeneration,
+        f.actorId,
+        current!.config,
+        new Date(),
+      ),
     ).rejects.toThrow();
     expect(calls).toBe(1);
   } finally {
@@ -35,7 +45,7 @@ test("a committed authority mutation requests reconciliation and notification fa
   }
 }, 20000);
 
-test("a committed disconnect requests durable reconciliation of active work", async () => {
+test("a credential transition requests durable reconciliation of active work", async () => {
   const { eq } = await import("drizzle-orm");
   const { integrationConnection } = await import("../db/schema.ts");
   const { makeMcpLifecycleReconciler } = await import("../mcp/lifecycle-reconciler.ts");
@@ -51,7 +61,14 @@ test("a committed disconnect requests durable reconciliation of active work", as
       .select()
       .from(integrationConnection)
       .where(eq(integrationConnection.id, f.connection.id));
-    await makeMcpRepository(f.db).disconnect(f.connection.id, current!.authGeneration, new Date());
+    await makeCredentialMetadataStore(f.db).claim(
+      f.connection.id,
+      current!.configRevision,
+      current!.authGeneration,
+      f.actorId,
+      current!.config,
+      new Date(),
+    );
     expect(scan).toBeDefined();
     await scan;
     expect((await f.journal.get(call.id))!.state).toBe("canceled");

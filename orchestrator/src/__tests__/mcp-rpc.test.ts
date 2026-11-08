@@ -56,9 +56,6 @@ function services(): McpServices {
   return {
     enabled: true,
     repository: {
-      updateConfig: unavailable,
-      setAuthorization: unavailable,
-      disconnect: unavailable,
       setEnabled: unavailable,
       saveDraft: unavailable,
       publish: unavailable,
