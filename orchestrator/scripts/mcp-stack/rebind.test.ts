@@ -57,6 +57,69 @@ test("does not retry unexpected errors or other drain reasons", async () => {
   }
 });
 
+test("reports only fixed precondition categories without retrying unexpected details", async () => {
+  const cases = [
+    {
+      error: new ConnectError("private-data", Code.FailedPrecondition),
+      seam: "rebind_precondition_details_0_reason_none_retry_na_category_other",
+    },
+    {
+      error: new ConnectError(
+        "MCP operation could not be completed",
+        Code.FailedPrecondition,
+      ),
+      seam: "rebind_precondition_details_0_reason_none_retry_na_category_operation",
+    },
+    {
+      error: pending(McpRebindDrainReason.UNKNOWN_INTENT),
+      seam: "rebind_precondition_details_1_reason_unknown_intent_retry_valid_category_other",
+    },
+    {
+      error: new ConnectError(
+        "private-data",
+        Code.FailedPrecondition,
+        undefined,
+        [
+          {
+            desc: McpRebindDrainSchema,
+            value: create(McpRebindDrainSchema, {
+              reason: McpRebindDrainReason.DISPATCH_IN_PROGRESS,
+              retryAfter: "private-data",
+            }),
+          },
+        ],
+      ),
+      seam: "rebind_precondition_details_1_reason_dispatch_retry_invalid_category_other",
+    },
+    {
+      error: new ConnectError(
+        "private-data",
+        Code.FailedPrecondition,
+        undefined,
+        [
+          { desc: McpRebindDrainSchema, value: create(McpRebindDrainSchema) },
+          { desc: McpRebindDrainSchema, value: create(McpRebindDrainSchema) },
+        ],
+      ),
+      seam: "rebind_precondition_details_many_reason_none_retry_na_category_other",
+    },
+  ];
+  for (const { error, seam } of cases) {
+    let calls = 0;
+    try {
+      await commitReviewedRebind(ctx, request, async () => {
+        calls++;
+        throw error;
+      });
+      throw new Error("unexpected success");
+    } catch (caught) {
+      expect(caught).toHaveProperty("seam", seam);
+      expect(String(caught)).not.toContain("private-data");
+      expect(calls).toBe(1);
+    }
+  }
+});
+
 test("rejects malformed drain detail and final binding hashes", async () => {
   const invalidDate = new ConnectError(
     "pending",

@@ -10,7 +10,7 @@ import {
   McpRebindDrainSchema,
 } from "../../src/gen/engram/app/v1/integration_pb.ts";
 import { bindingTools, expectRejected, waitFor } from "./bootstrap.ts";
-import { requireThat, type Context } from "./context.ts";
+import { requireThat, RunnerFailure, type Context } from "./context.ts";
 import { canonicalJson, guestReady } from "./guest.ts";
 import type { DatabaseObserver } from "./observer.ts";
 import type { StartedScenario } from "./scenario-runtime.ts";
@@ -87,12 +87,44 @@ export async function commitReviewedRebind(
         )
           throw error;
         const details = error.findDetails(McpRebindDrainSchema);
-        requireThat(
+        const validRetry =
           details.length === 1 &&
-            details[0]!.reason === McpRebindDrainReason.DISPATCH_IN_PROGRESS &&
-            Number.isFinite(Date.parse(details[0]!.retryAfter)),
-          "rebind_exact_recovery_pending",
-        );
+          Number.isFinite(Date.parse(details[0]!.retryAfter));
+        if (
+          details.length !== 1 ||
+          details[0]!.reason !== McpRebindDrainReason.DISPATCH_IN_PROGRESS ||
+          !validRetry
+        ) {
+          const count =
+            details.length === 0 ? "0" : details.length === 1 ? "1" : "many";
+          const reason =
+            details.length !== 1
+              ? "none"
+              : details[0]!.reason === McpRebindDrainReason.DISPATCH_IN_PROGRESS
+                ? "dispatch"
+                : details[0]!.reason === McpRebindDrainReason.UNKNOWN_INTENT
+                  ? "unknown_intent"
+                  : details[0]!.reason === McpRebindDrainReason.LEGACY_INTENT
+                    ? "legacy_intent"
+                    : details[0]!.reason === McpRebindDrainReason.UNSPECIFIED
+                      ? "unspecified"
+                      : "other";
+          const retry =
+            details.length === 1 ? (validRetry ? "valid" : "invalid") : "na";
+          const category =
+            error.rawMessage === "MCP calls are still draining"
+              ? "draining"
+              : error.rawMessage ===
+                  "An administrator must publish MCP grants before rebind"
+                ? "publication"
+                : error.rawMessage === "MCP operation could not be completed"
+                  ? "operation"
+                  : "other";
+          throw new RunnerFailure(
+            "ASSERTION_FAILED",
+            `rebind_precondition_details_${count}_reason_${reason}_retry_${retry}_category_${category}`,
+          );
+        }
         return null;
       }
     },
