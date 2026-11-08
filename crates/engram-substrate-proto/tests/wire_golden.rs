@@ -15,7 +15,9 @@
 
 use std::path::PathBuf;
 
-use engram_substrate_proto::{encode_frame, read_frame, ByteRange, FromWriter, Requester, ToWriter};
+use engram_substrate_proto::{
+    encode_frame, read_frame, ByteRange, FromWriter, Requester, ToWriter,
+};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -65,7 +67,10 @@ where
         "the frame for `{name}` changed bytes"
     );
     let decoded: T = read_frame(&mut golden.as_slice()).unwrap();
-    assert_eq!(&decoded, value, "the golden for `{name}` decodes to another value");
+    assert_eq!(
+        &decoded, value,
+        "the golden for `{name}` decodes to another value"
+    );
 }
 
 #[test]
