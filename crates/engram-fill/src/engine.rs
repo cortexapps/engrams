@@ -25,8 +25,9 @@ pub struct Config {
     pub max_in_flight: usize,
     /// Extra slots only `Demand` may use.
     pub demand_reserve: usize,
-    /// The most slots `Hydrate` and `Background` use together, so a bulk
-    /// fill leaves the rest of the limit to `Demand` and `Prefix`.
+    /// `Hydrate` and `Background` start only while fewer transfers than
+    /// this, of any class, are in flight, so a bulk fill leaves the rest of
+    /// the limit to `Demand` and `Prefix`.
     pub bulk_in_flight: usize,
     /// A `Demand` fetch still running after this gets a second request; the
     /// first answer wins. `None` turns hedging off.
