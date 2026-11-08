@@ -48,10 +48,10 @@ impl Class {
 
 /// Grants permits under one limit. `Demand` may also use `demand_reserve`
 /// slots above the limit, so a pipe full of bulk transfers delays a fault
-/// by at most one completion. `Hydrate` and `Background` together use at
-/// most `bulk_cap` slots, so a bulk fill cannot take the link, the CPU and
-/// the disk from a restore's critical path. Within a class, permits are
-/// granted in arrival order.
+/// by at most one completion. `Hydrate` and `Background` start only while
+/// fewer than `bulk_cap` transfers of any class are in flight, so a bulk
+/// fill cannot take the link, the CPU and the disk from a restore's
+/// critical path. Within a class, permits are granted in arrival order.
 pub struct Admission {
     name: &'static str,
     demand_reserve: usize,
@@ -187,8 +187,12 @@ impl Admission {
                     admission: Arc::clone(self),
                 };
             }
-            if let Some(t) = st.tuner.as_mut() {
-                t.window.saturated = true;
+            // Only a wait at the limit asks for a higher limit: a bulk
+            // wait at `bulk_cap` stays the same at any limit.
+            if st.in_flight >= st.limit {
+                if let Some(t) = st.tuner.as_mut() {
+                    t.window.saturated = true;
+                }
             }
             let (tx, rx) = oneshot::channel();
             st.waiting[class as usize].push_back(tx);
@@ -444,13 +448,21 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_stops_at_its_cap_while_prefix_uses_the_whole_limit() {
-        let adm = Admission::adaptive("test", 3, 1, 3, 0, 1);
+        let adm = Admission::adaptive("test", 3, 1, 4, 0, 1);
+        let saturated = || adm.state.lock().tuner.as_ref().unwrap().window.saturated;
         let _bulk = adm.acquire(Class::Hydrate).await;
         let mut more_bulk = Box::pin(adm.acquire(Class::Background));
         assert!(poll_once(&mut more_bulk).is_none(), "bulk is at its cap");
+        assert!(!saturated(), "a higher limit would not start the bulk wait");
         let _a = adm.acquire(Class::Prefix).await;
         let _b = adm.acquire(Class::Prefix).await;
         assert_eq!(adm.in_flight(), 3);
+        let mut more_prefix = Box::pin(adm.acquire(Class::Prefix));
+        assert!(
+            poll_once(&mut more_prefix).is_none(),
+            "prefix is at the limit"
+        );
+        assert!(saturated(), "a wait at the limit asks for a higher one");
     }
 
     #[tokio::test]
