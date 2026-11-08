@@ -57,6 +57,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
+itertools = { version = "0.14" }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -137,6 +138,7 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
+itertools = { version = "0.14" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
@@ -190,6 +192,7 @@ num-iter = { version = "0.1", default-features = false, features = ["i128", "std
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
@@ -199,6 +202,7 @@ mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
@@ -210,6 +214,7 @@ num-iter = { version = "0.1", default-features = false, features = ["i128", "std
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.build-dependencies]
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
@@ -219,6 +224,7 @@ mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["event", "fs", "stdio", "termios"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-apple-darwin.dependencies]
 errno = { version = "0.3" }

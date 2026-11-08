@@ -250,6 +250,20 @@ jobs:
                 -f "$chart/ci/render-values.yaml" -f "$stub" > /dev/null
             done
           done
+      # Node prep's disk scheduler script against constructed sysfs trees,
+      # and the chart default that turns it on.
+      - name: host-fleet io scheduler
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/engram-host-fleet
+          sh "$chart/ci/io-scheduler-test.sh"
+          helm template test-release "$chart" -f "$chart/ci/render-values.yaml" \
+            | grep -q 'IO_SCHEDULER="none"'
+          if helm template test-release "$chart" -f "$chart/ci/render-values.yaml" \
+            --set storage.ioScheduler= | grep -q 'io-scheduler'; then
+            echo "storage.ioScheduler=\"\" still renders the io-scheduler step" >&2
+            exit 1
+          fi
       - name: terraform fmt -check
         run: terraform fmt -check -recursive -diff deploy/terraform
       - name: Callback ingress profiles and effective nginx canary

@@ -118,6 +118,15 @@ spec:
                  touch {{ $.Values.storage.workDirHostPath }}/.engram-node-prep-mounted'
               {{- end }}
               {{- end }}
+              {{- with .Values.storage.ioScheduler }}
+              # The block I/O scheduler of the disks under the work dir. It
+              # comes after the dedicated mount, so it finds those devices.
+              nsenter -t 1 -m -- env \
+                IO_SCHEDULER={{ . | quote }} \
+                IO_DIR={{ $.Values.storage.workDirHostPath | quote }} \
+                sh -s < /opt/engram/io-scheduler.sh \
+                || echo "[node-prep] WARNING: the io scheduler step failed; the disk scheduler is not set"
+              {{- end }}
               {{- with .Values.firecracker.uffdBaseDir }}
               # UFFD minor faults require the base files on tmpfs/shmem.
               echo "[node-prep] tmpfs {{ . }} (size={{ $.Values.firecracker.uffdBaseTmpfsSize }})"
@@ -140,6 +149,9 @@ spec:
           volumeMounts:
             - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
             - {name: thin-pool-script, mountPath: /opt/engram/thin-pool.sh, subPath: thin-pool.sh, readOnly: true}
+            {{- if .Values.storage.ioScheduler }}
+            - {name: io-scheduler-script, mountPath: /opt/engram/io-scheduler.sh, subPath: io-scheduler.sh, readOnly: true}
+            {{- end }}
           resources:
             requests: {cpu: "10m", memory: 32Mi}
             limits: {cpu: "100m", memory: 64Mi}
@@ -347,6 +359,12 @@ spec:
           configMap:
             name: {{ include "hostfleet.hostAgent.fullname" . }}-thin-pool
             defaultMode: 0555
+        {{- if .Values.storage.ioScheduler }}
+        - name: io-scheduler-script
+          configMap:
+            name: {{ include "hostfleet.hostAgent.fullname" . }}-io-scheduler
+            defaultMode: 0555
+        {{- end }}
         {{- end }}
         # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
         # the node-assets init container — replaces the hostPath `type: File`
