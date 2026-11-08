@@ -3434,12 +3434,11 @@ mod tests {
                     .find(|&i| key == &manifest.chunks[i].hash.storage_key())
             })
             .collect();
+        // The sweep skips the installed hot chunks, so each chunk is fetched once.
         assert_eq!(
             fetched,
             if matches!(hint_kind, "unsealed" | "late-unsealed") {
-                // The uncached sweep fetches hot chunks again; installation
-                // remains idempotent. Their first fetch must precede the sweep.
-                vec![7, 6, 0, 2, 4, 6, 7]
+                vec![7, 6, 0, 2, 4]
             } else {
                 vec![0, 2, 4, 6, 7]
             },
