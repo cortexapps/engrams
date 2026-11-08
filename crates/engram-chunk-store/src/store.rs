@@ -395,7 +395,7 @@ impl ChunkStore {
                 latest,
             });
         }
-        let bytes = serde_json::to_vec(m)?;
+        let bytes = m.encode_json()?;
         let _ = self.inner.put(&key, Bytes::from(bytes)).await?;
         tracing::debug!(
             manifest_id = %r.manifest_id,
@@ -413,7 +413,7 @@ impl ChunkStore {
     /// committed, or was GC'd).
     pub async fn get_manifest(&self, r: ManifestRef) -> Result<Manifest> {
         let bytes = self.inner.get(&r.storage_key()).await?;
-        let m: Manifest = serde_json::from_slice(&bytes)?;
+        let m = Manifest::decode(&bytes)?;
         m.validate()?;
         Ok(m)
     }

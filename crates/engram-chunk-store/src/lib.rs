@@ -46,6 +46,7 @@ pub mod error;
 pub mod file;
 pub mod gc;
 pub mod manifest;
+pub mod manifest_codec;
 pub mod reader;
 pub mod region;
 pub mod resolver;

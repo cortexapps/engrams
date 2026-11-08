@@ -6,7 +6,7 @@
 //! identified by the sha256 of its contents.
 //!
 //! Manifests are append-only: a "new version" produces a *new*
-//! JSON object at `manifests/<manifest_id>/v<version>.json`. Old
+//! object at `manifests/<manifest_id>/v<version>.json`. Old
 //! versions stay forever (until GC sweeps them) so consumers can
 //! pin to a specific version.
 
@@ -189,8 +189,17 @@ impl Serialize for ChunkHash {
 
 impl<'de> Deserialize<'de> for ChunkHash {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(de)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
+        struct HexVisitor;
+        impl serde::de::Visitor<'_> for HexVisitor {
+            type Value = ChunkHash;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a 64-char hex sha256")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<ChunkHash, E> {
+                ChunkHash::from_hex(s).map_err(E::custom)
+            }
+        }
+        de.deserialize_str(HexVisitor)
     }
 }
 
@@ -221,7 +230,10 @@ pub use engram_core::types::manifest::ManifestRef;
 /// A manifest is the durable, versioned view of a virtual disk or
 /// memory image: which chunks are at which offsets, plus enough
 /// metadata for consumers to reconstruct or share state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// Read it with [`Manifest::decode`], which accepts both stored
+/// encodings (see [`crate::manifest_codec`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Manifest {
     /// Format version. Bumped only on incompatible changes;
     /// readers check `<=` MAX_SUPPORTED before consuming.
@@ -248,19 +260,19 @@ pub struct Manifest {
     /// **not** load-bearing for read correctness (each manifest
     /// version is self-contained — all its chunks are listed in
     /// `chunks`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<ManifestRef>,
 
     /// For memory manifests: the working-set trace the UFFD
     /// handler should prefault before letting vCPUs run. Stored
     /// separately under `traces/` because traces are host-local.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub working_set_trace: Option<TraceRef>,
 
     /// Free-form metadata. The chunk store doesn't interpret this;
     /// callers stash hints (image_tag, session_id, captured_at) for
     /// observability + tooling. Bounded by JSON sanity (a few KB).
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub annotations: serde_json::Value,
 }
 
@@ -639,20 +651,6 @@ mod tests {
             m.validate(),
             Err(ChunkStoreError::UnsupportedSchemaVersion { .. })
         ));
-    }
-
-    #[test]
-    fn manifest_round_trips_through_json() {
-        let mut m = Manifest::empty(ManifestKind::Memory, 4 * 1024 * 1024);
-        m.chunks.push(ChunkRef {
-            offset: 0,
-            hash: ChunkHash::of(b"hello"),
-        });
-        m.parent = Some(ManifestRef::new());
-        m.annotations = serde_json::json!({ "image_tag": "warm-1" });
-        let json = serde_json::to_string(&m).unwrap();
-        let back: Manifest = serde_json::from_str(&json).unwrap();
-        assert_eq!(m, back);
     }
 
     #[test]
