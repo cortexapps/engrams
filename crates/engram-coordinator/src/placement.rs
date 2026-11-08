@@ -106,12 +106,9 @@ pub struct CapabilityRequirements {
     /// source blackout).
     pub needs_live_substrate: bool,
     /// The snapshot row's recorded capture-time FC snapshot version,
-    /// when known (`SnapshotRecord::fc_snapshot_version`). `Some(v)`
-    /// requires the candidate host's reported `fc_snapshot_version` to
-    /// equal `v` exactly — closes the cross-`SNAPSHOT_VERSION` restore-
-    /// corruption class at placement instead of at guest-boot failure.
-    /// `None` (pre-migration snapshot rows, VZ/Process) imposes no
-    /// constraint.
+    /// when known (`SnapshotRecord::fc_snapshot_version`). When both the
+    /// snapshot and candidate host report a version, they must match exactly.
+    /// Either side being `None` imposes no constraint.
     pub fc_snapshot_version: Option<String>,
 }
 
@@ -272,9 +269,9 @@ impl From<PickError> for SandboxError {
     }
 }
 
-/// ADR 0046/0047: ranked candidates for `reserve_placement` — the
-/// snapshot-affinity hosts form the prefix (`hosts[..affinity_len]`),
-/// the rest follow in row order.
+/// Ranked candidates for `reserve_placement`, with bundle-covered hosts first
+/// and row order preserved within each group. `affinity_len` is zero;
+/// `pick_from` applies snapshot affinity after capacity checks.
 #[derive(Clone, Debug, Default)]
 pub struct RankedCandidates {
     pub hosts: Vec<HostId>,
@@ -474,20 +471,15 @@ pub fn exclusion_summary(
         .collect()
 }
 
-/// Pure ranking: filter to schedulable candidates and put the
-/// snapshot-affinity hosts first. Row order (PK-sorted from
-/// `list_active_hosts`) breaks ties deterministically.
+/// Filter to schedulable candidates and put bundle-covered hosts first.
+/// Row order (PK-sorted from `list_active_hosts`) is preserved within each group.
 pub fn rank_hosts(
     hosts: &[HostRecord],
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> RankedCandidates {
-    // ADR 0078: the authoritative `snapshot_host` tier-0 is decided in
-    // `pick_from` (it needs the reserved-budget map for the RAM/CPU +
-    // disk-headroom veto). `rank_hosts` just yields the schedulable
-    // candidate set in row order; there is no longer a capacity-blind
-    // affinity prefix baked in here (the dead `local_snapshots` tier).
+    // `pick_from` applies snapshot affinity after RAM, CPU, and disk checks.
     let mut ranked: Vec<HostId> = Vec::new();
     // ADR 0090: bundle-covered hosts first (soft, stable — row order
     // preserved within each tier). Uncovered hosts still rank; they just
@@ -722,8 +714,8 @@ async fn hosts_and_reserved(
 /// that fits BOTH budgets? A HARD 2D check — unlike `pick_from`'s
 /// capacity-soft fallback — so a drain doesn't start a move that would
 /// strand the session when the fleet is genuinely full. An unmeasured
-/// host (no allocatable / no reported vCPU) counts as fitting (same soft
-/// posture `reserve_placement` takes for brand-new / dev hosts).
+/// dimension (no allocatable RAM / no reported vCPU) counts as fitting;
+/// each measured dimension must still fit.
 pub async fn placement_preview(
     meta: &dyn MetadataStore,
     ctx: &ScheduleContext<'_>,
@@ -738,12 +730,11 @@ pub async fn placement_preview(
             return false;
         };
         let alloc = h.utilization.allocatable_mib as i64;
-        if alloc <= 0 {
-            return true; // unmeasured → soft fallback fits
-        }
-        let free_mib = alloc - reserved.get(id).map(|r| r.mem_mib).unwrap_or(0);
-        if free_mib < mem_mib {
-            return false;
+        if alloc > 0 {
+            let free_mib = alloc - reserved.get(id).map(|r| r.mem_mib).unwrap_or(0);
+            if free_mib < mem_mib {
+                return false;
+            }
         }
         let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
         if cpu_budget > 0 {
@@ -1749,9 +1740,8 @@ mod tests {
         assert_eq!(ranked.hosts, vec![hid(4)]);
     }
 
-    /// ADR 0078 tier 0: an alive, headroom-OK `snapshot_host` is picked
-    /// authoritatively — even over a host with more free RAM (h1) that
-    /// best-fit would otherwise prefer. The bytes are on h2's NVMe.
+    /// An alive `snapshot_host` with headroom is picked authoritatively.
+    /// The bytes are on h2's NVMe; best-fit also prefers h2's smaller free RAM.
     #[test]
     fn authoritative_snapshot_host_wins_when_healthy() {
         let mut h1 = host(1);

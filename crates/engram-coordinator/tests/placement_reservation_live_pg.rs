@@ -3,7 +3,7 @@
 //! `reserve_placement`)'s `FOR UPDATE` transaction (burst-safe spread +
 //! reject), the `mem_budget_mib` ledger column, `fleet_free_mib` (Σ
 //! allocatable − reserved), and the one-transaction write-set's atomicity —
-//! all against REAL Postgres. The api.rs create tests use a mock store whose
+//! against REAL Postgres. The api.rs create tests use a mock store whose
 //! `reserve_and_persist_create` is a trivial in-memory stand-in, so this is
 //! the only coverage of the actual SQL: the transaction, the reserved-set
 //! aggregate, the pending/queued-row insert, the satellite writes (secrets,
@@ -14,7 +14,9 @@
 //! (issue #535) that the write-set commits as ONE transaction, not a chain
 //! of individually-failable writes.
 //!
-//! `#[ignore]`'d by default; requires Postgres at `ENGRAM_TEST_DATABASE_URL`.
+//! The Postgres tests are `#[ignore]`'d by default and require
+//! `ENGRAM_TEST_DATABASE_URL`. The unignored preview regression uses the shared
+//! fixtures with `SimMetadataStore` and needs no database service.
 //! Run:
 //! ```bash
 //! just db-up
@@ -167,6 +169,71 @@ async fn reserve(
     {
         CreateDisposition::Placed(h) => Some(h),
         CreateDisposition::Queued => None,
+    }
+}
+
+#[tokio::test]
+async fn placement_preview_softens_only_unmeasured_dimensions() {
+    use engram_coordinator::placement::{placement_preview, ScheduleContext};
+
+    let meta: Arc<dyn MetadataStore> = engram_sim::SimMetadataStore::new(
+        Arc::new(engram_core::traits::SystemClock::new()),
+        Arc::new(engram_sim::SimEntropy::seeded(48)),
+    );
+    let host = seed_host(&meta, "preview-host", 0).await;
+    let reserved_cpu = i32::try_from(engram_core::types::host::host_cpu_budget(8)).unwrap();
+    assert_eq!(
+        reserve(&meta, SessionId::new(), 0, reserved_cpu, &[host], 0).await,
+        Some(host)
+    );
+    let context = ScheduleContext {
+        repo: "localhost:5001/placement-reservation",
+        image_version: "test",
+        snapshot_host: None,
+        memory_mib: Some(2),
+        cpu_budget_vcpus: Some(1),
+        required_image_digest: None,
+        exclude_host: None,
+        prefer_host: None,
+        caps: Default::default(),
+        prefer_bundles: &[],
+    };
+    for (allocatable_mib, total_vcpus, need_cpu, fits) in [
+        (0, 8, 1, false),
+        (0, 16, 1, true),
+        (0, 8, 0, true),
+        (0, 0, 1, true),
+        (1, 0, 1, false),
+        (2, 0, 1, true),
+    ] {
+        meta.touch_host_heartbeat(
+            host,
+            engram_core::types::host::HostHeartbeat {
+                status: HostStatus::Ready,
+                capacity: zero_capacity(),
+                utilization: HostUtilization {
+                    allocatable_mib,
+                    ..HostUtilization::default()
+                },
+                ready_images: Vec::new(),
+                current_bundles: Vec::new(),
+                sandbox_bundles: Vec::new(),
+                total_vcpus,
+                wire_version: engram_protocol::WIRE_VERSION,
+                stages_images: false,
+                capabilities: Default::default(),
+                lease_renew_until: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            placement_preview(meta.as_ref(), &context, 2, need_cpu, Utc::now())
+                .await
+                .unwrap(),
+            fits,
+            "allocatable_mib={allocatable_mib}, total_vcpus={total_vcpus}, need_cpu={need_cpu}"
+        );
     }
 }
 
