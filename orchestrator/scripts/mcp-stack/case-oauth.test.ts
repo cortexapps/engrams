@@ -15,31 +15,31 @@ test("a reviewed catalog is enabled with its current connection revision", async
   const integration = {
     async setConnectionEnabled(request: {
       id: string;
-      expectedRevision: bigint;
+      expectedRevision: number;
       enabled: boolean;
     }) {
       expect(request).toEqual({
         id: "fixture",
-        expectedRevision: 7n,
+        expectedRevision: 7,
         enabled: true,
       });
       enabled = true;
-      return { connection: { id: "fixture", configRevision: 7n, enabled } };
+      return { connection: { id: "fixture", configRevision: 7, enabled } };
     },
   };
-  await oauth.enableReviewedOAuthConnection(integration, "fixture", 7n);
+  await oauth.enableReviewedOAuthConnection(integration, "fixture", 7);
   expect(enabled).toBe(true);
   await expect(
     oauth.enableReviewedOAuthConnection(
       {
         async setConnectionEnabled() {
           return {
-            connection: { id: "fixture", configRevision: 7n, enabled: false },
+            connection: { id: "fixture", configRevision: 7, enabled: false },
           };
         },
       },
       "fixture",
-      7n,
+      7,
     ),
   ).rejects.toThrow();
 });

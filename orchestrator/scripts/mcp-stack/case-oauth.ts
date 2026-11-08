@@ -27,14 +27,14 @@ export async function enableReviewedOAuthConnection(
   integration: {
     setConnectionEnabled(request: {
       id: string;
-      expectedRevision: bigint;
+      expectedRevision: number;
       enabled: boolean;
     }): Promise<{
-      connection?: { id: string; configRevision: bigint; enabled: boolean };
+      connection?: { id: string; configRevision: number; enabled: boolean };
     }>;
   },
   id: string,
-  expectedRevision: bigint,
+  expectedRevision: number,
 ) {
   const enabled = await integration.setConnectionEnabled({
     id,
