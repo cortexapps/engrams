@@ -7,6 +7,7 @@ import {
   assertDuplicateWriteUnknown,
   recoverSettledUnknown,
   assertNewIdWriteDenial,
+  assertAcknowledgedNativeCompletion,
 } from "./case-recovery.ts";
 import { canonicalJson, parseGuestProofRecords } from "./guest.ts";
 import { sha256 } from "./context.ts";
@@ -15,6 +16,30 @@ const alias = "mcp_fixture_read";
 const callId = "cold-old-read";
 const planSha256 = `sha256:${"a".repeat(64)}`;
 const emptyExposure = `sha256:${sha256(canonicalJson([]))}`;
+
+test("acknowledged completion allows a delivery run but requires one successful matching call", () => {
+  const completion = {
+    tool_call_id: "call-1",
+    run_id: "delivery-run",
+    ok: true,
+  };
+  expect(() =>
+    assertAcknowledgedNativeCompletion([completion], "call-1", "original-run"),
+  ).not.toThrow();
+  for (const events of [
+    [],
+    [completion, completion],
+    [{ ...completion, tool_call_id: "other" }],
+    [{ ...completion, run_id: "" }],
+    [{ ...completion, ok: false }],
+  ])
+    expect(() =>
+      assertAcknowledgedNativeCompletion(events, "call-1", "original-run"),
+    ).toThrow();
+  expect(() =>
+    assertAcknowledgedNativeCompletion([completion], "call-1", ""),
+  ).toThrow();
+});
 const records = (proof: object) =>
   parseGuestProofRecords(Buffer.from(JSON.stringify(proof) + "\n"));
 const positive = () =>

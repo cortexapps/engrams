@@ -388,6 +388,21 @@ export const heldWriteRestartDriver: CaseDriver = async ({
   }
 };
 
+export function assertAcknowledgedNativeCompletion(
+  completion: { tool_call_id: string; run_id: string; ok: boolean }[],
+  callId: string,
+  executionRunId: string,
+) {
+  requireThat(
+    executionRunId.length > 0 &&
+      completion.length === 1 &&
+      completion[0]!.tool_call_id === callId &&
+      completion[0]!.run_id.length > 0 &&
+      completion[0]!.ok,
+    "ack_exact_native_run_call",
+  );
+}
+
 export const outboxGuestAckDriver: CaseDriver = async ({
   ctx,
   principals,
@@ -504,11 +519,10 @@ export const outboxGuestAckDriver: CaseDriver = async ({
           observation: "completionBarrierReleased",
         });
         const ack = await delivered(ctx, database, scenario);
-        requireThat(
-          ack.completion.length === 1 &&
-            ack.completion[0]!.run_id === row.runId &&
-            ack.completion[0]!.ok,
-          "ack_exact_native_run_call",
+        assertAcknowledgedNativeCompletion(
+          ack.completion,
+          scenario.input.callId,
+          row.runId,
         );
         observed["verified-persisted-result"] = [
           observation("public-rpc", "succeeded", result),
@@ -526,7 +540,10 @@ export const outboxGuestAckDriver: CaseDriver = async ({
           observation("guest-proof", "succeeded", { proofs, held, released }),
         ];
         observed["guest-ack"] = [
-          observation("public-rpc", "acknowledged", ack.completion),
+          observation("public-rpc", "acknowledged", {
+            executionRunId: row.runId,
+            completion: ack.completion,
+          }),
           observation("coordinator-read-only", "acknowledged", {
             outbox: ack.outbox,
             target: ack.target,
