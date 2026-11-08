@@ -3288,7 +3288,7 @@ impl FirecrackerBackend {
                     let migration_manifest =
                         migration_manifest.exists().then_some(migration_manifest);
                     let staged = |r| {
-                        let path = staged_manifest_path(snapshot_dir, &r);
+                        let path = staged_manifest_path(snapshot_dir, sandbox_id, &r);
                         path.exists().then_some(path)
                     };
                     let session_json = migration_manifest.clone().or_else(|| staged(session_ref));
@@ -4882,12 +4882,15 @@ enum SocketProbe {
 }
 
 /// Where a host stages a copy of the memory manifest `r` beside a snapshot,
-/// so the UFFD handler reads it from disk instead of the blob store.
+/// so the UFFD handler of `sandbox_id` reads it from disk instead of the
+/// blob store. Each restore has its own copy, so restores of one snapshot
+/// never write or remove a file another restore reads.
 pub fn staged_manifest_path(
     snapshot_dir: &Path,
+    sandbox_id: SandboxId,
     r: &engram_core::types::manifest::ManifestRef,
 ) -> PathBuf {
-    snapshot_dir.join(format!("manifest-{r}.json"))
+    snapshot_dir.join(format!("manifest-{r}.{sandbox_id}.json"))
 }
 
 /// Wait until either:
