@@ -557,6 +557,7 @@ function inspectedContainer(
     runId = "mcp-123456789012345678901234";
   const state = {
     Id: id,
+    AppArmorProfile: "",
     Image: image,
     Config: {
       Labels: { "engrams.mcp.run": runId },
@@ -629,11 +630,19 @@ async function inspectedHost(firecrackerPool?: string) {
     PidMode: firecrackerPool ? "host" : "",
     CapAdd: ["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_MKNOD"],
   });
+  if (firecrackerPool) {
+    state.AppArmorProfile = "unconfined";
+    state.HostConfig.SecurityOpt = ["no-new-privileges", "apparmor=unconfined"];
+  }
   state.Config.User = "0:0";
   options[options.indexOf("--user") + 1] = "0:0";
+  let createdOptions: string[] = [];
   const call = engine.call.bind(engine);
   const intercepted = spyOn(engine, "call").mockImplementation(async (args) => {
     if (args[0] === "create") {
+      createdOptions = args.flatMap((arg, i) =>
+        arg === "--security-opt" ? [args[i + 1]!] : [],
+      );
       state.Config.Entrypoint = [args[args.indexOf("--entrypoint") + 1]!];
       state.Config.Cmd = args.slice(args.indexOf(image) + 1);
     }
@@ -656,6 +665,11 @@ async function inspectedHost(firecrackerPool?: string) {
   } finally {
     intercepted.mockRestore();
   }
+  expect(createdOptions).toEqual(
+    firecrackerPool
+      ? ["no-new-privileges", "apparmor=unconfined"]
+      : ["no-new-privileges"],
+  );
   return fixture;
 }
 
@@ -668,26 +682,42 @@ test("FC host PID audit accepts only Docker's exact derived label option", async
   try {
     const { engine, state, id } = await inspectedHost(directory);
     for (const options of [
-      ["no-new-privileges"],
-      ["no-new-privileges", "label=disable"],
-      ["label=disable", "no-new-privileges"],
+      ["no-new-privileges", "apparmor=unconfined"],
+      ["no-new-privileges", "apparmor=unconfined", "label=disable"],
+      ["label=disable", "no-new-privileges", "apparmor=unconfined"],
     ]) {
       state.HostConfig.SecurityOpt = options;
       expect(await engine.audit(id)).toBeDefined();
     }
     for (const options of [
       [],
-      ["label=disable"],
-      ["no-new-privileges", "no-new-privileges"],
-      ["no-new-privileges", "label=disable", "label=disable"],
-      ["no-new-privileges", "label=disable", "apparmor=unconfined"],
-      ["no-new-privileges", "label=disable", "seccomp=unconfined"],
-      ["no-new-privileges", "label=type:container_t"],
+      ["no-new-privileges"],
+      ["apparmor=unconfined"],
+      ["no-new-privileges", "label=disable"],
+      ["no-new-privileges", "apparmor=unconfined", "apparmor=unconfined"],
+      [
+        "no-new-privileges",
+        "apparmor=unconfined",
+        "label=disable",
+        "label=disable",
+      ],
+      ["no-new-privileges", "apparmor=unconfined", "apparmor=other"],
+      ["no-new-privileges", "apparmor=unconfined", "seccomp=unconfined"],
+      ["no-new-privileges", "apparmor=unconfined", "label=type:container_t"],
     ]) {
       state.HostConfig.SecurityOpt = options;
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
     }
-    state.HostConfig.SecurityOpt = ["no-new-privileges", "label=disable"];
+    state.HostConfig.SecurityOpt = [
+      "no-new-privileges",
+      "apparmor=unconfined",
+      "label=disable",
+    ];
+    for (const profile of ["", "docker-default", "other"]) {
+      state.AppArmorProfile = profile;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.AppArmorProfile = "unconfined";
     state.HostConfig.CapAdd.push("CAP_SYS_PTRACE");
     await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
     state.HostConfig.CapAdd.pop();
@@ -712,7 +742,18 @@ test("ordinary containers and VZ hosts reject Docker's host PID label option", a
     await ordinary.engine.create("probe", ordinary.image, ordinary.options);
     const vz = await inspectedHost();
     for (const { engine, state, id } of [ordinary, vz]) {
-      state.HostConfig.SecurityOpt = ["no-new-privileges", "label=disable"];
+      for (const options of [
+        ["no-new-privileges", "label=disable"],
+        ["no-new-privileges", "apparmor=unconfined"],
+        ["no-new-privileges", "apparmor=unconfined", "label=disable"],
+      ]) {
+        state.HostConfig.SecurityOpt = options;
+        await expect(engine.audit(id)).rejects.toThrow(
+          "container_capabilities",
+        );
+      }
+      state.HostConfig.SecurityOpt = ["no-new-privileges"];
+      state.AppArmorProfile = "unconfined";
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
     }
   } finally {

@@ -621,6 +621,9 @@ export class Engine {
         "core=0",
         "--security-opt",
         "no-new-privileges",
+        ...(host && this.inputs.backend === "firecracker"
+          ? ["--security-opt", "apparmor=unconfined"]
+          : []),
         "--cap-drop",
         "ALL",
         ...options,
@@ -755,12 +758,18 @@ export class Engine {
     );
     const addedCapabilities = values("--cap-add").sort();
     const securityOptions = JSON.stringify([...(h.SecurityOpt ?? [])].sort());
-    // Docker derives this SELinux option for the host PID namespace.
-    const hostPidLabel =
+    const fcHost =
       spec.role === "host-agent" &&
       this.inputs.backend === "firecracker" &&
-      h.PidMode === "host" &&
-      securityOptions === '["label=disable","no-new-privileges"]';
+      h.PidMode === "host";
+    // The FC host creates named network namespaces; Docker can also derive a SELinux label option.
+    const expectedSecurity = fcHost
+      ? actual.AppArmorProfile === "unconfined" &&
+        (securityOptions === '["apparmor=unconfined","no-new-privileges"]' ||
+          securityOptions ===
+            '["apparmor=unconfined","label=disable","no-new-privileges"]')
+      : actual.AppArmorProfile !== "unconfined" &&
+        securityOptions === '["no-new-privileges"]';
     check(
       (spec.role === "dns" || spec.role === "denied-dns"
         ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
@@ -771,7 +780,7 @@ export class Engine {
             .map((capability: string) => capability.replace(/^CAP_/, ""))
             .sort(),
         ) === JSON.stringify(addedCapabilities) &&
-        (securityOptions === '["no-new-privileges"]' || hostPidLabel),
+        expectedSecurity,
       "container_capabilities",
     );
     check(

@@ -172,6 +172,12 @@ a serial-suite budget, not a volume count based on the 24 cases. A larger sparse
 file cannot satisfy it. The production File memory restore mode stays unchanged;
 UFFD helper bytes remain pinned without a claim of UFFD runtime qualification.
 
+Only the Firecracker host container sets `apparmor=unconfined` so the production
+host can create and bind named network namespaces. Its audit requires that exact
+inspected AppArmor profile. Other roles keep the default profile. The host keeps
+no-new-privileges, default seccomp, exact capabilities, and all device and mount
+bounds.
+
 FC's listener is `0.0.0.0:9101` only inside its owned namespace. C's guard
 publishes only the verified `nativeHostIp:9101`. The advertised TLS authority
 stays `host.fixture.example:9101` and resolves to C's bridge address because
