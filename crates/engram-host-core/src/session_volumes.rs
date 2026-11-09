@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::disk::{
     Capacity, Hydration, SessionDisk, SourceDevice, SourceServer, Volume, VolumeName,
 };
-use crate::disk_flows::{checkpoint_split, hydration_plan, shape_matches, stage};
+use crate::disk_flows::{checkpoint_split, hydration_plan, prefix_hashes, shape_matches, stage};
 use crate::image_volumes::{self, ImageVolumes};
 
 const LIVE_PREFIX: &str = "sb-";
@@ -231,7 +231,7 @@ fn live_first(names: &mut [(VolumeName, Parsed)]) {
 /// staged on this host, the volume starts as a snapshot of it and only
 /// the difference comes in: behind the running guest where the platform
 /// has a hydrating device, in full before it starts elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     /// An image's disk: the volume starts a new lineage as a snapshot of
     /// the image's volume, which is staged first when the host has none
@@ -244,9 +244,13 @@ pub enum Source {
         base: Option<ManifestRef>,
     },
     /// The sandbox's own manifest: the volume continues its lineage.
+    /// `first_touch` lists the chunks the guest read before the copy
+    /// reached them on its last hydrating restore, in order; the ones
+    /// this restore must copy are fetched first.
     Continue {
         manifest: ManifestRef,
         base: Option<ManifestRef>,
+        first_touch: Vec<u32>,
     },
     /// Zeros, in a new lineage.
     Empty { size_bytes: u64 },
@@ -326,6 +330,16 @@ struct Base {
     kept_by: Option<SandboxId>,
 }
 
+/// What a live volume this host does not hold is brought up to: the
+/// manifest, the lineage it continues, the base to start from, and the
+/// chunks the guest read first on the last hydrating restore.
+struct Wanted<'a> {
+    manifest: &'a Manifest,
+    lineage: ManifestRef,
+    base: Option<Base>,
+    first_touch: &'a [u32],
+}
+
 /// The owner of every `sb-` volume on a host.
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
@@ -340,6 +354,9 @@ pub struct SessionVolumes {
     sources: Option<Arc<dyn SourceServer>>,
     /// The source of each hydrating live volume this process serves.
     serving: Mutex<HashMap<VolumeName, Box<dyn SourceDevice>>>,
+    /// What each stopped source recorded as read first, kept until the
+    /// live volume goes.
+    touched: Mutex<HashMap<VolumeName, Vec<u32>>>,
 }
 
 impl SessionVolumes {
@@ -351,6 +368,7 @@ impl SessionVolumes {
             kept: Mutex::new(VecDeque::new()),
             sources: None,
             serving: Mutex::new(HashMap::new()),
+            touched: Mutex::new(HashMap::new()),
         }
     }
 
@@ -480,41 +498,63 @@ impl SessionVolumes {
                     None => {
                         let base = self.image_base(base).await;
                         let (live, path) = self
-                            .bring_up(fill, sandbox, role, &wanted, lineage, base)
+                            .bring_up(
+                                fill,
+                                sandbox,
+                                role,
+                                Wanted {
+                                    manifest: &wanted,
+                                    lineage,
+                                    base,
+                                    first_touch: &[],
+                                },
+                            )
                             .await?;
                         (live, lineage, path)
                     }
                 }
             }
-            Source::Continue { manifest, base } => {
-                match self.kept(sandbox, role, manifest).await? {
-                    Some((owner, volume, _, held)) if held == manifest => {
-                        let checkpoint = self.adopt(owner, volume, sandbox, role, held).await?;
-                        let live = self.live_snapshot(&checkpoint, sandbox, role).await?;
-                        (live, manifest, StagePath::Kept)
-                    }
-                    kept => {
-                        let wanted = self.manifest(manifest).await?;
-                        let base = match kept {
-                            Some((owner, volume, held_manifest, held))
-                                if volume.size_bytes == wanted.total_bytes =>
-                            {
-                                Some(Base {
-                                    volume,
-                                    manifest: held_manifest,
-                                    manifest_ref: held,
-                                    kept_by: Some(owner),
-                                })
-                            }
-                            _ => self.image_base(base).await,
-                        };
-                        let (live, path) = self
-                            .bring_up(fill, sandbox, role, &wanted, manifest, base)
-                            .await?;
-                        (live, manifest, path)
-                    }
+            Source::Continue {
+                manifest,
+                base,
+                first_touch,
+            } => match self.kept(sandbox, role, manifest).await? {
+                Some((owner, volume, _, held)) if held == manifest => {
+                    let checkpoint = self.adopt(owner, volume, sandbox, role, held).await?;
+                    let live = self.live_snapshot(&checkpoint, sandbox, role).await?;
+                    (live, manifest, StagePath::Kept)
                 }
-            }
+                kept => {
+                    let wanted = self.manifest(manifest).await?;
+                    let base = match kept {
+                        Some((owner, volume, held_manifest, held))
+                            if volume.size_bytes == wanted.total_bytes =>
+                        {
+                            Some(Base {
+                                volume,
+                                manifest: held_manifest,
+                                manifest_ref: held,
+                                kept_by: Some(owner),
+                            })
+                        }
+                        _ => self.image_base(base).await,
+                    };
+                    let (live, path) = self
+                        .bring_up(
+                            fill,
+                            sandbox,
+                            role,
+                            Wanted {
+                                manifest: &wanted,
+                                lineage: manifest,
+                                base,
+                                first_touch: &first_touch,
+                            },
+                        )
+                        .await?;
+                    (live, manifest, path)
+                }
+            },
             Source::Empty { size_bytes } => {
                 let volume = self.disk.create(&tmp, size_bytes).await?;
                 let manifest = Manifest {
@@ -608,27 +648,25 @@ impl SessionVolumes {
         self.disk.open(&name).await
     }
 
-    /// The live volume of a role whose manifest `wanted` is not on this
-    /// host, under `lineage`: a hydrating device when this host has one
-    /// and serves sources, else the difference from `base` written in
-    /// full first.
+    /// The live volume of a role whose manifest is not on this host: a
+    /// hydrating device when this host has one and serves sources, else
+    /// the difference from the base written in full first.
     async fn bring_up(
         &self,
         fill: &FillEngine,
         sandbox: SandboxId,
         role: DiskRole,
-        wanted: &Manifest,
-        lineage: ManifestRef,
-        base: Option<Base>,
+        wanted: Wanted<'_>,
     ) -> io::Result<(Volume, StagePath)> {
         if self.hydration_support().is_some() {
             let live = self
-                .hydrate(fill, sandbox, role, wanted, lineage, base)
+                .hydrate(fill, sandbox, role, wanted)
                 .instrument(tracing::info_span!(
                     "disk.hydrate",
                     held = tracing::field::Empty,
                     delta = tracing::field::Empty,
                     zero = tracing::field::Empty,
+                    prefix = tracing::field::Empty,
                 ))
                 .await?;
             return Ok((live, StagePath::Lazy));
@@ -639,12 +677,14 @@ impl SessionVolumes {
             fill,
             Class::Demand,
             &tmp,
-            wanted,
-            base.as_ref().map(|b| (&b.volume, &b.manifest)),
+            wanted.manifest,
+            wanted.base.as_ref().map(|b| (&b.volume, &b.manifest)),
         )
         .instrument(tracing::info_span!("disk.stage"))
         .await?;
-        let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
+        let live = self
+            .commit_live(&tmp, sandbox, role, wanted.lineage)
+            .await?;
         Ok((live, StagePath::Staged))
     }
 
@@ -653,17 +693,24 @@ impl SessionVolumes {
     /// stands in for no base) under the `dest` name, and its source
     /// serves `wanted` through `fill`. Chunks the base holds in final
     /// form are skipped; chunks `wanted` leaves out are zeroed first.
+    /// The `first_touch` chunks the copy must bring in are fetched at
+    /// `Prefix` without waiting, so the guest's first reads find them
+    /// resident before the copy reaches them.
     /// Records on the current span how many chunks the base `held`, the
-    /// kernel copies (`delta`) and were zeroed (`zero`).
+    /// kernel copies (`delta`), were zeroed (`zero`) and make the `prefix`.
     async fn hydrate(
         &self,
         fill: &FillEngine,
         sandbox: SandboxId,
         role: DiskRole,
-        wanted: &Manifest,
-        lineage: ManifestRef,
-        base: Option<Base>,
+        wanted: Wanted<'_>,
     ) -> io::Result<Volume> {
+        let Wanted {
+            manifest: wanted,
+            lineage,
+            base,
+            first_touch,
+        } = wanted;
         let (sources, region_bytes) = self.hydration_support().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "this host does not hydrate")
         })?;
@@ -724,10 +771,24 @@ impl SessionVolumes {
                 return Err(e);
             }
         };
+        let prefix = prefix_hashes(first_touch, &plan.delta, wanted);
         let span = tracing::Span::current();
         span.record("held", (plan.skip.len() - plan.zero.len()) as u64);
         span.record("delta", plan.delta.len() as u64);
         span.record("zero", plan.zero.len() as u64);
+        span.record("prefix", prefix.len() as u64);
+        if !prefix.is_empty() {
+            let fill = fill.clone();
+            tokio::spawn(
+                async move {
+                    match fill.fill(prefix, Class::Prefix).await {
+                        Ok(stats) => tracing::info!(?stats, "disk first-touch prefix resident"),
+                        Err(error) => tracing::warn!(%error, "disk first-touch prefix failed"),
+                    }
+                }
+                .instrument(tracing::info_span!("disk.prefix", sandbox_id = %sandbox, %role)),
+            );
+        }
         self.serving
             .lock()
             .unwrap()
@@ -913,6 +974,22 @@ impl SessionVolumes {
         Ok(reattached)
     }
 
+    /// The chunks the guest read before the copy reached them, in
+    /// order: from the role's source while it serves, and after its stop
+    /// until the volume goes. Empty for a role that never hydrated.
+    pub fn first_touch(&self, sandbox: SandboxId, role: DiskRole) -> Vec<u32> {
+        let live = live_name(sandbox, role);
+        if let Some(source) = self.serving.lock().unwrap().get(&live) {
+            return source.touched();
+        }
+        self.touched
+            .lock()
+            .unwrap()
+            .get(&live)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The devices of the sources this process serves.
     pub fn sources(&self) -> Vec<PathBuf> {
         self.serving
@@ -968,7 +1045,13 @@ impl SessionVolumes {
     async fn stop_source(&self, live: &VolumeName) -> io::Result<()> {
         let source = self.serving.lock().unwrap().remove(live);
         match source {
-            Some(source) => source.stop().await,
+            Some(source) => {
+                self.touched
+                    .lock()
+                    .unwrap()
+                    .insert(live.clone(), source.touched());
+                source.stop().await
+            }
             None => Ok(()),
         }
     }
@@ -1370,6 +1453,7 @@ impl SessionVolumes {
                         report.failed.push((name.clone(), e));
                         return true;
                     }
+                    self.touched.lock().unwrap().remove(name);
                 }
                 report.deleted.push(name.clone());
                 true
@@ -1821,6 +1905,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -1841,6 +1926,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: None,
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -1890,6 +1976,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: None,
+                    first_touch: vec![],
                 },
                 None,
                 Some(Arc::new(peer)),
@@ -2031,6 +2118,7 @@ mod tests {
                 Some(Source::Continue {
                     manifest: ManifestRef::new(),
                     base: None,
+                    first_touch: vec![],
                 }),
             )
             .await
@@ -2093,6 +2181,7 @@ mod tests {
                 Source::Continue {
                     manifest: v3,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2450,6 +2539,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2491,6 +2581,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2535,6 +2626,7 @@ mod tests {
                 Source::Continue {
                     manifest: next,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2608,6 +2700,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2671,6 +2764,7 @@ mod tests {
                 Source::Continue {
                     manifest: published,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2758,6 +2852,7 @@ mod tests {
                 Source::Continue {
                     manifest: wanted,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2771,6 +2866,11 @@ mod tests {
                 .unwrap(),
             wanted,
             "the live volume holds the destination's manifest"
+        );
+        assert_eq!(
+            r.volumes.first_touch(resumed, DiskRole::Root),
+            vec![1, 3],
+            "the source reports what the guest read first (the fake: the delta)"
         );
         write_byte(&p.root, 2, 7).await;
         write_byte(&p.root, 4, 8).await;
@@ -2804,6 +2904,11 @@ mod tests {
 
         settled(&r, resumed, DiskRole::Root).await;
         assert_eq!(bytes_at(&p.root).await, vec![1, 9, 7, 4, 8]);
+        assert_eq!(
+            r.volumes.first_touch(resumed, DiskRole::Root),
+            vec![1, 3],
+            "the record outlives the source until the volume goes"
+        );
         let after = r.volumes.checkpoint(resumed, DiskRole::Root).await.unwrap();
         assert_eq!(after.version, mid.version + 1);
         assert_eq!(manifest_bytes(&r, after).await, vec![1, 9, 7, 4, 8]);
@@ -2820,6 +2925,7 @@ mod tests {
             "a settled role has the normal layout"
         );
         r.volumes.release(resumed).await.unwrap();
+        assert!(r.volumes.first_touch(resumed, DiskRole::Root).is_empty());
     }
 
     /// The first byte of each chunk of a published manifest; 0 for a
@@ -2858,6 +2964,7 @@ mod tests {
                 Source::Continue {
                     manifest: next,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2897,6 +3004,7 @@ mod tests {
                 Source::Continue {
                     manifest: next,
                     base: Some(image),
+                    first_touch: vec![],
                 },
                 None,
             )
@@ -2942,6 +3050,7 @@ mod tests {
                 Source::Continue {
                     manifest: image,
                     base: None,
+                    first_touch: vec![],
                 },
                 None,
             )

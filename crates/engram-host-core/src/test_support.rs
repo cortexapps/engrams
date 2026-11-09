@@ -219,6 +219,8 @@ struct FileSource {
     path: PathBuf,
     holders: Arc<Mutex<HashSet<PathBuf>>>,
     stopped: Arc<AtomicU64>,
+    /// Reported as read first: every delta chunk, in order.
+    delta: Vec<u32>,
 }
 
 #[async_trait::async_trait]
@@ -227,7 +229,7 @@ impl SourceDevice for FileSource {
         &self.path
     }
     fn touched(&self) -> Vec<u32> {
-        Vec::new()
+        self.delta.clone()
     }
     async fn stop(self: Box<Self>) -> io::Result<()> {
         if self.holders.lock().unwrap().contains(&self.path) {
@@ -273,6 +275,7 @@ impl SourceServer for FileSources {
             path,
             holders: self.holders.clone(),
             stopped: self.stopped.clone(),
+            delta: delta.iter().map(|c| *c as u32).collect(),
         }))
     }
 
@@ -281,7 +284,7 @@ impl SourceServer for FileSources {
         path: &Path,
         _fill: FillEngine,
         _manifest: &Manifest,
-        _delta: Vec<u64>,
+        delta: Vec<u64>,
         _region_bytes: u64,
     ) -> io::Result<Box<dyn SourceDevice>> {
         std::fs::metadata(path)?;
@@ -289,6 +292,7 @@ impl SourceServer for FileSources {
             path: path.to_path_buf(),
             holders: self.holders.clone(),
             stopped: self.stopped.clone(),
+            delta: delta.iter().map(|c| *c as u32).collect(),
         }))
     }
 }

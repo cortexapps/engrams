@@ -230,6 +230,26 @@ pub fn hydration_plan(wanted: &Manifest, base: Option<&Manifest>) -> io::Result<
     })
 }
 
+/// The chunks of `first_touch` (guest reads of a hydrating volume, in
+/// order) that `delta` copies, as `wanted`'s hashes: what a restore
+/// fetches at `Prefix` before the copy reaches them. Chunks the base
+/// already holds and chunks `wanted` leaves out need no fetch.
+pub(crate) fn prefix_hashes(
+    first_touch: &[u32],
+    delta: &[u64],
+    wanted: &Manifest,
+) -> Vec<ChunkHash> {
+    let chunk_size = wanted.chunk_size.as_u64();
+    let by_offset: HashMap<u64, ChunkHash> =
+        wanted.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+    first_touch
+        .iter()
+        .map(|i| u64::from(*i))
+        .filter(|i| delta.binary_search(i).is_ok())
+        .filter_map(|i| by_offset.get(&(i * chunk_size)).copied())
+        .collect()
+}
+
 /// A snapshot of `live` and the manifest describing it. With `previous`
 /// (the last snapshot and its manifest) only the chunks that differ are
 /// uploaded. The guest must be paused across [`checkpoint_split::take`];
@@ -639,6 +659,30 @@ mod tests {
                 .to_vec(),
             expected[1]
         );
+    }
+
+    /// Reads of chunks 3, 0 and 4 came first; the copy brings 1 and 3,
+    /// so only chunk 3 is fetched ahead.
+    #[test]
+    fn the_prefix_is_the_first_touch_in_order_restricted_to_the_delta() {
+        let wanted = Manifest {
+            chunk_size: ChunkSize::bytes(CHUNK),
+            chunks: [1u8, 9, 0, 4, 5]
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b != 0)
+                .map(|(i, b)| ChunkRef {
+                    offset: i as u64 * CHUNK,
+                    hash: ChunkHash::of(&fill(*b)),
+                })
+                .collect(),
+            ..Manifest::empty(ManifestKind::Disk, CHUNK * 5)
+        };
+        assert_eq!(
+            prefix_hashes(&[3, 0, 4], &[1, 3], &wanted),
+            vec![ChunkHash::of(&fill(4))]
+        );
+        assert!(prefix_hashes(&[], &[1, 3], &wanted).is_empty());
     }
 
     #[tokio::test]

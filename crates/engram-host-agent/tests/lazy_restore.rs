@@ -137,6 +137,7 @@ async fn a_lazy_resume_reads_cold_chunks_through_the_source_and_settles() {
             Source::Continue {
                 manifest,
                 base: None,
+                first_touch: vec![],
             },
             None,
         )
@@ -190,6 +191,7 @@ async fn child_provisions_and_waits() {
             Source::Continue {
                 manifest,
                 base: None,
+                first_touch: vec![],
             },
             None,
         )

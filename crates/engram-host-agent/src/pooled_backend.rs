@@ -266,7 +266,16 @@ mod first_touch_tests {
             entries: vec![(2, 10), (3, 20), (1, 30)],
         };
         std::fs::write(&file, record.encode()).unwrap();
-        publish_first_touch(&plain, session, &file, Some(10)).await;
+        publish_first_touch(&plain, session, &file, Some(10), vec![5, 2]).await;
+        assert_eq!(
+            first_touch_indices(
+                &plain,
+                session,
+                &engram_chunk_store::FirstTouch::disk_key(session.as_uuid())
+            )
+            .await,
+            vec![5, 2]
+        );
 
         let cache = engram_chunk_store::cache::ChunkCache::new(
             engram_chunk_store::cache::ChunkCacheConfig {
@@ -350,6 +359,19 @@ async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
     serde_json::from_value(value.get("trace_lineage_id")?.clone()).ok()
 }
 
+/// The chunk indices published under `key` for `session`, in touch
+/// order; empty when none were, or the record is unreadable.
+async fn first_touch_indices(store: &ChunkStore, session: SessionId, key: &str) -> Vec<u32> {
+    match store.blob_storage().get(key).await {
+        Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
+        Err(engram_core::BlobError::NotFound) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(%session, key, error = %e, "first-touch prefix unreadable");
+            Vec::new()
+        }
+    }
+}
+
 /// The chunk indices under `key` as this manifest's chunk hashes, in
 /// order. Positions the manifest leaves out are zero pages and need no
 /// fetch.
@@ -359,14 +381,7 @@ async fn first_touch_hashes(
     key: &str,
     manifest: &engram_chunk_store::Manifest,
 ) -> Vec<engram_chunk_store::ChunkHash> {
-    let indices = match store.blob_storage().get(key).await {
-        Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
-        Err(engram_core::BlobError::NotFound) => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(%session, error = %e, "first-touch prefix unreadable");
-            return Vec::new();
-        }
-    };
+    let indices = first_touch_indices(store, session, key).await;
     let chunk_size = manifest.chunk_size.as_u64();
     let by_offset: std::collections::HashMap<u64, engram_chunk_store::ChunkHash> =
         manifest.chunks.iter().map(|c| (c.offset, c.hash)).collect();
@@ -426,15 +441,32 @@ fn split_first_touch(record: &engram_chunk_store::FirstTouch, cut_ms: i64) -> (V
     (prefix, rest)
 }
 
-/// Publish the chunks the sandbox touched up to its first completed run
-/// (all of them before one completes), for the session's next restore to
-/// fetch first. Best-effort.
+/// Publish the memory chunks the sandbox touched up to its first
+/// completed run (all of them before one completes) and the root disk
+/// chunks the guest read before a hydrating restore's copy reached them
+/// (`disk`, at most [`FIRST_TOUCH_PREFIX_CAP`]), for the session's next
+/// restore to fetch first. Best-effort.
 async fn publish_first_touch(
     store: &ChunkStore,
     session: SessionId,
     file: &Path,
     first_run_completed: Option<i64>,
+    mut disk: Vec<u32>,
 ) {
+    let blob = store.blob_storage();
+    let encode = engram_chunk_store::FirstTouch::encode_indices;
+    disk.truncate(FIRST_TOUCH_PREFIX_CAP);
+    if !disk.is_empty() {
+        let key = engram_chunk_store::FirstTouch::disk_key(session.as_uuid());
+        match blob.put(&key, encode(&disk).into()).await {
+            Ok(_) => {
+                tracing::info!(%session, chunks = disk.len(), "published disk first-touch prefix")
+            }
+            Err(e) => {
+                tracing::warn!(%session, error = %e, "publish disk first-touch prefix failed")
+            }
+        }
+    }
     let Ok(bytes) = tokio::fs::read(file).await else {
         return;
     };
@@ -446,8 +478,6 @@ async fn publish_first_touch(
         return;
     }
     let (prefix, rest) = split_first_touch(&record, first_run_completed.unwrap_or(i64::MAX));
-    let encode = engram_chunk_store::FirstTouch::encode_indices;
-    let blob = store.blob_storage();
     let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
     let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
     match tokio::try_join!(
@@ -2020,7 +2050,18 @@ impl PooledBackend {
         let root = if fork_disk {
             Source::Fork { manifest, base }
         } else {
-            Source::Continue { manifest, base }
+            let first_touch = match (read_trace_lineage(src).await, self.chunk_store.as_ref()) {
+                (Some(session), Some(store)) => {
+                    let key = engram_chunk_store::FirstTouch::disk_key(session.as_uuid());
+                    first_touch_indices(store, session, &key).await
+                }
+                _ => Vec::new(),
+            };
+            Source::Continue {
+                manifest,
+                base,
+                first_touch,
+            }
         };
         let sidecar = read_sidecar_swap(src).await?;
         let swap = match (metadata.swap_manifest, sidecar.swap_mib) {
@@ -2038,6 +2079,7 @@ impl PooledBackend {
             (Some(manifest), _) => Some(Source::Continue {
                 manifest,
                 base: None,
+                first_touch: Vec::new(),
             }),
             (None, _) if !fresh && !sidecar.base_capture => {
                 return Err(SandboxError::MemoryImageUnusable(
@@ -2616,8 +2658,13 @@ impl PooledBackend {
             Some(FirstRun::Completed { at_ms }) => Some(*at_ms),
             _ => None,
         };
+        let disk = self
+            .volumes
+            .as_ref()
+            .map(|v| v.first_touch(id, DiskRole::Root))
+            .unwrap_or_default();
         tokio::spawn(async move {
-            publish_first_touch(&chunk_store, session_id, &file, first_run_completed).await;
+            publish_first_touch(&chunk_store, session_id, &file, first_run_completed, disk).await;
         });
     }
 
@@ -4683,6 +4730,7 @@ impl SandboxBackend for PooledBackend {
                 Some(manifest) => Source::Continue {
                     manifest,
                     base: None,
+                    first_touch: Vec::new(),
                 },
                 None => {
                     let Some((uri, cached)) = cached.as_ref() else {
@@ -4710,6 +4758,7 @@ impl SandboxBackend for PooledBackend {
                 (Some(manifest), _) => Some(Source::Continue {
                     manifest,
                     base: None,
+                    first_touch: Vec::new(),
                 }),
                 (None, Some(mib)) => Some(Source::Empty {
                     size_bytes: u64::from(mib) << 20,
