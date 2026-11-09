@@ -733,18 +733,23 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 9
-      # Node 24 ("Krypton") is the newest LTS line: LTS since 2025-10-28,
-      # maintenance 2026-10-20, EOL 2028-04-30. Only even majors ever go LTS.
+      # Node 26 ("Lithium") is the newest Active LTS line: LTS since
+      # 2026-10-28, maintenance 2027-10-20, EOL 2029-04-30. Node 26 is the
+      # last release under the two-per-year model; from Node 27 every annual
+      # major becomes LTS (no odd/even distinction). Node 24 moved to
+      # Maintenance LTS on 2026-10-20.
       #
-      # This major is pinned in THREE places that must move together:
+      # This major is pinned in FIVE places that must move together:
       #   - here (the web lane)
+      #   - the site lane below (same `setup-node` version)
+      #   - .github/workflows/site-deploy.yml
       #   - docker/web.Dockerfile   (`FROM node:<major>-alpine`)
       #   - flake.nix               (`nodejs_<major>`, the `nix develop` shell)
       # They had drifted to 20 / 24 / 22 respectively; Node 20 went EOL
       # 2026-04-30, so CI was building on an unsupported runtime.
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
@@ -796,7 +801,7 @@ jobs:
           version: 9
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: site/pnpm-lock.yaml
 
