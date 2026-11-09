@@ -5,12 +5,10 @@
 //! at `chunks/sha256/<hex>`. On a host, the fill engine (`engram-fill`)
 //! admits and schedules these reads. Writes go to `BlobStorage` directly.
 //!
-//! # Hash verification
-//!
-//! Implementations **must** verify the returned bytes hash to the
-//! requested `ChunkHash`. The contract is "byte-correct or error";
-//! callers (e.g. `ChunkStore::get_chunk`) rely on this and do not
-//! re-verify.
+//! An implementation returns the object's bytes as stored. Every whole
+//! chunk is checked by [`verify_fetched`] before it is served or stored:
+//! by [`ChunkResolver::fetch_chunk`], by a cache fill, or by the fill
+//! engine.
 
 use std::sync::Arc;
 
@@ -18,31 +16,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::traits::BlobStorage;
 
-use crate::error::{ChunkStoreError, Result};
+use crate::cache::verify_fetched;
+use crate::error::Result;
 use crate::manifest::ChunkHash;
 
-/// Fetch chunk bytes by hash. The contract:
-///
-/// - `fetch_chunk` returns bytes that hash to the requested
-///   `ChunkHash`, or an error. Implementations verify before
-///   returning — callers can rely on the result being
-///   byte-correct without re-hashing.
-/// - `chunk_exists` returns whether the chunk is reachable
-///   through this resolver.
-///
-/// Cheap to clone via `Arc`. Production code passes
+/// Fetch chunk bytes by hash. Production code passes
 /// `Arc<dyn ChunkResolver>` around.
 #[async_trait]
 pub trait ChunkResolver: Send + Sync {
-    /// Fetch a chunk's bytes by hash.
-    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes>;
-
-    /// [`Self::fetch_chunk`] for a caller that verifies the bytes
-    /// itself before it uses or stores them (the cache populate path),
-    /// so a resolver that hashes can skip its own check.
-    async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
-        self.fetch_chunk(hash).await
+    /// The chunk's bytes, checked against `hash`.
+    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+        let bytes = self.fetch_chunk_unverified(hash).await?;
+        verify_fetched(hash, &bytes).await?;
+        Ok(bytes)
     }
+
+    /// The chunk object's bytes as stored, for a caller that checks them
+    /// with [`verify_fetched`] before it uses or stores them.
+    async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes>;
 
     /// The bytes `[offset, offset + len)` of the chunk's object, fewer
     /// when the object ends first. Not hash-checked: only a whole chunk
@@ -85,18 +76,6 @@ impl BlobStorageResolver {
 
 #[async_trait]
 impl ChunkResolver for BlobStorageResolver {
-    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        let bytes = self.fetch_chunk_unverified(hash).await?;
-        let actual = ChunkHash::of(&bytes);
-        if actual != hash {
-            return Err(ChunkStoreError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
-        Ok(bytes)
-    }
-
     async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
         Ok(self.blob.get(&hash.storage_key()).await?)
     }
@@ -131,6 +110,7 @@ impl ChunkResolver for BlobStorageResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ChunkStoreError;
     use engram_storage_local::LocalBlobStorage;
 
     async fn resolver() -> (BlobStorageResolver, Arc<dyn BlobStorage>, tempfile::TempDir) {

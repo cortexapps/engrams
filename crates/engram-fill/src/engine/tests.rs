@@ -56,10 +56,6 @@ struct Counting {
 
 #[async_trait]
 impl ChunkResolver for Counting {
-    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        self.inner.fetch_chunk(hash).await
-    }
-
     async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if let (0, Some(d)) = (n, self.slow_first) {
@@ -699,10 +695,6 @@ struct SlowFor {
 
 #[async_trait]
 impl ChunkResolver for SlowFor {
-    async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        self.inner.fetch_chunk(hash).await
-    }
-
     async fn fetch_chunk_unverified(&self, hash: ChunkHash) -> Result<Bytes> {
         if self.slow.contains(&hash) {
             tokio::time::sleep(Duration::from_secs(30)).await;

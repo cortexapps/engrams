@@ -776,12 +776,8 @@ mod tests {
 
         #[async_trait]
         impl crate::resolver::ChunkResolver for CountingResolver {
-            async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
+            async fn fetch_chunk_unverified(&self, _hash: ChunkHash) -> Result<Bytes> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                // Sanity: the returned bytes must hash to the request
-                // for the contract to hold; precompute a body that
-                // satisfies that.
-                assert_eq!(hash, ChunkHash::of(&self.body));
                 Ok(self.body.clone())
             }
             async fn chunk_exists(&self, _hash: ChunkHash) -> Result<bool> {

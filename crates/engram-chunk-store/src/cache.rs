@@ -1989,7 +1989,8 @@ pub async fn hash_chunk(bytes: &Bytes) -> Result<ChunkHash> {
 }
 
 /// `Err(HashMismatch)` unless `bytes`, fetched from the object store,
-/// hash to `hash`. A large chunk is hashed off the async worker.
+/// hash to `hash`. A large chunk is hashed off the async worker. Every
+/// check of a fetched chunk goes through here.
 pub async fn verify_fetched(hash: ChunkHash, bytes: &Bytes) -> Result<()> {
     let actual = hash_chunk(bytes).await?;
     if actual != hash {
