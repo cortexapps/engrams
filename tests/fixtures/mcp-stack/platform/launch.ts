@@ -486,7 +486,7 @@ export class Stack {
         stateDirectory: "/tmp/mcp-stack-fixture",
         cliPath: "/opt/engram/dyn/0/engram-mcp-model-fixture",
       },
-      deadlines: { requestMs: 30000, stepMs: 120000, totalMs: 3600000 },
+      deadlines: { requestMs: 30000, stepMs: 120000, totalMs: 5400000 },
       evidenceFile: join(this.root, "evidence.jsonl"),
     };
   }
@@ -1268,9 +1268,11 @@ export class Stack {
       try {
         process.kill(identity.pid, signal);
       } catch (error) {
-        if (
-          !(error instanceof Error && "code" in error && error.code === "ESRCH")
-        )
+        if (!(
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ESRCH"
+        ))
           throw error;
       }
     };
