@@ -91,7 +91,7 @@ runs:
         sudo apt-get install -y -qq musl-tools squashfs-tools busybox-static
 
     # Stock firecracker, the fork's upstream base (v1.16.0). Only the
-    # stock<->fork snapshot-compat test uses it (ENGRAM_FC_STOCK_BIN); every
+    # fork->stock snapshot-compat test uses it (ENGRAM_FC_STOCK_BIN); every
     # other test runs the fork, which is what the host image ships.
     - name: Install stock firecracker (v1.16.0, compat test only)
       shell: bash
