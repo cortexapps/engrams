@@ -87,6 +87,8 @@ pub(crate) mod snapshot_post;
 pub mod substrate_server;
 pub use host_client::{IdleEvictionHarness, LocalHostClient};
 #[cfg(target_os = "linux")]
+pub mod blk_source;
+#[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
 pub mod idle_evictor;

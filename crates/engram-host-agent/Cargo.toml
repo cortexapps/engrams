@@ -106,6 +106,10 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # linux5_13: `RegisterMode::MINOR` — the exact ioctl mode the probe
 # exercises.
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
+# The ublk device `blk_source` serves; `io-uring` for the eventfd read
+# that wakes its queue thread.
+libublk = "0.4.8"
+io-uring = "0.7"
 # #1003: jemalloc as the global allocator (prod is musl-static; musl
 # mallocng retained 23 GB of ~48 MiB groups under chunk-buffer churn)
 # + the sampled heap profiler (SIGUSR2 → pprof dump) + allocator

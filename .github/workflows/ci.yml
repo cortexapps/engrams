@@ -1178,6 +1178,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
           sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
             sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          sudo modprobe ublk_drv
 
       # Every state node prep can find: a used disk, a disk without room,
       # a crash before the first activation, a restart.
@@ -1185,10 +1186,12 @@ jobs:
         run: sudo sh scripts/thin-pool-states-test.sh
 
       # The disk over the pool, then the session disk under a real guest
-      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL)
+      # and the ublk source a hydrating volume reads from.
       - name: dm-thin session-disk tests (root)
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
+          ENGRAM_TEST_UBLK: "1"
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
@@ -1200,6 +1203,7 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test session_disk \
+            --test blk_source \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
