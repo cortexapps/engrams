@@ -894,6 +894,35 @@ impl SessionVolumes {
         Ok(roles)
     }
 
+    /// [`Self::reattach`] for every sandbox with a hydrating role, live
+    /// or not: a volume whose source nothing serves cannot be deleted,
+    /// so this runs before the startup reconcile.
+    pub async fn reattach_all(&self) -> io::Result<Vec<(SandboxId, DiskRole)>> {
+        let mut sandboxes: Vec<SandboxId> = Vec::new();
+        for p in self.disk.list().await?.iter().filter_map(parse) {
+            if matches!(p.kind, Kind::Dest(_)) && !sandboxes.contains(&p.sandbox) {
+                sandboxes.push(p.sandbox);
+            }
+        }
+        let mut reattached = Vec::new();
+        for sandbox in sandboxes {
+            for role in self.reattach(sandbox).await? {
+                reattached.push((sandbox, role));
+            }
+        }
+        Ok(reattached)
+    }
+
+    /// The devices of the sources this process serves.
+    pub fn sources(&self) -> Vec<PathBuf> {
+        self.serving
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.path().to_path_buf())
+            .collect()
+    }
+
     /// The roles of `sandbox` brought up on a hydrating device whose
     /// first checkpoint has not run: they have a `dest` volume.
     async fn lazy_roles(&self, sandbox: SandboxId) -> io::Result<Vec<DiskRole>> {

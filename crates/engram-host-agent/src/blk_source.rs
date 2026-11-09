@@ -24,9 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use engram_chunk_store::{ChunkHash, Manifest};
 use engram_fill::{Class, FillEngine};
+use engram_host_core::{SourceDevice, SourceServer};
 use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
@@ -46,10 +48,10 @@ const QUEUE_DEPTH: u16 = 64;
 /// The largest read the kernel sends; the block layer splits above it.
 const IO_BUF_BYTES: u32 = 512 << 10;
 const DEVICE_NODE_WAIT: Duration = Duration::from_secs(5);
-
-/// A served device. [`Self::stop`] ends it; a dropped one keeps serving
 /// Entries in a thread's ublk control ring; commands go one at a time.
 const CTRL_RING_DEPTH: u32 = 16;
+
+/// A served device. [`Self::stop`] ends it; a dropped one keeps serving
 /// until the process exits, after which [`Self::recover`] takes it over.
 pub struct BlkSource {
     ctrl: Arc<UblkCtrl>,
@@ -693,4 +695,100 @@ fn with_ctrl_ring<T>(f: impl FnOnce() -> Result<T, UblkError>) -> io::Result<T> 
     })
     .map_err(ublk_err)?;
     f().map_err(ublk_err)
+}
+
+/// The host's [`SourceServer`]: every source is a [`BlkSource`].
+pub struct UblkSources;
+
+#[async_trait]
+impl SourceServer for UblkSources {
+    async fn serve(
+        &self,
+        fill: FillEngine,
+        manifest: &Manifest,
+        delta: Vec<u64>,
+        region_bytes: u64,
+    ) -> io::Result<Box<dyn SourceDevice>> {
+        Ok(Box::new(
+            BlkSource::serve(fill, manifest, delta, region_bytes).await?,
+        ))
+    }
+
+    async fn recover(
+        &self,
+        path: &Path,
+        fill: FillEngine,
+        manifest: &Manifest,
+        delta: Vec<u64>,
+        region_bytes: u64,
+    ) -> io::Result<Box<dyn SourceDevice>> {
+        Ok(Box::new(
+            BlkSource::recover(dev_id_of(path)?, fill, manifest, delta, region_bytes).await?,
+        ))
+    }
+}
+
+#[async_trait]
+impl SourceDevice for BlkSource {
+    fn path(&self) -> &Path {
+        BlkSource::path(self)
+    }
+
+    fn touched(&self) -> Vec<u32> {
+        BlkSource::touched(self)
+    }
+
+    async fn stop(self: Box<Self>) -> io::Result<()> {
+        BlkSource::stop(*self).await
+    }
+}
+
+/// The id in `/dev/ublkb<id>`.
+fn dev_id_of(path: &Path) -> io::Result<u32> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("ublkb"))
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a ublk block device", path.display()),
+            )
+        })
+}
+
+/// Delete every ublk device nothing maps onto and no server in this
+/// process serves (`served` lists their paths): what a process left
+/// when it died between making a device and mapping a volume onto it.
+/// A device a volume still maps onto stays, with a warning: deleting it
+/// would wait on reads nothing answers.
+pub async fn reap_orphans(served: &[PathBuf]) -> io::Result<Vec<u32>> {
+    let mut reaped = Vec::new();
+    let mut entries = match tokio::fs::read_dir("/dev").await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(reaped),
+        Err(e) => return Err(e),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Ok(id) = dev_id_of(&path) else { continue };
+        if served.contains(&path) {
+            continue;
+        }
+        let held = std::fs::read_dir(format!("/sys/block/ublkb{id}/holders"))
+            .map(|holders| holders.count())
+            .unwrap_or(0);
+        if held > 0 {
+            tracing::warn!(device = %path.display(), holders = held, "an unserved ublk device is still mapped; it is not deleted");
+            continue;
+        }
+        tokio::task::spawn_blocking(move || {
+            with_ctrl_ring(|| UblkCtrl::new_simple(id as i32)?.del_dev())
+        })
+        .await
+        .map_err(io::Error::other)??;
+        tracing::info!(device = %path.display(), "deleted an orphaned ublk device");
+        reaped.push(id);
+    }
+    Ok(reaped)
 }

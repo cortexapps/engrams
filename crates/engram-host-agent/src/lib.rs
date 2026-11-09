@@ -304,9 +304,10 @@ impl HostAgent {
                 }
                 if let Some(fill) = self.fill.clone() {
                     if let Some(disk) = self.session_disk.clone() {
-                        p = p.with_session_volumes(Arc::new(
-                            engram_host_core::SessionVolumes::new(disk, fill.clone()),
-                        ));
+                        let volumes = engram_host_core::SessionVolumes::new(disk, fill.clone());
+                        #[cfg(target_os = "linux")]
+                        let volumes = volumes.with_sources(Arc::new(blk_source::UblkSources));
+                        p = p.with_session_volumes(Arc::new(volumes));
                     }
                     p = p.with_fill(fill);
                     // ADR 0080 §C: the MaterializeImage scratch root —

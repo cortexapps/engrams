@@ -828,6 +828,10 @@ pub struct PooledBackend {
     /// A lazy restore's background memory prefetch; dropping the entry
     /// cancels it.
     memory_prefetches: DashMap<SandboxId, AbortTaskOnDrop>,
+    /// The driver that settles a sandbox's hydrating disks; dropping the
+    /// entry ends it. Destroy drops it before the VM goes, so no settle
+    /// runs against a volume being released.
+    disk_settles: DashMap<SandboxId, AbortTaskOnDrop>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1012,6 +1016,44 @@ fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
 fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind) {
     metrics::counter!(crate::metrics::WARM_HOOK_FAILURES_TOTAL, "kind" => kind.as_str())
         .increment(1);
+}
+
+/// How often a settle driver reads a hydrating disk's progress, and how
+/// long it waits after a step fails.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Settle each of the sandbox's hydrating disks: poll until the kernel
+/// has every region, then cut the device over and stop its source
+/// (`SessionVolumes::settle` is the step). A failed step is retried; a
+/// destroy ends the driver by dropping its task.
+async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId, roles: Vec<DiskRole>) {
+    for role in roles {
+        let started = crate::time_source::metrics_now();
+        let mut regions = 0;
+        loop {
+            match volumes.settle(id, role).await {
+                Ok(engram_host_core::Hydration::Settled) => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        role = %role,
+                        regions,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "disk settled",
+                    );
+                    break;
+                }
+                Ok(engram_host_core::Hydration::Hydrating { total, .. }) => {
+                    regions = total;
+                    tokio::time::sleep(SETTLE_POLL).await;
+                }
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, role = %role, %error, "disk settle step failed; retrying");
+                    tokio::time::sleep(SETTLE_RETRY).await;
+                }
+            }
+        }
+    }
 }
 
 /// Abort the wrapped task on drop, including hint polling after DrainDone.
@@ -1911,15 +1953,41 @@ impl PooledBackend {
         }
         .await;
         remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
-        if restore.is_err() {
-            self.drop_failed_restore(id);
-            if let Some(volumes) = self.volumes.as_ref() {
-                if let Err(error) = volumes.release(id).await {
-                    tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
+        let volumes = self.volumes.as_ref();
+        match (&restore, volumes) {
+            (Err(_), _) => {
+                self.drop_failed_restore(id);
+                if let Some(volumes) = volumes {
+                    if let Err(error) = volumes.release(id).await {
+                        tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
+                    }
                 }
             }
+            (Ok(()), Some(volumes)) => match volumes.hydrating(id).await {
+                Ok(roles) => self.settle_disks(id, roles),
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, %error, "the hydrating disks of a restore are unknown; none settles")
+                }
+            },
+            (Ok(()), None) => {}
         }
         restore
+    }
+
+    /// Drive `roles`, the sandbox's hydrating disks, to settled volumes
+    /// in the background.
+    fn settle_disks(&self, id: SandboxId, roles: Vec<DiskRole>) {
+        let Some(volumes) = self.volumes.clone() else {
+            return;
+        };
+        if roles.is_empty() {
+            return;
+        }
+        let task = tokio::spawn(
+            settle_disks(volumes, id, roles)
+                .instrument(tracing::info_span!("disk.settle", sandbox_id = %id)),
+        );
+        self.disk_settles.insert(id, AbortTaskOnDrop(task));
     }
 
     /// End a restore's memory fetches: cancel its background prefetch and
@@ -2039,6 +2107,7 @@ impl PooledBackend {
             peer_registrations: Arc::new(DashMap::new()),
             sandbox_registrations: Arc::new(DashMap::new()),
             memory_prefetches: DashMap::new(),
+            disk_settles: DashMap::new(),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
             checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
@@ -2424,10 +2493,11 @@ impl PooledBackend {
         ))
     }
 
-    /// Delete the volumes of every sandbox that is neither alive nor
-    /// awaiting an eviction finalize. Runs once at startup, after the
-    /// reattach pass fixes the live set and before anything can
-    /// provision a sandbox.
+    /// Serve again the sources of every hydrating volume the previous
+    /// process left, settle the live sandboxes' ones, and delete the
+    /// volumes of every sandbox that is neither alive nor awaiting an
+    /// eviction finalize. Runs once at startup, after the reattach pass
+    /// fixes the live set and before anything can provision a sandbox.
     pub async fn reconcile_volumes(&self) {
         let Some(volumes) = &self.volumes else {
             return;
@@ -2439,6 +2509,22 @@ impl PooledBackend {
                 return;
             }
         };
+        match volumes.reattach_all().await {
+            Ok(reattached) => {
+                for id in live.iter().copied() {
+                    let roles: Vec<DiskRole> = reattached
+                        .iter()
+                        .filter(|(sandbox, _)| *sandbox == id)
+                        .map(|(_, role)| *role)
+                        .collect();
+                    self.settle_disks(id, roles);
+                }
+                if !reattached.is_empty() {
+                    tracing::info!(volumes = reattached.len(), "hydrating disks served again");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "startup reattach of hydrating disks failed"),
+        }
         let finalizer = self.eviction_finalizer();
         match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
             Ok(report) => {
@@ -2454,6 +2540,10 @@ impl PooledBackend {
                 }
             }
             Err(error) => tracing::warn!(%error, "startup volume reconcile failed"),
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::blk_source::reap_orphans(&volumes.sources()).await {
+            tracing::warn!(%error, "orphaned ublk devices were not all deleted");
         }
     }
 
@@ -5861,6 +5951,7 @@ impl SandboxBackend for PooledBackend {
         self.held_snapshots.remove(&id);
         self.hint_pollers.remove(&id);
         self.memory_prefetches.remove(&id);
+        self.disk_settles.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
