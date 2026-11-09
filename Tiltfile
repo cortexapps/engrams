@@ -795,16 +795,21 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_po
         # How to produce + launch the binary:
         #   • bin_dir set (CI): exec the prebuilt release binary, no compile.
         #   • else: cargo build, then launch the debug binary.
+        # The egress daemon and the UFFD handler (every Firecracker resume
+        # spawns one) sit beside the host-agent binary.
+        companions = ['engram-egress-proxyd']
+        if sandbox_backend == 'firecracker':
+            companions.append('engram-uffd-handler')
         if bin_dir:
-            ha_bin = bin_dir + '/engram-host-agent'
+            ha_dir = bin_dir
             build_prefix = ''
-            # ADR 0121: the prebuilt daemon sits beside the host-agent
-            # binary (the CI e2e artifact ships both).
-            env['ENGRAM_EGRESS_PROXYD_BIN'] = bin_dir + '/engram-egress-proxyd'
         else:
-            ha_bin = './target/debug/engram-host-agent'
-            build_prefix = 'cargo build -p engram-host-agent -p engram-egress-proxyd && '
-            env['ENGRAM_EGRESS_PROXYD_BIN'] = './target/debug/engram-egress-proxyd'
+            ha_dir = './target/debug'
+            build_prefix = 'cargo build -p engram-host-agent -p ' + ' -p '.join(companions) + ' && '
+        ha_bin = ha_dir + '/engram-host-agent'
+        env['ENGRAM_EGRESS_PROXYD_BIN'] = ha_dir + '/engram-egress-proxyd'
+        if sandbox_backend == 'firecracker' and 'ENGRAM_FC_UFFD_HANDLER_BIN' not in env:
+            env['ENGRAM_FC_UFFD_HANDLER_BIN'] = ha_dir + '/engram-uffd-handler'
 
         if needs_codesign:
             # VZ (macOS): the binary needs the virtualization entitlement;
