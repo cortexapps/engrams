@@ -937,7 +937,7 @@ impl ChunkCache {
         let _ = std::fs::remove_file(self.path_for(hash));
     }
 
-    /// [`Self::get_with_source`] with a cold-tier fetcher, writing at
+    /// [`Self::fill_with`] with an object-store fetcher, writing at
     /// `Demand`.
     #[cfg(test)]
     pub(crate) async fn get<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
@@ -945,7 +945,7 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
     {
-        self.get_with_source(hash, Class::Demand, || async move {
+        self.fill_with(hash, Class::Demand, None, |_| async move {
             fetch().await.map(|b| (b, FillSource::BlobStorage))
         })
         .await
@@ -1011,20 +1011,6 @@ impl ChunkCache {
         })
         .await
         .map_err(|e| ChunkStoreError::Internal(format!("cache read task: {e}")))?
-    }
-
-    /// [`Self::fill_with`] without a slot taken ahead.
-    pub async fn get_with_source<F, Fut>(
-        &self,
-        hash: ChunkHash,
-        class: Class,
-        fetch: F,
-    ) -> Result<Bytes>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
-    {
-        self.fill_with(hash, class, None, |_| fetch()).await
     }
 
     /// A chunk's bytes. Local NVMe first. On a miss, one fetch serves
@@ -3993,17 +3979,15 @@ mod tests {
         );
     }
 
-    /// ADR 0095: `get_with_source` keeps the populate contract of `get`
-    /// (verify-on-populate, write-through) while letting the closure
-    /// report a peer source — and a hash mismatch from a "peer" closure
-    /// still refuses to land, exactly like a corrupt GCS fetch.
+    /// ADR 0095: a fill stores a peer's bytes as they come and hashes
+    /// the object store's; a mismatch stores nothing.
     #[tokio::test]
-    async fn get_with_source_hashes_store_bytes_and_trusts_peer_bytes() {
+    async fn a_fill_hashes_store_bytes_and_trusts_peer_bytes() {
         let (cache, _store, _b, _c) = setup(NO_CEILING).await;
         let body = Bytes::from_static(b"fault-time peer chunk");
         let h = ChunkHash::of(&body);
         let got = cache
-            .get_with_source(h, Class::Demand, || async {
+            .fill_with(h, Class::Demand, None, |_| async {
                 Ok((body.clone(), FillSource::Peer))
             })
             .await
@@ -4013,7 +3997,7 @@ mod tests {
 
         let wrong = ChunkHash::of(b"something else");
         let err = cache
-            .get_with_source(wrong, Class::Demand, || async {
+            .fill_with(wrong, Class::Demand, None, |_| async {
                 Ok((Bytes::from_static(b"not that"), FillSource::BlobStorage))
             })
             .await;

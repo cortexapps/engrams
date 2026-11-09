@@ -19,8 +19,8 @@ pub trait ChunkSource: Send + Sync {
     async fn chunk(&self, hash: ChunkHash, class: Class) -> Result<Bytes>;
 }
 
-/// The store's own path: its cache, then its resolver, under its
-/// admission, with no hedge and no peer.
+/// The store's own path: its resolver, hash-checked, under its
+/// admission, with no cache, no hedge and no peer.
 #[async_trait]
 impl ChunkSource for ChunkStore {
     async fn chunk(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {

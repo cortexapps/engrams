@@ -306,6 +306,21 @@ async fn read_verifies_and_leaves_the_cache_alone() {
     assert!(engine.read(bad, Class::Demand).await.is_err());
 }
 
+#[tokio::test]
+async fn read_serves_a_resident_chunk_without_the_store() {
+    let f = fixture();
+    let hash = put(&f, b"staged once").await;
+    let resolver = counting(&f, None);
+    let engine = engine_over(&f, resolver.clone(), Config::default());
+    engine.get(hash, Class::Demand).await.unwrap();
+
+    assert_eq!(
+        &engine.read(hash, Class::Demand).await.unwrap()[..],
+        b"staged once"
+    );
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+}
+
 /// A peer that answers after `delay` with `answer`.
 struct FakePeer {
     answer: Option<Bytes>,

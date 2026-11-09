@@ -19,14 +19,14 @@
 //! see `cache::ChunkCache`.)
 //!
 //! The local NVMe cache (`cache::ChunkCache`), when wired in via
-//! [`ChunkStore::with_chunk_cache`], is the tier every read checks first
-//! and a **write-through** tier for `put_chunk`: a chunk written durably to
-//! `BlobStorage` is also populated into the local cache, so the host that
-//! *produced* it reads it back locally (μs) instead of re-fetching it from
-//! the blob store (~110 ms) on the next resume. A read the cache misses
-//! goes through the configured `ChunkResolver`, which by default reads
-//! `BlobStorage` directly. On a host, the store carries the fill engine's
-//! (`engram-fill`) [`Admission`]: every chunk GET past the cache and every
+//! [`ChunkStore::with_chunk_cache`], is a **write-through** tier for
+//! `put_chunk`: a chunk written durably to `BlobStorage` is also populated
+//! into the local cache, so the host that *produced* it reads it back
+//! locally (μs) instead of re-fetching it from the blob store (~110 ms) on
+//! the next resume. The fill engine (`engram-fill`) owns the reads of the
+//! cache; the store reads through the configured `ChunkResolver`, which by
+//! default reads `BlobStorage` directly. On a host, the store carries the
+//! fill engine's [`Admission`]: every chunk GET of the store and every
 //! chunk PUT body takes a permit from it, in class order.
 
 use std::sync::Arc;
@@ -69,12 +69,11 @@ pub struct ChunkStore {
     /// `BlobStorageResolver` over `inner` unless replaced with
     /// [`Self::with_resolver`].
     resolver: Arc<dyn ChunkResolver>,
-    /// The local tier. When set (host-agent), `get_chunk` reads it
-    /// before the resolver and a miss or a `put_chunk` populates it.
-    /// `None` on the coordinator, where every read goes to `inner`.
+    /// The local tier (host-agent). Every chunk upload writes it; the
+    /// fill engine reads it. `None` on the coordinator.
     cache: Option<crate::cache::ChunkCache>,
     /// The host's transfer admission (the fill engine's). When set, every
-    /// chunk PUT body and every chunk GET past the cache takes a permit
+    /// chunk PUT body and every chunk GET of the store takes a permit
     /// at `class`. `None` (coordinator, tests) admits everything.
     admission: Option<Arc<Admission>>,
     /// The class this store's transfers are admitted at.
@@ -135,7 +134,7 @@ impl ChunkStore {
     }
 
     /// Admit chunk transfers through `admission`: each chunk PUT body
-    /// (after the dedup HEAD) and each chunk GET the cache misses takes a
+    /// (after the dedup HEAD) and each chunk GET of the store takes a
     /// permit. HEADs and manifest or trace transfers take none. The fill
     /// engine wires its own admission here, so the host's uploads and
     /// downloads share one limit.
@@ -164,11 +163,9 @@ impl ChunkStore {
         }
     }
 
-    /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as the
-    /// tier every read checks first. A `get_chunk` miss and a
-    /// `put_chunk` both populate it, so a chunk this host fetched or
-    /// produced is served locally from then on. Cheap clone (the cache
-    /// is `Arc`-backed).
+    /// Wire a local [`ChunkCache`](crate::cache::ChunkCache): every chunk
+    /// upload also writes it, so a chunk this host produced is served
+    /// locally from then on. The fill engine over this store reads it.
     pub fn with_chunk_cache(mut self, cache: crate::cache::ChunkCache) -> Self {
         self.cache = Some(cache);
         self
@@ -385,44 +382,19 @@ impl ChunkStore {
         }
     }
 
-    /// One resolver fetch, under one admission permit. `verify` asks the
-    /// resolver to check the hash (the caller stores nothing that would).
-    async fn fetch_admitted(&self, hash: ChunkHash, verify: bool) -> Result<Bytes> {
+    /// A chunk's bytes from the resolver, hash-checked, under one
+    /// admission permit. It neither reads nor writes the local cache, and
+    /// has no hedge and no peer: on a host, the fill engine does all
+    /// three. Callers outside this crate read through a
+    /// [`crate::ChunkSource`]: the fill engine on a host, the store's own
+    /// impl in a process without one.
+    pub(crate) async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
         let permit = self.admit().await;
-        let got = if verify {
-            self.resolver.fetch_chunk(hash).await
-        } else {
-            self.resolver.fetch_chunk_unverified(hash).await
-        };
+        let got = self.resolver.fetch_chunk(hash).await;
         if let Some(p) = permit {
             p.finish(got.as_ref().map(|b| b.len() as u64));
         }
         got
-    }
-
-    /// A chunk's bytes: from the local cache when one is wired and
-    /// holds it, else from the resolver. Either way the bytes hash to
-    /// `hash`: the cache verifies once before it stores a fetched chunk,
-    /// and without a cache the resolver verifies.
-    ///
-    /// This path has no hedge and no peer. Callers outside this crate
-    /// read through a [`crate::ChunkSource`]: the fill engine on a host,
-    /// the store's own impl in a process without one.
-    ///
-    /// Never wrap this call in `ChunkCache::get` on the same cache:
-    /// the cache's singleflight would wait on itself.
-    pub(crate) async fn get_chunk(&self, hash: ChunkHash) -> Result<Bytes> {
-        match &self.cache {
-            Some(cache) => {
-                cache
-                    .get_with_source(hash, self.class, || async {
-                        let bytes = self.fetch_admitted(hash, false).await?;
-                        Ok((bytes, crate::cache::FillSource::BlobStorage))
-                    })
-                    .await
-            }
-            None => self.fetch_admitted(hash, true).await,
-        }
     }
 
     /// Existence check for a chunk, routed through the resolver.
@@ -869,27 +841,6 @@ mod tests {
         );
         let store = ChunkStore::new(counting.clone()).with_chunk_cache(cache.clone());
         (store, counting, cache, dir)
-    }
-
-    /// A chunk the cache holds is served without a blob call; the
-    /// first miss fetches once and leaves it resident.
-    #[tokio::test]
-    async fn get_chunk_reads_the_local_cache_before_blob_storage() {
-        let (s, counting, cache, _d) = counting_store_with_cache().await;
-        let body = b"served locally after the first miss";
-        let h = ChunkHash::of(body);
-        counting
-            .put(&h.storage_key(), Bytes::copy_from_slice(body))
-            .await
-            .unwrap();
-        assert!(!cache.contains_on_disk(h));
-
-        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
-        assert!(cache.contains_on_disk(h), "a miss populates the cache");
-        assert_eq!(counting.get_count(), 1, "the miss reaches blob storage");
-
-        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
-        assert_eq!(counting.get_count(), 1, "a hit makes no blob GET");
     }
 
     /// ADR 0078 move 4: the `exists()` dedup short-circuit must STILL

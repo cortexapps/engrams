@@ -293,7 +293,7 @@ the test named beside it.
   partial file. A metadata file a crash left before the first activation is formatted, not
   rejected (`scripts/thin-pool-states-test.sh`).
 - A stage reads the node's chunk cache before blob storage
-  (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
+  (`read_serves_a_resident_chunk_without_the_store`), so the chunks the image
   prefetch pulled are not fetched a second time.
 - The host reports the pool's data and metadata free space every heartbeat
   (`capacity_falls_by_the_blocks_written`, `pool_capacity_round_trips_through_heartbeat`).

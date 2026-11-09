@@ -97,7 +97,7 @@ async fn pinned_chunks_survive_populate_pressure() {
     // best-effort by design).
     let s2 = store.clone();
     cache
-        .get_with_source(pinned_hash, Class::Demand, || async move {
+        .fill_with(pinned_hash, Class::Demand, None, |_| async move {
             Ok((
                 s2.chunk(pinned_hash, Class::Demand).await?,
                 FillSource::BlobStorage,
@@ -114,7 +114,7 @@ async fn pinned_chunks_survive_populate_pressure() {
         let h = store.put_chunk(&fresh).await.unwrap();
         let store2 = store.clone();
         let _ = cache
-            .get_with_source(h, Class::Demand, || async move {
+            .fill_with(h, Class::Demand, None, |_| async move {
                 Ok((
                     store2.chunk(h, Class::Demand).await?,
                     FillSource::BlobStorage,
