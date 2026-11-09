@@ -301,55 +301,34 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("capture");
     let moved = restore.await.unwrap().expect("restore");
     common::postcopy::drain(&host_b.pooled, moved).await;
-    let stats_path = host_b
+    // The handler replays its reports to each new subscriber, so the
+    // drain's terminal report is readable after the drain.
+    let control = host_b
         .pooled
-        .prefault_stats_path(moved)
-        .expect("handler stats path");
-    assert!(
-        common::poll_until_async(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_millis(20),
-            || async {
-                std::fs::read(&stats_path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|stats| stats["fault_around_chunks_installed"].as_u64())
-                    .is_some()
-            },
-        )
-        .await,
-        "handler must report the demand-window install counter"
-    );
-    if idle_hint_probe() {
-        let path = host_b
-            .pooled
-            .prefault_stats_path(moved)
-            .expect("handler stats path");
-        assert!(
-            common::poll_until_async(
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_millis(10),
-                || {
-                    let path = path.clone();
-                    async move {
-                        tokio::fs::read(path)
-                            .await
-                            .ok()
-                            .and_then(|bytes| {
-                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                            })
-                            .is_some_and(|stats| stats["hot_hint_received"].as_bool().is_some())
-                    }
+        .post_copy_control_sock(moved)
+        .expect("handler control socket");
+    let hot_hint_received = tokio::task::spawn_blocking(move || {
+        let mut stream = std::os::unix::net::UnixStream::connect(control).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        loop {
+            match engram_migrate_proto::read_control_frame(&mut stream).expect("control frame") {
+                engram_migrate_proto::HandlerControl::DrainDone {
+                    hot_hint_received, ..
+                } => return hot_hint_received,
+                engram_migrate_proto::HandlerControl::PeerLost { detail, .. } => {
+                    panic!("drain lost its peer: {detail}")
                 }
-            )
-            .await,
-            "drain stats must be published"
-        );
-        let stats: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
-        assert_eq!(
-            stats["hot_hint_received"].as_bool(),
-            Some(true),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    if idle_hint_probe() {
+        assert!(
+            hot_hint_received,
             "the hint must arrive when the idle-page probes pass"
         );
     } else {
@@ -369,10 +348,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
     assert!(host_b.pooled.list().await.unwrap().contains(&moved));
-    assert!(
-        stats_path.is_file(),
-        "successful move retains handler stats"
-    );
 
     // G2: the post-checkpoint sentinel survives on B.
     let check = exec(

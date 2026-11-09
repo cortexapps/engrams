@@ -107,7 +107,11 @@ async fn observe_drain(sock: &Path) -> std::io::Result<DrainOutcome> {
     use engram_migrate_proto::HandlerControl;
     let mut stream = tokio::net::UnixStream::connect(sock).await?;
     loop {
-        match crate::migrate_peer::read_frame_async(&mut stream).await? {
+        let body = crate::migrate_peer::read_body_async(&mut stream).await?;
+        let frame = engram_migrate_proto::decode_control(&body).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+        })?;
+        match frame {
             HandlerControl::DrainDone {
                 pulled,
                 alt_sourced,
@@ -160,6 +164,8 @@ mod tests {
                     fault_us: 0,
                     fault_max_us: 0,
                     fault_around_chunks_installed: 0,
+                    hot_leading: 0,
+                    hot_hint_received: false,
                 },
             )
             .unwrap();

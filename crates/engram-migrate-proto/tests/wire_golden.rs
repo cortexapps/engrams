@@ -27,8 +27,9 @@
 //! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
-//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped.
-//! Review every changed fixture with the corresponding version change.
+//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped,
+//! or the change appends fields that both builds read (pin the previous
+//! bytes as `<name>_prev.bin`, as `drain_done_reads_across_one_release` does).
 
 use std::path::PathBuf;
 
@@ -275,6 +276,8 @@ fn handler_control_golden_and_variant_indices() {
         fault_us: 55_000,
         fault_max_us: 9_000,
         fault_around_chunks_installed: 0,
+        hot_leading: 3,
+        hot_hint_received: true,
     };
     let peer_lost = HandlerControl::PeerLost {
         remaining: 3,
@@ -290,6 +293,50 @@ fn handler_control_golden_and_variant_indices() {
     assert_variant_index(&drain_progress, 1, "HandlerControl::DrainProgress");
     assert_variant_index(&drain_done, 2, "HandlerControl::DrainDone");
     assert_variant_index(&peer_lost, 3, "HandlerControl::PeerLost");
+}
+
+/// Both builds of a `DrainDone` during a host-agent roll: the previous
+/// build's frame (pinned bytes, no hot fields) decodes with the hot fields
+/// at zero, and the previous build's reader takes the current frame's
+/// leading fields.
+#[test]
+fn drain_done_reads_across_one_release() {
+    let prev = std::fs::read(golden_path("handler_control_drain_done_prev"))
+        .expect("previous-build golden");
+    let decoded = engram_migrate_proto::decode_control(&prev).expect("previous build decodes");
+    assert_eq!(
+        decoded,
+        HandlerControl::DrainDone {
+            pulled: 10,
+            alt_sourced: 1,
+            zero_chunks: 1,
+            ms: 1234,
+            faults: 42,
+            fault_us: 55_000,
+            fault_max_us: 9_000,
+            fault_around_chunks_installed: 0,
+            hot_leading: 0,
+            hot_hint_received: false,
+        }
+    );
+    let current = bincode::serialize(&HandlerControl::DrainDone {
+        pulled: 10,
+        alt_sourced: 1,
+        zero_chunks: 1,
+        ms: 1234,
+        faults: 42,
+        fault_us: 55_000,
+        fault_max_us: 9_000,
+        fault_around_chunks_installed: 0,
+        hot_leading: 3,
+        hot_hint_received: true,
+    })
+    .unwrap();
+    // The previous build's reader: `HandlerControl` with the 8-field
+    // `DrainDone`, read through `bincode::deserialize`.
+    let (tag, fields): (u32, [u64; 8]) = bincode::deserialize(&current).unwrap();
+    assert_eq!((tag, fields), (2, [10, 1, 1, 1234, 42, 55_000, 9_000, 0]));
+    assert_eq!(&current[..prev.len()], &prev[..]);
 }
 
 #[test]
@@ -421,6 +468,8 @@ fn regen_golden() {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         },
     );
     write(

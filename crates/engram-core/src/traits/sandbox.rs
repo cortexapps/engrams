@@ -847,13 +847,6 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// Where a post-copy destination's uffd-handler writes its drain stats
-    /// (`prefault-stats.json`, in the same jail dir as
-    /// [`first_touch_path`](Self::first_touch_path)). `None` = no handler.
-    fn prefault_stats_path(&self, _id: SandboxId) -> Option<PathBuf> {
-        None
-    }
-
     /// ADR 0045 C2: what the source page server needs to read this
     /// sandbox's guest memory from outside: FC's pid (this process is
     /// its parent, so `process_vm_readv` is YAMA-legal) and the file its

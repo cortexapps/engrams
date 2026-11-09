@@ -424,11 +424,6 @@ fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], second, 0, 0)
 }
 
-/// The post-copy drain stats the uffd-handler writes in the jail dir (its
-/// `--report-dir`). Must stay in sync with
-/// `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`.
-pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
-
 /// Per-jail file where the uffd-handler records the base shm file it
 /// opened (empty: none). The Firecracker load names exactly that file.
 const UFFD_BASE_SHM_ACK_FILE: &str = "uffd-base-shm.ack";
@@ -4980,11 +4975,6 @@ impl SandboxBackend for FirecrackerBackend {
                 .join(id.to_string())
                 .join(engram_chunk_store::FirstTouch::FILE),
         )
-    }
-
-    /// The drain stats a post-copy destination's handler writes.
-    fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
-        Some(self.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE))
     }
 
     /// ADR 0045 C2: trait forwarding to the inherent composition (the

@@ -52,45 +52,6 @@ use crate::chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
 use crate::fault_stats::{self, Source};
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 
-/// A post-copy destination's drain, written to `prefault-stats.json` in the
-/// handler's report dir once the drain is done. The live-move tests read it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-struct PeerDrainStats {
-    /// Chunks the drain pulled from the peer.
-    peer_pulled: u64,
-    /// Chunks the peer named as equal to the durable chunk (AltSource).
-    peer_alt_sourced: u64,
-    /// Zero chunks the drain installed.
-    peer_zero_chunks: u64,
-    /// Guest faults served from the peer before the drain reached them.
-    peer_live_faults: u64,
-    /// Chunks installed by demand windows, including the faulting chunk.
-    fault_around_chunks_installed: u64,
-    /// Sealed chunks placed first by the hot-set hint.
-    hot_leading: u64,
-    /// A nonempty hint arrived while requests remained.
-    hot_hint_received: bool,
-}
-
-/// Filename for [`PeerDrainStats`] in the handler's report dir.
-pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
-
-/// Write the stats through a temp file and a rename, so a reader never
-/// sees a partial file. Best-effort: a failure is logged, never returned.
-fn write_drain_stats(path: &std::path::Path, stats: &PeerDrainStats) {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let written = serde_json::to_vec(stats)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&tmp, bytes))
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if let Err(e) = written {
-        tracing::warn!(error = %e, path = %path.display(), "drain stats write");
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
 /// Strip `O_NONBLOCK` from `fd` so blocking reads on it actually
 /// block. Firecracker creates the UFFD as `O_NONBLOCK`; the
 /// `userfaultfd` crate translates `EAGAIN` into `Ok(None)` and our
@@ -542,8 +503,6 @@ pub struct Runtime {
     /// `Installing` waits on this until the in-flight install settles.
     install_cv: Condvar,
     page_size: u64,
-    /// Where the drain stats go (the jail dir).
-    report_dir: Option<PathBuf>,
     /// ADR 0045 unified memory substrate (v2b). When set, guest memory
     /// is `MAP_PRIVATE` of this per-template base shm file (registered
     /// `MISSING|MINOR` by the forked FC) and canonical chunks install
@@ -644,7 +603,6 @@ impl Runtime {
             first_touch: crate::first_touch::FirstTouchRecorder::new(chunk_count),
             install_cv: Condvar::new(),
             page_size,
-            report_dir: None,
             base_shm,
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
@@ -730,11 +688,9 @@ impl Runtime {
         }
     }
 
-    /// Write the first-touch record (as each entry is recorded) and the
-    /// drain stats to `dir`.
-    pub fn set_report_dir(&mut self, dir: PathBuf) {
+    /// Write the first-touch record to `dir`, each entry as it is recorded.
+    pub fn set_report_dir(&mut self, dir: &std::path::Path) {
         self.first_touch.set_output(&dir.join(FirstTouch::FILE));
-        self.report_dir = Some(dir);
     }
 
     /// Log the memory manifest's composition once.
@@ -2087,7 +2043,7 @@ pub struct RunListenerOpts {
     /// Peer mode: the advisory hot-set hint, read concurrently with the
     /// drain (see [`crate::hot_hint`]).
     pub migration_hint: Option<PathBuf>,
-    /// Where the first-touch record and the drain stats go.
+    /// Where the first-touch record goes.
     pub report_dir: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
     /// ADR 0045 C2: post-copy peer mode (session already sealed) +
@@ -2139,7 +2095,7 @@ pub fn run_listener(
     let mut rt = Runtime::new(mappings, uffd, backend, handle, base_shm)?;
     rt.fault_around_chunks = fault_around_chunks;
     if let Some(dir) = report_dir {
-        rt.set_report_dir(dir);
+        rt.set_report_dir(&dir);
     }
     if let Some((session, control)) = peer {
         rt.set_peer(session, control);
@@ -2214,20 +2170,6 @@ pub fn run_listener(
                                 .fault_around_chunks_installed
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
-                            if let Some(dir) = rt.report_dir.as_ref() {
-                                write_drain_stats(
-                                    &dir.join(PREFAULT_STATS_FILE),
-                                    &PeerDrainStats {
-                                        peer_pulled: stats.pulled,
-                                        peer_alt_sourced: stats.alt_sourced,
-                                        peer_zero_chunks: stats.zero_chunks,
-                                        peer_live_faults: faults,
-                                        fault_around_chunks_installed,
-                                        hot_leading: stats.hot_leading,
-                                        hot_hint_received: stats.hot_hint_received,
-                                    },
-                                );
-                            }
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
@@ -2249,6 +2191,8 @@ pub fn run_listener(
                                     fault_us,
                                     fault_max_us,
                                     fault_around_chunks_installed,
+                                    hot_leading: stats.hot_leading,
+                                    hot_hint_received: stats.hot_hint_received,
                                 });
                             }
                         }
@@ -2302,26 +2246,6 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use userfaultfd::UffdBuilder;
-
-    /// The live-move tests read these field names from the stats file.
-    #[test]
-    fn drain_stats_file_keeps_its_field_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PREFAULT_STATS_FILE);
-        write_drain_stats(
-            &path,
-            &PeerDrainStats {
-                fault_around_chunks_installed: 3,
-                hot_hint_received: true,
-                ..Default::default()
-            },
-        );
-        let stats: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stats["fault_around_chunks_installed"], 3);
-        assert_eq!(stats["hot_hint_received"], true);
-        assert!(!dir.path().join("prefault-stats.json.tmp").exists());
-    }
 
     /// ADR 0043 P1: the sweep runs on a background thread CONCURRENT with
     /// the fault loop. A sweep thread and a `serve_pagefault` thread, with an
@@ -4259,6 +4183,8 @@ mod tests {
                 fault_us: 0,
                 fault_max_us: 0,
                 fault_around_chunks_installed: 0,
+                hot_leading: 0,
+                hot_hint_received: false,
             });
         let mut subscriber = std::os::unix::net::UnixStream::connect(control_path).unwrap();
         subscriber

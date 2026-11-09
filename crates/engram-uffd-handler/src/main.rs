@@ -131,8 +131,7 @@ mod linux {
         /// The session id: the handler reads the session's published
         /// first-touch prefix under it.
         pub trace_key: Option<Uuid>,
-        /// Where the handler writes its first-touch record and, in peer
-        /// mode, its drain stats (the jail dir).
+        /// Where the handler writes its first-touch record (the jail dir).
         pub report_dir: Option<PathBuf>,
         /// ADR 0014 M1.14: when set, bypass `pick_blob_backend`'s
         /// env-var lookup and `LocalBlobStorage::new(this)` directly.

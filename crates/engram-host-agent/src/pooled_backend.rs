@@ -5348,7 +5348,7 @@ impl SandboxBackend for PooledBackend {
                     return Err("drain wait timed out".into());
                 }
                 let msg: engram_migrate_proto::HandlerControl =
-                    match engram_migrate_proto::read_frame(&mut stream) {
+                    match engram_migrate_proto::read_control_frame(&mut stream) {
                         Ok(msg) => msg,
                         // A frame is written whole under the backlog lock,
                         // so a timeout falls between frames.
@@ -5372,6 +5372,8 @@ impl SandboxBackend for PooledBackend {
                         fault_us,
                         fault_max_us,
                         fault_around_chunks_installed,
+                        hot_leading,
+                        hot_hint_received,
                     } => {
                         // Restore-tail attribution: the fault-path
                         // totals are the serial P2P cost inside the FC
@@ -5382,6 +5384,8 @@ impl SandboxBackend for PooledBackend {
                             fault_ms = fault_us / 1000,
                             fault_max_us,
                             fault_around_chunks_installed,
+                            hot_leading,
+                            hot_hint_received,
                             "post-copy memory drain done (handler fault-path totals)",
                         );
                         return Ok(DrainOutcome::Done {
@@ -5683,8 +5687,8 @@ impl SandboxBackend for PooledBackend {
         self.inner.first_touch_path(id)
     }
 
-    fn prefault_stats_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
-        self.inner.prefault_stats_path(id)
+    fn post_copy_control_sock(&self, id: SandboxId) -> Option<std::path::PathBuf> {
+        self.inner.post_copy_control_sock(id)
     }
 
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
@@ -8544,6 +8548,8 @@ mod tests {
                 fault_us: 0,
                 fault_max_us: 0,
                 fault_around_chunks_installed: 0,
+                hot_leading: 0,
+                hot_hint_received: false,
             },
             HandlerControl::PeerLost {
                 remaining: 1,

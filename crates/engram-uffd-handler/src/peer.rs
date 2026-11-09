@@ -1815,6 +1815,8 @@ pub(crate) mod tests {
                         fault_us: 0,
                         fault_max_us: 0,
                         fault_around_chunks_installed: 0,
+                        hot_leading: 0,
+                        hot_hint_received: false,
                     });
                 });
                 std::thread::sleep(Duration::from_millis(200));
@@ -1873,6 +1875,8 @@ pub(crate) mod tests {
                     fault_us: 0,
                     fault_max_us: 0,
                     fault_around_chunks_installed: 0,
+                    hot_leading: 0,
+                    hot_hint_received: false,
                 });
             })
         };
