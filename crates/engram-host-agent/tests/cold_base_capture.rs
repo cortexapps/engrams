@@ -560,34 +560,6 @@ impl TestEnv {
         )
     }
 
-    /// Like [`Self::pooled`] but restoring in the PRODUCTION memory mode:
-    /// UFFD over a chunked memory manifest, served by the locally-built
-    /// `engram-uffd-handler`. No upload counting — the fidelity test
-    /// asserts bytes, not costs.
-    fn pooled_uffd(&self, handler: &Path) -> Arc<PooledBackend> {
-        let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
-        cfg.bundle_dir = self.staged.bundle_dir.clone();
-        cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::Uffd;
-        cfg.uffd_handler_bin = handler.to_path_buf();
-        cfg.track_dirty_pages = true;
-        cfg.default_boot_args =
-            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
-        let inner = Arc::new(FirecrackerBackend::new(self.work.path(), cfg));
-        let store = ChunkStore::new(self.blob.clone());
-        let mut cache_cfg = engram_chunk_store::cache::ChunkCacheConfig::new(
-            self.work.path().join("chunk-cache-uffd"),
-        );
-        cache_cfg.budget_bytes = 1024 * 1024 * 1024;
-        Arc::new(
-            PooledBackend::new(inner)
-                .with_chunk_store(store.clone())
-                .with_session_volumes(common::session_volumes(self.work.path(), &store))
-                .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
-                .with_checkpoint_dir(self.work.path().join("checkpoints-uffd")),
-        )
-    }
-
     /// The sandbox's own lineage of a freshly baked rootfs.
     async fn bake(&self, name: &str) -> engram_core::types::manifest::ManifestRef {
         let outcome = common::bake_fixture_ext4(
@@ -634,7 +606,7 @@ impl TestEnv {
 /// RAM at capture time — dirty page cache the guest has not yet written
 /// back — must survive the warm capture pipeline in its production
 /// shape (pre-hook Full SEED → warm-hook writes → final DIFF → sparse
-/// re-chunk → chunked memory manifest) and a UFFD restore, and still
+/// re-chunk → chunked memory manifest) and a fresh restore, and still
 /// read back intact after the restored guest syncs and drops its page
 /// cache.
 ///
@@ -648,28 +620,16 @@ impl TestEnv {
 ///
 /// Two-step verification splits the failure domain on a regression:
 ///   1. read BEFORE sync+drop — served from restored RAM. Garbage here
-///      = the memory leg (FC diff fidelity / sparse re-chunk / UFFD
-///      serving) lost the pages.
+///      = the memory leg (FC diff fidelity / sparse re-chunk / memory
+///      file materialize) lost the pages.
 ///   2. read AFTER `sync; echo 3 > drop_caches` — served from the disk
 ///      backend after the restored guest wrote the pages back. Garbage
 ///      only here = the write-back/disk leg.
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
-async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
+async fn unsynced_warm_writes_survive_restore_and_cache_drop() {
     let Some(env) = TestEnv::gate() else { return };
-    // The production restore path is UFFD (chunked memory manifest); the
-    // shared TestEnv uses File mode for its dedup-cost assertions, so
-    // build a dedicated backend here.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!(
-            "SKIP: engram-uffd-handler not built at {} — cargo build -p engram-uffd-handler",
-            handler.display(),
-        );
-        return;
-    }
-    let pooled = env.pooled_uffd(&handler);
+    let pooled = env.pooled_with_blob(env.blob.clone());
     let rootfs = env.bake("engram-unsynced-capture-test").await;
 
     // The warm hook writes a deterministic 4 MiB sentinel to the ext4
@@ -722,7 +682,7 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
     pooled
         .restore_fresh(restored, result.snapshot, None, Vec::new())
         .await
-        .expect("UFFD restore from the warm base snapshot");
+        .expect("fresh restore from the warm base snapshot");
 
     let expected = exec_out(
         &pooled,
@@ -743,7 +703,7 @@ async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
         from_ram.trim(),
         expected.trim(),
         "sentinel corrupted in RESTORED RAM — the memory leg (FC diff \
-         fidelity / sparse re-chunk / UFFD serving) lost or mangled \
+         fidelity / sparse re-chunk / memory file materialize) lost or mangled \
          pages the capture guest held as dirty page cache",
     );
 

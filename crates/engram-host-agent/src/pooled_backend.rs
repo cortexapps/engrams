@@ -6627,7 +6627,7 @@ impl SandboxBackend for PooledBackend {
                 // page cache to the (durably captured) disk BEFORE the
                 // final snapshot. The memory image is REQUIRED to carry
                 // dirty page cache faithfully — the fidelity gate
-                // (`unsynced_warm_writes_survive_uffd_restore_and_cache_drop`)
+                // (`unsynced_warm_writes_survive_restore_and_cache_drop`)
                 // asserts it does — but a base snapshot fans out to every
                 // session of an image, so its DISK must not depend on
                 // that: with the sync, the captured disk stands alone
