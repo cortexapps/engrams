@@ -313,7 +313,11 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         loop {
-            match engram_migrate_proto::read_control_frame(&mut stream).expect("control frame") {
+            match engram_migrate_proto::read_frame::<_, engram_migrate_proto::HandlerControl>(
+                &mut stream,
+            )
+            .expect("control frame")
+            {
                 engram_migrate_proto::HandlerControl::DrainDone {
                     hot_hint_received, ..
                 } => return hot_hint_received,

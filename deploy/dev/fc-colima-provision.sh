@@ -8,7 +8,8 @@
 #
 # Contract paths this script guarantees inside the VM (the Tiltfile /
 # justfile `dev-fc` path depends on these exact paths):
-#   /usr/local/bin/firecracker        - upstream FC binary, version pinned below
+#   /usr/local/bin/firecracker        - the forked FC (third_party/firecracker),
+#                                       built in the VM for aarch64
 #   /opt/engram-dev/Image             - the aarch64 guest kernel (ADR 0025 recipe)
 #   /opt/engram-dev/{bin,shared,var}  - working dirs for the host-agent
 #
@@ -52,13 +53,6 @@ echo "      Apple M3-or-later chip on macOS 15+. Older hardware/OS boots the" >&
 echo "      VM fine but KVM won't be available — this script fails loudly at" >&2
 echo "      the /dev/kvm check below rather than silently degrading to no" >&2
 echo "      isolation." >&2
-
-# Firecracker version: read CI's pin so the aarch64 dev rig and the x86_64
-# CI lane run the same FC release train (ADR 0082). Falls back to a
-# hardcoded value if ci.yml's format ever changes underneath this grep —
-# keep that fallback in sync with the "Install firecracker" step there.
-FC_VERSION="$(grep -oE 'FC_VER: v[0-9.]+' .github/workflows/ci.yml | head -1 | awk '{print $2}')"
-FC_VERSION="${FC_VERSION:-v1.16.0}"
 
 # --- docker context safety: `colima start` silently steals the docker CLI
 # context, which would repoint every other `docker`/`docker compose`
@@ -114,17 +108,17 @@ echo "==> /dev/kvm present in '$PROFILE'"
 
 VM_USER="$(ssh_ id -un)"
 
-# --- in-VM host prep (packages, firecracker binary, uffd/kvm-perms,
-# loopback forwarders, working dirs). One ssh round-trip; every step below
-# checks state before acting so re-runs are cheap and side-effect free. ---
+# --- in-VM host prep (packages, uffd/kvm-perms, loopback forwarders,
+# working dirs). One ssh round-trip; every step below checks state before
+# acting so re-runs are cheap and side-effect free. ---
 echo "==> host prep + packages inside '$PROFILE'"
-colima ssh --profile "$PROFILE" -- sudo bash -s -- "$FC_VERSION" "$VM_USER" <<'REMOTE'
+colima ssh --profile "$PROFILE" -- sudo bash -s -- "$VM_USER" <<'REMOTE'
 set -euo pipefail
-FC_VERSION="$1"
-VM_USER="$2"
+VM_USER="$1"
 
-# --- apt packages ---
-PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools thin-provisioning-tools"
+# --- apt packages: kernel build deps, Firecracker build deps (cmake, clang,
+# musl-tools, libseccomp-dev, linux-libc-dev), and host tools ---
+PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves cmake clang musl-tools libseccomp-dev linux-libc-dev curl git file iptables squashfs-tools thin-provisioning-tools"
 MISSING=""
 for p in $PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
@@ -138,23 +132,13 @@ else
     echo "==> all apt packages already present"
 fi
 
-# --- firecracker binary (upstream aarch64 release, CI's pinned version) ---
-NEED_FC=1
-if [ -x /usr/local/bin/firecracker ]; then
-    CURRENT="$(/usr/local/bin/firecracker --version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' || true)"
-    [ "$CURRENT" = "$FC_VERSION" ] && NEED_FC=0
-fi
-if [ "$NEED_FC" = "1" ]; then
-    echo "==> installing firecracker $FC_VERSION"
-    TMP="$(mktemp -d)"
-    curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-aarch64.tgz" -o "$TMP/fc.tgz"
-    tar -xzf "$TMP/fc.tgz" -C "$TMP"
-    install -m 0755 "$TMP/release-${FC_VERSION}-aarch64/firecracker-${FC_VERSION}-aarch64" /usr/local/bin/firecracker
-    rm -rf "$TMP"
-else
-    echo "==> firecracker $FC_VERSION already installed"
-fi
-/usr/local/bin/firecracker --version
+# --- kernel uapi headers for the musl Firecracker build: expose only the
+# libc-agnostic dirs inside musl's include root. A global -I/usr/include
+# leaks glibc headers into the aws-lc-sys musl compile and breaks it. ---
+MUSL_INC=/usr/include/aarch64-linux-musl
+ln -sfn /usr/include/linux                 "$MUSL_INC/linux"
+ln -sfn /usr/include/asm-generic           "$MUSL_INC/asm-generic"
+ln -sfn /usr/include/aarch64-linux-gnu/asm "$MUSL_INC/asm"
 
 # --- uffd: unprivileged userfaultfd for FC snapshot page-faulting ---
 echo "vm.unprivileged_userfaultfd=1" >/etc/sysctl.d/99-engram.conf
@@ -238,6 +222,59 @@ chown -R "${VM_USER}:${VM_USER}" /opt/engram-dev
 echo "==> host prep complete"
 REMOTE
 
+# --- firecracker: the fork in third_party/firecracker, which is the binary
+# production ships. Stock Firecracker rejects the fork's snapshot API (for
+# example `defer_sync` on /snapshot/create), so captures fail on it. The
+# submodule gitlink SHA is the version: /opt/engram-dev/firecracker.sha holds
+# the SHA of the installed binary, and a re-run builds again only when the
+# gitlink moves. The build runs natively in the VM with the toolchain that
+# the fork's rust-toolchain.toml pins. ---
+echo "==> forked firecracker"
+FC_SRC=third_party/firecracker
+FC_SHA="$(git ls-tree HEAD "$FC_SRC" | awk '{print $3}')"
+if [ -z "$FC_SHA" ]; then
+    echo "fc-colima-provision: no $FC_SRC submodule gitlink at HEAD" >&2
+    exit 1
+fi
+installed_sha="$(ssh_ cat /opt/engram-dev/firecracker.sha 2>/dev/null || true)"
+if [ "$installed_sha" = "$FC_SHA" ] && ssh_ test -x /usr/local/bin/firecracker; then
+    echo "    fork @ $FC_SHA already installed"
+else
+    if ! git -C "$FC_SRC" cat-file -e "${FC_SHA}^{commit}" 2>/dev/null; then
+        if [ -e "$FC_SRC/.git" ]; then
+            echo "    fetching fork commit $FC_SHA into $FC_SRC"
+            git -C "$FC_SRC" fetch --quiet origin "$FC_SHA"
+        else
+            echo "    initializing the $FC_SRC submodule"
+            git submodule update --init "$FC_SRC"
+        fi
+    fi
+    echo "    staging fork @ $FC_SHA into the VM (VM-local dir, not virtiofs)"
+    git -C "$FC_SRC" archive --format=tar "$FC_SHA" \
+        | ssh_ bash -c 'rm -rf /opt/engram-dev/fc-build && mkdir -p /opt/engram-dev/fc-build && tar -C /opt/engram-dev/fc-build -xf -'
+    echo "    building the fork for aarch64-unknown-linux-musl in-VM"
+    ssh_ bash -c '
+        set -euo pipefail
+        if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+        fi
+        export PATH="$HOME/.cargo/bin:$PATH"
+        cd /opt/engram-dev/fc-build
+        rustup toolchain install
+        CC_aarch64_unknown_linux_musl=musl-gcc \
+        BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include -I/usr/include/aarch64-linux-gnu" \
+            cargo build -p firecracker --release --target aarch64-unknown-linux-musl
+        bin=build/cargo_target/aarch64-unknown-linux-musl/release/firecracker
+        file "$bin" | grep -q "statically linked"
+        sudo install -m 0755 "$bin" /usr/local/bin/firecracker
+    '
+    ssh_ bash -c "echo $FC_SHA > /opt/engram-dev/firecracker.sha"
+    echo "    removing /opt/engram-dev/fc-build work tree"
+    ssh_ sudo rm -rf /opt/engram-dev/fc-build
+fi
+ssh_ /usr/local/bin/firecracker --version
+
 # --- dm-thin pool for session disks (ADR 0125): the same script node-prep
 # runs in production, piped into the VM ---
 echo "==> thin pool inside '$PROFILE'"
@@ -287,8 +324,8 @@ cat <<EOF
 ==> fc-colima-provision done for profile '$PROFILE'
 
 Provisioned inside the VM:
-  - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools
-  - /usr/local/bin/firecracker ($FC_VERSION)
+  - packages: kernel and Firecracker build deps, curl git file iptables squashfs-tools
+  - /usr/local/bin/firecracker (fork @ $FC_SHA)
   - vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
   - dm-thin pool engram-pool (20G data / 1G metadata under /var/lib/engram/thin)
   - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no

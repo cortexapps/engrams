@@ -12,9 +12,8 @@
 //! microVM with the in-guest agent, exec over vsock (baseline), pause + resume
 //! the VM in place, then exec again — the second exec must complete. It runs
 //! only when `ENGRAM_FC_FORK_BIN` points at a forked firecracker (stock v1.16
-//! fails this property by design of its snapshot-only kick), matching the
-//! `stock_fork_snapshot_compat` gating: skipped on a submodule-bump PR before
-//! the fork artifact publishes, exercised on every main run after.
+//! fails this property by design of its snapshot-only kick). CI always sets
+//! it: the fc-setup action fails when the fork artifact is missing.
 //!
 //! Sized to the property: one bake, one VM, one pause/resume cycle, two execs.
 

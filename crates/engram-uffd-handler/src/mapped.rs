@@ -97,9 +97,8 @@ impl AsRef<[u8]> for WholeFile {
     }
 }
 
-/// The bytes of an immutable chunk file (a cache file, or an fd a
-/// version-1 writer passed), without a copy. The file may be unlinked
-/// after this returns.
+/// The bytes of an immutable chunk file, without a copy. The file may
+/// be unlinked after this returns.
 pub fn chunk_file_bytes(file: &File) -> std::io::Result<Bytes> {
     use std::os::fd::AsFd;
     let len = usize::try_from(file.metadata()?.len())

@@ -90,20 +90,19 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq musl-tools squashfs-tools busybox-static
 
-    # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
-    # so the existing FC suite + the stock<->fork compat test exercise the
-    # version we actually ship. The cached test artifacts (our engram 6.1.102
-    # guest kernel + the ubuntu-22.04 rootfs) are validated compatible with
-    # v1.16.0 (dev-vm: the compat test boots+snapshots+restores green).
-    - name: Install firecracker (v1.16.0)
+    # Stock firecracker, the fork's upstream base (v1.16.0). Only the
+    # fork->stock snapshot-compat test uses it (ENGRAM_FC_STOCK_BIN); every
+    # other test runs the fork, which is what the host image ships.
+    - name: Install stock firecracker (v1.16.0, compat test only)
       shell: bash
       env:
         FC_VER: v1.16.0
       run: |
         curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
         tar -xzf /tmp/fc.tgz -C /tmp
-        sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
-        firecracker --version
+        sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker-stock
+        firecracker-stock --version
+        echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker-stock" >> "$GITHUB_ENV"
 
     # Pinned CLI version: setup-oras v2 changed its default from oras
     # 1.3.0 to 1.3.1, and this action shares the `oras pull` path with
@@ -113,33 +112,30 @@ runs:
       with:
         version: 1.3.0
 
-    # ADR 0045 Phase B: stage both binaries for the stock<->fork
-    # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
-    # v1.16.0 just installed; fork = the artifact build-firecracker published,
-    # keyed by the submodule's gitlink SHA (read from the tree — no submodule
-    # fetch). Graceful: if the fork artifact isn't published yet (e.g. a
-    # submodule-bump PR before its merge builds it), leave ENGRAM_FC_FORK_BIN
-    # unset and the compat test skips cleanly via compat_preflight().
-    - name: Stage stock + forked firecracker (compat test)
+    # The forked firecracker, as `firecracker` on PATH: the binary the host
+    # image ships, from the artifact published under the submodule's gitlink
+    # SHA (by build-firecracker on main, and by rebase-fc-fork before it
+    # opens a bump PR). A missing artifact fails the job: stock firecracker
+    # lacks the fork's API, so a green run on it proves nothing.
+    - name: Install forked firecracker
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-token }}
       run: |
         set -euo pipefail
-        echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
         FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
-        if [ -z "$FC_SHA" ]; then echo "no third_party/firecracker gitlink; compat test will skip"; exit 0; fi
-        if ! echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin; then
-          echo "oras login failed; compat test will skip"; exit 0
-        fi
+        if [ -z "$FC_SHA" ]; then echo "::error::no third_party/firecracker gitlink"; exit 1; fi
+        echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
         mkdir -p "$HOME/fc-fork"
         if oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
-          chmod +x "$HOME/fc-fork/firecracker"
-          echo "ENGRAM_FC_FORK_BIN=$HOME/fc-fork/firecracker" >> "$GITHUB_ENV"
+          sudo install -m 0755 "$HOME/fc-fork/firecracker" /usr/local/bin/firecracker
+          echo "ENGRAM_FC_FORK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
           echo "staged forked firecracker @ $FC_SHA"
         else
-          echo "fork artifact firecracker:$FC_SHA not published yet; compat test will skip"
+          echo "::error::forked firecracker artifact firecracker:$FC_SHA is not published; dispatch bake-images on this branch to build it"
+          exit 1
         fi
+        firecracker --version
 
     # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
     # artifacts are version-pinned via fetch-fc-test-artifacts.sh

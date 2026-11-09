@@ -1892,14 +1892,26 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
               musl-tools jq bc python3
 
-      - name: Install firecracker (v1.16.0)
+      # The forked firecracker the host image ships, as in the fc-setup
+      # action: keyed by the submodule's gitlink SHA, and an error when the
+      # artifact is missing.
+      - uses: oras-project/setup-oras@v2
+        with:
+          version: 1.3.0
+
+      - name: Install forked firecracker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FC_VER=v1.16.0
-          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
-            -o /tmp/fc.tgz
-          tar -xzf /tmp/fc.tgz -C /tmp
-          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" \
-              /usr/local/bin/firecracker
+          set -euo pipefail
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p "$HOME/fc-fork"
+          if ! oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+            echo "::error::forked firecracker artifact firecracker:$FC_SHA is not published; dispatch bake-images on this branch to build it"
+            exit 1
+          fi
+          sudo install -m 0755 "$HOME/fc-fork/firecracker" /usr/local/bin/firecracker
           firecracker --version
 
       - name: Cache FC kernel + rootfs artifacts

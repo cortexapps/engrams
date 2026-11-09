@@ -295,12 +295,6 @@ pub enum HandlerControl {
     /// faults that round-tripped the peer + their cumulative wall) —
     /// the serial P2P cost inside the FC load + early execution, the
     /// restore-tail attribution the drain numbers can't show.
-    ///
-    /// A handler outlives a host-agent roll, so both builds read each
-    /// other's `DrainDone`: an older host-agent reads the leading fields
-    /// and ignores the rest (`bincode::deserialize` allows trailing
-    /// bytes), and [`decode_control`] reads an older handler's, which
-    /// ends before `hot_leading`.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
@@ -330,37 +324,6 @@ where
     T: DeserializeOwned,
 {
     bincode::deserialize(&read_body(r)?).map_err(invalid)
-}
-
-/// [`read_frame`] for a [`HandlerControl`], through [`decode_control`].
-pub fn read_control_frame<R: Read>(r: &mut R) -> std::io::Result<HandlerControl> {
-    decode_control(&read_body(r)?).map_err(invalid)
-}
-
-/// Decode a [`HandlerControl`] frame body. This also reads the previous
-/// build's `DrainDone`, which ends before `hot_leading`; its hot fields
-/// read as zero. #1772 removes the fallback once no running handler
-/// predates them.
-pub fn decode_control(body: &[u8]) -> bincode::Result<HandlerControl> {
-    bincode::deserialize(body).or_else(|error| {
-        match bincode::deserialize::<(u32, [u64; 8])>(body) {
-            Ok((2, [pulled, alt_sourced, zero_chunks, ms, faults, fault_us, fault_max_us, fault_around_chunks_installed])) => {
-                Ok(HandlerControl::DrainDone {
-                    pulled,
-                    alt_sourced,
-                    zero_chunks,
-                    ms,
-                    faults,
-                    fault_us,
-                    fault_max_us,
-                    fault_around_chunks_installed,
-                    hot_leading: 0,
-                    hot_hint_received: false,
-                })
-            }
-            _ => Err(error),
-        }
-    })
 }
 
 fn invalid(e: bincode::Error) -> std::io::Error {

@@ -60,7 +60,6 @@ pub fn from_writer() -> impl Strategy<Value = FromWriter> {
                 cache_writable,
             }
         }),
-        any::<u64>().prop_map(|len| FromWriter::Populated { len }),
         "[ -~]{0,16}".prop_map(|msg| FromWriter::PopulateErr { msg }),
         any::<u64>().prop_map(|len| FromWriter::Filled { len }),
     ]
@@ -90,7 +89,6 @@ fn _exhaustiveness_requester(r: &Requester) {
 fn _exhaustiveness_from_writer(m: &FromWriter) {
     match m {
         FromWriter::HelloAck { .. } => {}
-        FromWriter::Populated { .. } => {}
         FromWriter::PopulateErr { .. } => {}
         FromWriter::Filled { .. } => {}
     }

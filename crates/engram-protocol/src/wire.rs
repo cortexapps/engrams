@@ -182,8 +182,11 @@ pub const WIRE_VERSION: u32 = 38;
 /// other's VMs; raise it in any change that stops a new build from adopting
 /// the previous build's VMs, and an upgrade across it drains every host
 /// first. 1: the session disk is a kernel-owned thin volume (ADR 0125); a
-/// build that reports nothing counts as 0.
-pub const REATTACH_GENERATION: u32 = 1;
+/// build that reports nothing counts as 0. 2: the uffd handler speaks only
+/// substrate protocol version 2 and later, a post-copy `DrainDone` carries
+/// the hot-set fields, a snapshot create always sends `defer_sync`, and a
+/// migration item always carries its hash.
+pub const REATTACH_GENERATION: u32 = 2;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -1,11 +1,12 @@
-//! Stock ↔ fork Firecracker snapshot compatibility (ADR 0045 Phase B, R2).
+//! Fork → stock Firecracker snapshot compatibility (ADR 0045 Phase B, R2).
 //!
-//! The engrams fork adds the MAP_SHARED / `Msync` surface but deliberately
-//! never touches `src/vmm/src/snapshot/` and never bumps `SNAPSHOT_VERSION`, so
-//! a snapshot taken by stock FC must restore on the fork and vice-versa. That
-//! byte-compatibility is what makes a mixed fleet safe during a `nodeAssetsImage`
-//! roll (some hosts forked, some not). This test proves it end-to-end: create +
-//! snapshot with one binary, restore with the other, both directions.
+//! The engrams fork adds the MAP_SHARED / `Msync` surface but never touches
+//! `src/vmm/src/snapshot/` and never bumps `SNAPSHOT_VERSION`, so a snapshot
+//! the fork takes restores on stock FC. This test guards that the fork's
+//! snapshot format does not drift from upstream: create + snapshot with the
+//! fork, restore with stock. The other direction is not tested: the backend
+//! sends the fork's snapshot API (`defer_sync`), which stock rejects, and no
+//! deployment restores a snapshot that stock took.
 //!
 //! Drives the high-level `SandboxBackend` trait (create → snapshot → resume).
 //! Both backends share one work dir so the restoring binary resolves the
@@ -160,22 +161,6 @@ async fn round_trip(
         .destroy(restored_id)
         .await
         .unwrap_or_else(|e| panic!("{label}: destroy restored: {e:?}"));
-}
-
-#[tokio::test]
-#[ignore = "requires Linux + KVM + ENGRAM_FC_STOCK_BIN + ENGRAM_FC_FORK_BIN; run with --ignored on the dev VM"]
-async fn stock_created_snapshot_restores_on_fork() {
-    let env = match common::compat_preflight() {
-        Some(e) => e,
-        None => return,
-    };
-    round_trip(
-        env.stock_bin.clone(),
-        env.fork_bin.clone(),
-        &env,
-        "compat-stock-to-fork",
-    )
-    .await;
 }
 
 #[tokio::test]

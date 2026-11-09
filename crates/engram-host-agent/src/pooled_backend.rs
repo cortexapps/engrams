@@ -83,14 +83,17 @@ impl ItemAssembler {
         }
         self.item = None;
         let bytes = std::mem::take(&mut self.bytes);
-        // A source of the previous release sends no hash; #1772.
-        if let Some(want) = frame.item_hash {
-            if engram_migrate_proto::wire_hash(&bytes) != want {
-                return Err(SandboxError::Snapshot(format!(
-                    "migration fetch: item {} does not match its hash",
-                    frame.item_idx
-                )));
-            }
+        let Some(want) = frame.item_hash else {
+            return Err(SandboxError::Snapshot(format!(
+                "migration fetch: item {} has no hash",
+                frame.item_idx
+            )));
+        };
+        if engram_migrate_proto::wire_hash(&bytes) != want {
+            return Err(SandboxError::Snapshot(format!(
+                "migration fetch: item {} does not match its hash",
+                frame.item_idx
+            )));
         }
         self.arrived[frame.item_idx as usize] = true;
         Ok(Some((frame.item_idx, bytes)))
@@ -176,11 +179,11 @@ mod item_assembler_tests {
     }
 
     #[test]
-    fn an_item_from_a_source_without_hashes_is_accepted() {
+    fn an_item_without_a_hash_is_refused() {
         let mut a = ItemAssembler::new(1);
         let mut f = frame(0, 0, b"ab", Some(b"ab"));
         f.item_hash = None;
-        assert!(a.push(f).unwrap().is_some());
+        assert!(a.push(f).is_err());
     }
 }
 
@@ -5348,7 +5351,7 @@ impl SandboxBackend for PooledBackend {
                     return Err("drain wait timed out".into());
                 }
                 let msg: engram_migrate_proto::HandlerControl =
-                    match engram_migrate_proto::read_control_frame(&mut stream) {
+                    match engram_migrate_proto::read_frame(&mut stream) {
                         Ok(msg) => msg,
                         // A frame is written whole under the backlog lock,
                         // so a timeout falls between frames.

@@ -5,9 +5,8 @@
 //! handlers, one tokio task per connection. `Hello` answers readiness
 //! from live probes and pins the session manifest's chunks while any
 //! connection names that manifest. `Populate` gets the chunk from the fill engine
-//! at [`Class::Demand`] and delivers the bytes it got: protocol version
-//! 2 copies them into the connection's shared-memory slot; version 1
-//! passes an fd (see `engram-substrate-proto`).
+//! at [`Class::Demand`] and copies the bytes it got into the connection's
+//! shared-memory slot (see `engram-substrate-proto`).
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -21,8 +20,7 @@ use engram_chunk_store::{ChunkCache, ChunkHash};
 use engram_core::types::manifest::ManifestRef;
 use engram_fill::{Class, FillEngine};
 use engram_substrate_proto::{
-    ByteRange, FromWriter, Requester, ToWriter, PROTO_VERSION, PROTO_VERSION_READ,
-    PROTO_VERSION_V1, SLOT_BYTES,
+    ByteRange, FromWriter, Requester, ToWriter, PROTO_VERSION, PROTO_VERSION_READ, SLOT_BYTES,
 };
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,9 +43,9 @@ pub struct SubstrateServer {
 
 /// Per-connection state.
 struct Conn {
-    /// The version the client's `Hello` asked for (1 without one).
+    /// The version the client's `Hello` asked for; 0 before it.
     version: u32,
-    /// The version-2 slot; `None` on a version-1 connection.
+    /// The shared-memory slot; `None` before the `Hello`.
     slot: Option<std::fs::File>,
     /// The length of the last reply in the slot.
     slot_used: u64,
@@ -131,7 +129,7 @@ impl SubstrateServer {
 
     async fn serve_conn(&self, mut stream: UnixStream) {
         let mut conn = Conn {
-            version: PROTO_VERSION_V1,
+            version: 0,
             slot: None,
             slot_used: 0,
             fill: self.fill.clone(),
@@ -152,22 +150,19 @@ impl SubstrateServer {
                     session_manifest,
                 } => {
                     // The slot exists before the ack, so a failure to
-                    // create it is a `PopulateErr` and the handler dials
-                    // again with version 1.
+                    // create it is a `PopulateErr`.
                     let slot = match proto_version {
                         PROTO_VERSION | PROTO_VERSION_READ => match new_slot() {
-                            Ok(slot) => Some(slot),
+                            Ok(slot) => slot,
                             Err(e) => {
                                 let msg = format!("create slot: {e}");
                                 write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                                 return Ok(());
                             }
                         },
-                        // A handler an older host-agent started; #1772.
-                        PROTO_VERSION_V1 => None,
                         other => {
                             let msg = format!(
-                                "proto version mismatch: writer {PROTO_VERSION_V1}..={PROTO_VERSION_READ}, client {other}"
+                                "proto version mismatch: writer {PROTO_VERSION}..={PROTO_VERSION_READ}, client {other}"
                             );
                             write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                             return Ok(());
@@ -180,11 +175,13 @@ impl SubstrateServer {
                         }
                     }
                     write_frame(stream, &self.hello_ack().await?).await?;
-                    if let Some(slot) = &slot {
-                        send_fd(stream, slot.as_fd()).await?;
-                    }
-                    conn.slot = slot;
+                    send_fd(stream, slot.as_fd()).await?;
+                    conn.slot = Some(slot);
                     conn.version = proto_version;
+                }
+                ToWriter::Populate { .. } | ToWriter::Read { .. } if conn.slot.is_none() => {
+                    let msg = "a request before the Hello".to_string();
+                    write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                 }
                 ToWriter::Populate { hash } => {
                     self.populate(stream, conn, ChunkHash::from_bytes(hash))
@@ -271,7 +268,7 @@ impl SubstrateServer {
     ) -> std::io::Result<()> {
         let already = self.cache.contains_on_disk(hash);
         let delivered = match conn.fill.get(hash, Class::Demand).await {
-            Ok(bytes) => self.deliver(stream, conn, hash, &bytes).await?,
+            Ok(bytes) => self.deliver(stream, conn, &bytes).await?,
             Err(e) => Err(format!("populate fetch: {e}")),
         };
         let outcome = match delivered {
@@ -285,7 +282,7 @@ impl SubstrateServer {
         ::metrics::counter!(
             crate::metrics::SUBSTRATE_POPULATE_REQUESTS_TOTAL,
             "outcome" => outcome,
-            "proto" => if conn.slot.is_some() { "2" } else { "1" },
+            "proto" => "2",
         )
         .increment(1);
         Ok(())
@@ -323,7 +320,7 @@ impl SubstrateServer {
                 .map_err(|e| format!("read: {e}")),
         };
         let delivered = match got {
-            Ok(bytes) => self.deliver(stream, conn, hash, &bytes).await?,
+            Ok(bytes) => self.deliver(stream, conn, &bytes).await?,
             Err(msg) => Err(msg),
         };
         let outcome = match delivered {
@@ -342,44 +339,31 @@ impl SubstrateServer {
         Ok(())
     }
 
-    /// Send `bytes` in the connection's protocol version. The outer
-    /// error is a broken connection; the inner one is a reply the
-    /// handler gets as `PopulateErr`.
+    /// Copy `bytes` into the slot and send `Filled`. The outer error is
+    /// a broken connection; the inner one is a reply the handler gets as
+    /// `PopulateErr`.
     async fn deliver(
         &self,
         stream: &mut UnixStream,
         conn: &mut Conn,
-        hash: ChunkHash,
         bytes: &Bytes,
     ) -> std::io::Result<Result<(), String>> {
-        let len = bytes.len() as u64;
-        if let Some(slot) = &conn.slot {
-            if len > SLOT_BYTES {
-                return Ok(Err(format!(
-                    "chunk of {len} bytes exceeds the {SLOT_BYTES}-byte slot"
-                )));
-            }
-            // A copy into shared memory, not disk I/O.
-            let written = slot.write_all_at(bytes, 0);
-            conn.slot_used = len;
-            if let Err(e) = written {
-                return Ok(Err(format!("write slot: {e}")));
-            }
-            write_frame(stream, &FromWriter::Filled { len }).await?;
-            return Ok(Ok(()));
-        }
-        // Version 1. The cache file holds the same bytes when it is
-        // there; when it is not (evicted, or its write is still queued),
-        // an anonymous file carries the bytes in hand.
-        let file = match std::fs::File::open(self.cache.on_disk_path(hash)) {
-            Ok(file) => file,
-            Err(_) => match anon_file_with(bytes) {
-                Ok(file) => file,
-                Err(e) => return Ok(Err(format!("anonymous chunk file: {e}"))),
-            },
+        let Some(slot) = &conn.slot else {
+            return Ok(Err("no slot".into()));
         };
-        write_frame(stream, &FromWriter::Populated { len }).await?;
-        send_fd(stream, file.as_fd()).await?;
+        let len = bytes.len() as u64;
+        if len > SLOT_BYTES {
+            return Ok(Err(format!(
+                "chunk of {len} bytes exceeds the {SLOT_BYTES}-byte slot"
+            )));
+        }
+        // A copy into shared memory, not disk I/O.
+        let written = slot.write_all_at(bytes, 0);
+        conn.slot_used = len;
+        if let Err(e) = written {
+            return Ok(Err(format!("write slot: {e}")));
+        }
+        write_frame(stream, &FromWriter::Filled { len }).await?;
         Ok(Ok(()))
     }
 }
@@ -418,14 +402,6 @@ fn new_slot() -> std::io::Result<std::fs::File> {
     let slot = anon_file()?;
     slot.set_len(SLOT_BYTES)?;
     Ok(slot)
-}
-
-/// An anonymous file that holds `bytes` from offset 0, with its file
-/// offset at 0.
-fn anon_file_with(bytes: &[u8]) -> std::io::Result<std::fs::File> {
-    let file = anon_file()?;
-    file.write_all_at(bytes, 0)?;
-    Ok(file)
 }
 
 #[cfg(target_os = "linux")]
@@ -581,7 +557,12 @@ mod tests {
             let sock = sock.clone();
             joins.push(std::thread::spawn(move || {
                 let mut stream = StdUnixStream::connect(&sock).expect("connect");
-                matches!(populate(&mut stream, hash), FromWriter::Populated { .. })
+                assert!(matches!(
+                    hello(&mut stream, PROTO_VERSION),
+                    FromWriter::HelloAck { .. }
+                ));
+                engram_substrate_proto::recv_fd(stream.as_fd()).expect("slot fd");
+                matches!(populate(&mut stream, hash), FromWriter::Filled { .. })
             }));
         }
         for j in joins {
@@ -606,7 +587,7 @@ mod tests {
 
         let ack = tokio::task::spawn_blocking(move || {
             let mut stream = StdUnixStream::connect(&sock).expect("connect");
-            hello(&mut stream, PROTO_VERSION_V1)
+            hello(&mut stream, PROTO_VERSION)
         })
         .await
         .unwrap();
@@ -652,43 +633,28 @@ mod tests {
         .unwrap();
     }
 
-    /// A version-1 handler gets an fd that reads the whole chunk from
-    /// offset 0, from the cache file or, when the file is gone at
-    /// delivery, from an anonymous file.
+    /// A request before the `Hello` has no slot to land in: the writer
+    /// refuses it and the connection stays open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn version_one_fd_reads_the_whole_chunk() {
-        use std::io::Read as _;
+    async fn a_populate_before_the_hello_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (server, _blob, hash, bytes) = server_fixture(dir.path()).await;
+        let (server, _blob, hash, _) = server_fixture(dir.path()).await;
         let sock = dir.path().join("substrate.sock");
         let _accept = server.spawn(sock.clone()).unwrap();
 
-        let expected = bytes.clone();
         tokio::task::spawn_blocking(move || {
-            let bytes = expected;
             let mut stream = StdUnixStream::connect(&sock).expect("connect");
             assert!(matches!(
-                hello(&mut stream, PROTO_VERSION_V1),
+                populate(&mut stream, hash),
+                FromWriter::PopulateErr { .. }
+            ));
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION),
                 FromWriter::HelloAck { .. }
             ));
-            let FromWriter::Populated { len } = populate(&mut stream, hash) else {
-                panic!("expected Populated");
-            };
-            let mut file = std::fs::File::from(
-                engram_substrate_proto::recv_fd(stream.as_fd()).expect("chunk fd"),
-            );
-            let mut got = Vec::new();
-            file.read_to_end(&mut got).unwrap();
-            assert_eq!(got.len() as u64, len);
-            assert_eq!(got, bytes.as_ref());
         })
         .await
         .unwrap();
-
-        let anon = anon_file_with(&bytes).unwrap();
-        let mut got = Vec::new();
-        (&anon).read_to_end(&mut got).unwrap();
-        assert_eq!(got, bytes.as_ref());
     }
 
     /// Connections that name one session manifest read it once and share
@@ -730,7 +696,7 @@ mod tests {
                     engram_substrate_proto::write_frame(
                         &mut stream,
                         &ToWriter::Hello {
-                            proto_version: PROTO_VERSION_V1,
+                            proto_version: PROTO_VERSION,
                             canonical_manifest: None,
                             session_manifest: Some(mref),
                         },

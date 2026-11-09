@@ -108,7 +108,7 @@ async fn observe_drain(sock: &Path) -> std::io::Result<DrainOutcome> {
     let mut stream = tokio::net::UnixStream::connect(sock).await?;
     loop {
         let body = crate::migrate_peer::read_body_async(&mut stream).await?;
-        let frame = engram_migrate_proto::decode_control(&body).map_err(|e| {
+        let frame: HandlerControl = bincode::deserialize(&body).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
         })?;
         match frame {

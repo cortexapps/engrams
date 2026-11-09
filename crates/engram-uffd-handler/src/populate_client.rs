@@ -6,11 +6,8 @@
 //! finds the socket gone redials a bounded number of times; past that
 //! the caller fetches the chunk from the object store itself.
 //!
-//! Each connection speaks protocol version 2 (the chunk arrives in the
-//! connection's shared-memory slot) or, against a writer that refuses
-//! version 2, version 1 (the chunk arrives as an fd). After a refusal the
-//! client dials version 1 until a connection breaks (the writer rolled);
-//! the next dial asks for version 2 again. #1772 removes version 1.
+//! Each connection speaks protocol version 2: the chunk arrives in the
+//! connection's shared-memory slot.
 //!
 //! [`PopulateClient::hello`] fills the pool with one connection per fault
 //! thread, so the first faults do not wait for a dial.
@@ -19,16 +16,15 @@ use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use engram_chunk_store::ChunkHash;
 use engram_core::types::manifest::ManifestRef;
-use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION, PROTO_VERSION_V1, SLOT_BYTES};
+use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION, SLOT_BYTES};
 
-use crate::mapped::{chunk_file_bytes, Mapping};
+use crate::mapped::Mapping;
 
 /// Dial attempts per request. A rolled host-agent's successor binds
 /// the socket within seconds; a dead writer must surface fast so the
@@ -78,20 +74,17 @@ pub struct PopulateClient {
     /// writer keeps the session's chunks pinned while a connection names
     /// them, and a rolled writer starts with no pins.
     hello_manifests: Mutex<Option<HelloManifests>>,
-    /// The writer refused version 2; dial version 1 directly.
-    writer_v1: AtomicBool,
 }
 
 struct Conn {
     stream: UnixStream,
-    /// The writer's slot, mapped read-only; `None` on version 1.
-    slot: Option<Mapping>,
+    /// The writer's slot, mapped read-only.
+    slot: Mapping,
 }
 
 enum Reply {
     /// The chunk is in the connection's slot, `len` bytes.
     Slot(usize),
-    Bytes(Bytes),
     Failed(String),
 }
 
@@ -109,20 +102,7 @@ impl Conn {
             },
         )?;
         match engram_substrate_proto::read_frame(&mut self.stream)? {
-            FromWriter::Filled { len } if self.slot.is_some() && len <= SLOT_BYTES => {
-                Ok(Reply::Slot(len as usize))
-            }
-            FromWriter::Populated { len } => {
-                let file = File::from(engram_substrate_proto::recv_fd(self.stream.as_fd())?);
-                let bytes = chunk_file_bytes(&file)?;
-                if bytes.len() as u64 != len {
-                    return Err(invalid(format!(
-                        "populate fd holds {} bytes, reply said {len}",
-                        bytes.len()
-                    )));
-                }
-                Ok(Reply::Bytes(bytes))
-            }
+            FromWriter::Filled { len } if len <= SLOT_BYTES => Ok(Reply::Slot(len as usize)),
             FromWriter::PopulateErr { msg } => Ok(Reply::Failed(msg)),
             other => Err(invalid(format!("unexpected Populate reply: {other:?}"))),
         }
@@ -141,12 +121,12 @@ struct SlotLease {
 
 impl AsRef<[u8]> for SlotLease {
     fn as_ref(&self) -> &[u8] {
-        match self.conn.as_ref().and_then(|c| c.slot.as_ref()) {
+        match &self.conn {
             // SAFETY: `len <= SLOT_BYTES`, the mapped length and the
             // slot file's size (checked at dial). The writer writes the
             // slot only while it serves a request on this connection,
             // and the lease holds the connection, so none is in flight.
-            Some(slot) => unsafe { slot.prefix(self.len) },
+            Some(conn) => unsafe { conn.slot.prefix(self.len) },
             None => &[],
         }
     }
@@ -166,7 +146,6 @@ impl PopulateClient {
             sock_path,
             idle: Mutex::new(Vec::new()),
             hello_manifests: Mutex::new(None),
-            writer_v1: AtomicBool::new(false),
         }
     }
 
@@ -184,7 +163,6 @@ impl PopulateClient {
         let manifests = (canonical_manifest, session_manifest);
         *self.hello_manifests.lock().expect("hello_manifests lock") = Some(manifests);
         self.idle.lock().expect("populate idle lock").clear();
-        self.writer_v1.store(false, Ordering::Relaxed);
         let mut last_err = None;
         for _ in 0..RECONNECT_ATTEMPTS {
             match self.dial_with_hello(manifests) {
@@ -210,10 +188,9 @@ impl PopulateClient {
         Err(unreachable_err(last_err))
     }
 
-    /// The bytes of one chunk. On version 2 they are the slot itself,
-    /// and the connection returns to the pool when the last clone of
-    /// the `Bytes` drops; on version 1 they map the fd the writer
-    /// passed (an eviction unlink after the reply is harmless).
+    /// The bytes of one chunk. They are the slot itself, and the
+    /// connection returns to the pool when the last clone of the `Bytes`
+    /// drops.
     pub fn request(self: &Arc<Self>, hash: ChunkHash) -> Result<Bytes, PopulateError> {
         let mut last_err = None;
         for _ in 0..RECONNECT_ATTEMPTS {
@@ -234,10 +211,6 @@ impl PopulateClient {
                         client: Arc::clone(self),
                     }))
                 }
-                Ok(Reply::Bytes(bytes)) => {
-                    self.checkin(conn);
-                    return Ok(bytes);
-                }
                 Ok(Reply::Failed(msg)) => {
                     self.checkin(conn);
                     return Err(PopulateError::Failed(msg));
@@ -257,7 +230,6 @@ impl PopulateClient {
                     // the idle ones are as stale. Redial now.
                     tracing::debug!(error = %e, "populate exchange failed; redialing");
                     self.idle.lock().expect("populate idle lock").clear();
-                    self.writer_v1.store(false, Ordering::Relaxed);
                     last_err = Some(e);
                 }
             }
@@ -276,26 +248,15 @@ impl PopulateClient {
         Ok(s)
     }
 
-    /// A new connection. Before [`Self::hello`] it sends no `Hello` and
-    /// speaks version 1.
+    /// A new connection, with the manifests of [`Self::hello`] (none
+    /// before it).
     fn dial(&self) -> std::io::Result<Conn> {
         let manifests = *self.hello_manifests.lock().expect("hello_manifests lock");
-        match manifests {
-            Some(manifests) => self.dial_with_hello(manifests).map(|(conn, _)| conn),
-            None => Ok(Conn {
-                stream: self.connect()?,
-                slot: None,
-            }),
-        }
+        self.dial_with_hello(manifests.unwrap_or((None, None)))
+            .map(|(conn, _)| conn)
     }
 
-    /// A new connection that asks for version 2 and, if the writer
-    /// refuses, speaks version 1 on a second connection. After a refusal
-    /// it asks for version 1 at once.
     fn dial_with_hello(&self, manifests: HelloManifests) -> std::io::Result<(Conn, HelloProbes)> {
-        if self.writer_v1.load(Ordering::Relaxed) {
-            return self.dial_v1(manifests);
-        }
         let mut stream = self.connect()?;
         match hello_on(&mut stream, PROTO_VERSION, manifests)? {
             HelloReply::Ack(probes) => {
@@ -304,24 +265,8 @@ impl PopulateClient {
                     return Err(invalid("slot file is not SLOT_BYTES long".into()));
                 }
                 let slot = Mapping::lazy(slot.as_fd(), SLOT_BYTES as usize)?;
-                let conn = Conn {
-                    stream,
-                    slot: Some(slot),
-                };
-                Ok((conn, probes))
+                Ok((Conn { stream, slot }, probes))
             }
-            HelloReply::Refused(msg) => {
-                tracing::debug!(%msg, "writer refused protocol v2; using v1");
-                self.writer_v1.store(true, Ordering::Relaxed);
-                self.dial_v1(manifests)
-            }
-        }
-    }
-
-    fn dial_v1(&self, manifests: HelloManifests) -> std::io::Result<(Conn, HelloProbes)> {
-        let mut stream = self.connect()?;
-        match hello_on(&mut stream, PROTO_VERSION_V1, manifests)? {
-            HelloReply::Ack(probes) => Ok((Conn { stream, slot: None }, probes)),
             HelloReply::Refused(msg) => Err(invalid(msg)),
         }
     }
@@ -361,97 +306,6 @@ fn unreachable_err(last: Option<std::io::Error>) -> PopulateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
-
-    /// A writer that refuses version 2 the way a version-1 writer does
-    /// (`PopulateErr`, then close), then takes `v1_conns` connections
-    /// that each must open with a version-1 `Hello`, and serves on them.
-    fn v1_writer(listener: UnixListener, chunk: Vec<u8>, v1_conns: usize) {
-        let (mut refused, _) = listener.accept().unwrap();
-        let hello: ToWriter = engram_substrate_proto::read_frame(&mut refused).unwrap();
-        assert!(matches!(
-            hello,
-            ToWriter::Hello {
-                proto_version: PROTO_VERSION,
-                ..
-            }
-        ));
-        engram_substrate_proto::write_frame(
-            &mut refused,
-            &FromWriter::PopulateErr {
-                msg: "proto version mismatch: writer 1, client 2".into(),
-            },
-        )
-        .unwrap();
-        drop(refused);
-
-        let served: Vec<_> = (0..v1_conns)
-            .map(|_| {
-                let (s, _) = listener.accept().unwrap();
-                let chunk = chunk.clone();
-                std::thread::spawn(move || serve_v1(s, &chunk))
-            })
-            .collect();
-        for s in served {
-            s.join().unwrap();
-        }
-    }
-
-    /// One version-1 connection: the `Hello`, then populates until the
-    /// client closes it.
-    fn serve_v1(mut s: UnixStream, chunk: &[u8]) {
-        use std::io::Write as _;
-        let hello: ToWriter = engram_substrate_proto::read_frame(&mut s).unwrap();
-        assert!(matches!(
-            hello,
-            ToWriter::Hello {
-                proto_version: PROTO_VERSION_V1,
-                ..
-            }
-        ));
-        engram_substrate_proto::write_frame(
-            &mut s,
-            &FromWriter::HelloAck {
-                tmpfs_ok: true,
-                cache_writable: true,
-            },
-        )
-        .unwrap();
-        while let Ok(_populate) = engram_substrate_proto::read_frame::<_, ToWriter>(&mut s) {
-            let mut file = tempfile::tempfile().unwrap();
-            file.write_all(chunk).unwrap();
-            engram_substrate_proto::write_frame(
-                &mut s,
-                &FromWriter::Populated {
-                    len: chunk.len() as u64,
-                },
-            )
-            .unwrap();
-            engram_substrate_proto::send_fd(s.as_fd(), file.as_fd()).unwrap();
-        }
-    }
-
-    /// Against a version-1 writer, the pool's later dials ask for
-    /// version 1 at once: one refused connection in all, not one per dial.
-    #[test]
-    fn falls_back_to_version_one_against_an_older_writer() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("substrate.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let chunk: Vec<u8> = (0..8192u32).map(|i| (i * 3) as u8).collect();
-        let writer = std::thread::spawn({
-            let chunk = chunk.clone();
-            move || v1_writer(listener, chunk, 3)
-        });
-        let client = Arc::new(PopulateClient::new(sock));
-        assert_eq!(client.hello(None, None, 3).unwrap(), (true, true));
-        assert_eq!(client.idle.lock().unwrap().len(), 3);
-        let got = client.request(ChunkHash::of(&chunk)).unwrap();
-        assert_eq!(got.as_ref(), chunk.as_slice());
-        drop(got);
-        drop(client);
-        writer.join().unwrap();
-    }
 
     #[test]
     fn a_dead_socket_is_unreachable_within_the_dial_budget() {

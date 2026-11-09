@@ -25,19 +25,7 @@
 //! a request on that connection, and the handler reads it only between
 //! a reply and its next request on that connection.
 //!
-//! Version 1 (served for one release, for handlers started by an older
-//! host-agent; such handlers outlive a host-agent roll; #1772 removes it):
-//!
-//! ```text
-//!   handler ──[ Hello { proto_version: 1, .. } ]──► writer   (optional)
-//!   writer  ──[ HelloAck { .. } ]──► handler
-//!   handler ──[ Populate { hash } ]──► writer
-//!   writer  ──[ Populated { len } + SCM_RIGHTS fd ]──► handler
-//!           or [ PopulateErr { msg } ]
-//! ```
-//!
-//! A version-1 fd is opened `O_RDONLY` and holds the whole chunk from
-//! offset 0. A connection without a `Hello` speaks version 1.
+//! A request before the `Hello` gets a `PopulateErr`.
 //!
 //! Version 3 is version 2 plus [`ToWriter::Read`]: a request that says
 //! who asks (guest memory or a disk) and may name a byte range of the
@@ -46,9 +34,7 @@
 //! connection.
 //!
 //! A writer that does not speak the requested version replies
-//! `PopulateErr` to the `Hello` and closes the connection. A writer
-//! older than version 3 does the same to a version-3 `Hello`. A version-2
-//! handler then dials again with version 1.
+//! `PopulateErr` to the `Hello` and closes the connection.
 
 use std::io::{Read, Write};
 
@@ -62,13 +48,8 @@ pub const PROTO_VERSION: u32 = 2;
 /// `Read` asks for it.
 pub const PROTO_VERSION_READ: u32 = 3;
 
-/// The fd-per-reply version. A writer serves it to handlers that an
-/// older host-agent started, and a handler falls back to it against an
-/// older writer.
-pub const PROTO_VERSION_V1: u32 = 1;
-
 /// Frame size cap. Frames carry a hash or a manifest ref; chunk bytes
-/// ride the slot or an fd, never a frame.
+/// ride the slot, never a frame.
 pub const MAX_MSG_BYTES: usize = 64 * 1024;
 
 /// Size of the version-2 slot. The largest chunk a writer can deliver
@@ -131,15 +112,10 @@ pub enum FromWriter {
         tmpfs_ok: bool,
         cache_writable: bool,
     },
-    /// Version 1: the chunk's `O_RDONLY` fd follows this frame as an
-    /// SCM_RIGHTS message on a 1-byte carrier (see [`send_fd`]).
-    Populated {
-        len: u64,
-    },
     PopulateErr {
         msg: String,
     },
-    /// Version 2: the chunk is in `slot[..len]`.
+    /// The chunk is in `slot[..len]`.
     Filled {
         len: u64,
     },
@@ -287,21 +263,17 @@ mod tests {
             let back: ToWriter = read_frame(&mut buf.as_slice()).unwrap();
             assert_eq!(back, m);
         }
-        for m in [
-            FromWriter::Populated { len: 524_288 },
-            FromWriter::Filled { len: 524_288 },
-        ] {
-            let mut buf = Vec::new();
-            write_frame(&mut buf, &m).unwrap();
-            let back: FromWriter = read_frame(&mut buf.as_slice()).unwrap();
-            assert_eq!(back, m);
-        }
+        let filled = FromWriter::Filled { len: 524_288 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &filled).unwrap();
+        let back: FromWriter = read_frame(&mut buf.as_slice()).unwrap();
+        assert_eq!(back, filled);
     }
 
-    /// A version-1 peer decodes these variants by position, so their
-    /// encodings must not move.
+    /// Both ends decode these variants by position, so their encodings
+    /// must not move.
     #[test]
-    fn version_one_variants_keep_their_wire_positions() {
+    fn variants_keep_their_wire_positions() {
         let tag = |m: &FromWriter| bincode::serialize(m).unwrap()[..4].to_vec();
         assert_eq!(
             tag(&FromWriter::HelloAck {
@@ -310,11 +282,11 @@ mod tests {
             }),
             [0, 0, 0, 0]
         );
-        assert_eq!(tag(&FromWriter::Populated { len: 1 }), [1, 0, 0, 0]);
         assert_eq!(
             tag(&FromWriter::PopulateErr { msg: String::new() }),
-            [2, 0, 0, 0]
+            [1, 0, 0, 0]
         );
+        assert_eq!(tag(&FromWriter::Filled { len: 1 }), [2, 0, 0, 0]);
         let to = |m: &ToWriter| bincode::serialize(m).unwrap()[..4].to_vec();
         assert_eq!(
             to(&ToWriter::Hello {
