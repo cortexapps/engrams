@@ -74,7 +74,12 @@ export class FixtureObserver {
     private readonly ctx: Context,
     private readonly protocol: FixtureKind = "modern",
   ) {}
-  private async request(method: "GET" | "POST", route: string, body?: unknown) {
+  private async request(
+    method: "GET" | "POST",
+    route: string,
+    body?: unknown,
+    requestMs = this.ctx.deadlines.requestMs,
+  ) {
     const token = (
       await privateFile(
         this.ctx.runRoot,
@@ -85,7 +90,7 @@ export class FixtureObserver {
       .trim();
     requireThat(/^[A-Za-z0-9_-]{32,128}$/.test(token), "observer_token");
     const response = await jsonRequest(
-      this.ctx,
+      { ...this.ctx, deadlines: { ...this.ctx.deadlines, requestMs } },
       this.ctx.protocolFixtures[this.protocol],
       method,
       route,
@@ -96,6 +101,39 @@ export class FixtureObserver {
     return response.body;
   }
   async ready() {
+    const deadline = performance.now() + this.ctx.deadlines.stepMs;
+    let body: unknown;
+    // Container start can complete before the HTTPS listener accepts requests.
+    for (;;) {
+      try {
+        body = await this.request(
+          "GET",
+          "/v1/ready",
+          undefined,
+          Math.max(
+            1,
+            Math.min(
+              this.ctx.deadlines.requestMs,
+              deadline - performance.now(),
+            ),
+          ),
+        );
+        break;
+      } catch (error) {
+        if (
+          !(error instanceof RunnerFailure) ||
+          error.code !== "TRANSPORT_FAILED" ||
+          error.seam !== "https_request"
+        )
+          throw error;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw error;
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(100, remaining)),
+        );
+        if (performance.now() >= deadline) throw error;
+      }
+    }
     const response = z
       .strictObject({
         version: z.literal(1),
@@ -103,7 +141,7 @@ export class FixtureObserver {
         resource: z.string(),
         issuer: z.string(),
       })
-      .safeParse(await this.request("GET", "/v1/ready"));
+      .safeParse(body);
     requireThat(
       response.success &&
         response.data.resource ===

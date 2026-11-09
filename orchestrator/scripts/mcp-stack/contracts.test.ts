@@ -55,6 +55,7 @@ import {
   PublishMcpRequestSchema,
 } from "../../src/gen/engram/app/v1/integration_pb.ts";
 import { OperatorPublicationServiceStageRequestSchema } from "../../src/gen/engram/mcp/v1/operator_pb.ts";
+import { FixtureObserver } from "./observer.ts";
 
 let root: string;
 beforeAll(async () => {
@@ -713,6 +714,131 @@ test("only an exact ordered present-to-absent pair can reuse a native call ID", 
     [present, absent, { ...absent, marker: "third" }],
   ])
     expect(() => encodeCallPlan({ steps })).toThrow();
+});
+
+test("fixture readiness waits for transport startup and rejects invalid responses without retry", async () => {
+  const keyPath = join(root, "observer.key");
+  const certPath = join(root, "observer.pem");
+  const certificate = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "subjectAltName=DNS:localhost",
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  expect(await certificate.exited).toBe(0);
+  await chmod(certPath, 0o600);
+  const cert = await readFile(certPath);
+  const token = "a".repeat(48);
+  const tokenPath = join(root, "observer.token");
+  await writeFile(tokenPath, token, { mode: 0o600 });
+  const ctx = ContextSchema.parse(validContext());
+  ctx.runRoot = root;
+  ctx.deadlines = { requestMs: 100, stepMs: 250, totalMs: 10000 };
+  const endpoint = ctx.protocolFixtures.legacy;
+  let status = 200;
+  let resource = endpoint.resourceOrigin + "/mcp";
+  let issuer = endpoint.issuerOrigin;
+  let connections = 0;
+  let transportFailures = 1;
+  const requests: {
+    method?: string;
+    route?: string;
+    authorization?: string;
+  }[] = [];
+  const server = createServer(
+    { key: await readFile(keyPath), cert },
+    (req, res) => {
+      requests.push({
+        method: req.method,
+        route: req.url,
+        authorization: req.headers.authorization,
+      });
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ version: 1, ready: true, resource, issuer }));
+    },
+  );
+  server.on("connection", (socket) => {
+    connections++;
+    if (transportFailures-- > 0) socket.destroy();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("server_address");
+    endpoint.origin = `https://localhost:${address.port}`;
+    endpoint.ca = { path: certPath, sha256: sha256(cert) };
+    endpoint.serverFingerprint = new X509Certificate(cert).fingerprint256;
+    endpoint.tokenFile = tokenPath;
+    const observer = new FixtureObserver(ctx, "legacy");
+    await observer.ready();
+    expect(connections).toBe(2);
+    expect(requests).toEqual([
+      { method: "GET", route: "/v1/ready", authorization: `Bearer ${token}` },
+    ]);
+
+    for (const failure of ["status", "resource", "issuer", "token"] as const) {
+      const before = connections;
+      status = failure === "status" ? 401 : 200;
+      resource =
+        endpoint.resourceOrigin + (failure === "resource" ? "/wrong" : "/mcp");
+      issuer = endpoint.issuerOrigin + (failure === "issuer" ? "/wrong" : "");
+      await writeFile(tokenPath, failure === "token" ? "invalid" : token);
+      await expect(observer.ready()).rejects.toThrow(
+        failure === "status"
+          ? "fixture_observer_status"
+          : failure === "token"
+            ? "observer_token"
+            : "fixture_identity",
+      );
+      expect(connections - before).toBe(failure === "token" ? 0 : 1);
+    }
+    await writeFile(tokenPath, token);
+    const beforeWrite = connections;
+    transportFailures = 1;
+    await expect(observer.configure({ revision: 2 })).rejects.toThrow(
+      "https_request",
+    );
+    expect(connections - beforeWrite).toBe(1);
+
+    for (const failure of ["transport", "certificate"] as const) {
+      status = 200;
+      resource = endpoint.resourceOrigin + "/mcp";
+      issuer = endpoint.issuerOrigin;
+      transportFailures = failure === "transport" ? 1000 : 0;
+      endpoint.serverFingerprint =
+        failure === "certificate"
+          ? Array(32).fill("00").join(":")
+          : new X509Certificate(cert).fingerprint256;
+      const before = connections;
+      const begun = performance.now();
+      await expect(observer.ready()).rejects.toThrow(
+        "TRANSPORT_FAILED:https_request",
+      );
+      expect(connections - before).toBeGreaterThan(1);
+      expect(performance.now() - begun).toBeLessThan(1000);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });
 
 test("guest proof reads use authenticated downloads with bounded verified bytes", async () => {
