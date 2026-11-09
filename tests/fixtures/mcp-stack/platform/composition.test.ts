@@ -2810,6 +2810,195 @@ test("FC sysctls belong only to its C guard and actual firewall order stays prod
     expect(() => verifyFcHostFirewall(current, 26000)).toThrow();
 });
 
+function dockerDnsFirewall(production: Record<string, string[]>): Record<
+  string,
+  string
+> & {
+  POSTROUTING: string;
+  OUTPUT: string;
+  DOCKER_OUTPUT: string;
+  DOCKER_POSTROUTING: string;
+} {
+  return {
+    ...Object.fromEntries(
+      Object.entries(production).map(([chain, rules]) => [
+        chain,
+        [`-P ${chain} ACCEPT`, ...rules].join("\n") + "\n",
+      ]),
+    ),
+    POSTROUTING:
+      [
+        "-P POSTROUTING ACCEPT",
+        "-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING",
+        ...production.POSTROUTING!,
+      ].join("\n") + "\n",
+    OUTPUT: "-P OUTPUT ACCEPT\n-A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT\n",
+    DOCKER_OUTPUT:
+      [
+        "-N DOCKER_OUTPUT",
+        "-A DOCKER_OUTPUT -d 127.0.0.11/32 -p tcp -m tcp --dport 53 -j DNAT --to-destination 127.0.0.11:35285",
+        "-A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp -m udp --dport 53 -j DNAT --to-destination 127.0.0.11:52990",
+      ].join("\n") + "\n",
+    DOCKER_POSTROUTING:
+      [
+        "-N DOCKER_POSTROUTING",
+        "-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p tcp -m tcp --sport 35285 -j SNAT --to-source :53",
+        "-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p udp -m udp --sport 52990 -j SNAT --to-source :53",
+      ].join("\n") + "\n",
+  };
+}
+
+test("FC firewall accepts the exact Docker loopback DNS graph", async () => {
+  const { fcHostFirewall, verifyFcHostFirewall } = await import("./engine.ts");
+  const actual = dockerDnsFirewall(fcHostFirewall(30000));
+  expect(() => verifyFcHostFirewall(actual, 30000)).not.toThrow();
+  const otherPorts = Object.fromEntries(
+    Object.entries(actual).map(([chain, rules]) => [
+      chain,
+      rules.replaceAll("35285", "1").replaceAll("52990", "65535"),
+    ]),
+  );
+  expect(() => verifyFcHostFirewall(otherPorts, 30000)).not.toThrow();
+});
+
+test("FC firewall rejects any changed Docker DNS graph or production rule", async () => {
+  const { fcHostFirewall, verifyFcHostFirewall } = await import("./engine.ts");
+  const actual = dockerDnsFirewall(fcHostFirewall(30000));
+  const mutations: Record<string, string>[] = [];
+  for (const chain of [
+    "OUTPUT",
+    "DOCKER_OUTPUT",
+    "DOCKER_POSTROUTING",
+  ] as const) {
+    const missing: Record<string, string> = { ...actual };
+    delete missing[chain];
+    mutations.push(missing);
+    mutations.push({
+      ...actual,
+      [chain]: actual[chain].replaceAll("127.0.0.11", "127.0.0.12"),
+    });
+    mutations.push({
+      ...actual,
+      [chain]: actual[chain] + "-A " + chain + " -d 203.0.113.1/32 -j ACCEPT\n",
+    });
+    const lines = actual[chain].trim().split("\n");
+    mutations.push({
+      ...actual,
+      [chain]: [...lines, lines[1]].join("\n") + "\n",
+    });
+  }
+  for (const port of ["0", "65536", "035285", "-1", "1:2"])
+    mutations.push({
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+        "127.0.0.11:35285",
+        "127.0.0.11:" + port,
+      ),
+    });
+  mutations.push(
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("--dport 53", "--dport 54"),
+    },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("-p tcp", "-p udp"),
+    },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace("-j DNAT", "-j REDIRECT"),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        "--sport 35285",
+        "--sport 35286",
+      ),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        "--to-source :53",
+        "--to-source :54",
+      ),
+    },
+    {
+      ...actual,
+      OUTPUT: actual.OUTPUT.replace("DOCKER_OUTPUT", "OTHER_OUTPUT"),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING.replace("127.0.0.11/32", "127.0.0.0/8"),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING.replace(
+        "DOCKER_POSTROUTING",
+        "OTHER_POSTROUTING",
+      ),
+    },
+    {
+      ...actual,
+      POSTROUTING: actual.POSTROUTING + "-A POSTROUTING -j MASQUERADE\n",
+    },
+    {
+      ...actual,
+      INPUT: actual.INPUT!.replace("--dport 30003", "--dport 30004"),
+    },
+    { ...actual, FORWARD: actual.FORWARD!.split("\n").reverse().join("\n") },
+    { ...actual, EXTRA: "-N EXTRA\n" },
+    {
+      ...actual,
+      DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+        /-A DOCKER_OUTPUT[^\n]+\n/,
+        "",
+      ),
+    },
+    {
+      ...actual,
+      DOCKER_POSTROUTING: actual.DOCKER_POSTROUTING.replace(
+        /-A DOCKER_POSTROUTING[^\n]+\n/,
+        "",
+      ),
+    },
+  );
+  const forward = actual.FORWARD!.trim().split("\n");
+  mutations.push({
+    ...actual,
+    FORWARD:
+      [forward[0], forward[2], forward[1], ...forward.slice(3)].join("\n") +
+      "\n",
+  });
+  mutations.push({
+    ...actual,
+    DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+      "--dport 53",
+      "--dport 53 --dport 53",
+    ),
+  });
+  mutations.push({
+    ...actual,
+    DOCKER_OUTPUT: actual.DOCKER_OUTPUT.replace(
+      "127.0.0.11/32",
+      "127.0.0.11/8",
+    ),
+  });
+  const swapped = actual.POSTROUTING.trim().split("\n");
+  mutations.push({
+    ...actual,
+    POSTROUTING: [swapped[0], swapped[2], swapped[1]].join("\n") + "\n",
+  });
+  mutations.push({
+    ...actual,
+    POSTROUTING: actual.POSTROUTING.replace(
+      "-P POSTROUTING ACCEPT\n",
+      "-P POSTROUTING ACCEPT\n-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING\n",
+    ),
+  });
+  for (const current of mutations)
+    expect(() => verifyFcHostFirewall(current, 30000)).toThrow();
+});
+
 test("FC qualification reads both actual namespace sysctls and production chains", async () => {
   const { fcHostFirewall } = await import("./engine.ts");
   const root = await mkdtemp(
@@ -2817,7 +3006,8 @@ test("FC qualification reads both actual namespace sysctls and production chains
   );
   const calls: string[][] = [];
   let badNamespace = false,
-    badSysctl = false;
+    badSysctl = false,
+    dockerDns = false;
   class FcProbe extends Engine {
     override async call(args: string[]) {
       calls.push(args);
@@ -2828,6 +3018,14 @@ test("FC qualification reads both actual namespace sysctls and production chains
       if (args[2] === "/bin/cat") return Buffer.from(badSysctl ? "0\n" : "1\n");
       if (args[2] === "/usr/sbin/iptables") {
         const chain = args[6]!;
+        if (dockerDns) {
+          const actual: Record<string, string> = dockerDnsFirewall(
+            fcHostFirewall(26000),
+          );
+          const output = actual[chain];
+          if (output === undefined) throw Error("unexpected DNS chain");
+          return Buffer.from(output);
+        }
         return Buffer.from(
           [`-P ${chain} ACCEPT`, ...fcHostFirewall(26000)[chain]!].join("\n") +
             "\n",
@@ -2848,7 +3046,23 @@ test("FC qualification reads both actual namespace sysctls and production chains
     expect(
       calls.filter((args) => args[2] === "/usr/sbin/iptables"),
     ).toHaveLength(4);
+    calls.length = 0;
+    dockerDns = true;
     await engine.qualifyFcHost("host");
+    expect(
+      calls
+        .filter((args) => args[2] === "/usr/sbin/iptables")
+        .map((args) => args.slice(4)),
+    ).toEqual([
+      ["filter", "-S", "INPUT"],
+      ["filter", "-S", "FORWARD"],
+      ["nat", "-S", "PREROUTING"],
+      ["nat", "-S", "POSTROUTING"],
+      ["nat", "-S", "OUTPUT"],
+      ["nat", "-S", "DOCKER_OUTPUT"],
+      ["nat", "-S", "DOCKER_POSTROUTING"],
+    ]);
+    dockerDns = false;
     badNamespace = true;
     await expect(engine.qualifyFcHost("host")).rejects.toThrow(
       "fc_host_namespace",

@@ -264,7 +264,7 @@ export function fcHostFirewall(port: number): Record<string, string[]> {
     ],
   };
 }
-function firewallRule(line: string): string {
+function firewallFields(line: string): Record<string, string> {
   const tokens = line.match(/"[^"\r\n]*"|[^\s]+/g) ?? [];
   const fields: Record<string, string> = {};
   let negate = false;
@@ -293,6 +293,9 @@ function firewallRule(line: string): string {
         "-i",
         "-p",
         "--dport",
+        "--sport",
+        "--to-destination",
+        "--to-source",
         "-j",
         "--to-port",
         "--ctstate",
@@ -307,13 +310,47 @@ function firewallRule(line: string): string {
     negate = false;
   }
   check(!negate, "fc_firewall_rule");
-  return JSON.stringify(Object.entries(fields).sort());
+  return fields;
+}
+function firewallRule(line: string): string {
+  return JSON.stringify(Object.entries(firewallFields(line)).sort());
+}
+function hasDockerDns(output: string): boolean {
+  const first = output.trim().split("\n")[1];
+  return (
+    first !== undefined &&
+    firewallRule(first) ===
+      firewallRule("-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING")
+  );
 }
 export function verifyFcHostFirewall(
   actual: Record<string, string>,
   port: number,
 ) {
   const expected = fcHostFirewall(port);
+  if (hasDockerDns(actual.POSTROUTING ?? "")) {
+    const output = actual.DOCKER_OUTPUT?.trim().split("\n") ?? [];
+    const ports = ["tcp", "udp"].map((protocol, index) => {
+      const target = firewallFields(output[index + 1] ?? "")[
+        "--to-destination"
+      ];
+      const match = /^127\.0\.0\.11:([1-9][0-9]{0,4})$/.exec(target ?? "");
+      check(match && Number(match[1]) <= 65535, "fc_dns_port");
+      return { protocol, port: match[1]! };
+    });
+    expected.POSTROUTING!.unshift(
+      "-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING",
+    );
+    expected.OUTPUT = ["-A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT"];
+    expected.DOCKER_OUTPUT = ports.map(
+      ({ protocol, port }) =>
+        `-A DOCKER_OUTPUT -d 127.0.0.11/32 -p ${protocol} --dport 53 -j DNAT --to-destination 127.0.0.11:${port}`,
+    );
+    expected.DOCKER_POSTROUTING = ports.map(
+      ({ protocol, port }) =>
+        `-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p ${protocol} --sport ${port} -j SNAT --to-source :53`,
+    );
+  }
   check(
     Object.keys(actual).sort().join(",") ===
       Object.keys(expected).sort().join(","),
@@ -321,7 +358,11 @@ export function verifyFcHostFirewall(
   );
   for (const [chain, lines] of Object.entries(expected)) {
     const current = actual[chain]!.trim().split("\n");
-    check(current.shift() === `-P ${chain} ACCEPT`, "fc_firewall_policy");
+    check(
+      current.shift() ===
+        (chain.startsWith("DOCKER_") ? `-N ${chain}` : `-P ${chain} ACCEPT`),
+      "fc_firewall_policy",
+    );
     check(
       JSON.stringify(current.map(firewallRule)) ===
         JSON.stringify(lines.map(firewallRule)),
@@ -1561,6 +1602,19 @@ export class Engine {
           chain,
         ])
       ).toString();
+    if (hasDockerDns(actual.POSTROUTING!))
+      for (const chain of ["OUTPUT", "DOCKER_OUTPUT", "DOCKER_POSTROUTING"])
+        actual[chain] = (
+          await this.call([
+            "exec",
+            id,
+            "/usr/sbin/iptables",
+            "-t",
+            "nat",
+            "-S",
+            chain,
+          ])
+        ).toString();
     verifyFcHostFirewall(actual, this.inputs.registryPort);
     await put(
       join(
