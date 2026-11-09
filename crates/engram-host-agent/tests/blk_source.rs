@@ -76,6 +76,15 @@ fn read_at(device: &File, offset: u64, len: usize) -> Vec<u8> {
     buf.as_slice().to_vec()
 }
 
+/// A read off the runtime: the source's dispatch runs on it, so a read
+/// that blocks a runtime thread waits for itself.
+async fn read_off_runtime(device: &Arc<File>, offset: u64, len: usize) -> Vec<u8> {
+    let device = device.clone();
+    tokio::task::spawn_blocking(move || read_at(&device, offset, len))
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires root and the ublk_drv module"]
 async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
@@ -88,13 +97,13 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
         .await
         .unwrap();
     let path = source.path().to_path_buf();
-    let device = open_direct(&path);
+    let device = Arc::new(open_direct(&path));
     let image = image();
 
     // A guest read far from where the copy starts: served, and recorded.
     let at = 3 * CHUNK + 8192;
     assert_eq!(
-        read_at(&device, at, 4096),
+        read_off_runtime(&device, at, 4096).await,
         image[at as usize..at as usize + 4096]
     );
     assert_eq!(source.touched(), vec![3]);
@@ -102,7 +111,7 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
     // The copy's stream: the whole device, region by region, ascending.
     for at in (0..CHUNKS * CHUNK).step_by(REGION as usize) {
         assert_eq!(
-            read_at(&device, at, REGION as usize),
+            read_off_runtime(&device, at, REGION as usize).await,
             image[at as usize..(at + REGION) as usize],
             "region at {at}"
         );

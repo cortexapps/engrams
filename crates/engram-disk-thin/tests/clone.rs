@@ -99,7 +99,11 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
         .await
         .unwrap();
     let listed = pool.list().await.unwrap();
-    assert!(listed.contains(&name("io")) && listed.contains(&name("io-md")));
+    let metadata = VolumeName::new(format!("{}-md", name("io"))).unwrap();
+    assert!(
+        listed.contains(&name("io")) && listed.contains(&metadata),
+        "the device and its metadata thin are volumes of the pool: {listed:?}"
+    );
     assert_eq!(
         pool.open(&name("io")).await.unwrap().size_bytes,
         device.size_bytes
@@ -136,8 +140,9 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
         vec![1, 3, 5]
     );
     assert_eq!(mid.read_chunk(ChunkIndex(5)).await.unwrap(), fill(5));
-    let mid = mid.name.clone();
-    pool.delete(&mid).await.unwrap();
+    let mid_name = mid.name.clone();
+    drop(mid);
+    pool.delete(&mid_name).await.unwrap();
 
     pool.settle(&device.name, &dest).await.unwrap();
     assert_eq!(
@@ -146,9 +151,13 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
     );
     let after = pool.snapshot(&device, &name("after")).await.unwrap();
     assert_eq!(after.read_chunk(ChunkIndex(3)).await.unwrap(), fill(4));
-    let after = after.name.clone();
-    pool.delete(&after).await.unwrap();
-    assert!(!pool.list().await.unwrap().contains(&name("io-md")));
+    let after_name = after.name.clone();
+    drop(after);
+    pool.delete(&after_name).await.unwrap();
+    assert!(
+        !pool.list().await.unwrap().contains(&metadata),
+        "the settle deleted the metadata thin"
+    );
 
     assert_eq!(device.read_chunk(ChunkIndex(1)).await.unwrap(), fill(3));
     assert_eq!(device.read_chunk(ChunkIndex(5)).await.unwrap(), fill(5));
