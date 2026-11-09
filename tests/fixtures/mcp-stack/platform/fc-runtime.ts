@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import {
   lstat,
   readFile,
@@ -6,9 +7,17 @@ import {
   readlink,
   stat,
   appendFile,
+  open,
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { check, hash, put, readOwned } from "./owned.ts";
+import {
+  check,
+  hash,
+  put,
+  readOwned,
+  command,
+  childEnvironment,
+} from "./owned.ts";
 import type { Inputs } from "./preflight.ts";
 import {
   admitPool,
@@ -352,6 +361,25 @@ export function verifyFcKernelPosture(mountinfo: string, status: string) {
   );
   return mounts;
 }
+type DiskReadTarget = {
+  key: string;
+  identity: string;
+  process: FcProcess;
+  node: DeviceNode;
+  mapping: { name: string; device: string; table: string; id: number };
+  deviceFd: { pid: number; fd: string; rdev: string };
+};
+export function requireDiskReadCoverage(
+  prepared: ReadonlyMap<string, string>,
+  current: ReadonlyMap<string, string>,
+  observed: ReadonlySet<string>,
+) {
+  check(prepared.size > 0, "fc_disk_read_not_prepared");
+  for (const [key, identity] of prepared) {
+    check(current.get(key) === identity, "fc_disk_read_target");
+    check(observed.has(key), "fc_physical_boot_unobserved");
+  }
+}
 /** The runner owns the whole disposable kernel. Device cgroups cannot
  * isolate device-mapper control from other host workloads. */
 export class FcRuntime {
@@ -368,6 +396,8 @@ export class FcRuntime {
   private readonly bootReads = new Map<string, bigint>();
   private readonly ownedSandboxes = new Set<string>();
   private readonly retainedVolumes = new Map<string, string>();
+  private diskReadTargets = new Map<string, DiskReadTarget>();
+  private preparedDiskReads = new Map<string, string>();
   constructor(
     readonly inventory: FcInventory,
     private readonly inputs: Inputs,
@@ -549,10 +579,111 @@ export class FcRuntime {
       check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
       return;
     }
-    const previous = this.observation;
-    const current = previous.catch(() => {}).then(() => this.observeOnce());
-    this.observation = current;
+    return this.withObservation(() => this.observeOnce());
+  }
+  private withObservation<T>(work: () => Promise<T>): Promise<T> {
+    const current = this.observation.catch(() => {}).then(work);
+    this.observation = current.then(
+      () => {},
+      () => {},
+    );
     return current;
+  }
+  async prepareDiskRead() {
+    check(!this.storageAccess.inspectionActive, "fc_pool_inspection_busy");
+    return this.withObservation(async () => {
+      check(this.preparedDiskReads.size === 0, "fc_disk_read_pending");
+      await this.observeOnce();
+      const targets = [...this.diskReadTargets.values()];
+      check(targets.length > 0, "fc_disk_read_boots");
+      for (const target of targets) await this.flushDiskReadTarget(target);
+      // No fixture FD may remain when the normal foreign-FD check runs.
+      await this.observeOnce();
+      for (const target of targets) {
+        check(
+          this.diskReadTargets.get(target.key)?.identity === target.identity,
+          "fc_disk_read_target",
+        );
+        if (this.requiredBoots.has(target.key))
+          this.preparedDiskReads.set(target.key, target.identity);
+      }
+      check(this.preparedDiskReads.size > 0, "fc_disk_read_boots");
+    });
+  }
+  async verifyDiskRead() {
+    check(!this.storageAccess.inspectionActive, "fc_pool_inspection_busy");
+    return this.withObservation(async () => {
+      await this.observeOnce();
+      requireDiskReadCoverage(
+        this.preparedDiskReads,
+        new Map(
+          [...this.diskReadTargets].map(([key, target]) => [
+            key,
+            target.identity,
+          ]),
+        ),
+        this.observations,
+      );
+      this.preparedDiskReads.clear();
+    });
+  }
+  private async flushDiskReadTarget(target: DiskReadTarget) {
+    const handle = await open(
+      target.node.path,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    try {
+      const verify = async () => {
+        const state = await handle.stat({ bigint: true });
+        check(
+          state.isBlockDevice() &&
+            state.uid === 0n &&
+            String(state.ino) === target.node.ino &&
+            String(state.rdev) === target.node.rdev,
+          "fc_disk_read_target",
+        );
+        const pool = await inspectPool(this.inventory.pool);
+        verifyPoolIdentity(this.inventory.pool, pool);
+        const mapping = pool.mappings.find(
+          (m) => m.name === target.mapping.name,
+        );
+        check(
+          mapping &&
+            mapping.device === target.mapping.device &&
+            mapping.id === target.mapping.id &&
+            mapping.table === target.mapping.table,
+          "fc_disk_read_target",
+        );
+        verifyFcProcessIdentity(
+          target.process,
+          await processIdentity(
+            target.process.pid,
+            this.inventory.bootId,
+            true,
+          ),
+        );
+        const fd = await stat(
+          `/proc/${target.process.pid}/fd/${target.deviceFd.fd}`,
+          { bigint: true },
+        );
+        check(
+          fd.isBlockDevice() && String(fd.rdev) === target.node.rdev,
+          "fc_rootfs_device_fd_changed",
+        );
+      };
+      await verify();
+      // The adapter keeps this descriptor open. The child opens the pinned
+      // descriptor through proc, never a mutable or caller-selected device path.
+      await command(
+        "/usr/sbin/blockdev",
+        ["--flushbufs", `/proc/${process.pid}/fd/${handle.fd}`],
+        "/",
+        childEnvironment("/"),
+      );
+      await verify();
+    } finally {
+      await handle.close();
+    }
   }
   private async observeOnce() {
     check(!this.evidenceWriteFailed, "fc_physical_evidence_write");
@@ -584,6 +715,7 @@ export class FcRuntime {
       "fc_thin_foreign_fd",
     );
     const seenProcesses = new Set<number>();
+    const diskReadTargets = new Map<string, DiskReadTarget>();
     const work = join(this.root, "host");
     const candidates: BootCandidate[] = [];
     for (const name of (await readdir(work)).filter((v) => uuid.test(v))) {
@@ -734,6 +866,14 @@ export class FcRuntime {
         (fd) => fd.pid === process.pid && fd.rdev === node.rdev,
       );
       check(deviceFd, "fc_rootfs_device_fd");
+      diskReadTargets.set(key, {
+        key,
+        identity,
+        process,
+        node,
+        mapping,
+        deviceFd,
+      });
       // A newly allocated thin device starts counters at zero. Bind the
       // counters to this boot's exact table, thin id and process birth.
       const readSectorsBefore = this.bootReads.get(key);
@@ -811,6 +951,7 @@ export class FcRuntime {
         this.retainedVolumes.set(mapping.name, JSON.stringify(mapping));
       }
     }
+    this.diskReadTargets = diskReadTargets;
   }
   // The path is fixed. This seam permits controlled write-failure tests;
   // observe calls it only after all physical checks pass.

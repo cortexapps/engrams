@@ -48,7 +48,13 @@ export type SupervisorStatus = z.infer<typeof StatusSchema>;
 export class Supervisor {
   constructor(private readonly ctx: Context) {}
   private async call(
-    operation: "status" | "restart" | "stop" | "infrastructure-ready",
+    operation:
+      | "status"
+      | "restart"
+      | "stop"
+      | "infrastructure-ready"
+      | "prepare-disk-read"
+      | "verify-disk-read",
     role?: MutableRole,
     configurationId?: ConfigurationId,
   ): Promise<SupervisorStatus> {
@@ -168,6 +174,12 @@ export class Supervisor {
       }
     }
     return state;
+  }
+  async prepareDiskRead() {
+    await this.call("prepare-disk-read");
+  }
+  async verifyDiskRead() {
+    await this.call("verify-disk-read");
   }
   async infrastructureReady() {
     return this.call("infrastructure-ready");

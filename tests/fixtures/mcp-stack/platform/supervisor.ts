@@ -30,6 +30,8 @@ import {
 export type Operation = { version: 1; runId: string } & (
   | { operation: "status" }
   | { operation: "infrastructure-ready" }
+  | { operation: "prepare-disk-read" }
+  | { operation: "verify-disk-read" }
   | { operation: "stop"; role: MutableRole }
   | {
       operation: "restart";
@@ -44,6 +46,14 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
     ["role", "configurationId"],
   );
   check(base.version === 1 && base.runId === ctx.runId, "supervisor_run");
+  if (
+    base.operation === "prepare-disk-read" ||
+    base.operation === "verify-disk-read"
+  ) {
+    record(base, ["version", "runId", "operation"]);
+    check(ctx.backend === "firecracker", "supervisor_storage_checkpoint");
+    return { version: 1, runId: ctx.runId, operation: base.operation };
+  }
   if (
     base.operation === "status" ||
     base.operation === "infrastructure-ready"
@@ -98,6 +108,8 @@ export function parseOperation(value: unknown, ctx: Context): Operation {
 export type Lifecycle = {
   status(signal: AbortSignal): Promise<SupervisorStatus>;
   infrastructureReady?(signal: AbortSignal): Promise<void>;
+  prepareDiskRead?(signal: AbortSignal): Promise<void>;
+  verifyDiskRead?(signal: AbortSignal): Promise<void>;
   restart(
     role: MutableRole,
     configuration: ConfigurationId,
@@ -205,6 +217,10 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
     "orchestrator_readiness",
     "coordinator_readiness",
     // Fixed physical observation, release and stopped-pool diagnostics.
+    "fc_disk_read_not_prepared",
+    "fc_disk_read_pending",
+    "fc_disk_read_target",
+    "fc_disk_read_boots",
     "fc_boot_device_changed",
     "fc_boot_process_duplicate",
     "fc_boot_volume_size",
@@ -419,6 +435,24 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         );
         phase = "lifecycle";
         await lifecycle.infrastructureReady(signal);
+      } else if (
+        operation.operation === "prepare-disk-read" ||
+        operation.operation === "verify-disk-read"
+      ) {
+        const action =
+          operation.operation === "prepare-disk-read"
+            ? lifecycle.prepareDiskRead
+            : lifecycle.verifyDiskRead;
+        check(
+          ctx.backend === "firecracker" && action,
+          "supervisor_storage_checkpoint",
+        );
+        check(
+          before.roles.every((r) => r.state === "running"),
+          "roles_before_restart",
+        );
+        phase = "lifecycle";
+        await action(signal);
       } else if (operation.operation === "restart") {
         check(
           before.roles.every((r) => r.state === "running"),
@@ -449,7 +483,10 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
         const changedRole =
           operation.operation === "infrastructure-ready"
             ? "host-agent"
-            : operation.role;
+            : operation.operation === "restart" ||
+                operation.operation === "stop"
+              ? operation.role
+              : undefined;
         if (current.role !== changedRole)
           check(
             current.bootId === prior.bootId &&
@@ -463,9 +500,9 @@ export async function startSupervisor(ctx: Context, lifecycle: Lifecycle) {
             current.state === "running" &&
               current.bootId !== prior.bootId &&
               current.configurationId ===
-                (operation.operation === "infrastructure-ready"
-                  ? "normal"
-                  : operation.configurationId),
+                (operation.operation === "restart"
+                  ? operation.configurationId
+                  : "normal"),
             "restart_identity",
           );
         else check(current.state === "stopped", "stop_identity");

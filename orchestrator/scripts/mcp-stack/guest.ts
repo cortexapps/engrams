@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { randomBytes } from "node:crypto";
 import { posix } from "node:path";
 import { requireThat, RunnerFailure, sha256, type Context } from "./context.ts";
 import type { PublicClient } from "./transport.ts";
+import { Supervisor } from "./supervisor.ts";
 
 export function canonicalJson(value: unknown): string {
   if (
@@ -251,7 +253,7 @@ export async function guestExec(
 
 export async function guestReady(
   ctx: Context,
-  client: PublicClient,
+  client: GuestExecClient,
   sessionId: string,
 ) {
   const response = await guestExec(ctx, client, sessionId, [
@@ -260,6 +262,71 @@ export async function guestReady(
     'test -d /tmp/mcp-stack-fixture && test ! -L /tmp/mcp-stack-fixture && test "$(stat -c %a /tmp/mcp-stack-fixture)" = 700',
   ]);
   requireThat(response.status === 0, "guest_fixture_directory_ready");
+  if (ctx.backend !== "firecracker") return;
+  const path = `/tmp/mcp-stack-fixture/disk-read-${randomBytes(16).toString("hex")}.bin`;
+  const created = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    `set -eu
+root=/tmp/mcp-stack-fixture
+test -d "$root" && test ! -L "$root"
+test "$(stat -c %a "$root")" = 700
+test "$(stat -c %u "$root")" = "$(id -u)"
+test "$(stat -c %d "$root")" = "$(stat -c %d /)"
+umask 077
+dd if=/dev/zero of="$1" bs=4096 count=1 conv=excl,fsync status=none
+test -f "$1" && test ! -L "$1"
+test "$(stat -c %h "$1")" = 1
+test "$(stat -c %u "$1")" = "$(id -u)"
+test "$(stat -c %a "$1")" = 600
+test "$(stat -c %s "$1")" = 4096
+test "$(stat -c %b "$1")" -ge 8
+`,
+    "fixture-disk-read-create",
+    path,
+  ]);
+  requireThat(
+    created.status === 0 && created.stdout.length === 0,
+    "guest_disk_read_file",
+  );
+  const supervisor = new Supervisor(ctx);
+  await supervisor.prepareDiskRead();
+  const read = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    `set -eu
+test -f "$1" && test ! -L "$1"
+test "$(stat -c %h "$1")" = 1
+test "$(stat -c %u "$1")" = "$(id -u)"
+test "$(stat -c %a "$1")" = 600
+test "$(stat -c %s "$1")" = 4096
+test "$(stat -c %d "$1")" = "$(stat -c %d /)"
+dd if="$1" iflag=direct,nofollow bs=4096 count=1 status=none
+`,
+    "fixture-disk-read",
+    path,
+  ]);
+  requireThat(
+    read.status === 0 && read.stdout.equals(Buffer.alloc(4096)),
+    "guest_disk_read_complete",
+  );
+  await supervisor.verifyDiskRead();
+  const removed = await guestExec(ctx, client, sessionId, [
+    "/bin/sh",
+    "-c",
+    `set -eu
+test -f "$1" && test ! -L "$1"
+test "$(stat -c %h "$1")" = 1
+test "$(stat -c %u "$1")" = "$(id -u)"
+rm -- "$1"
+`,
+    "fixture-disk-read-remove",
+    path,
+  ]);
+  requireThat(
+    removed.status === 0 && removed.stdout.length === 0,
+    "guest_disk_read_cleanup",
+  );
 }
 
 export function guestHarnessPath(ctx: Context) {

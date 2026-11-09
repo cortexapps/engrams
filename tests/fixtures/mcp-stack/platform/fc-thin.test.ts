@@ -302,9 +302,8 @@ test("release keeps only recorded closed image/checkpoint volumes with exact ide
 });
 
 test("managed boot selects only the current exact API socket and retains its disk contract", async () => {
-  const { managedBootPaths, selectManagedProcess } = await import(
-    "./fc-runtime.ts"
-  );
+  const { managedBootPaths, selectManagedProcess } =
+    await import("./fc-runtime.ts");
   const sandbox = "11111111-1111-4111-8111-111111111111";
   const one = managedBootPaths("/owned/host", sandbox, "boot-1");
   const next = managedBootPaths("/owned/host", sandbox, "boot-2");
@@ -505,4 +504,27 @@ test("offline reservation excludes a host restart until release and invalidates 
       async () => "",
     ),
   ).rejects.toThrow("fc_pool_host_not_quiescent");
+});
+
+test("disk read acknowledgement requires the same live boot and its measured read proof", async () => {
+  const { requireDiskReadCoverage } = await import("./fc-runtime.ts");
+  const ordinary = "sandbox:ordinary-10";
+  const identity = "exact-table-thin-id-device-fd-process-birth";
+  const prepared = new Map([[ordinary, identity]]);
+  expect(() =>
+    requireDiskReadCoverage(prepared, prepared, new Set([ordinary])),
+  ).not.toThrow();
+  expect(() => requireDiskReadCoverage(prepared, prepared, new Set())).toThrow(
+    "fc_physical_boot_unobserved",
+  );
+  for (const current of [
+    new Map<string, string>(),
+    new Map([[ordinary, "replacement"]]),
+  ])
+    expect(() =>
+      requireDiskReadCoverage(prepared, current, new Set([ordinary])),
+    ).toThrow("fc_disk_read_target");
+  expect(() =>
+    requireDiskReadCoverage(new Map(), prepared, new Set([ordinary])),
+  ).toThrow("fc_disk_read_not_prepared");
 });

@@ -331,12 +331,14 @@ export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
       );
       actors.add(identity.userId);
     } catch (error) {
-      if (!(
-        error &&
-        typeof error === "object" &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ))
+      if (
+        !(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "ENOENT"
+        )
+      )
         throw error;
     }
   }
@@ -353,12 +355,14 @@ export async function destroyRunSessions(ctx: Context, admin: PublicClient) {
       check(identity.userId, "cleanup_key_identity");
       actors.add(identity.userId);
     } catch (error) {
-      if (!(
-        error &&
-        typeof error === "object" &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ))
+      if (
+        !(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "ENOENT"
+        )
+      )
         throw error;
     }
   }
@@ -627,6 +631,16 @@ export async function main(args: string[]) {
       const uri = await publishGuest(inputs, root, engine!);
       await enableGuest(ctx, identity, uri, inputs.images.guest.manifestDigest);
       supervisor = await startContextSupervisor(ctx, {
+        prepareDiskRead: (signal) =>
+          engine!.controlled(signal, async () => {
+            check(engine!.fc, "fc_inventory_missing");
+            await engine!.fc.prepareDiskRead();
+          }),
+        verifyDiskRead: (signal) =>
+          engine!.controlled(signal, async () => {
+            check(engine!.fc, "fc_inventory_missing");
+            await engine!.fc.verifyDiskRead();
+          }),
         infrastructureReady: (signal) =>
           engine!.controlled(signal, async () => {
             check(engine!.fc, "fc_inventory_missing");

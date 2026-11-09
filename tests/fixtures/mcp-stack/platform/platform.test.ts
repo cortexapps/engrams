@@ -1930,6 +1930,79 @@ for (const known of [true, false])
     }
   });
 
+for (const operation of ["prepare-disk-read", "verify-disk-read"] as const)
+  test(`FC disk read control is fixed, authenticated and preserves roles (${operation})`, async () => {
+    const { Supervisor } =
+      await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+    const ctx = await context();
+    const body = { version: 1, runId: ctx.runId, operation } as const;
+    expect(() => parseOperation(body, ctx)).toThrow();
+    ctx.backend = "firecracker";
+    expect(parseOperation(body, ctx)).toEqual(body);
+    for (const extra of [
+      { path: "/dev/foreign" },
+      { pid: 1 },
+      { role: "host-agent" },
+    ])
+      expect(() => parseOperation({ ...body, ...extra }, ctx)).toThrow();
+    let prepared = 0;
+    let verified = 0;
+    const server = await startSupervisor(ctx, {
+      status: async () => status(ctx),
+      restart: async () => {
+        throw Error("unexpected restart");
+      },
+      stop: async () => {
+        throw Error("unexpected stop");
+      },
+      prepareDiskRead: async () => {
+        prepared++;
+      },
+      verifyDiskRead: async () => {
+        verified++;
+      },
+    });
+    try {
+      const client = new Supervisor(ctx);
+      if (operation === "prepare-disk-read") await client.prepareDiskRead();
+      else await client.verifyDiskRead();
+      expect([prepared, verified]).toEqual(
+        operation === "prepare-disk-read" ? [1, 0] : [0, 1],
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+test("FC disk read control rejects an unrelated service restart", async () => {
+  const { Supervisor } =
+    await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+  const ctx = await context();
+  ctx.backend = "firecracker";
+  let changed = false;
+  const server = await startSupervisor(ctx, {
+    status: async () => {
+      const current = status(ctx);
+      if (changed)
+        current.roles.find((r) => r.role === "worker")!.bootId =
+          "foreign-restart";
+      return current;
+    },
+    prepareDiskRead: async () => {
+      changed = true;
+    },
+    restart: async () => {},
+    stop: async () => {},
+  });
+  try {
+    await expect(new Supervisor(ctx).prepareDiskRead()).rejects.toThrow(
+      "TRANSPORT_FAILED:supervisor",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
 for (const change of ["missing-host-restart", "other-role", "network"] as const)
   test(`FC infrastructure checkpoint rejects an invalid restart transition (${change})`, async () => {
     const { Supervisor } =
