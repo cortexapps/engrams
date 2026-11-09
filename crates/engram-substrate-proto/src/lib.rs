@@ -263,12 +263,11 @@ mod tests {
             let back: ToWriter = read_frame(&mut buf.as_slice()).unwrap();
             assert_eq!(back, m);
         }
-        for m in [FromWriter::Filled { len: 524_288 }] {
-            let mut buf = Vec::new();
-            write_frame(&mut buf, &m).unwrap();
-            let back: FromWriter = read_frame(&mut buf.as_slice()).unwrap();
-            assert_eq!(back, m);
-        }
+        let filled = FromWriter::Filled { len: 524_288 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &filled).unwrap();
+        let back: FromWriter = read_frame(&mut buf.as_slice()).unwrap();
+        assert_eq!(back, filled);
     }
 
     /// Both ends decode these variants by position, so their encodings
