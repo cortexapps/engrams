@@ -2,6 +2,7 @@
 //! coordinator that still serves, so it uses only RPCs the previous release
 //! has.
 
+use std::future::Future;
 use std::time::Duration;
 
 use engram_core::HostId;
@@ -55,6 +56,49 @@ pub fn channel(endpoint: &str, call_timeout: Duration) -> Channel {
         .connect_lazy()
 }
 
+/// How often one call tries a coordinator that answers `Unavailable`, and the
+/// wait between tries: about a minute in all. The hook can start while the
+/// coordinator rolls, when the Service still routes to a stopping pod; the
+/// Helm hook timeout bounds the whole drain.
+const UNAVAILABLE_ATTEMPTS: u32 = 30;
+const UNAVAILABLE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Run one coordinator call, again on `Unavailable` (connection refused or
+/// reset, no ready endpoint) up to `attempts` times. Any other status fails
+/// at once. The drain re-reads the fleet each pass, so a call that reached
+/// the coordinator before the error is safe to send again.
+async fn retry_unavailable<T, F, Fut>(
+    op: &'static str,
+    attempts: u32,
+    backoff: Duration,
+    mut call: F,
+) -> Result<T, DrainError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let mut attempt = 1;
+    loop {
+        match call().await {
+            Ok(resp) => return Ok(resp.into_inner()),
+            Err(status) if status.code() == tonic::Code::Unavailable && attempt < attempts => {
+                tracing::warn!(op, attempt, error = %status, "coordinator unavailable; retrying");
+                attempt += 1;
+                tokio::time::sleep(backoff).await;
+            }
+            Err(status) => return Err(DrainError::rpc(op, status)),
+        }
+    }
+}
+
+async fn call<T, F, Fut>(op: &'static str, call: F) -> Result<T, DrainError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    retry_unavailable(op, UNAVAILABLE_ATTEMPTS, UNAVAILABLE_BACKOFF, call).await
+}
+
 pub fn parse_host_id(id: &str) -> Result<HostId, DrainError> {
     id.parse()
         .map_err(|_| DrainError::Invalid(format!("coordinator returned malformed host id {id:?}")))
@@ -103,14 +147,12 @@ impl Coordinator {
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<UpgradeHost>, DrainError> {
-        let resp = self
-            .fleet
-            .clone()
-            .list_hosts(app::ListHostsRequest {})
-            .await
-            .map_err(|status| DrainError::rpc("list_hosts", status))?;
-        resp.into_inner()
-            .hosts
+        let resp = call("list_hosts", || {
+            let mut fleet = self.fleet.clone();
+            async move { fleet.list_hosts(app::ListHostsRequest {}).await }
+        })
+        .await?;
+        resp.hosts
             .into_iter()
             .map(|v| {
                 Ok(UpgradeHost {
@@ -125,26 +167,25 @@ impl Coordinator {
     }
 
     pub async fn cordon(&self, host: HostId, owner: &str) -> Result<(), DrainError> {
-        self.fleet
-            .clone()
-            .cordon_host(app::CordonHostRequest {
+        call("cordon", || {
+            let mut fleet = self.fleet.clone();
+            let req = app::CordonHostRequest {
                 owner: owner.into(),
                 host_id: host.to_string(),
-            })
-            .await
-            .map_err(|status| DrainError::rpc("cordon", status))?;
+            };
+            async move { fleet.cordon_host(req).await }
+        })
+        .await?;
         Ok(())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<UpgradeSession>, DrainError> {
-        let resp = self
-            .sessions
-            .clone()
-            .list_sessions(app::ListSessionsRequest {})
-            .await
-            .map_err(|status| DrainError::rpc("list_sessions", status))?;
-        resp.into_inner()
-            .sessions
+        let resp = call("list_sessions", || {
+            let mut sessions = self.sessions.clone();
+            async move { sessions.list_sessions(app::ListSessionsRequest {}).await }
+        })
+        .await?;
+        resp.sessions
             .into_iter()
             .filter_map(|item| item.session)
             .map(|s| {
@@ -159,49 +200,113 @@ impl Coordinator {
 
     /// Whether the session has a checkpoint it can resume from.
     pub async fn has_checkpoint(&self, id: &str) -> Result<bool, DrainError> {
-        let resp = self
-            .sessions
-            .clone()
-            .list_checkpoints(app::ListCheckpointsRequest {
+        let resp = call("list_checkpoints", || {
+            let mut sessions = self.sessions.clone();
+            let req = app::ListCheckpointsRequest {
                 session_id: id.into(),
-            })
-            .await
-            .map_err(|status| DrainError::rpc("list_checkpoints", status))?;
-        Ok(resp.into_inner().checkpoints.iter().any(|c| c.recoverable))
+            };
+            async move { sessions.list_checkpoints(req).await }
+        })
+        .await?;
+        Ok(resp.checkpoints.iter().any(|c| c.recoverable))
     }
 
     pub async fn snapshot(&self, id: &str) -> Result<(), DrainError> {
-        self.sessions
-            .clone()
-            .snapshot(app::SnapshotRequest {
+        call("snapshot", || {
+            let mut sessions = self.sessions.clone();
+            let req = app::SnapshotRequest {
                 session_id: id.into(),
-            })
-            .await
-            .map_err(|status| DrainError::rpc("snapshot", status))?;
+            };
+            async move { sessions.snapshot(req).await }
+        })
+        .await?;
         Ok(())
     }
 
     pub async fn resume(&self, id: &str) -> Result<(), DrainError> {
-        self.sessions
-            .clone()
-            .resume(app::ResumeRequest {
+        call("resume", || {
+            let mut sessions = self.sessions.clone();
+            let req = app::ResumeRequest {
                 session_id: id.into(),
-            })
-            .await
-            .map_err(|status| DrainError::rpc("resume", status))?;
+            };
+            async move { sessions.resume(req).await }
+        })
+        .await?;
         Ok(())
     }
 
     /// The eviction that does not park: the session ends `idle` behind a
     /// fresh checkpoint, its VM destroyed.
     pub async fn evict(&self, id: &str) -> Result<(), DrainError> {
-        self.sessions
-            .clone()
-            .evict_local(app::EvictLocalRequest {
+        call("evict_local", || {
+            let mut sessions = self.sessions.clone();
+            let req = app::EvictLocalRequest {
                 session_id: id.into(),
-            })
-            .await
-            .map_err(|status| DrainError::rpc("evict_local", status))?;
+            };
+            async move { sessions.evict_local(req).await }
+        })
+        .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// A call that answers each status of `script` in turn, then `Ok(7)`.
+    fn scripted(
+        script: Vec<tonic::Code>,
+        calls: &AtomicU32,
+    ) -> impl FnMut() -> std::future::Ready<Result<tonic::Response<u32>, tonic::Status>> + '_ {
+        move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+            std::future::ready(match script.get(n) {
+                Some(code) => Err(tonic::Status::new(*code, "scripted")),
+                None => Ok(tonic::Response::new(7)),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_coordinator_is_tried_again_until_it_answers() {
+        let calls = AtomicU32::new(0);
+        let script = vec![tonic::Code::Unavailable, tonic::Code::Unavailable];
+        let got = retry_unavailable("list_hosts", 5, Duration::ZERO, scripted(script, &calls))
+            .await
+            .unwrap();
+        assert_eq!((got, calls.load(Ordering::SeqCst)), (7, 3));
+    }
+
+    #[tokio::test]
+    async fn any_other_status_fails_at_once() {
+        let calls = AtomicU32::new(0);
+        let script = vec![tonic::Code::PermissionDenied];
+        let err = retry_unavailable("list_hosts", 5, Duration::ZERO, scripted(script, &calls))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::Rpc {
+                op: "list_hosts",
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_retries_stop_after_the_last_attempt() {
+        let calls = AtomicU32::new(0);
+        let script = vec![tonic::Code::Unavailable; 10];
+        let err = retry_unavailable("list_hosts", 3, Duration::ZERO, scripted(script, &calls))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DrainError::Rpc { status, .. } if status.code() == tonic::Code::Unavailable)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
