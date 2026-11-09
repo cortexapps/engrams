@@ -86,6 +86,39 @@ pub fn checkpoint_name(sandbox: SandboxId, role: DiskRole, manifest: ManifestRef
     ))
     .expect("a checkpoint volume name is at most 100 bytes of [a-z0-9-]")
 }
+/// How [`SessionVolumes`] brought up a role's disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagePath {
+    /// The role's checkpoint was already on this host.
+    Kept,
+    /// Only the chunks that changed, written onto a kept checkpoint.
+    OntoKept,
+    /// The delta from the image, written onto its staged volume.
+    FromImage,
+    /// Every chunk, written into an empty volume: the image's volume is
+    /// not on this host.
+    Whole,
+    /// A snapshot of a manifest this host had staged.
+    StagedSnapshot,
+    /// A fork of the image's volume.
+    ImageFork,
+    /// A new empty volume.
+    Empty,
+}
+
+impl StagePath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StagePath::Kept => "kept",
+            StagePath::OntoKept => "onto_kept",
+            StagePath::FromImage => "from_image",
+            StagePath::Whole => "whole",
+            StagePath::StagedSnapshot => "staged_snapshot",
+            StagePath::ImageFork => "image_fork",
+            StagePath::Empty => "empty",
+        }
+    }
+}
 
 fn transient_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
     VolumeName::new(format!(
@@ -185,8 +218,11 @@ impl Source {
 pub struct Provisioned {
     pub root: PathBuf,
     pub root_manifest: ManifestRef,
+    /// How the root disk came up.
+    pub root_stage: StagePath,
     pub swap: Option<PathBuf>,
     pub swap_manifest: Option<ManifestRef>,
+    pub swap_stage: Option<StagePath>,
 }
 
 /// A snapshot taken under the guest pause, not yet published. Dropping
@@ -297,20 +333,24 @@ impl SessionVolumes {
                 Some(source) => self
                     .provision_role(&fill, sandbox, DiskRole::Swap, source)
                     .await
-                    .map(|(path, manifest)| (Some(path), Some(manifest))),
-                None => Ok((None, None)),
+                    .map(|(path, manifest, stage)| (Some(path), Some(manifest), Some(stage))),
+                None => Ok((None, None, None)),
             }
         };
         match tokio::join!(
             self.provision_role(&fill, sandbox, DiskRole::Root, root),
             swap
         ) {
-            (Ok((root, root_manifest)), Ok((swap, swap_manifest))) => Ok(Provisioned {
-                root,
-                root_manifest,
-                swap,
-                swap_manifest,
-            }),
+            (Ok((root, root_manifest, root_stage)), Ok((swap, swap_manifest, swap_stage))) => {
+                Ok(Provisioned {
+                    root,
+                    root_manifest,
+                    root_stage,
+                    swap,
+                    swap_manifest,
+                    swap_stage,
+                })
+            }
             (Err(error), _) | (_, Err(error)) => {
                 let _ = self.purge(sandbox).await;
                 Err(error)
@@ -334,10 +374,10 @@ impl SessionVolumes {
         sandbox: SandboxId,
         role: DiskRole,
         source: Source,
-    ) -> io::Result<(PathBuf, ManifestRef)> {
+    ) -> io::Result<(PathBuf, ManifestRef, StagePath)> {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
-        let (checkpoint, lineage) = match source {
+        let ((checkpoint, lineage), path) = match source {
             Source::Image { manifest } => {
                 let wanted = self
                     .fill
@@ -350,7 +390,10 @@ impl SessionVolumes {
                     .fork(manifest, &tmp)
                     .instrument(tracing::info_span!("disk.image_fork"))
                     .await?;
-                self.new_lineage(&tmp, sandbox, role, &wanted).await?
+                (
+                    self.new_lineage(&tmp, sandbox, role, &wanted).await?,
+                    StagePath::ImageFork,
+                )
             }
             Source::Fork { manifest, base } => {
                 let wanted = self
@@ -360,21 +403,28 @@ impl SessionVolumes {
                     .instrument(tracing::info_span!("disk.manifest_get"))
                     .await
                     .map_err(store_err)?;
-                match self.staged(manifest).await {
-                    Some((origin, _)) => self.disk.snapshot(&origin, &tmp).await?,
+                let path = match self.staged(manifest).await {
+                    Some((origin, _)) => {
+                        self.disk.snapshot(&origin, &tmp).await?;
+                        StagePath::StagedSnapshot
+                    }
                     None => {
                         self.stage_into(fill, &tmp, &wanted, base)
                             .instrument(tracing::info_span!("disk.stage"))
                             .await?
+                            .1
                     }
                 };
-                self.new_lineage(&tmp, sandbox, role, &wanted).await?
+                (self.new_lineage(&tmp, sandbox, role, &wanted).await?, path)
             }
             Source::Continue { manifest, base } => {
                 match self.kept(sandbox, role, manifest).await? {
                     Some((owner, volume, _, held)) if held == manifest => (
-                        self.adopt(owner, volume, sandbox, role, held).await?,
-                        manifest,
+                        (
+                            self.adopt(owner, volume, sandbox, role, held).await?,
+                            manifest,
+                        ),
+                        StagePath::Kept,
                     ),
                     kept => {
                         let wanted = self
@@ -384,7 +434,7 @@ impl SessionVolumes {
                             .instrument(tracing::info_span!("disk.manifest_get"))
                             .await
                             .map_err(store_err)?;
-                        match kept {
+                        let path = match kept {
                             Some((_, volume, held_manifest, _))
                                 if volume.size_bytes == wanted.total_bytes =>
                             {
@@ -397,15 +447,20 @@ impl SessionVolumes {
                                     Some((&volume, &held_manifest)),
                                 )
                                 .instrument(tracing::info_span!("disk.stage", onto_kept = true))
-                                .await?
+                                .await?;
+                                StagePath::OntoKept
                             }
                             _ => {
                                 self.stage_into(fill, &tmp, &wanted, base)
                                     .instrument(tracing::info_span!("disk.stage"))
                                     .await?
+                                    .1
                             }
                         };
-                        (self.commit(&tmp, sandbox, role, manifest).await?, manifest)
+                        (
+                            (self.commit(&tmp, sandbox, role, manifest).await?, manifest),
+                            path,
+                        )
                     }
                 }
             }
@@ -415,7 +470,10 @@ impl SessionVolumes {
                     chunk_size: ChunkSize::bytes(volume.chunk_size),
                     ..Manifest::empty(ManifestKind::Disk, size_bytes)
                 };
-                self.new_lineage(&tmp, sandbox, role, &manifest).await?
+                (
+                    self.new_lineage(&tmp, sandbox, role, &manifest).await?,
+                    StagePath::Empty,
+                )
             }
         };
         let live = self
@@ -423,7 +481,7 @@ impl SessionVolumes {
             .snapshot(&checkpoint, &live_name(sandbox, role))
             .instrument(tracing::info_span!("disk.live_snapshot"))
             .await?;
-        Ok((live.path, lineage))
+        Ok((live.path, lineage, path))
     }
 
     /// Start a lineage that holds `manifest`, whose bytes `tmp` holds,
@@ -540,19 +598,24 @@ impl SessionVolumes {
     }
 
     /// Write `wanted` into a new volume `name` through `fill`, from the
-    /// staged volume of `base` when this host has it.
+    /// staged volume of `base` when this host has it. Without it, every
+    /// chunk of `wanted` is written.
     async fn stage_into(
         &self,
         fill: &FillEngine,
         name: &VolumeName,
         wanted: &Manifest,
         base: Option<ManifestRef>,
-    ) -> io::Result<Volume> {
+    ) -> io::Result<(Volume, StagePath)> {
         let base = match base {
             Some(image) => self.staged(image).await,
             None => None,
         };
-        stage(
+        let path = match base {
+            Some(_) => StagePath::FromImage,
+            None => StagePath::Whole,
+        };
+        let volume = stage(
             self.disk.as_ref(),
             fill,
             Class::Demand,
@@ -560,7 +623,8 @@ impl SessionVolumes {
             wanted,
             base.as_ref().map(|(v, m)| (v, m)),
         )
-        .await
+        .await?;
+        Ok((volume, path))
     }
 
     /// The staged volume of an image and its manifest, when this host
