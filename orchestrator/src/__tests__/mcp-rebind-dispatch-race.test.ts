@@ -59,7 +59,9 @@ test("a rebind cannot expose a new binding while the old dispatch is in its fina
     await expect(
       service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId),
     ).rejects.toBeInstanceOf(McpRebindDraining);
+    await cold.restartRunOnce();
     cold.start();
+    await cold.restartRunOnce();
     await service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId);
     expect((await cold.store.read(f.sessionId)).session.mcpManagedLifecycle?.phase).toBe("started");
   } finally {
@@ -117,7 +119,9 @@ test("cancel and manual resolution do not waive the original in-flight intent", 
     await expect(
       service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId),
     ).rejects.toBeInstanceOf(McpRebindDraining);
+    await cold.restartRunOnce();
     cold.start();
+    await cold.restartRunOnce();
     await service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId);
     expect((await cold.store.read(f.sessionId)).session.mcpManagedLifecycle?.phase).toBe("started");
   } finally {
@@ -157,7 +161,9 @@ test("an expired original intent permits rebind and cannot send afterward", asyn
     await expect(
       service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId),
     ).rejects.toBeInstanceOf(McpRebindDraining);
+    await cold.restartRunOnce();
     cold.start();
+    await cold.restartRunOnce();
     await service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId);
     unblock();
     const outcome = await pending;
@@ -256,7 +262,9 @@ test("an accepted old call cannot cross the barrier after rebind", async () => {
     await expect(
       service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId),
     ).rejects.toBeInstanceOf(McpRebindDraining);
+    await cold.restartRunOnce();
     cold.start();
+    await cold.restartRunOnce();
     await service.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId);
     await f.driver.driveOnce(call.id).catch(() => undefined);
     expect((await f.command("stats")).calls).toBe(0);
@@ -289,9 +297,15 @@ test("a held cold host call allows another session to acquire a real worker cred
       enter();
       await blocked;
     });
-    pending = first.service
-      .commit(first.sessionId, first.snapshot.bindingHash, candidate.bindingHash, first.actorId)
-      .catch((error) => error);
+    await expect(
+      first.service.commit(
+        first.sessionId,
+        first.snapshot.bindingHash,
+        candidate.bindingHash,
+        first.actorId,
+      ),
+    ).rejects.toBeInstanceOf(McpRebindDraining);
+    pending = first.lifecycle.runOnce(first.sessionId);
     await entered;
     const call = await other.driver.acceptToolRequest(other.request);
     const result = await other.driver.driveOnce(call.id);
@@ -299,7 +313,15 @@ test("a held cold host call allows another session to acquire a real worker cred
     expect((await other.command("stats")).calls).toBe(1);
     expect(result.state).toBe("succeeded");
     release();
-    expect(await pending).toBeInstanceOf(McpRebindDraining);
+    await pending;
+    await expect(
+      first.service.commit(
+        first.sessionId,
+        first.snapshot.bindingHash,
+        candidate.bindingHash,
+        first.actorId,
+      ),
+    ).rejects.toBeInstanceOf(McpRebindDraining);
   } finally {
     release();
     await pending;

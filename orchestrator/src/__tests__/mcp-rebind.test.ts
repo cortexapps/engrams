@@ -13,7 +13,9 @@ async function finish(f: Awaited<ReturnType<typeof coldFixture>>, hash: string) 
   await expect(
     f.service.commit(f.sessionId, f.snapshot.bindingHash, hash, f.actorId),
   ).rejects.toBeInstanceOf(McpRebindDraining);
+  await f.restartRunOnce();
   f.start();
+  await f.restartRunOnce();
   return f.service.commit(f.sessionId, f.snapshot.bindingHash, hash, f.actorId);
 }
 
@@ -27,8 +29,11 @@ test("concurrent cold commits reserve one recovery and expose only its finalized
       ),
     );
     expect(results.every((r) => r.status === "rejected")).toBe(true);
+    expect(f.stats().recoveryIds).toBe(0);
+    await f.restartRunOnce();
     expect(f.stats().recoveryIds).toBe(1);
     f.start();
+    await f.restartRunOnce();
     const result = await f.service.commit(
       f.sessionId,
       f.snapshot.bindingHash,
@@ -220,7 +225,9 @@ test("typed rebind returns drain details and requires the exact reviewed candida
         McpRebindDrainReason.DISPATCH_IN_PROGRESS,
       );
     }
+    await f.restartRunOnce();
     f.start();
+    await f.restartRunOnce();
     const result = await client.rebindMcp({
       sessionId: f.sessionId,
       expectedBindingHash: f.snapshot.bindingHash,

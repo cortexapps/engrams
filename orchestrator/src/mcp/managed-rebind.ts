@@ -169,6 +169,7 @@ export function makeManagedRebind(deps: {
           (await lockHumanSession(tx, sessionId, actorId, true)).session.mcpManagedLifecycle,
       );
       if (!current) throw Error("MCP rebind source unavailable");
+      let recoveryId = current.recovery?.id;
       if (
         !(
           current.recovery?.expectedBindingHash === oldHash &&
@@ -181,11 +182,12 @@ export function makeManagedRebind(deps: {
           throw Error("stale MCP rebind candidate");
         if (prepared.drain) throw new McpRebindDraining(prepared.drain);
         const { pending: _pending, ...prior } = prepared.previous;
+        recoveryId = crypto.randomUUID();
         const next: ManagedLifecycle = {
           ...prior,
           phase: "recovering",
           recovery: {
-            id: crypto.randomUUID(),
+            id: recoveryId,
             actorId,
             sourceKey: prior.sourceKey!,
             expectedBindingHash: oldHash,
@@ -249,9 +251,17 @@ export function makeManagedRebind(deps: {
           if (rows.length !== 1) throw Error("MCP rebind reservation changed");
         });
       }
-      await deps.lifecycle.runOnce(sessionId);
       const value = (await deps.store.read(sessionId)).session.mcpManagedLifecycle;
-      if (value?.phase !== "started")
+      if (
+        !value?.recovery ||
+        value.recovery.id !== recoveryId ||
+        value.recovery.expectedBindingHash !== oldHash ||
+        value.recovery.candidateHash !== candidateHash ||
+        value.recovery.actorId !== actorId ||
+        !["started", "recovering", "finalizing"].includes(value.phase)
+      )
+        throw Error("MCP rebind reservation changed");
+      if (value.phase !== "started")
         throw new McpRebindDraining({
           reason: "dispatch_in_progress",
           retryAfter: new Date(deps.now().getTime() + 1000).toISOString(),
