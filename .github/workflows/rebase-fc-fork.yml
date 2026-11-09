@@ -35,6 +35,7 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+  packages: write   # publish the build-verified fork for the bump PR's CI
 
 concurrency:
   group: rebase-fc-fork
@@ -246,6 +247,33 @@ jobs:
           git tag -f "engram-${{ steps.target.outputs.latest }}" HEAD
           git -c "$auth" push --force origin "engram-${{ steps.target.outputs.latest }}"
           echo "Rebased onto ${{ steps.target.outputs.latest }} and pushed; fork HEAD=$(git rev-parse HEAD), tagged engram-${{ steps.target.outputs.latest }}"
+
+      # The bump PR's Firecracker CI runs the fork from this artifact (the
+      # fc-setup action pulls it by the gitlink SHA), so publish the binary
+      # the build-verify made before the PR opens. build-firecracker
+      # publishes the same tag again on merge.
+      - uses: oras-project/setup-oras@v2
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        with:
+          version: 1.3.0
+
+      - name: Publish the rebased fork to GHCR, keyed by fork SHA
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        working-directory: fc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FORK_SHA="$(git rev-parse HEAD)"
+          REPO="ghcr.io/${{ github.repository }}/firecracker"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p ../fc-dist
+          install -m 0755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker ../fc-dist/firecracker
+          cd ../fc-dist
+          oras push "$REPO:$FORK_SHA" \
+            --artifact-type application/vnd.engrams.firecracker.v1 \
+            firecracker:application/octet-stream
+          echo "Published forked firecracker -> $REPO:$FORK_SHA"
 
       # The engrams-automerge App (contents:write + pull_requests:write, scoped to
       # this repo) authors the bump branch + PR and enables auto-merge — the same
