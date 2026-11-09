@@ -1464,11 +1464,9 @@ test("command waits for retained same-group descendants after leader exit", asyn
       try {
         process.kill(-Number(group), "SIGKILL");
       } catch (error) {
-        if (!(
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "ESRCH"
-        ))
+        if (
+          !(error instanceof Error && "code" in error && error.code === "ESRCH")
+        )
           throw error;
       }
       const deadline = performance.now() + 1500;
@@ -1888,6 +1886,49 @@ test("FC infrastructure checkpoint has no caller-selected facts and invokes the 
     }
   }
 });
+
+for (const known of [true, false])
+  test(`FC infrastructure diagnostics retain only fixed release seams (${known ? "known" : "unknown"})`, async () => {
+    const { Supervisor } =
+      await import("../../../../orchestrator/scripts/mcp-stack/supervisor.ts");
+    const ctx = await context();
+    ctx.backend = "firecracker";
+    ctx.runRoot = dirname(ctx.supervisor.tokenFile);
+    ctx.supervisor.socket = join(ctx.runRoot, "s");
+    const seam = known
+      ? "fc_unreleased_volume"
+      : "fc_unreleased_volume_private_credential";
+    let inspected = 0;
+    const server = await startSupervisor(ctx, {
+      status: async () => status(ctx),
+      restart: async () => {},
+      stop: async () => {},
+      infrastructureReady: async () => {
+        inspected++;
+        throw new PlatformFailure("INVALID_CONTEXT", seam);
+      },
+    });
+    try {
+      await expect(new Supervisor(ctx).infrastructureReady()).rejects.toThrow(
+        "TRANSPORT_FAILED:supervisor",
+      );
+      expect(inspected).toBe(1);
+      const diagnostic = await readFile(
+        join(ctx.runRoot, "supervisor-failure-1.json"),
+        "utf8",
+      );
+      expect(JSON.parse(diagnostic)).toEqual({
+        version: 1,
+        operation: "infrastructure-ready",
+        phase: "lifecycle",
+        failure: known ? "INVALID_CONTEXT" : "OTHER",
+        seam: known ? "fc_unreleased_volume" : "other",
+      });
+      expect(diagnostic).not.toContain("private_credential");
+    } finally {
+      await server.close();
+    }
+  });
 
 for (const change of ["missing-host-restart", "other-role", "network"] as const)
   test(`FC infrastructure checkpoint rejects an invalid restart transition (${change})`, async () => {
