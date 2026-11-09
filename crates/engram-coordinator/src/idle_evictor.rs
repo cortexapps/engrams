@@ -23,6 +23,7 @@
 //! observe the resume op before routing.
 
 use engram_core::traits::SandboxBackend;
+use engram_core::types::host::HostHeadroom;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
@@ -141,56 +142,37 @@ async fn park_paused_bookkeeping(
 }
 
 /// ADR 0074 rung 2: does the session's host have memory headroom to
-/// keep a VM PAUSED (rung 2) rather than fully evicting it? Reads the
-/// heartbeat-persisted `hosts.utilization`. Fails CLOSED (no headroom →
-/// full eviction) on a telemetry gap: a paused VM frees no RAM, so
-/// parking under UNKNOWN pressure is the dangerous direction (it could
-/// leave the host overcommitted), the mirror of the idle detector's
-/// fail-open-toward-eviction.
-///
-/// Headroom threshold reuses the detector's mem floor (default 15% free)
-/// plus a margin, so a host that is not "under pressure" for eviction
-/// purposes has room to hold a paused VM.
+/// keep a VM PAUSED (rung 2) rather than fully evicting it? The host's
+/// unreserved RAM ([`HostHeadroom::free_pct`], the same accounting
+/// placement reserves against) must be at least
+/// `ENGRAM_PARK_HEADROOM_FLOOR_PCT` of its total. A parked VM keeps its
+/// reservation, so a host full of parks reads full here exactly as it does
+/// to placement, and the reaper descends them for the sessions that wait.
+/// Fails CLOSED (no headroom → full eviction) on an unmeasured host or a
+/// read error: a paused VM frees no RAM, so parking under unknown pressure
+/// is the dangerous direction.
 async fn host_has_memory_headroom(state: &SharedState, session_id: SessionId) -> bool {
     // Resolve the host through PG, NOT the in-memory `host_registry`: this
     // runs on whichever coord replica took the RPC / scanner tick, and a
     // replica that never cached the sandbox→host bind would fail closed
     // here — silently degrading every park into a full eviction on that
     // pod (a coin flip in a 2-replica deployment).
-    let host_id = match state.services.meta.get_session(session_id).await {
-        Ok(s) => s.host_id,
-        Err(_) => return false,
-    };
-    let Some(host_id) = host_id else {
+    let meta = &state.services.meta;
+    let Ok(Some(host_id)) = meta.get_session(session_id).await.map(|s| s.host_id) else {
         return false;
     };
-    let hosts = match state.services.meta.list_active_hosts().await {
-        Ok(h) => h,
-        Err(_) => return false,
+    let (Ok(hosts), Ok(reserved)) = (
+        meta.list_active_hosts().await,
+        meta.per_host_reserved().await,
+    ) else {
+        return false;
     };
     let Some(host) = hosts.into_iter().find(|h| h.id == host_id) else {
         return false;
     };
-    let u = &host.utilization;
-    if u.mem_total_mib == 0 {
-        return false; // unmeasured → fail closed (no parking)
-    }
-    // Prefer the RAM ledger's `allocatable_mib` (issue #540): it already
-    // nets out other parked-but-resident VMs' PSS, so parking decisions
-    // don't double-count a host that is already holding parked sandboxes
-    // (which is exactly how a naive `total − used` would over-park a host
-    // into pressure). Fall back to raw physical free on pre-ledger /
-    // non-Linux hosts where `allocatable_mib == 0`.
-    let free_mib = if u.allocatable_mib > 0 {
-        u.allocatable_mib
-    } else {
-        u.mem_total_mib.saturating_sub(u.mem_used_mib)
-    };
-    let free_pct = free_mib.saturating_mul(100) / u.mem_total_mib;
-    // A comfortable margin above the eviction floor: only park when the
-    // host has real slack, so parked residency can't tip it into
-    // pressure.
-    free_pct as u8 >= park_headroom_floor_pct()
+    HostHeadroom::of(&host, reserved.get(&host_id).copied().unwrap_or_default())
+        .free_pct(host.utilization.mem_total_mib)
+        .is_some_and(|pct| pct >= park_headroom_floor_pct())
 }
 
 /// Free-RAM percent above which a host will PARK (rung 2) instead of
@@ -3279,8 +3261,8 @@ mod tests {
     /// ADR 0074 rung 2: push a `HostRecord` into the mock's
     /// `list_active_hosts` set whose id matches the registry host that
     /// owns `sandbox_id`, with a memory utilization that either has or
-    /// lacks parking headroom. `free_mib` feeds `allocatable_mib` (the
-    /// ledger signal `host_has_memory_headroom` prefers).
+    /// lacks parking headroom. `free_mib` feeds `allocatable_mib`, which
+    /// `host_has_memory_headroom` reads net of the host's reservations.
     fn seed_host_with_free_ram(meta: &Arc<MiniMeta>, host_id: engram_core::HostId, free_mib: u64) {
         meta.hosts
             .lock()
@@ -3659,9 +3641,8 @@ mod tests {
         // The host now has none — the RAM the park was borrowing is needed.
         // (Mutate the seeded row in place; `seed_host_with_free_ram` PUSHES,
         // so re-seeding would leave the roomy record ahead of it.)
-        // MEASURED-but-tiny, not 0: `host_has_memory_headroom` treats a 0
-        // allocatable as "pre-ledger host" and falls back to raw physical
-        // free, which the fixture reports as plentiful.
+        // MEASURED-but-tiny, not 0: a 0 allocatable means "unmeasured" and
+        // also has no headroom; this test asserts the measured case.
         for h in meta.hosts.lock().iter_mut().filter(|h| h.id == host_id) {
             h.utilization.allocatable_mib = 1;
         }
@@ -3696,6 +3677,60 @@ mod tests {
         assert!(
             !meta.snapshots.lock().is_empty(),
             "descent captures a durable snapshot"
+        );
+    }
+
+    /// The production case: a host whose RAM measures roomy, but whose
+    /// parked VMs hold reservations that leave a waiting resume no room.
+    /// A parked VM keeps its reservation, so the reaper reads the same
+    /// unreserved RAM placement reserves against and descends the park.
+    #[tokio::test]
+    async fn parked_reservations_without_headroom_descend_the_park() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked with room");
+
+        // The host still measures 60 000 MiB allocatable, but the parks on
+        // it reserve 52 GiB of that: 10% of its RAM is unreserved.
+        meta.reserved.lock().insert(
+            host_id,
+            engram_core::types::host::ReservedBudget {
+                mem_mib: 53_248,
+                vcpus: 0,
+            },
+        );
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
+        {
+            let m = meta.clone();
+            wait_for("descended to Idle", move || {
+                m.session.lock().status == SessionState::Idle
+            })
+            .await;
+        }
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Idle,
+            "reservations, not raw RAM, decide the park's headroom"
         );
     }
 

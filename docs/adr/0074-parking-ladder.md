@@ -152,6 +152,15 @@ ladder descends to.
   this (the `ensure_active` hold loop; the next scanner tick); the unit
   tests poll `wait_for_lease_free` before the follow-on step. No product
   code change — the retry paths already existed for rung 1.
+- **Headroom gate reads unreserved RAM (2026-11-09).** The ledger's
+  `allocatable_mib` does not net out parked VMs: the host adds a parked
+  VM's memory back, so a host whose parks had reserved its RAM read as
+  roomy, held every park, and a queued resume never placed on it.
+  `host_has_memory_headroom` now reads `HostHeadroom::free_pct`, the
+  allocatable RAM less the host's reservations — the same accounting
+  placement reserves against. The raw `mem_total − mem_used` fallback is
+  gone; an unmeasured host (`allocatable_mib == 0`) has no headroom and
+  does not park.
 
 ### Post-ship incident: the un-pause vsock black-hole (2026-07-06)
 
