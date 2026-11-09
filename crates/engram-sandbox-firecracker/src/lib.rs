@@ -1278,6 +1278,33 @@ impl FirecrackerBackend {
         self.sandboxes.get(&id).map(|r| r.state.clone())
     }
 
+    /// Commit a started VM: write its `sandbox.json` (if FC is still
+    /// running), move its processes into the node cgroup, then build its
+    /// entry with `live` and make it listable. `list` therefore never shows
+    /// a sandbox whose manifest and migration role are not on disk. A
+    /// failed write returns before `live` runs, so the guards `live` would
+    /// disarm still fire.
+    fn commit_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        record: Option<sandbox_manifest::SandboxManifest>,
+        live: impl FnOnce() -> LiveSandbox,
+    ) -> Result<(), SandboxError> {
+        if let Some(record) = record {
+            let path = sandbox_manifest::manifest_path(&self.work_dir, sandbox_id);
+            sandbox_manifest::write_manifest(&path, &record)
+                .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))?;
+            // FC and its handler must survive a host-agent pod restart's
+            // `cgroup.kill`: a killed handler leaves the guest
+            // page-faulting forever.
+            let mut pids = vec![record.firecracker.process.pid];
+            pids.extend(record.uffd_handler.as_ref().map(|h| h.pid));
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
+        }
+        self.sandboxes.insert(sandbox_id, live());
+        Ok(())
+    }
+
     /// Shared body of [`SandboxBackend::restore`] (resume flavor,
     /// `fresh = false`) and [`SandboxBackend::restore_fresh`]
     /// (fresh-create flavor, `true`).
@@ -2580,13 +2607,9 @@ impl FirecrackerBackend {
         // whose underlying VM is dead, defeating reconcile.
         let fc_pid = child.id();
 
-        // ADR 0009 §5 / ADR 0044 K2: write the per-sandbox on-disk
-        // manifest before handing control back, so the startup reattach
-        // pass can re-adopt this still-live FC after a host-agent
-        // restart. Cold create = host-root `network`, no netns, no uffd.
-        if let Some(pid) = fc_pid {
-            persist_sandbox_manifest(
-                &self.work_dir,
+        // Cold create = host-root `network`, no netns, no uffd.
+        let record = fc_pid.map(|pid| {
+            sandbox_manifest_for(
                 sandbox_id,
                 &state,
                 (pid, None),
@@ -2598,18 +2621,13 @@ impl FirecrackerBackend {
                 }),
                 None,
                 None,
-            )?;
-            // ADR 0044 K2: move FC into the node cgroup so a host-agent pod
-            // restart doesn't `cgroup.kill` it. Cold create = FC only.
-            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &[pid]);
-        }
-
-        // FC is configured, started, and recorded in its manifest: the
-        // sandbox is now committed. Defuse the create-window backstop so
-        // the VM is fully decoupled from this host-agent's lifecycle.
-        fc_guard.disarm();
-        self.sandboxes.insert(
-            sandbox_id,
+            )
+        });
+        // Once FC is recorded in its manifest the sandbox is committed:
+        // defuse the create-window backstop so the VM is fully decoupled
+        // from this host-agent's lifecycle.
+        self.commit_sandbox(sandbox_id, record, || {
+            fc_guard.disarm();
             LiveSandbox {
                 state,
                 child: Some(child),
@@ -2626,8 +2644,8 @@ impl FirecrackerBackend {
                 agent_ready: agent_ready_rx,
                 vsock_epoch: tokio::sync::watch::channel(0).0,
                 started_at: Some(std::time::Instant::now()),
-            },
-        );
+            }
+        })?;
         if let Some(pid) = fc_pid {
             spawn_process_supervisor(
                 self.sandboxes.clone(),
@@ -3124,53 +3142,53 @@ impl FirecrackerBackend {
             if fresh {
                 return Ok::<_, SandboxError>(None);
             }
-                    let session_ref = manifest.memory_manifest.ok_or_else(|| {
-                        SandboxError::Snapshot(
+            let session_ref = manifest.memory_manifest.ok_or_else(|| {
+                SandboxError::Snapshot(
                     "a resume needs the snapshot's chunked memory manifest, and this \
                      snapshot has none"
                         .into(),
-                        )
-                    })?;
-                    // Base-identical pages continue against the shared
-                    // per-image base shm when the coordinator names it.
-                    let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
-                    let uffd_uds = jail_dir.join("uffd.sock");
-                    let _ = tokio::fs::remove_file(&uffd_uds).await;
-                    // A migration destination stages the not-yet-durable
-                    // session manifest as a local file.
-                    let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
+                )
+            })?;
+            // Base-identical pages continue against the shared
+            // per-image base shm when the coordinator names it.
+            let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
+            let uffd_uds = jail_dir.join("uffd.sock");
+            let _ = tokio::fs::remove_file(&uffd_uds).await;
+            // A migration destination stages the not-yet-durable
+            // session manifest as a local file.
+            let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
             let migration_manifest = migration_manifest.exists().then_some(migration_manifest);
-                    let staged = |r| {
-                        let path = staged_manifest_path(snapshot_dir, sandbox_id, &r);
-                        path.exists().then_some(path)
-                    };
-                    let session_json = migration_manifest.clone().or_else(|| staged(session_ref));
-                    let canonical_json = staged(canonical_ref);
-                    // A post-copy destination also stages the peer spec: the
-                    // handler dials the source's page server.
-                    let peer_spec: Option<MigrationPeerSpec> = {
-                        let p = snapshot_dir.join(MIGRATION_PEER_FILE);
-                        match tokio::fs::read(&p).await {
-                            Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| {
-                                SandboxError::Snapshot(format!("parse {MIGRATION_PEER_FILE}: {e}"))
-                            })?),
-                            Err(_) => None,
-                        }
-                    };
-                    let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
-                    let (handler, uffd_guard) = self
-                        .spawn_uffd_handler(
-                            &uffd_uds,
-                            canonical_ref,
-                            session_ref,
-                            canonical_json.as_deref(),
-                            session_json.as_deref(),
-                            trace_key,
-                            jail_dir,
-                            peer_spec.as_ref(),
-                        )
-                        .await?;
-                    Ok(Some((handler, uffd_uds, uffd_guard)))
+            let staged = |r| {
+                let path = staged_manifest_path(snapshot_dir, sandbox_id, &r);
+                path.exists().then_some(path)
+            };
+            let session_json = migration_manifest.clone().or_else(|| staged(session_ref));
+            let canonical_json = staged(canonical_ref);
+            // A post-copy destination also stages the peer spec: the
+            // handler dials the source's page server.
+            let peer_spec: Option<MigrationPeerSpec> = {
+                let p = snapshot_dir.join(MIGRATION_PEER_FILE);
+                match tokio::fs::read(&p).await {
+                    Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| {
+                        SandboxError::Snapshot(format!("parse {MIGRATION_PEER_FILE}: {e}"))
+                    })?),
+                    Err(_) => None,
+                }
+            };
+            let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
+            let (handler, uffd_guard) = self
+                .spawn_uffd_handler(
+                    &uffd_uds,
+                    canonical_ref,
+                    session_ref,
+                    canonical_json.as_deref(),
+                    session_json.as_deref(),
+                    trace_key,
+                    jail_dir,
+                    peer_spec.as_ref(),
+                )
+                .await?;
+            Ok(Some((handler, uffd_uds, uffd_guard)))
         };
 
         let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
@@ -3430,14 +3448,14 @@ impl FirecrackerBackend {
         // agentd was captured running: it never dials the ready port, so
         // the watch starts true.
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
-        // Persist the role while all restore guards remain armed. A failed
-        // write must kill the processes and release the network namespace.
-        if let Some(fc_pid_u) = fc_pid {
-            persist_sandbox_manifest(
-                &self.work_dir,
+        // The guards stay armed until the manifest (with the migration role)
+        // is durable: a failed write kills the processes and releases the
+        // network namespace.
+        let record = fc_pid.map(|pid| {
+            sandbox_manifest_for(
                 sandbox_id,
                 &state,
-                (fc_pid_u, uffd_pid),
+                (pid, uffd_pid),
                 None, // warm restores run in a per-VM netns, not host-root
                 netns_guard
                     .setup
@@ -3451,21 +3469,13 @@ impl FirecrackerBackend {
                         snat_cidr_network: ns.snat_cidr.network(),
                     }),
                 post_copy.then_some(sandbox_manifest::ROLE_POST_COPY_DEST),
-            )?;
-            // Both must survive a host-agent restart: a killed handler
-            // leaves the guest page-faulting forever.
-            let mut pids = vec![fc_pid_u];
-            pids.extend(uffd_pid);
-            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
-        }
-        // The manifest is durable. Transfer resource ownership to the live map.
-        fc_guard.disarm();
-        if let Some(g) = uffd_guard.as_mut() {
-            g.disarm();
-        }
-        let netns_setup = netns_guard.into_committed();
-        self.sandboxes.insert(
-            sandbox_id,
+            )
+        });
+        self.commit_sandbox(sandbox_id, record, || {
+            fc_guard.disarm();
+            if let Some(g) = uffd_guard.as_mut() {
+                g.disarm();
+            }
             LiveSandbox {
                 state,
                 child: Some(child),
@@ -3473,7 +3483,7 @@ impl FirecrackerBackend {
                 uffd_handler,
                 uffd_pid,
                 net: net_setup,
-                netns: netns_setup,
+                netns: netns_guard.into_committed(),
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
@@ -3481,8 +3491,8 @@ impl FirecrackerBackend {
                 agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
                 started_at: Some(std::time::Instant::now()),
-            },
-        );
+            }
+        })?;
         if let Some(pid) = fc_pid {
             spawn_process_supervisor(
                 self.sandboxes.clone(),
@@ -3861,22 +3871,20 @@ fn process_record(pid: u32) -> sandbox_manifest::ProcessRecord {
     }
 }
 
-/// Write the per-sandbox `sandbox.json` so the startup reattach pass can
-/// re-adopt this still-live VM after a host-agent restart (ADR 0044 K2).
-/// Called at the end of BOTH `create()` and `restore()` — the only
-/// difference is host-root `network` vs per-VM `netns`, and whether a
-/// uffd handler is present. A write failure aborts the guarded operation.
-fn persist_sandbox_manifest(
-    work_dir: &std::path::Path,
+/// The per-sandbox `sandbox.json` the startup reattach pass re-adopts a
+/// still-live VM from after a host-agent restart (ADR 0044 K2). `create()`
+/// and `restore()` differ only in host-root `network` vs per-VM `netns`,
+/// whether a uffd handler is present, and the migration role.
+fn sandbox_manifest_for(
     sandbox_id: SandboxId,
     state: &SandboxState,
     process_ids: (u32, Option<u32>),
     network: Option<sandbox_manifest::NetworkRecord>,
     netns: Option<sandbox_manifest::NetnsRecord>,
     migration_role: Option<&str>,
-) -> Result<(), SandboxError> {
+) -> sandbox_manifest::SandboxManifest {
     let (fc_pid, uffd_pid) = process_ids;
-    let m = sandbox_manifest::SandboxManifest {
+    sandbox_manifest::SandboxManifest {
         schema_version: sandbox_manifest::SCHEMA_VERSION,
         sandbox_id,
         backend: sandbox_manifest::BACKEND_FIRECRACKER.to_string(),
@@ -3894,10 +3902,7 @@ fn persist_sandbox_manifest(
         uffd_handler: uffd_pid.map(process_record),
         memory_backing: state.memory_backing.clone(),
         migration_role: migration_role.map(str::to_owned),
-    };
-    let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
-    sandbox_manifest::write_manifest(&path, &m)
-        .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))
+    }
 }
 
 /// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
@@ -5259,7 +5264,7 @@ impl SandboxBackend for FirecrackerBackend {
         disks: Option<SessionDisks>,
     ) -> Result<(), SandboxError> {
         self.restore_with(id, metadata, disks, /*fresh=*/ false, Vec::new())
-        .await
+            .await
     }
 
     async fn restore_fresh(
@@ -5273,7 +5278,7 @@ impl SandboxBackend for FirecrackerBackend {
         // generations AND patch the per-session selected skills into reserved
         // slots; both swaps happen load-paused inside restore_in_jail.
         self.restore_with(id, metadata, disks, /*fresh=*/ true, selected_mounts)
-        .await
+            .await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -8955,6 +8960,75 @@ mod tests {
         // No pid (not yet started) → nothing to read from.
         be.sandboxes.insert(id, live(None, Some(memfile)));
         assert!(be.post_copy_source_view(id).is_none());
+    }
+
+    /// A post-copy destination's role is on disk before the sandbox is
+    /// listable, and a failed manifest write never lists it: a host-agent
+    /// restart in between must find the role to keep custody.
+    #[tokio::test]
+    async fn a_committed_sandbox_is_listed_only_after_its_manifest_and_role() {
+        let (be, _dir) = backend();
+        let live = |id: SandboxId| {
+            let (_tx, agent_ready) = tokio::sync::watch::channel(true);
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: be.work_dir.join(id.to_string()).join("fc.sock"),
+                    rootfs_path: be.work_dir.join("rootfs.ext4"),
+                    vsock_cid: 3,
+                    vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
+                    rootfs_canonical: be.work_dir.join("rootfs.ext4"),
+                    swap_canonical: None,
+                    memory_backing: None,
+                },
+                child: None,
+                fc_pid: None,
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
+                agentd_slot_swapped: false,
+                agent_ready: agent_ready.into(),
+                vsock_epoch: tokio::sync::watch::channel(0).0,
+                started_at: None,
+            }
+        };
+        let record = |id: SandboxId| {
+            sandbox_manifest_for(
+                id,
+                &live(id).state,
+                (std::process::id(), None),
+                None,
+                None,
+                Some(sandbox_manifest::ROLE_POST_COPY_DEST),
+            )
+        };
+
+        let id = SandboxId::new();
+        be.commit_sandbox(id, Some(record(id)), || {
+            let on_disk =
+                sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(&be.work_dir, id))
+                    .expect("the manifest is written before the entry is built");
+            assert_eq!(
+                on_disk.migration_role.as_deref(),
+                Some(sandbox_manifest::ROLE_POST_COPY_DEST)
+            );
+            live(id)
+        })
+        .expect("commit");
+        assert_eq!(be.list().await.unwrap(), vec![id]);
+
+        // A file where the sandbox's directory goes makes the write fail.
+        let blocked = SandboxId::new();
+        std::fs::write(be.work_dir.join(blocked.to_string()), b"").unwrap();
+        be.commit_sandbox(blocked, Some(record(blocked)), || {
+            panic!("a failed manifest write must not build the entry")
+        })
+        .unwrap_err();
+        assert_eq!(be.list().await.unwrap(), vec![id]);
     }
 
     /// `prefault_stats_path` is `None` for a sandbox with no live
