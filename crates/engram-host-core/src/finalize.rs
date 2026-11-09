@@ -5,10 +5,10 @@
 //! under the pause, the FC memory snapshot, and the aux-bundle pins are
 //! held locally and a durable `EvictionFinalizeRecord` is written; a
 //! background job then runs the legs (disk manifest publish, memory
-//! chunking, blob upload) at the same time, persists one stage bump BEFORE
-//! it deletes the consumed memory file, then writes the terminal
-//! checkpoint record and destroys the sandbox. A crash re-enters at the
-//! persisted stage.
+//! chunking, blob upload) at the same time, persists the furthest stage
+//! they reached BEFORE it deletes the consumed memory file, then writes the
+//! terminal checkpoint record and destroys the sandbox. A crash re-enters
+//! at the persisted stage.
 //!
 //! This module holds the **pure decisions** of that flow, extracted out of
 //! the host-agent driver so the boundary simulator (`engram-dst-cosim`)
@@ -32,9 +32,9 @@ use serde::{Deserialize, Serialize};
 /// variant. Serde variant names are load-bearing: they are the on-disk
 /// `EvictionFinalizeRecord.stage` encoding.
 ///
-/// The finalize persists `Captured` and then `BlobsUploaded`.
-/// `DiskUploaded` and `MemoryChunked` are read from records an earlier
-/// build wrote, which bumped one stage per leg.
+/// The legs run together, and one persist records the furthest stage
+/// whose legs all completed: `DiskUploaded` or `MemoryChunked` when a later
+/// leg failed, `BlobsUploaded` when all did.
 #[derive(
     Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
