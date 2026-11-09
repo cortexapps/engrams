@@ -6,6 +6,8 @@
 //! sb-<sandbox>-<role>                        live
 //! sb-<sandbox>-<role>-ckpt-<manifest>-v<N>   the last checkpoint; holds that manifest
 //! tmp-sb-<sandbox>-<role>                    a stage or a checkpoint in flight
+//! sb-<sandbox>-<role>-dest-<manifest>-v<N>   a hydrating live volume's destination; becomes that manifest
+//! sb-<sandbox>-<role>-base-<manifest>-v<N>   what the destination was snapshotted from; holds that manifest
 //! ```
 //!
 //! A checkpoint volume is named after a manifest the chunk store holds,
@@ -14,12 +16,19 @@
 //! and the next checkpoint publishes under it, so no caller tracks a
 //! manifest ref between calls.
 //!
+//! A role whose manifest is not on the host starts on a hydrating
+//! device: the live volume reads the base's blocks and a source the
+//! fill engine serves, and the kernel copies the difference in behind
+//! the guest ([`SessionDisk::hydrate`]). Until that device settles there
+//! is no checkpoint volume; the `dest` and `base` names record what
+//! the live data converges to and what it is measured against.
+//!
 //! A released sandbox keeps its newest checkpoint volume per role, so a
 //! resume on this host is a snapshot of it instead of a stage from blob
 //! storage. [`SessionVolumes::reap`] deletes kept checkpoints, oldest
 //! release first, when the pool needs the space.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -32,13 +41,19 @@ use engram_fill::{Class, FillEngine, PeerSource};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::disk::{Capacity, SessionDisk, Volume, VolumeName};
-use crate::disk_flows::{checkpoint_split, stage};
+use crate::disk::{
+    Capacity, Hydration, SessionDisk, SourceDevice, SourceServer, Volume, VolumeName,
+};
+use crate::disk_flows::{checkpoint_split, hydration_plan, shape_matches, stage};
 use crate::image_volumes::{self, ImageVolumes};
 
 const LIVE_PREFIX: &str = "sb-";
 const TRANSIENT_PREFIX: &str = "tmp-sb-";
 const CHECKPOINT_INFIX: &str = "-ckpt-";
+const DEST_INFIX: &str = "-dest-";
+const BASE_INFIX: &str = "-base-";
+/// The base of a hydration that started from zeros.
+const BASE_NONE: &str = "none";
 const PRECOPY_SUFFIX: &str = "-pre";
 
 /// What a volume name says.
@@ -47,6 +62,11 @@ pub enum Kind {
     Live,
     Checkpoint(ManifestRef),
     Transient,
+    /// The destination of a hydrating live volume; holds the manifest
+    /// once the hydration settles.
+    Dest(ManifestRef),
+    /// What a hydration's destination was snapshotted from.
+    Base(Option<ManifestRef>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,27 +97,49 @@ pub fn live_name(sandbox: SandboxId, role: DiskRole) -> VolumeName {
 }
 
 pub fn checkpoint_name(sandbox: SandboxId, role: DiskRole, manifest: ManifestRef) -> VolumeName {
+    named_after(sandbox, role, CHECKPOINT_INFIX, &manifest_suffix(manifest))
+}
+
+fn dest_name(sandbox: SandboxId, role: DiskRole, manifest: ManifestRef) -> VolumeName {
+    named_after(sandbox, role, DEST_INFIX, &manifest_suffix(manifest))
+}
+
+fn base_name(sandbox: SandboxId, role: DiskRole, manifest: Option<ManifestRef>) -> VolumeName {
+    let suffix = manifest.map_or(BASE_NONE.to_string(), manifest_suffix);
+    named_after(sandbox, role, BASE_INFIX, &suffix)
+}
+
+fn named_after(sandbox: SandboxId, role: DiskRole, infix: &str, suffix: &str) -> VolumeName {
     VolumeName::new(format!(
-        "{LIVE_PREFIX}{}-{}{CHECKPOINT_INFIX}{}-v{}",
+        "{LIVE_PREFIX}{}-{role}{infix}{suffix}",
         sandbox.as_uuid().simple(),
-        role,
-        manifest.manifest_id.simple(),
-        manifest.version
     ))
-    .expect("a checkpoint volume name is at most 100 bytes of [a-z0-9-]")
+    .expect("a named volume is at most 100 bytes of [a-z0-9-]")
+}
+
+fn manifest_suffix(manifest: ManifestRef) -> String {
+    format!("{}-v{}", manifest.manifest_id.simple(), manifest.version)
+}
+
+fn parse_manifest_suffix(suffix: &str) -> Option<ManifestRef> {
+    let (id, version) = suffix.split_once("-v")?;
+    Some(ManifestRef {
+        manifest_id: Uuid::try_parse(id).ok()?,
+        version: version.parse().ok()?,
+    })
 }
 /// How [`SessionVolumes`] brought up a role's disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagePath {
     /// The role's checkpoint was already on this host.
     Kept,
-    /// Only the chunks that changed, written onto a kept checkpoint.
-    OntoKept,
-    /// The delta from the image, written onto its staged volume.
-    FromImage,
-    /// Every chunk, written into an empty volume: the image's volume is
-    /// not on this host.
-    Whole,
+    /// A hydrating device over a snapshot of the nearest base this host
+    /// holds: the guest starts at once and the kernel copies the
+    /// difference in behind it.
+    Lazy,
+    /// The difference from the nearest base written in full before the
+    /// guest starts: this platform has no hydrating device.
+    Staged,
     /// A snapshot of a manifest this host had staged.
     StagedSnapshot,
     /// A fork of the image's volume.
@@ -110,9 +152,8 @@ impl StagePath {
     pub fn as_str(self) -> &'static str {
         match self {
             StagePath::Kept => "kept",
-            StagePath::OntoKept => "onto_kept",
-            StagePath::FromImage => "from_image",
-            StagePath::Whole => "whole",
+            StagePath::Lazy => "lazy",
+            StagePath::Staged => "staged",
             StagePath::StagedSnapshot => "staged_snapshot",
             StagePath::ImageFork => "image_fork",
             StagePath::Empty => "empty",
@@ -148,38 +189,48 @@ pub fn parse(name: &VolumeName) -> Option<Parsed> {
     };
     let (sandbox, rest) = rest.split_once('-')?;
     let sandbox = SandboxId::from(Uuid::try_parse(sandbox).ok()?);
-    let (role, rest) = match rest.split_once(CHECKPOINT_INFIX) {
-        Some((role, manifest)) => (role, Some(manifest)),
-        None => (rest, None),
-    };
-    let role = match (transient, role.strip_suffix(PRECOPY_SUFFIX)) {
-        (true, Some(role)) => role,
-        _ => role,
-    };
-    let role: DiskRole = role.parse().ok()?;
-    let kind = match (transient, rest) {
-        (true, None) => Kind::Transient,
-        (false, None) => Kind::Live,
-        (false, Some(manifest)) => {
-            let (id, version) = manifest.split_once("-v")?;
-            Kind::Checkpoint(ManifestRef {
-                manifest_id: Uuid::try_parse(id).ok()?,
-                version: version.parse().ok()?,
-            })
+    let infixed = [CHECKPOINT_INFIX, DEST_INFIX, BASE_INFIX]
+        .into_iter()
+        .find_map(|infix| {
+            rest.split_once(infix)
+                .map(|(role, suffix)| (role, infix, suffix))
+        });
+    let (role, kind) = match (transient, infixed) {
+        (true, None) => (
+            rest.strip_suffix(PRECOPY_SUFFIX).unwrap_or(rest),
+            Kind::Transient,
+        ),
+        (false, None) => (rest, Kind::Live),
+        (false, Some((role, CHECKPOINT_INFIX, suffix))) => {
+            (role, Kind::Checkpoint(parse_manifest_suffix(suffix)?))
         }
-        (true, Some(_)) => return None,
+        (false, Some((role, DEST_INFIX, suffix))) => {
+            (role, Kind::Dest(parse_manifest_suffix(suffix)?))
+        }
+        (false, Some((role, BASE_INFIX, BASE_NONE))) => (role, Kind::Base(None)),
+        (false, Some((role, BASE_INFIX, suffix))) => {
+            (role, Kind::Base(Some(parse_manifest_suffix(suffix)?)))
+        }
+        _ => return None,
     };
     Some(Parsed {
         sandbox,
-        role,
+        role: role.parse().ok()?,
         kind,
     })
 }
 
-/// Where a live volume's contents come from. A manifest is written in
-/// full before the sandbox starts; when `base` names an image staged on
-/// this host, that volume is the origin and only the difference is
-/// written. A manifest that is itself a staged image is snapshotted.
+/// Live volumes first: a hydrating one holds its destination open, so
+/// the destination can go only after it.
+fn live_first(names: &mut [(VolumeName, Parsed)]) {
+    names.sort_by_key(|(_, p)| p.kind != Kind::Live);
+}
+
+/// Where a live volume's contents come from. A manifest that is itself a
+/// staged image is snapshotted. Otherwise, when `base` names an image
+/// staged on this host, the volume starts as a snapshot of it and only
+/// the difference comes in: behind the running guest where the platform
+/// has a hydrating device, in full before it starts elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// An image's disk: the volume starts a new lineage as a snapshot of
@@ -264,6 +315,17 @@ pub struct Report {
     pub kept: Vec<SandboxId>,
 }
 
+/// A volume on this host that holds a manifest near the one wanted:
+/// what a role's volume starts from.
+struct Base {
+    volume: Volume,
+    manifest: Manifest,
+    manifest_ref: ManifestRef,
+    /// The sandbox whose kept checkpoint volume this is; a hydration
+    /// takes the volume over as its base.
+    kept_by: Option<SandboxId>,
+}
+
 /// The owner of every `sb-` volume on a host.
 pub struct SessionVolumes {
     disk: Arc<dyn SessionDisk>,
@@ -273,6 +335,11 @@ pub struct SessionVolumes {
     /// first. A sandbox `reconcile` finds with no live volume joins at
     /// the front: its age is unknown, so it goes first.
     kept: Mutex<VecDeque<SandboxId>>,
+    /// Serves the sources hydrating volumes copy from; without it every
+    /// volume is written in full before its guest starts.
+    sources: Option<Arc<dyn SourceServer>>,
+    /// The source of each hydrating live volume this process serves.
+    serving: Mutex<HashMap<VolumeName, Box<dyn SourceDevice>>>,
 }
 
 impl SessionVolumes {
@@ -282,7 +349,21 @@ impl SessionVolumes {
             disk,
             fill,
             kept: Mutex::new(VecDeque::new()),
+            sources: None,
+            serving: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Start guests on hydrating volumes, with `sources` serving what
+    /// the kernel copies from.
+    pub fn with_sources(mut self, sources: Arc<dyn SourceServer>) -> Self {
+        self.sources = Some(sources);
+        self
+    }
+
+    /// The source server and the copy unit, when this host hydrates.
+    fn hydration_support(&self) -> Option<(&dyn SourceServer, u64)> {
+        Some((self.sources.as_deref()?, self.disk.region_bytes()?))
     }
 
     pub fn disk(&self) -> &dyn SessionDisk {
@@ -358,11 +439,10 @@ impl SessionVolumes {
         }
     }
 
-    /// The checkpoint volume first, under the transient name until its
-    /// manifest is in the store; then the live volume as its snapshot.
-    /// A `Continue` of a checkpoint this host kept for the lineage skips
-    /// the stage; one of a newer manifest stages only the delta onto it.
-    /// A stage fetches through `fill`.
+    /// The live volume of a role. A manifest this host holds in full (a
+    /// staged image, a kept checkpoint of it) is snapshotted; a
+    /// `Continue` or `Fork` of one it does not hold starts from the
+    /// nearest base it has ([`Self::bring_up`]).
     #[tracing::instrument(
         name = "disk.provision",
         skip_all,
@@ -377,90 +457,61 @@ impl SessionVolumes {
     ) -> io::Result<(PathBuf, ManifestRef, StagePath)> {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
-        let ((checkpoint, lineage), path) = match source {
+        let (live, lineage, path) = match source {
             Source::Image { manifest } => {
-                let wanted = self
-                    .fill
-                    .store()
-                    .get_manifest(manifest)
-                    .instrument(tracing::info_span!("disk.manifest_get"))
-                    .await
-                    .map_err(store_err)?;
+                let wanted = self.manifest(manifest).await?;
                 self.images
                     .fork(manifest, &tmp)
                     .instrument(tracing::info_span!("disk.image_fork"))
                     .await?;
-                (
-                    self.new_lineage(&tmp, sandbox, role, &wanted).await?,
-                    StagePath::ImageFork,
-                )
+                let lineage = self.new_lineage(&wanted).await?;
+                let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
+                (live, lineage, StagePath::ImageFork)
             }
             Source::Fork { manifest, base } => {
-                let wanted = self
-                    .fill
-                    .store()
-                    .get_manifest(manifest)
-                    .instrument(tracing::info_span!("disk.manifest_get"))
-                    .await
-                    .map_err(store_err)?;
-                let path = match self.staged(manifest).await {
+                let wanted = self.manifest(manifest).await?;
+                let lineage = self.new_lineage(&wanted).await?;
+                match self.staged(manifest).await {
                     Some((origin, _)) => {
                         self.disk.snapshot(&origin, &tmp).await?;
-                        StagePath::StagedSnapshot
+                        let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
+                        (live, lineage, StagePath::StagedSnapshot)
                     }
                     None => {
-                        self.stage_into(fill, &tmp, &wanted, base)
-                            .instrument(tracing::info_span!("disk.stage"))
-                            .await?
-                            .1
+                        let base = self.image_base(base).await;
+                        let (live, path) = self
+                            .bring_up(fill, sandbox, role, &wanted, lineage, base)
+                            .await?;
+                        (live, lineage, path)
                     }
-                };
-                (self.new_lineage(&tmp, sandbox, role, &wanted).await?, path)
+                }
             }
             Source::Continue { manifest, base } => {
                 match self.kept(sandbox, role, manifest).await? {
-                    Some((owner, volume, _, held)) if held == manifest => (
-                        (
-                            self.adopt(owner, volume, sandbox, role, held).await?,
-                            manifest,
-                        ),
-                        StagePath::Kept,
-                    ),
+                    Some((owner, volume, _, held)) if held == manifest => {
+                        let checkpoint = self.adopt(owner, volume, sandbox, role, held).await?;
+                        let live = self.live_snapshot(&checkpoint, sandbox, role).await?;
+                        (live, manifest, StagePath::Kept)
+                    }
                     kept => {
-                        let wanted = self
-                            .fill
-                            .store()
-                            .get_manifest(manifest)
-                            .instrument(tracing::info_span!("disk.manifest_get"))
-                            .await
-                            .map_err(store_err)?;
-                        let path = match kept {
-                            Some((_, volume, held_manifest, _))
+                        let wanted = self.manifest(manifest).await?;
+                        let base = match kept {
+                            Some((owner, volume, held_manifest, held))
                                 if volume.size_bytes == wanted.total_bytes =>
                             {
-                                stage(
-                                    self.disk.as_ref(),
-                                    fill,
-                                    Class::Demand,
-                                    &tmp,
-                                    &wanted,
-                                    Some((&volume, &held_manifest)),
-                                )
-                                .instrument(tracing::info_span!("disk.stage", onto_kept = true))
-                                .await?;
-                                StagePath::OntoKept
+                                Some(Base {
+                                    volume,
+                                    manifest: held_manifest,
+                                    manifest_ref: held,
+                                    kept_by: Some(owner),
+                                })
                             }
-                            _ => {
-                                self.stage_into(fill, &tmp, &wanted, base)
-                                    .instrument(tracing::info_span!("disk.stage"))
-                                    .await?
-                                    .1
-                            }
+                            _ => self.image_base(base).await,
                         };
-                        (
-                            (self.commit(&tmp, sandbox, role, manifest).await?, manifest),
-                            path,
-                        )
+                        let (live, path) = self
+                            .bring_up(fill, sandbox, role, &wanted, manifest, base)
+                            .await?;
+                        (live, manifest, path)
                     }
                 }
             }
@@ -470,29 +521,25 @@ impl SessionVolumes {
                     chunk_size: ChunkSize::bytes(volume.chunk_size),
                     ..Manifest::empty(ManifestKind::Disk, size_bytes)
                 };
-                (
-                    self.new_lineage(&tmp, sandbox, role, &manifest).await?,
-                    StagePath::Empty,
-                )
+                let lineage = self.new_lineage(&manifest).await?;
+                let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
+                (live, lineage, StagePath::Empty)
             }
         };
-        let live = self
-            .disk
-            .snapshot(&checkpoint, &live_name(sandbox, role))
-            .instrument(tracing::info_span!("disk.live_snapshot"))
-            .await?;
         Ok((live.path, lineage, path))
     }
 
-    /// Start a lineage that holds `manifest`, whose bytes `tmp` holds,
-    /// and commit `tmp` as its first checkpoint.
-    async fn new_lineage(
-        &self,
-        tmp: &VolumeName,
-        sandbox: SandboxId,
-        role: DiskRole,
-        manifest: &Manifest,
-    ) -> io::Result<(Volume, ManifestRef)> {
+    async fn manifest(&self, manifest: ManifestRef) -> io::Result<Manifest> {
+        self.fill
+            .store()
+            .get_manifest(manifest)
+            .instrument(tracing::info_span!("disk.manifest_get"))
+            .await
+            .map_err(store_err)
+    }
+
+    /// Start a lineage that holds `manifest`.
+    async fn new_lineage(&self, manifest: &Manifest) -> io::Result<ManifestRef> {
         let lineage = ManifestRef::new();
         self.fill
             .store()
@@ -500,7 +547,32 @@ impl SessionVolumes {
             .instrument(tracing::info_span!("disk.manifest_put"))
             .await
             .map_err(store_err)?;
-        Ok((self.commit(tmp, sandbox, role, lineage).await?, lineage))
+        Ok(lineage)
+    }
+
+    /// Commit `tmp`, which holds `lineage`'s manifest, as the role's
+    /// checkpoint volume, and make the live volume its snapshot.
+    async fn commit_live(
+        &self,
+        tmp: &VolumeName,
+        sandbox: SandboxId,
+        role: DiskRole,
+        lineage: ManifestRef,
+    ) -> io::Result<Volume> {
+        let checkpoint = self.commit(tmp, sandbox, role, lineage).await?;
+        self.live_snapshot(&checkpoint, sandbox, role).await
+    }
+
+    async fn live_snapshot(
+        &self,
+        checkpoint: &Volume,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<Volume> {
+        self.disk
+            .snapshot(checkpoint, &live_name(sandbox, role))
+            .instrument(tracing::info_span!("disk.live_snapshot"))
+            .await
     }
 
     /// Give the staged transient volume its checkpoint name and delete
@@ -534,6 +606,145 @@ impl SessionVolumes {
             }
         }
         self.disk.open(&name).await
+    }
+
+    /// The live volume of a role whose manifest `wanted` is not on this
+    /// host, under `lineage`: a hydrating device when this host has one
+    /// and serves sources, else the difference from `base` written in
+    /// full first.
+    async fn bring_up(
+        &self,
+        fill: &FillEngine,
+        sandbox: SandboxId,
+        role: DiskRole,
+        wanted: &Manifest,
+        lineage: ManifestRef,
+        base: Option<Base>,
+    ) -> io::Result<(Volume, StagePath)> {
+        if self.hydration_support().is_some() {
+            let live = self
+                .hydrate(fill, sandbox, role, wanted, lineage, base)
+                .instrument(tracing::info_span!(
+                    "disk.hydrate",
+                    held = tracing::field::Empty,
+                    delta = tracing::field::Empty,
+                    zero = tracing::field::Empty,
+                ))
+                .await?;
+            return Ok((live, StagePath::Lazy));
+        }
+        let tmp = transient_name(sandbox, role);
+        stage(
+            self.disk.as_ref(),
+            fill,
+            Class::Demand,
+            &tmp,
+            wanted,
+            base.as_ref().map(|b| (&b.volume, &b.manifest)),
+        )
+        .instrument(tracing::info_span!("disk.stage"))
+        .await?;
+        let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
+        Ok((live, StagePath::Staged))
+    }
+
+    /// A hydrating live volume: its destination is a snapshot of the
+    /// base (a kept checkpoint volume is taken over; an empty volume
+    /// stands in for no base) under the `dest` name, and its source
+    /// serves `wanted` through `fill`. Chunks the base holds in final
+    /// form are skipped; chunks `wanted` leaves out are zeroed first.
+    /// Records on the current span how many chunks the base `held`, the
+    /// kernel copies (`delta`) and were zeroed (`zero`).
+    async fn hydrate(
+        &self,
+        fill: &FillEngine,
+        sandbox: SandboxId,
+        role: DiskRole,
+        wanted: &Manifest,
+        lineage: ManifestRef,
+        base: Option<Base>,
+    ) -> io::Result<Volume> {
+        let (sources, region_bytes) = self.hydration_support().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "this host does not hydrate")
+        })?;
+        if let Some(base) = &base {
+            shape_matches(&base.volume, &base.manifest)?;
+        }
+        let plan = hydration_plan(wanted, base.as_ref().map(|b| &b.manifest))?;
+        let base_volume = match base {
+            Some(Base {
+                volume,
+                manifest_ref,
+                kept_by: Some(_),
+                ..
+            }) => {
+                let name = base_name(sandbox, role, Some(manifest_ref));
+                self.disk.rename(&volume.name, &name).await?;
+                drop(volume);
+                self.disk.open(&name).await?
+            }
+            Some(Base {
+                volume,
+                manifest_ref,
+                kept_by: None,
+                ..
+            }) => {
+                self.disk
+                    .snapshot(&volume, &base_name(sandbox, role, Some(manifest_ref)))
+                    .await?
+            }
+            None => {
+                self.disk
+                    .create(&base_name(sandbox, role, None), wanted.total_bytes)
+                    .await?
+            }
+        };
+        let dest = self
+            .disk
+            .snapshot(&base_volume, &dest_name(sandbox, role, lineage))
+            .await?;
+        drop(base_volume);
+        shape_matches(&dest, wanted)?;
+        for chunk in &plan.zero {
+            dest.zero_chunk(*chunk).await?;
+        }
+        let source = sources
+            .serve(fill.clone(), wanted, plan.delta.clone(), region_bytes)
+            .await?;
+        let live = match self
+            .disk
+            .hydrate(&dest, source.path(), &live_name(sandbox, role), &plan.skip)
+            .await
+        {
+            Ok(live) => live,
+            Err(e) => {
+                if let Err(error) = source.stop().await {
+                    tracing::warn!(sandbox_id = %sandbox, %role, %error, "source of a failed hydration not stopped");
+                }
+                return Err(e);
+            }
+        };
+        let span = tracing::Span::current();
+        span.record("held", (plan.skip.len() - plan.zero.len()) as u64);
+        span.record("delta", plan.delta.len() as u64);
+        span.record("zero", plan.zero.len() as u64);
+        self.serving
+            .lock()
+            .unwrap()
+            .insert(live.name.clone(), source);
+        Ok(live)
+    }
+
+    /// The staged volume of `image` as a base, when this host has it.
+    async fn image_base(&self, image: Option<ManifestRef>) -> Option<Base> {
+        let image = image?;
+        let (volume, manifest) = self.staged(image).await?;
+        Some(Base {
+            volume,
+            manifest,
+            manifest_ref: image,
+            kept_by: None,
+        })
     }
 
     /// The newest checkpoint volume of `role` that `sandbox` or a released
@@ -597,36 +808,6 @@ impl SessionVolumes {
         self.disk.open(&name).await
     }
 
-    /// Write `wanted` into a new volume `name` through `fill`, from the
-    /// staged volume of `base` when this host has it. Without it, every
-    /// chunk of `wanted` is written.
-    async fn stage_into(
-        &self,
-        fill: &FillEngine,
-        name: &VolumeName,
-        wanted: &Manifest,
-        base: Option<ManifestRef>,
-    ) -> io::Result<(Volume, StagePath)> {
-        let base = match base {
-            Some(image) => self.staged(image).await,
-            None => None,
-        };
-        let path = match base {
-            Some(_) => StagePath::FromImage,
-            None => StagePath::Whole,
-        };
-        let volume = stage(
-            self.disk.as_ref(),
-            fill,
-            Class::Demand,
-            name,
-            wanted,
-            base.as_ref().map(|(v, m)| (v, m)),
-        )
-        .await?;
-        Ok((volume, path))
-    }
-
     /// The staged volume of an image and its manifest, when this host
     /// has both.
     async fn staged(&self, image: ManifestRef) -> Option<(Volume, Manifest)> {
@@ -636,6 +817,130 @@ impl SessionVolumes {
         ) {
             (Ok(volume), Ok(manifest)) => Some((volume, manifest)),
             _ => None,
+        }
+    }
+
+    /// One step of a hydrating role's way to a settled volume: its
+    /// progress, and once every region is in, the cutover onto the
+    /// destination and the end of its source. `Settled` when the live
+    /// volume maps straight onto its destination.
+    pub async fn settle(&self, sandbox: SandboxId, role: DiskRole) -> io::Result<Hydration> {
+        let live = live_name(sandbox, role);
+        match self.disk.hydration(&live).await? {
+            state @ Hydration::Hydrating {
+                hydrated, total, ..
+            } if hydrated < total => return Ok(state),
+            Hydration::Hydrating { .. } => {
+                let (dest, _) = self.lazy_layout(sandbox, role).await?;
+                let dest = self.disk.open(&dest).await?;
+                self.disk.settle(&live, &dest).await?;
+            }
+            Hydration::Settled => {}
+        }
+        self.stop_source(&live).await?;
+        Ok(Hydration::Settled)
+    }
+
+    /// The roles of `sandbox` whose live volume is still hydrating.
+    pub async fn hydrating(&self, sandbox: SandboxId) -> io::Result<Vec<DiskRole>> {
+        let mut roles = Vec::new();
+        for role in self.lazy_roles(sandbox).await? {
+            if let Hydration::Hydrating { .. } =
+                self.disk.hydration(&live_name(sandbox, role)).await?
+            {
+                roles.push(role);
+            }
+        }
+        Ok(roles)
+    }
+
+    /// After a restart: serve again the sources of `sandbox`'s hydrating
+    /// roles, which the process that died left to the kernel. Returns
+    /// those roles.
+    pub async fn reattach(&self, sandbox: SandboxId) -> io::Result<Vec<DiskRole>> {
+        let Some((sources, region_bytes)) = self.hydration_support() else {
+            return Ok(Vec::new());
+        };
+        let mut roles = Vec::new();
+        for role in self.lazy_roles(sandbox).await? {
+            let live = live_name(sandbox, role);
+            let Hydration::Hydrating { source, .. } = self.disk.hydration(&live).await? else {
+                continue;
+            };
+            let (dest, base) = self.lazy_layout(sandbox, role).await?;
+            let (Some(Kind::Dest(wanted)), Some(Kind::Base(base))) =
+                (parse(&dest).map(|p| p.kind), parse(&base).map(|p| p.kind))
+            else {
+                unreachable!("lazy_layout returns a dest and a base name");
+            };
+            let wanted = self.manifest(wanted).await?;
+            let base = match base {
+                Some(base) => Some(self.manifest(base).await?),
+                None => None,
+            };
+            let plan = hydration_plan(&wanted, base.as_ref())?;
+            let recovered = sources
+                .recover(
+                    &source,
+                    self.fill.clone(),
+                    &wanted,
+                    plan.delta,
+                    region_bytes,
+                )
+                .await?;
+            self.serving.lock().unwrap().insert(live, recovered);
+            roles.push(role);
+        }
+        Ok(roles)
+    }
+
+    /// The roles of `sandbox` brought up on a hydrating device whose
+    /// first checkpoint has not run: they have a `dest` volume.
+    async fn lazy_roles(&self, sandbox: SandboxId) -> io::Result<Vec<DiskRole>> {
+        Ok(self
+            .disk
+            .list()
+            .await?
+            .iter()
+            .filter_map(parse)
+            .filter(|p| p.sandbox == sandbox && matches!(p.kind, Kind::Dest(_)))
+            .map(|p| p.role)
+            .collect())
+    }
+
+    /// The `dest` and `base` volume names of a lazy role.
+    async fn lazy_layout(
+        &self,
+        sandbox: SandboxId,
+        role: DiskRole,
+    ) -> io::Result<(VolumeName, VolumeName)> {
+        let (mut dest, mut base) = (None, None);
+        for name in self.disk.list().await? {
+            match parse(&name) {
+                Some(p) if p.sandbox == sandbox && p.role == role => match p.kind {
+                    Kind::Dest(_) => dest = Some(name),
+                    Kind::Base(_) => base = Some(name),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        match (dest, base) {
+            (Some(dest), Some(base)) => Ok((dest, base)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("sandbox {sandbox} has no hydrating {role} volume"),
+            )),
+        }
+    }
+
+    /// End the source of `live`, when this process serves one. The
+    /// device that read it must be gone or settled first.
+    async fn stop_source(&self, live: &VolumeName) -> io::Result<()> {
+        let source = self.serving.lock().unwrap().remove(live);
+        match source {
+            Some(source) => source.stop().await,
+            None => Ok(()),
         }
     }
 
@@ -836,14 +1141,15 @@ impl SessionVolumes {
     /// open stays and is reported as failed.
     pub async fn purge(&self, sandbox: SandboxId) -> io::Result<Report> {
         let mut report = Report::default();
-        for name in self.disk.list().await? {
-            if parse(&name).is_some_and(|p| p.sandbox == sandbox) {
-                match self.disk.delete(&name).await {
-                    Ok(()) => report.deleted.push(name),
-                    Err(e) => report.failed.push((name, e)),
-                }
-            }
-        }
+        let names: Vec<(VolumeName, Parsed)> = self
+            .disk
+            .list()
+            .await?
+            .into_iter()
+            .filter_map(|name| parse(&name).map(|p| (name, p)))
+            .filter(|(_, p)| p.sandbox == sandbox)
+            .collect();
+        self.delete_all(names, &mut report).await;
         if report.failed.is_empty() {
             self.kept.lock().unwrap().retain(|s| *s != sandbox);
         }
@@ -895,7 +1201,7 @@ impl SessionVolumes {
         live: &[SandboxId],
     ) -> io::Result<Report> {
         let mut report = Report::default();
-        let mut newest: std::collections::HashMap<(SandboxId, DiskRole), u64> = Default::default();
+        let mut newest: HashMap<(SandboxId, DiskRole), u64> = Default::default();
         let parsed: Vec<(VolumeName, Parsed)> = self
             .disk
             .list()
@@ -910,23 +1216,89 @@ impl SessionVolumes {
                 *v = (*v).max(m.version);
             }
         }
+        let mut unwanted = Vec::new();
         for (name, p) in parsed {
-            let unwanted = match p.kind {
-                Kind::Live | Kind::Transient => !live.contains(&p.sandbox),
-                Kind::Checkpoint(m) => m.version < newest[&(p.sandbox, p.role)],
-            };
-            if !unwanted {
-                if matches!(p.kind, Kind::Checkpoint(_)) && !report.kept.contains(&p.sandbox) {
-                    report.kept.push(p.sandbox);
+            let wanted = match p.kind {
+                Kind::Live | Kind::Transient | Kind::Dest(_) | Kind::Base(_) => {
+                    live.contains(&p.sandbox)
                 }
-                continue;
-            }
-            match self.disk.delete(&name).await {
-                Ok(()) => report.deleted.push(name),
-                Err(e) => report.failed.push((name, e)),
+                Kind::Checkpoint(m) => m.version == newest[&(p.sandbox, p.role)],
+            };
+            match wanted {
+                true if matches!(p.kind, Kind::Checkpoint(_)) => {
+                    if !report.kept.contains(&p.sandbox) {
+                        report.kept.push(p.sandbox);
+                    }
+                }
+                true => {}
+                false => unwanted.push((name, p)),
             }
         }
+        self.delete_all(unwanted, &mut report).await;
         Ok(report)
+    }
+
+    /// Delete `names`, each sandbox's live volume first. A live volume
+    /// that stays keeps the destination and base under it: the kernel
+    /// copies from them and `reattach` rebuilds its plan from them.
+    async fn delete_all(&self, mut names: Vec<(VolumeName, Parsed)>, report: &mut Report) {
+        live_first(&mut names);
+        let mut live_stays = HashSet::new();
+        for (name, p) in names {
+            if matches!(p.kind, Kind::Dest(_) | Kind::Base(_)) && live_stays.contains(&p.sandbox) {
+                continue;
+            }
+            let deleted = self.delete_into(&name, p.kind, report).await;
+            if p.kind == Kind::Live && !deleted {
+                live_stays.insert(p.sandbox);
+            }
+        }
+    }
+
+    /// Delete one volume into `report`; whether it is gone. A deleted
+    /// live volume's source stops with it. A hydrating volume whose
+    /// source this process does not serve is not deleted: the kernel
+    /// removes a device only after its reads complete, and nothing
+    /// answers them, so the delete would hang (`reattach` first).
+    async fn delete_into(&self, name: &VolumeName, kind: Kind, report: &mut Report) -> bool {
+        if kind == Kind::Live && !self.serving.lock().unwrap().contains_key(name) {
+            match self.disk.hydration(name).await {
+                Ok(Hydration::Hydrating { source, .. }) => {
+                    report.failed.push((
+                        name.clone(),
+                        io::Error::new(
+                            io::ErrorKind::ResourceBusy,
+                            format!(
+                                "{name} hydrates from {}, which nothing serves",
+                                source.display()
+                            ),
+                        ),
+                    ));
+                    return false;
+                }
+                Ok(Hydration::Settled) => {}
+                Err(e) => {
+                    report.failed.push((name.clone(), e));
+                    return false;
+                }
+            }
+        }
+        match self.disk.delete(name).await {
+            Ok(()) => {
+                if kind == Kind::Live {
+                    if let Err(e) = self.stop_source(name).await {
+                        report.failed.push((name.clone(), e));
+                        return true;
+                    }
+                }
+                report.deleted.push(name.clone());
+                true
+            }
+            Err(e) => {
+                report.failed.push((name.clone(), e));
+                false
+            }
+        }
     }
 
     /// The released sandboxes whose kept checkpoints a resume may take.
@@ -989,7 +1361,8 @@ mod tests {
     use super::*;
     use crate::disk::{ChunkIndex, FileDisk};
     use crate::disk_flows::checkpoint;
-    use crate::test_support::CountingBlob;
+    use crate::test_support::{CountingBlob, FileSources, HydratingDisk};
+    use std::sync::atomic::Ordering;
 
     const CHUNK: u64 = 4096;
 
@@ -999,12 +1372,39 @@ mod tests {
         store: ChunkStore,
         volumes: SessionVolumes,
         blob: Arc<CountingBlob>,
+        /// Set on a rig whose disk hydrates.
+        sources: Option<Arc<FileSources>>,
     }
 
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let disk = Arc::new(FileDisk::new(dir.path().join("volumes"), CHUNK).unwrap());
         rig_on(dir, disk)
+    }
+
+    /// A rig whose disk has a hydrating device and whose host serves
+    /// sources: resumes take the lazy path.
+    fn lazy_rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(HydratingDisk::new(&dir.path().join("volumes"), CHUNK).unwrap());
+        let sources = Arc::new(disk.sources(&dir.path().join("sources")));
+        let mut r = rig_on(dir, disk);
+        r.volumes = r.volumes.with_sources(sources.clone());
+        r.sources = Some(sources);
+        r
+    }
+
+    /// Drive `settle` until the role's volume is settled; the steps it
+    /// took.
+    async fn settled(r: &Rig, sandbox: SandboxId, role: DiskRole) -> u64 {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match r.volumes.settle(sandbox, role).await.unwrap() {
+                Hydration::Settled => return steps,
+                Hydration::Hydrating { .. } => assert!(steps < 100, "the hydration never ends"),
+            }
+        }
     }
 
     /// A rig whose pool reports `POOL_TOTAL` bytes with `VOLUME_COST`
@@ -1030,6 +1430,7 @@ mod tests {
             disk,
             store,
             blob,
+            sources: None,
             _dir: dir,
         }
     }
@@ -1195,6 +1596,24 @@ mod tests {
                     sandbox,
                     role: DiskRole::Root,
                     kind: Kind::Transient
+                })
+            );
+        }
+        assert_eq!(
+            parse(&dest_name(sandbox, DiskRole::Root, manifest)),
+            Some(Parsed {
+                sandbox,
+                role: DiskRole::Root,
+                kind: Kind::Dest(manifest)
+            })
+        );
+        for base in [Some(manifest), None] {
+            assert_eq!(
+                parse(&base_name(sandbox, DiskRole::Swap, base)),
+                Some(Parsed {
+                    sandbox,
+                    role: DiskRole::Swap,
+                    kind: Kind::Base(base)
                 })
             );
         }
@@ -2143,5 +2562,210 @@ mod tests {
         let reaped = restarted.reap(POOL_TOTAL).await.unwrap();
         assert_eq!(reaped.deleted.len(), 1);
         assert!(checkpoints_of(&r, dead, DiskRole::Root).await.is_empty());
+    }
+
+    /// Image [1, 2, 3]; the session changed chunk 1 and zeroed chunk 2.
+    /// Its resume on a host that hydrates starts on a device over a
+    /// snapshot of the image volume: chunk 1 is the whole delta, chunk 2
+    /// is zeroed before the copy, chunk 0 is never touched.
+    #[tokio::test]
+    async fn a_lazy_resume_starts_on_a_hydrating_volume_and_settles_onto_it() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2, 3]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        assert_eq!(p.root_stage, StagePath::StagedSnapshot);
+        write_byte(&p.root, 1, 9).await;
+        write_byte(&p.root, 2, 0).await;
+        let published = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.release(first).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+
+        let resumed = SandboxId::new();
+        let gets = r.blob.gets();
+        let p = r
+            .volumes
+            .provision(
+                resumed,
+                Source::Continue {
+                    manifest: published,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.root_stage, p.root_manifest),
+            (StagePath::Lazy, published)
+        );
+        assert_eq!(
+            r.blob.gets(),
+            gets + 1,
+            "the source serves only the changed chunk"
+        );
+        assert_eq!(
+            names(&r).await,
+            vec![
+                image_volumes::volume_name(image).to_string(),
+                live_name(resumed, DiskRole::Root).to_string(),
+                base_name(resumed, DiskRole::Root, Some(image)).to_string(),
+                dest_name(resumed, DiskRole::Root, published).to_string(),
+            ]
+            .into_iter()
+            .map(|n| n.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+        // The fake device has no lazy read: until the copy lands, the
+        // destination shows the base with the dropped chunk zeroed.
+        assert_eq!(bytes_at(&p.root).await, vec![1, 2, 0]);
+        assert_eq!(
+            r.volumes.hydrating(resumed).await.unwrap(),
+            vec![DiskRole::Root]
+        );
+
+        let steps = settled(&r, resumed, DiskRole::Root).await;
+        assert_eq!(
+            steps, 1,
+            "the one chunk copies on the first step, then the cutover"
+        );
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9, 0]);
+        assert!(r.volumes.hydrating(resumed).await.unwrap().is_empty());
+        let sources = r.sources.as_ref().unwrap();
+        assert_eq!(sources.stopped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            r.volumes.settle(resumed, DiskRole::Root).await.unwrap(),
+            Hydration::Settled,
+            "settle is idempotent"
+        );
+
+        r.volumes.release(resumed).await.unwrap();
+        assert_eq!(
+            names(&r).await,
+            vec![image_volumes::volume_name(image).to_string()],
+            "a hydrating role keeps no checkpoint volume"
+        );
+    }
+
+    /// A release during the window deletes the device before its
+    /// source; the source refuses the other order.
+    #[tokio::test]
+    async fn a_release_during_hydration_ends_the_device_then_its_source() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        let mut newer = r.store.get_manifest(image).await.unwrap();
+        newer.chunks[0].hash = r.store.put_chunk(&vec![7u8; CHUNK as usize]).await.unwrap();
+        let next = ManifestRef::new();
+        r.store.put_manifest(next, &newer).await.unwrap();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: next,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.root_stage, StagePath::Lazy);
+        assert_eq!(
+            r.volumes.hydrating(sandbox).await.unwrap(),
+            vec![DiskRole::Root]
+        );
+
+        r.volumes.release(sandbox).await.unwrap();
+        let sources = r.sources.as_ref().unwrap();
+        assert_eq!(sources.stopped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            names(&r).await,
+            vec![image_volumes::volume_name(image).to_string()]
+        );
+    }
+
+    /// A host-agent restart mid-window: the device and its source
+    /// outlive the process; the next process cannot delete the device
+    /// before it serves the source again, then settles the volume.
+    #[tokio::test]
+    async fn a_restart_serves_a_hydrating_volume_again() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2]).await;
+        let sandbox = SandboxId::new();
+        let mut newer = r.store.get_manifest(image).await.unwrap();
+        newer.chunks[0].hash = r.store.put_chunk(&vec![7u8; CHUNK as usize]).await.unwrap();
+        let next = ManifestRef::new();
+        r.store.put_manifest(next, &newer).await.unwrap();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: next,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.root_stage, StagePath::Lazy);
+
+        let sources = r.sources.clone().unwrap();
+        let restarted = SessionVolumes::new(
+            r.disk.clone(),
+            engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default()),
+        )
+        .with_sources(sources.clone());
+        // Until the source is served again, nothing deletes the device:
+        // its removal would wait on reads nothing answers.
+        let refused = restarted.release(sandbox).await.unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ResourceBusy);
+        assert_eq!(
+            restarted.reattach(sandbox).await.unwrap(),
+            vec![DiskRole::Root]
+        );
+        loop {
+            if let Hydration::Settled = restarted.settle(sandbox, DiskRole::Root).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(bytes_at(&p.root).await, vec![7, 2]);
+        assert_eq!(sources.stopped.load(Ordering::Relaxed), 1);
+        assert!(restarted.reattach(sandbox).await.unwrap().is_empty());
+    }
+
+    /// Without a base on the host, the destination starts from zeros and
+    /// every listed chunk is the delta.
+    #[tokio::test]
+    async fn a_lazy_resume_without_a_base_starts_from_zeros() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 0, 3]).await;
+        let sandbox = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                sandbox,
+                Source::Continue {
+                    manifest: image,
+                    base: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.root_stage, StagePath::Lazy);
+        assert_eq!(bytes_at(&p.root).await, vec![0, 0, 0]);
+        assert_eq!(
+            settled(&r, sandbox, DiskRole::Root).await,
+            2,
+            "two chunks to copy"
+        );
+        assert_eq!(bytes_at(&p.root).await, vec![1, 0, 3]);
+        assert!(names(&r)
+            .await
+            .contains(&base_name(sandbox, DiskRole::Root, None).to_string()));
     }
 }

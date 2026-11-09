@@ -139,6 +139,15 @@ pub fn clone_status(status: &str) -> io::Result<CloneStatus> {
     }
 }
 
+/// The source device of a `clone` table:
+/// `<metadata> <destination> <source> <region sectors> ...`.
+pub fn clone_source(params: &str) -> io::Result<DevNo> {
+    match params.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [_, _, source, ..] => DevNo::parse(source),
+        _ => Err(invalid(format!("not clone params: {params:?}"))),
+    }
+}
+
 /// The `DEVNAME=` line of a sysfs `uevent` file.
 pub fn devname(uevent: &str) -> io::Result<String> {
     uevent
@@ -269,6 +278,18 @@ mod tests {
             assert!(err.starts_with("thin-pool is "), "{status}: {err}");
             assert!(!err.contains('/'), "the message carries no block counts: {err}");
         }
+    }
+
+    #[test]
+    fn clone_source_is_the_third_device() {
+        assert_eq!(
+            clone_source("252:3 252:4 259:0 128 2 no_hydration no_discard_passdown 0").unwrap(),
+            DevNo {
+                major: 259,
+                minor: 0
+            }
+        );
+        assert!(clone_source("252:3 252:4").is_err());
     }
 
     #[test]

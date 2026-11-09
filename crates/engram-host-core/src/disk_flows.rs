@@ -1,5 +1,6 @@
 //! Chunks between a [`Volume`] and the chunk store: [`stage`] turns a
-//! manifest into a volume, [`checkpoint`] turns a volume into a manifest.
+//! manifest into a volume, [`hydration_plan`] says what a kernel copy
+//! does instead, [`checkpoint`] turns a volume into a manifest.
 
 use std::io;
 
@@ -23,7 +24,7 @@ fn store_err(e: engram_chunk_store::ChunkStoreError) -> io::Error {
     io::Error::other(e)
 }
 
-fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
+pub(crate) fn shape_matches(volume: &Volume, manifest: &Manifest) -> io::Result<()> {
     if volume.chunk_size != manifest.chunk_size.as_u64()
         || volume.size_bytes != manifest.total_bytes
     {
@@ -183,6 +184,47 @@ pub async fn stage_at(
         .instrument(tracing::info_span!("disk.stage.sync"))
         .await?;
     Ok(volume)
+}
+
+/// What brings a snapshot of `base`'s volume (an empty volume when
+/// `None`) to `wanted` when the kernel copies the difference in behind
+/// a running guest ([`SessionDisk::hydrate`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HydrationPlan {
+    /// The chunks the kernel copies from the source, ascending: listed
+    /// in `wanted` with a hash the base does not hold at that offset.
+    pub delta: Vec<u64>,
+    /// Chunks to zero on the destination before the copy starts: the
+    /// base holds them, `wanted` does not.
+    pub zero: Vec<ChunkIndex>,
+    /// Every chunk not in `delta`: the destination holds it already.
+    pub skip: Vec<ChunkIndex>,
+}
+
+pub fn hydration_plan(wanted: &Manifest, base: Option<&Manifest>) -> io::Result<HydrationPlan> {
+    wanted.validate().map_err(store_err)?;
+    let chunk_size = wanted.chunk_size.as_u64();
+    let (write, zero) = match base {
+        Some(base) => {
+            let delta = wanted.delta_from(base).map_err(store_err)?;
+            (delta.write, delta.zero)
+        }
+        None => (wanted.chunks.clone(), Vec::new()),
+    };
+    let mut delta: Vec<u64> = write.iter().map(|c| c.offset / chunk_size).collect();
+    delta.sort_unstable();
+    let skip = (0..wanted.expected_chunk_count())
+        .filter(|chunk| delta.binary_search(chunk).is_err())
+        .map(ChunkIndex)
+        .collect();
+    Ok(HydrationPlan {
+        delta,
+        zero: zero
+            .iter()
+            .map(|offset| ChunkIndex(offset / chunk_size))
+            .collect(),
+        skip,
+    })
 }
 
 /// A snapshot of `live` and the manifest describing it. With `previous`
@@ -412,6 +454,45 @@ mod tests {
         .unwrap();
         assert_eq!(bytes_of(&fresh).await, bytes_of(&c2).await);
         assert_eq!(bytes_of(&over).await, bytes_of(&c2).await);
+    }
+
+    /// Base [1, 2, 3, 0, 5]; wanted [1, 9, 0, 4, 5]: chunk 1 changed,
+    /// chunk 2 dropped, chunk 3 new, the rest held.
+    #[test]
+    fn a_hydration_plan_copies_the_changed_chunks_zeroes_the_dropped_and_skips_the_rest() {
+        let manifest = |pattern: &[u8]| Manifest {
+            chunk_size: ChunkSize::bytes(CHUNK),
+            chunks: pattern
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte != 0)
+                .map(|(i, byte)| ChunkRef {
+                    offset: i as u64 * CHUNK,
+                    hash: engram_chunk_store::ChunkHash::of(&fill(*byte)),
+                })
+                .collect(),
+            ..Manifest::empty(ManifestKind::Disk, CHUNK * pattern.len() as u64)
+        };
+        let base = manifest(&[1, 2, 3, 0, 5]);
+        let wanted = manifest(&[1, 9, 0, 4, 5]);
+        assert_eq!(
+            hydration_plan(&wanted, Some(&base)).unwrap(),
+            HydrationPlan {
+                delta: vec![1, 3],
+                zero: vec![ChunkIndex(2)],
+                skip: [0, 2, 4].map(ChunkIndex).to_vec(),
+            }
+        );
+        assert_eq!(
+            hydration_plan(&wanted, None).unwrap(),
+            HydrationPlan {
+                delta: vec![0, 1, 3, 4],
+                zero: vec![],
+                skip: vec![ChunkIndex(2)],
+            }
+        );
+        let other_shape = manifest(&[1, 2]);
+        assert!(hydration_plan(&wanted, Some(&other_shape)).is_err());
     }
 
     #[tokio::test]

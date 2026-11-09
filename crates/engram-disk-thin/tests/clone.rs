@@ -97,9 +97,13 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
     let device = pool
         .hydrate(&dest, &source.0, &name("io"), &skip)
         .await
-        .unwrap()
-        .expect("dm-clone on linux");
-    assert!(pool.list().await.unwrap().contains(&name("io-md")));
+        .unwrap();
+    let listed = pool.list().await.unwrap();
+    assert!(listed.contains(&name("io")) && listed.contains(&name("io-md")));
+    assert_eq!(
+        pool.open(&name("io")).await.unwrap().size_bytes,
+        device.size_bytes
+    );
 
     assert_eq!(device.read_chunk(ChunkIndex(0)).await.unwrap(), fill(1));
     assert_eq!(device.read_chunk(ChunkIndex(1)).await.unwrap(), fill(3));
@@ -110,8 +114,12 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match pool.hydration(&device.name).await.unwrap() {
-            Hydration::Hydrating { hydrated, total } if hydrated == total => {
-                assert_eq!(total, REGIONS);
+            Hydration::Hydrating {
+                hydrated,
+                total,
+                source: from,
+            } if hydrated == total => {
+                assert_eq!((total, from), (REGIONS, source.0.clone()));
                 break;
             }
             Hydration::Hydrating { .. } if Instant::now() < deadline => {
@@ -142,7 +150,10 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
         "the skipped chunk 0 still shares its blocks with the origin"
     );
 
-    let (device, dest, base) = (device.name, dest.name, base.name);
+    // A volume holds its device open; a delete needs it closed.
+    let names = (device.name.clone(), dest.name.clone(), base.name.clone());
+    drop((device, dest, base));
+    let (device, dest, base) = names;
     pool.delete(&device).await.unwrap();
     pool.delete(&dest).await.unwrap();
     pool.delete(&base).await.unwrap();
@@ -169,7 +180,6 @@ async fn settle_refuses_a_device_that_is_still_hydrating() {
     let device = pool
         .hydrate(&dest, &source.0, &name("early-io"), &[])
         .await
-        .unwrap()
         .unwrap();
     let err = pool.settle(&device.name, &dest).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
@@ -179,7 +189,9 @@ async fn settle_refuses_a_device_that_is_still_hydrating() {
     ));
     dmsetup(&["resume", &pool.device_name(&dest.name)]).await;
     // A delete while the kernel is still copying leaks nothing.
-    let (device, dest) = (device.name, dest.name);
+    let names = (device.name.clone(), dest.name.clone());
+    drop((device, dest));
+    let (device, dest) = names;
     pool.delete(&device).await.unwrap();
     pool.delete(&dest).await.unwrap();
     assert!(!pool

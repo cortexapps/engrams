@@ -117,20 +117,11 @@ impl ThinPoolDisk {
         self.nodes_dir.join(self.device_name(name))
     }
 
+    /// The id of every thin on this pool that has a device, from one
+    /// device list and one table read per device. A device that goes
+    /// away between the two is not on the pool.
     async fn active_ids(&self) -> io::Result<Vec<u32>> {
-        Ok(self
-            .thins()
-            .await?
-            .into_iter()
-            .map(|t| t.params.id)
-            .collect())
-    }
-
-    /// Every thin device on this pool, from one device list and one
-    /// table read per device. A device that goes away between the two
-    /// is not on the pool.
-    async fn thins(&self) -> io::Result<Vec<Thin>> {
-        let mut thins = Vec::new();
+        let mut ids = Vec::new();
         for (name, _) in self.dm.list().await? {
             let targets = match self.dm.table(&name).await {
                 Ok(targets) => targets,
@@ -145,10 +136,10 @@ impl ThinPoolDisk {
             }
             let params = parse::thin_params(&target.params)?;
             if params.pool == self.pool_dev {
-                thins.push(Thin { name, params });
+                ids.push(params.id);
             }
         }
-        Ok(thins)
+        Ok(ids)
     }
 
     /// The one target of the device behind `name`.
@@ -309,11 +300,6 @@ impl ThinPoolDisk {
     }
 }
 
-struct Thin {
-    name: String,
-    params: ThinParams,
-}
-
 /// A reserved metadata snapshot; released on drop.
 struct MetadataSnap<'a> {
     dm: &'a dm::Dm,
@@ -429,7 +415,17 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn open(&self, name: &VolumeName) -> io::Result<Volume> {
-        let (_, sectors) = self.thin_of(name).await?;
+        let target = self.target_of(name).await?;
+        let sectors = match target.kind.as_str() {
+            "thin" => self.thin_of(name).await?.1,
+            "clone" | "linear" => target.length_sectors,
+            kind => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is a {kind} device, which this disk did not make"),
+                ))
+            }
+        };
         self.volume(name, sectors).await
     }
 
@@ -450,16 +446,31 @@ impl SessionDisk for ThinPoolDisk {
         }
     }
 
+    /// The pool's thins and the hydrating and settled devices over them,
+    /// all under this pool's name.
     async fn list(&self) -> io::Result<Vec<VolumeName>> {
-        Ok(self
-            .thins()
-            .await?
-            .into_iter()
-            .filter_map(|t| {
-                let volume = t.name.strip_prefix(&self.pool)?.strip_prefix('.')?;
-                VolumeName::new(volume.to_string()).ok()
-            })
-            .collect())
+        let prefix = format!("{}.", self.pool);
+        let mut names = Vec::new();
+        for (device, _) in self.dm.list().await? {
+            let Some(volume) = device.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(name) = VolumeName::new(volume.to_string()) else {
+                continue;
+            };
+            match self.dm.table(&device).await {
+                Ok(targets) => {
+                    if let [target] = targets.as_slice() {
+                        if ["thin", "clone", "linear"].contains(&target.kind.as_str()) {
+                            names.push(name);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(names)
     }
 
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()> {
@@ -485,6 +496,10 @@ impl SessionDisk for ThinPoolDisk {
         })
     }
 
+    fn region_bytes(&self) -> Option<u64> {
+        Some(self.block_bytes)
+    }
+
     /// A `clone` target over `dest` with `source` as its source and a
     /// region per pool block (the unit the pool shares and `dirty_blocks`
     /// sees; a guest write to a cold region waits for one region's copy),
@@ -496,7 +511,7 @@ impl SessionDisk for ThinPoolDisk {
         source: &Path,
         name: &VolumeName,
         skip: &[ChunkIndex],
-    ) -> io::Result<Option<Volume>> {
+    ) -> io::Result<Volume> {
         let (_, sectors) = self.thin_of(&dest.name).await?;
         let region_sectors = self.block_bytes / SECTOR_BYTES;
         if !sectors.is_multiple_of(region_sectors) {
@@ -534,23 +549,26 @@ impl SessionDisk for ThinPoolDisk {
                 tracing::warn!(%name, %error, "hydrating device left behind by a failed hydrate");
             }
         }
-        hydrating.map(Some)
+        hydrating
     }
 
     async fn hydration(&self, name: &VolumeName) -> io::Result<Hydration> {
-        let status = self.dm.status(&self.device_name(name)).await?;
+        let device = self.device_name(name);
+        let status = self.dm.status(&device).await?;
         match status.as_slice() {
             [target] if target.kind == "clone" => {
                 let status = parse::clone_status(&target.params)?;
+                let table = single_target(&self.dm.table(&device).await?, "clone")?;
                 Ok(Hydration::Hydrating {
                     hydrated: status.hydrated_regions,
                     total: status.total_regions,
+                    source: dm::device_path(parse::clone_source(&table)?).await?,
                 })
             }
-            [target] if target.kind == "linear" => Ok(Hydration::Settled),
+            [target] if target.kind == "linear" || target.kind == "thin" => Ok(Hydration::Settled),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{name} is not a hydrating device: {status:?}"),
+                format!("{name} is not a session volume: {status:?}"),
             )),
         }
     }
@@ -560,7 +578,9 @@ impl SessionDisk for ThinPoolDisk {
     /// last: the kernel closes it when the clone table is destroyed.
     async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
         match self.hydration(name).await? {
-            Hydration::Hydrating { hydrated, total } if hydrated < total => {
+            Hydration::Hydrating {
+                hydrated, total, ..
+            } if hydrated < total => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("{name}: {hydrated} of {total} regions are hydrated"),

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use engram_chunk_store::Manifest;
+use engram_fill::FillEngine;
 
 /// The name a volume is created and reopened by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -73,11 +75,15 @@ impl Capacity {
 }
 
 /// How far the kernel has copied a hydrating volume's regions in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hydration {
     /// `hydrated` of `total` regions are in the destination; the rest
-    /// still read from the source.
-    Hydrating { hydrated: u64, total: u64 },
+    /// still read from the block device at `source`.
+    Hydrating {
+        hydrated: u64,
+        total: u64,
+        source: PathBuf,
+    },
     /// Every region is in the destination and the device maps onto it
     /// directly ([`SessionDisk::settle`] ran).
     Settled,
@@ -427,6 +433,13 @@ pub trait SessionDisk: Send + Sync {
 
     async fn capacity(&self) -> io::Result<Capacity>;
 
+    /// The unit [`Self::hydrate`] copies in, which divides the chunk
+    /// size; `None` on a platform without a hydrating device, where a
+    /// volume is written in full before the guest starts.
+    fn region_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// A device named `name` over `dest` that a guest can open before
     /// `dest` holds its data: a read of a region not yet in `dest` is
     /// served from the read-only block device at `source`, a write goes
@@ -434,26 +447,26 @@ pub trait SessionDisk: Send + Sync {
     /// and the kernel copies every other region from `source` into
     /// `dest` in the background. `skip` lists the chunks `dest` already
     /// holds in their final form; they are never copied, so blocks
-    /// `dest` shares with its origin stay shared. `Ok(None)` on a
-    /// platform without such a device; the caller then writes `dest` in
-    /// full before the guest starts.
+    /// `dest` shares with its origin stay shared.
     async fn hydrate(
         &self,
         dest: &Volume,
         source: &Path,
         name: &VolumeName,
         skip: &[ChunkIndex],
-    ) -> io::Result<Option<Volume>> {
-        let _ = (dest, source, name, skip);
-        Ok(None)
-    }
-
-    /// Progress of a device [`Self::hydrate`] made.
-    async fn hydration(&self, name: &VolumeName) -> io::Result<Hydration> {
+    ) -> io::Result<Volume> {
+        let _ = (dest, source, skip);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("{name} is not a hydrating device on this platform"),
+            format!("{name}: this platform has no hydrating device"),
         ))
+    }
+
+    /// Progress of a device [`Self::hydrate`] made; `Settled` for a volume
+    /// that never hydrated or has settled.
+    async fn hydration(&self, name: &VolumeName) -> io::Result<Hydration> {
+        let _ = name;
+        Ok(Hydration::Settled)
     }
 
     /// Map a fully hydrated device straight onto `dest`. Every I/O in
@@ -509,6 +522,45 @@ pub trait SessionDisk: Send + Sync {
         chunks.dedup();
         Ok(chunks)
     }
+}
+
+/// A read-only block device that serves a manifest from the fill
+/// engine: what a hydrating volume copies its cold regions from.
+#[async_trait]
+pub trait SourceDevice: Send + Sync {
+    fn path(&self) -> &Path;
+
+    /// Chunks a guest read before the copy reached them, in first-read
+    /// order.
+    fn touched(&self) -> Vec<u32>;
+
+    /// Stop serving and delete the device. Refused while a device still
+    /// maps onto it.
+    async fn stop(self: Box<Self>) -> io::Result<()>;
+}
+
+/// Makes [`SourceDevice`]s. `delta` lists, ascending, the chunks the kernel
+/// copies from the device; `region_bytes` is its copy unit.
+#[async_trait]
+pub trait SourceServer: Send + Sync {
+    async fn serve(
+        &self,
+        fill: FillEngine,
+        manifest: &Manifest,
+        delta: Vec<u64>,
+        region_bytes: u64,
+    ) -> io::Result<Box<dyn SourceDevice>>;
+
+    /// Take over the device at `path` from a process that died serving
+    /// it; the reads it left queued are answered.
+    async fn recover(
+        &self,
+        path: &Path,
+        fill: FillEngine,
+        manifest: &Manifest,
+        delta: Vec<u64>,
+        region_bytes: u64,
+    ) -> io::Result<Box<dyn SourceDevice>>;
 }
 
 /// The data extents of `file` as `(offset, len)` ranges, from
