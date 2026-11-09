@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engram_chunk_store::cache::{ChunkCache, CHUNK_FILL_TOTAL};
+use engram_chunk_store::cache::ChunkCache;
 use engram_chunk_store::manifest::ChunkHash;
 use engram_protocol::grpc::{PeerChunkFrame, PeerChunkGetRequest};
 use engram_protocol::grpc_client::{GrpcHostClient, PeerChunkScope};
@@ -564,7 +564,6 @@ async fn fetch_batch(
             Ok(Assembled::Whole(idx, body)) => {
                 if let Some(waiter) = waiters[idx].take() {
                     let _ = waiter.send(Some(bytes::Bytes::from(body)));
-                    metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
                 }
             }
             Err(e) => {
