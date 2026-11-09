@@ -1766,15 +1766,11 @@ impl PooledBackend {
         // A hinted peer holds the session's chunks on local disk: the disk
         // stages and every memory fetch of a lazy restore ask it before
         // the store.
-        let peer: Option<Arc<dyn engram_fill::PeerSource>> =
-            metadata.peer_hints.first().map(|addr| {
-                let peer: Arc<dyn engram_fill::PeerSource> = crate::peer_fill::PeerFetcher::spawn(
-                    addr.clone(),
-                    engram_protocol::grpc_client::PeerChunkScope::Snapshot(metadata.id),
-                    self.peer_health.clone(),
-                );
-                peer
-            });
+        let peer = crate::peer_fill::PeerFetcher::first_live(
+            metadata.peer_hints.iter().map(String::as_str),
+            engram_protocol::grpc_client::PeerChunkScope::Snapshot(metadata.id),
+            &self.peer_health,
+        );
 
         // The sidecar names the memory manifest `materialize_memory_if_missing`
         // rebuilds from, so on a cross-host restore it is downloaded first.

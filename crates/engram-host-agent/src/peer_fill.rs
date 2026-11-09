@@ -568,6 +568,19 @@ pub struct PeerFetcher {
 }
 
 impl PeerFetcher {
+    /// A fetcher for the first of `addrs` that is not lost, as a fill
+    /// engine source; `None` when every one is lost or there is none.
+    pub fn first_live<'a>(
+        addrs: impl IntoIterator<Item = &'a str>,
+        scope: PeerChunkScope,
+        health: &Arc<PeerHealth>,
+    ) -> Option<Arc<dyn engram_fill::PeerSource>> {
+        let addr = addrs.into_iter().find(|addr| !health.is_lost(addr))?;
+        let fetcher: Arc<dyn engram_fill::PeerSource> =
+            Self::spawn(addr.to_string(), scope, health.clone());
+        Some(fetcher)
+    }
+
     /// Start the fetcher's batching task. It ends when the fetcher drops.
     pub fn spawn(addr: String, scope: PeerChunkScope, health: Arc<PeerHealth>) -> Arc<Self> {
         Self::spawn_with_idle(addr, scope, health, PEER_IDLE)
