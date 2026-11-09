@@ -925,6 +925,9 @@ impl SessionVolumes {
         let mut roles = Vec::new();
         for role in self.lazy_roles(sandbox).await? {
             let live = live_name(sandbox, role);
+            if self.serving.lock().unwrap().contains_key(&live) {
+                continue;
+            }
             let Hydration::Hydrating { source, .. } = self.disk.hydration(&live).await? else {
                 continue;
             };
@@ -957,7 +960,10 @@ impl SessionVolumes {
 
     /// [`Self::reattach`] for every sandbox with a hydrating role, live
     /// or not: a volume whose source nothing serves cannot be deleted,
-    /// so this runs before the startup reconcile.
+    /// so this runs before the startup reconcile. A role this process
+    /// already serves is skipped. A sandbox whose reattach fails is
+    /// logged and left as it is (its volumes stay, unserved and
+    /// undeletable) so the rest of the host comes up.
     pub async fn reattach_all(&self) -> io::Result<Vec<(SandboxId, DiskRole)>> {
         let mut sandboxes: Vec<SandboxId> = Vec::new();
         for p in self.disk.list().await?.iter().filter_map(parse) {
@@ -967,8 +973,11 @@ impl SessionVolumes {
         }
         let mut reattached = Vec::new();
         for sandbox in sandboxes {
-            for role in self.reattach(sandbox).await? {
-                reattached.push((sandbox, role));
+            match self.reattach(sandbox).await {
+                Ok(roles) => reattached.extend(roles.into_iter().map(|role| (sandbox, role))),
+                Err(error) => {
+                    tracing::error!(sandbox_id = %sandbox, %error, "hydrating volume not served again");
+                }
             }
         }
         Ok(reattached)
@@ -3103,6 +3112,10 @@ mod tests {
         assert_eq!(
             restarted.reattach(sandbox).await.unwrap(),
             vec![DiskRole::Root]
+        );
+        assert!(
+            restarted.reattach_all().await.unwrap().is_empty(),
+            "a role this process serves is not served twice"
         );
         loop {
             if let Hydration::Settled = restarted.settle(sandbox, DiskRole::Root).await.unwrap() {
