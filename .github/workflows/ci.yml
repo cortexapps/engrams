@@ -1193,6 +1193,7 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
+            --test clone \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

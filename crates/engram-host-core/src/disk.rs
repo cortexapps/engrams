@@ -72,6 +72,17 @@ impl Capacity {
     }
 }
 
+/// How far the kernel has copied a hydrating volume's regions in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hydration {
+    /// `hydrated` of `total` regions are in the destination; the rest
+    /// still read from the source.
+    Hydrating { hydrated: u64, total: u64 },
+    /// Every region is in the destination and the device maps onto it
+    /// directly ([`SessionDisk::settle`] ran).
+    Settled,
+}
+
 /// An open volume. Clones share the file handle.
 #[derive(Clone, Debug)]
 pub struct Volume {
@@ -415,6 +426,46 @@ pub trait SessionDisk: Send + Sync {
     async fn rename(&self, from: &VolumeName, to: &VolumeName) -> io::Result<()>;
 
     async fn capacity(&self) -> io::Result<Capacity>;
+
+    /// A device named `name` over `dest` that a guest can open before
+    /// `dest` holds its data: a read of a region not yet in `dest` is
+    /// served from the read-only block device at `source`, a write goes
+    /// to `dest` (after the kernel copies the rest of its region in),
+    /// and the kernel copies every other region from `source` into
+    /// `dest` in the background. `skip` lists the chunks `dest` already
+    /// holds in their final form; they are never copied, so blocks
+    /// `dest` shares with its origin stay shared. `Ok(None)` on a
+    /// platform without such a device; the caller then writes `dest` in
+    /// full before the guest starts.
+    async fn hydrate(
+        &self,
+        dest: &Volume,
+        source: &Path,
+        name: &VolumeName,
+        skip: &[ChunkIndex],
+    ) -> io::Result<Option<Volume>> {
+        let _ = (dest, source, name, skip);
+        Ok(None)
+    }
+
+    /// Progress of a device [`Self::hydrate`] made.
+    async fn hydration(&self, name: &VolumeName) -> io::Result<Hydration> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{name} is not a hydrating device on this platform"),
+        ))
+    }
+
+    /// Map a fully hydrated device straight onto `dest`. Every I/O in
+    /// flight completes first; open handles keep working; `source` is
+    /// not read again.
+    async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
+        let _ = dest;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{name} is not a hydrating device on this platform"),
+        ))
+    }
 
     /// Ascending indices of the `block_bytes`-sized blocks that differ
     /// between two snapshots of one origin; `block_bytes` divides the

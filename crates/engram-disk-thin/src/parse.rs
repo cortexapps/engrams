@@ -110,6 +110,35 @@ pub fn pool_status(status: &str) -> io::Result<PoolStatus> {
     }
 }
 
+/// `clone` status: `<metadata block sectors> <used>/<total metadata>
+/// <region sectors> <hydrated>/<total regions> <hydrating> <n features>
+/// ... <n core args> ... <mode>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloneStatus {
+    pub hydrated_regions: u64,
+    pub total_regions: u64,
+    pub hydrating_regions: u64,
+}
+
+/// A clone whose metadata is not read-write (`ro`, or the single word
+/// `Fail`) is an error: it copies nothing more and must not be settled.
+pub fn clone_status(status: &str) -> io::Result<CloneStatus> {
+    let fields: Vec<&str> = status.split_whitespace().collect();
+    match fields.as_slice() {
+        ["Fail" | "Error"] => Err(invalid(format!("clone is {}", fields[0]))),
+        [.., mode] if *mode != "rw" => Err(invalid(format!("clone is {mode}"))),
+        [_, _, _, regions, hydrating, ..] => {
+            let (hydrated_regions, total_regions) = fraction(regions)?;
+            Ok(CloneStatus {
+                hydrated_regions,
+                total_regions,
+                hydrating_regions: number(hydrating)?,
+            })
+        }
+        _ => Err(invalid(format!("not clone status: {status:?}"))),
+    }
+}
+
 /// The `DEVNAME=` line of a sysfs `uevent` file.
 pub fn devname(uevent: &str) -> io::Result<String> {
     uevent
@@ -239,6 +268,26 @@ mod tests {
             let err = pool_status(status).unwrap_err().to_string();
             assert!(err.starts_with("thin-pool is "), "{status}: {err}");
             assert!(!err.contains('/'), "the message carries no block counts: {err}");
+        }
+    }
+
+    #[test]
+    fn clone_status_reads_the_region_counts() {
+        let status = clone_status(
+            "8 25/2048 128 1500/4096 16 2 no_hydration no_discard_passdown 4 hydration_threshold 128 hydration_batch_size 16 rw",
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            CloneStatus {
+                hydrated_regions: 1500,
+                total_regions: 4096,
+                hydrating_regions: 16,
+            }
+        );
+        for bad in ["8 25/2048 128 4096/4096 0 0 0 ro", "Fail"] {
+            let err = clone_status(bad).unwrap_err().to_string();
+            assert!(err.starts_with("clone is "), "{bad}: {err}");
         }
     }
 

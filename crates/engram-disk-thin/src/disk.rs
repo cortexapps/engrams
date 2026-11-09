@@ -1,5 +1,6 @@
 //! The disk over the ioctl layer; Linux only.
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -9,7 +10,9 @@ use std::time::Duration;
 use crate::dm;
 use crate::parse::{self, DevNo, ThinParams, METADATA_BLOCK_BYTES};
 use async_trait::async_trait;
-use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
+use engram_host_core::disk::{
+    punch_hole, Capacity, ChunkIndex, Hydration, SessionDisk, Volume, VolumeName,
+};
 
 const SECTOR_BYTES: u64 = 512;
 /// dm-thin device ids are 24 bits wide.
@@ -18,6 +21,14 @@ const ID_MASK: u32 = 0x00FF_FFFF;
 /// to close it.
 const REMOVE_ATTEMPTS: u32 = 10;
 const REMOVE_RETRY: Duration = Duration::from_millis(100);
+/// A dm-clone metadata volume: a superblock and one bit per region in
+/// 4 KiB blocks. 8 MiB holds the bitset of a 2 million region volume
+/// with room for its transaction shadows.
+const CLONE_METADATA_BYTES: u64 = 8 << 20;
+/// Regions per background copy and copies in flight: 1 MiB bios, 8 MiB
+/// in flight. The kernel's defaults of 1 and 1 copy at a few MiB/s.
+const HYDRATION_BATCH_REGIONS: u64 = 16;
+const HYDRATION_THRESHOLD_REGIONS: u64 = 128;
 
 pub struct ThinPoolDisk {
     dm: dm::Dm,
@@ -130,11 +141,28 @@ impl ThinPoolDisk {
         Ok(thins)
     }
 
+    /// The one target of the device behind `name`.
+    async fn target_of(&self, name: &VolumeName) -> io::Result<dm::Target> {
+        match self.dm.table(&self.device_name(name)).await?.as_slice() {
+            [target] => Ok(target.clone()),
+            targets => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} has {} targets, not one", targets.len()),
+            )),
+        }
+    }
+
     /// The thin behind `name` and its size, refused when it belongs to
     /// another pool.
     async fn thin_of(&self, name: &VolumeName) -> io::Result<(ThinParams, u64)> {
-        let targets = self.dm.table(&self.device_name(name)).await?;
-        let params = parse::thin_params(&single_target(&targets, "thin")?)?;
+        let target = self.target_of(name).await?;
+        if target.kind != "thin" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is a {} device, not a thin", target.kind),
+            ));
+        }
+        let params = parse::thin_params(&target.params)?;
         if params.pool != self.pool_dev {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -144,7 +172,43 @@ impl ThinPoolDisk {
                 ),
             ));
         }
-        Ok((params, targets[0].length_sectors))
+        Ok((params, target.length_sectors))
+    }
+
+    /// Remove the device, waiting a bounded time for the last holder to
+    /// close it, then its node.
+    async fn remove_device(&self, name: &VolumeName) -> io::Result<()> {
+        let mut attempt = 1;
+        loop {
+            match self.dm.remove(&self.device_name(name)).await {
+                Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(REMOVE_RETRY).await;
+                }
+                removed => break removed?,
+            }
+        }
+        match tokio::fs::remove_file(self.node_of(name)).await {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    async fn delete_thin(&self, name: &VolumeName) -> io::Result<()> {
+        let (thin, _) = self.thin_of(name).await?;
+        self.remove_device(name).await?;
+        self.dm
+            .message(&self.pool, &format!("delete {}", thin.id))
+            .await
+    }
+
+    /// Delete the metadata thin of the hydrating device `name`, if a
+    /// settle or an earlier delete has not.
+    async fn delete_metadata(&self, name: &VolumeName) -> io::Result<()> {
+        match self.delete_thin(&metadata_name(name)?).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            deleted => deleted,
+        }
     }
 
     /// A device over thin `id`. On failure the thin is deleted from the
@@ -230,6 +294,46 @@ impl Drop for MetadataSnap<'_> {
     }
 }
 
+/// The metadata volume of a hydrating device.
+fn metadata_name(name: &VolumeName) -> io::Result<VolumeName> {
+    VolumeName::new(format!("{name}-md"))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+/// Mark the `skip` chunks of a hydrating device as copied: under
+/// `no_discard_passdown`, a discard of regions the kernel has not copied
+/// marks them copied and leaves the destination's blocks as they are.
+/// Consecutive chunks go in one discard; a skip list is most of a
+/// volume, in long runs.
+async fn skip_regions(device: &Volume, skip: &[ChunkIndex]) -> io::Result<()> {
+    let file = File::options().read(true).write(true).open(&device.path)?;
+    let (chunk, size) = (device.chunk_size, device.size_bytes);
+    let mut chunks: Vec<u64> = skip.iter().map(|c| c.0).collect();
+    chunks.sort_unstable();
+    chunks.dedup();
+    tokio::task::spawn_blocking(move || {
+        let mut chunks = chunks.into_iter().peekable();
+        while let Some(first) = chunks.next() {
+            let mut last = first;
+            while chunks.next_if_eq(&(last + 1)).is_some() {
+                last += 1;
+            }
+            let offset = first * chunk;
+            let end = (last + 1) * chunk;
+            if end > size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("skip chunk {last} lies beyond the {size}-byte volume"),
+                ));
+            }
+            punch_hole(&file, offset, end - offset)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 fn single_target(targets: &[dm::Target], kind: &str) -> io::Result<String> {
     match targets {
         [target] if target.kind == kind => Ok(target.params.clone()),
@@ -302,26 +406,21 @@ impl SessionDisk for ThinPoolDisk {
         self.volume(name, sectors).await
     }
 
-    /// Waits a bounded time for the last holder to close the device.
+    /// Waits a bounded time for the last holder to close the device. A
+    /// hydrating or settled device takes its metadata thin with it.
     async fn delete(&self, name: &VolumeName) -> io::Result<()> {
-        let (thin, _) = self.thin_of(name).await?;
-        let mut attempt = 1;
-        loop {
-            match self.dm.remove(&self.device_name(name)).await {
-                Err(e) if e.kind() == io::ErrorKind::ResourceBusy && attempt < REMOVE_ATTEMPTS => {
-                    attempt += 1;
-                    tokio::time::sleep(REMOVE_RETRY).await;
-                }
-                removed => break removed?,
+        let target = self.target_of(name).await?;
+        match target.kind.as_str() {
+            "thin" => self.delete_thin(name).await,
+            "clone" | "linear" => {
+                self.remove_device(name).await?;
+                self.delete_metadata(name).await
             }
+            kind => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is a {kind} device, which this disk did not make"),
+            )),
         }
-        match tokio::fs::remove_file(self.node_of(name)).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        self.dm
-            .message(&self.pool, &format!("delete {}", thin.id))
-            .await
     }
 
     async fn list(&self) -> io::Result<Vec<VolumeName>> {
@@ -357,6 +456,107 @@ impl SessionDisk for ThinPoolDisk {
                 - status.metadata_used_blocks * METADATA_BLOCK_BYTES,
             metadata_total_bytes,
         })
+    }
+
+    /// A `clone` target over `dest` with `source` as its source and a
+    /// region per pool block (the unit the pool shares and `dirty_blocks`
+    /// sees; a guest write to a cold region waits for one region's copy),
+    /// created with hydration off so the skip discards land before any
+    /// copy; then hydration on. A failure leaves nothing.
+    async fn hydrate(
+        &self,
+        dest: &Volume,
+        source: &Path,
+        name: &VolumeName,
+        skip: &[ChunkIndex],
+    ) -> io::Result<Option<Volume>> {
+        let (_, sectors) = self.thin_of(&dest.name).await?;
+        let region_sectors = self.block_bytes / SECTOR_BYTES;
+        if !sectors.is_multiple_of(region_sectors) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: {sectors} sectors is not whole pool blocks", dest.name),
+            ));
+        }
+        let metadata = self
+            .create(&metadata_name(name)?, CLONE_METADATA_BYTES)
+            .await?;
+        let params = format!(
+            "{} {} {} {region_sectors} 2 no_hydration no_discard_passdown \
+             4 hydration_threshold {HYDRATION_THRESHOLD_REGIONS} \
+             hydration_batch_size {HYDRATION_BATCH_REGIONS}",
+            dm::devno_of(&metadata.path)?,
+            dm::devno_of(&dest.path)?,
+            dm::devno_of(source)?,
+        );
+        let device = self.device_name(name);
+        let hydrating = async {
+            self.dm.create(&device, sectors, "clone", &params).await?;
+            let volume = self.volume(name, sectors).await?;
+            skip_regions(&volume, skip).await?;
+            self.dm.message(&device, "enable_hydration").await?;
+            Ok(volume)
+        }
+        .await;
+        if hydrating.is_err() {
+            let removed = match self.remove_device(name).await {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            };
+            if let Err(error) = removed.and(self.delete_metadata(name).await) {
+                tracing::warn!(%name, %error, "hydrating device left behind by a failed hydrate");
+            }
+        }
+        hydrating.map(Some)
+    }
+
+    async fn hydration(&self, name: &VolumeName) -> io::Result<Hydration> {
+        let status = self.dm.status(&self.device_name(name)).await?;
+        match status.as_slice() {
+            [target] if target.kind == "clone" => {
+                let status = parse::clone_status(&target.params)?;
+                Ok(Hydration::Hydrating {
+                    hydrated: status.hydrated_regions,
+                    total: status.total_regions,
+                })
+            }
+            [target] if target.kind == "linear" => Ok(Hydration::Settled),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is not a hydrating device: {status:?}"),
+            )),
+        }
+    }
+
+    /// Reloads the device as `linear` over `dest`. The suspend holds the
+    /// guest's I/O for the reload, so the three calls are one owned task.
+    /// A failed reload resumes the clone table. The metadata thin goes
+    /// last: the kernel closes it when the clone table is destroyed.
+    async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
+        match self.hydration(name).await? {
+            Hydration::Hydrating { hydrated, total } if hydrated < total => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name}: {hydrated} of {total} regions are hydrated"),
+                ));
+            }
+            Hydration::Hydrating { .. } => {
+                let (_, sectors) = self.thin_of(&dest.name).await?;
+                let params = format!("{} 0", dm::devno_of(&dest.path)?);
+                let dm = self.dm.clone();
+                let device = self.device_name(name);
+                tokio::spawn(async move {
+                    dm.suspend(&device).await?;
+                    let loaded = dm.load(&device, sectors, "linear", &params).await;
+                    let resumed = dm.resume(&device).await;
+                    loaded.and(resumed)
+                })
+                .await
+                .map_err(io::Error::other)??;
+            }
+            Hydration::Settled => {}
+        }
+        self.delete_metadata(name).await
     }
 
     /// Reads the pool's mapping tree instead of the volumes. A block is
