@@ -68,7 +68,10 @@ after, and excludes parent credentials and default contexts.
 
 The operator must supply actual private DNS and routes from the native host
 to all exact fixture names, including `postgres.fixture.example`, and to the
-Linux substrate. Native resolution is checked. TLS, database, fixture, host,
+Linux substrate. For Firecracker, `host.fixture.example` must resolve to the
+coordinator bridge address (`<subnet-prefix>.21`). For VZ, it must resolve to
+`nativeHostIp`. Native resolution is checked against the same exact map used
+by fixture DNS. TLS, database, fixture, host,
 and matrix operations test their real routes. No adapter installs a VM
 manager or changes host DNS, host routes, or global engine settings.
 
@@ -171,7 +174,9 @@ UFFD helper bytes remain pinned without a claim of UFFD runtime qualification.
 
 FC's listener is `0.0.0.0:9101` only inside its owned namespace. C's guard
 publishes only the verified `nativeHostIp:9101`. The advertised TLS authority
-stays `host.fixture.example:9101`. VZ binds its verified native address directly.
+stays `host.fixture.example:9101` and resolves to C's bridge address because
+FC and C share that namespace. The published native port remains exact.
+VZ resolves this name to and binds its verified native address directly.
 
 ## Network and startup order
 
@@ -182,7 +187,8 @@ rules. The owned registry shares C's guard and is published only on
 retain strict HTTPS and nonloopback checks.
 
 C alone has an exact `/32` route to the native host. FC uses the internal
-bridge gateway, whose target is on that same Linux kernel. VZ has one additional
+bridge gateway for this native route. C's host RPC uses its own bridge address,
+with the same host TLS name and leaf pin. VZ has one additional
 run-owned noninternal private IPv4 bridge attached only to C's guard. The
 launcher checks its actual IPAM for overlap with fixture and native host
 addresses, derives the exact interface from its endpoint IP and MAC, removes

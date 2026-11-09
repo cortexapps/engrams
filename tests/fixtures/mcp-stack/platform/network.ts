@@ -21,8 +21,15 @@ export function address(
 ): string {
   return inputs.subnet.slice(0, -4) + ADDRESS[role];
 }
+function hostRpcAddress(
+  inputs: Pick<Inputs, "backend" | "subnet" | "nativeHostIp">,
+): string {
+  return inputs.backend === "firecracker"
+    ? address(inputs, "coordinator")
+    : inputs.nativeHostIp;
+}
 export function dnsRecords(
-  inputs: Pick<Inputs, "subnet" | "nativeHostIp">,
+  inputs: Pick<Inputs, "backend" | "subnet" | "nativeHostIp">,
 ): Record<string, string> {
   const records: Record<string, string> = {
     "postgres.fixture.example": address(inputs, "postgres"),
@@ -31,7 +38,7 @@ export function dnsRecords(
     "operator.fixture.example": address(inputs, "coordinator"),
     "control.fixture.example": address(inputs, "coordinator"),
     "worker.fixture.example": address(inputs, "worker"),
-    "host.fixture.example": inputs.nativeHostIp,
+    "host.fixture.example": hostRpcAddress(inputs),
   };
   for (const protocol of ["modern", "legacy"] as const)
     for (const name of [
@@ -48,7 +55,7 @@ export function dnsRecords(
   return records;
 }
 export function dnsHosts(
-  inputs: Pick<Inputs, "subnet" | "nativeHostIp">,
+  inputs: Pick<Inputs, "backend" | "subnet" | "nativeHostIp">,
 ): string {
   return (
     Object.entries(dnsRecords(inputs))
@@ -60,7 +67,7 @@ export function dnsHosts(
 // Install these exact nft objects before an app joins its guard namespace.
 // No forwarding chain, default route allowance, or external DNS server is installed.
 export function rules(
-  inputs: Pick<Inputs, "subnet" | "nativeHostIp">,
+  inputs: Pick<Inputs, "backend" | "subnet" | "nativeHostIp">,
   role: GuardRole,
 ): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [
@@ -106,7 +113,7 @@ export function rules(
   if (role !== "worker") {
     allow(address(inputs, "postgres"), "tcp", 5432);
     allow(address(inputs, "worker"), "tcp", 8443);
-    allow(inputs.nativeHostIp, "tcp", 9101);
+    allow(hostRpcAddress(inputs), "tcp", 9101);
   }
   if (role === "orchestrator") {
     for (const port of [443, 50061, 8444])

@@ -82,8 +82,12 @@ cache clearing or history deletion is allowed. Retain restricted evidence for
 identity-scoped recovery on a failed run.
 
 Provision native private DNS and routes for the exact fixture hosts and the
-selected bridge subnet. Native host processes must reach container IPs, and
-containers must reach the native host address. Provide real KVM and TUN access
+selected bridge subnet. Set `host.fixture.example` to the coordinator bridge
+address (`<subnet-prefix>.21`) for Firecracker, or to `nativeHostIp` for VZ.
+The native DNS answer must match fixture DNS; the launcher does not change it.
+Keep `nativeHostIp` as the real native interface address outside the fixture
+subnet. Native host processes must reach container IPs, and containers must
+reach the native host address. Provide real KVM and TUN access
 on Linux, and real hardware virtualization on native arm64 macOS. Production
 Firecracker uses the production dm-thin rootfs path; the platform's reviewed native
 capability preflight must qualify that path before a VM starts. No workflow

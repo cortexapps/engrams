@@ -1340,40 +1340,55 @@ for (const failedLookup of [false, true]) {
   });
 }
 
-test("native DNS accepts only the expected addresses for every fixture name", async () => {
-  const engine = new Engine(
-    { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
-    "/owned",
-    "mcp-123456789012345678901234",
-  );
-  const records: Record<string, string> = {
-    "postgres.fixture.example": "10.42.3.10",
-    "app.fixture.example": "10.42.3.20",
-    "coordinator.fixture.example": "10.42.3.21",
-    "operator.fixture.example": "10.42.3.21",
-    "control.fixture.example": "10.42.3.21",
-    "worker.fixture.example": "10.42.3.22",
-    "host.fixture.example": "10.42.4.1",
-    "resource.modern.fixture.example": "10.42.3.30",
-    "issuer.modern.fixture.example": "10.42.3.30",
-    "authorization.modern.fixture.example": "10.42.3.30",
-    "token.modern.fixture.example": "10.42.3.30",
-    "observer.modern.fixture.example": "10.42.3.30",
-    "resource.legacy.fixture.example": "10.42.3.31",
-    "issuer.legacy.fixture.example": "10.42.3.31",
-    "authorization.legacy.fixture.example": "10.42.3.31",
-    "token.legacy.fixture.example": "10.42.3.31",
-    "observer.legacy.fixture.example": "10.42.3.31",
-  };
-  const names: string[] = [];
-  await engine.nativeDns(async (name, options) => {
-    expect(options).toEqual({ all: true });
-    expect(records[name]).toBeDefined();
-    names.push(name);
-    return [{ address: records[name]!, family: 4 }];
+for (const backend of ["firecracker", "vz"] as const)
+  test(`native DNS accepts only the expected addresses for every fixture name (${backend})`, async () => {
+    const engine = new Engine(
+      { backend, subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+      "/owned",
+      "mcp-123456789012345678901234",
+    );
+    const records: Record<string, string> = {
+      "postgres.fixture.example": "10.42.3.10",
+      "app.fixture.example": "10.42.3.20",
+      "coordinator.fixture.example": "10.42.3.21",
+      "operator.fixture.example": "10.42.3.21",
+      "control.fixture.example": "10.42.3.21",
+      "worker.fixture.example": "10.42.3.22",
+      "host.fixture.example":
+        backend === "firecracker" ? "10.42.3.21" : "10.42.4.1",
+      "resource.modern.fixture.example": "10.42.3.30",
+      "issuer.modern.fixture.example": "10.42.3.30",
+      "authorization.modern.fixture.example": "10.42.3.30",
+      "token.modern.fixture.example": "10.42.3.30",
+      "observer.modern.fixture.example": "10.42.3.30",
+      "resource.legacy.fixture.example": "10.42.3.31",
+      "issuer.legacy.fixture.example": "10.42.3.31",
+      "authorization.legacy.fixture.example": "10.42.3.31",
+      "token.legacy.fixture.example": "10.42.3.31",
+      "observer.legacy.fixture.example": "10.42.3.31",
+    };
+    const names: string[] = [];
+    await engine.nativeDns(async (name, options) => {
+      expect(options).toEqual({ all: true });
+      expect(records[name]).toBeDefined();
+      names.push(name);
+      return [{ address: records[name]!, family: 4 }];
+    });
+    expect(names).toEqual(Object.keys(records));
+    if (backend === "firecracker")
+      await expect(
+        engine.nativeDns(async (name) => [
+          {
+            address:
+              name === "host.fixture.example" ? "10.42.4.1" : records[name]!,
+            family: 4,
+          },
+        ]),
+      ).rejects.toMatchObject({
+        code: "NEEDS_CONTEXT",
+        seam: "native_dns_route",
+      });
   });
-  expect(names).toEqual(Object.keys(records));
-});
 
 for (const actual of [
   [],
@@ -1385,7 +1400,7 @@ for (const actual of [
 ]) {
   test(`native DNS rejects empty or wrong successful answers (${actual.length})`, async () => {
     const engine = new Engine(
-      { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+      { backend: "vz", subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
       "/owned",
       "mcp-123456789012345678901234",
     );
@@ -1398,7 +1413,7 @@ for (const actual of [
 
 test("native DNS lookup rejection exposes only the static safe seam", async () => {
   const engine = new Engine(
-    { subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
+    { backend: "vz", subnet: "10.42.3.0/24", nativeHostIp: "10.42.4.1" } as Inputs,
     "/owned",
     "mcp-123456789012345678901234",
   );
@@ -1486,6 +1501,44 @@ test("FC bind stays in its private namespace while VZ binds the verified native 
   );
   expect(dnsRecords(inputs)["postgres.fixture.example"]).toBe("10.42.3.10");
   expect(dnsHosts(inputs)).toContain("10.42.3.10 postgres.fixture.example\n");
+  const hostRule = (ip: string) => ({
+    rule: {
+      family: "inet",
+      table: "mcp",
+      chain: "output",
+      expr: [
+        {
+          match: {
+            op: "==",
+            left: { payload: { protocol: "ip", field: "daddr" } },
+            right: ip,
+          },
+        },
+        {
+          match: {
+            op: "==",
+            left: { payload: { protocol: "tcp", field: "dport" } },
+            right: 9101,
+          },
+        },
+        { accept: null },
+      ],
+    },
+  });
+  for (const backend of ["firecracker", "vz"] as const) {
+    const selected = backend === "firecracker" ? "10.42.3.21" : "10.42.4.1";
+    const other = backend === "firecracker" ? "10.42.4.1" : "10.42.3.21";
+    const current = { ...inputs, backend };
+    expect(dnsRecords(current)["host.fixture.example"]).toBe(selected);
+    expect(dnsHosts(current)).toContain(`${selected} host.fixture.example\n`);
+    expect(dnsHosts(current)).not.toContain(`${other} host.fixture.example\n`);
+    for (const role of ["coordinator", "orchestrator"] as const) {
+      expect(rules(current, role)).toContainEqual(hostRule(selected));
+      expect(rules(current, role)).not.toContainEqual(hostRule(other));
+    }
+    expect(rules(current, "worker")).not.toContainEqual(hostRule(selected));
+    expect(rules(current, "worker")).not.toContainEqual(hostRule(other));
+  }
   expect(JSON.stringify(rules(inputs, "worker"))).not.toContain(
     address(inputs, "postgres"),
   );
