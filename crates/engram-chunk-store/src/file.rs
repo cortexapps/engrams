@@ -282,31 +282,6 @@ impl ChunkStore {
         dirty_ranges: &[(u64, u64)],
         source: Arc<dyn ChunkSource>,
     ) -> Result<Manifest> {
-        let (manifest, _new) = self
-            .update_for_dirty_ranges_sparse_with_sink(prev, diff_path, dirty_ranges, None, source)
-            .await?;
-        Ok(manifest)
-    }
-
-    /// ADR 0045 Phase C1: sink-parameterized flavor. `local_sink = Some(cache)`
-    /// writes each rebuilt dirty chunk into the host-local NVMe
-    /// [`crate::cache::ChunkCache`] instead of the blob store — keeping GCS PUTs off
-    /// the migration pause path entirely (the durability catch-up
-    /// uploads them later from the returned new-hash set). `None` is
-    /// the durable flavor (`put_chunk` to the store), identical to
-    /// [`Self::update_for_dirty_ranges_sparse_from`].
-    ///
-    /// Returns the next manifest plus the hashes of chunks REBUILT by
-    /// this call (the migration transfer/advertise set — carried-over
-    /// chunks are durable already and excluded).
-    pub async fn update_for_dirty_ranges_sparse_with_sink(
-        &self,
-        prev: &Manifest,
-        diff_path: &Path,
-        dirty_ranges: &[(u64, u64)],
-        local_sink: Option<&crate::cache::ChunkCache>,
-        source: Arc<dyn ChunkSource>,
-    ) -> Result<(Manifest, Vec<crate::manifest::ChunkHash>)> {
         use std::collections::BTreeMap;
         use std::collections::BTreeSet;
 
@@ -400,7 +375,6 @@ impl ChunkStore {
                 results.push(joined(done)?);
             }
             let store = self.clone();
-            let local_sink = local_sink.cloned();
             let claimed = Arc::clone(&claimed);
             let ranges = Arc::clone(&ranges);
             let diff = Arc::clone(&diff);
@@ -456,54 +430,34 @@ impl ChunkStore {
                 }
                 let slice = slice.freeze();
                 let hash = crate::cache::hash_chunk(&slice).await?;
-                match &local_sink {
-                    // Migration flavor: land in the local
-                    // cache only; no GCS round-trip on the pause
-                    // path. NO per-write eviction sweep (the prod
-                    // canary's 12.6s capture leg was mostly sweep
-                    // readdirs) — the batch-closing sweep runs
-                    // below, once.
-                    Some(cache) => {
-                        cache.put_no_evict(hash, slice, store.class()).await?;
-                    }
-                    None => {
-                        if prev_hash == Some(hash) {
-                            // Rebuilt to identical content: already
-                            // durable — the parent manifest referencing
-                            // this hash published only after its chunks
-                            // did (ADR 0007), so both the dedup HEAD and
-                            // the PUT are pure waste. KVM dirty tracking
-                            // over-reports (a page rewritten with the
-                            // same bytes is still "dirty"), so this arm
-                            // is common, not exotic. (ADR 0101 A. The
-                            // migration flavor's cache-only chunks are
-                            // owned by its durability catch-up either
-                            // way — this skip doesn't change that.)
-                            metrics::counter!(
-                                "engram_chunk_put_total",
-                                "mode" => "sparse", "outcome" => "unchanged"
-                            )
-                            .increment(1);
-                        } else if !claimed.lock().insert(hash) {
-                            // A batch sibling already uploaded (or is
-                            // uploading) this exact content, or a prev
-                            // chunk at another offset already made it
-                            // durable. Either way the PUT would be a
-                            // duplicate mutation of a write-once object
-                            // — the 429 shape above.
-                            metrics::counter!(
-                                "engram_chunk_put_total",
-                                "mode" => "sparse", "outcome" => "deduped"
-                            )
-                            .increment(1);
-                        } else {
-                            // Content no prior chunk and no batch
-                            // sibling carries — new to this chain, so
-                            // the dedup HEAD would almost always miss:
-                            // unchecked PUT (ADR 0078 move 5).
-                            store.put_chunk_unchecked_prehashed(hash, slice).await?;
-                        }
-                    }
+                if prev_hash == Some(hash) {
+                    // Rebuilt to identical content: already durable — the
+                    // parent manifest referencing this hash published only
+                    // after its chunks did (ADR 0007), so both the dedup
+                    // HEAD and the PUT are pure waste. KVM dirty tracking
+                    // over-reports (a page rewritten with the same bytes
+                    // is still "dirty"), so this arm is common.
+                    metrics::counter!(
+                        "engram_chunk_put_total",
+                        "mode" => "sparse", "outcome" => "unchanged"
+                    )
+                    .increment(1);
+                } else if !claimed.lock().insert(hash) {
+                    // A batch sibling already uploaded (or is uploading)
+                    // this exact content, or a prev chunk at another
+                    // offset already made it durable. Either way the PUT
+                    // would be a duplicate mutation of a write-once
+                    // object — the 429 shape above.
+                    metrics::counter!(
+                        "engram_chunk_put_total",
+                        "mode" => "sparse", "outcome" => "deduped"
+                    )
+                    .increment(1);
+                } else {
+                    // Content no prior chunk and no batch sibling carries
+                    // — new to this chain, so the dedup HEAD would almost
+                    // always miss: unchecked PUT (ADR 0078 move 5).
+                    store.put_chunk_unchecked_prehashed(hash, slice).await?;
                 }
                 Ok((offset, Some(ChunkRef { offset, hash })))
             });
@@ -515,42 +469,23 @@ impl ChunkStore {
         // Fold the (order-independent) results into the carried-over
         // map: a `Some` replaces/inserts the chunk, a `None` (chunk
         // dirtied to all-zero) elides it — preserving the sparse
-        // invariant. Rebuilt hashes are collected for the migration
-        // transfer set (deterministic order: by offset, post-fold).
-        let mut rebuilt: BTreeSet<u64> = BTreeSet::new();
+        // invariant.
         for (offset, entry) in results {
             match entry {
-                Some(c) => {
-                    by_offset.insert(offset, c);
-                    rebuilt.insert(offset);
-                }
-                None => {
-                    by_offset.remove(&offset);
-                }
-            }
-        }
-        let new_hashes = rebuilt
-            .iter()
-            .filter_map(|off| by_offset.get(off).map(|c| c.hash))
-            .collect();
-        if let Some(cache) = local_sink {
-            // The batch-closing eviction sweep (pairs with
-            // put_no_evict above).
-            cache.sweep().await?;
+                Some(c) => by_offset.insert(offset, c),
+                None => by_offset.remove(&offset),
+            };
         }
 
-        Ok((
-            Manifest {
-                schema_version: prev.schema_version,
-                kind: prev.kind,
-                chunk_size: prev.chunk_size,
-                total_bytes,
-                chunks: by_offset.into_values().collect(),
-                parent: prev.parent,
-                annotations: prev.annotations.clone(),
-            },
-            new_hashes,
-        ))
+        Ok(Manifest {
+            schema_version: prev.schema_version,
+            kind: prev.kind,
+            chunk_size: prev.chunk_size,
+            total_bytes,
+            chunks: by_offset.into_values().collect(),
+            parent: prev.parent,
+            annotations: prev.annotations.clone(),
+        })
     }
 
     /// Reconstruct a file from a manifest. Creates `dest` (or
@@ -1327,92 +1262,6 @@ mod tests {
         let out = work.path().join("out.bin");
         s.materialize_to_file_from(&got, &out, &s).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
-    }
-
-    /// ADR 0045 C1: the local-cache sink produces a manifest identical
-    /// to the durable flavor, returns exactly the rebuilt hashes, lands
-    /// the bytes in the LOCAL cache, and never PUTs them to the store.
-    #[tokio::test]
-    async fn local_sink_rechunk_matches_gcs_sink_manifest_and_returns_new_hashes() {
-        let (s, _d) = store().await;
-        let work = tempfile::tempdir().unwrap();
-        let cs: u64 = 4096;
-
-        let mut prev_img = Vec::new();
-        for b in [0xAAu8, 0xBB, 0xCC, 0xDD] {
-            prev_img.extend(std::iter::repeat_n(b, cs as usize));
-        }
-        let p = work.path().join("prev.bin");
-        fs::write(&p, &prev_img).await.unwrap();
-        let prev = s
-            .chunk_file(&p, ManifestKind::Memory, Some(cs))
-            .await
-            .unwrap();
-
-        let diff = work.path().join("mem.diff");
-        write_sparse_diff(&diff, prev.total_bytes, &[(cs, vec![0x11u8; cs as usize])]).await;
-        let ranges = [(cs, cs)];
-
-        // Local-sink flavor FIRST — the durable run below would
-        // content-address the same hash into the store and mask the
-        // no-GCS-PUT assertion.
-        let cache_dir = tempfile::tempdir().unwrap();
-        // Pin the floor to 0: the local sink writes the rebuilt chunk into
-        // this cache and the test reads it back, so the default free-space
-        // floor must not evict it on a near-full host disk.
-        let cache = crate::cache::ChunkCache::new_with_floor(
-            crate::cache::ChunkCacheConfig::new(cache_dir.path().to_path_buf()),
-            0.0,
-        );
-        let (local, new_hashes) = s
-            .update_for_dirty_ranges_sparse_with_sink(
-                &prev,
-                &diff,
-                &ranges,
-                Some(&cache),
-                Arc::new(s.clone()),
-            )
-            .await
-            .unwrap();
-        let rebuilt_early = new_hashes[0];
-        assert!(
-            s.get_chunk(rebuilt_early).await.is_err(),
-            "local sink must keep GCS PUTs off the pause path"
-        );
-
-        // Durable flavor = ground truth.
-        let durable = s
-            .update_for_dirty_ranges_sparse_from(&prev, &diff, &ranges, Arc::new(s.clone()))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            keys(&local),
-            keys(&durable),
-            "sink choice must not change the manifest"
-        );
-        let rebuilt = local
-            .chunks
-            .iter()
-            .find(|c| c.offset == cs)
-            .expect("dirty chunk present")
-            .hash;
-        assert_eq!(
-            new_hashes,
-            vec![rebuilt],
-            "exactly the rebuilt hash advertised"
-        );
-
-        // Bytes live in the LOCAL cache (no store fetch needed)...
-        let cached = cache
-            .get(rebuilt, || async {
-                Err(crate::error::ChunkStoreError::Internal(
-                    "must not fall through to the store".into(),
-                ))
-            })
-            .await
-            .expect("rebuilt chunk served from local cache");
-        assert_eq!(cached.as_ref(), &vec![0x11u8; cs as usize][..]);
     }
 
     /// A dirty chunk whose prev offset is ELIDED (all-zero in prev) must

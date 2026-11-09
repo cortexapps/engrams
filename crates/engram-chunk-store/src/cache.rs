@@ -1389,22 +1389,8 @@ impl ChunkCache {
         self.inner.pinned.lock().contains_key(&hash)
     }
 
-    /// Like [`Self::put_trusted`] but WITHOUT the per-write eviction
-    /// sweep, for paths that write many chunks back to back. Callers MUST
-    /// call [`Self::sweep`] once after the batch (the budget/floor
-    /// invariant is per batch, not per write).
-    pub(crate) async fn put_no_evict(
-        &self,
-        hash: ChunkHash,
-        bytes: Bytes,
-        class: Class,
-    ) -> Result<()> {
-        self.store_file(hash, bytes, class).await
-    }
-
-    /// One eviction sweep: the batch-closing pair of
-    /// [`Self::put_no_evict`], and what the periodic
-    /// [`Self::spawn_sweeper`] runs. It enforces the budget against the
+    /// One eviction sweep: what the periodic [`Self::spawn_sweeper`]
+    /// runs. It enforces the budget against the
     /// in-memory index; the first sweep after boot builds the index with
     /// the cache's one directory walk.
     pub async fn sweep(&self) -> Result<()> {
@@ -3503,7 +3489,7 @@ mod tests {
             ChunkCacheConfig {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: 1, // any chunk is "over" — the sweep must evict
-                sweep_debounce_ms: 0,
+                sweep_debounce_ms: i64::MAX, // only the explicit sweep evicts
                 eviction_enabled: true,
             },
             0.0,
@@ -3511,7 +3497,7 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .put_trusted(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
 
@@ -3556,10 +3542,10 @@ mod tests {
         );
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
-        // `put_no_evict` skips the sweep entirely, modeling "populated,
+        // The debounce keeps the write from sweeping, modeling "populated,
         // then zero traffic since" (e.g. a host that just restarted).
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .put_trusted(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
         assert!(cache.contains(ha), "chunk lands before any sweep runs");
@@ -3599,7 +3585,7 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
         cache
-            .put_no_evict(ha, Bytes::copy_from_slice(a), Class::Background)
+            .put_trusted(ha, Bytes::copy_from_slice(a), Class::Background)
             .await
             .unwrap();
 
