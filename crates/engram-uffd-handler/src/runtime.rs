@@ -410,12 +410,6 @@ const FAULT_RECENT: Duration = Duration::from_millis(2);
 /// of the same chunk before it asks for the chunk itself.
 const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
 
-/// How long after the handshake the first-touch window stays open. A cold
-/// resume's first agent turn ended about 29 s after the VM resumed; the
-/// host-agent cuts the published prefix at the first completed run, so
-/// the window only has to cover that turn.
-const FIRST_TOUCH_WINDOW: Duration = Duration::from_secs(30);
-
 /// How long the eager sweep waits before it goes over the chunks it could
 /// not install yet.
 const SWEEP_RETRY: Duration = Duration::from_millis(250);
@@ -490,11 +484,11 @@ enum Installer {
 /// What [`Runtime::sweep_step`] did with one chunk.
 enum SweepStep {
     Installed,
-    /// Its bytes are not at hand yet, or the guest should touch it first.
+    /// Its bytes are not at hand yet.
     Wait,
     /// A zero chunk, or a canonical one with no hash: faults serve it.
     Zero,
-    /// Installed already, sealed, or past the end.
+    /// Installed already, sealed, left to the guest, or past the end.
     Skip,
 }
 
@@ -975,9 +969,12 @@ impl Runtime {
             passes += 1;
             stalled = if installed > before { 0 } else { stalled + 1 };
         };
+        let (carried, carried_touched) = self.first_touch.carried_use();
         tracing::info!(
             end,
             installed,
+            carried,
+            carried_touched,
             passes,
             left_to_faults = pending.len(),
             zero_skipped,
@@ -1006,8 +1003,10 @@ impl Runtime {
         if self.chunk_installed(idx) || sealed {
             return Ok(SweepStep::Skip);
         }
+        // The guest's own fault records a carried chunk in the next
+        // prefix; an install here would hide it.
         if self.first_touch.awaits_guest(idx) {
-            return Ok(SweepStep::Wait);
+            return Ok(SweepStep::Skip);
         }
         let Some(fill) = Self::fill_for(&self.backend, offset) else {
             return Ok(SweepStep::Skip);
@@ -2282,22 +2281,6 @@ pub fn run_listener(
     // resumes. The claim table makes each install exactly-once, and a fault
     // that finds its chunk installed by the producer wakes its vCPU.
     let rt = Arc::new(rt);
-    {
-        let rt = Arc::clone(&rt);
-        let _ = std::thread::Builder::new()
-            .name("engram-uffd-first-touch".to_string())
-            .spawn(move || {
-                std::thread::sleep(FIRST_TOUCH_WINDOW);
-                if let Some(stats) = rt.first_touch.close_window() {
-                    tracing::info!(
-                        carried = stats.carried,
-                        carried_used = stats.carried_used,
-                        "first-touch window closed"
-                    );
-                    fault_stats::STATS.log("first-touch window");
-                }
-            });
-    }
     if let Some(prefix) = previous_prefix {
         let rt = Arc::clone(&rt);
         rt.handle.clone().spawn(async move {

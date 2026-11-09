@@ -12,10 +12,11 @@ use engram_chunk_store::FirstTouch;
 ///
 /// The previous run's published prefix is *carried*: its chunks are
 /// recorded like any other, when the guest touches them, so a chunk the
-/// guest no longer needs leaves the next prefix. While the first-touch
-/// window is open the eager sweep leaves carried chunks to the guest's
-/// faults ([`Self::awaits_guest`]); the prefix fill makes them resident in
-/// the chunk cache, so such a fault is a local read.
+/// guest no longer needs leaves the next prefix. The eager sweep leaves
+/// carried chunks to the guest's faults ([`Self::awaits_guest`]), so an
+/// install does not hide a touch; the prefix fill makes them resident in
+/// the chunk cache, so such a fault is a local read. The host-agent
+/// decides where the published prefix ends (its first completed run).
 ///
 /// With an output file, each entry is appended to the file as it is
 /// recorded, so the file always holds the whole record (in
@@ -27,19 +28,8 @@ pub struct FirstTouchRecorder {
 struct Inner {
     seen: Vec<bool>,
     carried: Vec<bool>,
-    /// `None` once the window is closed.
-    window: Option<WindowStats>,
     record: FirstTouch,
     output: Option<File>,
-}
-
-/// The carried prefix during the first-touch window.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WindowStats {
-    /// Chunks of the carried prefix.
-    pub carried: usize,
-    /// Carried chunks the guest touched.
-    pub carried_used: usize,
 }
 
 impl FirstTouchRecorder {
@@ -48,7 +38,6 @@ impl FirstTouchRecorder {
             inner: Mutex::new(Inner {
                 seen: vec![false; chunks],
                 carried: vec![false; chunks],
-                window: Some(WindowStats::default()),
                 record: FirstTouch::default(),
                 output: None,
             }),
@@ -73,8 +62,8 @@ impl FirstTouchRecorder {
         }
     }
 
-    /// Note a fault on chunk `idx` now. Later notes on
-    /// the same chunk, and an index past the end, are ignored.
+    /// Note a fault on chunk `idx` now. Later notes on the same chunk,
+    /// and an index past the end, are ignored.
     pub fn touch(&self, idx: usize) {
         self.touch_at(idx, || chrono::Utc::now().timestamp_millis());
     }
@@ -83,40 +72,31 @@ impl FirstTouchRecorder {
     /// is ignored.
     pub fn carry(&self, indices: &[u32]) {
         let mut inner = self.inner.lock().expect("first-touch lock");
-        let Inner {
-            seen,
-            carried,
-            window,
-            ..
-        } = &mut *inner;
         for &idx in indices {
-            let idx = idx as usize;
-            let Some(slot) = carried.get_mut(idx) else {
-                continue;
-            };
-            if std::mem::replace(slot, true) {
-                continue;
-            }
-            if let Some(w) = window.as_mut() {
-                w.carried += 1;
-                w.carried_used += usize::from(seen[idx]);
+            if let Some(slot) = inner.carried.get_mut(idx as usize) {
+                *slot = true;
             }
         }
     }
 
-    /// True while the window is open, for a carried chunk the guest has
-    /// not touched: a producer that installs it now hides the guest's
-    /// fault.
+    /// True for a carried chunk the guest has not touched: a producer
+    /// that installs it now hides the guest's fault.
     pub fn awaits_guest(&self, idx: usize) -> bool {
         let inner = self.inner.lock().expect("first-touch lock");
-        inner.window.is_some()
-            && inner.carried.get(idx).copied().unwrap_or(false)
-            && !inner.seen[idx]
+        inner.carried.get(idx).copied().unwrap_or(false) && !inner.seen[idx]
     }
 
-    /// Close the first-touch window. Returns its stats the first time.
-    pub fn close_window(&self) -> Option<WindowStats> {
-        self.inner.lock().expect("first-touch lock").window.take()
+    /// `(carried, touched)`: the chunks of the carried prefix, and how many
+    /// of them the guest has touched.
+    pub fn carried_use(&self) -> (usize, usize) {
+        let inner = self.inner.lock().expect("first-touch lock");
+        let carried = inner.carried.iter().filter(|c| **c);
+        let touched = inner
+            .carried
+            .iter()
+            .zip(&inner.seen)
+            .filter(|(c, s)| **c && **s);
+        (carried.count(), touched.count())
     }
 
     fn touch_at(&self, idx: usize, now_ms: impl FnOnce() -> i64) {
@@ -126,11 +106,6 @@ impl FirstTouchRecorder {
         };
         if std::mem::replace(seen, true) {
             return;
-        }
-        if inner.carried[idx] {
-            if let Some(w) = inner.window.as_mut() {
-                w.carried_used += 1;
-            }
         }
         // The time is read under the lock, so the entries stay in order.
         let entry = (idx as u32, now_ms());
@@ -180,18 +155,11 @@ mod tests {
         r.touch_at(6, || 3);
         let indices: Vec<u32> = r.snapshot().entries.iter().map(|e| e.0).collect();
         assert_eq!(indices, vec![5, 1, 6], "carried chunk 3 was never touched");
-        assert_eq!(
-            r.close_window(),
-            Some(WindowStats {
-                carried: 3,
-                carried_used: 2,
-            })
-        );
-        assert_eq!(r.close_window(), None);
+        assert_eq!(r.carried_use(), (3, 2));
     }
 
     #[test]
-    fn carried_chunks_await_the_guest_until_the_window_closes() {
+    fn carried_chunks_await_the_guest_until_it_touches_them() {
         let r = FirstTouchRecorder::new(4);
         r.carry(&[1, 2]);
         r.touch_at(2, || 1);
@@ -199,9 +167,8 @@ mod tests {
         assert!(!r.awaits_guest(2), "the guest touched it");
         assert!(!r.awaits_guest(3), "not carried");
         assert!(!r.awaits_guest(9));
-        r.close_window();
-        assert!(!r.awaits_guest(1));
         r.touch_at(1, || 2);
+        assert!(!r.awaits_guest(1));
         assert_eq!(r.snapshot().entries, vec![(2, 1), (1, 2)]);
     }
 
