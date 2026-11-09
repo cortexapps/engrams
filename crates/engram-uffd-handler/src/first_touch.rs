@@ -10,13 +10,11 @@ use engram_chunk_store::FirstTouch;
 /// Each chunk index once, in order, with the time the guest first faulted
 /// on it.
 ///
-/// The previous run's published prefix is *carried*: its chunks are
-/// recorded like any other, when the guest touches them, so a chunk the
-/// guest no longer needs leaves the next prefix. The eager sweep leaves
-/// carried chunks to the guest's faults ([`Self::awaits_guest`]), so an
-/// install does not hide a touch; the prefix fill makes them resident in
-/// the chunk cache, so such a fault is a local read. The host-agent
-/// decides where the published prefix ends (its first completed run).
+/// The previous run's published prefix is *carried*: the eager sweep
+/// installs its chunks first, before the guest faults on them, and records
+/// each install as a touch. So a carried chunk stays in the next prefix;
+/// the host-agent decides where the published prefix ends (its first
+/// completed run).
 ///
 /// With an output file, each entry is appended to the file as it is
 /// recorded, so the file always holds the whole record (in
@@ -79,24 +77,10 @@ impl FirstTouchRecorder {
         }
     }
 
-    /// True for a carried chunk the guest has not touched: a producer
-    /// that installs it now hides the guest's fault.
-    pub fn awaits_guest(&self, idx: usize) -> bool {
+    /// True for a chunk of the carried prefix.
+    pub fn is_carried(&self, idx: usize) -> bool {
         let inner = self.inner.lock().expect("first-touch lock");
-        inner.carried.get(idx).copied().unwrap_or(false) && !inner.seen[idx]
-    }
-
-    /// `(carried, touched)`: the chunks of the carried prefix, and how many
-    /// of them the guest has touched.
-    pub fn carried_use(&self) -> (usize, usize) {
-        let inner = self.inner.lock().expect("first-touch lock");
-        let carried = inner.carried.iter().filter(|c| **c);
-        let touched = inner
-            .carried
-            .iter()
-            .zip(&inner.seen)
-            .filter(|(c, s)| **c && **s);
-        (carried.count(), touched.count())
+        inner.carried.get(idx).copied().unwrap_or(false)
     }
 
     fn touch_at(&self, idx: usize, now_ms: impl FnOnce() -> i64) {
@@ -147,29 +131,16 @@ mod tests {
     }
 
     #[test]
-    fn a_carried_chunk_is_recorded_only_when_touched() {
+    fn carrying_marks_chunks_and_records_nothing() {
         let r = FirstTouchRecorder::new(8);
         r.touch_at(5, || 1);
         r.carry(&[3, 5, 1, 99]);
+        assert!(r.is_carried(3) && r.is_carried(5) && r.is_carried(1));
+        assert!(!r.is_carried(6), "not carried");
+        assert!(!r.is_carried(99), "past the end");
         r.touch_at(1, || 2);
-        r.touch_at(6, || 3);
         let indices: Vec<u32> = r.snapshot().entries.iter().map(|e| e.0).collect();
-        assert_eq!(indices, vec![5, 1, 6], "carried chunk 3 was never touched");
-        assert_eq!(r.carried_use(), (3, 2));
-    }
-
-    #[test]
-    fn carried_chunks_await_the_guest_until_it_touches_them() {
-        let r = FirstTouchRecorder::new(4);
-        r.carry(&[1, 2]);
-        r.touch_at(2, || 1);
-        assert!(r.awaits_guest(1));
-        assert!(!r.awaits_guest(2), "the guest touched it");
-        assert!(!r.awaits_guest(3), "not carried");
-        assert!(!r.awaits_guest(9));
-        r.touch_at(1, || 2);
-        assert!(!r.awaits_guest(1));
-        assert_eq!(r.snapshot().entries, vec![(2, 1), (1, 2)]);
+        assert_eq!(indices, vec![5, 1], "only touches are recorded");
     }
 
     #[test]

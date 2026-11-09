@@ -757,14 +757,19 @@ impl Runtime {
         // file mapping, so each would COPY a zeroed buffer), defeating
         // the density the substrate exists for. A zero fault is already
         // served with no fetch.
-        let (mut order, canonical): (Vec<u64>, Vec<u64>) = (0..total)
+        // The carried first-touch prefix goes before both: it is what the
+        // guest reads first, and the host-agent fills it first.
+        let (mut order, rest): (Vec<u64>, Vec<u64>) = (0..total)
             .step_by(chunk_size as usize)
-            .partition(|&offset| {
-                matches!(
-                    Self::fill_for(&self.backend, offset),
-                    Some(Fill::Private(_))
-                )
-            });
+            .partition(|&offset| self.first_touch.is_carried(self.chunk_idx(offset)));
+        let (divergent, canonical): (Vec<u64>, Vec<u64>) = rest.into_iter().partition(|&offset| {
+            matches!(
+                Self::fill_for(&self.backend, offset),
+                Some(Fill::Private(_))
+            )
+        });
+        let carried = order.len();
+        order.extend(divergent);
         order.extend(canonical);
         let mut pending = Vec::new();
         for offset in order {
@@ -801,12 +806,10 @@ impl Runtime {
             passes += 1;
             stalled = if installed > before { 0 } else { stalled + 1 };
         };
-        let (carried, carried_touched) = self.first_touch.carried_use();
         tracing::info!(
             end,
             installed,
             carried,
-            carried_touched,
             passes,
             left_to_faults = pending.len(),
             zero_skipped,
@@ -835,11 +838,6 @@ impl Runtime {
         if self.chunk_installed(idx) || sealed {
             return Ok(SweepStep::Skip);
         }
-        // The guest's own fault records a carried chunk in the next
-        // prefix; an install here would hide it.
-        if self.first_touch.awaits_guest(idx) {
-            return Ok(SweepStep::Skip);
-        }
         let Some(fill) = Self::fill_for(&self.backend, offset) else {
             return Ok(SweepStep::Skip);
         };
@@ -857,11 +855,15 @@ impl Runtime {
         if follow && !held {
             return Ok(SweepStep::Wait);
         }
-        Ok(if self.install(offset, fill, Installer::Sweep)? {
-            SweepStep::Installed
-        } else {
-            SweepStep::Skip
-        })
+        if !self.install(offset, fill, Installer::Sweep)? {
+            return Ok(SweepStep::Skip);
+        }
+        // An install hides the guest's fault on this chunk, so a carried
+        // chunk is recorded here, or it would leave the next prefix.
+        if self.first_touch.is_carried(idx) {
+            self.first_touch.touch(idx);
+        }
+        Ok(SweepStep::Installed)
     }
 
     /// Atomically claim a chunk for installation (CAS `Empty →
