@@ -5,31 +5,24 @@
 //! semantics, resident-only (a peer can never induce a GCS read here),
 //! bounded by a host-global stream semaphore.
 //!
-//! **Pull** ([`pull_chunks_from_peer`] for bulk; [`PeerFetcher`] as the
-//! fill engine's peer tier): dial a coordinator-hinted sibling, stream
-//! the wanted set over a few fat connections, and reassemble each chunk
-//! from frames that pass their CRC32C and arrive in order, contiguous
-//! from offset 0 up to the `last` frame. Peer bytes are trusted, not
-//! hashed: the peer hashed each chunk when it stored it. Bulk chunks
-//! land through `ChunkCache::put_trusted`. The pull is a
-//! best-effort PRE-PASS: callers re-check residency afterwards and
-//! complete whatever is still missing through the existing verified
-//! GCS path, so a dead/missing/saturated peer degrades to today's
-//! behavior with at most the bounded dials of one window.
+//! **Fetch** ([`PeerFetcher`], the fill engine's peer source): ask a
+//! coordinator-hinted sibling for the chunks the engine wants, several
+//! batches at a time on one tuned HTTP/2 connection, and reassemble each
+//! chunk from frames that pass their CRC32C and arrive in order,
+//! contiguous from offset 0 up to the `last` frame. Peer bytes are
+//! trusted, not hashed: the peer hashed each chunk when it stored it. A
+//! chunk the peer does not answer comes from the store, so a dead,
+//! missing or saturated peer costs at most one bounded dial per window.
 //!
-//! Transport shape (the loopback bench in
-//! `tests/peer_transport_bench.rs` gates these defaults): a few
-//! separate TCP connections (HTTP/2 connection-level flow control and
-//! GCP single-flow bandwidth both cap a single channel), large static
-//! windows + adaptive flow control, 4 MiB frames. The teleport
-//! transport's 8×1 MiB-frames-on-one-channel shape measured ~20 MB/s
-//! per stream — a config artifact this module exists to not repeat.
+//! Transport shape (`tests/peer_transport_bench.rs` measures it): large
+//! static windows + adaptive flow control and 4 MiB frames. Tonic's
+//! default windows cap a stream at about 20 MB/s.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engram_chunk_store::cache::{ChunkCache, CHUNK_FILL_BYTES_TOTAL, CHUNK_FILL_TOTAL};
+use engram_chunk_store::cache::{ChunkCache, CHUNK_FILL_TOTAL};
 use engram_chunk_store::manifest::ChunkHash;
 use engram_protocol::grpc::{PeerChunkFrame, PeerChunkGetRequest};
 use engram_protocol::grpc_client::{GrpcHostClient, PeerChunkScope};
@@ -49,11 +42,6 @@ const DEFAULT_SERVE_STREAMS: usize = 16;
 /// envelope stays under the fleet-wide 32 MiB decode cap.
 pub const FRAME_BYTES_ENV: &str = "ENGRAM_PEER_FRAME_BYTES";
 const DEFAULT_FRAME_BYTES: usize = 4 * 1024 * 1024;
-
-/// Parallel TCP connections per bulk pull. Each is its own HTTP/2
-/// connection (window + GCP single-flow limits are per-connection).
-pub const PULL_CONNS_ENV: &str = "ENGRAM_PEER_PULL_CONNS";
-const DEFAULT_PULL_CONNS: usize = 4;
 
 /// The one-dial degradation contract (ADR 0095): connect timeout per
 /// hinted address, and how long a failed peer stays marked lost.
@@ -75,7 +63,7 @@ async fn next_frame<S: futures::Stream + Unpin>(
     tokio::time::timeout(idle, stream.next()).await
 }
 
-/// HTTP/2 stream/connection windows for peer pulls. Tonic's defaults
+/// HTTP/2 stream/connection windows for peer fetches. Tonic's defaults
 /// (64 KiB / 1 MiB) cap a stream at ~20 MB/s; these put the
 /// bandwidth-delay product comfortably above NVMe rate. Adaptive
 /// flow control is also enabled and may grow past these.
@@ -96,10 +84,6 @@ pub fn serve_streams_from_env() -> usize {
 
 pub fn frame_bytes_from_env() -> usize {
     env_usize(FRAME_BYTES_ENV, DEFAULT_FRAME_BYTES)
-}
-
-fn pull_conns_from_env() -> usize {
-    env_usize(PULL_CONNS_ENV, DEFAULT_PULL_CONNS)
 }
 
 // ---------------------------------------------------------------------
@@ -230,11 +214,11 @@ impl PeerServe {
 }
 
 // ---------------------------------------------------------------------
-// Pull side
+// Fetch side
 // ---------------------------------------------------------------------
 
 /// Requester-side health cache: a peer that failed a dial or died
-/// mid-stream is "lost" for [`PEER_LOST_WINDOW`] — later pulls in the
+/// mid-stream is "lost" for [`PEER_LOST_WINDOW`] — later fetches in the
 /// window skip it without dialing (the one-dial contract).
 /// Backpressure (`RESOURCE_EXHAUSTED`) and honest misses never land
 /// here.
@@ -264,22 +248,8 @@ impl PeerHealth {
     }
 }
 
-/// Outcome of one bulk pull window — counts for logs/metrics. The
-/// authoritative "what still needs GCS" signal is residency
-/// (`cache.contains`), re-checked by the caller after the pull.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PullStats {
-    pub landed: usize,
-    pub landed_bytes: u64,
-    pub missing: usize,
-    /// Dial/stream failure (peer marked lost) — distinct from
-    /// `backpressure` (peer healthy, batch deferred to GCS).
-    pub failed: bool,
-    pub backpressure: bool,
-}
-
-/// Tune a peer-pull endpoint for throughput: big static windows +
-/// adaptive flow control + TCP nodelay off the table (we send MiBs).
+/// A peer endpoint tuned for throughput: big static windows, adaptive
+/// flow control, no Nagle delay, and one bounded dial.
 fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
     Ok(tonic::transport::Endpoint::from_shared(addr.to_string())
         .map_err(|e| format!("bad peer addr {addr}: {e}"))?
@@ -288,185 +258,6 @@ fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
         .initial_connection_window_size(Some(CONN_WINDOW))
         .http2_adaptive_window(true)
         .tcp_nodelay(true))
-}
-
-/// Bulk-pull `hashes` from the peer at `addr` into `cache` through
-/// [`ChunkCache::put_trusted`]. Best-effort pre-pass (see module
-/// docs): every outcome short of success leaves the caller's GCS
-/// completion pass to pick up the remainder.
-///
-/// Concurrency: `hashes` is sharded contiguously (hot-first order
-/// preserved per shard) across [`PULL_CONNS_ENV`] separate TCP
-/// connections, one request-stream each.
-pub async fn pull_chunks_from_peer(
-    addr: &str,
-    scope: PeerChunkScope,
-    hashes: &[ChunkHash],
-    cache: &ChunkCache,
-    health: &PeerHealth,
-) -> PullStats {
-    let mut stats = PullStats::default();
-    if hashes.is_empty() {
-        return stats;
-    }
-    if health.is_lost(addr) {
-        metrics::counter!("engram_peer_dial_total", "outcome" => "lost_cached").increment(1);
-        stats.failed = true;
-        return stats;
-    }
-    let conns = pull_conns_from_env().min(hashes.len());
-    let endpoint = match peer_endpoint(addr) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(addr, error = %e, "peer pull: bad endpoint");
-            health.mark_lost(addr);
-            stats.failed = true;
-            return stats;
-        }
-    };
-    // Dial the connections up front — ONE bounded dial attempt per
-    // connection, and any failure marks the peer lost for the window
-    // (the degradation contract). Connections dial concurrently, so
-    // worst-case added latency is one DIAL_TIMEOUT, not conns × it.
-    let dials = futures::future::join_all((0..conns).map(|_| endpoint.connect()));
-    let mut clients = Vec::with_capacity(conns);
-    for dial in dials.await {
-        match dial {
-            Ok(channel) => clients.push(GrpcHostClient::new(channel)),
-            Err(e) => {
-                metrics::counter!("engram_peer_dial_total", "outcome" => "timeout").increment(1);
-                tracing::warn!(addr, error = %e, "peer pull: dial failed — peer lost for window");
-                health.mark_lost(addr);
-                stats.failed = true;
-                return stats;
-            }
-        }
-    }
-    metrics::counter!("engram_peer_dial_total", "outcome" => "ok").increment(1);
-
-    let shard_len = hashes.len().div_ceil(clients.len()).max(1);
-    let mut tasks = Vec::with_capacity(clients.len());
-    for (client, shard) in clients.into_iter().zip(hashes.chunks(shard_len)) {
-        let shard: Vec<ChunkHash> = shard.to_vec();
-        let scope = scope.clone();
-        let cache = cache.clone();
-        tasks.push(tokio::spawn(async move {
-            pull_shard(client, scope, shard, cache).await
-        }));
-    }
-    let mut any_stream_failure = false;
-    let mut any_backpressure = false;
-    for t in tasks {
-        match t.await {
-            Ok(shard_stats) => {
-                stats.landed += shard_stats.landed;
-                stats.landed_bytes += shard_stats.landed_bytes;
-                stats.missing += shard_stats.missing;
-                any_stream_failure |= shard_stats.failed;
-                any_backpressure |= shard_stats.backpressure;
-            }
-            Err(e) => {
-                tracing::warn!(addr, error = %e, "peer pull: shard task join failed");
-                any_stream_failure = true;
-            }
-        }
-    }
-    if any_stream_failure {
-        health.mark_lost(addr);
-        stats.failed = true;
-    }
-    stats.backpressure = any_backpressure;
-    stats
-}
-
-/// One connection's shard: a single `PeerChunkGet` request, frames
-/// reassembled per item by [`Reassembly`], landed through
-/// `ChunkCache::put_trusted`.
-async fn pull_shard(
-    client: GrpcHostClient,
-    scope: PeerChunkScope,
-    hashes: Vec<ChunkHash>,
-    cache: ChunkCache,
-) -> PullStats {
-    let mut stats = PullStats::default();
-    let wire_hashes: Vec<[u8; 32]> = hashes.iter().map(|h| *h.as_bytes()).collect();
-    let opened = tokio::time::timeout(PEER_IDLE, client.peer_chunk_get(wire_hashes, scope)).await;
-    let Ok(opened) = opened else {
-        tracing::warn!("peer pull: stream open timed out");
-        metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout").increment(1);
-        stats.failed = true;
-        return stats;
-    };
-    let mut stream = match opened {
-        Ok(s) => s,
-        Err(e) => {
-            // RESOURCE_EXHAUSTED (→ LimitExceeded) is backpressure, not
-            // death: the serve semaphore is full; this batch goes to
-            // GCS and the peer stays healthy.
-            if matches!(&e, engram_core::SandboxError::LimitExceeded(_)) {
-                metrics::counter!("engram_peer_pull_total", "outcome" => "backpressure")
-                    .increment(1);
-                stats.backpressure = true;
-            } else {
-                tracing::warn!(error = %e, "peer pull: stream open failed");
-                stats.failed = true;
-            }
-            return stats;
-        }
-    };
-    let mut reassembly = Reassembly::new(hashes.len());
-    loop {
-        let frame = match next_frame(&mut stream, PEER_IDLE).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => {
-                tracing::warn!("peer pull: peer sent nothing; stream ends");
-                metrics::counter!("engram_peer_pull_total", "outcome" => "idle_timeout")
-                    .increment(1);
-                stats.failed = true;
-                return stats;
-            }
-        };
-        let frame = match frame {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = %e, "peer pull: mid-stream error");
-                stats.failed = true;
-                return stats;
-            }
-        };
-        let (idx, body) = match reassembly.push(frame) {
-            Ok(Assembled::Partial) => continue,
-            Ok(Assembled::Missing(_)) => {
-                stats.missing += 1;
-                continue;
-            }
-            Ok(Assembled::Whole(idx, body)) => (idx, body),
-            Err(e) => {
-                tracing::warn!(error = %e, "peer pull: bad frame");
-                stats.failed = true;
-                return stats;
-            }
-        };
-        let hash = hashes[idx];
-        let len = body.len();
-        // A restore waits for these chunks.
-        if let Err(e) = cache
-            .put_trusted(hash, bytes::Bytes::from(body), engram_fill::Class::Prefix)
-            .await
-        {
-            // Local landing failure (ENOSPC…) — not the peer's
-            // fault; skip this chunk (GCS pass covers it) and keep
-            // draining the stream.
-            tracing::warn!(hash = %hash, error = %e, "peer pull: landing failed");
-        } else {
-            stats.landed += 1;
-            stats.landed_bytes += len as u64;
-            metrics::counter!(CHUNK_FILL_TOTAL, "source" => "peer").increment(1);
-            metrics::counter!(CHUNK_FILL_BYTES_TOTAL, "source" => "peer").increment(len as u64);
-        }
-    }
-    stats
 }
 
 /// What one frame completes in a [`Reassembly`].
