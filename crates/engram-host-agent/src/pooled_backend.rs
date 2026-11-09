@@ -2203,7 +2203,13 @@ impl PooledBackend {
                     .take_precopy(id, role)
                     .instrument(tracing::info_span!("presetup.precopy_snapshot", %role))
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
+                    .map_err(|e| match e.kind() {
+                        // The coordinator moves the session by snapshot.
+                        std::io::ErrorKind::Unsupported => SandboxError::InvalidSpec(format!(
+                            "{role} disk precopy: {e} — use snapshot-rehome"
+                        )),
+                        _ => SandboxError::Snapshot(format!("{role} disk precopy: {e}")),
+                    })?;
                 taken.push((role, pending));
                 let pending = &taken.last().expect("just pushed").1;
                 let changed = volumes

@@ -1112,12 +1112,32 @@ impl SessionVolumes {
     /// move to carry before the pause. It is independent of the
     /// transient snapshot [`Self::take`] makes, so the capture can take
     /// its own beside it. A precopy left by an earlier move is replaced.
+    ///
+    /// `Unsupported` for a role with no checkpoint volume: a hydrating
+    /// device, or a settled one before its first checkpoint. The blocks
+    /// it changed since its manifest are the whole copy plus the guest's
+    /// writes, which is not a live move's small difference; the session
+    /// moves by snapshot until a checkpoint makes the normal layout.
     pub async fn take_precopy(
         &self,
         sandbox: SandboxId,
         role: DiskRole,
     ) -> io::Result<PendingCheckpoint> {
         let previous = self.checkpoint_of(sandbox, role).await?;
+        match self
+            .disk
+            .open(&checkpoint_name(sandbox, role, previous))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{role} disk of {sandbox} has no checkpoint volume yet"),
+                ))
+            }
+            Err(e) => return Err(e),
+        }
         let name = precopy_name(sandbox, role);
         self.delete_if_present(&name).await?;
         let live = self.live(sandbox, role).await?;
@@ -2926,6 +2946,64 @@ mod tests {
         );
         r.volumes.release(resumed).await.unwrap();
         assert!(r.volumes.first_touch(resumed, DiskRole::Root).is_empty());
+    }
+
+    /// A live move carries the blocks changed since the checkpoint
+    /// volume; a role without one (hydrating, or settled before its
+    /// first checkpoint) refuses the precopy, and the first checkpoint
+    /// makes the live move possible again.
+    #[tokio::test]
+    async fn a_role_without_a_checkpoint_volume_refuses_a_live_move() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2, 3]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        write_byte(&p.root, 1, 9).await;
+        let wanted = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.release(first).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+
+        let resumed = SandboxId::new();
+        r.volumes
+            .provision(
+                resumed,
+                Source::Continue {
+                    manifest: wanted,
+                    base: Some(image),
+                    first_touch: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let refused = |e: io::Error| assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+        refused(
+            r.volumes
+                .take_precopy(resumed, DiskRole::Root)
+                .await
+                .unwrap_err(),
+        );
+        settled(&r, resumed, DiskRole::Root).await;
+        refused(
+            r.volumes
+                .take_precopy(resumed, DiskRole::Root)
+                .await
+                .unwrap_err(),
+        );
+        r.volumes.checkpoint(resumed, DiskRole::Root).await.unwrap();
+        let precopy = r
+            .volumes
+            .take_precopy(resumed, DiskRole::Root)
+            .await
+            .unwrap();
+        assert!(r
+            .volumes
+            .changed_blocks(&precopy, CHUNK)
+            .await
+            .unwrap()
+            .is_empty());
+        r.volumes.discard(precopy).await.unwrap();
+        r.volumes.release(resumed).await.unwrap();
     }
 
     /// The first byte of each chunk of a published manifest; 0 for a
