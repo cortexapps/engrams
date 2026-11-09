@@ -23,7 +23,6 @@ use tokio::fs;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::buffers::ChunkBuf;
-use crate::cache::ChunkCache;
 use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
 use crate::source::ChunkSource;
@@ -87,24 +86,19 @@ impl ChunkStore {
         kind: ManifestKind,
         chunk_size: Option<u64>,
     ) -> Result<Manifest> {
-        self.chunk_file_into(path, kind, chunk_size, None, None)
+        self.chunk_file_into(path, kind, chunk_size, None)
             .await
             .map(|(manifest, _)| manifest)
     }
 
-    /// Like [`Self::chunk_file`], but also write-throughs each produced
-    /// chunk into `cache` as it's uploaded — ADR 0039 (sticky-everywhere):
-    /// a host that *captures* a base keeps its chunks on local NVMe rather
-    /// than re-fetching its own writes from GCS (`put_chunk` is
-    /// upload-only). `None` ⇒ identical to `chunk_file`; caching is
-    /// best-effort (a local-cache write failure is logged, not fatal —
-    /// the chunk is durable in the store).
+    /// [`Self::chunk_file`] with progress reports and phase timings. Each
+    /// chunk goes in through [`Self::put_chunk_bytes`], so a store with a
+    /// local cache also keeps the chunk on this host.
     pub async fn chunk_file_into(
         &self,
         path: &Path,
         kind: ManifestKind,
         chunk_size: Option<u64>,
-        cache: Option<&ChunkCache>,
         // Called after each window flush (and once at the end) with
         // (windows_scanned, windows_total) — windows_total counts
         // zero-elided windows too, so callers get a monotone fraction
@@ -166,23 +160,8 @@ impl ChunkStore {
 
         let put_one = |offset: u64, bytes: Bytes| {
             let store = self.clone();
-            let cache = cache.cloned();
             async move {
-                let hash = store.put_chunk_bytes(bytes.clone()).await?;
-                // ADR 0039 (sticky-everywhere): write-through so the
-                // capturing host keeps its chunk on local NVMe and never
-                // re-fetches its own write from GCS. Best-effort — the
-                // chunk is durable in the store regardless.
-                if let Some(cache) = &cache {
-                    // `put_chunk` just hashed these bytes.
-                    if let Err(e) = cache.put_trusted(hash, bytes, store.class()).await {
-                        tracing::warn!(
-                            %hash,
-                            error = %e,
-                            "chunk_file write-through to local cache failed (chunk durable in store)",
-                        );
-                    }
-                }
+                let hash = store.put_chunk_bytes(bytes).await?;
                 Ok::<_, crate::error::ChunkStoreError>(ChunkRef { offset, hash })
             }
         };
@@ -311,7 +290,7 @@ impl ChunkStore {
 
     /// ADR 0045 Phase C1: sink-parameterized flavor. `local_sink = Some(cache)`
     /// writes each rebuilt dirty chunk into the host-local NVMe
-    /// [`ChunkCache`] instead of the blob store — keeping GCS PUTs off
+    /// [`crate::cache::ChunkCache`] instead of the blob store — keeping GCS PUTs off
     /// the migration pause path entirely (the durability catch-up
     /// uploads them later from the returned new-hash set). `None` is
     /// the durable flavor (`put_chunk` to the store), identical to
@@ -1038,7 +1017,7 @@ mod tests {
         fs::write(&src, &data).await.unwrap();
 
         let (manifest, stats) = s
-            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None, None)
+            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None)
             .await
             .unwrap();
         assert_eq!(manifest.chunks.len(), 3);
@@ -1698,7 +1677,7 @@ mod tests {
             calls.lock().unwrap().push((done, total));
         };
         let (m, _stats) = s
-            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None, Some(&report))
+            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), Some(&report))
             .await
             .unwrap();
         assert_eq!(m.chunks.len(), n_chunks - 2);

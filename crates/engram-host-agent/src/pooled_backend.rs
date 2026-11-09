@@ -2372,7 +2372,6 @@ impl PooledBackend {
         SnapshotFinisher {
             volumes: self.volumes.clone(),
             chunks: self.fill.clone().map(crate::snapshot_post::Chunks::new),
-            chunk_cache: self.chunk_cache.clone(),
             bundle_dir: self.bundle_dir.clone(),
             bundle_file_ext: self.bundle_file_ext(),
             inflight_snapshots: self.inflight_snapshots.clone(),
@@ -2459,7 +2458,6 @@ impl PooledBackend {
         Some(crate::eviction_finalize::EvictionFinalizer::new(
             self.volumes.clone(),
             self.fill.clone(),
-            self.chunk_cache.clone(),
             self.bundle_dir.clone(),
             self.bundle_file_ext(),
             checkpoint_dir,
@@ -4105,7 +4103,6 @@ impl DeferredSnapshot {
 pub(crate) struct SnapshotFinisher {
     volumes: Option<Arc<SessionVolumes>>,
     chunks: Option<crate::snapshot_post::Chunks>,
-    chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
     /// The backend's staged-bundle extension, so `publish` opens the
     /// same staged filename the backend attaches.
@@ -4166,7 +4163,6 @@ impl SnapshotFinisher {
         crate::snapshot_post::PostPhase {
             volumes: self.volumes.as_deref(),
             chunks: self.chunks.as_ref(),
-            chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
             fs: self.host_fs.as_ref(),

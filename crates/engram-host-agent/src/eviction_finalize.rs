@@ -20,7 +20,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_chunk_store::ChunkCache;
 use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
@@ -225,7 +224,6 @@ pub trait EvictionSandbox: Send + Sync {
 pub struct EvictionFinalizer {
     pub(crate) volumes: Option<Arc<engram_host_core::SessionVolumes>>,
     pub(crate) chunks: Option<crate::snapshot_post::Chunks>,
-    pub(crate) chunk_cache: Option<ChunkCache>,
     pub(crate) bundle_dir: PathBuf,
     pub(crate) bundle_file_ext: &'static str,
     /// `<work_dir>/checkpoints`: `records/` and `finalize/` live under it.
@@ -243,7 +241,6 @@ impl EvictionFinalizer {
     pub fn new(
         volumes: Option<Arc<engram_host_core::SessionVolumes>>,
         fill: Option<engram_fill::FillEngine>,
-        chunk_cache: Option<ChunkCache>,
         bundle_dir: PathBuf,
         bundle_file_ext: &'static str,
         checkpoint_dir: PathBuf,
@@ -256,7 +253,6 @@ impl EvictionFinalizer {
         Self {
             volumes,
             chunks: fill.map(crate::snapshot_post::Chunks::new),
-            chunk_cache,
             bundle_dir,
             bundle_file_ext,
             checkpoint_dir,
@@ -297,7 +293,6 @@ impl EvictionFinalizer {
         crate::snapshot_post::PostPhase {
             volumes: self.volumes.as_deref(),
             chunks: self.chunks.as_ref(),
-            chunk_cache: self.chunk_cache.as_ref(),
             bundle_dir: &self.bundle_dir,
             bundle_file_ext: self.bundle_file_ext,
             fs: self.fs.as_ref(),
@@ -674,7 +669,6 @@ mod tests {
         let finalizer = EvictionFinalizer::new(
             Some(volumes.clone()),
             Some(fill),
-            None,
             tmp.join("bundles"),
             "bundle",
             tmp.join("checkpoints"),
@@ -1138,10 +1132,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let prev_ref =
-            crate::snapshot_post::chunk_memory_to_store(&store, &prev_path, None, "test")
-                .await
-                .unwrap();
+        let prev_ref = crate::snapshot_post::chunk_memory_to_store(&store, &prev_path, "test")
+            .await
+            .unwrap();
 
         let dest = tmp.path().join("capture");
         std::fs::create_dir_all(&dest).unwrap();

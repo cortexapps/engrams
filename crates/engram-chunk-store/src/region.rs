@@ -383,7 +383,7 @@ mod tests {
         let path = work.path().join("img.bin");
         std::fs::write(&path, &image).unwrap();
         let (file_manifest, _) = store
-            .chunk_file_into(&path, ManifestKind::Disk, None, None, None)
+            .chunk_file_into(&path, ManifestKind::Disk, None, None)
             .await
             .unwrap();
 

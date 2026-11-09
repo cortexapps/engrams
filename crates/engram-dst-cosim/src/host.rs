@@ -1023,7 +1023,6 @@ impl CosimHost {
         EvictionFinalizer::new(
             Some(self.volumes.clone()),
             Some(self.fill.clone()),
-            None,
             self.bundle_dir(),
             BUNDLE_EXT,
             self.root.path().to_path_buf(),

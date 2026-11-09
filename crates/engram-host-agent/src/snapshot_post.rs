@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
+use engram_chunk_store::{ChunkStore, Manifest};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
 use engram_core::types::snapshot::DiskRole;
@@ -52,7 +52,6 @@ impl Chunks {
 pub(crate) struct PostPhase<'a> {
     pub volumes: Option<&'a SessionVolumes>,
     pub chunks: Option<&'a Chunks>,
-    pub chunk_cache: Option<&'a ChunkCache>,
     pub bundle_dir: &'a Path,
     pub bundle_file_ext: &'static str,
     pub fs: &'a dyn HostFs,
@@ -425,10 +424,9 @@ impl PostPhase<'_> {
             }
             Memory::Full => {
                 let mem_path = dest.join("memory.bin");
-                let manifest_ref =
-                    chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache, source)
-                        .instrument(tracing::info_span!("finish.memory_chunk"))
-                        .await?;
+                let manifest_ref = chunk_memory_to_store(chunk_store, &mem_path, source)
+                    .instrument(tracing::info_span!("finish.memory_chunk"))
+                    .await?;
                 tracing::info!(manifest = %manifest_ref, "full memory chunked");
                 Ok(Some(PublishedMemory {
                     manifest_ref,
@@ -521,12 +519,11 @@ async fn publish_manifest_collision_safe(
 }
 
 /// Chunk a whole `memory.bin` into the store and publish its manifest
-/// under a fresh id. The chunks also go into `cache`, so the capturing
-/// host keeps them local.
+/// under a fresh id. The store's cache keeps the chunks on the
+/// capturing host.
 pub(crate) async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &Path,
-    cache: Option<&ChunkCache>,
     // The `source` label of the re-chunk metrics: which capture flavor
     // paid for this full-image scan.
     source: &'static str,
@@ -536,7 +533,6 @@ pub(crate) async fn chunk_memory_to_store(
             memory_bin,
             engram_chunk_store::ManifestKind::Memory,
             None,
-            cache,
             None,
         )
         .await;
