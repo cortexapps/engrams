@@ -57,6 +57,30 @@ struct Prepared {
     started: bool,
     streams: tokio::task::JoinSet<()>,
 }
+#[cfg(any(target_os = "linux", test))]
+fn normalize_config(mut config: serde_json::Value) -> std::io::Result<serde_json::Value> {
+    let drives = config
+        .get_mut("drives")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| std::io::Error::other("managed VM drives are invalid"))?;
+    // Preboot uses the configured drive order; runtime iterates a device map.
+    let mut ordered = std::collections::BTreeMap::new();
+    for drive in std::mem::take(drives) {
+        let id = drive
+            .get("drive_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| std::io::Error::other("managed VM drive identity is invalid"))?
+            .to_owned();
+        if ordered.insert(id, drive).is_some() {
+            return Err(std::io::Error::other(
+                "managed VM drive identity is duplicated",
+            ));
+        }
+    }
+    *drives = ordered.into_values().collect();
+    Ok(config)
+}
 impl crate::FirecrackerBackend {
     /// Transfer disposable staging to the blocking pin operation. Cancellation
     /// can close ingress while that operation still owns its input files.
@@ -137,7 +161,7 @@ impl PreparedManagedFc {
         tokio::task::spawn_blocking(move || namespace.check(Some(pid)))
             .await
             .map_err(std::io::Error::other)??;
-        if self.inner.api.managed_get("/vm/config").await? != self.inner.config
+        if normalize_config(self.inner.api.managed_get("/vm/config").await?)? != self.inner.config
             || self.inner.api.managed_get("/").await?["state"]
                 != if self.inner.started {
                     "Running"
@@ -377,7 +401,7 @@ impl Prepared {
             .await
             .map_err(|_| std::io::Error::other("namespace check stopped"))??;
         if self.api.managed_get("/").await?["state"] != "Not started"
-            || self.api.managed_get("/vm/config").await? != self.config
+            || normalize_config(self.api.managed_get("/vm/config").await?)? != self.config
         {
             return Err(std::io::Error::other("managed VM state changed").into());
         }
@@ -467,7 +491,7 @@ async fn prepare(
         return Err(io::Error::other("invalid vsock identity").into());
     }
     configure::configure(&api, &backend.config, &request, &spec, &path, &shape, cid).await?;
-    let config = api.managed_get("/vm/config").await?;
+    let config = normalize_config(api.managed_get("/vm/config").await?)?;
     let devices = config["network-interfaces"]
         .as_array()
         .ok_or_else(|| io::Error::other("missing VM network readback"))?;
@@ -529,6 +553,61 @@ async fn wait_for_stop(stream: &tokio::net::UnixStream) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configuration_comparison_ignores_only_drive_order() {
+        let expected = serde_json::json!({
+            "drives": [
+                {"drive_id":"rootfs","path_on_host":"/owned/root","is_root_device":true,"is_read_only":false},
+                {"drive_id":"agentd","path_on_host":"/owned/agentd","is_root_device":false,"is_read_only":true}
+            ],
+            "network-interfaces":[{"iface_id":"a"},{"iface_id":"b"}]
+        });
+        let mut reordered = expected.clone();
+        reordered["drives"].as_array_mut().unwrap().reverse();
+        assert_eq!(
+            super::normalize_config(expected.clone()).unwrap(),
+            super::normalize_config(reordered).unwrap()
+        );
+        for (field, value) in [
+            ("path_on_host", serde_json::json!("/other/root")),
+            ("is_root_device", serde_json::json!(false)),
+            ("is_read_only", serde_json::json!(true)),
+        ] {
+            let mut changed = expected.clone();
+            changed["drives"][0][field] = value;
+            assert_ne!(
+                super::normalize_config(expected.clone()).unwrap(),
+                super::normalize_config(changed).unwrap(),
+                "drive field {field} must remain authoritative"
+            );
+        }
+        let mut changed = expected.clone();
+        changed["network-interfaces"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert_ne!(
+            super::normalize_config(expected).unwrap(),
+            super::normalize_config(changed).unwrap(),
+            "other arrays must retain their order"
+        );
+    }
+
+    #[test]
+    fn configuration_comparison_rejects_invalid_drive_identities() {
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"drives":{}}),
+            serde_json::json!({"drives":[null]}),
+            serde_json::json!({"drives":[{}]}),
+            serde_json::json!({"drives":[{"drive_id":""}]}),
+            serde_json::json!({"drives":[{"drive_id":1}]}),
+            serde_json::json!({"drives":[{"drive_id":"same"},{"drive_id":"same"}]}),
+        ] {
+            assert!(super::normalize_config(config.clone()).is_err(), "{config}");
+        }
+    }
+
     #[tokio::test]
     async fn cold_boot_ready_hint_is_drained_and_pending_listener_is_owned() {
         let sockets = tempfile::tempdir_in("/tmp").unwrap();
