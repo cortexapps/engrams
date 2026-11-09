@@ -99,6 +99,7 @@ use engram_core::types::BindingDisposition;
 use engram_core::SessionId;
 use tokio::sync::Notify;
 
+use crate::api::snapshot::ResumeFit;
 use crate::state::{SessionEvent, SharedState};
 
 #[derive(Clone, Debug)]
@@ -567,99 +568,33 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     }
 }
 
-/// Is there a schedulable host for a resume-origin session? `Some(true)`
-/// = a candidate exists (resume's own soft placement will pick one),
-/// `Some(false)` = none (stay queued), `None` = transient read error.
+/// Does a resume-origin session fit a host now? The verdict is the resume
+/// verb's own (`resume_context` + `resume_fit`, from the snapshot it
+/// restores), so the scanner never dequeues a session that the resume
+/// would queue again.
 async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCapacity {
-    let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
-    // ADR 0036 amendment (issue #538): `required_image_digest` below is
-    // deliberately `None`, NOT the create-path digest gate. This is the
-    // RESUME-origin arm (a session that was Idle and got queued for
-    // capacity, ADR 0048 C7) — resume places by snapshot affinity, not
-    // base-image residency, same as every other resume/evac/admin call
-    // site (`api/snapshot.rs`, `evacuation.rs`, `api/admin.rs`). The issue
-    // text that seeded this change named `queue_scanner.rs:218,321`
-    // together, but 321 is this function, not the create-origin
-    // `place_create` above (218) — gating it would incorrectly block a
-    // resume's re-queue check on base-image prestage status for a
-    // session that already has its own snapshot.
-    //
-    // ADR 0068: same pairing `resume_from_fc_snapshot` uses. This is a
-    // soft pre-check (does ANY host look schedulable before we bother
-    // dequeueing) — the authoritative gate is the real resume path's own
-    // `ScheduleContext`, which re-derives this from the snapshot it
-    // actually restores. A stale/missing lookup here just means one
-    // extra requeue cycle, not a correctness gap.
-    let latest = state
+    let latest = match state
         .services
         .meta
         .latest_snapshot_for_session(q.session.id)
         .await
-        .ok()
-        .flatten();
-    let ctx = crate::placement::ScheduleContext {
-        repo,
-        image_version: tag,
-        snapshot_host: None,
-        memory_mib: Some(q.mem_budget_mib.max(0) as u32),
-        cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
-        required_image_digest: None,
-        exclude_host: None,
-        prefer_host: None,
-        caps: crate::placement::CapabilityRequirements {
-            needs_uffd_substrate: latest.as_ref().is_some_and(|s| s.memory_manifest.is_some()),
-            needs_live_substrate: false,
-            fc_snapshot_version: latest.and_then(|s| s.fc_snapshot_version),
-        },
-        // Capacity PRE-check only (the resume's own pick carries the
-        // real pins); ordering is irrelevant to an emptiness test.
-        prefer_bundles: &[],
-    };
-    let now = state.services.clock.now_utc();
-    let candidates =
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(session_id = %q.session.id, error = ?e,
-                "queue-scanner: resume candidates_for failed");
-                return ResumeCapacity::Error;
-            }
-        };
-    if candidates.hosts.is_empty() {
-        // No schedulable host fleet-wide (fully cordoned / scaled to zero)
-        // — the one legitimate GLOBAL stop in the sweep loop. Same
-        // exclusion-reason visibility the other empty-candidate paths have.
-        crate::placement::log_empty_candidates(
-            state.services.meta.as_ref(),
-            &ctx,
-            "queue_resume_precheck",
-            now,
-        )
-        .await;
-        return ResumeCapacity::NoHost;
-    }
-    // R3 (#722): dequeue ONLY when this session's budget actually FITS —
-    // the SAME hard 2D check (`placement_preview`) the resume verb's own
-    // gate uses. The old soft `!hosts.is_empty()` dequeued whenever any
-    // host was schedulable; on a present-but-FULL fleet the resume verb
-    // then re-queued (no fit), churning Idle↔Queued every sweep and leaving
-    // a session stuck-Queued at a moment a host had just freed (the seed-142
-    // `quiescence-queued-with-capacity` regression). Aligning the check
-    // with the placement removes the churn: stay Queued until a host fits.
-    match crate::placement::placement_preview(
-        state.services.meta.as_ref(),
-        &ctx,
-        q.mem_budget_mib,
-        i64::from(q.cpu_budget_vcpus),
-        now,
-    )
-    .await
     {
-        Ok(true) => ResumeCapacity::Fits,
-        Ok(false) => ResumeCapacity::NoFit,
+        Ok(latest) => latest,
         Err(e) => {
-            tracing::warn!(session_id = %q.session.id, error = ?e,
-                "queue-scanner: resume placement_preview failed");
+            tracing::warn!(session_id = %q.session.id, error = %e,
+                "queue-scanner: resume snapshot lookup failed");
+            return ResumeCapacity::Error;
+        }
+    };
+    let ctx = crate::api::snapshot::resume_context(state, &q.session, latest.as_ref()).await;
+    let now = state.services.clock.now_utc();
+    match crate::api::snapshot::resume_fit(state, &ctx, now).await {
+        ResumeFit::Fits => ResumeCapacity::Fits,
+        ResumeFit::NoFit => ResumeCapacity::NoFit,
+        ResumeFit::NoHost => ResumeCapacity::NoHost,
+        ResumeFit::Error(e) => {
+            tracing::warn!(session_id = %q.session.id, error = %e,
+                "queue-scanner: resume fit check failed");
             ResumeCapacity::Error
         }
     }
@@ -667,8 +602,7 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCa
 
 /// The resume-origin re-queue check's verdict (R3 #722). Distinguishes a
 /// per-session capacity miss (stay queued, try other classes) from a
-/// fleet-wide stall (global stop) — the soft `Option<bool>` this replaced
-/// conflated them.
+/// fleet-wide stall (global stop).
 enum ResumeCapacity {
     /// A schedulable host FITS this session's budget — dequeue and resume.
     Fits,

@@ -1981,6 +1981,7 @@ impl PooledBackend {
             }),
         };
         let peer = peer.map(crate::peer_fill::CountingPeer::new);
+        let started = crate::time_source::metrics_now();
         let provisioned = self
             .volumes()?
             .provision_with_peer(
@@ -1995,6 +1996,17 @@ impl PooledBackend {
             tracing::Span::current().record("peer_chunks", peer.answered());
         }
         let provisioned = provisioned?;
+        // The one log line of a restore's disks: a slow restore reads from
+        // the host-agent log with no trace backend. `whole` wrote every
+        // chunk of the disk (the image's staged volume is not on this host).
+        tracing::info!(
+            sandbox_id = %id,
+            root = provisioned.root_stage.as_str(),
+            swap = provisioned.swap_stage.map(|s| s.as_str()),
+            peer_chunks = peer.as_ref().map(|p| p.answered()),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "session disks provisioned"
+        );
         Ok(SessionDisks {
             root: provisioned.root,
             swap: provisioned.swap,
