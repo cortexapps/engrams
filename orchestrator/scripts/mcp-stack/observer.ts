@@ -246,6 +246,10 @@ export class DatabaseObserver {
   async prerequisites() {
     const expected = {
       coordinator: [
+        "session_ops.id:bigint",
+        "session_ops.session_id:uuid",
+        "session_ops.kind:text",
+        "session_ops.state:text",
         "session_managed_creations.session_id:uuid",
         "session_managed_creations.task_id:text",
         "session_managed_creations.native_version:integer",
@@ -327,6 +331,23 @@ export class DatabaseObserver {
     const task = this.owned.get(sessionId);
     requireThat(task, "observer_unowned_session");
     return task;
+  }
+  async destroyOperation(sessionId: string) {
+    this.task(sessionId);
+    const result = await this.coordinator.query(
+      "SELECT id::text,state FROM session_ops WHERE session_id=$1 AND kind='destroy' ORDER BY id DESC LIMIT 1",
+      [sessionId],
+    );
+    if (result.rowCount === 0) return null;
+    requireThat(result.rowCount === 1, "coordinator_destroy_row");
+    const parsed = z
+      .strictObject({
+        id: z.string().regex(/^[1-9][0-9]*$/),
+        state: z.enum(["queued", "running", "done", "failed", "cancelled"]),
+      })
+      .safeParse(result.rows[0]);
+    requireThat(parsed.success, "coordinator_destroy_shape");
+    return parsed.data;
   }
   async started(sessionId: string, hostId: string) {
     const taskId = this.task(sessionId);

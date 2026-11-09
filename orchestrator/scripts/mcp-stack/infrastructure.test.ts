@@ -3,6 +3,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:https";
 import { X509Certificate } from "node:crypto";
+import pg from "pg";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
@@ -194,6 +195,8 @@ for (const failure of [
   "binding",
   "counter",
   "cleanup",
+  "destroy-failed",
+  "destroy-cancelled",
   "managed-upload",
   "managed-download",
   "upload-cleanup",
@@ -235,13 +238,50 @@ for (const failure of [
       await writeFile(path, "postgres://unit@unused.fixture.example/mcp_unit", {
         mode: 0o600,
       });
-    // Pools remain disconnected. Only the managed read-only observations use test values.
+    // Pools remain disconnected. Read-only observations use controlled values.
     const database = await DatabaseObserver.connect(ctx);
     const events: string[] = [];
+    const deletions = new Set<string>();
+    const destroyReads = new Map<string, number>();
+    const destroyQuery = spyOn(pg.Pool.prototype, "query").mockImplementation(
+      async (...args: unknown[]) => {
+        expect(args[0]).toContain("FROM session_ops");
+        const sessionId = (args[1] as string[])[0]!;
+        expect(deletions.has(sessionId)).toBe(true);
+        const reads = (destroyReads.get(sessionId) ?? 0) + 1;
+        destroyReads.set(sessionId, reads);
+        const state =
+          failure === "destroy-failed"
+            ? "failed"
+            : failure === "destroy-cancelled"
+              ? "cancelled"
+              : reads === 1
+                ? "missing"
+                : reads === 2
+                  ? "queued"
+                  : reads === 3
+                    ? "running"
+                    : "done";
+        events.push(`destroy-${sessionId}-${state}`);
+        return {
+          rows: state === "missing" ? [] : [{ id: "1", state }],
+          rowCount: state === "missing" ? 0 : 1,
+          command: "SELECT",
+          oid: 0,
+          fields: [],
+        };
+      },
+    );
     const sessionIds = [
       "11111111-1111-4111-8111-111111111112",
       "11111111-1111-4111-8111-111111111113",
     ];
+    if (failure === "none") {
+      await expect(
+        database.destroyOperation("11111111-1111-4111-8111-111111111199"),
+      ).rejects.toThrow("observer_unowned_session");
+      expect(destroyQuery).not.toHaveBeenCalled();
+    }
     const source_key = {
       creation: {
         session_id: sessionIds[managedIndex]!,
@@ -419,11 +459,16 @@ for (const failure of [
           },
         });
         router.service(SessionService, {
+          deleteSession(req) {
+            deletions.add(req.sessionId);
+            events.push(`delete-session-${req.sessionId}`);
+            return {};
+          },
           getSession(req) {
             return {
               session: {
                 id: req.sessionId,
-                status: "active",
+                status: deletions.has(req.sessionId) ? "completed" : "active",
                 hostId: ctx.hostId,
               },
             };
@@ -635,9 +680,8 @@ for (const failure of [
       };
       const { runInfrastructure } = await import("./infrastructure.ts");
       if (scenarioTest) {
-        const { startScenario, scenarioBindingTools } = await import(
-          "./scenario-runtime.ts"
-        );
+        const { startScenario, scenarioBindingTools } =
+          await import("./scenario-runtime.ts");
         const pending = startScenario(ctx, principals, database, {
           harness: "claude",
           suffix: "claude-grant-missing",
@@ -691,6 +735,15 @@ for (const failure of [
             nonOwnerStatus: 404,
           })),
         );
+        for (let i = 0; i < 2; i++) {
+          expect(deletions.has(sessionIds[i]!)).toBe(true);
+          expect(
+            events.indexOf(`destroy-${sessionIds[i]}-done`),
+          ).toBeGreaterThan(-1);
+          expect(events.indexOf(`destroy-${sessionIds[i]}-done`)).toBeLessThan(
+            events.indexOf(`delete-task-${i + 1}`),
+          );
+        }
         expect(events.indexOf("delete-task-1")).toBeLessThan(
           events.indexOf("catalog"),
         );
@@ -710,6 +763,8 @@ for (const failure of [
           binding: "exact_public_binding",
           counter: "infrastructure_no_tool_execution",
           cleanup: "private",
+          "destroy-failed": "infrastructure_destroy_failed",
+          "destroy-cancelled": "infrastructure_destroy_failed",
           "managed-upload": "guest_file_status_http_400_rpc_code_3",
           "managed-download": "guest_file_status_http_404",
           "upload-cleanup": "guest_file_status_http_400_rpc_code_3",
@@ -734,12 +789,15 @@ for (const failure of [
           expect(tasks).toBe(1);
       }
       expect(deletedTasks).toEqual(
-        Array.from({ length: tasks }, (_, i) => `task-${i + 1}`),
+        failure.startsWith("destroy-")
+          ? []
+          : Array.from({ length: tasks }, (_, i) => `task-${i + 1}`),
       );
       expect(deletedProfiles).toEqual(
         Array.from({ length: profiles }, (_, i) => `profile-${i + 1}`),
       );
     } finally {
+      destroyQuery.mockRestore();
       started.mockRestore();
       lifecycle.mockRestore();
       await database.close();

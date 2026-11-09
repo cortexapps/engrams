@@ -31,6 +31,7 @@ export async function runInfrastructure(
   for (const mode of ["ordinary", "managed"] as const) {
     let profileId: string | undefined;
     let taskId: string | undefined;
+    let sessionId: string | undefined;
     let failed = false;
     // Retain ownership as soon as Create returns, including later helper failures.
     const admin = {
@@ -57,6 +58,10 @@ export async function runInfrastructure(
         ) => {
           const response = await principals.owner.tasks.createTask(...args);
           taskId = response.task?.id;
+          if (response.task?.sessions.length === 1) {
+            sessionId = response.task.sessions[0]!.sessionId;
+            if (taskId && sessionId) database.own(taskId, sessionId);
+          }
           return response;
         },
       },
@@ -100,7 +105,6 @@ export async function runInfrastructure(
       }
       requireThat(profileId, "infrastructure_profile");
       const task = await createHumanTask(ctx, owner, profileId, "claude");
-      database.own(task.taskId, task.sessionId);
       if (managed) {
         const coordinator = await waitFor(
           ctx,
@@ -235,6 +239,26 @@ printf 'infrastructure-exec-ok\\n'
     } finally {
       let cleanupError: unknown;
       try {
+        if (sessionId) {
+          const cleanupSessionId = sessionId;
+          await principals.admin.sessions.deleteSession({
+            sessionId: cleanupSessionId,
+          });
+          // The terminal session status can precede physical host teardown.
+          await waitFor(
+            ctx,
+            "infrastructure_destroy_done",
+            () => database.destroyOperation(cleanupSessionId),
+            (operation) => {
+              requireThat(
+                operation?.state !== "failed" &&
+                  operation?.state !== "cancelled",
+                "infrastructure_destroy_failed",
+              );
+              return operation?.state === "done";
+            },
+          );
+        }
         if (taskId) await principals.admin.tasks.deleteTask({ taskId });
       } catch (error) {
         cleanupError = error;
