@@ -52,25 +52,11 @@ impl PostCopyFinish {
         let sealed = control_sock.with_file_name(engram_sandbox_firecracker::POST_COPY_SEALED_FILE);
         match self.source_manifest {
             Some(source) if sealed.exists() => {
-                let started = crate::time_source::metrics_now();
-                match self
-                    .finisher
-                    .seed_checkpoint_chain_post_copy(self.id, source, &sealed)
-                    .await
-                {
-                    Ok(fork) => tracing::info!(
-                        sandbox_id = %self.id,
-                        %source,
-                        %fork,
-                        seed_ms = started.elapsed().as_millis() as u64,
-                        "post-copy chain seeded; the first checkpoint diffs against it",
-                    ),
-                    Err(error) => tracing::warn!(
-                        sandbox_id = %self.id,
-                        %error,
-                        "post-copy chain seed failed; the first checkpoint is Full",
-                    ),
-                }
+                let seed = crate::pooled_backend::ChainSeed::PostCopy {
+                    source,
+                    sealed: &sealed,
+                };
+                let _ = self.finisher.seed_chain(self.id, seed).await;
             }
             _ => tracing::info!(sandbox_id = %self.id,
                 "no complete sealed output; the first checkpoint is Full"),

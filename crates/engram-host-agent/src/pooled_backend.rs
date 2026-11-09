@@ -3592,35 +3592,6 @@ impl PooledBackend {
         }
     }
 
-    /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
-    /// host-owned record. Runs at the tail of every successful
-    /// `snapshot()` (periodic checkpoint, eviction, drain, SIGTERM —
-    /// they're all chain entries now). Never fails the capture: the
-    /// snapshot's own durability (chunks + blobs in GCS) is already
-    /// settled; everything here is acceleration (chain) or
-    /// reconciliation insurance (record).
-    async fn seed_checkpoint_chain_sparse(
-        &self,
-        id: SandboxId,
-        memory_ref: engram_core::types::manifest::ManifestRef,
-    ) {
-        self.finisher()
-            .seed_checkpoint_chain_sparse(id, memory_ref)
-            .instrument(tracing::info_span!("restore.seed_chain", fork = false))
-            .await
-    }
-
-    async fn seed_checkpoint_chain_forked(
-        &self,
-        id: SandboxId,
-        src_ref: engram_core::types::manifest::ManifestRef,
-    ) {
-        self.finisher()
-            .seed_checkpoint_chain_forked(id, src_ref)
-            .instrument(tracing::info_span!("restore.seed_chain", fork = true))
-            .await
-    }
-
     /// ADR 0101 B: sandboxes due for a periodic checkpoint — each
     /// sandbox's due-interval comes from its last epoch's observed
     /// dirty rate ([`crate::checkpoint::next_epoch_after`]), clamped to
@@ -4277,6 +4248,34 @@ pub(crate) struct SnapshotFinisher {
     host_fs: Arc<dyn engram_host_core::HostFs>,
 }
 
+/// Where a sandbox's checkpoint chain starts.
+#[derive(Clone, Copy)]
+pub(crate) enum ChainSeed<'a> {
+    /// A durable memory manifest that this sandbox's memory equals: the
+    /// resumed snapshot's, or the one a Full capture just published.
+    Manifest(engram_core::types::manifest::ManifestRef),
+    /// A shared manifest (a create's image base), published again under a
+    /// new lineage that only this sandbox writes. Without it, each session's
+    /// first diff would race to publish the next version of the shared id.
+    Fork(engram_core::types::manifest::ManifestRef),
+    /// A post-copy destination: the source's chain manifest with the pages
+    /// the peer supplied (`sealed`) written over it, under a new lineage.
+    PostCopy {
+        source: engram_core::types::manifest::ManifestRef,
+        sealed: &'a Path,
+    },
+}
+
+impl ChainSeed<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Manifest(_) => "manifest",
+            Self::Fork(_) => "fork",
+            Self::PostCopy { .. } => "post_copy",
+        }
+    }
+}
+
 /// ADR 0101 B: what the last capture observed about a sandbox's memory
 /// dirty rate — the adaptive checkpoint controller's only input.
 /// `dirty_bytes: None` means the capture carried no rate signal (a Full
@@ -4563,7 +4562,7 @@ impl SnapshotFinisher {
             // Subsequent captures ride the sparse diff path. (The seed
             // persists the chain-head record itself.)
             None => {
-                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+                let _ = self.seed_chain(id, ChainSeed::Manifest(memory_ref)).await;
             }
         }
 
@@ -4616,85 +4615,40 @@ impl SnapshotFinisher {
         self.last_snapshot_unix_ms.entry(id).or_insert(now_ms);
     }
 
-    /// ADR 0045 seed-at-create: seed the chain by FORKING the source
-    /// lineage — publish the source manifest's content under a fresh
-    /// manifest id @v1, and chain on that. Required because fresh
-    /// creates seed from the SHARED per-image base manifest: chaining
-    /// directly on it makes every session's first diff race to publish
-    /// `base_id@v2` (the e2e-caught version conflict). The fork gives
-    /// each session a lineage it solely owns; the diff path then ticks
-    /// versions unchanged. One small manifest-JSON PUT (no chunk
-    /// uploads — the content is byte-identical to the source).
-    /// Best-effort like the sparse seed: failure → no chain → the next
-    /// capture is Full.
-    async fn seed_checkpoint_chain_forked(
+    /// Start the checkpoint chain of `id` from `seed`, so the next
+    /// checkpoint diffs against a durable manifest instead of reading all
+    /// of guest memory (a Full capture). Returns the chain head. Refuses
+    /// when checkpoints are off or a chain exists; the caller's capture or
+    /// restore does not fail on an error, the next checkpoint is Full.
+    pub(crate) async fn seed_chain(
         &self,
         id: SandboxId,
-        src_ref: engram_core::types::manifest::ManifestRef,
-    ) {
-        let Some(chunk_store) = self.chunks.as_ref().map(|c| &c.store) else {
-            return;
-        };
-        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
-            return;
-        }
-        let manifest = match chunk_store.get_manifest(src_ref).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    manifest = %src_ref,
-                    error = %e,
-                    "seed-at-create: source manifest fetch failed; first checkpoint falls back to Full",
-                );
-                return;
-            }
-        };
-        let fork_ref = engram_core::types::manifest::ManifestRef::new();
-        if let Err(e) = chunk_store.put_manifest(fork_ref, &manifest).await {
-            tracing::warn!(
+        seed: ChainSeed<'_>,
+    ) -> Result<engram_core::types::manifest::ManifestRef, String> {
+        let kind = seed.kind();
+        let result = self
+            .seed_chain_inner(id, seed)
+            .instrument(tracing::info_span!("checkpoint.seed_chain", kind))
+            .await;
+        match &result {
+            Ok(head) => tracing::info!(sandbox_id = %id, kind, %head, "checkpoint chain seeded"),
+            Err(error) => tracing::warn!(
                 sandbox_id = %id,
-                src = %src_ref,
-                fork = %fork_ref,
-                error = %e,
-                "seed-at-create: fork manifest publish failed; first checkpoint falls back to Full",
-            );
-            return;
+                kind,
+                %error,
+                "checkpoint chain seed failed; the first checkpoint is Full",
+            ),
         }
-        self.checkpoint_chains.insert(
-            id,
-            crate::checkpoint::CheckpointChain {
-                manifest_ref: fork_ref,
-                manifest,
-            },
-        );
-        // The fork manifest is durable (put_manifest above succeeded) —
-        // commit the chain-head record so the chain survives a pod roll.
-        self.persist_chain_head(id, fork_ref).await;
-        self.stamp_seeded(id);
-        tracing::info!(
-            sandbox_id = %id,
-            src = %src_ref,
-            fork = %fork_ref,
-            "chain seeded on a forked lineage; the first checkpoint diffs against it",
-        );
+        result
     }
 
-    /// A post-copy destination's seed: publish `source` (the source's
-    /// chain manifest) with the data ranges of `sealed` (the bytes the
-    /// peer supplied) written over it, under a fresh lineage. That is
-    /// the guest's memory at load, so the next capture diffs against it.
-    pub(crate) async fn seed_checkpoint_chain_post_copy(
+    async fn seed_chain_inner(
         &self,
         id: SandboxId,
-        source: engram_core::types::manifest::ManifestRef,
-        sealed: &Path,
+        seed: ChainSeed<'_>,
     ) -> Result<engram_core::types::manifest::ManifestRef, String> {
-        let Some(crate::snapshot_post::Chunks {
-            store: chunk_store,
-            fill,
-        }) = self.chunks.as_ref()
-        else {
+        use engram_core::types::manifest::ManifestRef;
+        let Some(crate::snapshot_post::Chunks { store, fill }) = self.chunks.as_ref() else {
             return Err("no chunk store".into());
         };
         if self.checkpoint_dir.is_none() {
@@ -4703,94 +4657,51 @@ impl SnapshotFinisher {
         if self.checkpoint_chains.contains_key(&id) {
             return Err("a chain already exists".into());
         }
-        let path = sealed.to_path_buf();
-        let ranges = tokio::task::spawn_blocking(move || {
-            std::fs::File::open(&path).and_then(|f| engram_host_core::data_extents(&f))
-        })
-        .await
-        .map_err(|e| format!("sealed ranges join: {e}"))?
-        .map_err(|e| format!("sealed ranges: {e}"))?;
-        let prev = chunk_store
-            .get_manifest(source)
-            .await
-            .map_err(|e| format!("source manifest {source}: {e}"))?;
-        let manifest = chunk_store
-            .update_for_dirty_ranges_sparse_from(&prev, sealed, &ranges, Arc::new(fill.clone()))
-            .await
-            .map_err(|e| format!("re-chunk sealed chunks: {e}"))?;
-        let fork = engram_core::types::manifest::ManifestRef::new();
-        chunk_store
-            .put_manifest(fork, &manifest)
-            .await
-            .map_err(|e| format!("put manifest {fork}: {e}"))?;
+        let get = |r: ManifestRef| async move {
+            store
+                .get_manifest(r)
+                .await
+                .map_err(|e| format!("manifest {r}: {e}"))
+        };
+        let (head, manifest) = match seed {
+            ChainSeed::Manifest(r) => (r, get(r).await?),
+            ChainSeed::Fork(r) => (ManifestRef::new(), get(r).await?),
+            ChainSeed::PostCopy { source, sealed } => {
+                let path = sealed.to_path_buf();
+                let ranges = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&path).and_then(|f| engram_host_core::data_extents(&f))
+                })
+                .await
+                .map_err(|e| format!("sealed ranges join: {e}"))?
+                .map_err(|e| format!("sealed ranges: {e}"))?;
+                let manifest = store
+                    .update_for_dirty_ranges_sparse_from(
+                        &get(source).await?,
+                        sealed,
+                        &ranges,
+                        Arc::new(fill.clone()),
+                    )
+                    .await
+                    .map_err(|e| format!("re-chunk sealed chunks: {e}"))?;
+                (ManifestRef::new(), manifest)
+            }
+        };
+        if !matches!(seed, ChainSeed::Manifest(_)) {
+            store
+                .put_manifest(head, &manifest)
+                .await
+                .map_err(|e| format!("put manifest {head}: {e}"))?;
+        }
         self.checkpoint_chains.insert(
             id,
             crate::checkpoint::CheckpointChain {
-                manifest_ref: fork,
+                manifest_ref: head,
                 manifest,
             },
         );
-        self.persist_chain_head(id, fork).await;
+        self.persist_chain_head(id, head).await;
         self.stamp_seeded(id);
-        Ok(fork)
-    }
-
-    /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
-    /// (no local rolling image — "sparse mode"). Two entry points: on
-    /// RESUME from the source's memory manifest, and after a fresh Full
-    /// capture from the just-published one. ADR 0039 retired the rolling
-    /// memfile, so this is the *only* seed. The manifest already describes
-    /// the full image in the chunk store, so the next periodic checkpoint
-    /// takes the diff path (`update_for_dirty_ranges_sparse_from`) instead of a
-    /// Full re-read of guest RAM — which under UFFD faults the entire
-    /// working set in from the store (the 60 s `PUT /snapshot/create`
-    /// hang).
-    ///
-    /// Best-effort: a missing/unfetchable manifest just means the next
-    /// checkpoint falls back to Full. Skips when checkpointing is
-    /// disabled, there's no chunk store, or a chain is already tracked
-    /// (a fresh `restore` mints a new sandbox id; the Full-capture caller
-    /// only reaches here when the chain was empty).
-    async fn seed_checkpoint_chain_sparse(
-        &self,
-        id: SandboxId,
-        memory_ref: engram_core::types::manifest::ManifestRef,
-    ) {
-        let Some(chunk_store) = self.chunks.as_ref().map(|c| &c.store) else {
-            return;
-        };
-        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
-            return;
-        }
-        match chunk_store.get_manifest(memory_ref).await {
-            Ok(manifest) => {
-                self.checkpoint_chains.insert(
-                    id,
-                    crate::checkpoint::CheckpointChain {
-                        manifest_ref: memory_ref,
-                        manifest,
-                    },
-                );
-                // The seed source is a published manifest (we just
-                // fetched it) — commit the chain-head record so the
-                // chain survives a pod roll.
-                self.persist_chain_head(id, memory_ref).await;
-                self.stamp_seeded(id);
-                tracing::info!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    "ADR 0038/0039: seeded sparse checkpoint chain; next checkpoint will diff",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    error = %e,
-                    "resume chain seed failed; first checkpoint falls back to Full",
-                );
-            }
-        }
+        Ok(head)
     }
 }
 
@@ -6269,7 +6180,10 @@ impl SandboxBackend for PooledBackend {
         // destination seeds after its drain (`postcopy_finish`).
         if migration.is_none() {
             if let Some(memory_ref) = memory_ref {
-                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+                let _ = self
+                    .finisher()
+                    .seed_chain(id, ChainSeed::Manifest(memory_ref))
+                    .await;
             }
         }
         self.spawn_prefault_stats_probe(id);
@@ -6290,7 +6204,7 @@ impl SandboxBackend for PooledBackend {
         // FIRST capture a diff (pages it actually dirtied) instead of a
         // Full dump+re-chunk of all guest RAM. FORKED seed: the source
         // manifest is shared across sessions, so the chain must own a
-        // fresh lineage (see seed_checkpoint_chain_forked).
+        // fresh lineage (`ChainSeed::Fork`).
         let memory_ref = metadata.memory_manifest;
         self.restore_with(
             id,
@@ -6301,7 +6215,10 @@ impl SandboxBackend for PooledBackend {
         )
         .await?;
         if let Some(memory_ref) = memory_ref {
-            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+            let _ = self
+                .finisher()
+                .seed_chain(id, ChainSeed::Fork(memory_ref))
+                .await;
         }
         Ok(())
     }
@@ -6548,7 +6465,10 @@ impl SandboxBackend for PooledBackend {
                 )
                 .await?;
                 if let Some(memory_ref) = memory_ref {
-                    self.seed_checkpoint_chain_forked(id, memory_ref).await;
+                    let _ = self
+                        .finisher()
+                        .seed_chain(id, ChainSeed::Fork(memory_ref))
+                        .await;
                 }
                 // ADR 0088 addendum: a balloon-era cold base was dumped
                 // with the balloon INFLATED — the deflate happens inside
@@ -7040,7 +6960,10 @@ impl SandboxBackend for PooledBackend {
         // merge below dirties pages AFTER tracking started, so the
         // diff stays correct.
         if let Some(memory_ref) = memory_ref {
-            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+            let _ = self
+                .finisher()
+                .seed_chain(id, ChainSeed::Fork(memory_ref))
+                .await;
         }
 
         // ADR 0080: let the captured agentd adopt the agentd bundle
@@ -12218,7 +12141,13 @@ mod tests {
             .with_checkpoint_dir(tmp.path().join("checkpoints"));
         let fork = pooled
             .finisher()
-            .seed_checkpoint_chain_post_copy(id, source, &sealed)
+            .seed_chain(
+                id,
+                ChainSeed::PostCopy {
+                    source,
+                    sealed: &sealed,
+                },
+            )
             .await
             .unwrap();
         assert_ne!(fork.manifest_id, source.manifest_id, "a fresh lineage");
@@ -13137,8 +13066,10 @@ mod tests {
         let restored = SandboxId::new();
         pooled.bind_session(SessionId::new(), restored);
         pooled
-            .seed_checkpoint_chain_sparse(restored, memory_ref)
-            .await;
+            .finisher()
+            .seed_chain(restored, ChainSeed::Manifest(memory_ref))
+            .await
+            .expect("seed");
         let cfg = crate::checkpoint::CheckpointConfig {
             interval: Some(std::time::Duration::from_secs(600)),
             min_interval: std::time::Duration::from_secs(30),
@@ -13154,8 +13085,10 @@ mod tests {
         let captured = SandboxId::new();
         pooled.last_snapshot_unix_ms.insert(captured, 7);
         pooled
-            .seed_checkpoint_chain_forked(captured, memory_ref)
-            .await;
+            .finisher()
+            .seed_chain(captured, ChainSeed::Fork(memory_ref))
+            .await
+            .expect("seed");
         assert_eq!(
             pooled.last_snapshot_unix_ms.get(&captured).map(|v| *v),
             Some(7)
