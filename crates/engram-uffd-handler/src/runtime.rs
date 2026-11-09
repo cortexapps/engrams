@@ -338,8 +338,7 @@ pub fn recv_handshake(
 /// `host_va` are still inside this mapping. Returns `None` when the
 /// offset isn't covered by any mapping.
 ///
-/// Used by both per-fault serving and prefault: every byte-offset
-/// translation funnels through here.
+/// Every byte-offset translation funnels through here.
 fn locate_offset(
     mappings: &[GuestRegionUffdMapping],
     byte_offset: u64,
@@ -425,11 +424,67 @@ const SWEEP_RETRY: Duration = Duration::from_millis(250);
 /// stops (5 s). A running prefetch lands hundreds of chunks a second.
 const SWEEP_STALL_PASSES: usize = 20;
 
-/// The eager sweep's order: divergent chunks, then canonical ones.
-#[derive(Clone, Copy)]
-enum SweepPass {
-    Divergent,
-    Canonical,
+/// How a chunk installs. [`Runtime::fill_for`] takes this decision for an
+/// offset from the manifests; a peer response gives it directly.
+enum Fill {
+    /// Bytes private to this session: copied in (`UFFDIO_COPY`).
+    Private(Payload),
+    /// The base image's chunk: mapped from the shared base file
+    /// (`UFFDIO_CONTINUE`) when there is one, else copied in.
+    Canonical(Payload),
+    /// A zero chunk (`UFFDIO_ZEROPAGE`).
+    Zero,
+}
+
+/// A chunk's bytes, or the store chunk that holds them.
+enum Payload {
+    Hash(ChunkHash),
+    Bytes(Bytes),
+}
+
+impl Payload {
+    fn bytes(
+        self,
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+    ) -> Result<Bytes, HandlerError> {
+        match self {
+            Payload::Hash(hash) => Ok(backend.fetch_chunk(handle, hash)?),
+            Payload::Bytes(bytes) => Ok(bytes),
+        }
+    }
+
+    /// Whether the bytes are at hand: given, or in the local cache.
+    fn is_resident(&self, backend: &ChunkedMemoryBackend) -> bool {
+        match self {
+            Payload::Hash(hash) => backend.is_resident(*hash),
+            Payload::Bytes(_) => true,
+        }
+    }
+}
+
+impl Fill {
+    /// The same fill, with its bytes fetched now.
+    fn fetched(
+        self,
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+    ) -> Result<Self, HandlerError> {
+        Ok(match self {
+            Fill::Private(p) => Fill::Private(Payload::Bytes(p.bytes(backend, handle)?)),
+            Fill::Canonical(p) => Fill::Canonical(Payload::Bytes(p.bytes(backend, handle)?)),
+            Fill::Zero => Fill::Zero,
+        })
+    }
+}
+
+/// Who installs a chunk. A fault wakes the vCPUs that wait on it; a peer
+/// install is recorded in the sealed output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Installer {
+    Fault,
+    Sweep,
+    Peer,
 }
 
 /// What [`Runtime::sweep_step`] did with one chunk.
@@ -876,15 +931,22 @@ impl Runtime {
         // file mapping, so each would COPY a zeroed buffer), defeating
         // the density the substrate exists for. A zero fault is already
         // served with no fetch.
+        let (mut order, canonical): (Vec<u64>, Vec<u64>) = (0..total)
+            .step_by(chunk_size as usize)
+            .partition(|&offset| {
+                matches!(
+                    Self::fill_for(&self.backend, offset),
+                    Some(Fill::Private(_))
+                )
+            });
+        order.extend(canonical);
         let mut pending = Vec::new();
-        for pass in [SweepPass::Divergent, SweepPass::Canonical] {
-            for offset in (0..total).step_by(chunk_size as usize) {
-                match self.sweep_step(pass, offset, follow)? {
-                    SweepStep::Installed => installed += 1,
-                    SweepStep::Zero => zero_skipped += 1,
-                    SweepStep::Wait => pending.push((pass, offset)),
-                    SweepStep::Skip => {}
-                }
+        for offset in order {
+            match self.sweep_step(offset, follow)? {
+                SweepStep::Installed => installed += 1,
+                SweepStep::Zero => zero_skipped += 1,
+                SweepStep::Wait => pending.push(offset),
+                SweepStep::Skip => {}
             }
         }
         let mut passes = 1usize;
@@ -902,10 +964,10 @@ impl Runtime {
             std::thread::sleep(SWEEP_RETRY);
             let before = installed;
             let mut still = Vec::with_capacity(pending.len());
-            for (pass, offset) in pending {
-                match self.sweep_step(pass, offset, follow)? {
+            for offset in pending {
+                match self.sweep_step(offset, follow)? {
                     SweepStep::Installed => installed += 1,
-                    SweepStep::Wait => still.push((pass, offset)),
+                    SweepStep::Wait => still.push(offset),
                     SweepStep::Zero | SweepStep::Skip => {}
                 }
             }
@@ -929,14 +991,8 @@ impl Runtime {
     /// One chunk of the eager sweep: install it when its bytes are at
     /// hand (with a writer, `follow`: when the cache or the base shm
     /// holds them).
-    fn sweep_step(
-        &self,
-        pass: SweepPass,
-        offset: u64,
-        follow: bool,
-    ) -> Result<SweepStep, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let idx = (offset / chunk_size) as usize;
+    fn sweep_step(&self, offset: u64, follow: bool) -> Result<SweepStep, HandlerError> {
+        let idx = self.chunk_idx(offset);
         // ADR 0045 C2: a sealed-but-undrained chunk's truth is the PEER,
         // not the manifest — installing resolve()'s stale view here would
         // be silent corruption. The drain runs before this on the
@@ -953,37 +1009,24 @@ impl Runtime {
         if self.first_touch.awaits_guest(idx) {
             return Ok(SweepStep::Wait);
         }
-        let held = |hash| !follow || self.backend.is_resident(hash);
-        let did = match (pass, self.backend.resolve(offset)) {
-            (SweepPass::Divergent, Some(ResolvedPage::Chunk { hash })) if held(hash) => {
-                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                self.install_chunk_at(offset, bytes, false)?
-            }
-            (SweepPass::Divergent, Some(ResolvedPage::Chunk { .. })) => {
-                return Ok(SweepStep::Wait);
-            }
-            (SweepPass::Canonical, Some(ResolvedPage::Canonical { canonical_offset })) => {
-                let Some(hash) = self.backend.canonical_chunk_hash(canonical_offset) else {
-                    return Ok(SweepStep::Zero);
-                };
-                let len = chunk_size.min(self.backend.total_bytes() - offset);
-                match self.base_shm.as_ref() {
-                    Some(base) if held(hash) || base.is_populated(offset, len) => {
-                        self.install_canonical_shared(base, offset, hash, false)?
-                    }
-                    None if held(hash) => {
-                        let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                        self.install_chunk_at(offset, bytes, false)?
-                    }
-                    _ => return Ok(SweepStep::Wait),
-                }
-            }
-            (SweepPass::Canonical, Some(ResolvedPage::Zero { .. })) => {
-                return Ok(SweepStep::Zero);
-            }
-            _ => false,
+        let Some(fill) = Self::fill_for(&self.backend, offset) else {
+            return Ok(SweepStep::Skip);
         };
-        Ok(if did {
+        let held = match &fill {
+            Fill::Zero => return Ok(SweepStep::Zero),
+            Fill::Private(payload) => payload.is_resident(&self.backend),
+            Fill::Canonical(payload) => {
+                payload.is_resident(&self.backend)
+                    || self
+                        .base_shm
+                        .as_ref()
+                        .is_some_and(|base| base.is_populated(offset, self.chunk_len(offset)))
+            }
+        };
+        if follow && !held {
+            return Ok(SweepStep::Wait);
+        }
+        Ok(if self.install(offset, fill, Installer::Sweep)? {
             SweepStep::Installed
         } else {
             SweepStep::Skip
@@ -991,7 +1034,7 @@ impl Runtime {
     }
 
     /// Atomically claim a chunk for installation (CAS `Empty →
-    /// Installing` under the lock). Concurrent prefault / fault / drain
+    /// Installing` under the lock). Concurrent sweep / fault / drain
     /// installs serialise to exactly one installer per chunk.
     ///
     /// - [`Claim::Claimed`]  — WE own the install; on success call
@@ -1184,55 +1227,89 @@ impl Runtime {
         Ok(())
     }
 
-    /// Install `bytes` (a full chunk) at the given session byte
-    /// offset, copying into the guest's UFFD-registered region via
-    /// `UFFDIO_COPY`. `wake` controls whether vCPUs blocked on
-    /// pages in this range are woken (`true` during the fault loop,
-    /// `false` during prefault when no vCPU is blocked yet).
-    ///
-    /// Walks every region the chunk touches (see `install_spanning`):
-    /// a chunk straddling an FC region boundary is installed in full,
-    /// not clamped to the first region.
-    ///
-    /// Returns `Ok(true)` if we installed; `Ok(false)` if the chunk
-    /// was already installed (idempotent path).
-    fn install_chunk_at(
-        &self,
-        byte_offset: u64,
-        bytes: Bytes,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Claim the chunk (Empty → Installing). If another installer is
-        // mid-flight or already done, short-circuit to a wake (false);
-        // a failed in-flight install rolls back to Empty and we retry.
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_chunk_at(byte_offset, bytes, wake)
+    fn chunk_idx(&self, offset: u64) -> usize {
+        (offset / self.backend.chunk_size()) as usize
     }
 
-    fn install_claimed_chunk_at(
-        &self,
-        byte_offset: u64,
-        bytes: Bytes,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
+    /// The length of the chunk at `offset`: the last chunk can be short.
+    fn chunk_len(&self, offset: u64) -> u64 {
+        self.backend
+            .chunk_size()
+            .min(self.backend.total_bytes().saturating_sub(offset))
+    }
 
-        // The chunk's bytes occupy file offsets
-        // [byte_offset, byte_offset + total_len). Walk every region the
-        // range touches so a boundary-spanning chunk installs in FULL,
-        // copying the matching slice of `bytes` into each segment.
-        let total_len = std::cmp::min(chunk_size, bytes.len() as u64);
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, pos| {
+    /// How the chunk at `offset` installs, from the manifests: the one
+    /// source decision every installer takes. `None` past the end.
+    fn fill_for(backend: &ChunkedMemoryBackend, offset: u64) -> Option<Fill> {
+        Some(match backend.resolve(offset)? {
+            ResolvedPage::Chunk { hash } => Fill::Private(Payload::Hash(hash)),
+            ResolvedPage::Canonical { hash } => Fill::Canonical(Payload::Hash(hash)),
+            ResolvedPage::Zero => Fill::Zero,
+        })
+    }
+
+    /// Install the chunk at `offset` from `fill`. `Ok(false)` when another
+    /// installer had it. The claim is held across the fetch, so a chunk is
+    /// fetched once however many installers race for it.
+    fn install(&self, offset: u64, fill: Fill, by: Installer) -> Result<bool, HandlerError> {
+        if self.claim_for_install(self.chunk_idx(offset)) != Claim::Claimed {
+            return Ok(false);
+        }
+        self.install_claimed(offset, fill, by)
+    }
+
+    /// Install a chunk the caller claimed, then settle the claim:
+    /// `Installed` on success, back to `Empty` on any error, so a failed
+    /// fetch or copy leaves the chunk retryable (#206). A peer install is
+    /// recorded before it is marked installed, so once every sealed chunk
+    /// is installed the sealed output is complete.
+    fn install_claimed(
+        &self,
+        offset: u64,
+        fill: Fill,
+        by: Installer,
+    ) -> Result<bool, HandlerError> {
+        let len = self.chunk_len(offset);
+        let record = self.sealed_out.as_ref().filter(|_| by == Installer::Peer);
+        let wake = by == Installer::Fault;
+        let result = (|| {
+            let base = match fill {
+                Fill::Canonical(_) => self.base_shm.as_ref(),
+                _ => None,
+            };
+            // A base that holds the chunk needs no bytes, unless they are recorded.
+            let bytes = match fill {
+                Fill::Zero => None,
+                Fill::Canonical(_)
+                    if record.is_none() && base.is_some_and(|b| b.is_populated(offset, len)) =>
+                {
+                    None
+                }
+                Fill::Private(payload) | Fill::Canonical(payload) => {
+                    Some(payload.bytes(&self.backend, &self.handle)?)
+                }
+            };
+            if let Some(out) = record {
+                out.record(offset, bytes.as_deref(), len);
+            }
+            match (base, bytes) {
+                (Some(base), bytes) => self.continue_from_base(base, offset, len, bytes, wake),
+                (None, Some(bytes)) => self.copy_in(offset, &bytes, wake),
+                (None, None) => self.zero_in(offset, len, wake),
+            }
+        })();
+        self.settle_install(self.chunk_idx(offset), &result);
+        result.map(|()| true)
+    }
+
+    /// `UFFDIO_COPY` `bytes` (a full chunk, or the short last one) into
+    /// every region the chunk spans (see `install_spanning`).
+    fn copy_in(&self, offset: u64, bytes: &[u8], wake: bool) -> Result<(), HandlerError> {
+        let len = self.backend.chunk_size().min(bytes.len() as u64);
+        self.install_spanning(offset, len, |host_va, seg_len, pos| {
             // SAFETY: `bytes[pos..pos+seg_len]` is in bounds
-            // (`install_spanning` never advances past `total_len`, which
-            // is clamped to `bytes.len()`). `host_va` is a guest-visible
+            // (`install_spanning` never advances past `len`, which is
+            // clamped to `bytes.len()`). `host_va` is a guest-visible
             // address in a UFFD-registered region we hold copy access
             // to. UFFDIO_COPY installs the PTE + wakes per page atomically.
             unsafe {
@@ -1244,41 +1321,16 @@ impl Runtime {
                 )?;
             }
             Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
+        })
     }
 
-    /// Install a zero-filled chunk: `UFFDIO_ZEROPAGE` over the
-    /// chunk-aligned range, so the kernel maps its shared zero page and
-    /// the guest's first write copies it. Some kernels reject ZEROPAGE
-    /// on the substrate's MAP_PRIVATE file mapping; then this and every
-    /// later zero install copies a zeroed buffer (one private page per
-    /// touched page). Same idempotency and clamping as
-    /// `install_chunk_at`.
-    fn install_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-        self.install_claimed_zero_at(byte_offset, wake)
-    }
-
-    fn install_claimed_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-
-        // Zero the chunk's whole [byte_offset, +total_len) range,
-        // walking every region it spans (clamped to the manifest's
-        // total so the final partial chunk doesn't overrun).
-        let total_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
+    /// Zero `len` bytes from `offset`: `UFFDIO_ZEROPAGE`, so the kernel
+    /// maps its shared zero page and the guest's first write copies it.
+    /// Some kernels reject ZEROPAGE on the substrate's MAP_PRIVATE file
+    /// mapping; then this and every later zero install copies a zeroed
+    /// buffer (one private page per touched page).
+    fn zero_in(&self, offset: u64, len: u64, wake: bool) -> Result<(), HandlerError> {
+        self.install_spanning(offset, len, |host_va, seg_len, _pos| {
             if self.zeropage_ok.load(Ordering::Relaxed) {
                 // SAFETY: `host_va` is a guest-visible address in a UFFD-
                 // registered region we hold zeropage access to. ZEROPAGE
@@ -1302,7 +1354,7 @@ impl Runtime {
             }
             let zeros = vec![0u8; seg_len];
             // SAFETY: a zeroed buffer of `seg_len`; same contract as
-            // `install_claimed_chunk_at`'s copy.
+            // `copy_in`'s copy.
             unsafe {
                 self.uffd.copy(
                     zeros.as_ptr() as *const _,
@@ -1312,72 +1364,33 @@ impl Runtime {
                 )?;
             }
             Ok(())
-        });
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
+        })
     }
 
-    /// ADR 0045 substrate (v2b): install a canonical chunk by ensuring the
-    /// base shm file holds its bytes, then `UFFDIO_CONTINUE`-ing the range —
-    /// the kernel maps the base file's page-cache pages (write-protected
-    /// MAP_PRIVATE; guest writes COW), so every same-template VM on the host
-    /// shares one physical copy. The fetch is skipped entirely when a
-    /// sibling already populated the range (`SEEK_HOLE` probe).
-    fn install_canonical_shared(
+    /// ADR 0045 substrate (v2b): map a canonical chunk from the base shm
+    /// file with `UFFDIO_CONTINUE` — the kernel maps the base file's
+    /// page-cache pages (write-protected MAP_PRIVATE; guest writes COW),
+    /// so every same-template VM on the host shares one physical copy.
+    /// `bytes` are written to the base first when it does not hold them;
+    /// they are `None` only when it does.
+    fn continue_from_base(
         &self,
         base: &crate::base_shm::BaseShm,
-        byte_offset: u64,
-        hash: engram_chunk_store::ChunkHash,
-        wake: bool,
-    ) -> Result<bool, HandlerError> {
-        let chunk_size = self.backend.chunk_size();
-        let chunk_idx = (byte_offset / chunk_size) as usize;
-        match self.claim_for_install(chunk_idx) {
-            Claim::Claimed => {}
-            _ => return Ok(false),
-        }
-
-        let populate_len = std::cmp::min(
-            chunk_size,
-            self.backend.total_bytes().saturating_sub(byte_offset),
-        );
-        // All fallible work — the (multi-second, network-bound)
-        // `fetch_chunk`, the base write, and the CONTINUE walk — runs in
-        // `populate_and_continue` so a single `settle_install` publishes
-        // `Installed` only on full success and rolls the claim back to
-        // `Empty` on ANY error. The chunk is never left `Installing`
-        // across `?`, and a transient fetch failure is retried by the
-        // next fault rather than permanently poisoning the chunk (#206).
-        let result = self.populate_and_continue(base, byte_offset, populate_len, hash, wake);
-        self.settle_install(chunk_idx, &result);
-        result.map(|()| true)
-    }
-
-    /// The fallible body of `install_canonical_shared`: ensure the base
-    /// shm holds the chunk's bytes (fetch + write, skipped when a sibling
-    /// already populated the range), then `UFFDIO_CONTINUE` every region
-    /// segment the chunk spans. Split out so the claim is settled in one
-    /// place on the combined `Result`.
-    fn populate_and_continue(
-        &self,
-        base: &crate::base_shm::BaseShm,
-        byte_offset: u64,
-        populate_len: u64,
-        hash: engram_chunk_store::ChunkHash,
+        offset: u64,
+        len: u64,
+        bytes: Option<Bytes>,
         wake: bool,
     ) -> Result<(), HandlerError> {
-        // Ensure the base shm holds this chunk's bytes (file-offset keyed
-        // — independent of the region layout) before we map them.
-        if !base.is_populated(byte_offset, populate_len) {
-            let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-            base.write_chunk(byte_offset, &bytes)
-                .map_err(HandlerError::BaseShm)?;
+        if let Some(bytes) = bytes {
+            if !base.is_populated(offset, len) {
+                base.write_chunk(offset, &bytes)
+                    .map_err(HandlerError::BaseShm)?;
+            }
         }
-
         // CONTINUE each region segment the chunk spans. Per segment the
         // kernel may map a prefix and return progress (looped) and may
         // EEXIST on a page a racing fault already mapped.
-        self.install_spanning(byte_offset, populate_len, |host_va, seg_len, _pos| {
+        self.install_spanning(offset, len, |host_va, seg_len, _pos| {
             let mut done: u64 = 0;
             while (done as usize) < seg_len {
                 let start = host_va + done;
@@ -1461,77 +1474,36 @@ impl Runtime {
         }
     }
 
+    /// The fill for a verified peer response, its bytes fetched now: the
+    /// sealed output records them, and the fault window must not fetch
+    /// under its cancellation lock. `AltSource` (live content equals the
+    /// durable chunk) takes the manifest's fill.
+    fn peer_fill(
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+        offset: u64,
+        page: crate::peer::PeerPage,
+    ) -> Result<Fill, HandlerError> {
+        use crate::peer::PeerPage;
+        match page {
+            PeerPage::Bytes(bytes) => Ok(Fill::Private(Payload::Bytes(Bytes::from(bytes)))),
+            PeerPage::Zero => Ok(Fill::Zero),
+            PeerPage::AltSource(_) => Self::fill_for(backend, offset)
+                .ok_or_else(|| {
+                    HandlerError::PeerLost(format!("AltSource for unresolvable offset {offset:#x}"))
+                })?
+                .fetched(backend, handle),
+        }
+    }
+
     /// Install one verified peer response without waking adjacent pages.
     fn install_peer_page(
         &self,
         offset: u64,
         page: crate::peer::PeerPage,
     ) -> Result<bool, HandlerError> {
-        let bytes = Self::prepare_peer_page(&self.backend, &self.handle, offset, page)?;
-        self.install_prepared_peer_page(offset, bytes)
-    }
-
-    /// Resolve durable bytes without a runtime reference or the install lock.
-    fn prepare_peer_page(
-        backend: &ChunkedMemoryBackend,
-        handle: &TokioHandle,
-        offset: u64,
-        page: crate::peer::PeerPage,
-    ) -> Result<Option<Bytes>, HandlerError> {
-        use crate::peer::PeerPage;
-        Ok(match page {
-            PeerPage::Bytes(bytes) => Some(Bytes::from(bytes)),
-            PeerPage::Zero => None,
-            PeerPage::AltSource(_) => {
-                let hash = match backend.resolve(offset) {
-                    Some(ResolvedPage::Chunk { hash }) => Some(hash),
-                    Some(ResolvedPage::Canonical { canonical_offset }) => {
-                        backend.canonical_chunk_hash(canonical_offset)
-                    }
-                    Some(ResolvedPage::Zero { .. }) => None,
-                    None => {
-                        return Err(HandlerError::PeerLost(format!(
-                            "AltSource for unresolvable offset {offset:#x}"
-                        )))
-                    }
-                };
-                hash.map(|hash| backend.fetch_chunk(handle, hash))
-                    .transpose()?
-            }
-        })
-    }
-
-    fn install_prepared_peer_page(
-        &self,
-        offset: u64,
-        bytes: Option<Bytes>,
-    ) -> Result<bool, HandlerError> {
-        let chunk_idx = (offset / self.backend.chunk_size()) as usize;
-        if self.claim_for_install(chunk_idx) != Claim::Claimed {
-            return Ok(false);
-        }
-        self.install_claimed_peer_page(offset, bytes)
-    }
-
-    /// Every peer install passes here. The chunk is recorded before it
-    /// is marked installed, so once every sealed chunk is installed the
-    /// sealed output is complete.
-    fn install_claimed_peer_page(
-        &self,
-        offset: u64,
-        bytes: Option<Bytes>,
-    ) -> Result<bool, HandlerError> {
-        if let Some(out) = &self.sealed_out {
-            let len = self
-                .backend
-                .chunk_size()
-                .min(self.backend.total_bytes().saturating_sub(offset));
-            out.record(offset, bytes.as_deref(), len);
-        }
-        match bytes {
-            Some(bytes) => self.install_claimed_chunk_at(offset, bytes, false),
-            None => self.install_claimed_zero_at(offset, false),
-        }
+        let fill = Self::peer_fill(&self.backend, &self.handle, offset, page)?;
+        self.install(offset, fill, Installer::Peer)
     }
 
     #[cfg(test)]
@@ -1562,15 +1534,14 @@ impl Runtime {
         // lands consistently across faults in the same chunk.
         let chunk_size = self.backend.chunk_size();
         let chunk_byte_offset = byte_offset - (byte_offset % chunk_size);
-        self.first_touch
-            .touch((chunk_byte_offset / chunk_size) as usize);
+        let chunk_idx = self.chunk_idx(chunk_byte_offset);
+        self.first_touch.touch(chunk_idx);
 
         // ADR 0045 C2: sealed chunks are peer-authoritative — their truth
         // lives only in the paused source's address space, so they MUST
         // resolve via the peer, never via `resolve()` (whose manifest view
         // predates the dirtying). Ahead of everything else by design.
         if let Some(peer) = self.peer.as_ref() {
-            let chunk_idx = (chunk_byte_offset / chunk_size) as usize;
             if peer.seal().get(chunk_idx as u64) {
                 if self.chunk_installed(chunk_idx) {
                     // Drain (or an earlier fault) already landed it; the
@@ -1621,76 +1592,16 @@ impl Runtime {
             }
         }
 
-        let source = match self
-            .backend
-            .resolve(chunk_byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
-        {
-            ResolvedPage::Canonical { canonical_offset } => {
-                // Route B: "canonical" means "fetch the canonical chunk
-                // hash from the store" (shared via base-shm CONTINUE
-                // when present). Reaching this arm means the session
-                // agrees with the base here, so a hash is expected; the
-                // `None` branch is a defensive zero-fill for a malformed
-                // manifest — session omissions resolve to `Zero` below.
-                match self.backend.canonical_chunk_hash(canonical_offset) {
-                    Some(hash) => {
-                        let installed = match self.base_shm.as_ref() {
-                            // ADR 0045 substrate: shared install via the
-                            // base shm + CONTINUE (one physical copy per
-                            // host); guest writes COW privately.
-                            Some(base) => {
-                                self.install_canonical_shared(base, chunk_byte_offset, hash, true)?
-                            }
-                            None => {
-                                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                                self.install_chunk_at(chunk_byte_offset, bytes, true)?
-                            }
-                        };
-                        if !installed {
-                            // Already installed: wake the vCPU since the
-                            // kernel may have queued the fault before our
-                            // earlier prefault landed.
-                            self.wake_page(page_aligned, page_size)?;
-                            Source::Wake
-                        } else {
-                            Source::Shm
-                        }
-                    }
-                    None => {
-                        let installed = self.install_zero_at(chunk_byte_offset, true)?;
-                        if !installed {
-                            self.wake_page(page_aligned, page_size)?;
-                            Source::Wake
-                        } else {
-                            Source::Zero
-                        }
-                    }
-                }
-            }
-            ResolvedPage::Chunk { hash } => {
-                let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
-                let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
-                if !installed {
-                    self.wake_page(page_aligned, page_size)?;
-                }
-                Source::Wake
-            }
-            ResolvedPage::Zero { offset } => {
-                // Session omits this offset → authoritative zero page,
-                // regardless of what the base holds there (the session
-                // capture is full + zero-omitted). No chunk to record.
-                let installed = self.install_zero_at(offset, true)?;
-                if !installed {
-                    self.wake_page(page_aligned, page_size)?;
-                    Source::Wake
-                } else {
-                    Source::Zero
-                }
-            }
-        };
-
-        Ok(source)
+        let fill = Self::fill_for(&self.backend, chunk_byte_offset)
+            .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?;
+        let zero = matches!(fill, Fill::Zero);
+        if !self.install(chunk_byte_offset, fill, Installer::Fault)? {
+            // Another installer had it: the kernel may have queued this
+            // fault before that install landed, so wake the vCPU.
+            self.wake_page(page_aligned, page_size)?;
+            return Ok(Source::Wake);
+        }
+        Ok(if zero { Source::Zero } else { Source::Shm })
     }
 
     /// Cheap read of whether a chunk is fully `Installed` (a chunk that
@@ -1831,9 +1742,8 @@ impl Runtime {
                                 } else {
                                     // Fetches may outlive stop(). They own only the backend,
                                     // never the runtime or its mappings.
-                                    let bytes =
-                                        Self::prepare_peer_page(&backend, &handle, offset, page)
-                                            .map_err(|e| e.to_string())?;
+                                    let fill = Self::peer_fill(&backend, &handle, offset, page)
+                                        .map_err(|e| e.to_string())?;
                                     if worker_progress.stopped() {
                                         return Ok(());
                                     }
@@ -1853,7 +1763,7 @@ impl Runtime {
                                         return Ok(());
                                     }
                                     if rt
-                                        .install_claimed_peer_page(offset, bytes)
+                                        .install_claimed(offset, fill, Installer::Peer)
                                         .map_err(|e| e.to_string())?
                                     {
                                         rt.fault_around_chunks_installed
@@ -2240,8 +2150,7 @@ impl Runtime {
                 PeerPage::Zero => &shared.zero_chunks,
                 PeerPage::AltSource(_) => &shared.alt_sourced,
             };
-            let installed = Self::prepare_peer_page(&self.backend, &self.handle, offset, page)
-                .and_then(|bytes| self.install_prepared_peer_page(offset, bytes));
+            let installed = self.install_peer_page(offset, page);
             self.clear_request(idx);
             if let Err(e) = installed {
                 abandon(&in_flight, &retry);
@@ -2273,8 +2182,8 @@ impl Runtime {
     }
 
     /// `UFFDIO_WAKE` the specified page. Used when the chunk this
-    /// fault belongs to was already installed (by an earlier
-    /// prefault or sibling-fault install): the page is no longer
+    /// fault belongs to was already installed (by the sweep, the
+    /// drain, or a sibling fault): the page is no longer
     /// missing but the vCPU was still queued, so we have to tell
     /// the kernel explicitly.
     fn wake_page(&self, page_aligned: u64, page_size: u64) -> Result<(), HandlerError> {
@@ -4414,7 +4323,11 @@ mod tests {
         let fault = std::thread::spawn(move || fault_rt.serve_pagefault(base));
         barrier.wait();
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         barrier.wait();
         fault.join().unwrap().unwrap();
@@ -4479,7 +4392,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(rt
-            .install_prepared_peer_page(4096, Some(Bytes::from(vec![0x5A; 4096])))
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0x5A; 4096]))),
+                Installer::Peer,
+            )
             .unwrap());
         rt.clear_request(1);
         let stats = drain.join().unwrap().unwrap();
@@ -4530,7 +4447,11 @@ mod tests {
             .unwrap()
             .set_peer(Arc::new(peer), None);
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         let base = rt.mappings[0].base_host_virt_addr;
         let fault_rt = rt.clone();
@@ -4668,7 +4589,11 @@ mod tests {
             .unwrap();
         pending_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(rt
-            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .install(
+                4096,
+                Fill::Private(Payload::Bytes(Bytes::from(vec![0xCD; 4096]))),
+                Installer::Sweep,
+            )
             .unwrap());
         assert_eq!(rt.sealed_uninstalled_count(&peer), 0);
         assert!(!rt.is_drain_done());

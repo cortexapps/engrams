@@ -10,9 +10,8 @@
 //!   there (written-over state) — fetch + `UFFDIO_COPY`; or
 //! - the **canonical** chunk at that offset (the common case for a
 //!   freshly-resumed session, where the session agrees with the base)
-//!   — the runtime resolves its hash via
-//!   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
-//!   (shared via base-shm `UFFDIO_CONTINUE`, else fetch + COPY); or
+//!   — installed shared via base-shm `UFFDIO_CONTINUE`, else fetch +
+//!   COPY; or
 //! - a **zero page** (`UFFDIO_ZEROPAGE`) when the session manifest
 //!   omits the offset — the capture is full + zero-omitted, so an
 //!   omission means the guest zeroed it (never served as base bytes).
@@ -62,9 +61,8 @@ use engram_core::traits::BlobStorage;
 /// - `Chunk` — the session manifest's own hash here (diverged /
 ///   written-over state); fetch + `UFFDIO_COPY`.
 /// - `Canonical` — the session agrees with the base image here; the
-///   runtime resolves the canonical hash via
-///   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
-///   (shared via the base-shm `UFFDIO_CONTINUE`, else fetch + COPY).
+///   runtime installs the base's chunk (shared via the base-shm
+///   `UFFDIO_CONTINUE`, else fetch + COPY).
 ///   For a base snapshot (session == canonical) every non-zero page
 ///   resolves to `Canonical`.
 /// - `Zero` — the session omits this offset. The session manifest is
@@ -74,10 +72,9 @@ use engram_core::traits::BlobStorage;
 ///   zeroed must NOT be served as stale base content.
 #[derive(Clone, Debug)]
 pub enum ResolvedPage {
-    /// Session agrees with the base image at this chunk-aligned byte
-    /// offset. The runtime looks up the canonical chunk hash here and
-    /// installs it (shared base-shm CONTINUE, else fetch + COPY).
-    Canonical { canonical_offset: u64 },
+    /// Session agrees with the base image here: `hash` is the chunk
+    /// both manifests name.
+    Canonical { hash: ChunkHash },
     /// Page diverges from canonical. The named chunk is what to
     /// fetch and copy into the guest, via
     /// [`ChunkedMemoryBackend::fetch_chunk`].
@@ -86,7 +83,7 @@ pub enum ResolvedPage {
     /// the session capture is full + zero-omitted (see `file.rs`'s
     /// sparse capture), an omission is an authoritative "all zero
     /// here" — install `UFFDIO_ZEROPAGE`, never base content.
-    Zero { offset: u64 },
+    Zero,
 }
 
 /// In-memory shape of the canonical + session manifests. We pre-
@@ -437,10 +434,8 @@ impl ChunkedMemoryBackend {
         self.canonical.total_bytes
     }
 
-    /// Resolve the chunk-aligned region containing `byte_offset`
-    /// into either "matches canonical here" (runtime resolves the
-    /// canonical hash / zero-fills) or "fetch this session-divergent
-    /// chunk." Pure data-plane; no I/O.
+    /// Resolve the chunk-aligned region containing `byte_offset`.
+    /// Pure data-plane; no I/O.
     ///
     /// Returns `None` when the offset is past `total_bytes`. The
     /// runtime treats that as a programming bug — FC's mappings
@@ -450,15 +445,12 @@ impl ChunkedMemoryBackend {
             return None;
         }
         let chunk_idx = (byte_offset / self.canonical.chunk_size) as usize;
-        let chunk_offset = (chunk_idx as u64) * self.canonical.chunk_size;
         let canon = self.canonical.chunks.get(chunk_idx).copied().flatten();
         let session = self.session.chunks.get(chunk_idx).copied().flatten();
         Some(match (canon, session) {
             // Session agrees with the base here → share the canonical
             // page (base-shm CONTINUE / fetch + COPY).
-            (Some(c), Some(s)) if c == s => ResolvedPage::Canonical {
-                canonical_offset: chunk_offset,
-            },
+            (Some(c), Some(s)) if c == s => ResolvedPage::Canonical { hash: c },
             // Session has its own hash here — diverged / written-over
             // state. Use it regardless of what the base holds.
             (_, Some(s)) => ResolvedPage::Chunk { hash: s },
@@ -467,19 +459,8 @@ impl ChunkedMemoryBackend {
             // zeroed this chunk" — install a zero page regardless of
             // the base. Serving canonical content here when the base
             // is non-zero would silently un-zero guest RAM on resume.
-            (_, None) => ResolvedPage::Zero {
-                offset: chunk_offset,
-            },
+            (_, None) => ResolvedPage::Zero,
         })
-    }
-
-    /// The canonical chunk hash at a chunk-aligned byte offset.
-    pub fn canonical_chunk_hash(&self, byte_offset: u64) -> Option<ChunkHash> {
-        if byte_offset >= self.canonical.total_bytes {
-            return None;
-        }
-        let chunk_idx = (byte_offset / self.canonical.chunk_size) as usize;
-        self.canonical.chunks.get(chunk_idx).copied().flatten()
     }
 
     /// The bytes of one chunk, from the first tier that has it:
@@ -558,7 +539,7 @@ impl ChunkedMemoryBackend {
                         c.divergent_local += 1;
                     }
                 }
-                Some(ResolvedPage::Zero { .. }) => c.zero += 1,
+                Some(ResolvedPage::Zero) => c.zero += 1,
                 None => {}
             }
         }
@@ -874,25 +855,19 @@ mod tests {
     }
 
     #[test]
-    fn resolves_canonical_match_to_canonical_offset() {
-        // Both canonical and session agree on chunk 0. The
-        // resolver returns `Canonical { canonical_offset: 0 }`
-        // — runtime fetches the canonical chunk hash at that offset.
+    fn resolves_canonical_match_to_the_canonical_hash() {
+        // Both canonical and session agree on chunks 0 and 1.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         assert!(matches!(
             b.resolve(0),
-            Some(ResolvedPage::Canonical {
-                canonical_offset: 0
-            })
+            Some(ResolvedPage::Canonical { hash }) if hash == h(1)
         ));
         assert!(matches!(
             b.resolve(512),
-            Some(ResolvedPage::Canonical {
-                canonical_offset: 512
-            })
+            Some(ResolvedPage::Canonical { hash }) if hash == h(2)
         ));
     }
 
@@ -922,8 +897,8 @@ mod tests {
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         let r = b.resolve(600).unwrap();
         match r {
-            ResolvedPage::Canonical { canonical_offset } => assert_eq!(canonical_offset, 512),
-            other => panic!("expected Canonical(512), got {other:?}"),
+            ResolvedPage::Canonical { hash } => assert_eq!(hash, h(2)),
+            other => panic!("expected Canonical(h(2)), got {other:?}"),
         }
     }
 
@@ -936,10 +911,7 @@ mod tests {
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
-        assert!(matches!(
-            b.resolve(512),
-            Some(ResolvedPage::Zero { offset: 512 })
-        ));
+        assert!(matches!(b.resolve(512), Some(ResolvedPage::Zero)));
     }
 
     #[test]
@@ -954,9 +926,9 @@ mod tests {
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         match b.resolve(512) {
-            Some(ResolvedPage::Zero { offset }) => assert_eq!(offset, 512),
+            Some(ResolvedPage::Zero) => {}
             other => {
-                panic!("expected Zero(512) for a session-zeroed base-nonzero chunk, got {other:?}")
+                panic!("expected Zero for a session-zeroed base-nonzero chunk, got {other:?}")
             }
         }
     }
