@@ -162,6 +162,7 @@ impl SubstrateServer {
                                 return Ok(());
                             }
                         },
+                        // A handler an older host-agent started; #1772.
                         PROTO_VERSION_V1 => None,
                         other => {
                             let msg = format!(

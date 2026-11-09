@@ -83,7 +83,7 @@ impl ItemAssembler {
         }
         self.item = None;
         let bytes = std::mem::take(&mut self.bytes);
-        // A source of the previous release sends no hash.
+        // A source of the previous release sends no hash; #1772.
         if let Some(want) = frame.item_hash {
             if engram_migrate_proto::wire_hash(&bytes) != want {
                 return Err(SandboxError::Snapshot(format!(

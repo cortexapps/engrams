@@ -10,7 +10,7 @@
 //! connection's shared-memory slot) or, against a writer that refuses
 //! version 2, version 1 (the chunk arrives as an fd). After a refusal the
 //! client dials version 1 until a connection breaks (the writer rolled);
-//! the next dial asks for version 2 again.
+//! the next dial asks for version 2 again. #1772 removes version 1.
 //!
 //! [`PopulateClient::hello`] fills the pool with one connection per fault
 //! thread, so the first faults do not wait for a dial.

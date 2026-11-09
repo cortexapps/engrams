@@ -26,7 +26,7 @@
 //! a reply and its next request on that connection.
 //!
 //! Version 1 (served for one release, for handlers started by an older
-//! host-agent; such handlers outlive a host-agent roll):
+//! host-agent; such handlers outlive a host-agent roll; #1772 removes it):
 //!
 //! ```text
 //!   handler ──[ Hello { proto_version: 1, .. } ]──► writer   (optional)

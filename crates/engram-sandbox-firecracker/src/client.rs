@@ -233,7 +233,8 @@ impl FirecrackerClient {
     /// the pause and the caller must sync them before it relies on them
     /// across a host crash. A Firecracker that does not know the field
     /// rejects the body before it captures anything; the create then runs
-    /// again without it, so the files come back synced.
+    /// again without it, so the files come back synced. #1772 removes the
+    /// retry.
     pub async fn create_snapshot_at(
         &self,
         state_path: PathBuf,
