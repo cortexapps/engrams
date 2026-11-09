@@ -168,6 +168,13 @@ impl PreparedManagedFc {
             .store(true, std::sync::atomic::Ordering::Release);
         self.inner.failed = true;
         let vsock = self.inner.files.path.join("guest.vsock");
+        // Drain the cold-boot hint before agentd starts serving RPCs. This
+        // listener has no authority over the private network's release state.
+        let _agent_ready = crate::FirecrackerBackend::spawn_agent_ready_listener(
+            self.inner.receipt.prepared.request.sandbox_id,
+            &vsock,
+        )
+        .await?;
         let listener = tokio::net::UnixListener::bind(crate::harness_uds_for(&vsock))?;
         self.inner.streams.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -522,6 +529,50 @@ async fn wait_for_stop(stream: &tokio::net::UnixStream) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cold_boot_ready_hint_is_drained_and_pending_listener_is_owned() {
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        let vsock = sockets.path().join("guest.vsock");
+        let id = engram_core::SandboxId::new();
+        let readiness = crate::FirecrackerBackend::spawn_agent_ready_listener(id, &vsock)
+            .await
+            .unwrap();
+        let ready_path = crate::per_port_uds(&vsock, engram_agentd::ENGRAM_AGENTD_READY_PORT);
+        // A guest can close an early connection before it writes its frame.
+        drop(tokio::net::UnixStream::connect(&ready_path).await.unwrap());
+        let mut guest = tokio::net::UnixStream::connect(&ready_path).await.unwrap();
+        engram_agentd::write_msg(
+            &mut guest,
+            &engram_agentd::AgentReady {
+                agent_version: "fixture".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut receiver = readiness.receiver.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.wait_for(|v| *v))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(readiness);
+
+        let pending = crate::FirecrackerBackend::spawn_agent_ready_listener(
+            id,
+            &sockets.path().join("pending.vsock"),
+        )
+        .await
+        .unwrap();
+        let listener = pending.listener.as_ref().unwrap().abort_handle();
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !listener.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the owner must stop the ready listener");
+    }
+
     #[tokio::test]
     async fn proxy_shutdown_and_unexpected_data_stop_preparation_before_copy_completes() {
         use tokio::io::AsyncWriteExt;
