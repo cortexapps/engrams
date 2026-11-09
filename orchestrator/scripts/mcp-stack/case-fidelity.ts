@@ -14,6 +14,8 @@ import type { Harness } from "./manifest.ts";
 import { bindingTools } from "./bootstrap.ts";
 import { DatabaseObserver, FixtureObserver } from "./observer.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   closeScenario,
   delivered,
   execution,
@@ -140,8 +142,12 @@ export async function catalogFidelity(
             fixtureBeforeHash: sha256(canonicalJson(before)),
             fixtureAfterHash: sha256(canonicalJson(after)),
           });
+        } catch (error) {
+          throw caseBodyFailure(error);
         } finally {
-          await closeScenario(principals, scenario);
+          await completeCaseCleanup(async () => {
+            await closeScenario(principals, scenario);
+          });
         }
       }
   }

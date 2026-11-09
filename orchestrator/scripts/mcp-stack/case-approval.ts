@@ -3,6 +3,8 @@ import { canonicalJson, expectedCounterNative } from "./guest.ts";
 import type { Harness } from "./manifest.ts";
 import { DatabaseObserver, FixtureObserver } from "./observer.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   approveOnce,
   closeScenario,
   delivered,
@@ -85,8 +87,12 @@ export async function interactiveApproval(
         beforeHash: sha256(canonicalJson(before)),
         afterHash: sha256(canonicalJson(after)),
       });
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      await closeScenario(principals, scenario);
+      await completeCaseCleanup(async () => {
+        await closeScenario(principals, scenario);
+      });
     }
   }
   requireThat(observations.length === 2, "owner_and_admin_approvals");

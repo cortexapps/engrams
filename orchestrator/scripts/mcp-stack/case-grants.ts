@@ -21,6 +21,8 @@ import {
 } from "./driver.ts";
 import { canonicalJson, releaseGuestBarrier } from "./guest.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   approveOnce,
   closeScenario,
   execution,
@@ -488,8 +490,12 @@ export const unattendedGrantDriver: CaseDriver = async (input) => {
           ),
         });
       }
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      await closeScenario(principals, scenario);
+      await completeCaseCleanup(async () => {
+        await closeScenario(principals, scenario);
+      });
     }
   }
   return completeAssertions("unattended-grant", assertions);
@@ -578,8 +584,12 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
     noEffects.push(
       ...observations.filter((value) => value.source === "fixture-observer"),
     );
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await closeScenario(principals, missing);
+    await completeCaseCleanup(async () => {
+      await closeScenario(principals, missing);
+    });
   }
   const revoked = await startScenario(ctx, principals, database, {
     harness,
@@ -618,8 +628,12 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
     noEffects.push(
       ...observations.filter((value) => value.source === "fixture-observer"),
     );
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await closeScenario(principals, revoked);
+    await completeCaseCleanup(async () => {
+      await closeScenario(principals, revoked);
+    });
   }
   const forged = await startScenario(ctx, principals, database, {
     harness,
@@ -794,8 +808,12 @@ export const grantDenialsDriver: CaseDriver = async (input) => {
         effects,
       ],
     });
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await closeScenario(principals, forged);
+    await completeCaseCleanup(async () => {
+      await closeScenario(principals, forged);
+    });
   }
   assertions.push({ assertion: "no-effect", observations: noEffects });
   return completeAssertions("grant-denials", assertions);
@@ -963,8 +981,12 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
           ),
         ],
       });
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      await closeScenario(principals, scenario);
+      await completeCaseCleanup(async () => {
+        await closeScenario(principals, scenario);
+      });
     }
   }
   let outsideAlias = "";
@@ -1043,11 +1065,14 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
             sessionId: child!.sessionId,
           });
         } catch (error) {
-          if (error instanceof ConnectError && error.code === Code.NotFound) return undefined;
+          if (error instanceof ConnectError && error.code === Code.NotFound)
+            return undefined;
           throw error;
         }
       },
-      (value) => value?.session?.status === "active" && value.session.hostId === ctx.hostId,
+      (value) =>
+        value?.session?.status === "active" &&
+        value.session.hostId === ctx.hostId,
     );
     const started = await waitFor(
       ctx,
@@ -1158,13 +1183,17 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
         ...denied,
       ],
     });
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    try {
-      if (child)
-        await principals.admin.tasks.deleteTask({ taskId: child.taskId });
-    } finally {
-      await closeScenario(principals, parent);
-    }
+    await completeCaseCleanup(async () => {
+      try {
+        if (child)
+          await principals.admin.tasks.deleteTask({ taskId: child.taskId });
+      } finally {
+        await closeScenario(principals, parent);
+      }
+    });
   }
   return completeAssertions("plan-child-intersection", assertions);
 };

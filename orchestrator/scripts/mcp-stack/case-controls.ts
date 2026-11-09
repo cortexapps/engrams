@@ -7,6 +7,8 @@ import {
   type DriverAssertion,
 } from "./driver.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   approveOnce,
   closeScenario,
   execution,
@@ -322,24 +324,28 @@ export const killCancelDriver: CaseDriver = async (input) => {
           ),
         ],
       });
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      try {
-        await scenario.fixture.release();
-        await scenario.fixture.configure({ holdCalls: false });
-      } finally {
+      await completeCaseCleanup(async () => {
         try {
-          if (variantChanged) {
-            await supervisor.restart("orchestrator", "normal");
-            requireThat(publicationBefore, "kill_publication_baseline");
-            assertKillPublication(
-              publicationBefore,
-              await readOperatorPublication(ctx),
-            );
-          }
+          await scenario.fixture.release();
+          await scenario.fixture.configure({ holdCalls: false });
         } finally {
-          await closeScenario(principals, scenario);
+          try {
+            if (variantChanged) {
+              await supervisor.restart("orchestrator", "normal");
+              requireThat(publicationBefore, "kill_publication_baseline");
+              assertKillPublication(
+                publicationBefore,
+                await readOperatorPublication(ctx),
+              );
+            }
+          } finally {
+            await closeScenario(principals, scenario);
+          }
         }
-      }
+      });
     }
   }
   assertions.push(

@@ -23,6 +23,8 @@ import {
 import { FixtureObserver } from "./observer.ts";
 import { recoverCurrentBinding, revokeProfileGrants } from "./rebind.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   closeScenario,
   delivered,
   execution,
@@ -190,10 +192,14 @@ export const credentialNetworkIsolationDriver: CaseDriver = async ({
         ],
       },
     ]);
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await fixture.release();
-    await fixture.configure({ holdCalls: false });
-    await closeScenario(principals, scenario);
+    await completeCaseCleanup(async () => {
+      await fixture.release();
+      await fixture.configure({ holdCalls: false });
+      await closeScenario(principals, scenario);
+    });
   }
 };
 
@@ -380,7 +386,11 @@ export const diskOnlyColdRebindDriver: CaseDriver = async ({
         ],
       },
     ]);
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await closeScenario(principals, scenario);
+    await completeCaseCleanup(async () => {
+      await closeScenario(principals, scenario);
+    });
   }
 };

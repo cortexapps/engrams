@@ -14,6 +14,7 @@ import {
   type DriverInput,
 } from "./driver.ts";
 import { Supervisor } from "./supervisor.ts";
+import { CaseBodyFailure, CaseCleanupFailure } from "./scenario-runtime.ts";
 import { Evidence } from "./evidence.ts";
 import { canonicalJson } from "./guest.ts";
 import { runInfrastructure } from "./infrastructure.ts";
@@ -41,6 +42,8 @@ export function validateDrivers(
   );
 }
 export function safeFailure(error: unknown): RunnerFailure {
+  if (error instanceof CaseBodyFailure || error instanceof CaseCleanupFailure)
+    return safeFailure(error.failure);
   if (
     error instanceof RunnerFailure &&
     /^[A-Za-z0-9_./:-]{1,200}$/.test(error.seam)
@@ -62,17 +65,25 @@ export async function runSelectedCases(
   selection: RunSelection,
   input: Omit<DriverInput, "harness">,
   evidence: Evidence,
+  assertReady = async () => {
+    await preflight(input.ctx, input.database);
+    await publicPrerequisites(input.ctx, input.principals.admin);
+  },
+  deadline = performance.now() + input.ctx.deadlines.totalMs,
 ) {
   validateDrivers(drivers);
-  for (const selected of selectedCases(selection)) {
+  const cases = selectedCases(selection);
+  let firstFailure: RunnerFailure | undefined;
+  for (const [index, selected] of cases.entries()) {
+    let driverReturned = false;
     try {
-      const assertions = completeAssertions(
-        selected.id,
-        await drivers[selected.id]({
-          ...input,
-          harness: selected.harness,
-        }),
-      );
+      const driverAssertions = await drivers[selected.id]({
+        ...input,
+        harness: selected.harness,
+      });
+      driverReturned = true;
+      const assertions = completeAssertions(selected.id, driverAssertions);
+      driverReturned = false;
       const recorded = [];
       for (const assertion of assertions) {
         const observationHashes = [];
@@ -88,6 +99,8 @@ export async function runSelectedCases(
         assertions: recorded,
       });
     } catch (error) {
+      const caseError =
+        error instanceof CaseBodyFailure ? error.failure : error;
       const failure = safeFailure(error);
       await evidence.result({
         key: selected.key,
@@ -95,9 +108,24 @@ export async function runSelectedCases(
         assertions: [],
         seam: failure.seam,
       });
-      throw failure;
+      if (
+        !(error instanceof CaseBodyFailure || driverReturned) ||
+        !(caseError instanceof RunnerFailure) ||
+        failure !== caseError ||
+        failure.code !== "ASSERTION_FAILED" ||
+        // Unclassified diagnostics can hide transport or unexpected errors.
+        failure.seam.endsWith("_unclassified")
+      )
+        throw failure;
+      firstFailure ??= failure;
+      if (index + 1 < cases.length) {
+        requireThat(performance.now() < deadline, "runner_total_deadline");
+        await assertReady();
+        requireThat(performance.now() < deadline, "runner_total_deadline");
+      }
     }
   }
+  if (firstFailure) throw firstFailure;
 }
 
 /** Physical release is checked before infrastructure can permit MCP cases. */
@@ -111,11 +139,12 @@ export async function completeInfrastructure(
   await evidence.infrastructure(rows);
 }
 
-/** A failed or missing case leaves an incomplete artifact and stops the matrix. */
+/** Failed cases leave an incomplete artifact, even when later cases can run. */
 export async function runMatrix(
   ctx: Context,
   drivers: DriverRegistry,
   selection: RunSelection = FULL_MATRIX,
+  deadline = performance.now() + ctx.deadlines.totalMs,
 ) {
   selectedCases(selection);
   validateDrivers(drivers);
@@ -143,6 +172,8 @@ export async function runMatrix(
       selection,
       { ctx, principals, database },
       evidence,
+      undefined,
+      deadline,
     );
     await evidence.finish();
   } finally {
@@ -173,7 +204,12 @@ export async function main(drivers: DriverRegistry, args: readonly string[]) {
     const remaining = ctx.deadlines.totalMs - (performance.now() - begun);
     requireThat(remaining > 0, "runner_context_deadline");
     watchdog = setTimeout(expired, remaining);
-    await runMatrix(ctx, drivers, selected.selection);
+    await runMatrix(
+      ctx,
+      drivers,
+      selected.selection,
+      begun + ctx.deadlines.totalMs,
+    );
     process.stdout.write(
       JSON.stringify({
         status: "PASS",

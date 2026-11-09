@@ -35,6 +35,7 @@ import { StatusSchema } from "./supervisor.ts";
 import { Evidence } from "./evidence.ts";
 import { requirePrerequisites } from "./preflight.ts";
 import { safeFailure, validateDrivers } from "./runner.ts";
+import { caseBodyFailure, completeCaseCleanup } from "./scenario-runtime.ts";
 import { drivers } from "./run.ts";
 import {
   isProofFilename,
@@ -660,9 +661,8 @@ test("native barrier and absent denial records cannot masquerade as result recei
 });
 
 test("grant replacement preserves public profile state and exact publication CAS", async () => {
-  const { ProfileSchema, UpdateProfileRequestSchema } = await import(
-    "../../src/gen/engram/app/v1/profile_pb.ts"
-  );
+  const { ProfileSchema, UpdateProfileRequestSchema } =
+    await import("../../src/gen/engram/app/v1/profile_pb.ts");
   const { grantUpdateRequest } = await import("./rebind.ts");
   const profile = create(ProfileSchema, {
     id: "profile-1",
@@ -1808,7 +1808,7 @@ test("observer accepts the production automation task id and retains ownership g
   }
 });
 
-test("selected dispatcher executes only canonical selected cases and preserves assertion failures", async () => {
+test("selected dispatcher collects cleaned case failures and stops on unsafe failures", async () => {
   const { runSelectedCases } = await import("./runner.ts");
   const { DatabaseObserver } = await import("./observer.ts");
   const { SCENARIOS } = await import("./manifest.ts");
@@ -1853,25 +1853,66 @@ test("selected dispatcher executes only canonical selected cases and preserves a
   };
   const input = { ctx, database, principals };
   const calls: string[] = [];
-  let incomplete = false;
+  let mode = "pass";
+  const events: string[] = [];
   const registry: Record<string, unknown> = Object.fromEntries(
     SCENARIOS.map((s) => [
       s.id,
       async ({ harness }: { harness: string }) => {
         calls.push(`${harness}/${s.id}`);
-        return incomplete
-          ? []
-          : s.assertions.map((assertion) => ({
-              assertion,
-              observations: [
-                {
-                  source: "guest-proof",
-                  identitySha256: h,
-                  state: "succeeded",
-                  contentSha256: h,
-                },
-              ],
-            }));
+        if (harness === "claude" && mode === "setup")
+          throw new RunnerFailure("ASSERTION_FAILED", "setup_failed");
+        try {
+          if (
+            (harness === "claude" && ["body", "body-cleanup"].includes(mode)) ||
+            mode === "both-body"
+          )
+            throw new RunnerFailure(
+              "ASSERTION_FAILED",
+              `${harness}_case_assertion`,
+            );
+          if (harness === "claude" && mode === "nested-cleanup")
+            await completeCaseCleanup(async () => {
+              throw new RunnerFailure(
+                "ASSERTION_FAILED",
+                "nested_cleanup_failed",
+              );
+            });
+          if (harness === "claude" && mode === "transport")
+            throw new RunnerFailure("TRANSPORT_FAILED", "https_request");
+          if (harness === "claude" && mode === "unexpected")
+            throw new Error("private-error");
+          if (harness === "claude" && mode === "unclassified")
+            throw new RunnerFailure(
+              "ASSERTION_FAILED",
+              "oauth_account_recovery_prepare_phase_unavailable_unclassified",
+            );
+          if (harness === "claude" && mode === "unsafe-seam")
+            throw new RunnerFailure("ASSERTION_FAILED", "private error text");
+          if (mode === "incomplete") return [];
+          return s.assertions.map((assertion) => ({
+            assertion,
+            observations: [
+              {
+                source: "guest-proof",
+                identitySha256: h,
+                state: "succeeded",
+                contentSha256: h,
+              },
+            ],
+          }));
+        } catch (error) {
+          throw caseBodyFailure(error);
+        } finally {
+          await completeCaseCleanup(async () => {
+            events.push(`cleanup:${harness}`);
+            if (
+              harness === "claude" &&
+              ["cleanup", "body-cleanup"].includes(mode)
+            )
+              throw new RunnerFailure("ASSERTION_FAILED", "cleanup_failed");
+          });
+        }
       },
     ]),
   );
@@ -1895,17 +1936,23 @@ test("selected dispatcher executes only canonical selected cases and preserves a
   }
   ctx.evidenceFile = join(root, "selected-failure.jsonl");
   const failed = await Evidence.create(ctx, selection);
-  incomplete = true;
+  mode = "incomplete";
   calls.length = 0;
+  events.length = 0;
   try {
     await expect(
-      runSelectedCases(registry, selection, input, failed),
+      runSelectedCases(registry, selection, input, failed, async () => {
+        events.push("ready");
+      }),
     ).rejects.toThrow("driver_subassertions_complete");
-    expect(calls).toEqual(["claude/catalog-fidelity"]);
+    expect(calls).toEqual([
+      "claude/catalog-fidelity",
+      "codex/catalog-fidelity",
+    ]);
+    expect(events).toEqual(["cleanup:claude", "ready", "cleanup:codex"]);
     await expect(failed.finish()).rejects.toThrow("selected_cases_incomplete");
   } finally {
     await failed.close();
-    await database.close();
   }
   const records = (await readFile(ctx.evidenceFile, "utf8"))
     .trim()
@@ -1913,16 +1960,145 @@ test("selected dispatcher executes only canonical selected cases and preserves a
     .map((line) => JSON.parse(line));
   expect(records.at(-1)).toMatchObject({
     kind: "case",
-    key: "claude/catalog-fidelity",
+    key: "codex/catalog-fidelity",
     status: "FAIL",
     seam: "driver_subassertions_complete",
   });
+  expect(records.filter((record) => record.kind === "case")).toHaveLength(2);
   expect(
     records.some(
       (record) =>
         record.kind === "complete" || record.kind === "stage-complete",
     ),
   ).toBe(false);
+  try {
+    for (const variant of [
+      { mode: "body", seam: "claude_case_assertion", calls: 2, ready: true },
+      {
+        mode: "both-body",
+        seam: "claude_case_assertion",
+        calls: 2,
+        ready: true,
+      },
+      { mode: "cleanup", seam: "cleanup_failed", calls: 1, ready: false },
+      { mode: "body-cleanup", seam: "cleanup_failed", calls: 1, ready: false },
+      {
+        mode: "nested-cleanup",
+        seam: "nested_cleanup_failed",
+        calls: 1,
+        ready: false,
+      },
+      { mode: "setup", seam: "setup_failed", calls: 1, ready: false },
+      { mode: "transport", seam: "https_request", calls: 1, ready: false },
+      {
+        mode: "unclassified",
+        seam: "oauth_account_recovery_prepare_phase_unavailable_unclassified",
+        calls: 1,
+        ready: false,
+      },
+      {
+        mode: "unsafe-seam",
+        seam: "unexpected_runner_error",
+        calls: 1,
+        ready: false,
+      },
+      {
+        mode: "unexpected",
+        seam: "unexpected_runner_error",
+        calls: 1,
+        ready: false,
+      },
+      {
+        mode: "body",
+        seam: "infrastructure_unhealthy",
+        calls: 1,
+        ready: true,
+        unhealthy: true,
+      },
+      {
+        mode: "body",
+        seam: "runner_total_deadline",
+        calls: 1,
+        ready: false,
+        expired: true,
+      },
+      {
+        mode: "body",
+        seam: "runner_total_deadline",
+        calls: 1,
+        ready: true,
+        expiresDuringHealth: true,
+      },
+    ]) {
+      mode = variant.mode;
+      calls.length = 0;
+      events.length = 0;
+      ctx.evidenceFile = join(
+        root,
+        `selected-${variant.mode}-${variant.seam}.jsonl`,
+      );
+      // Deadline cases use distinct files without changing the run identity.
+      if (variant.expiresDuringHealth) ctx.evidenceFile += ".during-health";
+      const output = await Evidence.create(ctx, selection);
+      let ready = false;
+      try {
+        const deadline = variant.expired
+          ? performance.now() - 1
+          : performance.now() +
+            (variant.expiresDuringHealth ? 500 : ctx.deadlines.totalMs);
+        await expect(
+          runSelectedCases(
+            registry,
+            selection,
+            input,
+            output,
+            async () => {
+              ready = true;
+              events.push("ready");
+              if (variant.unhealthy)
+                throw new RunnerFailure(
+                  "ASSERTION_FAILED",
+                  "infrastructure_unhealthy",
+                );
+              if (variant.expiresDuringHealth)
+                await new Promise((resolve) => setTimeout(resolve, 510));
+            },
+            deadline,
+          ),
+        ).rejects.toThrow(variant.seam);
+        expect(calls).toHaveLength(variant.calls);
+        expect(ready).toBe(variant.ready);
+        if (variant.calls === 2)
+          expect(events).toEqual(["cleanup:claude", "ready", "cleanup:codex"]);
+        await expect(output.finish()).rejects.toThrow();
+      } finally {
+        await output.close();
+      }
+      const rows = (await readFile(ctx.evidenceFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(rows.filter((row) => row.kind === "case")).toHaveLength(
+        variant.calls,
+      );
+      expect(rows.find((row) => row.kind === "case")).toMatchObject({
+        key: "claude/catalog-fidelity",
+        status: "FAIL",
+      });
+      if (variant.calls === 2)
+        expect(rows.at(-1)).toMatchObject({
+          key: "codex/catalog-fidelity",
+          status: variant.mode === "both-body" ? "FAIL" : "PASS",
+        });
+      expect(
+        rows.some(
+          (row) => row.kind === "complete" || row.kind === "stage-complete",
+        ),
+      ).toBe(false);
+    }
+  } finally {
+    await database.close();
+  }
 });
 
 // Run the generated guest shell against a private proc tree, with no live guest.

@@ -10,6 +10,8 @@ import {
 import { FixtureObserver } from "./observer.ts";
 import { recoverCurrentBinding } from "./rebind.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   closeScenario,
   execution,
   pollProof,
@@ -616,17 +618,23 @@ export const oauthAuthorityDriver: CaseDriver = async ({
         planSha256: scenario.planSha256,
       });
       return completeAssertions("oauth-authority", assertions);
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      await closeScenario(principals, scenario);
+      await completeCaseCleanup(async () => {
+        await closeScenario(principals, scenario);
+      });
     }
   } finally {
-    await fixture.release();
-    await fixture.configure({ holdCalls: false });
-    await fixture.oauth({
-      account: "account-one",
-      scope: "tools:read",
-      issuer: "configured",
-      expiresInSeconds: 3600,
+    await completeCaseCleanup(async () => {
+      await fixture.release();
+      await fixture.configure({ holdCalls: false });
+      await fixture.oauth({
+        account: "account-one",
+        scope: "tools:read",
+        issuer: "configured",
+        expiresInSeconds: 3600,
+      });
     });
   }
 };

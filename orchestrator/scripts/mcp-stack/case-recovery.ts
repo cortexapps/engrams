@@ -15,6 +15,8 @@ import {
 import { FixtureObserver } from "./observer.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
+  caseBodyFailure,
+  completeCaseCleanup,
   delivered,
   pollGuestObservation,
   pollProof,
@@ -381,10 +383,14 @@ export const heldWriteRestartDriver: CaseDriver = async ({
         ],
       },
     ]);
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await fixture.release();
-    await fixture.configure({ holdCalls: false });
-    await closeScenario(principals, scenario);
+    await completeCaseCleanup(async () => {
+      await fixture.release();
+      await fixture.configure({ holdCalls: false });
+      await closeScenario(principals, scenario);
+    });
   }
 };
 
@@ -601,8 +607,12 @@ export const outboxGuestAckDriver: CaseDriver = async ({
       (observed["no-provider-replay"] ??= []).push(
         observation("fixture-observer", "succeeded", { before, after }),
       );
+    } catch (error) {
+      throw caseBodyFailure(error);
     } finally {
-      await closeScenario(principals, scenario);
+      await completeCaseCleanup(async () => {
+        await closeScenario(principals, scenario);
+      });
     }
   }
   return completeAssertions(
@@ -844,7 +854,11 @@ export const revokeResumeDriver: CaseDriver = async ({
         ],
       },
     ]);
+  } catch (error) {
+    throw caseBodyFailure(error);
   } finally {
-    await closeScenario(principals, scenario);
+    await completeCaseCleanup(async () => {
+      await closeScenario(principals, scenario);
+    });
   }
 };

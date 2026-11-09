@@ -32,6 +32,30 @@ import {
 import type { CallPlan } from "./call-plan.ts";
 import type { PublicClient } from "./transport.ts";
 
+/** A body error can escape its finally block only after successful cleanup. */
+export class CaseBodyFailure extends Error {
+  constructor(readonly failure: unknown) {
+    super("case_body_failed");
+  }
+}
+export class CaseCleanupFailure extends Error {
+  constructor(readonly failure: unknown) {
+    super("case_cleanup_failed");
+  }
+}
+export function caseBodyFailure(error: unknown) {
+  return error instanceof CaseBodyFailure || error instanceof CaseCleanupFailure
+    ? error
+    : new CaseBodyFailure(error);
+}
+export async function completeCaseCleanup(cleanup: () => Promise<void>) {
+  try {
+    await cleanup();
+  } catch (error) {
+    throw new CaseCleanupFailure(error);
+  }
+}
+
 export type Principals = Awaited<ReturnType<typeof bootstrapHumans>>;
 export type StartedScenario = Awaited<ReturnType<typeof startScenario>>;
 export async function startScenario(
