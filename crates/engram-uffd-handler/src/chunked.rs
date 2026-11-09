@@ -48,7 +48,6 @@
 //! - The UFFD event loop + the actual `UFFDIO_COPY`/`UFFDIO_ZEROPAGE`
 //!   (incl. the full-chunk-per-fault install policy). That's in
 //!   `runtime.rs` and consumes this backend.
-//! - Working-set trace recording. That's in `working_set.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -474,11 +473,7 @@ impl ChunkedMemoryBackend {
         })
     }
 
-    /// ADR 0014 M1.14: return the canonical chunk hash at a given
-    /// chunk-aligned byte offset. The working-set recorder uses this
-    /// to observe canonical-resolved faults too — without it, the
-    /// bake-time profile pass produces an empty trace because a
-    /// freshly-canonical snapshot has zero divergence chunks.
+    /// The canonical chunk hash at a chunk-aligned byte offset.
     pub fn canonical_chunk_hash(&self, byte_offset: u64) -> Option<ChunkHash> {
         if byte_offset >= self.canonical.total_bytes {
             return None;
@@ -571,12 +566,11 @@ impl ChunkedMemoryBackend {
     }
 
     /// Chunk-start byte offsets where the session manifest holds
-    /// `hash`. Used by the working-set replay path: a trace entry
-    /// names a chunk hash, the runtime asks "where does the session
-    /// place this chunk?" and pre-installs it at each position.
+    /// `hash`. The drain orders a hot-set hint (chunk hashes) by these
+    /// positions.
     ///
     /// Built once at load, so ordering a large hot set is linear in the
-    /// number of returned positions instead of trace length times RAM size.
+    /// number of returned positions instead of hint length times RAM size.
     pub fn session_positions_of(&self, hash: ChunkHash) -> Vec<u64> {
         self.session_positions
             .get(&hash)
@@ -607,7 +601,6 @@ mod fallback_tests {
             total_bytes,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -767,7 +760,6 @@ mod tests {
                 .map(|(offset, hash)| ChunkRef { offset, hash })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }

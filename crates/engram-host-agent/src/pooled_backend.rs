@@ -251,7 +251,6 @@ mod first_touch_tests {
             total_bytes: 4 * CHUNK,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mref = engram_core::types::manifest::ManifestRef::new();
@@ -1110,12 +1109,19 @@ fn spawn_leg_keepalive(
 /// Publish the optional hint without changing the required disk seal.
 #[cfg(any(target_os = "linux", test))]
 fn publish_hot_hint(dir: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
-    let tmp = dir.join("hot-hint.json.tmp");
+    write_hot_hint(&dir.join("hot-hint.json"), hot)
+}
+
+/// Atomically write a hot-set hint, `{"hot_chunks": [...]}`: the source's
+/// `hot-hint.json`, and the copy the destination stages for its handler
+/// after state.bin has opened the load gate.
+fn write_hot_hint(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
     std::fs::write(
         &tmp,
         serde_json::to_vec(&serde_json::json!({"hot_chunks": hot}))?,
     )?;
-    std::fs::rename(tmp, dir.join("hot-hint.json"))
+    std::fs::rename(tmp, path)
 }
 
 /// Parse the optional hint independently of the required disk seal.
@@ -1134,19 +1140,6 @@ fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
             Some(Vec::new())
         }
     }
-}
-
-/// Atomically stage an advisory hint after state.bin has opened the load gate.
-fn stage_hot_trace(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
-    let mut trace =
-        engram_chunk_store::working_set::WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
-    trace.chunks = hot
-        .iter()
-        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
-        .collect();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&trace)?)?;
-    std::fs::rename(tmp, path)
 }
 
 impl PooledBackend {
@@ -1177,7 +1170,7 @@ impl PooledBackend {
             precopy,
             sidecar_json: sidecar_json.clone(),
             idle_marked: false,
-            hot_chunks: self.read_hot_chunks(id),
+            hot_chunks: self.read_hot_chunks(id, chain_manifest),
             dest: Arc::default(),
         };
         self.pending_presetups.insert(id, pending.clone());
@@ -2432,7 +2425,7 @@ impl PooledBackend {
         let (capture_guard, cap) = self
             .capture_phase(id, CaptureUser::DeferredSnapshot)
             .await?;
-        self.spawn_trace_publish(id);
+        self.spawn_first_touch_publish(id);
         // The cold-base seed's multi-GiB upload: no session waits for it.
         let finisher = self.finisher_with_class(Class::Background);
         Ok(DeferredSnapshot {
@@ -2565,34 +2558,15 @@ impl PooledBackend {
         }
     }
 
-    /// Publish this sandbox's per-jail working-set trace to the blob store
-    /// under the session-stable **canonical** key, so the session's NEXT
-    /// resume finds it and prefaults its working set (the replay side landed
-    /// with the Tier 2 `--trace-key` fix in #517).
-    ///
-    /// Why the host-agent publishes it (not the handler): the `engram-uffd-
-    /// handler` only `put_trace`s on a clean fault-loop exit, but eviction
-    /// **SIGKILLs** the handler (`engram-sandbox-firecracker` `destroy`,
-    /// ADR 0044 K2 — no `kill_on_drop`) before that runs, so in prod NO trace
-    /// was ever published and prefault-on-resume was inert regardless of the
-    /// key. The handler *does* write the per-jail `working-set-trace.json`
-    /// periodically (the ADR 0045 C2 migration rider dump); we lift that
-    /// same file into the blob store at capture time, when the handler is
-    /// still alive and the file is present.
-    ///
-    /// **Detached + best-effort:** spawned off the (latency-critical, ADR
-    /// 0045 D5) capture path so a GCS `put_trace` never blocks the
-    /// user-visible eviction. A no bound session / no chunk store / absent /
-    /// empty / corrupt trace is a silent no-op — the handler's on-demand
-    /// fault path is the backstop. Idempotent: re-publishing the same
-    /// canonical key is a harmless overwrite (a session runs one place at a
-    /// time, so there are no concurrent writers).
-    fn spawn_trace_publish(&self, id: SandboxId) {
+    /// Publish this sandbox's first-touch record for the session's next
+    /// restore (the handler is SIGKILLed on destroy, so it cannot publish
+    /// on exit). Detached and best-effort: it never blocks the capture.
+    fn spawn_first_touch_publish(&self, id: SandboxId) {
         let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
-            return; // no bound session → no canonical key to publish under
+            return;
         };
-        let Some(trace_path) = self.working_set_trace_path(id) else {
-            return; // backend has no per-jail trace (VZ / process)
+        let Some(file) = self.first_touch_path(id) else {
+            return; // VZ / process: no handler
         };
         let Some(chunk_store) = self.chunk_store.clone() else {
             return;
@@ -2601,45 +2575,8 @@ impl PooledBackend {
             Some(FirstRun::Completed { at_ms }) => Some(*at_ms),
             _ => None,
         };
-        if let Some(dir) = trace_path.parent() {
-            let file = dir.join(engram_chunk_store::FirstTouch::FILE);
-            let store = chunk_store.clone();
-            tokio::spawn(async move {
-                publish_first_touch(&store, session_id, &file, first_run_completed).await;
-            });
-        }
         tokio::spawn(async move {
-            let bytes = match tokio::fs::read(&trace_path).await {
-                Ok(b) => b,
-                Err(_) => return, // handler never wrote it / already torn down
-            };
-            let trace: engram_chunk_store::working_set::WorkingSetTrace =
-                match serde_json::from_slice(&bytes) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::debug!(sandbox_id = %id, error = %e, "working-set trace parse failed; not published");
-                        return;
-                    }
-                };
-            if trace.chunks.is_empty() {
-                return; // nothing to prefault — don't publish an empty trace
-            }
-            let n = trace.chunks.len();
-            let trace_ref =
-                engram_chunk_store::working_set::TraceRef::canonical(session_id.as_uuid());
-            match chunk_store.put_trace(trace_ref, &trace).await {
-                Ok(()) => tracing::info!(
-                    sandbox_id = %id,
-                    session_id = %session_id,
-                    chunks = n,
-                    "published session working-set trace (resume prefault)",
-                ),
-                Err(e) => tracing::warn!(
-                    sandbox_id = %id,
-                    error = %e,
-                    "publish session working-set trace failed (best-effort)",
-                ),
-            }
+            publish_first_touch(&chunk_store, session_id, &file, first_run_completed).await;
         });
     }
 
@@ -2907,24 +2844,30 @@ impl PooledBackend {
         ))
     }
 
-    /// ADR 0045 C2 (E2B fold): read the sandbox's per-jail working-set
-    /// trace (fault-order hot set) for the migration rider. Best-effort
-    /// by design: an absent/corrupt file (handler predates the dump,
-    /// guest never faulted, bake-profile override) returns empty.
-    fn read_hot_chunks(&self, id: SandboxId) -> Vec<[u8; 32]> {
-        let Some(path) = self.inner.working_set_trace_path(id) else {
+    /// ADR 0045 C2 (E2B fold): the migration rider — the chunks the guest
+    /// touched first, from the handler's first-touch record, as hashes of
+    /// the `chain` manifest. Best-effort: an absent or torn record (no
+    /// handler, guest never faulted) gives an empty rider.
+    fn read_hot_chunks(
+        &self,
+        id: SandboxId,
+        chain: &engram_chunk_store::Manifest,
+    ) -> Vec<[u8; 32]> {
+        let Some(record) = self
+            .inner
+            .first_touch_path(id)
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| engram_chunk_store::FirstTouch::decode(&bytes))
+        else {
             return Vec::new();
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Vec::new();
-        };
-        match serde_json::from_slice::<engram_chunk_store::working_set::WorkingSetTrace>(&bytes) {
-            Ok(trace) => trace.chunks.iter().map(|h| *h.as_bytes()).collect(),
-            Err(e) => {
-                tracing::debug!(sandbox_id = %id, error = %e, "hot-set trace parse failed; empty rider");
-                Vec::new()
-            }
-        }
+        let chunk_size = chain.chunk_size.as_u64();
+        let offsets: Vec<u64> = record
+            .entries
+            .iter()
+            .map(|(idx, _)| u64::from(*idx) * chunk_size)
+            .collect();
+        crate::page_idle::hot_hashes(chain, &offsets, &[])
     }
 
     /// ADR 0045 C2 (destination): stage the presetup's restore package
@@ -3162,7 +3105,7 @@ impl PooledBackend {
                 let path = dest_dir.join(&pending.hot_trace_file);
                 // File I/O is independent of the Tokio workers serving the move.
                 if let result @ (Ok(Err(_)) | Err(_)) =
-                    tokio::task::spawn_blocking(move || stage_hot_trace(&path, &hot)).await
+                    tokio::task::spawn_blocking(move || write_hot_hint(&path, &hot)).await
                 {
                     tracing::info!(?result, "post-copy hint staging failed; drain continues");
                 }
@@ -3607,11 +3550,7 @@ impl PooledBackend {
         user: CaptureUser,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let (_capture_guard, cap) = self.capture_phase(id, user).await?;
-        // Lift the per-jail working-set trace into the blob store under the
-        // session-canonical key so the next resume prefaults it (#517 keyed
-        // the replay; the handler can't publish it itself — SIGKILLed on
-        // destroy). Detached + best-effort; never blocks the capture.
-        self.spawn_trace_publish(id);
+        self.spawn_first_touch_publish(id);
         self.finisher_with_class(class).finish(id, cap).await
     }
 
@@ -5055,9 +4994,7 @@ impl SandboxBackend for PooledBackend {
         };
 
         let (capture_guard, cap) = self.capture_phase(id, CaptureUser::EvictionCapture).await?;
-        // Publish the working-set trace for the next resume's prefault (see
-        // `spawn_trace_publish`); detached, never blocks the eviction.
-        self.spawn_trace_publish(id);
+        self.spawn_first_touch_publish(id);
         // Idempotent re-pause; best-effort (a failure leaves the orphan
         // running until destroy, which is today's behavior).
         if let Err(e) = self.inner.pause(id).await {
@@ -5986,8 +5923,8 @@ impl SandboxBackend for PooledBackend {
         self.abort_prior_inflight_snapshot(id).await
     }
 
-    fn working_set_trace_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
-        self.inner.working_set_trace_path(id)
+    fn first_touch_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
+        self.inner.first_touch_path(id)
     }
 
     fn prefault_stats_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
@@ -9064,10 +9001,8 @@ mod tests {
             last_activity: Arc::new(std::sync::Mutex::new(pooled.clock.now_mono())),
             capture_guard: guard,
         }));
-        let trace_path = dest.join(engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE);
-        let mut loader = Box::pin(engram_uffd_handler::working_set::load_migration_trace(
-            &trace_path,
-        ));
+        let hint_path = dest.join("migration-hot.json");
+        let mut loader = Box::pin(engram_uffd_handler::hot_hint::load(&hint_path));
         assert!(futures::poll!(&mut loader).is_pending());
         let initial = || async {
             pooled
@@ -9131,14 +9066,10 @@ mod tests {
         assert_eq!(*last_activity.lock().unwrap(), anchor);
         let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let hot: Vec<[u8; 32]> = serde_json::from_value(info["hot_chunks"].clone()).unwrap();
-        stage_hot_trace(&trace_path, &hot).unwrap();
-        let trace = loader.await.unwrap();
+        write_hot_hint(&hint_path, &hot).unwrap();
+        let staged = loader.await.unwrap();
         assert_eq!(
-            trace
-                .chunks
-                .iter()
-                .map(|h| *h.as_bytes())
-                .collect::<Vec<_>>(),
+            staged.iter().map(|h| *h.as_bytes()).collect::<Vec<_>>(),
             vec![[2; 32], [1; 32]]
         );
     }
@@ -9313,8 +9244,12 @@ mod tests {
                 memory_backing: self.capture_root.as_ref()?.join("ram"),
             })
         }
-        fn working_set_trace_path(&self, _: SandboxId) -> Option<PathBuf> {
-            Some(self.capture_root.as_ref()?.join("trace.json"))
+        fn first_touch_path(&self, _: SandboxId) -> Option<PathBuf> {
+            Some(
+                self.capture_root
+                    .as_ref()?
+                    .join(engram_chunk_store::FirstTouch::FILE),
+            )
         }
         async fn pause(&self, _: SandboxId) -> Result<(), SandboxError> {
             Ok(())
@@ -10377,14 +10312,6 @@ mod tests {
         assert_eq!(recovered, bytes, "materialized bytes round-trip");
     }
 
-    /// Cross-host trace replay: when a snapshot carries a
-    /// `trace_host_hint` on its sidecar JSON, the FC restore path
-    /// passes that as `--prefault-trace <host>` to the UFFD
-    /// handler so the recorded trace replays on a different host.
-    /// Locked at the wire-shape level here — we assert the field
-    /// round-trips through serde so a refactor can't accidentally
-    /// drop it. (End-to-end replay needs a live VM; that's the
-    /// follow-up.)
     #[tokio::test]
     async fn snapshot_skips_materialize_when_memory_bin_already_present() {
         // Negative case: memory.bin already exists locally, so
@@ -12044,7 +11971,6 @@ mod tests {
             total_bytes: 4 * CHUNK,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let source = engram_core::types::manifest::ManifestRef::new();

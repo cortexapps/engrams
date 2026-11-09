@@ -102,7 +102,6 @@ fn base_manifest(base_hash: ChunkHash) -> Manifest {
             })
             .collect(),
         parent: None,
-        working_set_trace: None,
         annotations: Default::default(),
     }
 }

@@ -46,7 +46,6 @@ async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty(
         chunk_size: ChunkSize::bytes(8),
         chunks: chunks.clone(),
         parent: None,
-        working_set_trace: None,
         annotations: serde_json::Value::Null,
     };
     bake_store

@@ -39,6 +39,7 @@
 pub mod chunked;
 pub mod fault_stats;
 pub mod first_touch;
+pub mod hot_hint;
 pub mod mapped;
 /// ADR 0045 C2: the post-copy peer channel — `PeerSession` (sync TCP
 /// client to the source host-agent's page server) + `ControlTx` (the
@@ -47,7 +48,6 @@ pub mod mapped;
 pub mod peer;
 pub mod populate_client;
 pub mod proto;
-pub mod working_set;
 
 #[cfg(target_os = "linux")]
 pub mod base_shm;
@@ -56,7 +56,6 @@ pub mod runtime;
 
 pub use chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
 pub use proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
-pub use working_set::WorkingSetRecorder;
 
 #[cfg(target_os = "linux")]
 pub use runtime::{recv_handshake, run_listener, HandlerError, Runtime};

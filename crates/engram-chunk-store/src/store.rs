@@ -39,7 +39,6 @@ use crate::admission::{Admission, Class, Permit};
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::{ChunkHash, Manifest, ManifestRef};
 use crate::resolver::{BlobStorageResolver, ChunkResolver};
-use crate::working_set::{TraceRef, WorkingSetTrace};
 
 /// How a chunk upload learns whether the store already holds the chunk.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -558,40 +557,9 @@ impl ChunkStore {
     pub async fn fork_manifest(&self, src: ManifestRef) -> Result<ManifestRef> {
         let mut m = self.get_manifest(src).await?;
         m.parent = Some(src);
-        // Working-set traces are host-local; don't inherit them on
-        // fork — the fork is a different logical session and its
-        // access patterns may differ.
-        m.working_set_trace = None;
         let new_ref = ManifestRef::new();
         self.put_manifest(new_ref, &m).await?;
         Ok(new_ref)
-    }
-
-    // ---------- working-set traces ----------
-
-    /// PUT a working-set trace. Overwrites any prior trace for the
-    /// same `(manifest_id, host_id)` — replay always uses the
-    /// latest. Caller decides cadence (e.g. record once on first
-    /// restore per host, refresh occasionally as access patterns
-    /// drift).
-    pub async fn put_trace(&self, r: TraceRef, t: &WorkingSetTrace) -> Result<()> {
-        let bytes = serde_json::to_vec(t)?;
-        let _ = self.inner.put(&r.storage_key(), Bytes::from(bytes)).await?;
-        Ok(())
-    }
-
-    /// GET a working-set trace. `None` if no trace was ever
-    /// recorded — first restore on a host hits this and falls
-    /// back to lazy UFFD without prefault.
-    pub async fn get_trace(&self, r: TraceRef) -> Result<Option<WorkingSetTrace>> {
-        match self.inner.get(&r.storage_key()).await {
-            Ok(bytes) => {
-                let t: WorkingSetTrace = serde_json::from_slice(&bytes)?;
-                Ok(Some(t))
-            }
-            Err(engram_core::error::BlobError::NotFound) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 }
 
@@ -797,7 +765,6 @@ mod tests {
         let forked_m = s.get_manifest(forked).await.unwrap();
         assert_eq!(forked_m.parent, Some(src));
         assert_eq!(forked_m.chunks, m.chunks); // chunk list unchanged
-        assert!(forked_m.working_set_trace.is_none());
     }
 
     #[tokio::test]
@@ -817,25 +784,6 @@ mod tests {
             Err(ChunkStoreError::HashMismatch { .. }) => {}
             other => panic!("expected HashMismatch, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn put_and_get_trace_round_trips() {
-        let (s, _d) = store().await;
-        let r = TraceRef::canonical(Uuid::new_v4());
-        let mut t = WorkingSetTrace::new(2, 5000, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-        t.chunks.push(ChunkHash::of(b"a"));
-        t.chunks.push(ChunkHash::of(b"b"));
-        s.put_trace(r, &t).await.unwrap();
-        let back = s.get_trace(r).await.unwrap().unwrap();
-        assert_eq!(back, t);
-    }
-
-    #[tokio::test]
-    async fn get_trace_returns_none_when_absent() {
-        let (s, _d) = store().await;
-        let r = TraceRef::canonical(Uuid::new_v4());
-        assert!(s.get_trace(r).await.unwrap().is_none());
     }
 
     // ---- ChunkResolver indirection ----

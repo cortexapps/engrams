@@ -852,20 +852,19 @@ pub trait SandboxBackend: Send + Sync {
     /// files before reading.
     fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
 
-    /// ADR 0045 C2 (E2B fold): where this sandbox's uffd-handler dumps
-    /// its working-set trace (fault-order hot set), when the backend
-    /// runs one. The migration capture reads it best-effort to ship a
-    /// `hot_chunks` rider so the destination warms the guest's hot set
-    /// first. `None` = backend has no per-sandbox trace (VZ, process).
-    fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
+    /// Where this sandbox's uffd-handler writes its first-touch record
+    /// (the chunk positions the guest touched, in order), when the backend
+    /// runs one. The host-agent publishes it for the session's next
+    /// restore, and the migration capture reads it best-effort for the
+    /// `hot_chunks` rider. `None` = no handler (VZ, process).
+    fn first_touch_path(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }
 
     /// ADR 0019 / telemetry restoration (#526): where this sandbox's
     /// uffd-handler dumps its per-jail prefault-effectiveness snapshot
-    /// (`PrefaultStats` in `engram-uffd-handler`), a sibling of
-    /// [`working_set_trace_path`](Self::working_set_trace_path) in the
-    /// same jail dir. `PooledBackend::restore` reads it after a resume
+    /// (`PrefaultStats` in `engram-uffd-handler`), in the same jail dir
+    /// as [`first_touch_path`](Self::first_touch_path). `PooledBackend::restore` reads it after a resume
     /// completes and emits `engram_resume_prefault_*` — the standing
     /// detector for "prefault shipped but silently stopped firing" (it
     /// went inert three separate, undetected ways before this). `None`

@@ -346,9 +346,8 @@ pub const EVICTION_FINALIZE_QUARANTINED_TOTAL: &str = "engram_eviction_finalize_
 pub const EVICTION_FINALIZE_STAGE_SECONDS: &str = "engram_eviction_finalize_stage_seconds";
 /// ADR 0019 / telemetry restoration (#526): the resume-prefault
 /// effectiveness detector. The uffd-handler writes a per-jail
-/// `prefault-stats.json` (sibling of `working-set-trace.json`) at the
-/// end of `prefault_from_trace` (and, for the no-trace case, from
-/// `main.rs` before the fault loop starts); `restore()` here reads it
+/// `prefault-stats.json` before the fault loop starts; `restore()` here
+/// reads it
 /// after a resume completes and increments this by `outcome`:
 /// - `replayed`: a trace was loaded and prefault ran (installed may
 ///   still be 0 — see `PREFAULT_CHUNKS_TOTAL`).

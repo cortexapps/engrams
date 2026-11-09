@@ -135,8 +135,7 @@ pub struct HostAgent {
     /// Where image and session volumes live. `None` keeps readiness on
     /// the chunk cache alone and leaves the disks to the backend.
     pub session_disk: Option<Arc<dyn engram_host_core::SessionDisk>>,
-    /// This host's stable id, stamped on snapshot trace hints and passed
-    /// to the UFFD handler. `None` generates one at run time.
+    /// This host's stable id. `None` generates one at run time.
     pub host_id: Option<engram_core::HostId>,
     /// The base-shm sweeper's keep-set. The image-prefetch supervisor
     /// publishes into it; inert unless a sweeper holds the same handle.
@@ -207,8 +206,6 @@ impl HostAgent {
         self
     }
 
-    /// Must match the id on `FirecrackerConfig.host_id`: both key the
-    /// trace file `traces/<manifest_id>/<host_id>.json`.
     pub fn with_host_id(mut self, id: engram_core::HostId) -> Self {
         self.host_id = Some(id);
         self
@@ -288,11 +285,6 @@ impl HostAgent {
         }
 
         if let Some(coord_url) = self.cfg.coordinator_endpoint.clone() {
-            // Re-use the host_id that was stamped on the FC
-            // backend at construction time, so trace replay keys
-            // line up. Falls back to a fresh id when the caller
-            // didn't set one — that's the pre-Phase-5 behaviour
-            // (no trace replay).
             let host_id = self.host_id.unwrap_or_default();
             tracing::info!(
                 host_id = %host_id,

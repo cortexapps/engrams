@@ -145,7 +145,6 @@ impl Bootstrap {
                 })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -167,7 +166,6 @@ mod tests {
                 .map(|(offset, hash)| ChunkRef { offset, hash })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }

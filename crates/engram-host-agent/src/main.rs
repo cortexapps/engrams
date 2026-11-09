@@ -336,11 +336,6 @@ async fn main() -> Result<(), HostAgentError> {
         ..HostAgentConfig::default()
     };
 
-    // ADR 0007 Phase 5: resolve the HostId early so the FC config can
-    // stamp it on snapshots' `trace_host_hint` and pass it as
-    // `--publish-trace-host` to the UFFD handler. Cross-host trace replay
-    // keys off this id — a snapshot taken by host A becomes restoreable on
-    // host B with B reusing A's recorded trace.
     // ADR 0044 K2 (GAP 1): STABLE across restarts (persisted in work_dir,
     // node-name-seeded on K8s) so a DaemonSet pod restart keeps its host
     // identity and the coordinator's session→host binding survives.
@@ -381,7 +376,6 @@ async fn main() -> Result<(), HostAgentError> {
                 )
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-            fc_cfg.host_id = Some(host_id);
             // ADR 0035/0062: read RO bundles from the same dir the host-agent
             // reports `current_bundles` from — ENGRAM_BUNDLE_DIR in dev/e2e, the
             // fleet-canonical SHARED_DIR in prod (env unset). Mirrors the VZ arm

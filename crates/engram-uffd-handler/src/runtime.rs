@@ -16,13 +16,9 @@
 //! - On every fault we install a **full chunk** in one `UFFDIO_COPY`,
 //!   not just the faulting page. This amortises the syscall + fault-
 //!   handler cost across the chunk's pages and gets us cleanly under
-//!   100 ms for typical Python workloads after the working-set trace
-//!   warms.
-//! - On restore, if a [`WorkingSetTrace`] is supplied we prefault
-//!   every chunk in the trace (REAP-style) **before** vCPUs run.
-//! - As faults are served we record observed chunk hashes into a
-//!   [`WorkingSetRecorder`] so the next restore on this host can
-//!   prefault them.
+//!   100 ms for typical Python workloads.
+//! - As faults are served we record each chunk's position in the
+//!   first-touch record, which the next restore fetches first.
 //!
 //! Dropping the canonical mmap is what removes the `materialize`
 //! pass + the `MAP_POPULATE` eager read from the restore critical
@@ -46,7 +42,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use engram_chunk_store::working_set::WorkingSetTrace;
+use engram_chunk_store::manifest::ChunkHash;
 use engram_chunk_store::FirstTouch;
 use sendfd::RecvWithFd;
 use tokio::runtime::Handle as TokioHandle;
@@ -55,13 +51,10 @@ use userfaultfd::{Event, Uffd};
 use crate::chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
 use crate::fault_stats::{self, Source};
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
-use crate::working_set::WorkingSetRecorder;
 
 /// ADR 0019 / telemetry restoration (#526): per-jail prefault
-/// effectiveness snapshot, written next to `working-set-trace.json` in
-/// the same jail dir (same per-jail-file pattern). The host-agent reads
-/// it after a restore completes (`pooled_backend.rs`, next to its
-/// `working_set_trace_path` accessor) and emits the
+/// effectiveness snapshot, written to the handler's report dir (the jail
+/// dir). The host-agent reads it after a restore completes and emits the
 /// `engram_resume_prefault_*` counters from it.
 ///
 /// This is the standing detector for "prefault shipped but silently
@@ -102,13 +95,11 @@ pub struct PrefaultStats {
     /// post-copy migration destination's peer-fill counterpart to
     /// `installed`/`skipped`. `#[serde(default)]` so a reader built
     /// against the pre-finding-6 schema (or a file this process never
-    /// patches, e.g. `main.rs`'s early `trace_loaded: false` write on a
-    /// non-peer resume) still parses as all-zero, not an error.
+    /// patches, e.g. `main.rs`'s early write on a non-peer resume) still
+    /// parses as all-zero, not an error.
     ///
     /// Populated once, as a read-modify-write patch applied at the very
-    /// end of `run_listener`'s background thread (strictly after
-    /// `prefault_from_trace`/`sweep_all`, so it can never be clobbered
-    /// by their own writes) — see `run_listener`. A **snapshot as of
+    /// end of `run_listener`'s background thread — see `run_listener`. A **snapshot as of
     /// that patch**, not a full-VM-lifetime total: `serve_pagefault`
     /// can still route later on-demand faults to the peer after this
     /// point. Span attributes only for now (`resume.prefault_stats` on
@@ -143,9 +134,7 @@ pub struct PrefaultStats {
     pub hot_hint_received: Option<bool>,
 }
 
-/// Filename for [`PrefaultStats`], colocated with
-/// [`crate::runtime`]'s per-jail `working-set-trace.json`
-/// (`WORKING_SET_TRACE_FILE` in `engram-sandbox-firecracker`).
+/// Filename for [`PrefaultStats`] in the handler's report dir.
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
 
 /// Write `bytes` to `path` through a temp file and a rename, so a reader
@@ -166,16 +155,6 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
     }
 }
 
-/// Where `PrefaultStats` lands for a jail whose per-jail trace file is
-/// `trace_output` — the sibling `<jail_dir>/prefault-stats.json`.
-/// `None` only if `trace_output` has no parent directory (never true
-/// for a real jail path; guards a degenerate relative path in tests).
-pub fn prefault_stats_path(trace_output: &std::path::Path) -> Option<PathBuf> {
-    trace_output
-        .parent()
-        .map(|dir| dir.join(PREFAULT_STATS_FILE))
-}
-
 /// Best-effort [`write_atomic`]. Failures are logged, never
 /// propagated: the stats file is a diagnostic surface, not load-bearing
 /// for the restore itself (a write failure here must never fail or
@@ -189,10 +168,9 @@ pub fn write_prefault_stats(path: &std::path::Path, stats: &PrefaultStats) {
 
 /// Review finding 6: the pure read-modify-write half of patching the
 /// peer-drain snapshot onto whatever `prefault-stats.json` bytes already
-/// exist (written by `prefault_from_trace` or `main.rs`'s early
-/// `trace_loaded: false` case). `existing_bytes` is `None`/unparseable
-/// exactly when the handler never wrote a stats file at all (crashed
-/// before either writer ran) — deliberately returns `None` in that case
+/// exist (written by `main.rs` at startup). `existing_bytes` is
+/// `None`/unparseable exactly when the handler never wrote a stats file
+/// at all (crashed before that write) — deliberately returns `None` in that case
 /// rather than fabricating a file, so a genuinely dead handler still
 /// alarms as `stats_missing` instead of surfacing a peer-only stub that
 /// would mask it.
@@ -599,10 +577,6 @@ pub struct Runtime {
     /// runs on a `spawn_blocking` thread which is safe to call
     /// `block_on` from.
     handle: TokioHandle,
-    /// Working-set recorder shared with whoever publishes the trace
-    /// on shutdown. `Mutex` is here for correctness, not contention:
-    /// the fault loop is single-threaded today.
-    recorder: Arc<Mutex<WorkingSetRecorder>>,
     /// Per-chunk installation lifecycle (see [`ChunkState`]). Lets the
     /// fault loop skip duplicate `UFFDIO_COPY` attempts for chunks
     /// already installed (`EEXIST` would otherwise force a retry), and
@@ -618,12 +592,8 @@ pub struct Runtime {
     /// `Installing` waits on this until the in-flight install settles.
     install_cv: Condvar,
     page_size: u64,
-    /// ADR 0014 M1.14: when set, the fault loop periodically writes
-    /// the current recorder snapshot to this path. Belt-and-
-    /// suspenders: the bake's profile pass can read the trace
-    /// even if the run loop hangs on a stale userfaultfd that the
-    /// kernel never closes after FC dies.
-    trace_output: Option<PathBuf>,
+    /// Where the prefault stats go (the jail dir).
+    report_dir: Option<PathBuf>,
     /// ADR 0045 unified memory substrate (v2b). When set, guest memory
     /// is `MAP_PRIVATE` of this per-template base shm file (registered
     /// `MISSING|MINOR` by the forked FC) and canonical chunks install
@@ -668,27 +638,17 @@ pub struct Runtime {
     /// rather than fatally escalating PeerLost on a healthy, fully-drained
     /// destination (issue #227 scenario (a)).
     drain_done: std::sync::atomic::AtomicBool,
-    /// ADR 0045 C2 (E2B fold): one-shot trace dump when the recorder
-    /// window closes — the migration capture reads the per-jail trace
-    /// file LIVE, so waiting for handler exit (the publish channel) is
-    /// too late. Set once the close-dump has fired.
-    window_dump_done: std::sync::atomic::AtomicBool,
 }
 
 impl Runtime {
     /// Pair the chunked backend with the UFFD the handshake gave us.
     /// No `memory.bin` file is opened — every page is served from
     /// chunks (ADR 0020 Route B).
-    ///
-    /// `recorder_window` controls how long the trace recorder stays
-    /// open after construction. Pass `Duration::ZERO` to disable
-    /// recording (useful for unit tests / one-shot replays).
     pub fn new(
         mappings: Vec<GuestRegionUffdMapping>,
         uffd: Uffd,
         backend: Arc<ChunkedMemoryBackend>,
         handle: TokioHandle,
-        recorder_window: Duration,
         base_shm: Option<crate::base_shm::BaseShm>,
     ) -> Result<Self, HandlerError> {
         let mappings_total: u64 = mappings.iter().map(|m| m.size as u64).sum();
@@ -724,23 +684,17 @@ impl Runtime {
                 );
             }
         }
-        let vcpu_count = u32::try_from(mappings.len()).unwrap_or(u32::MAX);
-        let recorder = Arc::new(Mutex::new(WorkingSetRecorder::new(
-            vcpu_count,
-            recorder_window,
-        )));
 
         Ok(Self {
             mappings,
             uffd,
             backend,
             handle,
-            recorder,
             installed: Mutex::new(vec![ChunkState::Empty; chunk_count]),
             first_touch: crate::first_touch::FirstTouchRecorder::new(chunk_count),
             install_cv: Condvar::new(),
             page_size,
-            trace_output: None,
+            report_dir: None,
             base_shm,
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
@@ -752,7 +706,6 @@ impl Runtime {
             fault_around_chunks_installed: std::sync::atomic::AtomicU64::new(0),
             control: None,
             drain_done: std::sync::atomic::AtomicBool::new(false),
-            window_dump_done: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -827,17 +780,11 @@ impl Runtime {
         }
     }
 
-    /// ADR 0014 M1.14: configure periodic trace_output dumping. The
-    /// fault loop snapshots the recorder into the path every N
-    /// faults (and once after the recorder window closes) so the
-    /// trace lands on disk even if the loop doesn't unwind cleanly.
-    /// The first-touch record goes to its sibling file as each entry is
-    /// recorded.
-    pub fn set_trace_output(&mut self, path: PathBuf) {
-        if let Some(dir) = path.parent() {
-            self.first_touch.set_output(&dir.join(FirstTouch::FILE));
-        }
-        self.trace_output = Some(path);
+    /// Write the first-touch record (as each entry is recorded) and the
+    /// prefault stats to `dir`.
+    pub fn set_report_dir(&mut self, dir: PathBuf) {
+        self.first_touch.set_output(&dir.join(FirstTouch::FILE));
+        self.report_dir = Some(dir);
     }
 
     /// Log the memory manifest's composition once.
@@ -867,134 +814,14 @@ impl Runtime {
         );
     }
 
-    /// The per-jail `prefault-stats.json` sibling of this run's
-    /// `--trace-output` path, or `None` when no `--trace-output` was
-    /// given (VZ/Process backends never spawn this binary; a test
-    /// harness that omits it just gets no stats file — best-effort
-    /// diagnostics, never load-bearing).
     fn prefault_stats_path(&self) -> Option<PathBuf> {
-        self.trace_output
-            .as_ref()
-            .and_then(|p| prefault_stats_path(p))
-    }
-
-    /// Snapshot the current recorder state and write it to
-    /// `trace_output` if configured. The recorder lock is held through
-    /// the write, so an older snapshot never replaces a newer one.
-    /// Best-effort; failures are logged but don't propagate (the path
-    /// matters more than our error reporting).
-    fn dump_trace_output(&self) {
-        let Some(path) = self.trace_output.as_ref() else {
-            return;
-        };
-        let r = self.recorder.lock().expect("recorder poisoned");
-        let mut trace = WorkingSetTrace::new(
-            r.vcpu_count_snapshot(),
-            r.window_ms_snapshot(),
-            chrono::Utc::now(),
-        );
-        trace.chunks = r.chunks_snapshot();
-        match serde_json::to_vec(&trace) {
-            Ok(bytes) => write_atomic(path, &bytes),
-            Err(e) => tracing::warn!(error = %e, "trace_output serialize"),
-        }
-        drop(r);
-    }
-
-    /// Pre-install every chunk listed in `trace` into the guest
-    /// before vCPUs run. Idempotent against partial overlap with a
-    /// later fault-served install (per-chunk bitmap guards the
-    /// double-install case).
-    ///
-    /// Drops the trace lock between chunks so a follow-up
-    /// pre-fault from a fresh trace can interleave with the fault
-    /// loop — useful only in testing; production always pre-faults
-    /// once at startup.
-    pub fn prefault_from_trace(&self, trace: &WorkingSetTrace) -> Result<(), HandlerError> {
-        let started = std::time::Instant::now();
-        let mut installed = 0usize;
-        let mut skipped = 0usize;
-        let chunk_size = self.backend.chunk_size();
-        // Run the body in a closure so a `?`-propagated error still falls
-        // through to the stats write below (#526: a handler that dies
-        // partway through must leave a stats file recording what it DID
-        // manage before failing — not the total absence that would
-        // masquerade as `outcome="stats_missing"`, the "handler never even
-        // started" alarm).
-        let result: Result<(), HandlerError> = (|| {
-            for hash in &trace.chunks {
-                // Fetch once per hash; install at every position the
-                // session manifest places the chunk at.
-                let positions = self.backend.session_positions_of(*hash);
-                if positions.is_empty() {
-                    // Trace mentions a hash the session no longer needs
-                    // (rewritten / GC'd). Cheap to skip.
-                    skipped += 1;
-                    continue;
-                }
-                // ADR 0045 substrate: canonical positions must install via the
-                // shared base + CONTINUE — a prefault COPY here would privately
-                // duplicate exactly the hot pages the substrate exists to share.
-                if let Some(base) = self.base_shm.as_ref() {
-                    for byte_offset in positions {
-                        let shared = matches!(
-                            self.backend.resolve(byte_offset),
-                            Some(ResolvedPage::Canonical { canonical_offset })
-                                if self.backend.canonical_chunk_hash(canonical_offset)
-                                    == Some(*hash)
-                        );
-                        let did = if shared {
-                            self.install_canonical_shared(base, byte_offset, *hash, false)?
-                        } else {
-                            let bytes = self.backend.fetch_chunk(&self.handle, *hash)?;
-                            self.install_chunk_at(byte_offset, bytes, false)?
-                        };
-                        if did {
-                            installed += 1;
-                        }
-                        self.first_touch.touch((byte_offset / chunk_size) as usize);
-                    }
-                    continue;
-                }
-                let bytes = self.backend.fetch_chunk(&self.handle, *hash)?;
-                for byte_offset in positions {
-                    if self.install_chunk_at(byte_offset, bytes.clone(), false)? {
-                        installed += 1;
-                    }
-                    self.first_touch.touch((byte_offset / chunk_size) as usize);
-                }
-            }
-            Ok(())
-        })();
-        tracing::info!(
-            installed,
-            skipped,
-            trace_len = trace.chunks.len(),
-            ok = result.is_ok(),
-            "prefault from working-set trace complete"
-        );
-        if let Some(path) = self.prefault_stats_path() {
-            write_prefault_stats(
-                &path,
-                &PrefaultStats {
-                    trace_loaded: true,
-                    chunks_in_trace: trace.chunks.len(),
-                    installed,
-                    skipped,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    ..Default::default()
-                },
-            );
-        }
-        result
+        Some(self.report_dir.as_ref()?.join(PREFAULT_STATS_FILE))
     }
 
     /// ADR 0045 tail latency: eagerly install EVERY chunk of the
     /// session — canonical via the shared base (CONTINUE), divergent
     /// via fetch + COPY — as a background producer racing the fault
-    /// loop, exactly like `prefault_from_trace` but with total
-    /// coverage instead of a recorded working set. A migration restore
-    /// has no host trace, so before this sweep its divergent chunks
+    /// loop. Before this sweep a migration restore's divergent chunks
     /// (the checkpoint chain's accumulated diff — hundreds of 512 KiB
     /// chunks, all prestaged on local NVMe) faulted in one at a time
     /// through the single-threaded fault loop: the residual ~27 s
@@ -1617,27 +1444,6 @@ impl Runtime {
                     let served = fault_stats::STATS.record_fault(source, started.elapsed());
                     if served.is_power_of_two() {
                         fault_stats::STATS.log("pow2");
-                        // ADR 0014 M1.14: dump trace_output on the
-                        // same log-cadence so a hung run loop still
-                        // produces a usable file. Cheap (~1 KiB
-                        // serialize + fs::write).
-                        self.dump_trace_output();
-                    }
-                    // ADR 0045 C2 (E2B fold): one-shot dump on the first
-                    // fault AFTER the recorder window closes, so the
-                    // complete hot set is on disk ~window-length after
-                    // restore — a live migration capture reads it from
-                    // the jail. (The power-of-two cadence alone can
-                    // leave the file stale mid-window.)
-                    if !self
-                        .window_dump_done
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        && !self.recorder.lock().expect("recorder poisoned").is_open()
-                        && !self
-                            .window_dump_done
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        self.dump_trace_output();
                     }
                 }
                 Ok(Some(other)) => {
@@ -1829,17 +1635,6 @@ impl Runtime {
                 // manifest — session omissions resolve to `Zero` below.
                 match self.backend.canonical_chunk_hash(canonical_offset) {
                     Some(hash) => {
-                        // ADR 0014 M1.14: record the canonical chunk
-                        // hash. Without this, a fully-canonical snapshot
-                        // (base snapshot, pre-divergence) produces an
-                        // empty working-set trace and the next restore's
-                        // prefetch can't narrow at all.
-                        {
-                            let mut r = self.recorder.lock().expect("recorder poisoned");
-                            if r.is_open() {
-                                r.observe(hash);
-                            }
-                        }
                         let installed = match self.base_shm.as_ref() {
                             // ADR 0045 substrate: shared install via the
                             // base shm + CONTINUE (one physical copy per
@@ -1874,15 +1669,6 @@ impl Runtime {
                 }
             }
             ResolvedPage::Chunk { hash } => {
-                // Track in the working-set recorder regardless of
-                // whether the install fires — the hash is what the
-                // *next* restore wants to prefault.
-                {
-                    let mut r = self.recorder.lock().expect("recorder poisoned");
-                    if r.is_open() {
-                        r.observe(hash);
-                    }
-                }
                 let bytes = self.backend.fetch_chunk(&self.handle, hash)?;
                 let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
                 if !installed {
@@ -2177,17 +1963,18 @@ impl Runtime {
     /// ADR 0045 C2: the background drain — pull every sealed chunk the
     /// fault path hasn't already served, over the drain's OWN
     /// connections, pipelined. Runs FIRST on the producer thread (before
-    /// the trace prefault and the eager sweep): sealed content exists
-    /// only in the paused source, so draining it is what releases the
-    /// source — and it makes the later sweep/prefault trivially safe
-    /// (by the time they run, every sealed chunk is installed, so their
-    /// stale `resolve()` view can never be installed over divergence).
+    /// the eager sweep): sealed content exists only in the paused source,
+    /// so draining it is what releases the source — and it makes the
+    /// later sweep trivially safe (by the time it runs, every sealed chunk
+    /// is installed, so its stale `resolve()` view can never be installed
+    /// over divergence).
     ///
     /// A large drain runs on [`DRAIN_CONNS`] connections; the source
     /// serves each connection on its own thread. A chunk that a fault
     /// already requested is skipped until that request ends; it is asked
     /// for again only if it is still not installed then.
     ///
+    /// `hot` (the source's hot chunks, hottest first) leads the drain.
     /// `AltSource` responses demote inline to the class-2 path (fetch
     /// via cache/store + private install). Install errors are real
     /// errors; peer errors return `Err` and the caller reports
@@ -2195,16 +1982,18 @@ impl Runtime {
     pub fn drain_from_peer(
         &self,
         peer: &crate::peer::PeerSession,
-        hot: Option<&engram_chunk_store::working_set::WorkingSetTrace>,
+        hot: &[ChunkHash],
     ) -> Result<crate::peer::DrainStats, HandlerError> {
-        self.drain_with_hint(peer, &mut hot.cloned(), &mut || None)
+        self.drain_with_hint(peer, hot, &mut || None)
     }
 
+    /// [`Self::drain_from_peer`], with `hint` polled once per response:
+    /// the first hot set it returns reorders the chunks still queued.
     fn drain_with_hint(
         &self,
         peer: &crate::peer::PeerSession,
-        hot: &mut Option<WorkingSetTrace>,
-        hint: &mut impl FnMut() -> Option<WorkingSetTrace>,
+        hot: &[ChunkHash],
+        hint: &mut impl FnMut() -> Option<Vec<ChunkHash>>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
         use crate::peer::DrainStats;
 
@@ -2224,19 +2013,17 @@ impl Runtime {
         // cold remainder keeps offset order.
         let mut todo: Vec<u64> = Vec::with_capacity(seal.count_ones() as usize);
         let mut queued = std::collections::HashSet::new();
-        if let Some(trace) = hot.as_ref() {
-            for hash in &trace.chunks {
-                for offset in self.backend.session_positions_of(*hash) {
-                    let idx = offset / chunk_size;
-                    if seal.get(idx) && queued.insert(idx) {
-                        todo.push(idx * chunk_size);
-                    }
+        for hash in hot {
+            for offset in self.backend.session_positions_of(*hash) {
+                let idx = offset / chunk_size;
+                if seal.get(idx) && queued.insert(idx) {
+                    todo.push(idx * chunk_size);
                 }
             }
         }
         let hot_leading = todo.len();
         stats.hot_leading = hot_leading as u64;
-        stats.hot_hint_received = hot.as_ref().is_some_and(|trace| !trace.chunks.is_empty());
+        stats.hot_hint_received = !hot.is_empty();
         for i in (0..seal.chunk_count).filter(|i| seal.get(*i)) {
             if !queued.contains(&i) {
                 todo.push(i * chunk_size);
@@ -2253,11 +2040,11 @@ impl Runtime {
         let shared = DrainShared::new(todo);
 
         let mut apply_hint = || {
-            let Some(trace) = hint() else { return };
+            let Some(hot) = hint() else { return };
             let mut todo = shared.todo.lock().expect("drain queue poisoned");
-            stats.hot_hint_received |= !trace.chunks.is_empty() && !todo.is_empty();
+            stats.hot_hint_received |= !hot.is_empty() && !todo.is_empty();
             let mut rank = std::collections::HashMap::new();
-            for hash in &trace.chunks {
+            for hash in &hot {
                 for offset in self.backend.session_positions_of(*hash) {
                     let next = rank.len();
                     rank.entry(offset).or_insert(next);
@@ -2271,10 +2058,6 @@ impl Runtime {
                 .count() as u64;
             todo.make_contiguous()
                 .sort_by_key(|(o, _)| rank.get(o).copied().unwrap_or(usize::MAX));
-            // The source already merged handler and idle hints in priority
-            // order. Keep all hashes, including unsealed chunks, for the
-            // post-drain prefault. Never wait for another hint.
-            *hot = Some(trace);
         };
         std::thread::scope(|scope| {
             let workers: Vec<_> = (0..extra_conns)
@@ -2500,17 +2283,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Consume the runtime, freezing the working-set recorder into a
-    /// publishable trace. Caller uploads it to
-    /// `traces/<manifest_id>/<host_id>.json` for the next restore.
-    pub fn finish_recorder(&self) -> WorkingSetTrace {
-        let recorder = std::mem::replace(
-            &mut *self.recorder.lock().expect("recorder poisoned"),
-            WorkingSetRecorder::new(0, Duration::ZERO),
-        );
-        recorder.finish()
-    }
-
     /// Test/debug accessor.
     #[allow(dead_code)]
     pub fn mappings(&self) -> &[GuestRegionUffdMapping] {
@@ -2519,9 +2291,7 @@ impl Runtime {
 }
 
 /// One-shot run: bind the listener, accept Firecracker, handshake,
-/// optionally pre-fault from a trace, then loop until the UFFD
-/// closes. On clean exit, returns the recorded working-set trace
-/// (which the caller publishes back to the chunk store).
+/// then serve faults until the UFFD closes.
 ///
 /// `stream` is held alive for the lifetime of the run — matches the
 /// upstream `on_demand_handler.rs` which polls both the stream and
@@ -2529,12 +2299,12 @@ impl Runtime {
 /// Firecracker to hang on `PUT /snapshot/load` (it keeps its side
 /// open and treats our close as a protocol error).
 pub struct RunListenerOpts {
-    pub prefault_trace: Option<WorkingSetTrace>,
     pub fault_around_chunks: usize,
-    /// Advisory capture-time trace, delivered concurrently with the drain.
-    pub migration_trace: Option<PathBuf>,
-    pub recorder_window: Duration,
-    pub trace_output: Option<PathBuf>,
+    /// Peer mode: the advisory hot-set hint, read concurrently with the
+    /// drain (see [`crate::hot_hint`]).
+    pub migration_hint: Option<PathBuf>,
+    /// Where the first-touch record and the prefault stats go.
+    pub report_dir: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
     /// ADR 0045 C2: post-copy peer mode (session already sealed) +
     /// the optional control-sock reporter.
@@ -2555,13 +2325,11 @@ pub fn run_listener(
     backend: Arc<ChunkedMemoryBackend>,
     handle: TokioHandle,
     opts: RunListenerOpts,
-) -> Result<WorkingSetTrace, HandlerError> {
+) -> Result<(), HandlerError> {
     let RunListenerOpts {
-        mut prefault_trace,
         fault_around_chunks,
-        migration_trace,
-        recorder_window,
-        trace_output,
+        migration_hint,
+        report_dir,
         base_shm,
         peer,
         sealed_output,
@@ -2584,10 +2352,10 @@ pub fn run_listener(
         total_bytes = total,
         "handshake complete",
     );
-    let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window, base_shm)?;
+    let mut rt = Runtime::new(mappings, uffd, backend, handle, base_shm)?;
     rt.fault_around_chunks = fault_around_chunks;
-    if let Some(path) = trace_output {
-        rt.set_trace_output(path);
+    if let Some(dir) = report_dir {
+        rt.set_report_dir(dir);
     }
     if let Some((session, control)) = peer {
         rt.set_peer(session, control);
@@ -2600,18 +2368,10 @@ pub fn run_listener(
             }
         }
     }
-    // ADR 0043 P1: run the working-set prefault as a BACKGROUND producer
-    // concurrent with the fault loop, instead of blocking resume on it.
-    // vCPUs run the instant Firecracker resumes; any page the guest touches
-    // before the prefault reaches it is served on-demand by the fault loop.
-    // This is safe to run in parallel: `install_chunk_at` is idempotent via
-    // the per-chunk `installed` bitmap (whichever of prefault/fault installs
-    // first wins, the other skips), and `serve_pagefault` explicitly wakes a
-    // vCPU whose fault raced ahead of a prefault install (the `wake_page`
-    // path). `Uffd` is `Send + Sync` (a `RawFd`) and every install path is
-    // mutex-guarded, so sharing the `Runtime` across the two threads is
-    // sound. Previously prefault ran to completion before `run()`, which put
-    // the entire working-set fetch on the resume critical path.
+    // ADR 0043 P1: the drain and the sweep run on a BACKGROUND producer
+    // concurrent with the fault loop; vCPUs run the instant Firecracker
+    // resumes. The claim table makes each install exactly-once, and a fault
+    // that finds its chunk installed by the producer wakes its vCPU.
     let rt = Arc::new(rt);
     {
         let rt = Arc::clone(&rt);
@@ -2651,9 +2411,9 @@ pub fn run_listener(
             .name("engram-uffd-prefault".to_string())
             .spawn(move || {
                 let (hint_tx, mut hint_rx) = tokio::sync::oneshot::channel();
-                let hint_task = migration_trace.map(|path| rt.handle.spawn(async move {
-                    match crate::working_set::load_migration_trace(&path).await {
-                        Ok(trace) => { let _ = hint_tx.send(trace); }
+                let hint_task = migration_hint.map(|path| rt.handle.spawn(async move {
+                    match crate::hot_hint::load(&path).await {
+                        Ok(hot) => { let _ = hint_tx.send(hot); }
                         Err(error) => tracing::info!(%error, "migration hint unavailable; drain continues"),
                     }
                 }));
@@ -2666,14 +2426,13 @@ pub fn run_listener(
                 // ADR 0045 C2: in peer mode the sealed drain runs FIRST —
                 // sealed content exists only in the paused source, so
                 // draining it is what releases the source, and it makes
-                // the trace prefault + sweep below trivially safe (every
-                // sealed chunk is installed before their stale resolve()
-                // view could touch it). A drain failure is PeerLost:
+                // the sweep below trivially safe (every sealed chunk is
+                // installed before its stale resolve() view could touch it). A drain failure is PeerLost:
                 // report and stop producing — the host-agent rewinds the
                 // whole VM; warming a doomed guest is wasted I/O.
                 if let Some(peer) = rt.peer.clone() {
                     let started = std::time::Instant::now();
-                    let outcome = rt.drain_with_hint(&peer, &mut prefault_trace, &mut || hint_rx.try_recv().ok());
+                    let outcome = rt.drain_with_hint(&peer, &[], &mut || hint_rx.try_recv().ok());
                     if let Some(task) = hint_task { task.abort(); }
                     match outcome {
                         Ok(stats) => {
@@ -2743,21 +2502,9 @@ pub fn run_listener(
                         }
                     }
                 }
-                // Hot set first (when a trace exists), then the eager
-                // full sweep covers everything else — so by the time
-                // the guest touches ANY page, the odds it must round-
-                // trip the fault loop shrink to the race window. The
-                // sweep is what kills the migration-restore crawl: no
-                // host trace exists on a fresh dest, and the divergent
-                // chunk set otherwise faults in serially (ADR 0045).
-                if let Some(trace) = prefault_trace {
-                    if let Err(e) = rt.prefault_from_trace(&trace) {
-                        tracing::warn!(
-                            error = %e,
-                            "background prefault failed; remaining pages serve on-demand",
-                        );
-                    }
-                }
+                // The eager sweep installs what the cache holds, so by
+                // the time the guest touches a page, the odds it must
+                // round-trip the fault loop shrink to the race window.
                 if let Err(e) = rt.sweep_all() {
                     tracing::warn!(
                         error = %e,
@@ -2765,15 +2512,10 @@ pub fn run_listener(
                     );
                 }
                 // Review finding 6: patch the peer-drain snapshot onto
-                // `prefault-stats.json`, read-modify-write. Runs strictly
-                // after `prefault_from_trace`'s own internal write (just
-                // above) and after `main.rs`'s early `trace_loaded: false`
-                // write (which happens before this thread even starts) —
-                // sequential code on this one background thread, so this is
-                // always the LAST writer and can never be clobbered by an
-                // earlier one. A missing/corrupt file at this point (the
-                // handler died before either wrote) is left alone: patching
-                // a stats-missing state into a fabricated file would defeat
+                // `prefault-stats.json`, read-modify-write, after `main.rs`'s
+                // startup write. A missing/corrupt file at this point (the
+                // handler died before that write) is left alone: patching a
+                // stats-missing state into a fabricated file would defeat
                 // the alarm finding 1 exists to protect.
                 if let Some(peer_drain_stats) = peer_drain_stats {
                     if let Some(path) = rt.prefault_stats_path() {
@@ -2796,14 +2538,12 @@ pub fn run_listener(
     tracing::info!(pid, ?result, "fault loop returned");
     fault_stats::STATS.log("exit");
     rt.stop_fault_window();
-    // Join the prefault producer before freezing the recorder so it's
-    // quiesced. Once the uffd closes (FC exited) the prefault's next install
-    // errors out, so this returns promptly rather than blocking teardown.
+    // Once the uffd closes (FC exited) the producer's next install errors
+    // out, so this join returns promptly rather than blocking teardown.
     if let Ok(handle) = prefault_thread {
         let _ = handle.join();
     }
-    result?;
-    Ok(rt.finish_recorder())
+    result
 }
 
 #[cfg(test)]
@@ -2826,9 +2566,7 @@ mod tests {
     #[test]
     fn prefault_stats_serialize_write_read_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let trace_output = dir.path().join("working-set-trace.json");
-        let stats_path = prefault_stats_path(&trace_output).expect("sibling path resolves");
-        assert_eq!(stats_path, dir.path().join(PREFAULT_STATS_FILE));
+        let stats_path = dir.path().join(PREFAULT_STATS_FILE);
 
         let stats = PrefaultStats {
             trace_loaded: true,
@@ -2858,34 +2596,9 @@ mod tests {
         );
     }
 
-    /// The `trace_loaded: false` shape main.rs writes for the no-trace
-    /// case (either no trace was requested, or the requested one failed
-    /// to load) — distinguishable from a `stats_missing` (file absent
-    /// entirely) read on the host-agent side.
-    #[test]
-    fn prefault_stats_no_trace_shape_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let trace_output = dir.path().join("working-set-trace.json");
-        let stats_path = prefault_stats_path(&trace_output).unwrap();
-
-        let stats = PrefaultStats {
-            trace_loaded: false,
-            ..Default::default()
-        };
-        write_prefault_stats(&stats_path, &stats);
-
-        let read_back: PrefaultStats =
-            serde_json::from_slice(&std::fs::read(&stats_path).unwrap()).unwrap();
-        assert!(!read_back.trace_loaded);
-        assert_eq!(read_back.chunks_in_trace, 0);
-        assert_eq!(read_back.installed, 0);
-        assert_eq!(read_back.skipped, 0);
-    }
-
     /// Review finding 6 regression test: the peer-drain snapshot patches
-    /// onto an EXISTING stats file (either shape `prefault_from_trace` or
-    /// `main.rs`'s no-trace path could have written) without disturbing
-    /// the fields that writer already set.
+    /// onto an EXISTING stats file without disturbing the fields that
+    /// writer already set.
     #[test]
     fn patch_peer_fields_preserves_existing_trace_fields() {
         let base = PrefaultStats {
@@ -2927,17 +2640,15 @@ mod tests {
         assert!(patch_peer_fields(Some(b"not json"), (1, 2, 3, 4, 0, false)).is_none());
     }
 
-    /// ADR 0043 P1: the prefault now runs on a background thread CONCURRENT
-    /// with the fault loop instead of fully ahead of it. Prove the two install
-    /// paths race safely: a `prefault_from_trace` thread and a `serve_pagefault`
-    /// thread, with an overlapping chunk range, must between them install every
-    /// chunk EXACTLY once (the `installed` bitmap serialises the check-and-set)
+    /// ADR 0043 P1: the sweep runs on a background thread CONCURRENT with
+    /// the fault loop. A sweep thread and a `serve_pagefault` thread, with an
+    /// overlapping chunk range, must between them install every chunk
+    /// EXACTLY once (the `installed` bitmap serialises the check-and-set)
     /// and leave the guest region byte-correct — no double-`UFFDIO_COPY`
-    /// (`EEXIST`), no corruption, no panic. This is the core safety property the
-    /// concurrent restructure relies on (the wake-a-blocked-vCPU half is
-    /// `wake_page`, unchanged + covered by the FC UFFD integration tests).
+    /// (`EEXIST`), no corruption, no panic. (The wake-a-blocked-vCPU half is
+    /// `wake_page`, covered by the FC UFFD integration tests.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn concurrent_prefault_and_faults_install_every_chunk_once_and_correctly() {
+    async fn concurrent_sweep_and_faults_install_every_chunk_once_and_correctly() {
         let page_size = 4096u64;
         let chunk_size = page_size; // one page per chunk keeps the math simple
         let n_chunks = 16usize;
@@ -2949,7 +2660,6 @@ mod tests {
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = ChunkStore::new(blob);
         let mut entries = Vec::with_capacity(n_chunks);
-        let mut hashes = Vec::with_capacity(n_chunks);
         for i in 0..n_chunks {
             let tag = (i as u8).wrapping_add(1);
             let hash = store
@@ -2960,7 +2670,6 @@ mod tests {
                 offset: i as u64 * chunk_size,
                 hash,
             });
-            hashes.push(hash);
         }
         let manifest = Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -2969,7 +2678,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3029,29 +2737,19 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
         );
 
-        // Two install paths race with an OVERLAP in the middle quarter
-        // [n/4, 3n/4): the prefault thread covers chunks [0, 3n/4); the
-        // "fault server" thread serves chunks [n/4, n). Every chunk is covered
-        // by at least one path; the overlap forces the bitmap to arbitrate.
-        // Both call `handle.block_on`, so they MUST run on plain threads (not
-        // tokio workers) — exactly as the handler runs on a spawn_blocking thread.
+        // Two install paths race: the sweep covers every chunk; the "fault
+        // server" thread serves chunks [n/4, n). Both call
+        // `handle.block_on`, so they MUST run on plain threads (not tokio
+        // workers) — exactly as the handler runs on a spawn_blocking thread.
         let base = ptr as u64;
-        // Build the trace the way production does — observe the first 3/4 of
-        // the chunks into a recorder, then freeze it.
-        let mut recorder = WorkingSetRecorder::new(1, Duration::from_secs(60));
-        for h in hashes.iter().take(3 * n_chunks / 4) {
-            recorder.observe(*h);
-        }
-        let trace = recorder.finish();
         let rt_pf = Arc::clone(&rt);
         let prefault = std::thread::spawn(move || {
-            rt_pf.prefault_from_trace(&trace).expect("prefault");
+            rt_pf.sweep_all().expect("sweep");
         });
         let rt_sf = Arc::clone(&rt);
         let server = std::thread::spawn(move || {
@@ -3188,7 +2886,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3328,7 +3025,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -3336,12 +3032,11 @@ mod tests {
         let rt = Arc::new(rt);
 
         // Producer order, exactly as run_listener does it: drain, then
-        // prefault, then sweep. Off the tokio workers (block_on inside).
+        // sweep. Off the tokio workers (block_on inside).
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
         let kind = hint_kind.to_owned();
-        let mut trace = WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
-        trace.chunks = match hint_kind {
+        let hot = match hint_kind {
             "installed" => vec![manifest.chunks[1].hash],
             "in-flight" => vec![manifest.chunks[3].hash],
             "unsealed" | "late-unsealed" => {
@@ -3351,16 +3046,15 @@ mod tests {
         };
         let stats = std::thread::spawn(move || {
             let mut delivered = false;
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<WorkingSetTrace>();
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<Vec<ChunkHash>>();
             let _pending = if kind == "failed" {
                 drop(tx);
                 None
             } else {
                 Some(tx)
             };
-            let mut hot = None;
             let stats = rt_drain
-                .drain_with_hint(&sess, &mut hot, &mut || {
+                .drain_with_hint(&sess, &[], &mut || {
                     // An unresolved or failed delivery must not gate the first request.
                     if kind == "unavailable" || kind == "failed" {
                         return rx.try_recv().ok();
@@ -3375,16 +3069,13 @@ mod tests {
                     }
                     delivered = true;
                     Some(if kind == "empty" {
-                        WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH)
+                        Vec::new()
                     } else {
-                        trace.clone()
+                        hot.clone()
                     })
                 })
                 .expect("advisory hints cannot fail the drain");
             rt_drain.mark_drain_done();
-            if let Some(trace) = hot {
-                rt_drain.prefault_from_trace(&trace).expect("prefault");
-            }
             rt_drain.sweep_all().expect("sweep");
             stats
         })
@@ -3419,8 +3110,8 @@ mod tests {
         drop(requests);
 
         // Only unsealed durable reads matter here: sealed AltSource reads
-        // happen during the drain. The hint must move late unsealed chunks
-        // ahead of offset zero, preserving the source's merged trace order.
+        // happen during the drain. The hint orders only the drain: the
+        // sweep reads the unsealed chunks in offset order.
         let unsealed = [0, 2, 4, 6, 7];
         let fetched: Vec<_> = durable
             .fetched
@@ -3434,14 +3125,9 @@ mod tests {
                     .find(|&i| key == &manifest.chunks[i].hash.storage_key())
             })
             .collect();
-        // The sweep skips the installed hot chunks, so each chunk is fetched once.
         assert_eq!(
             fetched,
-            if matches!(hint_kind, "unsealed" | "late-unsealed") {
-                vec![7, 6, 0, 2, 4]
-            } else {
-                vec![0, 2, 4, 6, 7]
-            },
+            vec![0, 2, 4, 6, 7],
             "unsealed durable fetch order ({hint_kind})"
         );
 
@@ -3518,7 +3204,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3642,7 +3327,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -3651,7 +3335,7 @@ mod tests {
 
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
-        let stats = std::thread::spawn(move || rt_drain.drain_from_peer(&sess, None))
+        let stats = std::thread::spawn(move || rt_drain.drain_from_peer(&sess, &[]))
             .join()
             .unwrap()
             .expect("drain must SUCCEED through the per-request error, not rewind");
@@ -3719,7 +3403,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -3852,7 +3535,6 @@ mod tests {
             uffd,
             backend,
             tokio::runtime::Handle::current(),
-            Duration::ZERO,
             None,
         )
         .unwrap();
@@ -3954,7 +3636,6 @@ mod tests {
             total_bytes: total,
             chunks: entries,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -4031,7 +3712,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
@@ -4181,7 +3861,6 @@ mod tests {
             total_bytes: total,
             chunks: Vec::new(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -4235,7 +3914,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),
@@ -4308,7 +3986,7 @@ mod tests {
         let drain_rt = rt.clone();
         let drain_peer = peer.clone();
         let drain = std::thread::spawn(move || {
-            let result = drain_rt.drain_from_peer(&drain_peer, None);
+            let result = drain_rt.drain_from_peer(&drain_peer, &[]);
             drain_rt.mark_drain_done();
             done_tx.send(result).unwrap();
         });
@@ -4393,7 +4071,7 @@ mod tests {
         let drain_peer = peer.clone();
         let drain = std::thread::spawn(move || {
             done_tx
-                .send(drain_rt.drain_from_peer(&drain_peer, None))
+                .send(drain_rt.drain_from_peer(&drain_peer, &[]))
                 .unwrap();
         });
         let stats = done_rx
@@ -4507,7 +4185,6 @@ mod tests {
                 total_bytes: 8192,
                 chunks: vec![ChunkRef { offset: 4096, hash }],
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             };
             let path = dir.path().join("populate.sock");
@@ -4792,7 +4469,7 @@ mod tests {
         assert!(rt.try_request(1));
         let drain_rt = rt.clone();
         let drain_peer = peer.clone();
-        let drain = std::thread::spawn(move || drain_rt.drain_from_peer(&drain_peer, None));
+        let drain = std::thread::spawn(move || drain_rt.drain_from_peer(&drain_peer, &[]));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while ![0, 2, 3].iter().all(|i| rt.chunk_installed(*i)) {
             assert!(
@@ -5218,7 +4895,6 @@ mod tests {
             total_bytes: total,
             chunks: vec![ChunkRef { offset: 0, hash }],
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
@@ -5276,7 +4952,6 @@ mod tests {
                 uffd,
                 backend,
                 tokio::runtime::Handle::current(),
-                Duration::ZERO,
                 None,
             )
             .unwrap(),

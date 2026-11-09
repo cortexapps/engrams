@@ -7,9 +7,8 @@ use std::sync::Mutex;
 
 use engram_chunk_store::FirstTouch;
 
-/// Each chunk index once, in order, with the time it was recorded: a chunk
-/// the guest faults on, and a chunk the trace prefault installs (a
-/// producer that installs a chunk early hides the guest's fault on it).
+/// Each chunk index once, in order, with the time the guest first faulted
+/// on it.
 ///
 /// The previous run's published prefix is *carried*: its chunks are
 /// recorded like any other, when the guest touches them, so a chunk the
@@ -39,7 +38,7 @@ struct Inner {
 pub struct WindowStats {
     /// Chunks of the carried prefix.
     pub carried: usize,
-    /// Carried chunks the guest touched (or the trace prefault installed).
+    /// Carried chunks the guest touched.
     pub carried_used: usize,
 }
 
@@ -74,7 +73,7 @@ impl FirstTouchRecorder {
         }
     }
 
-    /// Note a fault (or a trace install) on chunk `idx` now. Later notes on
+    /// Note a fault on chunk `idx` now. Later notes on
     /// the same chunk, and an index past the end, are ignored.
     pub fn touch(&self, idx: usize) {
         self.touch_at(idx, || chrono::Utc::now().timestamp_millis());

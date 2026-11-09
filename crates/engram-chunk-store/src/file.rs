@@ -124,7 +124,6 @@ impl ChunkStore {
             total_bytes,
             chunks: Vec::new(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
 
@@ -569,7 +568,6 @@ impl ChunkStore {
                 total_bytes,
                 chunks: by_offset.into_values().collect(),
                 parent: prev.parent,
-                working_set_trace: prev.working_set_trace,
                 annotations: prev.annotations.clone(),
             },
             new_hashes,
@@ -1233,7 +1231,6 @@ mod tests {
                 hash: phantom,
             }],
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
 

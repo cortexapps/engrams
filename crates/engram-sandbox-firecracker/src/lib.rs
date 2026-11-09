@@ -425,15 +425,9 @@ fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], second, 0, 0)
 }
 
-/// ADR 0045 C2 (E2B fold): per-jail working-set trace dump filename —
-/// the uffd-handler's fault-order hot set, read best-effort by the
-/// migration capture for the `hot_chunks` rider.
-pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
-
 /// ADR 0019 / telemetry restoration (#526): per-jail prefault-
-/// effectiveness snapshot filename, written by the uffd-handler as a
-/// sibling of [`WORKING_SET_TRACE_FILE`] in the same jail dir. Must
-/// stay in sync with `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`
+/// effectiveness snapshot filename, written by the uffd-handler in the
+/// jail dir (its `--report-dir`). Must stay in sync with `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`
 /// (duplicated, not shared, by design — the two binaries don't depend
 /// on each other; the filename is the contract).
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
@@ -482,10 +476,6 @@ pub const POST_COPY_SEALED_FILE: &str = "postcopy-sealed.bin";
 /// snapshot dir to arm a POST-COPY restore (peer-mode handler spawn,
 /// state.bin appears late via the fetch poller).
 pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
-
-/// The final source hot trace, staged by the destination poller in the
-/// snapshot directory. The handler reads this advisory file concurrently with drain.
-pub const MIGRATION_HOT_TRACE_FILE: &str = "migration-hot-trace.json";
 
 /// ADR 0045 C2: `migration-peer.json` content.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -584,15 +574,6 @@ pub struct FirecrackerConfig {
     /// TCP port for the session-scoped guest gateway. Iptables redirects guest
     /// 169.254.169.254:80 here for native services and compatibility adapters.
     pub guest_gateway_port: Option<u16>,
-    /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
-    /// the FC sidecar JSON at snapshot time (so cross-host restore
-    /// knows which host's working-set trace to prefault) AND
-    /// passed to the UFFD handler at restore time as
-    /// `--publish-trace-host` (so the recorder publishes this
-    /// host's trace under the right key). `None` keeps the
-    /// pre-Phase-5 behaviour: traces aren't recorded or replayed,
-    /// every restore pays full first-fault cost.
-    pub host_id: Option<engram_core::HostId>,
     /// ADR 0007 Phase 5: NVMe-backed chunk cache dir handed to
     /// `engram-uffd-handler` as `--cache-root`. `None` falls back
     /// to the handler's compiled-in default
@@ -842,7 +823,6 @@ impl FirecrackerConfig {
             restore_mode: RestoreMode::File,
             track_dirty_pages: false,
             balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
-            host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
             uffd_blob_root: None,
@@ -1026,28 +1006,9 @@ struct FcSnapshotManifest {
     /// with PooledBackend+chunk_store or switch to RestoreMode::File.
     #[serde(default)]
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    /// ADR 0007 / Phase 5: hint about whose working-set trace to
-    /// prefault on the restoring host. Set to the snapshotting
-    /// host's `HostId` so cross-host restore can ask
-    /// `traces/<manifest_id>/<this_hint>.json` for the chunks
-    /// the original host knew were hot. `None` skips trace replay
-    /// (pre-Phase-5 snapshots or hosts that didn't have a
-    /// `HostId` configured on FC). Note: this is a HINT — the
-    /// recorder on the restoring host still publishes its own
-    /// trace under its own host id, so subsequent restores on
-    /// this host use the local recording.
-    #[serde(default)]
-    trace_host_hint: Option<engram_core::HostId>,
-    /// Tier 2 (resume-prefault fix): a **session-stable** id (the session
-    /// id) that keys this session's working-set trace across ALL of its
-    /// checkpoints. Unlike `memory_manifest` (a fresh `ManifestRef` minted
-    /// every snapshot), this is constant for the session's life, so the
-    /// handler's prefault-replay on resume finds the trace the prior life
-    /// published (`traces/<trace_lineage_id>/canonical.json`) instead of
-    /// looking under a per-checkpoint manifest id that never matches.
-    /// Stamped by the host-agent at snapshot-finish. `None` on base
-    /// snapshots and pre-Tier-2 checkpoints (the handler then falls back to
-    /// the per-host manifest key — today's always-miss-on-resume behavior).
+    /// The session id, under which the session's first-touch prefix is
+    /// published. Stamped by the host-agent at snapshot-finish; `None` on
+    /// base snapshots.
     #[serde(default)]
     trace_lineage_id: Option<engram_core::SessionId>,
     /// ADR 0014 M1.11: the exact `path_on_host` the bake's FC
@@ -2102,20 +2063,6 @@ impl FirecrackerBackend {
         Ok((socket, child, guard))
     }
 
-    /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
-    /// wait until it's listening on `uffd_uds`. `canonical_ref` +
-    /// `session_ref` identify the manifests it reads from the chunk
-    /// store; it serves every fault from chunks (no `memory.bin`).
-    /// `prefault_trace_host` optionally points at a host's prior
-    /// working-set recording for REAP-style replay; `publish_trace_host`
-    /// names the host the recorder publishes the new trace under on
-    /// clean shutdown.
-    ///
-    /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
-    /// snapshot-restore failure has a recoverable diagnostic.
-    /// Returns the live `Child` so the caller can hold it for the
-    /// VM's lifetime.
-    #[allow(clippy::too_many_arguments)]
     /// ADR 0045 substrate (v2b): the per-template base shm path for a
     /// canonical manifest, or `None` when the substrate is off. The
     /// handler spawn passes it as `--base-shm`; the FC load maps only what
@@ -2130,11 +2077,17 @@ impl FirecrackerBackend {
             .map(|dir| uffd_base_path_in(dir, canonical_ref))
     }
 
-    #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
-    // 8 args: the migration manifest file is a restore-time input
-    // orthogonal to the trace/publish hosts; a params struct is the
-    // cleanup when the next arg arrives.
+    /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
+    /// wait until it's listening on `uffd_uds`. `canonical_ref` +
+    /// `session_ref` identify the manifests it reads from the chunk
+    /// store; it serves every fault from chunks (no `memory.bin`).
+    ///
+    /// Stdout/stderr go into the jail dir's `uffd-handler.log` so a
+    /// snapshot-restore failure has a recoverable diagnostic.
+    /// Returns the live `Child` so the caller can hold it for the
+    /// VM's lifetime.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
@@ -2145,12 +2098,7 @@ impl FirecrackerBackend {
         // reads them from disk instead of the blob store.
         canonical_manifest_json: Option<&Path>,
         session_manifest_json: Option<&Path>,
-        prefault_trace_host: Option<uuid::Uuid>,
-        publish_trace_host: Option<uuid::Uuid>,
-        // Tier 2 (resume-prefault fix): the session-stable trace key (the
-        // session id). When set, the handler keys prefault-replay + publish
-        // by this id under the canonical variant, so a resumed session finds
-        // the trace its own prior life recorded.
+        // The session id: the handler reads its first-touch prefix.
         trace_key: Option<uuid::Uuid>,
         jail_dir: &Path,
         // ADR 0045 C2: post-copy peer mode. The handler dials the
@@ -2213,41 +2161,13 @@ impl FirecrackerBackend {
                 .arg("--base-shm-ack")
                 .arg(ack);
         }
-        // The destination poller atomically stages the capture-time rider in
-        // the snapshot directory. Hint reads run independently: neither the drain
-        // nor the fault loop or Firecracker resume waits for this file.
-        let migration_hot_trace = if let Some(peer) = peer {
-            let dir = session_manifest_json
-                .and_then(Path::parent)
-                .ok_or_else(|| vm_err("post-copy requires a staged session manifest"))?;
-            Some(dir.join(&peer.hot_trace_file))
-        } else {
-            None
-        };
-        if let Some(path) = migration_hot_trace.as_ref() {
-            cmd.arg("--prefault-trace")
-                .arg(format!("file:{}", path.display()));
-        } else if let Some(host) = prefault_trace_host {
-            cmd.arg("--prefault-trace").arg(host.to_string());
-        }
-        if let Some(host) = publish_trace_host {
-            cmd.arg("--publish-trace-host").arg(host.to_string());
-        }
-        // Tier 2 (resume-prefault fix): the per-session stable trace key.
-        // Keyed under the canonical variant (`traces/<key>/canonical.json`)
-        // for both replay and publish, so life N's recorded working-set
-        // trace lands exactly where life N+1's resume looks — unlike the
-        // per-checkpoint `session_manifest.manifest_id`, which is minted
-        // fresh each snapshot and so always missed on resume.
         if let Some(key) = trace_key {
             cmd.arg("--trace-key").arg(key.to_string());
         }
-        // ADR 0045 C2 (E2B fold): production spawns default to a
-        // PER-JAIL trace file — the migration capture reads it to ship
-        // the `hot_chunks` rider (the publish-trace-host channel only
-        // lands at handler EXIT, which is too late for a live move).
-        cmd.arg("--trace-output")
-            .arg(jail_dir.join(WORKING_SET_TRACE_FILE));
+        // The jail dir holds the first-touch record, which the migration
+        // capture reads for the `hot_chunks` rider and the host-agent
+        // publishes for the session's next restore.
+        cmd.arg("--report-dir").arg(jail_dir);
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
         }
@@ -2258,6 +2178,14 @@ impl FirecrackerBackend {
                 .arg(jail_dir.join(UFFD_CONTROL_SOCK_FILE));
             cmd.arg("--sealed-output")
                 .arg(jail_dir.join(POST_COPY_SEALED_FILE));
+            // The destination poller stages the source's hot-set hint in
+            // the snapshot dir. Neither the drain nor the fault loop nor
+            // the Firecracker resume waits for this file.
+            let dir = session_manifest_json
+                .and_then(Path::parent)
+                .ok_or_else(|| vm_err("post-copy requires a staged session manifest"))?;
+            cmd.arg("--migration-hint")
+                .arg(dir.join(&peer.hot_trace_file));
             // Token via env: argv leaks on /proc/*/cmdline.
             cmd.env("ENGRAM_PEER_TOKEN", &peer.peer_token);
         }
@@ -3304,10 +3232,6 @@ impl FirecrackerBackend {
                             Err(_) => None,
                         }
                     };
-                    // Prefault from the capture host's trace; publish this
-                    // host's own.
-                    let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
-                    let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
                     let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
                     let (handler, uffd_guard) = self
                         .spawn_uffd_handler(
@@ -3316,8 +3240,6 @@ impl FirecrackerBackend {
                             session_ref,
                             canonical_json.as_deref(),
                             session_json.as_deref(),
-                            prefault_host,
-                            publish_host,
                             trace_key,
                             jail_dir,
                             peer_spec.as_ref(),
@@ -5124,20 +5046,17 @@ impl SandboxBackend for FirecrackerBackend {
         self.config.track_dirty_pages
     }
 
-    /// ADR 0045 C2 (E2B fold): the per-jail trace dump the spawn wires
-    /// via `--trace-output`.
-    fn working_set_trace_path(&self, id: SandboxId) -> Option<PathBuf> {
+    /// The first-touch record the handler writes in its `--report-dir`.
+    fn first_touch_path(&self, id: SandboxId) -> Option<PathBuf> {
         Some(
             self.work_dir
                 .join(id.to_string())
-                .join(WORKING_SET_TRACE_FILE),
+                .join(engram_chunk_store::FirstTouch::FILE),
         )
     }
 
     /// ADR 0019 / telemetry restoration (#526): the per-jail prefault
-    /// stats sibling of `working_set_trace_path`, written by the
-    /// uffd-handler at the end of `prefault_from_trace` (or, for the
-    /// no-trace case, from its own startup path).
+    /// stats, written by the uffd-handler at startup.
     ///
     /// `None` unless a uffd-handler actually exists for this sandbox
     /// (`uffd_pid.is_some()` — populated for `RestoreMode::Uffd`
@@ -6590,10 +6509,7 @@ async fn destroy_teardown(
     // holds via SCM_RIGHTS doesn't auto-close — `read_event()`
     // blocks indefinitely. Send SIGTERM so the kernel-default
     // handler kills the process; if that doesn't take effect
-    // within a short window, escalate to SIGKILL. ADR 0014 M1.14
-    // relies on the handler having already flushed `--trace-output`
-    // by the time we get here, so the write must happen earlier
-    // (the runtime dumps after the recorder window closes).
+    // within a short window, escalate to SIGKILL.
     // We own a `Child` for a handler spawned in THIS host-agent
     // generation; for a pidfd-reattached one we only have the pid
     // (`uffd_pid`, ADR 0044 K2). Either way: SIGTERM, then escalate to
@@ -6905,10 +6821,8 @@ impl FirecrackerBackend {
             net: net_snapshot,
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest,
-            trace_host_hint: self.config.host_id,
-            // Tier 2 (resume-prefault fix): the FC backend is session-
-            // agnostic, so it can't know the session id here; the host-agent
-            // patches this to the session id at snapshot-finish.
+            // The FC backend is session-agnostic; the host-agent patches
+            // this to the session id at snapshot-finish.
             trace_lineage_id: None,
             source_rootfs_canonical,
             source_harness_canonical: None,
@@ -7123,14 +7037,9 @@ impl FirecrackerBackend {
             // in-place after FC returns (the bare backend can't
             // chunk memory.bin without a chunk-store wiring).
             memory_manifest: None,
-            // ADR 0007 Phase 5: snapshotting host's id, so cross-
-            // host restore can request this host's recorded
-            // trace via `--prefault-trace <hint>`. Set from FC
-            // config; falls back to None when not wired.
-            trace_host_hint: self.config.host_id,
             source_swap_canonical,
-            // Tier 2 (resume-prefault fix): patched to the session id by the
-            // host-agent at snapshot-finish (session-agnostic here).
+            // The host-agent patches this to the session id at
+            // snapshot-finish (session-agnostic here).
             trace_lineage_id: None,
             // ADR 0014 M1.11: canonical paths embedded in FC's
             // state.bin. Cross-host restore reads these to recreate
@@ -7483,7 +7392,6 @@ mod tests {
             egress_proxy_port: None,
             egress_dns_port: None,
             guest_gateway_port: None,
-            host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
             uffd_blob_root: None,
@@ -7790,7 +7698,6 @@ mod tests {
             net: None,
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
-            trace_host_hint: None,
             trace_lineage_id: None,
             source_rootfs_canonical: None,
             source_swap_canonical: None,
@@ -7838,7 +7745,6 @@ mod tests {
             }),
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
-            trace_host_hint: None,
             trace_lineage_id: None,
             source_rootfs_canonical: None,
             source_swap_canonical: None,

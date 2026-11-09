@@ -499,7 +499,6 @@ mod tests {
             egress_proxy_port: None,
             egress_dns_port: None,
             guest_gateway_port: None,
-            host_id: None,
             uffd_cache_root: None,
             uffd_blob_root: None,
             cpu_template: None,
