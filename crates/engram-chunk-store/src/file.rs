@@ -86,12 +86,12 @@ impl ChunkStore {
         kind: ManifestKind,
         chunk_size: Option<u64>,
     ) -> Result<Manifest> {
-        self.chunk_file_into(path, kind, chunk_size, None)
+        self.chunk_file_into(path, kind, chunk_size)
             .await
             .map(|(manifest, _)| manifest)
     }
 
-    /// [`Self::chunk_file`] with progress reports and phase timings. Each
+    /// [`Self::chunk_file`] with phase timings. Each
     /// chunk goes in through [`Self::put_chunk_bytes`], so a store with a
     /// local cache also keeps the chunk on this host.
     pub async fn chunk_file_into(
@@ -99,17 +99,11 @@ impl ChunkStore {
         path: &Path,
         kind: ManifestKind,
         chunk_size: Option<u64>,
-        // Called after each window flush (and once at the end) with
-        // (windows_scanned, windows_total) — windows_total counts
-        // zero-elided windows too, so callers get a monotone fraction
-        // with a known denominator (the enable UI's progress bar).
-        progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     ) -> Result<(Manifest, ChunkFileStats)> {
         let chunk_size = chunk_size.unwrap_or_else(|| kind.default_chunk_size());
         let file = fs::File::open(path).await?;
         let meta = file.metadata().await?;
         let total_bytes = meta.len();
-        let windows_total = total_bytes.div_ceil(chunk_size);
 
         let mut manifest = Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -171,16 +165,12 @@ impl ChunkStore {
         let mut inflight = tokio::task::JoinSet::new();
         let mut refs: Vec<ChunkRef> = Vec::new();
         let mut done_reading = false;
-        let mut scanned_hi: u64 = 0;
-        let mut completed: u64 = 0;
         let issue = |offset: u64,
                      bytes: Bytes,
                      stats: &mut ChunkFileStats,
-                     scanned_hi: &mut u64,
                      inflight: &mut tokio::task::JoinSet<_>| {
             stats.chunks_uploaded += 1;
             stats.bytes_uploaded += bytes.len() as u64;
-            *scanned_hi = (*scanned_hi).max(offset + bytes.len() as u64);
             // Its own task, so the SHA-256 and the PUT's TLS use every core.
             inflight.spawn(put_one(offset, bytes));
         };
@@ -188,9 +178,7 @@ impl ChunkStore {
             // Top up the in-flight set without blocking.
             while !done_reading && inflight.len() < CHUNK_UPLOAD_CONCURRENCY {
                 match rx.try_recv() {
-                    Ok(Ok((offset, bytes))) => {
-                        issue(offset, bytes, &mut stats, &mut scanned_hi, &mut inflight)
-                    }
+                    Ok(Ok((offset, bytes))) => issue(offset, bytes, &mut stats, &mut inflight),
                     Ok(Err(e)) => return Err(e.into()),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -207,9 +195,7 @@ impl ChunkStore {
                 let item = rx.recv().await;
                 stats.scan_seconds += scan_start.elapsed().as_secs_f64();
                 match item {
-                    Some(Ok((offset, bytes))) => {
-                        issue(offset, bytes, &mut stats, &mut scanned_hi, &mut inflight)
-                    }
+                    Some(Ok((offset, bytes))) => issue(offset, bytes, &mut stats, &mut inflight),
                     Some(Err(e)) => return Err(e.into()),
                     None => done_reading = true,
                 }
@@ -221,26 +207,11 @@ impl ChunkStore {
                 refs.push(done_put.map_err(|e| {
                     crate::error::ChunkStoreError::Internal(format!("chunk upload task: {e}"))
                 })??);
-                completed += 1;
-                if completed.is_multiple_of(SPARSE_RECHUNK_CONCURRENCY as u64) {
-                    if let Some(report) = progress {
-                        // The highest offset issued so far. The scan
-                        // threads send out of offset order, so it lags
-                        // the scan, but it never goes back.
-                        report(
-                            scanned_hi.div_ceil(chunk_size).min(windows_total),
-                            windows_total,
-                        );
-                    }
-                }
             }
         }
         reader
             .await
             .map_err(|e| crate::error::ChunkStoreError::Internal(format!("file scan task: {e}")))?;
-        if let Some(report) = progress {
-            report(windows_total, windows_total);
-        }
         // Puts complete out of order — restore the offset ordering the
         // manifest invariant requires.
         refs.sort_by_key(|c| c.offset);
@@ -952,7 +923,7 @@ mod tests {
         fs::write(&src, &data).await.unwrap();
 
         let (manifest, stats) = s
-            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None)
+            .chunk_file_into(&src, ManifestKind::Memory, Some(cs))
             .await
             .unwrap();
         assert_eq!(manifest.chunks.len(), 3);
@@ -1500,47 +1471,6 @@ mod tests {
         let dest = work.path().join("dest.bin");
         s.materialize_to_file_from(&m, &dest, &s).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
-    }
-
-    /// Progress contract under the streaming pipeline (ADR 0088
-    /// addendum): nondecreasing `done`, constant denominator, final
-    /// call is exactly (total, total).
-    #[tokio::test]
-    async fn chunk_file_progress_is_monotone_with_fixed_denominator() {
-        let (s, _d) = store().await;
-        let work = tempfile::tempdir().unwrap();
-        let cs: u64 = 4096;
-        let n_chunks = CHUNK_UPLOAD_CONCURRENCY * 2 + 9;
-        let mut data = vec![0u8; n_chunks * cs as usize];
-        for c in 0..n_chunks {
-            data[c * cs as usize..(c + 1) * cs as usize].fill(((c % 251) + 1) as u8);
-        }
-        // Two zero windows mixed in: they must count toward `done`.
-        data[3 * cs as usize..4 * cs as usize].fill(0);
-        data[70 * cs as usize..71 * cs as usize].fill(0);
-        let src = work.path().join("big.bin");
-        fs::write(&src, &data).await.unwrap();
-
-        let calls: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
-        let report = |done: u64, total: u64| {
-            calls.lock().unwrap().push((done, total));
-        };
-        let (m, _stats) = s
-            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), Some(&report))
-            .await
-            .unwrap();
-        assert_eq!(m.chunks.len(), n_chunks - 2);
-
-        let calls = calls.lock().unwrap().clone();
-        assert!(!calls.is_empty());
-        let total = n_chunks as u64;
-        let mut prev = 0;
-        for (done, t) in &calls {
-            assert_eq!(*t, total, "denominator must never change");
-            assert!(*done >= prev, "done must be nondecreasing: {calls:?}");
-            prev = *done;
-        }
-        assert_eq!(*calls.last().unwrap(), (total, total));
     }
 
     /// The pipeline must bound in-flight puts at

@@ -529,12 +529,7 @@ pub(crate) async fn chunk_memory_to_store(
     source: &'static str,
 ) -> Result<ManifestRef, SandboxError> {
     let res = chunk_store
-        .chunk_file_into(
-            memory_bin,
-            engram_chunk_store::ManifestKind::Memory,
-            None,
-            None,
-        )
+        .chunk_file_into(memory_bin, engram_chunk_store::ManifestKind::Memory, None)
         .await;
     let outcome = if res.is_ok() { "success" } else { "error" };
     if let Ok((_, stats)) = &res {

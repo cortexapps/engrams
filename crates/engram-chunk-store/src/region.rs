@@ -254,8 +254,8 @@ impl ChunkStore {
     /// the producer calls [`RegionChunker::finish`] and all uploads land.
     ///
     /// `progress(done, total)` counts finalized chunks (uploaded,
-    /// deduped, and zero-elided alike) so callers get the same
-    /// monotone fraction `chunk_file_into` reports.
+    /// deduped, and zero-elided alike), so the fraction is monotone with
+    /// a fixed denominator.
     pub fn region_chunker(
         &self,
         kind: ManifestKind,
@@ -383,7 +383,7 @@ mod tests {
         let path = work.path().join("img.bin");
         std::fs::write(&path, &image).unwrap();
         let (file_manifest, _) = store
-            .chunk_file_into(&path, ManifestKind::Disk, None, None)
+            .chunk_file_into(&path, ManifestKind::Disk, None)
             .await
             .unwrap();
 
