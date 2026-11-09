@@ -1766,9 +1766,9 @@ async fn resume_from_fc_snapshot(
     // wire-compatible, tell the destination where the chunks are
     // resident. Stamped unconditionally BEFORE placement (the pick
     // happens inside restore_for_session): an affinity-host landing
-    // makes the destination's pre-pass a no-op stat walk, a cross-host
-    // landing pulls the divergent set over the LAN, and a dead/absent
-    // source leaves the hint empty ⇒ the pure-GCS path, unchanged.
+    // finds the chunks local, a cross-host landing fetches the chunks it
+    // lacks from the hinted host before the store, and a dead/absent
+    // source leaves the hint empty ⇒ the pure-GCS path.
     // Best-effort by contract: any lookup failure degrades to no hint.
     let peer_hints = match record.host_id {
         Some(source) => match state.services.meta.list_active_hosts().await {

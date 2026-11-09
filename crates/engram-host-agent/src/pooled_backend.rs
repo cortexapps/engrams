@@ -340,45 +340,6 @@ mod first_touch_tests {
     }
 }
 
-/// Land `want` from the snapshot's hinted peers into the chunk cache,
-/// skipping chunks already resident. Best-effort.
-async fn pull_from_peers(
-    cache: &ChunkCache,
-    health: &Arc<crate::peer_fill::PeerHealth>,
-    metadata: &SnapshotMetadata,
-    want: Vec<engram_chunk_store::manifest::ChunkHash>,
-) {
-    let mut seen = std::collections::HashSet::with_capacity(want.len());
-    let mut missing: Vec<_> = want
-        .into_iter()
-        .filter(|h| seen.insert(*h) && !cache.contains_on_disk(*h))
-        .collect();
-    let scope = engram_protocol::grpc_client::PeerChunkScope::Snapshot(metadata.id);
-    let started = crate::time_source::metrics_now();
-    for addr in metadata.peer_hints.iter().take(2) {
-        if missing.is_empty() {
-            return;
-        }
-        let stats =
-            crate::peer_fill::pull_chunks_from_peer(addr, scope.clone(), &missing, cache, health)
-                .await;
-        tracing::info!(
-            snapshot_id = %metadata.id,
-            peer = %addr,
-            landed = stats.landed,
-            missing_on_peer = stats.missing,
-            failed = stats.failed,
-            of = missing.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "peer pull window complete",
-        );
-        if !stats.failed {
-            return;
-        }
-        missing.retain(|h| !cache.contains_on_disk(*h));
-    }
-}
-
 /// The sidecar's `trace_lineage_id`: the session whose traces this
 /// snapshot's restores read.
 async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
@@ -2967,28 +2928,6 @@ impl PooledBackend {
                 tracing::debug!(sandbox_id = %id, error = %e, "hot-set trace parse failed; empty rider");
                 Vec::new()
             }
-        }
-    }
-
-    /// ADR 0095, a peer-hinted resume: the disk is staged before the guest
-    /// boots, so its chunks come from the hinted sibling in bulk first.
-    /// Memory goes through the fill engine with the peer as a tier
-    /// (`restore_with`). Best-effort: a shortfall leaves those chunks to
-    /// the store.
-    async fn peer_resume_prepass(&self, metadata: &SnapshotMetadata) {
-        let (Some(store), Some(cache), Some(r)) = (
-            self.chunk_store.clone(),
-            self.chunk_cache.clone(),
-            metadata.disk_manifest,
-        ) else {
-            return;
-        };
-        match store.get_manifest(r).await {
-            Ok(m) => {
-                let want = m.chunks.iter().map(|c| c.hash).collect();
-                pull_from_peers(&cache, &self.peer_health, metadata, want).await;
-            }
-            Err(e) => tracing::warn!(manifest = %r, error = %e, "peer pre-pass: disk manifest"),
         }
     }
 
@@ -6152,19 +6091,6 @@ impl SandboxBackend for PooledBackend {
             // (restore_in_jail) waits on those files; the handler
             // parks at the page server for the SEAL.
             self.postcopy_stage(&metadata, mig).await?;
-        } else if !metadata.peer_hints.is_empty() {
-            // ADR 0095: peer-hinted ordinary resume — the coordinator
-            // says a live sibling (the snapshot host) holds this
-            // session's chunks on NVMe. Land the locally-missing set
-            // BEFORE the guest resumes, synchronously, for exactly the
-            // reason: the background
-            // version loses the race and the wake-up working set then
-            // faults at GCS round-trip speed. On the affinity host the
-            // missing set is empty (everything resident) and this arm
-            // is a stat walk; on a dead/saturated peer the pull
-            // degrades per the bounded-dial contract and the remainder
-            // faults via GCS — today's path, unchanged.
-            self.peer_resume_prepass(&metadata).await;
         }
         let memory_ref = metadata.memory_manifest;
         // Resume keeps the snapshot's pinned mounts — no per-session selection.
