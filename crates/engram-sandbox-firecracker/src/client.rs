@@ -231,10 +231,7 @@ impl FirecrackerClient {
     ///
     /// With `defer_sync`, Firecracker does not fsync the two files inside
     /// the pause and the caller must sync them before it relies on them
-    /// across a host crash. A Firecracker that does not know the field
-    /// rejects the body before it captures anything; the create then runs
-    /// again without it, so the files come back synced. #1772 removes the
-    /// retry.
+    /// across a host crash.
     pub async fn create_snapshot_at(
         &self,
         state_path: PathBuf,
@@ -254,22 +251,15 @@ impl FirecrackerClient {
         // don't double-resume.
         let mut guard = ResumeOnDrop::arm(self.clone());
 
-        let mut body = SnapshotCreateBody {
+        let body = SnapshotCreateBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_file_path: mem_path.to_string_lossy().into_owned(),
             snapshot_type,
             vmstate_only: false,
             defer_sync,
         };
-        let create = async {
-            let res = self.put("/snapshot/create", &body).await;
-            if defer_sync && res.as_ref().is_err_and(rejects_defer_sync) {
-                body.defer_sync = false;
-                return self.put("/snapshot/create", &body).await;
-            }
-            res
-        };
-        let create_res = create
+        let create_res = self
+            .put("/snapshot/create", &body)
             .instrument(tracing::info_span!("fc.snapshot_create", defer_sync))
             .await;
 
@@ -678,20 +668,6 @@ pub fn is_balloon_device_missing(e: &SandboxError) -> bool {
         SandboxError::Vm(inner) => {
             let msg = inner.to_string();
             msg.contains("/balloon") && msg.contains("-> 400:")
-        }
-        _ => false,
-    }
-}
-
-/// Whether a `PUT /snapshot/create` failed because this Firecracker does
-/// not know `defer_sync`. Its API server rejects an unknown field
-/// (`deny_unknown_fields`) while it parses the body, before the create
-/// runs, so the dirty bitmap is not consumed and a retry is safe.
-fn rejects_defer_sync(e: &SandboxError) -> bool {
-    match e {
-        SandboxError::Vm(inner) => {
-            let msg = inner.to_string();
-            msg.contains("-> 400:") && msg.contains("unknown field `defer_sync`")
         }
         _ => false,
     }
@@ -1345,34 +1321,6 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["vmstate_only"], true);
         assert_eq!(v["defer_sync"], true);
-    }
-
-    /// Only the parse rejection of the field itself allows the retry
-    /// without it; any other create failure stays a failure.
-    #[test]
-    fn only_an_unknown_defer_sync_field_allows_the_retry() {
-        let err_for = |code: u16, fault: &str| {
-            let body = serde_json::json!({ "fault_message": fault }).to_string();
-            let raw = format!("HTTP/1.1 {code} X\r\n\r\n{body}");
-            parse_response("PUT", "/snapshot/create", raw.as_bytes()).unwrap_err()
-        };
-        assert!(rejects_defer_sync(&err_for(
-            400,
-            "An error occurred when deserializing the json body of a request: \
-             unknown field `defer_sync`, expected one of `snapshot_type`, `snapshot_path`"
-        )));
-        assert!(!rejects_defer_sync(&err_for(
-            400,
-            "unknown field `vmstate_only`, expected one of `snapshot_type`"
-        )));
-        assert!(!rejects_defer_sync(&err_for(
-            500,
-            "unknown field `defer_sync`"
-        )));
-        assert!(!rejects_defer_sync(&err_for(
-            400,
-            "Cannot write memory file"
-        )));
     }
 
     #[test]

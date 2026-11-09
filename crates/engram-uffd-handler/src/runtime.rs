@@ -3798,12 +3798,24 @@ mod tests {
             };
             let path = dir.path().join("populate.sock");
             let listener = UnixListener::bind(&path).unwrap();
-            let file_path = dir.path().join("chunk");
-            std::fs::write(&file_path, bytes).unwrap();
+            let slot = tempfile::tempfile().unwrap();
+            slot.set_len(engram_substrate_proto::SLOT_BYTES).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&slot, &bytes, 0).unwrap();
             let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let durable = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
+                let hello: ToWriter = read_frame(&mut socket).unwrap();
+                assert!(matches!(hello, ToWriter::Hello { .. }));
+                write_frame(
+                    &mut socket,
+                    &FromWriter::HelloAck {
+                        tmpfs_ok: true,
+                        cache_writable: true,
+                    },
+                )
+                .unwrap();
+                engram_substrate_proto::send_fd(socket.as_fd(), slot.as_fd()).unwrap();
                 let request: ToWriter = read_frame(&mut socket).unwrap();
                 assert!(matches!(request, ToWriter::Populate { .. }));
                 fetch_tx.send(()).unwrap();
@@ -3819,9 +3831,7 @@ mod tests {
                     )
                     .unwrap();
                 } else {
-                    write_frame(&mut socket, &FromWriter::Populated { len: 4096 }).unwrap();
-                    let file = std::fs::File::open(file_path).unwrap();
-                    engram_substrate_proto::send_fd(socket.as_fd(), file.as_fd()).unwrap();
+                    write_frame(&mut socket, &FromWriter::Filled { len: 4096 }).unwrap();
                 }
             });
             Arc::get_mut(&mut rt).unwrap().backend = Arc::new(

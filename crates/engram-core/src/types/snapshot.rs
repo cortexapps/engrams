@@ -407,7 +407,6 @@ pub struct MigrationFrame {
     pub offset: u64,
     pub data: bytes::Bytes,
     pub last: bool,
-    /// On the last frame: blake3 of the whole item. `None` from a source
-    /// that predates it.
+    /// On the last frame: blake3 of the whole item. `None` on the others.
     pub item_hash: Option<[u8; 32]>,
 }

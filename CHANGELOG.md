@@ -55,6 +55,13 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - **A Firecracker resume always restores memory lazily.** `ENGRAM_FC_RESTORE_MODE` and the
   `firecracker.restoreMode` chart value (`engram-host-fleet`) are removed; delete them from
   your values. Every resume spawns `engram-uffd-handler`, so the host image must ship it.
+- **This upgrade drains every host again.** The host agent no longer serves memory handlers,
+  Firecracker processes, or migration sources from an earlier build, so the reattach
+  generation goes to 2. With `upgradeDrain.enabled` (the default), the pre-upgrade job
+  evicts each running session to a checkpoint before Helm changes anything, as described
+  above. Nothing ends and no data is lost: each session resumes on the new build the next
+  time it is used. With `upgradeDrain.enabled: false`, evict every session before the
+  upgrade. To roll back past this release, drain the hosts first the same way.
 
 ### Changed
 

@@ -487,10 +487,9 @@ impl GrpcHostClient {
         Ok(resp
             .map(|frame| {
                 let f = frame.map_err(grpc_to_sandbox_err)?;
-                // An empty hash is an older source that sends none; #1772.
-                let item_hash = match f.item_hash.len() {
-                    0 => None,
-                    _ => Some(f.item_hash.as_slice().try_into().map_err(|_| {
+                let item_hash = match f.last {
+                    false => None,
+                    true => Some(f.item_hash.as_slice().try_into().map_err(|_| {
                         SandboxError::Snapshot(format!(
                             "migration item {} hash is {} bytes, not 32",
                             f.item_idx,
