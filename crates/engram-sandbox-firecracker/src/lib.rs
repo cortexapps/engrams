@@ -424,11 +424,9 @@ fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], second, 0, 0)
 }
 
-/// ADR 0019 / telemetry restoration (#526): per-jail prefault-
-/// effectiveness snapshot filename, written by the uffd-handler in the
-/// jail dir (its `--report-dir`). Must stay in sync with `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`
-/// (duplicated, not shared, by design — the two binaries don't depend
-/// on each other; the filename is the contract).
+/// The post-copy drain stats the uffd-handler writes in the jail dir (its
+/// `--report-dir`). Must stay in sync with
+/// `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`.
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
 
 /// Per-jail file where the uffd-handler records the base shm file it
@@ -4984,18 +4982,8 @@ impl SandboxBackend for FirecrackerBackend {
         )
     }
 
-    /// ADR 0019 / telemetry restoration (#526): the per-jail prefault
-    /// stats, written by the uffd-handler at startup.
-    ///
-    /// `None` unless a uffd-handler exists for this sandbox
-    /// (`uffd_pid.is_some()`: a resume, or a pidfd-reattached resumed
-    /// sandbox, ADR 0044 K2). A fresh create spawns no handler, so
-    /// nothing writes this file for it. Trait contract: `None` = "this
-    /// backend/sandbox has no per-sandbox prefault detector" (mirrors
-    /// the VZ/Process default).
+    /// The drain stats a post-copy destination's handler writes.
     fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
-        let live = self.sandboxes.get(&id)?;
-        live.uffd_pid?;
         Some(self.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE))
     }
 
@@ -9029,64 +9017,6 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(be.list().await.unwrap(), vec![id]);
-    }
-
-    /// `prefault_stats_path` is `None` for a sandbox with no live
-    /// uffd-handler (a fresh create spawns none, so nothing writes the
-    /// file). It keys off `uffd_pid`, which a resume and a pidfd-reattached
-    /// resumed sandbox both carry.
-    #[test]
-    fn prefault_stats_path_none_without_a_uffd_handler() {
-        let (be, _dir) = backend();
-        let id = SandboxId::new();
-
-        // No entry in `sandboxes` at all (unknown/not-yet-live sandbox).
-        assert_eq!(be.prefault_stats_path(id), None);
-
-        let live_without_uffd = |uffd_pid: Option<u32>| {
-            let (_tx, agent_ready) = tokio::sync::watch::channel(true);
-            LiveSandbox {
-                state: SandboxState {
-                    spec: spec(),
-                    firecracker_socket: be.work_dir.join(id.to_string()).join("fc.sock"),
-                    rootfs_path: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
-                    vsock_cid: 3,
-                    vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
-                    rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
-                    swap_canonical: None,
-                    memory_backing: None,
-                },
-                child: None,
-                fc_pid: None,
-                uffd_handler: None,
-                uffd_pid,
-                net: None,
-                netns: None,
-                guest_endpoints: parking_lot::Mutex::new(None),
-                #[cfg(target_os = "linux")]
-                parked: false,
-                agentd_slot_swapped: false,
-                agent_ready: agent_ready.into(),
-                vsock_epoch: tokio::sync::watch::channel(0).0,
-                started_at: None,
-            }
-        };
-
-        // Live, but a fresh create: no uffd_pid → still None.
-        be.sandboxes.insert(id, live_without_uffd(None));
-        assert_eq!(
-            be.prefault_stats_path(id),
-            None,
-            "a fresh create never spawns a handler; must not alarm as stats_missing",
-        );
-
-        // Live Uffd-mode restore (or a pidfd-reattached one): uffd_pid is
-        // Some → the sibling path resolves.
-        be.sandboxes.insert(id, live_without_uffd(Some(4242)));
-        assert_eq!(
-            be.prefault_stats_path(id),
-            Some(be.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE)),
-        );
     }
 
     const PROC_STATUS_FIXTURE: &str = "\

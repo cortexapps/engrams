@@ -612,8 +612,8 @@ pub(crate) async fn patch_fc_manifest_memory_ref(
         serde_json::to_value(memory_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("serialize memory_manifest: {e}")))?,
     );
-    // The session id keys the working-set trace, so the next resume's
-    // prefault replay finds it whatever the memory manifest id is.
+    // The session id keys the first-touch prefix, so the next restore
+    // finds it whatever the memory manifest id is.
     if let Some(session_id) = trace_lineage {
         obj.insert(
             "trace_lineage_id".into(),

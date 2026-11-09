@@ -847,14 +847,9 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// ADR 0019 / telemetry restoration (#526): where this sandbox's
-    /// uffd-handler dumps its per-jail prefault-effectiveness snapshot
-    /// (`PrefaultStats` in `engram-uffd-handler`), in the same jail dir
-    /// as [`first_touch_path`](Self::first_touch_path). `PooledBackend::restore` reads it after a resume
-    /// completes and emits `engram_resume_prefault_*` — the standing
-    /// detector for "prefault shipped but silently stopped firing" (it
-    /// went inert three separate, undetected ways before this). `None`
-    /// = backend has no per-sandbox prefault detector (VZ, process).
+    /// Where a post-copy destination's uffd-handler writes its drain stats
+    /// (`prefault-stats.json`, in the same jail dir as
+    /// [`first_touch_path`](Self::first_touch_path)). `None` = no handler.
     fn prefault_stats_path(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }

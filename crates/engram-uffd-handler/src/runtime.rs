@@ -52,147 +52,43 @@ use crate::chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};
 use crate::fault_stats::{self, Source};
 use crate::proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 
-/// ADR 0019 / telemetry restoration (#526): per-jail prefault
-/// effectiveness snapshot, written to the handler's report dir (the jail
-/// dir). The host-agent reads it after a restore completes and emits the
-/// `engram_resume_prefault_*` counters from it.
-///
-/// This is the standing detector for "prefault shipped but silently
-/// stopped firing" — it went inert three separate, undetected ways
-/// (`d0e5ecf3` dead canonical-trace path removed, `cf6e4d32`
-/// per-checkpoint manifest key = guaranteed miss, `7c2a7226` publish
-/// killed by eviction SIGKILL), each caught only by manual archaeology
-/// weeks later. A missing file where a trace was requested (host-agent
-/// side: `outcome="stats_missing"`) is now itself the alarm.
-///
-/// Convergence note: `prefault-admission-control` (landing in the same
-/// overhaul) ships a superset gate file (`prefault-gate.json`, same
-/// fields + `trace_source`) that reuses this struct's counter
-/// namespace. Whichever issue lands second drops its own file in favor
-/// of the other's — see #526's guardrails. Do not fork a second
-/// jail-dir file or a parallel `engram_prefault_*` namespace.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PrefaultStats {
-    /// Whether a working-set trace was requested AND successfully
-    /// loaded for this restore. `false` means there was nothing to
-    /// replay (base image, migration dest with no prior life, or the
-    /// prior life's publish never landed) — expected, not an error.
-    pub trace_loaded: bool,
-    /// `trace.chunks.len()` — the size of the trace that was loaded.
-    /// `0` when `trace_loaded` is `false`.
-    pub chunks_in_trace: usize,
-    /// Chunks the prefault actually installed (a position the session
-    /// manifest still needs, not already installed by a racing fault).
-    pub installed: usize,
-    /// Trace entries that were skipped (the session manifest no longer
-    /// references that hash — rewritten or GC'd since the trace was
-    /// recorded).
-    pub skipped: usize,
-    /// Wall-clock duration of the prefault pass.
-    pub duration_ms: u64,
-    /// Review finding 6: issue step (d)3's "uffd-handler live peer
-    /// page-serves are recorded in the same per-jail stats file" — the
-    /// post-copy migration destination's peer-fill counterpart to
-    /// `installed`/`skipped`. `#[serde(default)]` so a reader built
-    /// against the pre-finding-6 schema (or a file this process never
-    /// patches, e.g. `main.rs`'s early write on a non-peer resume) still
-    /// parses as all-zero, not an error.
-    ///
-    /// Populated once, as a read-modify-write patch applied at the very
-    /// end of `run_listener`'s background thread — see `run_listener`. A **snapshot as of
-    /// that patch**, not a full-VM-lifetime total: `serve_pagefault`
-    /// can still route later on-demand faults to the peer after this
-    /// point. Span attributes only for now (`resume.prefault_stats` on
-    /// the host-agent side) — `epic-gcs-free-resume` owns promoting
-    /// these to their own Prometheus counters.
-    #[serde(default)]
-    pub peer_pulled: u64,
-    /// Chunks the drain sourced from somewhere other than the direct
-    /// peer pull (e.g. already-local via a racing fault/prefault) —
-    /// `engram_uffd_handler::peer::DrainStats::alt_sourced`.
-    #[serde(default)]
-    pub peer_alt_sourced: u64,
-    /// Zero-filled chunks the drain skipped installing (no bytes to
-    /// pull) — `engram_uffd_handler::peer::DrainStats::zero_chunks`.
-    #[serde(default)]
-    pub peer_zero_chunks: u64,
-    /// Live page faults served directly from the peer during the
-    /// fault loop, as of the patch point (`Peer::fault_stats().0`) —
-    /// distinct from `peer_pulled` (the eager drain), this is the
-    /// on-demand path a guest's own touch takes before the drain
-    /// reaches that chunk.
-    #[serde(default)]
-    pub peer_live_faults: u64,
+/// A post-copy destination's drain, written to `prefault-stats.json` in the
+/// handler's report dir once the drain is done. The live-move tests read it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+struct PeerDrainStats {
+    /// Chunks the drain pulled from the peer.
+    peer_pulled: u64,
+    /// Chunks the peer named as equal to the durable chunk (AltSource).
+    peer_alt_sourced: u64,
+    /// Zero chunks the drain installed.
+    peer_zero_chunks: u64,
+    /// Guest faults served from the peer before the drain reached them.
+    peer_live_faults: u64,
     /// Chunks installed by demand windows, including the faulting chunk.
-    #[serde(default)]
-    pub fault_around_chunks_installed: u64,
-    /// Sealed chunks placed first by the final migration trace.
-    #[serde(default)]
-    pub hot_leading: u64,
-    /// Set after drain completion: a nonempty hint arrived while requests remained.
-    #[serde(default)]
-    pub hot_hint_received: Option<bool>,
+    fault_around_chunks_installed: u64,
+    /// Sealed chunks placed first by the hot-set hint.
+    hot_leading: u64,
+    /// A nonempty hint arrived while requests remained.
+    hot_hint_received: bool,
 }
 
-/// Filename for [`PrefaultStats`] in the handler's report dir.
+/// Filename for [`PeerDrainStats`] in the handler's report dir.
 pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
 
-/// Write `bytes` to `path` through a temp file and a rename, so a reader
-/// never sees a partial file. Each call has its own temp file, so fault
-/// threads that write one path at once do not truncate each other's.
-/// Best-effort: a failure is logged.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Write the stats through a temp file and a rename, so a reader never
+/// sees a partial file. Best-effort: a failure is logged, never returned.
+fn write_drain_stats(path: &std::path::Path, stats: &PeerDrainStats) {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(
-        ".{}.tmp",
-        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
-        tracing::warn!(error = %e, path = %path.display(), "write");
+    let written = serde_json::to_vec(stats)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, path = %path.display(), "drain stats write");
         let _ = std::fs::remove_file(&tmp);
     }
-}
-
-/// Best-effort [`write_atomic`]. Failures are logged, never
-/// propagated: the stats file is a diagnostic surface, not load-bearing
-/// for the restore itself (a write failure here must never fail or
-/// slow down the guest's boot).
-pub fn write_prefault_stats(path: &std::path::Path, stats: &PrefaultStats) {
-    match serde_json::to_vec(stats) {
-        Ok(bytes) => write_atomic(path, &bytes),
-        Err(e) => tracing::warn!(error = %e, "prefault_stats serialize"),
-    }
-}
-
-/// Review finding 6: the pure read-modify-write half of patching the
-/// peer-drain snapshot onto whatever `prefault-stats.json` bytes already
-/// exist (written by `main.rs` at startup). `existing_bytes` is
-/// `None`/unparseable exactly when the handler never wrote a stats file
-/// at all (crashed before that write) — deliberately returns `None` in that case
-/// rather than fabricating a file, so a genuinely dead handler still
-/// alarms as `stats_missing` instead of surfacing a peer-only stub that
-/// would mask it.
-fn patch_peer_fields(
-    existing_bytes: Option<&[u8]>,
-    (
-        peer_pulled,
-        peer_alt_sourced,
-        peer_zero_chunks,
-        peer_live_faults,
-        hot_leading,
-        hot_hint_received,
-    ): (u64, u64, u64, u64, u64, bool),
-) -> Option<PrefaultStats> {
-    let mut stats: PrefaultStats = serde_json::from_slice(existing_bytes?).ok()?;
-    stats.peer_pulled = peer_pulled;
-    stats.peer_alt_sourced = peer_alt_sourced;
-    stats.peer_zero_chunks = peer_zero_chunks;
-    stats.peer_live_faults = peer_live_faults;
-    stats.hot_leading = hot_leading;
-    stats.hot_hint_received = Some(hot_hint_received);
-    Some(stats)
 }
 
 /// Strip `O_NONBLOCK` from `fd` so blocking reads on it actually
@@ -646,7 +542,7 @@ pub struct Runtime {
     /// `Installing` waits on this until the in-flight install settles.
     install_cv: Condvar,
     page_size: u64,
-    /// Where the prefault stats go (the jail dir).
+    /// Where the drain stats go (the jail dir).
     report_dir: Option<PathBuf>,
     /// ADR 0045 unified memory substrate (v2b). When set, guest memory
     /// is `MAP_PRIVATE` of this per-template base shm file (registered
@@ -835,7 +731,7 @@ impl Runtime {
     }
 
     /// Write the first-touch record (as each entry is recorded) and the
-    /// prefault stats to `dir`.
+    /// drain stats to `dir`.
     pub fn set_report_dir(&mut self, dir: PathBuf) {
         self.first_touch.set_output(&dir.join(FirstTouch::FILE));
         self.report_dir = Some(dir);
@@ -866,10 +762,6 @@ impl Runtime {
             chunk_size = self.backend.chunk_size(),
             "memory manifest composition"
         );
-    }
-
-    fn prefault_stats_path(&self) -> Option<PathBuf> {
-        Some(self.report_dir.as_ref()?.join(PREFAULT_STATS_FILE))
     }
 
     /// ADR 0045 tail latency: eagerly install EVERY chunk of the
@@ -2195,7 +2087,7 @@ pub struct RunListenerOpts {
     /// Peer mode: the advisory hot-set hint, read concurrently with the
     /// drain (see [`crate::hot_hint`]).
     pub migration_hint: Option<PathBuf>,
-    /// Where the first-touch record and the prefault stats go.
+    /// Where the first-touch record and the drain stats go.
     pub report_dir: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
     /// ADR 0045 C2: post-copy peer mode (session already sealed) +
@@ -2281,10 +2173,10 @@ pub fn run_listener(
             .spawn(move || composition.log_composition());
         fault_stats::spawn_periodic_log();
     }
-    let prefault_thread = {
+    let producer = {
         let rt = Arc::clone(&rt);
         std::thread::Builder::new()
-            .name("engram-uffd-prefault".to_string())
+            .name("engram-uffd-producer".to_string())
             .spawn(move || {
                 let (hint_tx, mut hint_rx) = tokio::sync::oneshot::channel();
                 let hint_task = migration_hint.map(|path| rt.handle.spawn(async move {
@@ -2293,12 +2185,6 @@ pub fn run_listener(
                         Err(error) => tracing::info!(%error, "migration hint unavailable; drain continues"),
                     }
                 }));
-                // Review finding 6: (pulled, alt_sourced, zero_chunks, live
-                // faults) from the peer drain, captured below if this
-                // restore is peer mode — `None` otherwise (base/resume
-                // restores never set `rt.peer`). Patched onto
-                // `prefault-stats.json` at the end of this closure.
-                let mut peer_drain_stats: Option<(u64, u64, u64, u64, u64, bool)> = None;
                 // ADR 0045 C2: in peer mode the sealed drain runs FIRST —
                 // sealed content exists only in the paused source, so
                 // draining it is what releases the source, and it makes
@@ -2328,19 +2214,20 @@ pub fn run_listener(
                                 .fault_around_chunks_installed
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
-                            // Review finding 6: stash the drain + live-fault
-                            // snapshot so it can be patched onto
-                            // `prefault-stats.json` once every other writer
-                            // in this closure has had its turn (see the
-                            // read-modify-write patch below `sweep_all`).
-                            peer_drain_stats = Some((
-                                stats.pulled,
-                                stats.alt_sourced,
-                                stats.zero_chunks,
-                                faults,
-                                stats.hot_leading,
-                                stats.hot_hint_received,
-                            ));
+                            if let Some(dir) = rt.report_dir.as_ref() {
+                                write_drain_stats(
+                                    &dir.join(PREFAULT_STATS_FILE),
+                                    &PeerDrainStats {
+                                        peer_pulled: stats.pulled,
+                                        peer_alt_sourced: stats.alt_sourced,
+                                        peer_zero_chunks: stats.zero_chunks,
+                                        peer_live_faults: faults,
+                                        fault_around_chunks_installed,
+                                        hot_leading: stats.hot_leading,
+                                        hot_hint_received: stats.hot_hint_received,
+                                    },
+                                );
+                            }
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
@@ -2387,25 +2274,6 @@ pub fn run_listener(
                         "eager full sweep failed; remaining pages serve on-demand",
                     );
                 }
-                // Review finding 6: patch the peer-drain snapshot onto
-                // `prefault-stats.json`, read-modify-write, after `main.rs`'s
-                // startup write. A missing/corrupt file at this point (the
-                // handler died before that write) is left alone: patching a
-                // stats-missing state into a fabricated file would defeat
-                // the alarm finding 1 exists to protect.
-                if let Some(peer_drain_stats) = peer_drain_stats {
-                    if let Some(path) = rt.prefault_stats_path() {
-                        let existing = std::fs::read(&path).ok();
-                        if let Some(mut patched) =
-                            patch_peer_fields(existing.as_deref(), peer_drain_stats)
-                        {
-                            patched.fault_around_chunks_installed = rt
-                                .fault_around_chunks_installed
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            write_prefault_stats(&path, &patched);
-                        }
-                    }
-                }
             })
     };
     let _stream_alive = stream;
@@ -2416,7 +2284,7 @@ pub fn run_listener(
     rt.stop_fault_window();
     // Once the uffd closes (FC exited) the producer's next install errors
     // out, so this join returns promptly rather than blocking teardown.
-    if let Ok(handle) = prefault_thread {
+    if let Ok(handle) = producer {
         let _ = handle.join();
     }
     result
@@ -2435,85 +2303,24 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
     use userfaultfd::UffdBuilder;
 
-    /// ADR 0019 / telemetry restoration (#526): `PrefaultStats` is the
-    /// per-jail file the host-agent reads post-restore to derive the
-    /// `engram_resume_prefault_*` counters — a pure serialize/write/read
-    /// round-trip, no uffd/kernel surface involved.
+    /// The live-move tests read these field names from the stats file.
     #[test]
-    fn prefault_stats_serialize_write_read_round_trips() {
+    fn drain_stats_file_keeps_its_field_names() {
         let dir = tempfile::tempdir().unwrap();
-        let stats_path = dir.path().join(PREFAULT_STATS_FILE);
-
-        let stats = PrefaultStats {
-            trace_loaded: true,
-            chunks_in_trace: 42,
-            installed: 40,
-            skipped: 2,
-            duration_ms: 1234,
-            peer_pulled: 0,
-            peer_alt_sourced: 0,
-            peer_zero_chunks: 0,
-            peer_live_faults: 0,
-            fault_around_chunks_installed: 0,
-            hot_leading: 0,
-            hot_hint_received: None,
-        };
-        write_prefault_stats(&stats_path, &stats);
-
-        let bytes = std::fs::read(&stats_path).expect("stats file must exist after write");
-        let read_back: PrefaultStats =
-            serde_json::from_slice(&bytes).expect("stats file must be valid JSON");
-        assert_eq!(read_back, stats);
-
-        // The temp file from the atomic write must not linger.
-        assert!(
-            !stats_path.with_extension("json.tmp").exists(),
-            "temp file must be renamed away, not left behind"
-        );
-    }
-
-    /// Review finding 6 regression test: the peer-drain snapshot patches
-    /// onto an EXISTING stats file without disturbing the fields that
-    /// writer already set.
-    #[test]
-    fn patch_peer_fields_preserves_existing_trace_fields() {
-        let base = PrefaultStats {
-            trace_loaded: true,
-            chunks_in_trace: 10,
-            installed: 8,
-            skipped: 2,
-            duration_ms: 55,
-            ..Default::default()
-        };
-        let bytes = serde_json::to_vec(&base).unwrap();
-        let patched =
-            patch_peer_fields(Some(&bytes), (3, 1, 4, 7, 2, true)).expect("existing file parses");
-        assert_eq!(
-            patched,
-            PrefaultStats {
-                trace_loaded: true,
-                chunks_in_trace: 10,
-                installed: 8,
-                skipped: 2,
-                duration_ms: 55,
-                peer_pulled: 3,
-                peer_alt_sourced: 1,
-                peer_zero_chunks: 4,
-                peer_live_faults: 7,
-                fault_around_chunks_installed: 0,
-                hot_leading: 2,
-                hot_hint_received: Some(true),
+        let path = dir.path().join(PREFAULT_STATS_FILE);
+        write_drain_stats(
+            &path,
+            &PeerDrainStats {
+                fault_around_chunks_installed: 3,
+                hot_hint_received: true,
+                ..Default::default()
             },
         );
-    }
-
-    /// A handler that died before either writer ran (no stats file at
-    /// all) must NOT get a fabricated peer-only file — that would mask
-    /// the `stats_missing` alarm finding 1 exists to protect.
-    #[test]
-    fn patch_peer_fields_none_when_no_prior_writer_ran() {
-        assert!(patch_peer_fields(None, (1, 2, 3, 4, 0, false)).is_none());
-        assert!(patch_peer_fields(Some(b"not json"), (1, 2, 3, 4, 0, false)).is_none());
+        let stats: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stats["fault_around_chunks_installed"], 3);
+        assert_eq!(stats["hot_hint_received"], true);
+        assert!(!dir.path().join("prefault-stats.json.tmp").exists());
     }
 
     /// ADR 0043 P1: the sweep runs on a background thread CONCURRENT with
