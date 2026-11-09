@@ -61,11 +61,5 @@ pub use proto::{GuestRegionUffdMapping, HANDSHAKE_BUF_BYTES};
 pub use runtime::{recv_handshake, run_listener, HandlerError, Runtime};
 
 /// Threads that read the userfaultfd. A guest has at most one fault
-/// outstanding per vCPU, so more threads than vCPUs only wait. From
-/// `ENGRAM_UFFD_FAULT_THREADS` (at least 1); default 8.
-pub fn fault_threads() -> usize {
-    std::env::var("ENGRAM_UFFD_FAULT_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map_or(8, |n| n.max(1))
-}
+/// outstanding per vCPU, so more threads than vCPUs only wait.
+pub const FAULT_THREADS: usize = 8;

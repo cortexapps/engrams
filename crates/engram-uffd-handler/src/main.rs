@@ -424,7 +424,7 @@ mod linux {
                     client.hello(
                         Some(canonical),
                         Some(session),
-                        engram_uffd_handler::fault_threads(),
+                        engram_uffd_handler::FAULT_THREADS,
                     )
                 });
                 (client, probes)

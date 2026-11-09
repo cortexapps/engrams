@@ -410,6 +410,11 @@ const FAULT_RECENT: Duration = Duration::from_millis(2);
 /// of the same chunk before it asks for the chunk itself.
 const PEER_REQUESTED_WAIT: Duration = Duration::from_millis(50);
 
+/// The most time the eager sweep runs. Each install is whole, so the sweep
+/// can stop between chunks; the rest serve on demand. This bound keeps a
+/// slow sweep from holding the I/O long after it helps.
+const SWEEP_BUDGET: Duration = Duration::from_secs(60);
+
 /// How long the eager sweep waits before it goes over the chunks it could
 /// not install yet.
 const SWEEP_RETRY: Duration = Duration::from_millis(250);
@@ -889,27 +894,6 @@ impl Runtime {
     /// Without a writer nothing else fills the cache, so the sweep
     /// fetches.
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
-        if std::env::var("ENGRAM_UFFD_EAGER_SWEEP")
-            .map(|v| v == "0")
-            .unwrap_or(false)
-        {
-            tracing::info!("eager sweep disabled via ENGRAM_UFFD_EAGER_SWEEP=0");
-            return Ok(());
-        }
-        // Time-box: each per-chunk install completes atomically (the
-        // `installed` bit and the bytes land together), so stopping
-        // BETWEEN chunks is always safe — the rest serve on-demand. A
-        // stuck origin fetch inside one chunk is the dangerous case
-        // (its bit is set; a faulting vCPU would wake onto a missing
-        // page), which is why fetches go through the cache's bounded
-        // path — the budget here is the backstop that keeps a slow
-        // sweep from monopolizing I/O long past its usefulness.
-        let budget = std::time::Duration::from_secs(
-            std::env::var("ENGRAM_UFFD_EAGER_SWEEP_BUDGET_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-        );
         let started = std::time::Instant::now();
         let chunk_size = self.backend.chunk_size();
         let total = self.backend.total_bytes();
@@ -949,7 +933,7 @@ impl Runtime {
             if pending.is_empty() {
                 break "complete";
             }
-            if started.elapsed() > budget {
+            if started.elapsed() > SWEEP_BUDGET {
                 break "budget";
             }
             if stalled >= SWEEP_STALL_PASSES {
@@ -1420,13 +1404,13 @@ impl Runtime {
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
     ///
-    /// [`crate::fault_threads`] threads read the userfaultfd. The kernel
+    /// [`crate::FAULT_THREADS`] threads read the userfaultfd. The kernel
     /// gives each fault message to exactly one reader, and the claim table
     /// makes two installs of one chunk safe: one thread installs, the
     /// others wait for it and wake. The first thread to end (end of file
     /// or an error) ends the handler; the others end with the process.
     pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
-        let threads = crate::fault_threads();
+        let threads = crate::FAULT_THREADS;
         let (done, ended) = std::sync::mpsc::channel();
         for i in 0..threads {
             let rt = Arc::clone(self);
