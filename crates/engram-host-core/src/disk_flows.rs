@@ -2,15 +2,18 @@
 //! manifest into a volume, [`hydration_plan`] says what a kernel copy
 //! does instead, [`checkpoint`] turns a volume into a manifest.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use engram_chunk_store::{ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind};
+use engram_chunk_store::{
+    ChunkHash, ChunkRef, ChunkSize, ChunkStore, Manifest, ManifestDelta, ManifestKind,
+};
 use engram_fill::{Class, FillEngine};
 
-use crate::disk::{is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
+use crate::disk::{blocks_per_chunk, is_zero_chunk, ChunkIndex, SessionDisk, Volume, VolumeName};
 use tracing::Instrument as _;
 
 /// Store calls in flight; peak buffered memory is this many chunks.
@@ -282,20 +285,96 @@ pub mod checkpoint_split {
             }
         };
 
+        let chunks = indices.into_iter().map(|index| {
+            let snapshot = snapshot.clone();
+            (index, async move { snapshot.read_chunk(index).await })
+        });
+        let delta = put_chunks(store, snapshot.chunk_size, chunks).await?;
+        Ok(base_manifest.apply(&delta))
+    }
+
+    /// Outside the pause, for a snapshot of a hydrating volume. The
+    /// volume logically holds `wanted`; a block whose mapping still
+    /// equals `base`'s is one the copy has not reached, and holds the
+    /// base's bytes where `wanted`'s belong. So a block whose mapping
+    /// changed since `base` (hydrated or written) is read from the
+    /// snapshot and any other block is `wanted`'s: a chunk with no
+    /// changed block keeps `wanted`'s entry unread, one changed
+    /// throughout is read whole, and a mixed one is `wanted`'s chunk
+    /// with the changed blocks laid over it. `block_bytes` is the
+    /// mapping unit; it divides the chunk size.
+    pub async fn upload_hydrating(
+        disk: &dyn SessionDisk,
+        fill: &FillEngine,
+        snapshot: &Volume,
+        base: &Volume,
+        wanted: &Manifest,
+        block_bytes: u64,
+    ) -> io::Result<Manifest> {
+        shape_matches(snapshot, wanted)?;
+        let per_chunk = blocks_per_chunk(snapshot, block_bytes)?;
         let chunk_size = snapshot.chunk_size;
-        // One task per chunk, so the 16 MiB read, the zero check, the
-        // SHA-256 and the PUT's TLS spread over every core.
+        let mut changed: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for block in disk.dirty_blocks(base, snapshot, block_bytes).await? {
+            changed
+                .entry(block / per_chunk)
+                .or_default()
+                .push((block % per_chunk) * block_bytes);
+        }
+        let wanted_hashes: HashMap<u64, ChunkHash> =
+            wanted.chunks.iter().map(|c| (c.offset, c.hash)).collect();
+        let chunks = changed.into_iter().map(|(chunk, blocks)| {
+            let index = ChunkIndex(chunk);
+            let offset = chunk * chunk_size;
+            let (snapshot, fill) = (snapshot.clone(), fill.clone());
+            let hash = wanted_hashes.get(&offset).copied();
+            (index, async move {
+                if blocks.len() as u64 == per_chunk {
+                    return snapshot.read_chunk(index).await;
+                }
+                let mut bytes = match hash {
+                    Some(hash) => fill
+                        .read(hash, Class::Hydrate)
+                        .await
+                        .map_err(store_err)?
+                        .to_vec(),
+                    None => vec![0; snapshot.read_chunk(index).await?.len()],
+                };
+                for at in blocks {
+                    let end = (at + block_bytes).min(bytes.len() as u64);
+                    let part = snapshot.read_range(offset + at, end - at).await?;
+                    bytes[at as usize..end as usize].copy_from_slice(&part);
+                }
+                Ok(bytes)
+            })
+        });
+        let delta = put_chunks(fill.store(), chunk_size, chunks).await?;
+        Ok(wanted.apply(&delta))
+    }
+
+    /// Put the chunks `chunks` yields, each a chunk index and the future
+    /// of its bytes, and return the delta they make: a chunk of zeros is
+    /// a hole. One task per chunk, so the 16 MiB read, the zero check,
+    /// the SHA-256 and the PUT's TLS spread over every core.
+    async fn put_chunks<F>(
+        store: &ChunkStore,
+        chunk_size: u64,
+        chunks: impl Iterator<Item = (ChunkIndex, F)>,
+    ) -> io::Result<ManifestDelta>
+    where
+        F: std::future::Future<Output = io::Result<Vec<u8>>> + Send + 'static,
+    {
         let mut tasks = tokio::task::JoinSet::new();
-        let mut results: Vec<(u64, Option<ChunkRef>)> = Vec::with_capacity(indices.len());
-        for index in indices {
+        let mut results: Vec<(u64, Option<ChunkRef>)> = Vec::new();
+        for (index, bytes) in chunks {
             while tasks.len() >= CONCURRENCY {
                 let done = tasks.join_next().await.expect("tasks is not empty");
                 results.push(done.map_err(io::Error::other)??);
             }
-            let (snapshot, store) = (snapshot.clone(), store.clone());
+            let store = store.clone();
             tasks.spawn(async move {
                 let offset = index.0 * chunk_size;
-                let bytes = snapshot.read_chunk(index).await?;
+                let bytes = bytes.await?;
                 if is_zero_chunk(&bytes) {
                     return Ok::<_, io::Error>((offset, None));
                 }
@@ -309,7 +388,6 @@ pub mod checkpoint_split {
         while let Some(done) = tasks.join_next().await {
             results.push(done.map_err(io::Error::other)??);
         }
-
         let mut delta = ManifestDelta::default();
         for (offset, written) in results {
             match written {
@@ -317,7 +395,7 @@ pub mod checkpoint_split {
                 None => delta.zero.push(offset),
             }
         }
-        Ok(base_manifest.apply(&delta))
+        Ok(delta)
     }
 }
 
@@ -493,6 +571,74 @@ mod tests {
         );
         let other_shape = manifest(&[1, 2]);
         assert!(hydration_plan(&wanted, Some(&other_shape)).is_err());
+    }
+
+    /// Base [1, 2, 3, 0]; wanted [7, 8, 3, 9]. The snapshot of the
+    /// hydrating volume holds chunk 0 hydrated (7), the first half of
+    /// chunk 1 written (5) with the rest not yet copied (still 2), chunk
+    /// 2 held, and chunk 3 not yet copied (still 0). The published disk
+    /// is the wanted one with the write laid over it.
+    #[tokio::test]
+    async fn a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk() {
+        let r = rig();
+        let fill_engine = engram_fill::FillEngine::new(r.store.clone(), Default::default());
+        let base = r.disk.create(&name("base"), CHUNK * 4).await.unwrap();
+        for (i, byte) in [1u8, 2, 3].into_iter().enumerate() {
+            base.write_chunk(ChunkIndex(i as u64), fill(byte))
+                .await
+                .unwrap();
+        }
+        let mut wanted_chunks = Vec::new();
+        for (i, byte) in [7u8, 8, 3, 9].into_iter().enumerate() {
+            wanted_chunks.push(ChunkRef {
+                offset: i as u64 * CHUNK,
+                hash: r.store.put_chunk(&fill(byte)).await.unwrap(),
+            });
+        }
+        let wanted = Manifest {
+            chunk_size: ChunkSize::bytes(CHUNK),
+            chunks: wanted_chunks,
+            ..Manifest::empty(ManifestKind::Disk, CHUNK * 4)
+        };
+        let snapshot = r.disk.snapshot(&base, &name("snap")).await.unwrap();
+        snapshot.write_chunk(ChunkIndex(0), fill(7)).await.unwrap();
+        snapshot
+            .write_range(CHUNK, vec![5u8; (CHUNK / 2) as usize])
+            .await
+            .unwrap();
+
+        let published = checkpoint_split::upload_hydrating(
+            &r.disk,
+            &fill_engine,
+            &snapshot,
+            &base,
+            &wanted,
+            CHUNK / 2,
+        )
+        .await
+        .unwrap();
+        let mut chunk_1 = vec![5u8; (CHUNK / 2) as usize];
+        chunk_1.extend(vec![8u8; (CHUNK / 2) as usize]);
+        let expected = [fill(7), chunk_1, fill(3), fill(9)];
+        assert_eq!(published.chunks.len(), 4);
+        for (i, bytes) in expected.iter().enumerate() {
+            assert_eq!(
+                published.chunks[i],
+                ChunkRef {
+                    offset: i as u64 * CHUNK,
+                    hash: ChunkHash::of(bytes)
+                },
+                "chunk {i}"
+            );
+        }
+        assert_eq!(
+            fill_engine
+                .read(published.chunks[1].hash, Class::Hydrate)
+                .await
+                .unwrap()
+                .to_vec(),
+            expected[1]
+        );
     }
 
     #[tokio::test]

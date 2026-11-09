@@ -128,11 +128,26 @@ async fn a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destinati
             state => panic!("hydration did not finish: {state:?}"),
         }
     }
+    // A snapshot of the hydrating device is a snapshot of its
+    // destination, under the device's suspend; it diffs against the base.
+    let mid = pool.snapshot(&device, &name("mid")).await.unwrap();
+    assert_eq!(
+        pool.dirty_blocks(&base, &mid, CHUNK).await.unwrap(),
+        vec![1, 3, 5]
+    );
+    assert_eq!(mid.read_chunk(ChunkIndex(5)).await.unwrap(), fill(5));
+    let mid = mid.name.clone();
+    pool.delete(&mid).await.unwrap();
+
     pool.settle(&device.name, &dest).await.unwrap();
     assert_eq!(
         pool.hydration(&device.name).await.unwrap(),
         Hydration::Settled
     );
+    let after = pool.snapshot(&device, &name("after")).await.unwrap();
+    assert_eq!(after.read_chunk(ChunkIndex(3)).await.unwrap(), fill(4));
+    let after = after.name.clone();
+    pool.delete(&after).await.unwrap();
     assert!(!pool.list().await.unwrap().contains(&name("io-md")));
 
     assert_eq!(device.read_chunk(ChunkIndex(1)).await.unwrap(), fill(3));

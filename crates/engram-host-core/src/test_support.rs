@@ -76,7 +76,10 @@ pub(crate) struct HydratingDisk {
 
 struct Clone {
     source: PathBuf,
-    dest: PathBuf,
+    /// The device's own path, a hard link of the destination: the copy
+    /// writes through it, as the kernel writes through the destination's
+    /// device number, so a rename of the destination changes nothing.
+    device: PathBuf,
     pending: Vec<ChunkIndex>,
     total: u64,
     settled: bool,
@@ -150,7 +153,7 @@ impl SessionDisk for HydratingDisk {
             name.clone(),
             Clone {
                 source: source.to_path_buf(),
-                dest: dest.path.clone(),
+                device: path.clone(),
                 pending,
                 total: dest.chunk_count(),
                 settled: false,
@@ -172,7 +175,7 @@ impl SessionDisk for HydratingDisk {
             File::open(&clone.source)?.read_exact_at(&mut bytes, chunk.0 * self.chunk_size)?;
             File::options()
                 .write(true)
-                .open(&clone.dest)?
+                .open(&clone.device)?
                 .write_all_at(&bytes, chunk.0 * self.chunk_size)?;
             clone.pending.remove(0);
         }

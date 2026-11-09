@@ -1085,6 +1085,16 @@ impl SessionVolumes {
     /// Outside the pause: upload what changed since the last checkpoint,
     /// publish the manifest at the lineage's next free version, and make
     /// the snapshot the sandbox's checkpoint volume.
+    ///
+    /// A role with no checkpoint volume is on a hydrating device, and
+    /// `previous` is its destination's manifest: the upload lays the
+    /// blocks that changed since the base over it
+    /// ([`checkpoint_split::upload_hydrating`]). While the device still
+    /// hydrates, the destination takes the published manifest's name
+    /// and the snapshot goes, so the names stay the record and no
+    /// checkpoint volume exists before the settle; once settled, the
+    /// snapshot becomes the checkpoint volume and the destination and
+    /// base names go with the layout they described.
     pub async fn publish(&self, pending: PendingCheckpoint) -> io::Result<ManifestRef> {
         let PendingCheckpoint {
             sandbox,
@@ -1092,22 +1102,47 @@ impl SessionVolumes {
             snapshot,
             previous,
         } = pending;
+        let previous_manifest = self.manifest(previous).await?;
         let previous_name = checkpoint_name(sandbox, role, previous);
-        let previous_volume = self.disk.open(&previous_name).await?;
-        let previous_manifest = self
-            .fill
-            .store()
-            .get_manifest(previous)
-            .await
-            .map_err(store_err)?;
-        let manifest = checkpoint_split::upload(
-            self.disk.as_ref(),
-            self.fill.store(),
-            &snapshot,
-            Some((&previous_volume, &previous_manifest)),
-        )
-        .await?;
-        drop(previous_volume);
+        let (manifest, lazy) = match self.disk.open(&previous_name).await {
+            Ok(previous_volume) => {
+                let manifest = checkpoint_split::upload(
+                    self.disk.as_ref(),
+                    self.fill.store(),
+                    &snapshot,
+                    Some((&previous_volume, &previous_manifest)),
+                )
+                .await?;
+                (manifest, None)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let (dest, base) = self.lazy_layout(sandbox, role).await?;
+                if parse(&dest).map(|p| p.kind) != Some(Kind::Dest(previous)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{dest} is not the destination for {previous}"),
+                    ));
+                }
+                let block_bytes = self.disk.region_bytes().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("{dest} exists on a disk without a hydrating device"),
+                    )
+                })?;
+                let base_volume = self.disk.open(&base).await?;
+                let manifest = checkpoint_split::upload_hydrating(
+                    self.disk.as_ref(),
+                    &self.fill,
+                    &snapshot,
+                    &base_volume,
+                    &previous_manifest,
+                    block_bytes,
+                )
+                .await?;
+                (manifest, Some((dest, base)))
+            }
+            Err(e) => return Err(e),
+        };
         // The store, not the volume name, says which versions exist: a
         // crash after `put_manifest` and before the rename leaves a
         // version the name never reached.
@@ -1129,10 +1164,26 @@ impl SessionVolumes {
             .map_err(store_err)?;
         let tmp = snapshot.name.clone();
         drop(snapshot);
-        self.disk
-            .rename(&tmp, &checkpoint_name(sandbox, role, next))
-            .await?;
-        self.disk.delete(&previous_name).await?;
+        let published = checkpoint_name(sandbox, role, next);
+        match lazy {
+            None => {
+                self.disk.rename(&tmp, &published).await?;
+                self.disk.delete(&previous_name).await?;
+            }
+            Some((dest, base)) => match self.disk.hydration(&live_name(sandbox, role)).await? {
+                Hydration::Hydrating { .. } => {
+                    self.disk
+                        .rename(&dest, &dest_name(sandbox, role, next))
+                        .await?;
+                    self.disk.delete(&tmp).await?;
+                }
+                Hydration::Settled => {
+                    self.disk.rename(&tmp, &published).await?;
+                    self.disk.delete(&dest).await?;
+                    self.disk.delete(&base).await?;
+                }
+            },
+        }
         Ok(next)
     }
 
@@ -1346,27 +1397,28 @@ impl SessionVolumes {
         }
     }
 
-    /// The manifest of the sandbox's checkpoint volume: what the last
-    /// publish made durable.
+    /// The manifest the role's live volume holds: its checkpoint
+    /// volume's, or, while it hydrates with no checkpoint volume yet,
+    /// its destination's.
     pub async fn checkpoint_of(
         &self,
         sandbox: SandboxId,
         role: DiskRole,
     ) -> io::Result<ManifestRef> {
-        let mut found: Option<ManifestRef> = None;
-        for name in self.disk.list().await? {
-            if let Some(Parsed {
-                sandbox: s,
-                role: r,
-                kind: Kind::Checkpoint(m),
-            }) = parse(&name)
-            {
-                if s == sandbox && r == role && found.is_none_or(|f| m.version > f.version) {
-                    found = Some(m);
+        let (mut checkpoint, mut dest): (Option<ManifestRef>, Option<ManifestRef>) = (None, None);
+        for p in self.disk.list().await?.iter().filter_map(parse) {
+            if (p.sandbox, p.role) != (sandbox, role) {
+                continue;
+            }
+            match p.kind {
+                Kind::Checkpoint(m) if checkpoint.is_none_or(|c| m.version > c.version) => {
+                    checkpoint = Some(m)
                 }
+                Kind::Dest(m) => dest = Some(m),
+                _ => {}
             }
         }
-        found.ok_or_else(|| {
+        checkpoint.or(dest).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("sandbox {sandbox} has no {} checkpoint volume", role),
@@ -2676,6 +2728,116 @@ mod tests {
             vec![image_volumes::volume_name(image).to_string()],
             "a hydrating role keeps no checkpoint volume"
         );
+    }
+
+    /// Base [1, 2, 3, 0, 5], wanted [1, 9, 0, 4, 5]: chunks 1 and 3
+    /// copy in, chunk 2 is zeroed. Before the copy the guest writes 7
+    /// over the zeroed chunk and 8 over held chunk 4. A checkpoint then
+    /// publishes the wanted disk with the writes laid over it, under
+    /// the destination's name: no checkpoint volume exists until the
+    /// settle. The next checkpoint, after the settle, makes the normal
+    /// layout.
+    #[tokio::test]
+    async fn a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2, 3, 0, 5]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        write_byte(&p.root, 1, 9).await;
+        write_byte(&p.root, 2, 0).await;
+        write_byte(&p.root, 3, 4).await;
+        let wanted = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.release(first).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+
+        let resumed = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                resumed,
+                Source::Continue {
+                    manifest: wanted,
+                    base: Some(image),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.root_stage, StagePath::Lazy);
+        assert_eq!(
+            r.volumes
+                .checkpoint_of(resumed, DiskRole::Root)
+                .await
+                .unwrap(),
+            wanted,
+            "the live volume holds the destination's manifest"
+        );
+        write_byte(&p.root, 2, 7).await;
+        write_byte(&p.root, 4, 8).await;
+
+        let mid = r.volumes.checkpoint(resumed, DiskRole::Root).await.unwrap();
+        assert_eq!(
+            (mid.manifest_id, mid.version),
+            (wanted.manifest_id, wanted.version + 1)
+        );
+        assert_eq!(manifest_bytes(&r, mid).await, vec![1, 9, 7, 4, 8]);
+        let expected: std::collections::BTreeSet<String> = [
+            image_volumes::volume_name(image).to_string(),
+            live_name(resumed, DiskRole::Root).to_string(),
+            base_name(resumed, DiskRole::Root, Some(image)).to_string(),
+            dest_name(resumed, DiskRole::Root, mid).to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            names(&r).await,
+            expected.into_iter().collect::<Vec<_>>(),
+            "the destination carries the published manifest; no checkpoint volume yet"
+        );
+        assert_eq!(
+            r.volumes
+                .checkpoint_of(resumed, DiskRole::Root)
+                .await
+                .unwrap(),
+            mid
+        );
+
+        settled(&r, resumed, DiskRole::Root).await;
+        assert_eq!(bytes_at(&p.root).await, vec![1, 9, 7, 4, 8]);
+        let after = r.volumes.checkpoint(resumed, DiskRole::Root).await.unwrap();
+        assert_eq!(after.version, mid.version + 1);
+        assert_eq!(manifest_bytes(&r, after).await, vec![1, 9, 7, 4, 8]);
+        let expected: std::collections::BTreeSet<String> = [
+            image_volumes::volume_name(image).to_string(),
+            live_name(resumed, DiskRole::Root).to_string(),
+            checkpoint_name(resumed, DiskRole::Root, after).to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            names(&r).await,
+            expected.into_iter().collect::<Vec<_>>(),
+            "a settled role has the normal layout"
+        );
+        r.volumes.release(resumed).await.unwrap();
+    }
+
+    /// The first byte of each chunk of a published manifest; 0 for a
+    /// hole.
+    async fn manifest_bytes(r: &Rig, manifest: ManifestRef) -> Vec<u8> {
+        let fill = engram_fill::FillEngine::new(r.store.clone(), engram_fill::Config::default());
+        let manifest = r.store.get_manifest(manifest).await.unwrap();
+        let mut out = Vec::new();
+        for i in 0..manifest.expected_chunk_count() {
+            out.push(match manifest.chunk_at(i * CHUNK) {
+                Some(c) => fill
+                    .read(c.hash, engram_fill::Class::Hydrate)
+                    .await
+                    .unwrap()[0],
+                None => 0,
+            });
+        }
+        out
     }
 
     /// A release during the window deletes the device before its

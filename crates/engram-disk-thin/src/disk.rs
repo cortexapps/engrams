@@ -153,6 +153,39 @@ impl ThinPoolDisk {
         }
     }
 
+    /// The thin a volume's data lives on, and its size: the volume
+    /// itself for a thin, the destination for a hydrating or settled
+    /// device. A snapshot of the volume is a snapshot of that thin.
+    async fn thin_under(&self, name: &VolumeName) -> io::Result<(ThinParams, u64)> {
+        let target = self.target_of(name).await?;
+        let devno = match target.kind.as_str() {
+            "thin" => return self.thin_of(name).await,
+            "clone" => parse::clone_dest(&target.params)?,
+            "linear" => parse::linear_device(&target.params)?,
+            kind => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is a {kind} device, which this disk did not make"),
+                ))
+            }
+        };
+        let prefix = format!("{}.", self.pool);
+        let dest = self
+            .dm
+            .list()
+            .await?
+            .into_iter()
+            .find(|(_, d)| *d == devno)
+            .and_then(|(device, _)| VolumeName::new(device.strip_prefix(&prefix)?.to_string()).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{name} maps onto {devno}, which is not a volume of this pool"),
+                )
+            })?;
+        self.thin_of(&dest).await
+    }
+
     /// The thin behind `name` and its size, refused when it belongs to
     /// another pool.
     async fn thin_of(&self, name: &VolumeName) -> io::Result<(ThinParams, u64)> {
@@ -383,7 +416,7 @@ impl SessionDisk for ThinPoolDisk {
     }
 
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
-        let (thin, sectors) = self.thin_of(&origin.name).await?;
+        let (thin, sectors) = self.thin_under(&origin.name).await?;
         let pool = self.pool.clone();
         let next_id = self.next_id.clone();
         let (created, resumed) = self
