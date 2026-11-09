@@ -294,9 +294,13 @@ pub enum HandlerControl {
     /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
     /// faults that round-tripped the peer + their cumulative wall) —
     /// the serial P2P cost inside the FC load + early execution, the
-    /// restore-tail attribution the drain numbers can't show. Control
-    /// sock is same-host (handler ↔ its own host-agent, one image), so
-    /// extending the variant is bincode-safe.
+    /// restore-tail attribution the drain numbers can't show.
+    ///
+    /// A handler outlives a host-agent roll, so both builds read each
+    /// other's `DrainDone`: an older host-agent reads the leading fields
+    /// and ignores the rest (`bincode::deserialize` allows trailing
+    /// bytes), and [`decode_control`] reads an older handler's, which
+    /// ends before `hot_leading`.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
@@ -306,6 +310,10 @@ pub enum HandlerControl {
         fault_us: u64,
         fault_max_us: u64,
         fault_around_chunks_installed: u64,
+        /// Sealed chunks the hot-set hint placed first.
+        hot_leading: u64,
+        /// A nonempty hot-set hint arrived while requests remained.
+        hot_hint_received: bool,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -321,6 +329,45 @@ where
     R: Read,
     T: DeserializeOwned,
 {
+    bincode::deserialize(&read_body(r)?).map_err(invalid)
+}
+
+/// [`read_frame`] for a [`HandlerControl`], through [`decode_control`].
+pub fn read_control_frame<R: Read>(r: &mut R) -> std::io::Result<HandlerControl> {
+    decode_control(&read_body(r)?).map_err(invalid)
+}
+
+/// Decode a [`HandlerControl`] frame body. This also reads the previous
+/// build's `DrainDone`, which ends before `hot_leading`; its hot fields
+/// read as zero. #1772 removes the fallback once no running handler
+/// predates them.
+pub fn decode_control(body: &[u8]) -> bincode::Result<HandlerControl> {
+    bincode::deserialize(body).or_else(|error| {
+        match bincode::deserialize::<(u32, [u64; 8])>(body) {
+            Ok((2, [pulled, alt_sourced, zero_chunks, ms, faults, fault_us, fault_max_us, fault_around_chunks_installed])) => {
+                Ok(HandlerControl::DrainDone {
+                    pulled,
+                    alt_sourced,
+                    zero_chunks,
+                    ms,
+                    faults,
+                    fault_us,
+                    fault_max_us,
+                    fault_around_chunks_installed,
+                    hot_leading: 0,
+                    hot_hint_received: false,
+                })
+            }
+            _ => Err(error),
+        }
+    })
+}
+
+fn invalid(e: bincode::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+}
+
+fn read_body<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -332,8 +379,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    bincode::deserialize(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+    Ok(body)
 }
 
 /// Bincode-encode `msg` and write it as a length-prefixed frame.
@@ -466,6 +512,8 @@ mod tests {
             fault_us: 55_000,
             fault_max_us: 9_000,
             fault_around_chunks_installed: 0,
+            hot_leading: 3,
+            hot_hint_received: true,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

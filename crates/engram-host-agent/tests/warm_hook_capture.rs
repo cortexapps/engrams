@@ -40,9 +40,7 @@ use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// The long-lived process the warm command leaves running (a
@@ -318,7 +316,6 @@ impl TestEnv {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::File;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
         let inner = Arc::new(FirecrackerBackend::new(self.work.path(), cfg));

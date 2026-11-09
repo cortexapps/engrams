@@ -92,6 +92,31 @@ impl Interceptor for TraceparentInjector {
     }
 }
 
+/// Parent `span` on the W3C `traceparent` in `req`'s metadata: the
+/// server side of [`TraceparentInjector`]. A no-op when the request has
+/// none (OTLP disabled, or a caller that does not propagate).
+pub fn link_remote_parent<T>(span: &tracing::Span, req: &tonic::Request<T>) {
+    if let Some(tp) = req
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        engram_telemetry::set_parent_from_traceparent(span, tp);
+    }
+}
+
+/// ADR 0079: build the shared fenced request for the
+/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
+/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
+/// without advancing).
+fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
+    FencedSandboxRequest {
+        uuid: id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: fence.epoch,
+        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+    }
+}
+
 /// Deadline applied (via the gRPC `grpc-timeout` header) to the
 /// snapshot-restore RPCs — `restore` (resume),
 /// `restore_base_for_session` (cold-create-via-restore), and
@@ -107,18 +132,6 @@ impl Interceptor for TraceparentInjector {
 /// rides the gRPC deadline header, the *host* side observes it too and
 /// can abort its own work. Override via
 /// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
-/// ADR 0079: build the shared fenced request for the
-/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
-/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
-/// without advancing).
-fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
-    FencedSandboxRequest {
-        uuid: id.as_uuid().as_bytes().to_vec(),
-        fencing_epoch: fence.epoch,
-        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
-    }
-}
-
 fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
@@ -473,14 +486,25 @@ impl GrpcHostClient {
         use futures::StreamExt;
         Ok(resp
             .map(|frame| {
-                frame
-                    .map(|f| engram_core::types::snapshot::MigrationFrame {
-                        item_idx: f.item_idx,
-                        offset: f.offset,
-                        data: bytes::Bytes::from(f.data),
-                        last: f.last,
-                    })
-                    .map_err(grpc_to_sandbox_err)
+                let f = frame.map_err(grpc_to_sandbox_err)?;
+                // An empty hash is an older source that sends none; #1772.
+                let item_hash = match f.item_hash.len() {
+                    0 => None,
+                    _ => Some(f.item_hash.as_slice().try_into().map_err(|_| {
+                        SandboxError::Snapshot(format!(
+                            "migration item {} hash is {} bytes, not 32",
+                            f.item_idx,
+                            f.item_hash.len()
+                        ))
+                    })?),
+                };
+                Ok(engram_core::types::snapshot::MigrationFrame {
+                    item_idx: f.item_idx,
+                    offset: f.offset,
+                    data: bytes::Bytes::from(f.data),
+                    last: f.last,
+                    item_hash,
+                })
             })
             .boxed())
     }

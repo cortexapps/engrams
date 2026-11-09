@@ -184,7 +184,7 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 ### Host agent (`engram-host-agent`)
 
 **Responsibilities:**
-- Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
+- Host-side `PooledBackend` wrapper composes the image cache, the chunk store, egress proxy, and the session-disk pool (see [Session disk](#session-disk)) onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the chunk store before delegating to the underlying backend. A chunk comes from the local NVMe cache, a peer host, or the object store; the host's fill engine (`engram-fill`) admits and schedules the object-store fetches. The OCI registry is not a chunk tier: no session read goes to it. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
 - Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
@@ -238,6 +238,25 @@ the test named beside it.
   `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`), and the destination's
   disk holds every byte once the source is destroyed
   (`two_host_teleport_rootfs_survives_source_destroy`).
+- A live move pauses the source only after the destination has provisioned its disks
+  and landed the precopy, or after a bound when it does not ask
+  (`a_presetup_learns_when_the_destination_is_ready_for_the_pause`).
+- A live move's destination asks the source for each sealed memory chunk once: the drain
+  skips a chunk that a fault already requested, and a fault waits for a request that is
+  already on the wire (`drain_skips_a_requested_chunk_and_records_the_sealed_output`).
+  The destination records every chunk the source supplied. After the drain it publishes
+  the source's chain manifest with those chunks over it as its own lineage, so its first
+  checkpoint is a diff (`post_copy_seed_publishes_the_peer_chunks_over_the_source_manifest`).
+  No capture runs on the destination before that seed
+  (`migration_drain_wait_reports_a_finished_drain_and_leaves_the_role`).
+- While the destination drains, the move's op holds the session lane only for one-second
+  drain waits, so the moved session's other ops run between them
+  (`release_gives_the_lane_back_while_the_drain_runs`).
+- A host binds its gRPC listener before it registers, so the capability vector the
+  register carries passes the self-connect probe
+  (`grpc_self_connect_ok_once_bound_before_the_server_runs`). A refused move names the
+  reason: the missing capability and its probe result, or why the target is not a
+  candidate (`a_capability_refusal_carries_the_probe_result`).
 - A live move whose destination fails before it fetches the paused state aborts on the
   source, and the session stays active there
   (`dest_failure_before_the_state_is_served_resumes_the_source`). The source checks and
@@ -274,7 +293,7 @@ the test named beside it.
   partial file. A metadata file a crash left before the first activation is formatted, not
   rejected (`scripts/thin-pool-states-test.sh`).
 - A stage reads the node's chunk cache before blob storage
-  (`get_chunk_reads_the_local_cache_before_blob_storage`), so the chunks the image
+  (`read_serves_a_resident_chunk_without_the_store`), so the chunks the image
   prefetch pulled are not fetched a second time.
 - The host reports the pool's data and metadata free space every heartbeat
   (`capacity_falls_by_the_blocks_written`, `pool_capacity_round_trips_through_heartbeat`).
@@ -983,7 +1002,7 @@ For Phase 2 the equivalent end-to-end is the FC integration suite (each test is 
 
 ```bash
 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
-# boot, lifecycle, snapshot (file-backed), snapshot_uffd (lazy paging),
+# boot, lifecycle, snapshot (lazy-paging resume),
 # exec_real_vm (busybox-fixture rootfs → boot → vsock CONNECT → exec → assert stdout)
 ```
 

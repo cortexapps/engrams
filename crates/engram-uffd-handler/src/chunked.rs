@@ -10,9 +10,8 @@
 //!   there (written-over state) — fetch + `UFFDIO_COPY`; or
 //! - the **canonical** chunk at that offset (the common case for a
 //!   freshly-resumed session, where the session agrees with the base)
-//!   — the runtime resolves its hash via
-//!   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
-//!   (shared via base-shm `UFFDIO_CONTINUE`, else fetch + COPY); or
+//!   — installed shared via base-shm `UFFDIO_CONTINUE`, else fetch +
+//!   COPY; or
 //! - a **zero page** (`UFFDIO_ZEROPAGE`) when the session manifest
 //!   omits the offset — the capture is full + zero-omitted, so an
 //!   omission means the guest zeroed it (never served as base bytes).
@@ -39,7 +38,7 @@
 //!
 //! - [`ChunkedMemoryBackend`] — the data plane: carries the canonical
 //!   and session manifests, resolves an offset, and fetches chunks
-//!   via a [`ChunkCache`] over a [`ChunkStore`].
+//!   (local cache file, then the host-agent, then the object store).
 //! - [`ResolvedPage`] — what the resolver returns. Types-only so the
 //!   syscall path stays out of the unit-testable surface.
 //!
@@ -48,7 +47,6 @@
 //! - The UFFD event loop + the actual `UFFDIO_COPY`/`UFFDIO_ZEROPAGE`
 //!   (incl. the full-chunk-per-fault install policy). That's in
 //!   `runtime.rs` and consumes this backend.
-//! - Working-set trace recording. That's in `working_set.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -63,9 +61,8 @@ use engram_core::traits::BlobStorage;
 /// - `Chunk` — the session manifest's own hash here (diverged /
 ///   written-over state); fetch + `UFFDIO_COPY`.
 /// - `Canonical` — the session agrees with the base image here; the
-///   runtime resolves the canonical hash via
-///   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
-///   (shared via the base-shm `UFFDIO_CONTINUE`, else fetch + COPY).
+///   runtime installs the base's chunk (shared via the base-shm
+///   `UFFDIO_CONTINUE`, else fetch + COPY).
 ///   For a base snapshot (session == canonical) every non-zero page
 ///   resolves to `Canonical`.
 /// - `Zero` — the session omits this offset. The session manifest is
@@ -75,20 +72,18 @@ use engram_core::traits::BlobStorage;
 ///   zeroed must NOT be served as stale base content.
 #[derive(Clone, Debug)]
 pub enum ResolvedPage {
-    /// Session agrees with the base image at this chunk-aligned byte
-    /// offset. The runtime looks up the canonical chunk hash here and
-    /// installs it (shared base-shm CONTINUE, else fetch + COPY).
-    Canonical { canonical_offset: u64 },
+    /// Session agrees with the base image here: `hash` is the chunk
+    /// both manifests name.
+    Canonical { hash: ChunkHash },
     /// Page diverges from canonical. The named chunk is what to
-    /// fetch from the store + copy into the guest. The runtime
-    /// hands this hash to the [`ChunkCache`] (via
-    /// [`ChunkedMemoryBackend::fetch_chunk`]) for the bytes.
+    /// fetch and copy into the guest, via
+    /// [`ChunkedMemoryBackend::fetch_chunk`].
     Chunk { hash: ChunkHash },
     /// The session manifest omits this chunk-aligned offset. Because
     /// the session capture is full + zero-omitted (see `file.rs`'s
     /// sparse capture), an omission is an authoritative "all zero
     /// here" — install `UFFDIO_ZEROPAGE`, never base content.
-    Zero { offset: u64 },
+    Zero,
 }
 
 /// In-memory shape of the canonical + session manifests. We pre-
@@ -155,19 +150,14 @@ pub struct ChunkedMemoryBackend {
     canonical: PositionalManifest,
     session: PositionalManifest,
     session_positions: std::collections::HashMap<ChunkHash, Vec<u64>>,
-    /// ADR 0075: the READ-ONLY view of the shared cache dir. The
-    /// handler cannot mutate the directory by construction.
+    /// The read-only view of the shared cache dir (ADR 0075): the
+    /// handler cannot change the directory.
     reader: ChunkCacheReader,
-    /// ADR 0075: the populate channel to the one writer (the
-    /// host-agent). `None` = no writer configured (unit tests, and
-    /// the explicit fallback-only mode) — misses go straight to the
-    /// direct-blob fallback.
+    /// The channel to the one writer (the host-agent). `None` when no
+    /// writer answered at startup: misses go to the object store.
     populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
-    /// Blob store for the LAST-RESORT fallback fetch (writer
-    /// unreachable — e.g. a host-agent mid-roll; ADR 0044 K2 handlers
-    /// outlive rolls). Served from memory, never written to the cache
-    /// dir, counted via `engram_substrate_fallback_fetch_total`.
-    /// backend-agnostic — see the docstring on `ChunkCache`.
+    /// The object store, used only when the writer is unreachable.
+    /// Chunks from it stay in memory and never reach the cache dir.
     store: ChunkStore,
 }
 
@@ -221,6 +211,52 @@ impl From<engram_chunk_store::ChunkStoreError> for ChunkedBackendError {
     fn from(e: engram_chunk_store::ChunkStoreError) -> Self {
         Self::Manifest(e)
     }
+}
+
+/// Local copies of the manifests, which the backend reads from disk
+/// instead of the blob store: a migration's not-yet-durable session
+/// manifest, or the copies the host stages beside a snapshot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalManifests<'a> {
+    pub canonical: Option<&'a Path>,
+    pub session: Option<&'a Path>,
+}
+
+/// The manifest `r`, from the local copy at `path` when there is one. A
+/// copy that does not read gives a warning, and the store serves the same
+/// version; a migration manifest is not in the store yet, so that read fails.
+async fn read_manifest(
+    store: &engram_chunk_store::ChunkStore,
+    path: Option<&Path>,
+    r: engram_core::types::manifest::ManifestRef,
+    which: &str,
+) -> Result<engram_chunk_store::Manifest, ChunkedBackendError> {
+    if let Some(path) = path {
+        let local = std::fs::read(path)
+            .map_err(ChunkedBackendError::Io)
+            .and_then(|bytes| {
+                serde_json::from_slice::<engram_chunk_store::Manifest>(&bytes).map_err(|e| {
+                    ChunkedBackendError::InvalidManifest(format!(
+                        "parse local {which} manifest {}: {e}",
+                        path.display()
+                    ))
+                })
+            })
+            .and_then(|m| {
+                m.validate()
+                    .map_err(ChunkedBackendError::Manifest)
+                    .map(|()| m)
+            });
+        match local {
+            Ok(m) => return Ok(m),
+            Err(error) => tracing::warn!(
+                %error,
+                manifest = %r,
+                "local {which} manifest unreadable; reading the store",
+            ),
+        }
+    }
+    Ok(store.get_manifest(r).await?)
 }
 
 impl ChunkedMemoryBackend {
@@ -278,10 +314,10 @@ impl ChunkedMemoryBackend {
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<Self, ChunkedBackendError> {
-        Self::from_blob_with_session_json(
+        Self::from_blob_with_local(
             canonical_ref,
             session_ref,
-            None,
+            LocalManifests::default(),
             blob,
             cache_root,
             populate,
@@ -289,14 +325,8 @@ impl ChunkedMemoryBackend {
         .await
     }
 
-    /// ADR 0045: like [`Self::from_blob`], but when
-    /// `session_manifest_json` is `Some(path)` the SESSION manifest is
-    /// read from that local file instead of the blob store. A migration
-    /// destination restores from a manifest that is deliberately NOT
-    /// yet durable (the catch-up upload publishes it later) — its
-    /// chunks are already resident in the host NVMe cache, so the
-    /// fill path never needs the store for them. The canonical (image
-    /// base) manifest is always durable and store-resolved.
+    /// Like [`Self::from_blob`], but a manifest with a copy in `local` is
+    /// read from that file instead of the blob store.
     /// ADR 0045 D4 fail-open (#1066): build with the supplied canonical,
     /// and when the canonical/session manifests disagree on layout
     /// (guest resized since capture, FC snapshot cutover, ...), retry
@@ -310,15 +340,15 @@ impl ChunkedMemoryBackend {
     pub async fn build_with_canonical_fallback(
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        session_manifest_json: Option<&Path>,
+        local: LocalManifests<'_>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<(Self, bool), ChunkedBackendError> {
-        match Self::from_blob_with_session_json(
+        match Self::from_blob_with_local(
             canonical_ref,
             session_ref,
-            session_manifest_json,
+            local,
             blob.clone(),
             cache_root,
             populate.clone(),
@@ -334,10 +364,13 @@ impl ChunkedMemoryBackend {
                     "canonical/session manifest mismatch; failing open to \
                      canonical == session (session-keyed restore, no shared base)",
                 );
-                Self::from_blob_with_session_json(
+                Self::from_blob_with_local(
                     session_ref,
                     session_ref,
-                    session_manifest_json,
+                    LocalManifests {
+                        canonical: None,
+                        session: local.session,
+                    },
                     blob,
                     cache_root,
                     populate,
@@ -349,10 +382,10 @@ impl ChunkedMemoryBackend {
         }
     }
 
-    pub async fn from_blob_with_session_json(
+    pub async fn from_blob_with_local(
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
-        session_manifest_json: Option<&Path>,
+        local: LocalManifests<'_>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
@@ -362,43 +395,16 @@ impl ChunkedMemoryBackend {
         // migration restore (no image-base rider), the canonical IS the
         // local file too — store-fetching it would 404 (the v+1 manifest
         // is deliberately unpublished until the catch-up).
-        let canonical = match session_manifest_json {
-            Some(path) if canonical_ref == session_ref => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local canonical manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                m
-            }
-            _ => store.get_manifest(canonical_ref).await?,
+        let canonical_path = if canonical_ref == session_ref {
+            local.session
+        } else {
+            local.canonical
         };
-        let session = match session_manifest_json {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
-                let m: engram_chunk_store::Manifest =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ChunkedBackendError::InvalidManifest(format!(
-                            "parse local session manifest {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                m.validate().map_err(ChunkedBackendError::Manifest)?;
-                let _ = session_ref; // named by ref for logging only
-                m
-            }
-            None => store.get_manifest(session_ref).await?,
-        };
-        // ADR 0075: the handler holds a READ-ONLY view of the shared
-        // cache_root — population happens in the one writer (the
-        // host-agent) via the substrate socket, so its global
-        // singleflight / pin set / budget govern this handler's
-        // traffic too. The #437/#522-era per-handler ChunkCache (and
-        // its eviction_enabled:false half-measure) is gone.
+        // The two reads are independent, so they run together.
+        let (canonical, session) = tokio::try_join!(
+            read_manifest(&store, canonical_path, canonical_ref, "canonical"),
+            read_manifest(&store, local.session, session_ref, "session"),
+        )?;
         let reader = ChunkCacheReader::new(cache_root);
         Self::new(&canonical, &session, reader, populate, store)
     }
@@ -410,6 +416,17 @@ impl ChunkedMemoryBackend {
         self.canonical.chunk_size
     }
 
+    /// True when the writer (the host-agent) fills the cache: its
+    /// prefetch lands the chunks, so a producer can wait for them.
+    pub fn has_writer(&self) -> bool {
+        self.populate.is_some()
+    }
+
+    /// True when the local chunk cache holds `hash`.
+    pub fn is_resident(&self, hash: ChunkHash) -> bool {
+        self.reader.contains_on_disk(hash)
+    }
+
     /// Total backing-store size. Should match what FC's UFFD
     /// regions sum to — the runtime's handshake validation does
     /// the cross-check.
@@ -417,10 +434,8 @@ impl ChunkedMemoryBackend {
         self.canonical.total_bytes
     }
 
-    /// Resolve the chunk-aligned region containing `byte_offset`
-    /// into either "matches canonical here" (runtime resolves the
-    /// canonical hash / zero-fills) or "fetch this session-divergent
-    /// chunk." Pure data-plane; no I/O.
+    /// Resolve the chunk-aligned region containing `byte_offset`.
+    /// Pure data-plane; no I/O.
     ///
     /// Returns `None` when the offset is past `total_bytes`. The
     /// runtime treats that as a programming bug — FC's mappings
@@ -430,15 +445,12 @@ impl ChunkedMemoryBackend {
             return None;
         }
         let chunk_idx = (byte_offset / self.canonical.chunk_size) as usize;
-        let chunk_offset = (chunk_idx as u64) * self.canonical.chunk_size;
         let canon = self.canonical.chunks.get(chunk_idx).copied().flatten();
         let session = self.session.chunks.get(chunk_idx).copied().flatten();
         Some(match (canon, session) {
             // Session agrees with the base here → share the canonical
             // page (base-shm CONTINUE / fetch + COPY).
-            (Some(c), Some(s)) if c == s => ResolvedPage::Canonical {
-                canonical_offset: chunk_offset,
-            },
+            (Some(c), Some(s)) if c == s => ResolvedPage::Canonical { hash: c },
             // Session has its own hash here — diverged / written-over
             // state. Use it regardless of what the base holds.
             (_, Some(s)) => ResolvedPage::Chunk { hash: s },
@@ -447,70 +459,55 @@ impl ChunkedMemoryBackend {
             // zeroed this chunk" — install a zero page regardless of
             // the base. Serving canonical content here when the base
             // is non-zero would silently un-zero guest RAM on resume.
-            (_, None) => ResolvedPage::Zero {
-                offset: chunk_offset,
-            },
+            (_, None) => ResolvedPage::Zero,
         })
     }
 
-    /// ADR 0014 M1.14: return the canonical chunk hash at a given
-    /// chunk-aligned byte offset. The working-set recorder uses this
-    /// to observe canonical-resolved faults too — without it, the
-    /// bake-time profile pass produces an empty trace because a
-    /// freshly-canonical snapshot has zero divergence chunks.
-    pub fn canonical_chunk_hash(&self, byte_offset: u64) -> Option<ChunkHash> {
-        if byte_offset >= self.canonical.total_bytes {
-            return None;
+    /// The bytes of one chunk, from the first tier that has it:
+    ///
+    /// 1. The local cache file, mapped (no read into a buffer).
+    /// 2. The writer (the host-agent), which makes it available through
+    ///    the fill engine; misses from every handler collapse there.
+    /// 3. Only when the writer is unreachable (a host-agent roll, or a
+    ///    writer past the client's reply timeout): the object store
+    ///    directly, hash-verified, kept in memory and never written to
+    ///    the cache. Each fault thread waits on at most one such fetch,
+    ///    so the fault threads bound the fan-out. It is the only fetch
+    ///    outside the fill engine, and it runs only while no engine can
+    ///    answer: a handler with no writer at startup (bake and test
+    ///    runs) and a writer that is gone mid-run (a guest keeps running
+    ///    through the roll).
+    ///
+    /// Synchronous: the fault and producer threads call it, never a
+    /// runtime worker. `rt` runs the object-store fetch of step 3.
+    pub fn fetch_chunk(
+        &self,
+        rt: &tokio::runtime::Handle,
+        hash: ChunkHash,
+    ) -> Result<Bytes, ChunkedBackendError> {
+        match std::fs::File::open(self.reader.path_for(hash)) {
+            Ok(file) => {
+                crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Cache);
+                return Ok(crate::mapped::chunk_file_bytes(&file)?);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-        let chunk_idx = (byte_offset / self.canonical.chunk_size) as usize;
-        self.canonical.chunks.get(chunk_idx).copied().flatten()
-    }
-
-    /// Bytes for a session-divergent chunk — the ADR 0075 3-step read
-    /// path: (1) resident on NVMe → serve (trust-on-read, unchanged);
-    /// (2) ask the one writer to populate and read back the fd —
-    /// cross-process misses collapse in the WRITER's singleflight;
-    /// (3) writer unreachable past its retry budget (host-agent
-    /// mid-roll) → direct blob fetch served from memory, never written
-    /// to the cache dir. Step 3 keeps the fault path independent of
-    /// the control plane (ADR 0044 K2) while preserving the
-    /// single-writer invariant.
-    pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
-        // 1. Fast path: resident.
-        if let Some(bytes) = self.reader.read(hash).map_err(ChunkedBackendError::Io)? {
-            crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Cache);
-            return Ok(Bytes::from(bytes));
-        }
-        // 2. Populate via the writer. Sync UDS I/O — hop off the
-        // runtime worker (the fault loop block_on's this future on the
-        // handler's small private runtime).
         if let Some(client) = &self.populate {
-            let client = client.clone();
-            let res = tokio::task::spawn_blocking(move || client.request(hash))
-                .await
-                .map_err(|e| {
-                    ChunkedBackendError::Io(std::io::Error::other(format!(
-                        "populate task join: {e}"
-                    )))
-                })?;
-            match res {
+            match client.request(hash) {
                 Ok(bytes) => {
                     crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Populate);
-                    return Ok(Bytes::from(bytes));
+                    return Ok(bytes);
                 }
                 Err(crate::populate_client::PopulateError::WriterUnreachable(msg)) => {
-                    // The handler exports no Prometheus metrics (it is a
-                    // per-VM leaf process; its telemetry rides logs + the
-                    // stats-file pattern). This WARN is the alarm signal —
-                    // sustained occurrences mean the writer is unreachable
-                    // — and the writer-side populate counter going quiet
-                    // corroborates. (ADR 0075 divergence note.)
+                    // The handler exports no metrics; this WARN is the
+                    // signal, and the writer's populate counter going
+                    // quiet confirms it.
                     tracing::warn!(
                         %hash,
                         %msg,
-                        "substrate writer unreachable; direct-blob fallback (uncached)",
+                        "substrate writer unreachable; direct object-store fetch (uncached)",
                     );
-                    // fall through to 3
                 }
                 Err(e) => {
                     return Err(ChunkedBackendError::Io(std::io::Error::other(format!(
@@ -519,9 +516,14 @@ impl ChunkedMemoryBackend {
                 }
             }
         }
-        // 3. Last resort — memory-only, never written to the cache dir.
         crate::fault_stats::set_fetch_source(crate::fault_stats::Source::Fallback);
-        self.store.get_chunk(hash).await.map_err(Into::into)
+        // A guest waits on this fault.
+        rt.block_on(engram_chunk_store::ChunkSource::chunk(
+            &self.store,
+            hash,
+            engram_chunk_store::Class::Demand,
+        ))
+        .map_err(Into::into)
     }
 
     /// Chunk counts by how a fault would resolve them: canonical,
@@ -537,7 +539,7 @@ impl ChunkedMemoryBackend {
                         c.divergent_local += 1;
                     }
                 }
-                Some(ResolvedPage::Zero { .. }) => c.zero += 1,
+                Some(ResolvedPage::Zero) => c.zero += 1,
                 None => {}
             }
         }
@@ -545,12 +547,11 @@ impl ChunkedMemoryBackend {
     }
 
     /// Chunk-start byte offsets where the session manifest holds
-    /// `hash`. Used by the working-set replay path: a trace entry
-    /// names a chunk hash, the runtime asks "where does the session
-    /// place this chunk?" and pre-installs it at each position.
+    /// `hash`. The drain orders a hot-set hint (chunk hashes) by these
+    /// positions.
     ///
     /// Built once at load, so ordering a large hot set is linear in the
-    /// number of returned positions instead of trace length times RAM size.
+    /// number of returned positions instead of hint length times RAM size.
     pub fn session_positions_of(&self, hash: ChunkHash) -> Vec<u64> {
         self.session_positions
             .get(&hash)
@@ -581,7 +582,6 @@ mod fallback_tests {
             total_bytes,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -605,7 +605,7 @@ mod fallback_tests {
         let (backend, _) = ChunkedMemoryBackend::build_with_canonical_fallback(
             r,
             r,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -616,6 +616,34 @@ mod fallback_tests {
         assert!(backend
             .session_positions_of(ChunkHash::of(b"absent"))
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_that_does_not_parse_reads_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        let manifest = mem_manifest(4 * 4096, 4096, 7);
+        let r = put(&store, &manifest).await;
+        let torn = dir.path().join("torn.json");
+        std::fs::write(&torn, b"").unwrap();
+        let (backend, _) = ChunkedMemoryBackend::build_with_canonical_fallback(
+            r,
+            r,
+            LocalManifests {
+                canonical: Some(&torn),
+                session: Some(&torn),
+            },
+            blob,
+            &dir.path().join("cache"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.session_positions_of(manifest.chunks[1].hash),
+            vec![4096]
+        );
     }
 
     /// #1066: a session whose layout predates a guest resize must fail
@@ -633,7 +661,7 @@ mod fallback_tests {
         let (backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             canonical,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -659,7 +687,7 @@ mod fallback_tests {
         let (_backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             canonical,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -680,7 +708,7 @@ mod fallback_tests {
         let (_b, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             session,
             session,
-            None,
+            LocalManifests::default(),
             blob,
             &dir.path().join("cache"),
             None,
@@ -713,7 +741,6 @@ mod tests {
                 .map(|(offset, hash)| ChunkRef { offset, hash })
                 .collect(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }
@@ -793,7 +820,11 @@ mod tests {
         )
         .unwrap();
 
-        let got = b.fetch_chunk(hash).await.expect("fallback fetch");
+        let rt = tokio::runtime::Handle::current();
+        let got = tokio::task::spawn_blocking(move || b.fetch_chunk(&rt, hash))
+            .await
+            .unwrap()
+            .expect("fallback fetch");
         assert_eq!(got, bytes, "fallback must serve correct bytes");
 
         // The single-writer invariant in degraded mode: nothing landed
@@ -824,25 +855,19 @@ mod tests {
     }
 
     #[test]
-    fn resolves_canonical_match_to_canonical_offset() {
-        // Both canonical and session agree on chunk 0. The
-        // resolver returns `Canonical { canonical_offset: 0 }`
-        // — runtime fetches the canonical chunk hash at that offset.
+    fn resolves_canonical_match_to_the_canonical_hash() {
+        // Both canonical and session agree on chunks 0 and 1.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         assert!(matches!(
             b.resolve(0),
-            Some(ResolvedPage::Canonical {
-                canonical_offset: 0
-            })
+            Some(ResolvedPage::Canonical { hash }) if hash == h(1)
         ));
         assert!(matches!(
             b.resolve(512),
-            Some(ResolvedPage::Canonical {
-                canonical_offset: 512
-            })
+            Some(ResolvedPage::Canonical { hash }) if hash == h(2)
         ));
     }
 
@@ -872,8 +897,8 @@ mod tests {
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         let r = b.resolve(600).unwrap();
         match r {
-            ResolvedPage::Canonical { canonical_offset } => assert_eq!(canonical_offset, 512),
-            other => panic!("expected Canonical(512), got {other:?}"),
+            ResolvedPage::Canonical { hash } => assert_eq!(hash, h(2)),
+            other => panic!("expected Canonical(h(2)), got {other:?}"),
         }
     }
 
@@ -886,10 +911,7 @@ mod tests {
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
-        assert!(matches!(
-            b.resolve(512),
-            Some(ResolvedPage::Zero { offset: 512 })
-        ));
+        assert!(matches!(b.resolve(512), Some(ResolvedPage::Zero)));
     }
 
     #[test]
@@ -904,9 +926,9 @@ mod tests {
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         match b.resolve(512) {
-            Some(ResolvedPage::Zero { offset }) => assert_eq!(offset, 512),
+            Some(ResolvedPage::Zero) => {}
             other => {
-                panic!("expected Zero(512) for a session-zeroed base-nonzero chunk, got {other:?}")
+                panic!("expected Zero for a session-zeroed base-nonzero chunk, got {other:?}")
             }
         }
     }

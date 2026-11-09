@@ -1,241 +1,450 @@
-//! ADR 0075: the substrate populate server — the WRITER side of the
-//! single-writer chunk-cache discipline.
+//! The substrate populate server: the writer side of the
+//! single-writer chunk cache (ADR 0075).
 //!
 //! Binds `<work_dir>/substrate.sock` and serves the per-VM uffd
-//! handlers (read-only clients): `Hello` answers readiness from live
-//! probes (never config echoes), `Populate` runs the pin → get →
-//! open → send-fd → unpin sequence against the host-agent's ONE
-//! `ChunkCache` instance — so the global singleflight, the pin set,
-//! verify-on-populate, and the #528 budget sweep all apply to handler
-//! traffic exactly as they do to the host-agent's own.
-//!
-//! The clients are synchronous blocking threads (the fault path), so
-//! the protocol is one-request-one-response per frame — no pipelining,
-//! no backpressure subtleties. Each accepted connection gets a tokio
-//! task that does blocking UDS I/O via `spawn_blocking`-free direct
-//! reads on a dedicated std thread: simplest correct shape, and the
-//! populate work itself (cache.get) is async on the server side.
+//! handlers, one tokio task per connection. `Hello` answers readiness
+//! from live probes and pins the session manifest's chunks while any
+//! connection names that manifest. `Populate` gets the chunk from the fill engine
+//! at [`Class::Demand`] and delivers the bytes it got: protocol version
+//! 2 copies them into the connection's shared-memory slot; version 1
+//! passes an fd (see `engram-substrate-proto`).
 
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::HashMap;
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore};
-use engram_substrate_proto::{FromWriter, ToWriter, PROTO_VERSION};
+use bytes::Bytes;
+use engram_chunk_store::{ChunkCache, ChunkHash};
+use engram_core::types::manifest::ManifestRef;
+use engram_fill::{Class, FillEngine};
+use engram_substrate_proto::{
+    ByteRange, FromWriter, Requester, ToWriter, PROTO_VERSION, PROTO_VERSION_READ,
+    PROTO_VERSION_V1, SLOT_BYTES,
+};
+use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 
 /// Everything a connection needs to answer requests.
 #[derive(Clone)]
 pub struct SubstrateServer {
     cache: ChunkCache,
-    store: Arc<ChunkStore>,
+    fill: FillEngine,
     /// The uffd base-shm dir; `HelloAck.tmpfs_ok` is a live statfs of
-    /// this path (TMPFS_MAGIC), closing the handler-side half of the
-    /// post-roll "register memory … userfaultfd … System error" window.
-    uffd_base_dir: PathBuf,
-    /// Tokio runtime handle for the async cache/store calls, entered
-    /// from the per-connection std threads.
-    rt: tokio::runtime::Handle,
+    /// this path. With none, restores use anonymous memory and need no
+    /// tmpfs.
+    uffd_base_dir: Option<PathBuf>,
+    /// The pinned chunk set of each session manifest that a live
+    /// connection names. All connections for one manifest share one
+    /// entry, so the manifest is read and pinned once, not per dial.
+    pins: Arc<Mutex<HashMap<ManifestRef, Weak<SessionPins>>>>,
+}
+
+/// Per-connection state.
+struct Conn {
+    /// The version the client's `Hello` asked for (1 without one).
+    version: u32,
+    /// The version-2 slot; `None` on a version-1 connection.
+    slot: Option<std::fs::File>,
+    /// The length of the last reply in the slot.
+    slot_used: u64,
+    /// The engine, scoped to the session manifest's hinted peer.
+    fill: FillEngine,
+    pins: Option<Arc<SessionPins>>,
+}
+
+/// A slot reply longer than this has its pages freed once the client is
+/// done with it: a 512 KiB memory chunk stays, a 16 MiB disk chunk goes.
+const SLOT_PUNCH_ABOVE: u64 = 1024 * 1024;
+
+impl Conn {
+    /// Free the pages of the last reply when it was long. Called when a
+    /// frame arrives: the exchange is strictly request/response, and the
+    /// client reads the slot only between a reply and its next request,
+    /// so by then it is done with the bytes.
+    fn release_slot(&mut self) {
+        let used = std::mem::take(&mut self.slot_used);
+        let Some(slot) = self.slot.as_ref().filter(|_| used > SLOT_PUNCH_ABOVE) else {
+            return;
+        };
+        if let Err(e) = engram_host_core::disk::punch_hole(slot, 0, used) {
+            tracing::debug!(error = %e, used, "substrate slot pages not freed");
+        }
+    }
+}
+
+/// A session manifest's chunks, pinned while a connection holds this
+/// entry and unpinned when the last one drops it, so an ended or
+/// cancelled connection never leaks a pin.
+struct SessionPins {
+    cache: ChunkCache,
+    hashes: tokio::sync::OnceCell<Vec<ChunkHash>>,
+}
+
+impl Drop for SessionPins {
+    fn drop(&mut self) {
+        if let Some(hashes) = self.hashes.get() {
+            self.cache.unpin_all(hashes.iter().copied());
+        }
+    }
 }
 
 impl SubstrateServer {
-    pub fn new(cache: ChunkCache, store: Arc<ChunkStore>, uffd_base_dir: PathBuf) -> Self {
+    pub fn new(cache: ChunkCache, fill: FillEngine, uffd_base_dir: Option<PathBuf>) -> Self {
         Self {
             cache,
-            store,
+            fill,
             uffd_base_dir,
-            rt: tokio::runtime::Handle::current(),
+            pins: Arc::default(),
         }
     }
 
-    /// Bind and serve. Replaces any stale socket file (a rolled
-    /// host-agent's successor re-binds the same path — the clients'
-    /// bounded reconnect covers the gap; their LAST-RESORT direct-blob
-    /// fallback covers a wedged writer).
-    pub fn spawn(self, sock_path: PathBuf) -> std::io::Result<std::thread::JoinHandle<()>> {
+    /// Bind and serve on the current tokio runtime. Replaces a stale
+    /// socket file: a rolled host-agent's successor binds the same
+    /// path, and the handlers redial.
+    pub fn spawn(self, sock_path: PathBuf) -> std::io::Result<tokio::task::JoinHandle<()>> {
         let _ = std::fs::remove_file(&sock_path);
         if let Some(parent) = sock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&sock_path)?;
         tracing::info!(sock = %sock_path.display(), "substrate populate server bound");
-        Ok(std::thread::Builder::new()
-            .name("substrate-accept".into())
-            .spawn(move || {
-                for conn in listener.incoming() {
-                    match conn {
-                        Ok(stream) => {
-                            let server = self.clone();
-                            if let Err(e) = std::thread::Builder::new()
-                                .name("substrate-conn".into())
-                                .spawn(move || server.serve_conn(stream))
-                            {
-                                tracing::warn!(error = %e, "substrate conn thread spawn failed");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "substrate accept failed");
-                        }
+        Ok(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let server = self.clone();
+                        tokio::spawn(async move { server.serve_conn(stream).await });
+                    }
+                    Err(e) => {
+                        // EMFILE and similar persist; do not spin on them.
+                        tracing::warn!(error = %e, "substrate accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-            })
-            .expect("spawn substrate accept thread"))
+            }
+        }))
     }
 
-    fn serve_conn(&self, mut stream: UnixStream) {
-        // ADR 0075 phase 2: chunks pinned for this connection's
-        // lifetime (the session manifest from Hello). Unpinned on every
-        // exit path below.
-        let mut conn_pins: Vec<ChunkHash> = Vec::new();
-        let result = self.serve_conn_inner(&mut stream, &mut conn_pins);
-        for h in conn_pins {
-            self.cache.unpin(h);
-        }
-        if let Err(e) = result {
+    async fn serve_conn(&self, mut stream: UnixStream) {
+        let mut conn = Conn {
+            version: PROTO_VERSION_V1,
+            slot: None,
+            slot_used: 0,
+            fill: self.fill.clone(),
+            pins: None,
+        };
+        if let Err(e) = self.serve_frames(&mut stream, &mut conn).await {
             tracing::debug!(error = %e, "substrate connection ended");
         }
     }
 
-    fn serve_conn_inner(
-        &self,
-        stream: &mut UnixStream,
-        conn_pins: &mut Vec<ChunkHash>,
-    ) -> std::io::Result<()> {
-        loop {
-            let msg: ToWriter = match engram_substrate_proto::read_frame(stream) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
-            };
-            let res = match msg {
+    async fn serve_frames(&self, stream: &mut UnixStream, conn: &mut Conn) -> std::io::Result<()> {
+        while let Some(msg) = read_frame(stream).await? {
+            conn.release_slot();
+            match msg {
                 ToWriter::Hello {
                     proto_version,
-                    canonical_manifest,
+                    canonical_manifest: _,
                     session_manifest,
                 } => {
-                    if proto_version != PROTO_VERSION {
-                        engram_substrate_proto::write_frame(
-                            stream,
-                            &FromWriter::PopulateErr {
-                                msg: format!(
-                                    "proto version mismatch: writer {PROTO_VERSION}, client {proto_version}"
-                                ),
-                            },
-                        )?;
-                        return Ok(());
-                    }
-                    // `canonical_manifest` is accepted for the ADR 0076
-                    // owner (whose readiness registry can answer
-                    // staged-ness); the host-agent answers the two live
-                    // probes it CAN answer honestly.
-                    let _ = canonical_manifest;
-                    // ADR 0075 phase 2: pin the session manifest's
-                    // divergent chunks for this connection's lifetime,
-                    // so the single evictor can never unlink them out
-                    // from under the handler's faults. A manifest the
-                    // store can't resolve (a migration destination's
-                    // deliberately-unpublished v+1) skips pinning —
-                    // those chunks are resident + peer-served.
-                    if conn_pins.is_empty() {
-                        if let Some(mref) = session_manifest {
-                            match self.rt.block_on(self.store.get_manifest(mref)) {
-                                Ok(manifest) => {
-                                    for chunk in &manifest.chunks {
-                                        self.cache.pin(chunk.hash);
-                                        conn_pins.push(chunk.hash);
-                                    }
-                                    tracing::debug!(
-                                        pinned = conn_pins.len(),
-                                        "substrate: pinned session chunk set for connection lifetime",
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "session manifest unavailable; no pins");
-                                }
+                    // The slot exists before the ack, so a failure to
+                    // create it is a `PopulateErr` and the handler dials
+                    // again with version 1.
+                    let slot = match proto_version {
+                        PROTO_VERSION | PROTO_VERSION_READ => match new_slot() {
+                            Ok(slot) => Some(slot),
+                            Err(e) => {
+                                let msg = format!("create slot: {e}");
+                                write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
+                                return Ok(());
                             }
+                        },
+                        // A handler an older host-agent started; #1772.
+                        PROTO_VERSION_V1 => None,
+                        other => {
+                            let msg = format!(
+                                "proto version mismatch: writer {PROTO_VERSION_V1}..={PROTO_VERSION_READ}, client {other}"
+                            );
+                            write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
+                            return Ok(());
                         }
-                    }
-                    let ack = FromWriter::HelloAck {
-                        tmpfs_ok: dir_is_tmpfs(&self.uffd_base_dir),
-                        cache_writable: self.cache.root_writable_probe(),
                     };
-                    engram_substrate_proto::write_frame(stream, &ack)
+                    if let Some(mref) = session_manifest {
+                        conn.fill = self.fill.for_manifest(mref.manifest_id);
+                        if conn.pins.is_none() {
+                            conn.pins = Some(self.pin_session_chunks(mref).await);
+                        }
+                    }
+                    write_frame(stream, &self.hello_ack().await?).await?;
+                    if let Some(slot) = &slot {
+                        send_fd(stream, slot.as_fd()).await?;
+                    }
+                    conn.slot = slot;
+                    conn.version = proto_version;
                 }
-                ToWriter::Populate { hash } => self.populate(stream, ChunkHash::from_bytes(hash)),
-            };
-            res?;
-        }
-    }
-
-    /// The pin-around-open sequence (ADR 0075): the pin holds the
-    /// single evictor off between populate and open; the fd makes a
-    /// post-reply unlink harmless.
-    fn populate(&self, stream: &mut UnixStream, hash: ChunkHash) -> std::io::Result<()> {
-        self.cache.pin(hash);
-        let already = self.cache.contains_on_disk(hash);
-        let fetched = self.rt.block_on(self.store.get_chunk(hash));
-        let outcome = match fetched {
-            Ok(_bytes) => {
-                let path = self.cache.on_disk_path(hash);
-                match std::fs::File::open(&path) {
-                    Ok(file) => {
-                        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                        engram_substrate_proto::write_frame(
-                            stream,
-                            &FromWriter::Populated { len },
-                        )?;
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::fd::AsFd;
-                            engram_substrate_proto::send_fd(stream, file.as_fd())?;
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            // Non-Linux never has out-of-process clients
-                            // (ADR 0075) — this server is only exercised
-                            // by tests on macOS, which read the cache
-                            // dir directly after Populated.
-                            let _ = file;
-                        }
-                        if already {
-                            "already_local"
-                        } else {
-                            "populated"
-                        }
-                    }
-                    Err(e) => {
-                        engram_substrate_proto::write_frame(
-                            stream,
-                            &FromWriter::PopulateErr {
-                                msg: format!("open after populate: {e}"),
-                            },
-                        )?;
-                        "error"
-                    }
+                ToWriter::Populate { hash } => {
+                    self.populate(stream, conn, ChunkHash::from_bytes(hash))
+                        .await?
+                }
+                ToWriter::Read {
+                    hash,
+                    requester,
+                    range,
+                } if conn.version >= PROTO_VERSION_READ => {
+                    self.read(stream, conn, ChunkHash::from_bytes(hash), requester, range)
+                        .await?
+                }
+                ToWriter::Read { .. } => {
+                    let msg = format!(
+                        "read needs protocol version {PROTO_VERSION_READ}; this connection speaks {}",
+                        conn.version
+                    );
+                    write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                 }
             }
-            Err(e) => {
-                engram_substrate_proto::write_frame(
-                    stream,
-                    &FromWriter::PopulateErr {
-                        msg: format!("populate fetch: {e}"),
-                    },
-                )?;
+        }
+        Ok(())
+    }
+
+    /// Pin the session manifest's chunks so the evictor never removes
+    /// them while the handler can fault them. The first connection for
+    /// a manifest reads it and pins; the others wait for that read and
+    /// share its pins. A manifest the store cannot resolve (a migration
+    /// destination's unpublished manifest) pins nothing, and the next
+    /// connection reads it again; its chunks are resident or come from
+    /// the peer.
+    async fn pin_session_chunks(&self, mref: ManifestRef) -> Arc<SessionPins> {
+        let pins = {
+            let mut map = self.pins.lock();
+            match map.get(&mref).and_then(Weak::upgrade) {
+                Some(pins) => pins,
+                None => {
+                    map.retain(|_, pins| pins.strong_count() > 0);
+                    let pins = Arc::new(SessionPins {
+                        cache: self.cache.clone(),
+                        hashes: tokio::sync::OnceCell::new(),
+                    });
+                    map.insert(mref, Arc::downgrade(&pins));
+                    pins
+                }
+            }
+        };
+        let pinned = pins
+            .hashes
+            .get_or_try_init(|| async {
+                let manifest = self.fill.store().get_manifest(mref).await?;
+                let hashes: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
+                self.cache.pin_all(hashes.iter().copied());
+                tracing::debug!(
+                    pinned = hashes.len(),
+                    "substrate: pinned session chunk set while a connection names it",
+                );
+                Ok::<_, engram_chunk_store::ChunkStoreError>(hashes)
+            })
+            .await;
+        if let Err(e) = pinned {
+            tracing::debug!(error = %e, "session manifest unavailable; no pins");
+        }
+        pins
+    }
+
+    async fn hello_ack(&self) -> std::io::Result<FromWriter> {
+        let dir = self.uffd_base_dir.clone();
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || FromWriter::HelloAck {
+            tmpfs_ok: dir.as_deref().is_none_or(dir_is_tmpfs),
+            cache_writable: cache.root_writable_probe(),
+        })
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    async fn populate(
+        &self,
+        stream: &mut UnixStream,
+        conn: &mut Conn,
+        hash: ChunkHash,
+    ) -> std::io::Result<()> {
+        let already = self.cache.contains_on_disk(hash);
+        let delivered = match conn.fill.get(hash, Class::Demand).await {
+            Ok(bytes) => self.deliver(stream, conn, hash, &bytes).await?,
+            Err(e) => Err(format!("populate fetch: {e}")),
+        };
+        let outcome = match delivered {
+            Ok(()) if already => "already_local",
+            Ok(()) => "populated",
+            Err(msg) => {
+                write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
                 "error"
             }
         };
-        self.cache.unpin(hash);
         ::metrics::counter!(
             crate::metrics::SUBSTRATE_POPULATE_REQUESTS_TOTAL,
-            "outcome" => outcome
+            "outcome" => outcome,
+            "proto" => if conn.slot.is_some() { "2" } else { "1" },
         )
         .increment(1);
         Ok(())
     }
+
+    /// Serve a version-3 read at `Demand`, through the connection's engine
+    /// view (its peer, and the sandbox's `Demand` cap when one is
+    /// registered for the session manifest the `Hello` named).
+    async fn read(
+        &self,
+        stream: &mut UnixStream,
+        conn: &mut Conn,
+        hash: ChunkHash,
+        requester: Requester,
+        range: Option<ByteRange>,
+    ) -> std::io::Result<()> {
+        let got = match (range, requester) {
+            (Some(range), _) => match usize::try_from(range.len) {
+                Ok(len) => conn
+                    .fill
+                    .read_range(hash, range.offset, len, Class::Demand)
+                    .await
+                    .map_err(|e| format!("read range: {e}")),
+                Err(_) => Err(format!("range of {} bytes is too long", range.len)),
+            },
+            (None, Requester::Memory) => conn
+                .fill
+                .get(hash, Class::Demand)
+                .await
+                .map_err(|e| format!("read: {e}")),
+            (None, Requester::Disk) => conn
+                .fill
+                .read(hash, Class::Demand)
+                .await
+                .map_err(|e| format!("read: {e}")),
+        };
+        let delivered = match got {
+            Ok(bytes) => self.deliver(stream, conn, hash, &bytes).await?,
+            Err(msg) => Err(msg),
+        };
+        let outcome = match delivered {
+            Ok(()) => "read",
+            Err(msg) => {
+                write_frame(stream, &FromWriter::PopulateErr { msg }).await?;
+                "error"
+            }
+        };
+        ::metrics::counter!(
+            crate::metrics::SUBSTRATE_POPULATE_REQUESTS_TOTAL,
+            "outcome" => outcome,
+            "proto" => "3",
+        )
+        .increment(1);
+        Ok(())
+    }
+
+    /// Send `bytes` in the connection's protocol version. The outer
+    /// error is a broken connection; the inner one is a reply the
+    /// handler gets as `PopulateErr`.
+    async fn deliver(
+        &self,
+        stream: &mut UnixStream,
+        conn: &mut Conn,
+        hash: ChunkHash,
+        bytes: &Bytes,
+    ) -> std::io::Result<Result<(), String>> {
+        let len = bytes.len() as u64;
+        if let Some(slot) = &conn.slot {
+            if len > SLOT_BYTES {
+                return Ok(Err(format!(
+                    "chunk of {len} bytes exceeds the {SLOT_BYTES}-byte slot"
+                )));
+            }
+            // A copy into shared memory, not disk I/O.
+            let written = slot.write_all_at(bytes, 0);
+            conn.slot_used = len;
+            if let Err(e) = written {
+                return Ok(Err(format!("write slot: {e}")));
+            }
+            write_frame(stream, &FromWriter::Filled { len }).await?;
+            return Ok(Ok(()));
+        }
+        // Version 1. The cache file holds the same bytes when it is
+        // there; when it is not (evicted, or its write is still queued),
+        // an anonymous file carries the bytes in hand.
+        let file = match std::fs::File::open(self.cache.on_disk_path(hash)) {
+            Ok(file) => file,
+            Err(_) => match anon_file_with(bytes) {
+                Ok(file) => file,
+                Err(e) => return Ok(Err(format!("anonymous chunk file: {e}"))),
+            },
+        };
+        write_frame(stream, &FromWriter::Populated { len }).await?;
+        send_fd(stream, file.as_fd()).await?;
+        Ok(Ok(()))
+    }
 }
 
-/// Live probe: is `dir` on a tmpfs? (The uffd base-shm contract —
-/// ADR 0045 — requires it; a handler serving off non-tmpfs later dies
-/// with `register memory … userfaultfd … System error`.)
+/// One frame, or `None` at a clean end of stream.
+async fn read_frame<T: serde::de::DeserializeOwned>(
+    stream: &mut UnixStream,
+) -> std::io::Result<Option<T>> {
+    let mut header = [0u8; 4];
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let mut body = vec![0u8; engram_substrate_proto::frame_body_len(header)?];
+    stream.read_exact(&mut body).await?;
+    engram_substrate_proto::decode_frame_body(&body).map(Some)
+}
+
+async fn write_frame<T: serde::Serialize>(stream: &mut UnixStream, msg: &T) -> std::io::Result<()> {
+    stream
+        .write_all(&engram_substrate_proto::encode_frame(msg)?)
+        .await
+}
+
+async fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    stream
+        .async_io(tokio::io::Interest::WRITABLE, || {
+            engram_substrate_proto::send_fd(stream.as_fd(), fd)
+        })
+        .await
+}
+
+/// A sparse anonymous file of [`SLOT_BYTES`].
+fn new_slot() -> std::io::Result<std::fs::File> {
+    let slot = anon_file()?;
+    slot.set_len(SLOT_BYTES)?;
+    Ok(slot)
+}
+
+/// An anonymous file that holds `bytes` from offset 0, with its file
+/// offset at 0.
+fn anon_file_with(bytes: &[u8]) -> std::io::Result<std::fs::File> {
+    let file = anon_file()?;
+    file.write_all_at(bytes, 0)?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn anon_file() -> std::io::Result<std::fs::File> {
+    let fd =
+        nix::sys::memfd::memfd_create(c"engram-substrate", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// No memfd off Linux; an unlinked temp file behaves the same for the
+/// tests that run the server there.
+#[cfg(not(target_os = "linux"))]
+fn anon_file() -> std::io::Result<std::fs::File> {
+    tempfile::tempfile()
+}
+
+/// Live probe: is `dir` on a tmpfs? The uffd base shm (ADR 0045) must
+/// be; a handler that serves off another file system later dies with
+/// `register memory … userfaultfd … System error`.
 #[cfg(target_os = "linux")]
 fn dir_is_tmpfs(dir: &Path) -> bool {
     match nix::sys::statfs::statfs(dir) {
@@ -247,22 +456,23 @@ fn dir_is_tmpfs(dir: &Path) -> bool {
     }
 }
 
+/// macOS has no tmpfs contract (VZ restores do not use the uffd
+/// substrate).
 #[cfg(not(target_os = "linux"))]
 fn dir_is_tmpfs(_dir: &Path) -> bool {
-    // macOS has no tmpfs contract (VZ restores don't use the uffd
-    // substrate); answer true so dev flows aren't blocked by a probe
-    // for a Linux-only invariant.
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engram_chunk_store::ChunkStore;
     use engram_core::traits::BlobStorage;
+    use std::os::unix::net::UnixStream as StdUnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
-    /// Counting blob store: serves fixed bytes, counts fetches — the
-    /// cross-process-singleflight assertion's witness.
+    /// Counting blob store: serves fixed bytes, counts fetches.
     struct CountingBlob {
         inner: engram_storage_local::LocalBlobStorage,
         gets: AtomicU64,
@@ -298,7 +508,9 @@ mod tests {
         }
     }
 
-    fn server_fixture(dir: &std::path::Path) -> (SubstrateServer, Arc<CountingBlob>, ChunkHash) {
+    async fn server_fixture(
+        dir: &std::path::Path,
+    ) -> (SubstrateServer, Arc<CountingBlob>, ChunkHash, bytes::Bytes) {
         let blob = Arc::new(CountingBlob {
             inner: engram_storage_local::LocalBlobStorage::new(dir.join("blobs")),
             gets: AtomicU64::new(0),
@@ -306,30 +518,59 @@ mod tests {
         let cache = ChunkCache::new(engram_chunk_store::cache::ChunkCacheConfig::new(
             dir.join("chunk-cache"),
         ));
-        let store = Arc::new(
-            ChunkStore::new(blob.clone() as Arc<dyn BlobStorage>).with_chunk_cache(cache.clone()),
-        );
-        let bytes = bytes::Bytes::from(vec![7u8; 1024]);
-        let hash = engram_chunk_store::ChunkHash::of(&bytes);
-        let store_for_put = store.clone();
-        tokio::runtime::Handle::current()
-            .block_on(async move { store_for_put.put_chunk(&bytes).await })
-            .expect("seed chunk");
-        // Reset the counter — the seed's write-through may have read.
+        let store =
+            ChunkStore::new(blob.clone() as Arc<dyn BlobStorage>).with_chunk_cache(cache.clone());
+        let bytes = bytes::Bytes::from((0..64 * 1024).map(|i| i as u8).collect::<Vec<_>>());
+        let hash = store.put_chunk(&bytes).await.expect("seed chunk");
         blob.gets.store(0, Ordering::SeqCst);
-        let server = SubstrateServer::new(cache, store, dir.join("shm"));
-        (server, blob, hash)
+        let fill = FillEngine::new(store, engram_fill::Config::default());
+        let server = SubstrateServer::new(cache, fill, Some(dir.join("shm")));
+        (server, blob, hash, bytes)
     }
 
-    /// N concurrent populate requests for one hash across ≥2 client
-    /// connections produce exactly ≤1 blob fetch — the writer's global
-    /// singleflight collapses cross-client dupes (pre-0069 each
-    /// handler process fetched independently).
+    /// With no uffd base dir, restores use anonymous memory: the handler
+    /// must not refuse to serve because no tmpfs is there.
+    #[tokio::test]
+    async fn no_base_dir_needs_no_tmpfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut server, _, _, _) = server_fixture(dir.path()).await;
+        server.uffd_base_dir = None;
+        match server.hello_ack().await.unwrap() {
+            FromWriter::HelloAck { tmpfs_ok, .. } => assert!(tmpfs_ok),
+            other => panic!("expected a HelloAck, got {other:?}"),
+        }
+    }
+
+    fn hello(stream: &mut StdUnixStream, proto_version: u32) -> FromWriter {
+        engram_substrate_proto::write_frame(
+            stream,
+            &ToWriter::Hello {
+                proto_version,
+                canonical_manifest: None,
+                session_manifest: None,
+            },
+        )
+        .unwrap();
+        engram_substrate_proto::read_frame(stream).unwrap()
+    }
+
+    fn populate(stream: &mut StdUnixStream, hash: ChunkHash) -> FromWriter {
+        engram_substrate_proto::write_frame(
+            stream,
+            &ToWriter::Populate {
+                hash: *hash.as_bytes(),
+            },
+        )
+        .unwrap();
+        engram_substrate_proto::read_frame(stream).unwrap()
+    }
+
+    /// Concurrent populates for one hash on several connections make at
+    /// most one blob fetch: the writer's singleflight collapses them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_clients_collapse_to_one_fetch() {
         let dir = tempfile::tempdir().unwrap();
-        // Evict the seeded chunk from local cache so populate must fetch.
-        let (server, blob, hash) = tokio::task::block_in_place(|| server_fixture(dir.path()));
+        let (server, blob, hash, _) = server_fixture(dir.path()).await;
         server.cache.evict_on_disk_for_test(hash);
 
         let sock = dir.path().join("substrate.sock");
@@ -339,17 +580,8 @@ mod tests {
         for _ in 0..4 {
             let sock = sock.clone();
             joins.push(std::thread::spawn(move || {
-                let mut stream = UnixStream::connect(&sock).expect("connect");
-                engram_substrate_proto::write_frame(
-                    &mut stream,
-                    &engram_substrate_proto::ToWriter::Populate {
-                        hash: *hash.as_bytes(),
-                    },
-                )
-                .unwrap();
-                let reply: engram_substrate_proto::FromWriter =
-                    engram_substrate_proto::read_frame(&mut stream).unwrap();
-                matches!(reply, engram_substrate_proto::FromWriter::Populated { .. })
+                let mut stream = StdUnixStream::connect(&sock).expect("connect");
+                matches!(populate(&mut stream, hash), FromWriter::Populated { .. })
             }));
         }
         for j in joins {
@@ -360,40 +592,303 @@ mod tests {
             fetches <= 1,
             "singleflight must collapse concurrent misses to one fetch, saw {fetches}",
         );
-        // The chunk landed in the cache (write-through) — a reader sees it.
         assert!(server.cache.contains_on_disk(hash));
     }
 
     /// HelloAck answers live probes; the writability probe is
-    /// cross-platform (tmpfs is Linux-contract territory).
+    /// cross-platform (tmpfs is a Linux contract).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hello_answers_probes() {
         let dir = tempfile::tempdir().unwrap();
-        let (server, _blob, _hash) = tokio::task::block_in_place(|| server_fixture(dir.path()));
+        let (server, _blob, _hash, _) = server_fixture(dir.path()).await;
         let sock = dir.path().join("substrate.sock");
         let _accept = server.spawn(sock.clone()).unwrap();
 
-        let ack = std::thread::spawn(move || {
-            let mut stream = UnixStream::connect(&sock).expect("connect");
-            engram_substrate_proto::write_frame(
-                &mut stream,
-                &engram_substrate_proto::ToWriter::Hello {
-                    proto_version: engram_substrate_proto::PROTO_VERSION,
-                    canonical_manifest: None,
-                    session_manifest: None,
-                },
-            )
-            .unwrap();
-            engram_substrate_proto::read_frame::<_, engram_substrate_proto::FromWriter>(&mut stream)
-                .unwrap()
+        let ack = tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).expect("connect");
+            hello(&mut stream, PROTO_VERSION_V1)
         })
-        .join()
+        .await
         .unwrap();
         match ack {
-            engram_substrate_proto::FromWriter::HelloAck { cache_writable, .. } => {
+            FromWriter::HelloAck { cache_writable, .. } => {
                 assert!(cache_writable, "tempdir cache root must probe writable");
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
+    }
+
+    /// Version 2: the ack carries the slot fd, and each `Filled` reply
+    /// puts the chunk in the slot, also after the cache file is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_two_delivers_chunks_through_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, bytes) = server_fixture(dir.path()).await;
+        let cache = server.cache.clone();
+        let sock = dir.path().join("substrate.sock");
+        let _accept = server.spawn(sock.clone()).unwrap();
+
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).expect("connect");
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION),
+                FromWriter::HelloAck { .. }
+            ));
+            let slot = std::fs::File::from(
+                engram_substrate_proto::recv_fd(stream.as_fd()).expect("slot fd"),
+            );
+            assert_eq!(slot.metadata().unwrap().len(), SLOT_BYTES);
+            for _ in 0..2 {
+                let FromWriter::Filled { len } = populate(&mut stream, hash) else {
+                    panic!("expected Filled");
+                };
+                let mut got = vec![0u8; len as usize];
+                slot.read_exact_at(&mut got, 0).unwrap();
+                assert_eq!(got, bytes.as_ref());
+                cache.evict_on_disk_for_test(hash);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A version-1 handler gets an fd that reads the whole chunk from
+    /// offset 0, from the cache file or, when the file is gone at
+    /// delivery, from an anonymous file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_one_fd_reads_the_whole_chunk() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, bytes) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _accept = server.spawn(sock.clone()).unwrap();
+
+        let expected = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            let bytes = expected;
+            let mut stream = StdUnixStream::connect(&sock).expect("connect");
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION_V1),
+                FromWriter::HelloAck { .. }
+            ));
+            let FromWriter::Populated { len } = populate(&mut stream, hash) else {
+                panic!("expected Populated");
+            };
+            let mut file = std::fs::File::from(
+                engram_substrate_proto::recv_fd(stream.as_fd()).expect("chunk fd"),
+            );
+            let mut got = Vec::new();
+            file.read_to_end(&mut got).unwrap();
+            assert_eq!(got.len() as u64, len);
+            assert_eq!(got, bytes.as_ref());
+        })
+        .await
+        .unwrap();
+
+        let anon = anon_file_with(&bytes).unwrap();
+        let mut got = Vec::new();
+        (&anon).read_to_end(&mut got).unwrap();
+        assert_eq!(got, bytes.as_ref());
+    }
+
+    /// Connections that name one session manifest read it once and share
+    /// one pin per chunk; the pins go when the last connection closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connections_for_one_manifest_read_and_pin_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, blob, _hash, _) = server_fixture(dir.path()).await;
+        let store = server.fill.store().clone();
+        let src = dir.path().join("mem.bin");
+        // Four distinct chunks.
+        let body: Vec<u8> = (0..4 * 4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        std::fs::write(&src, body).unwrap();
+        let manifest = store
+            .chunk_file(
+                &src,
+                engram_chunk_store::manifest::ManifestKind::Memory,
+                Some(4096),
+            )
+            .await
+            .unwrap();
+        let mref = ManifestRef::new();
+        // Another process wrote the manifest, so the server reads it.
+        ChunkStore::new(blob.clone() as Arc<dyn BlobStorage>)
+            .put_manifest(mref, &manifest)
+            .await
+            .unwrap();
+        blob.gets.store(0, Ordering::SeqCst);
+        let cache = server.cache.clone();
+        let sock = dir.path().join("substrate.sock");
+        let _accept = server.spawn(sock.clone()).unwrap();
+
+        let streams = tokio::task::spawn_blocking(move || {
+            (0..3)
+                .map(|_| {
+                    let mut stream = StdUnixStream::connect(&sock).expect("connect");
+                    engram_substrate_proto::write_frame(
+                        &mut stream,
+                        &ToWriter::Hello {
+                            proto_version: PROTO_VERSION_V1,
+                            canonical_manifest: None,
+                            session_manifest: Some(mref),
+                        },
+                    )
+                    .unwrap();
+                    let ack: FromWriter = engram_substrate_proto::read_frame(&mut stream).unwrap();
+                    assert!(matches!(ack, FromWriter::HelloAck { .. }));
+                    stream
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(blob.gets.load(Ordering::SeqCst), 1, "one manifest read");
+        let chunks: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
+        assert!(chunks.iter().all(|h| cache.is_pinned(*h)));
+        for h in &chunks {
+            cache.unpin(*h);
+        }
+        assert!(
+            chunks.iter().all(|h| !cache.is_pinned(*h)),
+            "each chunk holds one pin, not one per connection"
+        );
+        for h in &chunks {
+            cache.pin(*h);
+        }
+
+        drop(streams);
+        // At most 5 s of 10 ms polls.
+        for poll in 0.. {
+            if !chunks.iter().any(|h| cache.is_pinned(*h)) {
+                break;
+            }
+            assert!(poll < 500, "pins outlive the connections");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn read(stream: &mut StdUnixStream, hash: ChunkHash, range: Option<ByteRange>) -> FromWriter {
+        engram_substrate_proto::write_frame(
+            stream,
+            &ToWriter::Read {
+                hash: *hash.as_bytes(),
+                requester: Requester::Disk,
+                range,
+            },
+        )
+        .unwrap();
+        engram_substrate_proto::read_frame(stream).unwrap()
+    }
+
+    /// Version 3: a disk read of a range lands the range in the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_three_reads_a_range_through_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, bytes) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        let want = bytes.slice(4096..8192);
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION_READ),
+                FromWriter::HelloAck { .. }
+            ));
+            let slot =
+                std::fs::File::from(engram_substrate_proto::recv_fd(stream.as_fd()).unwrap());
+            let range = ByteRange {
+                offset: 4096,
+                len: 4096,
+            };
+            assert_eq!(
+                read(&mut stream, hash, Some(range)),
+                FromWriter::Filled { len: 4096 }
+            );
+            let mut got = vec![0u8; 4096];
+            slot.read_exact_at(&mut got, 0).unwrap();
+            assert_eq!(got, want.as_ref());
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The pages of a long reply are freed when the next request comes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_next_request_frees_a_long_reply() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, small, _) = server_fixture(dir.path()).await;
+        let long = bytes::Bytes::from(vec![7u8; 4 * 1024 * 1024]);
+        let long = server.fill.store().put_chunk(&long).await.unwrap();
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION_READ),
+                FromWriter::HelloAck { .. }
+            ));
+            let slot =
+                std::fs::File::from(engram_substrate_proto::recv_fd(stream.as_fd()).unwrap());
+            let held = |slot: &std::fs::File| slot.metadata().unwrap().blocks() * 512;
+            assert!(matches!(
+                populate(&mut stream, long),
+                FromWriter::Filled { .. }
+            ));
+            assert!(held(&slot) >= 4 * 1024 * 1024);
+            assert!(matches!(
+                populate(&mut stream, small),
+                FromWriter::Filled { .. }
+            ));
+            assert!(held(&slot) < 1024 * 1024, "held {}", held(&slot));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_on_a_version_two_connection_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, hash, _) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _task = server.spawn(sock.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).unwrap();
+            assert!(matches!(
+                hello(&mut stream, PROTO_VERSION),
+                FromWriter::HelloAck { .. }
+            ));
+            let _slot = engram_substrate_proto::recv_fd(stream.as_fd()).unwrap();
+            assert!(matches!(
+                read(&mut stream, hash, None),
+                FromWriter::PopulateErr { .. }
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _blob, _hash, _) = server_fixture(dir.path()).await;
+        let sock = dir.path().join("substrate.sock");
+        let _accept = server.spawn(sock.clone()).unwrap();
+
+        // A writer older than version 3 answers a version-3 Hello the same
+        // way: an error, then the end of the connection.
+        let (reply, after) = tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&sock).expect("connect");
+            let reply = hello(&mut stream, PROTO_VERSION_READ + 1);
+            let after = engram_substrate_proto::read_frame::<_, FromWriter>(&mut stream);
+            (reply, after)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(reply, FromWriter::PopulateErr { .. }));
+        assert_eq!(after.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

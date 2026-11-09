@@ -70,15 +70,16 @@ fn agentd_musl_bin() -> PathBuf {
 /// — every InRelease fetch timed out after 40s). So we do all the
 /// network work HOST-side (download ttyd via `curl`) and use only
 /// `COPY` inside Docker, which doesn't need DNS.
-/// The baked rootfs file, the chunk store holding its manifest, and the
-/// manifest: a cold test boots the file, a warm test restores through
-/// session volumes staged from the manifest.
+/// The baked rootfs file, the chunk store holding its manifest, the
+/// manifest, and the store's blob root: a cold test boots the file, a warm
+/// test restores through session volumes staged from the manifest.
 async fn bake_shell_rootfs(
     busybox: &Path,
 ) -> (
     PathBuf,
     engram_chunk_store::ChunkStore,
     engram_core::ManifestRef,
+    PathBuf,
 ) {
     let src = tempfile::tempdir().expect("source dir");
 
@@ -109,11 +110,10 @@ async fn bake_shell_rootfs(
     // Keep the tempdir alive for the duration of the test.
     std::mem::forget(images_dir);
 
-    let chunk_root = tempfile::tempdir().expect("chunk store");
+    let chunk_root = tempfile::tempdir().expect("chunk store").keep();
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+        engram_storage_local::LocalBlobStorage::new(chunk_root.clone()),
     );
-    std::mem::forget(chunk_root);
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
     // ttyd is a fully-static binary; drop it at /usr/local/bin/ttyd. busybox
@@ -138,7 +138,12 @@ async fn bake_shell_rootfs(
     )
     .await;
 
-    (outcome.rootfs_path, chunk_store, outcome.disk_manifest)
+    (
+        outcome.rootfs_path,
+        chunk_store,
+        outcome.disk_manifest,
+        chunk_root,
+    )
 }
 
 /// Drive a WS round-trip through the ShellTunnel.
@@ -269,7 +274,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
     cleanup_host_state();
 
     // ---- 1. Bake a real rootfs with ttyd + agentd ----
-    let (rootfs_path, _, _) = bake_shell_rootfs(&busybox).await;
+    let (rootfs_path, _, _, _) = bake_shell_rootfs(&busybox).await;
 
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
@@ -338,7 +343,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
     };
     cleanup_host_state();
 
-    let (_, chunk_store, image) = bake_shell_rootfs(&busybox).await;
+    let (_, chunk_store, image, blob_root) = bake_shell_rootfs(&busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -347,6 +352,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
+    common::resume_through_uffd(&mut cfg, &blob_root);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
     let pooled = Arc::new(

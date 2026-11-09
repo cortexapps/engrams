@@ -954,3 +954,69 @@ async fn runtime_spec_round_trips_and_absent_reads_none() {
         Some(spec2),
     );
 }
+
+/// The heartbeat reconcile records a snapshot unfenced while the Snapshot
+/// RPC promotes the same row fenced. Both write the session row (the
+/// fence read, the durable-head advance), so both must lock it before the
+/// snapshot row; otherwise each holds the lock the other waits for.
+/// Here an outside transaction holds the session row: the blocked
+/// unfenced write must not hold the snapshot row while it waits.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn an_unfenced_record_locks_the_session_row_before_the_snapshot_row() {
+    use sqlx::Connection as _;
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let url = db.url.clone();
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
+    let (session_id, _sandbox) = seed_active(&meta).await;
+    let mut row = checkpoint_row(session_id, Utc::now(), None);
+    row.recoverable = false;
+    let snapshot_id = row.id;
+    meta.record_snapshot(row.clone())
+        .await
+        .expect("first record");
+
+    let mut holder = sqlx::PgConnection::connect(&url).await.expect("connect");
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE")
+        .bind(session_id.as_uuid())
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    row.recoverable = true;
+    let writer = {
+        let meta = meta.clone();
+        tokio::spawn(async move { meta.record_snapshot(row).await })
+    };
+    let mut observer = sqlx::PgConnection::connect(&url).await.expect("connect");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never blocked on the held session row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    sqlx::query("SELECT 1 FROM snapshots WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(snapshot_id.as_uuid())
+        .execute(&mut holder)
+        .await
+        .expect("the waiting writer must not hold the snapshot row");
+    sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+    let inserted = writer.await.unwrap().expect("the writer completes");
+    assert!(!inserted, "a re-record updates the existing row");
+}

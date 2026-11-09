@@ -95,6 +95,7 @@ async fn chained_restore_snapshot_lineage_holds() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -128,6 +129,7 @@ async fn chained_restore_snapshot_lineage_holds() {
     // socket gone). Let early boot finish.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
 
     // Chained hops. Each hop:
@@ -189,6 +191,7 @@ async fn chained_restore_snapshot_lineage_holds() {
             .snapshot(restored)
             .await
             .unwrap_or_else(|e| panic!("hop {hop}: snapshot of restored sandbox: {e}"));
+        common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
 
         backend
             .destroy(restored)

@@ -261,6 +261,16 @@ impl BlobStorage for BlobClient {
         .await
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        let deadline = Some(self.policy.attempt_timeout);
+        self.with_retry("get_range", deadline, || {
+            let inner = self.inner.clone();
+            let key = key.to_owned();
+            async move { inner.get_range(&key, offset, len).await }
+        })
+        .await
+    }
+
     async fn head(&self, key: &str) -> Result<BlobObjectMeta, BlobError> {
         let deadline = Some(self.policy.attempt_timeout);
         self.with_retry("head", deadline, || {
@@ -383,6 +393,25 @@ mod tests {
     use engram_testkit::storage::{
         FaultPlan, FaultyBlobStorage, GetFault, GetFaultKind, InjectedError, KeyMatch, When,
     };
+
+    /// GCS's ranged GET through the client that wraps every store. The
+    /// emulator closes its connection after a 416 without a
+    /// `Connection: close`, so a request on the pooled connection can fail
+    /// in transport; the client retries it, as it does in production.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_ranged_get_against_emulator() {
+        if std::env::var("STORAGE_EMULATOR_HOST").is_err() {
+            return;
+        }
+        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
+            return;
+        };
+        let gcs = engram_storage_gcs::GcsBlobStorage::connect(bucket)
+            .await
+            .expect("connect against emulator");
+        let client = BlobClient::wrap(Arc::new(gcs));
+        engram_testkit::blob_conformance::ranged_get(&client).await;
+    }
 
     fn test_policy() -> ClientPolicy {
         ClientPolicy {

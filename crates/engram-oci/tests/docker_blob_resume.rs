@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
-use engram_oci::{AnonymousResolver, BlobRetryConfig, DockerBlobRef, OciClient};
+use engram_oci::{AnonymousResolver, BlobRetryConfig, DockerBlobRef, OciClient, RangedPullConfig};
 use futures::stream;
 use parking_lot::Mutex;
 use sha2::Digest as _;
@@ -45,6 +45,11 @@ enum Mode {
     AlwaysCut,
     /// 401 the first blob GET (token expired), serve cleanly after.
     Fail401ThenServe,
+    /// Serve exactly the requested `bytes=<start>-<end>` range.
+    Ranges,
+    /// Answer every request with a 206 from the start offset to the end
+    /// of the blob, ignoring the requested end.
+    IgnoreRangeEnd,
 }
 
 #[derive(Clone)]
@@ -70,6 +75,12 @@ fn range_offset(range: Option<&str>) -> usize {
         .and_then(|r| r.split('-').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0)
+}
+
+/// Parse `bytes=<start>-<end>` into `start..=end`.
+fn range_bounds(range: Option<&str>) -> Option<(usize, usize)> {
+    let (start, end) = range?.strip_prefix("bytes=")?.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 /// A 206 that delivers `full[start..start+len]` as one chunk, then errors
@@ -164,6 +175,18 @@ async fn get_blob(
             }
         }
         Mode::AlwaysCut => cut(full, offset, 1),
+        Mode::Ranges => match range_bounds(range.as_deref()) {
+            Some((start, end)) => {
+                let chunk = Bytes::copy_from_slice(&full[start..=end]);
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(axum::http::header::CONTENT_LENGTH, chunk.len())
+                    .body(Body::from(chunk))
+                    .unwrap()
+            }
+            None => partial(full, offset),
+        },
+        Mode::IgnoreRangeEnd => partial(full, offset),
         Mode::Fail401ThenServe => {
             if n == 0 {
                 (StatusCode::UNAUTHORIZED, "token expired").into_response()
@@ -323,4 +346,71 @@ async fn reauth_on_401_still_works() {
     assert_eq!(std::fs::read(&path).unwrap(), blob.as_ref());
     // GET #0 → 401, GET #1 → served. The re-auth is free of the budget.
     assert_eq!(reg.gets.load(Ordering::SeqCst), 2);
+}
+
+/// Two KB in 512-byte parts, three in flight.
+fn ranged_client() -> OciClient {
+    fast_client().with_ranged_pull(RangedPullConfig {
+        min_blob_bytes: 1000,
+        part_bytes: 512,
+        parts_in_flight: 3,
+    })
+}
+
+/// (e) A blob over the threshold downloads as one request per part,
+/// each for exactly its range, and assembles byte-exact.
+#[tokio::test]
+async fn large_blob_downloads_in_ranges() {
+    let blob = Bytes::from((0u8..=255).cycle().take(2000).collect::<Vec<_>>());
+    let (addr, reg, _sd) = spawn(Mode::Ranges, blob.clone()).await;
+    let uri = format!("127.0.0.1:{}/repo:t", addr.port());
+    let dest = tempfile::tempdir().unwrap();
+    let path = dest.path().join("layer");
+
+    ranged_client()
+        .pull_docker_blob_to_file(&uri, &blob_ref(&blob), &path)
+        .await
+        .expect("ranged pull");
+
+    assert_eq!(std::fs::read(&path).unwrap(), blob.as_ref(), "byte-exact");
+    let mut ranges: Vec<_> = reg.ranges.lock().iter().flatten().cloned().collect();
+    ranges.sort();
+    assert_eq!(
+        ranges,
+        [
+            "bytes=0-511",
+            "bytes=1024-1535",
+            "bytes=1536-1999",
+            "bytes=512-1023"
+        ]
+    );
+    assert_eq!(
+        std::fs::read_dir(dest.path()).unwrap().count(),
+        1,
+        "only the layer file remains"
+    );
+}
+
+/// (f) A registry that sends more than the requested range fails the
+/// ranged pull, and the blob downloads again on one stream.
+#[tokio::test]
+async fn a_range_overrun_falls_back_to_one_stream() {
+    let blob = Bytes::from((0u8..=255).cycle().take(2000).collect::<Vec<_>>());
+    let (addr, reg, _sd) = spawn(Mode::IgnoreRangeEnd, blob.clone()).await;
+    let uri = format!("127.0.0.1:{}/repo:t", addr.port());
+    let dest = tempfile::tempdir().unwrap();
+    let path = dest.path().join("layer");
+
+    ranged_client()
+        .pull_docker_blob_to_file(&uri, &blob_ref(&blob), &path)
+        .await
+        .expect("one-stream fallback");
+
+    assert_eq!(std::fs::read(&path).unwrap(), blob.as_ref(), "byte-exact");
+    assert_eq!(
+        reg.ranges.lock().last().cloned().flatten().as_deref(),
+        Some("bytes=0-"),
+        "the last request is the one-stream pull"
+    );
+    assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 1);
 }

@@ -8,6 +8,7 @@ use engram_harness_proto::{FileChange, HarnessEvent};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tracing::Instrument as _;
 
 use crate::config::CoordinatorConfig;
 use crate::host_registry::HostRegistry;
@@ -967,6 +968,9 @@ pub struct AppState {
     /// receiver-less `watch::Sender` is kept alive here; handlers call
     /// `subscribe_shutdown()` for a fresh receiver.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// The fleet-wide heartbeat-ack reads, shared by the heartbeats this
+    /// replica takes within a short window.
+    pub heartbeat_fleet: crate::api::host_http::FleetReadCache,
 }
 
 impl AppState {
@@ -1048,6 +1052,7 @@ impl AppState {
             preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            heartbeat_fleet: Default::default(),
         }
     }
 
@@ -1096,9 +1101,12 @@ impl AppState {
         host_id: engram_core::HostId,
         sandbox: Arc<dyn engram_core::traits::SandboxBackend>,
     ) {
-        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::new(sandbox, self.harness_hub.clone()),
-        );
+        let client: Arc<dyn engram_core::traits::HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::new(
+                sandbox,
+                self.harness_hub.clone(),
+                engram_host_agent::IdleEvictionHarness::default(),
+            ));
         self.host_registry.register(host_id, client);
     }
 
@@ -1361,6 +1369,19 @@ fn harness_event_sink(
     .sink()
 }
 
+/// A step span under the current `coord.ingest_harness_event` span, or no
+/// span when the ingest has none (an unsampled chunk), so that the steps
+/// of an untraced event do not become root spans.
+macro_rules! ingest_step_span {
+    ($name:literal) => {
+        if tracing::Span::current().is_disabled() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!($name)
+        }
+    };
+}
+
 struct HarnessEventWriter {
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
@@ -1411,6 +1432,7 @@ impl HarnessEventWriter {
                     &continued,
                     settled_at,
                 )
+                .instrument(ingest_step_span!("coord.harness_event.settle"))
                 .await?;
             if settled.is_some() {
                 if let Err(e) = meta
@@ -1501,13 +1523,18 @@ impl HarnessEventWriter {
         // signal the incident waited 41 s for, and it is exactly
         // the shape the dedupe drops from the log.
         if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
+            let attach_wake = ingest_step_span!("coord.harness_event.attach_wake");
             // ADR 0108 A8: a harness that just announced Idle can
             // take a prompt NOW — a row waiting out ACK_TIMEOUT
             // from a forward into a dead link has no reason to
             // keep waiting. Without this recall the wake below
             // finds nothing due and no-ops; the row then sits out
             // the full timeout.
-            if let Err(e) = meta.outbox_make_due(session_id).await {
+            if let Err(e) = meta
+                .outbox_make_due(session_id)
+                .instrument(attach_wake.clone())
+                .await
+            {
                 tracing::debug!(
                     session_id = %session_id,
                     error = %e,
@@ -1516,6 +1543,7 @@ impl HarnessEventWriter {
             }
             if let Err(e) = meta
                 .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+                .instrument(attach_wake)
                 .await
             {
                 tracing::debug!(
@@ -1586,7 +1614,11 @@ impl HarnessEventWriter {
         // correctness — the durable `agent_message` (same message_id) is
         // the authoritative record and supersedes every chunk.
         if delivery.is_none() && kind == "agent_message_chunk" {
-            if let Err(e) = meta.notify_session_delta(session_id, &payload).await {
+            if let Err(e) = meta
+                .notify_session_delta(session_id, &payload)
+                .instrument(ingest_step_span!("coord.harness_event.notify_delta"))
+                .await
+            {
                 tracing::debug!(
                     session_id = %session_id,
                     error = %e,
@@ -1596,20 +1628,28 @@ impl HarnessEventWriter {
             return Ok(());
         }
 
-        let idx = if let Some(delivery) = delivery {
-            meta.append_session_event_idempotent(
-                session_id,
-                &format!(
-                    "harness:{}:{}:{}",
-                    delivery.binding_epoch, delivery.incarnation, delivery.seq
-                ),
-                kind,
-                payload,
-            )
-            .await?
-        } else {
-            Some(meta.append_session_event(session_id, kind, payload).await?)
-        };
+        let idx = async {
+            match delivery {
+                Some(delivery) => {
+                    meta.append_session_event_idempotent(
+                        session_id,
+                        &format!(
+                            "harness:{}:{}:{}",
+                            delivery.binding_epoch, delivery.incarnation, delivery.seq
+                        ),
+                        kind,
+                        payload,
+                    )
+                    .await
+                }
+                None => meta
+                    .append_session_event(session_id, kind, payload)
+                    .await
+                    .map(Some),
+            }
+        }
+        .instrument(ingest_step_span!("coord.harness_event.append"))
+        .await?;
         if let Some(idx) = idx {
             last_kind.insert(session_id, kind);
 
@@ -1620,6 +1660,7 @@ impl HarnessEventWriter {
             // of it (worst case: the query's full timeout delays
             // every run_started delivery, precisely when a
             // contended Postgres makes that delay most costly).
+            let _publish = ingest_step_span!("coord.harness_event.publish").entered();
             events.publish(
                 session_id,
                 IndexedEvent {
@@ -1641,7 +1682,11 @@ impl HarnessEventWriter {
         // replay is the only retry there is. A failed ack withholds the
         // harness ack so the event is replayed again.
         if let Some(ack_id) = &ack_id {
-            match meta.outbox_ack(ack_id).await {
+            match meta
+                .outbox_ack(ack_id)
+                .instrument(ingest_step_span!("coord.harness_event.outbox_ack"))
+                .await
+            {
                 Ok(true) => {
                     metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
                 }
@@ -1688,7 +1733,11 @@ impl HarnessEventWriter {
             // mixed in, so there's no coordinator/Postgres (or
             // cross-replica) clock skew to bias or drop samples.
             if let Some(pid) = &run_started_prompt_id {
-                match meta.prompt_received_seconds_ago(session_id, pid).await {
+                match meta
+                    .prompt_received_seconds_ago(session_id, pid)
+                    .instrument(ingest_step_span!("coord.harness_event.run_started_metric"))
+                    .await
+                {
                     Ok(Some(secs)) if secs >= 0.0 => {
                         metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
                             .record(secs);
@@ -2274,6 +2323,8 @@ pub(crate) mod tests {
         pub(crate) session: PlMutex<Session>,
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         binding_epoch: PlMutex<u64>,
+        /// The binding generation whose harness attached last.
+        pub(crate) attached_binding_epoch: PlMutex<u64>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
         /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
@@ -2368,6 +2419,7 @@ pub(crate) mod tests {
                 session: PlMutex::new(session),
                 events: PlMutex::new(Vec::new()),
                 binding_epoch: PlMutex::new(0),
+                attached_binding_epoch: PlMutex::new(0),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
@@ -3245,6 +3297,16 @@ pub(crate) mod tests {
             Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
         }
 
+        async fn op_requeue_wait(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            delay: std::time::Duration,
+            reason: &str,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.requeue_wait(op_id, epoch, delay, reason))
+        }
+
         async fn op_cancel_queued(
             &self,
             session_id: SessionId,
@@ -3386,6 +3448,19 @@ pub(crate) mod tests {
                 );
             }
             Ok(Some((prev, indices)))
+        }
+
+        async fn session_binding_generations(
+            &self,
+            id: SessionId,
+        ) -> Result<(u64, u64), MetaError> {
+            if self.session.lock().id != id {
+                return Err(MetaError::NotFound);
+            }
+            Ok((
+                *self.binding_epoch.lock(),
+                *self.attached_binding_epoch.lock(),
+            ))
         }
 
         async fn rebind_session_guarded(

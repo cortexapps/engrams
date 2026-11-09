@@ -1,6 +1,9 @@
 //! End-to-end snapshot/restore round-trip test against a real Firecracker.
 //! Drives the SandboxBackend trait through `create` → `snapshot` →
-//! `destroy` → `restore` → `destroy`. Same gating as the other ignored
+//! `destroy` → `restore` → `destroy`. The resume serves memory through
+//! `engram-uffd-handler` from the chunked memory manifest, which
+//! `PooledBackend::snapshot` writes in production and
+//! `common::chunk_memory` writes here. Same gating as the other ignored
 //! integration tests (Linux + KVM + firecracker on PATH + cached test
 //! artifacts).
 //!
@@ -8,6 +11,7 @@
 //!
 //! ```sh
 //! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
+//! cargo build -p engram-uffd-handler
 //! cargo test -p engram-sandbox-firecracker --test snapshot -- --ignored --nocapture
 //! ```
 
@@ -52,6 +56,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // Unprivileged test — see lifecycle.rs comment.
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -121,7 +126,10 @@ async fn snapshot_then_restore_round_trips_microvm() {
         "list should be empty after destroying the original",
     );
 
-    // Step 6: restore from the snapshot — gets a *new* sandbox id
+    // Step 6: chunk the memory and drop memory.bin, as a cross-host
+    // receiver has it, then resume — gets a *new* sandbox id
+    common::chunk_memory(&snap_dir, work.path()).await;
+    std::fs::remove_file(snap_dir.join("memory.bin")).expect("remove memory.bin");
     let restored_id = SandboxId::new();
     backend
         .restore(restored_id, metadata.clone(), common::disks(&local_rootfs))
@@ -149,6 +157,10 @@ async fn snapshot_then_restore_round_trips_microvm() {
         "manifest's spec.image carried through restore"
     );
     assert_eq!(st.rootfs_path, local_rootfs, "rootfs path preserved");
+    assert!(
+        restored_jail.join("uffd-handler.log").exists(),
+        "the resume must serve memory through the UFFD handler"
+    );
 
     // Step 8: cleanup
     backend

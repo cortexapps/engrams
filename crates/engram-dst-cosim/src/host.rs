@@ -102,7 +102,6 @@ fn base_manifest(base_hash: ChunkHash) -> Manifest {
             })
             .collect(),
         parent: None,
-        working_set_trace: None,
         annotations: Default::default(),
     }
 }
@@ -398,6 +397,8 @@ pub struct CosimHost {
     /// modeled process restart, exactly like the node's disk.
     root: TempDir,
     pub store: ChunkStore,
+    /// The fill engine over `store`, as on a real host.
+    fill: engram_fill::FillEngine,
     /// The REAL session-volume owner over a [`FileDisk`] in the tempdir.
     pub volumes: Arc<SessionVolumes>,
     fs_seam: Arc<dyn HostFs>,
@@ -451,13 +452,15 @@ impl CosimHost {
         // I/O never feeds a decision — see the swarm's I/O-audit verdict.
         let store = ChunkStore::new(blob.clone());
         let disk = FileDisk::new(root.path().join("volumes"), CHUNK_SIZE).expect("file disk");
-        let volumes = Arc::new(SessionVolumes::new(Arc::new(disk), store.clone()));
+        let fill = engram_fill::FillEngine::new(store.clone(), engram_fill::Config::default());
+        let volumes = Arc::new(SessionVolumes::new(Arc::new(disk), fill.clone()));
         Self {
             host_id,
             clock,
             entropy,
             root,
             store,
+            fill,
             volumes,
             fs_seam: Arc::new(TokioFs),
             view: Arc::new(HostView::default()),
@@ -867,9 +870,18 @@ impl CosimHost {
         tokio::fs::create_dir_all(&dest)
             .await
             .map_err(|e| format!("snapshot_begin staging dir: {e}"))?;
-        tokio::fs::write(dest.join("state.bin"), b"cosim fc state")
-            .await
-            .map_err(|e| format!("snapshot_begin state.bin: {e}"))?;
+        // The files a Firecracker full capture leaves: the finalize's
+        // memory leg chunks `memory.bin` and patches the `manifest.json`
+        // sidecar, and its blob leg uploads both with `state.bin`.
+        for (name, body) in [
+            ("state.bin", &b"cosim fc state"[..]),
+            ("memory.bin", &b"cosim guest memory"[..]),
+            ("manifest.json", &br#"{"format":"fc"}"#[..]),
+        ] {
+            tokio::fs::write(dest.join(name), body)
+                .await
+                .map_err(|e| format!("snapshot_begin {name}: {e}"))?;
+        }
 
         // The checkpoint taken under the pause: the transient volume the
         // finalize publishes by name.
@@ -885,7 +897,7 @@ impl CosimHost {
         drop(root);
 
         let now = self.clock.now_utc();
-        let record = EvictionFinalizeRecord {
+        let mut record = EvictionFinalizeRecord {
             snapshot_id,
             session_id,
             sandbox_id,
@@ -906,10 +918,11 @@ impl CosimHost {
             swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
+            diff_extents: None,
         };
         let finalizer = self.finalizer();
         record
-            .persist(self.fs_seam.as_ref(), &finalizer.finalize_dir())
+            .persist_captured(self.fs_seam.as_ref(), &finalizer.finalize_dir())
             .await
             .map_err(|e| format!("snapshot_begin record persist: {e}"))?;
 
@@ -1009,8 +1022,7 @@ impl CosimHost {
     fn finalizer(&self) -> EvictionFinalizer {
         EvictionFinalizer::new(
             Some(self.volumes.clone()),
-            Some(self.store.clone()),
-            None,
+            Some(self.fill.clone()),
             self.bundle_dir(),
             BUNDLE_EXT,
             self.root.path().to_path_buf(),

@@ -375,7 +375,7 @@ async fn materialize_and_boot() {
     let work = tempfile::tempdir().expect("work dir");
     let rootfs = work.path().join("rootfs.ext4");
     chunk_store
-        .materialize_to_file(&disk_manifest, &rootfs)
+        .materialize_to_file_from(&disk_manifest, &rootfs, &chunk_store)
         .await
         .expect("reassemble ext4 from chunks");
 

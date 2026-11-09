@@ -31,6 +31,7 @@ use engram_harness_proto::{
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
+use tracing::Instrument as _;
 
 /// Default timeout for a `Checkpoint` command's ack. The harness gets
 /// this long to flush its transcript and reply; on miss the caller
@@ -146,9 +147,10 @@ struct ConnectionHandle {
     /// Currently-pending checkpoint ack. Only one `Checkpoint` may be
     /// in flight per connection at a time — the host serializes them.
     pending_checkpoint: Mutex<Option<oneshot::Sender<()>>>,
-    /// Session this harness belongs to (from `HarnessAttach`).
-    /// Stored on the connection so the idle evictor can return
-    /// `(SessionId, SandboxId)` pairs without a separate lookup.
+    /// W3C trace context of the last prompt sent on this connection. The
+    /// reader parents its event spans on it until the next prompt. A leaf
+    /// lock, held only to read or replace the value.
+    prompt_trace: Arc<Mutex<Option<String>>>,
     /// Per-hub-unique generation stamped at insert (issue #218). The
     /// teardown epilogue compares the live entry's generation against
     /// its own before removing, so a stale connection never evicts the
@@ -414,7 +416,13 @@ impl HarnessHub {
         // driver owns retries (and the reattach), and the mpsc handoff
         // below is fire-and-forget by design — durability is the PG row
         // + the ack loop, not host memory.
-        let cmd_tx = self.acquire_cmd_tx(sandbox_id)?;
+        let (cmd_tx, prompt_trace) = {
+            let conns = self.inner.connections.lock();
+            let handle = conns.get(&sandbox_id).ok_or(HarnessError::NotAttached)?;
+            (handle.cmd_tx.clone(), handle.prompt_trace.clone())
+        };
+        // Set before the send, so the run's first event sees it.
+        *prompt_trace.lock() = engram_telemetry::current_traceparent();
         cmd_tx
             .send(HarnessFrame::Command(HarnessCommand::Prompt {
                 prompt_id,
@@ -778,10 +786,12 @@ async fn drive_attached<R, W>(
     // only when it still owns the live entry.
     let my_generation = inner.next_gen.fetch_add(1, Ordering::Relaxed);
     let disconnected = Arc::new(Notify::new());
+    let prompt_trace = Arc::new(Mutex::new(None));
     let handle = ConnectionHandle {
         disconnected: disconnected.clone(),
         cmd_tx: cmd_tx.clone(),
         pending_checkpoint: Mutex::new(None),
+        prompt_trace: prompt_trace.clone(),
         generation: my_generation,
     };
     // ADR 0108 A2, invariant 2 — "ack implies registered": the insert
@@ -845,7 +855,7 @@ async fn drive_attached<R, W>(
     let reader_outcome = tokio::select! {
         biased;
         _ = disconnected.notified() => Err(HarnessError::WriterClosed),
-        result = reader_loop(reader, &inner, attach.session_id, sandbox_id, attach.binding_epoch, &cmd_tx) => result,
+        result = reader_loop(reader, &inner, attach.session_id, sandbox_id, attach.binding_epoch, &cmd_tx, &prompt_trace) => result,
         _ = &mut writer_task => Err(HarnessError::WriterClosed),
     };
     // Issue #218: guarded teardown. Only remove the registration if it
@@ -877,6 +887,44 @@ async fn drive_attached<R, W>(
     }
 }
 
+/// Agent-message chunks per run that get an event span. A reply streams
+/// one chunk per token batch; the first few show the time to first
+/// token, and the rest post without a span.
+const TRACED_CHUNKS_PER_RUN: u32 = 3;
+
+/// Makes the `host.post_harness_event` span for each event a connection
+/// reads, parented on the prompt that started the run.
+struct EventSpans<'a> {
+    session_id: SessionId,
+    prompt_trace: &'a Mutex<Option<String>>,
+    chunks_left: u32,
+}
+
+impl EventSpans<'_> {
+    fn span(&mut self, event: &HarnessEvent, seq: Option<u64>) -> tracing::Span {
+        match event {
+            HarnessEvent::RunStarted { .. } => self.chunks_left = TRACED_CHUNKS_PER_RUN,
+            HarnessEvent::AgentMessageChunk { .. } if self.chunks_left == 0 => {
+                return tracing::Span::none();
+            }
+            HarnessEvent::AgentMessageChunk { .. } => self.chunks_left -= 1,
+            _ => {}
+        }
+        let span = tracing::info_span!(
+            parent: None,
+            "host.post_harness_event",
+            session_id = %self.session_id,
+            kind = event.kind(),
+            seq,
+            attempt = tracing::field::Empty,
+        );
+        if let Some(tp) = self.prompt_trace.lock().as_deref() {
+            engram_telemetry::set_parent_from_traceparent(&span, tp);
+        }
+        span
+    }
+}
+
 async fn reader_loop<R>(
     mut reader: R,
     hub: &HubInner,
@@ -884,10 +932,16 @@ async fn reader_loop<R>(
     sandbox_id: SandboxId,
     binding_epoch: u64,
     cmd_tx: &mpsc::Sender<HarnessFrame>,
+    prompt_trace: &Mutex<Option<String>>,
 ) -> Result<(), HarnessError>
 where
     R: AsyncRead + Unpin,
 {
+    let mut spans = EventSpans {
+        session_id,
+        prompt_trace,
+        chunks_left: TRACED_CHUNKS_PER_RUN,
+    };
     loop {
         let frame: HarnessFrame = match read_msg(&mut reader).await {
             Ok(f) => f,
@@ -908,7 +962,9 @@ where
                 // (RunStarted{prompt_id} / PromptQueued /
                 // ToolCallCompleted) also ack the outbox row at the
                 // coordinator's emit choke point.
+                let span = spans.span(&ev, None);
                 (hub.event_sink)(session_id, sandbox_id, ev, None)
+                    .instrument(span)
                     .await
                     .map_err(HarnessError::Sink)?;
             }
@@ -924,6 +980,7 @@ where
                         attach_epoch: binding_epoch,
                     });
                 }
+                let span = spans.span(&event, Some(seq));
                 (hub.event_sink)(
                     session_id,
                     sandbox_id,
@@ -934,6 +991,7 @@ where
                         incarnation,
                     }),
                 )
+                .instrument(span)
                 .await
                 .map_err(HarnessError::Sink)?;
                 cmd_tx
@@ -1723,6 +1781,7 @@ mod tests {
                 disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_new,
                 pending_checkpoint: Mutex::new(None),
+                prompt_trace: Arc::default(),
                 generation: new_gen,
             },
         ));
@@ -1734,6 +1793,7 @@ mod tests {
                 disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_old,
                 pending_checkpoint: Mutex::new(None),
+                prompt_trace: Arc::default(),
                 generation: old_gen,
             },
         ));
@@ -2126,5 +2186,37 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         assert_eq!(hub.attached_count(), 1);
+    }
+
+    #[test]
+    fn event_spans_trace_the_first_chunks_of_each_run() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let prompt_trace = PlMutex::new(None);
+        let mut spans = EventSpans {
+            session_id: SessionId::new(),
+            prompt_trace: &prompt_trace,
+            chunks_left: TRACED_CHUNKS_PER_RUN,
+        };
+        let run_started = HarnessEvent::RunStarted {
+            run_id: "r1".into(),
+            prompt_summary: None,
+            prompt_id: None,
+        };
+        let chunk = HarnessEvent::AgentMessageChunk {
+            run_id: "r1".into(),
+            message_id: "m1".into(),
+            chunk: "token".into(),
+        };
+        let traced_chunks = |spans: &mut EventSpans<'_>| {
+            (0..TRACED_CHUNKS_PER_RUN + 2)
+                .filter(|_| !spans.span(&chunk, None).is_none())
+                .count()
+        };
+
+        assert!(!spans.span(&run_started, Some(1)).is_none());
+        assert_eq!(traced_chunks(&mut spans), TRACED_CHUNKS_PER_RUN as usize);
+        assert!(!spans.span(&HarnessEvent::Idle, None).is_none());
+        assert!(!spans.span(&run_started, Some(2)).is_none());
+        assert_eq!(traced_chunks(&mut spans), TRACED_CHUNKS_PER_RUN as usize);
     }
 }

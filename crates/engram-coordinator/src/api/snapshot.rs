@@ -111,8 +111,9 @@ pub(crate) async fn reattach_harness_in_place(
     let session = state.services.meta.get_session(session_id).await?;
     // Re-confirm the session is still bound to the sandbox the caller resolved —
     // a concurrent eviction/resume may have moved it, and we must never re-issue
-    // start_agent against a stale or unbound sandbox.
-    if session.sandbox_id != Some(sandbox_id) {
+    // start_agent against a stale or unbound sandbox. A dev-VM session has no
+    // harness, so there is nothing to rebind.
+    if session.sandbox_id != Some(sandbox_id) || session.mode.is_dev_vm() {
         return Ok(false);
     }
     let epoch = state
@@ -1765,9 +1766,9 @@ async fn resume_from_fc_snapshot(
     // wire-compatible, tell the destination where the chunks are
     // resident. Stamped unconditionally BEFORE placement (the pick
     // happens inside restore_for_session): an affinity-host landing
-    // makes the destination's pre-pass a no-op stat walk, a cross-host
-    // landing pulls the divergent set over the LAN, and a dead/absent
-    // source leaves the hint empty ⇒ the pure-GCS path, unchanged.
+    // finds the chunks local, a cross-host landing fetches the chunks it
+    // lacks from the hinted host before the store, and a dead/absent
+    // source leaves the hint empty ⇒ the pure-GCS path.
     // Best-effort by contract: any lookup failure degrades to no hint.
     let peer_hints = match record.host_id {
         Some(source) => match state.services.meta.list_active_hosts().await {
@@ -2244,16 +2245,24 @@ pub async fn verify_snapshot_recoverable(
 ) -> bool {
     // S4: swap alone cannot restore a guest; root or memory must also exist.
     let any_present = disk.is_some() || memory.is_some();
-    for (kind, reference) in [("disk", disk), ("memory", memory), ("swap", swap)] {
-        if let Some(reference) = reference {
-            if let Err(error) = blob.head(&reference.storage_key()).await {
-                tracing::warn!(kind, manifest_key = %reference.storage_key(), %error,
-                    "manifest HEAD failed; snapshot recorded as not-recoverable");
-                return false;
+    let heads = [("disk", disk), ("memory", memory), ("swap", swap)]
+        .into_iter()
+        .filter_map(|(kind, reference)| reference.map(|r| (kind, r.storage_key())))
+        .map(|(kind, key)| async move {
+            match blob.head(&key).await {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(kind, manifest_key = %key, %error,
+                        "manifest HEAD failed; snapshot recorded as not-recoverable");
+                    false
+                }
             }
-        }
-    }
-    any_present
+        });
+    futures::future::join_all(heads)
+        .await
+        .into_iter()
+        .all(|ok| ok)
+        && any_present
 }
 
 /// ADR 0034 durability: resume-time re-verification that a snapshot's
@@ -2283,31 +2292,35 @@ async fn snapshot_artifacts_present(
     // portable state.bin + sidecar blobs the abort path deletes: the
     // manifests can survive while state/sidecar do not, and the row
     // still says recoverable=true.
-    if !verify_snapshot_recoverable(
-        blob,
-        record.disk_manifest.as_ref(),
-        Some(memory),
-        record.swap_manifest.as_ref(),
-    )
-    .await
-    {
-        return false;
-    }
-    for key in [
+    // The HEADs are independent, so they run together.
+    let portable = [
         engram_chunk_store::snapshot_blob::state_blob_key(record.id),
         engram_chunk_store::snapshot_blob::sidecar_blob_key(record.id),
-    ] {
-        if let Err(e) = blob.head(&key).await {
-            tracing::warn!(
-                snapshot_id = %record.id,
-                key = %key,
-                error = %e,
-                "resume: portable snapshot artifact missing in BlobStorage",
-            );
-            return false;
+    ]
+    .map(|key| async move {
+        match blob.head(&key).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    snapshot_id = %record.id,
+                    key = %key,
+                    error = %e,
+                    "resume: portable snapshot artifact missing in BlobStorage",
+                );
+                false
+            }
         }
-    }
-    true
+    });
+    let (manifests, portable) = futures::join!(
+        verify_snapshot_recoverable(
+            blob,
+            record.disk_manifest.as_ref(),
+            Some(memory),
+            record.swap_manifest.as_ref(),
+        ),
+        futures::future::join_all(portable),
+    );
+    manifests && portable.into_iter().all(|ok| ok)
 }
 
 #[cfg(test)]

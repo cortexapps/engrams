@@ -9,10 +9,8 @@
 //!    records one layer descriptor per chunk. A second push of the
 //!    same content skips every chunk (the cross-bake dedup that
 //!    makes deterministic re-bakes upload only their delta).
-//! 2. **Chunk pull** — `pull_chunk` fetches each chunk by its own
-//!    digest, verified against the digest by `oci-client`.
-//! 3. **Image pull** — `pull_image` lands the metadata files on disk
-//!    and likewise skips chunk layers.
+//! 2. **Image pull** — `pull_image` lands the metadata files on disk
+//!    and skips chunk layers.
 //!
 //! The fake registry is in-memory axum; the test runs in the plain
 //! workspace nextest pass with zero external dependencies.
@@ -266,22 +264,7 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
         "no blob uploads on the skip sweep"
     );
 
-    // (ADR 0080 phase 3b: the "metadata pull" leg is gone —
-    // `pull_template_metadata` retired with the coordinator's
-    // engram-artifact enable path. The remaining consumers of this
-    // artifact dialect are the HOST pull path (`pull_image`, step 5)
-    // and the tiered per-chunk fault path (`pull_chunk`, step 4).)
-
-    // ---- 4. Per-chunk pull, digest-verified by oci-client. ----
-    for (c, d) in chunks.iter().zip(&digests) {
-        let got = client
-            .pull_chunk(&uri, d, c.len() as u64)
-            .await
-            .expect("pull chunk");
-        assert_eq!(got.as_ref(), *c);
-    }
-
-    // ---- 5. pull_image lands metadata files, skips chunk layers. ----
+    // ---- 3. pull_image lands metadata files, skips chunk layers. ----
     let dest = tempfile::tempdir().unwrap();
     let gets_before = reg.chunk_blob_gets.load(Ordering::Relaxed);
     let pulled = client

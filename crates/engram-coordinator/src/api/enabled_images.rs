@@ -339,25 +339,18 @@ pub(crate) fn new_enable_row(
     }
 }
 
-/// Verify a reuse-candidate base snapshot's chunks are actually present in
-/// BlobStorage before re-pointing a fresh enable at it. Content-keyed reuse
-/// skips the capture VM entirely — but if the candidate snapshot's chunks
-/// were lost (a GC over-delete, a manual deletion, a partial earlier upload),
-/// reusing it re-points the image at a corrupt base that 404s at restore (the
-/// wedged-session class). The disk materialize re-uploads missing disk chunks
-/// from the OCI source on every refresh, but a base snapshot's MEMORY chunks
-/// have no source other than a fresh capture — so a miss in EITHER of the
-/// candidate's manifests means we must recapture rather than reuse. HEADs
-/// every chunk (short-circuiting on the first miss); any miss — or any error
-/// reading a manifest/probe — is treated as "not reusable" so we fail safe
-/// toward a correct fresh capture.
+/// Whether a reuse candidate's chunks are all in BlobStorage. Reusing a
+/// base snapshot whose chunks were lost (a GC over-delete, a manual
+/// deletion, a partial upload) re-points the image at a base that 404s
+/// at restore. A materialize puts back missing disk chunks, but memory
+/// chunks have no source other than a fresh capture, so a miss in either
+/// manifest means recapture. Any error reading a manifest or probing a
+/// chunk also answers `false`, toward a correct fresh capture.
 pub(crate) async fn reuse_candidate_chunks_present(
     chunk_store: &engram_chunk_store::ChunkStore,
-    blob: std::sync::Arc<dyn engram_core::traits::BlobStorage>,
     disk_manifest: engram_core::types::manifest::ManifestRef,
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
 ) -> bool {
-    use futures::stream::{self, StreamExt};
     for mref in std::iter::once(disk_manifest).chain(memory_manifest) {
         let manifest = match chunk_store.get_manifest(mref).await {
             Ok(m) => m,
@@ -371,32 +364,17 @@ pub(crate) async fn reuse_candidate_chunks_present(
                 return false;
             }
         };
-        // Collect owned keys up front: holding a borrow of `manifest` (a
-        // slice Iter) across the buffer_unordered awaits makes this future
-        // non-Send, and it runs inside the spawned enable pipeline.
-        let keys: Vec<String> = manifest
-            .chunks
-            .iter()
-            .map(|c| c.hash.storage_key())
-            .collect();
-        let mut checks = stream::iter(keys.into_iter().map(|key| {
-            let blob = blob.clone();
-            async move { blob.exists(&key).await }
-        }))
-        .buffer_unordered(32);
-        while let Some(res) = checks.next().await {
-            match res {
-                Ok(true) => {}
-                Ok(false) => return false,
-                Err(e) => {
-                    tracing::warn!(
-                        manifest = %mref,
-                        error = %e,
-                        "reuse verify: chunk existence probe failed; \
-                         treating as not reusable (will recapture)",
-                    );
-                    return false;
-                }
+        match chunk_store.all_chunks_stored(&manifest).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    manifest = %mref,
+                    error = %e,
+                    "reuse verify: chunk existence probe failed; \
+                     treating as not reusable (will recapture)",
+                );
+                return false;
             }
         }
     }
@@ -534,7 +512,6 @@ pub(crate) async fn try_reuse_base_snapshot(
                 // source but a fresh capture, so a miss ⇒ recapture.
                 if reuse_candidate_chunks_present(
                     &state.services.chunk_store,
-                    state.services.blob.clone(),
                     disk_manifest,
                     memory_manifest,
                 )
@@ -587,7 +564,6 @@ pub(crate) async fn try_reuse_base_snapshot(
                 // (see the content-keyed branch above).
                 if reuse_candidate_chunks_present(
                     &state.services.chunk_store,
-                    state.services.blob.clone(),
                     disk_manifest,
                     memory_manifest,
                 )
@@ -804,13 +780,8 @@ pub(crate) async fn resolve_cold_base_plan(
             reason: ColdBaseMissReason::ChunksMissing,
         };
     };
-    let present = reuse_candidate_chunks_present(
-        &state.services.chunk_store,
-        state.services.blob.clone(),
-        disk_ref,
-        mem_ref,
-    )
-    .await;
+    let present =
+        reuse_candidate_chunks_present(&state.services.chunk_store, disk_ref, mem_ref).await;
     if !present {
         tracing::warn!(
             %content_key, snapshot_id = %candidate.snapshot_id,
@@ -1704,7 +1675,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reuse_candidate_chunks_present(&chunk_store, blob.clone(), present_ref, None).await,
+            reuse_candidate_chunks_present(&chunk_store, present_ref, None).await,
             "all chunks present ⇒ reusable",
         );
 
@@ -1722,20 +1693,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !reuse_candidate_chunks_present(&chunk_store, blob.clone(), missing_ref, None).await,
+            !reuse_candidate_chunks_present(&chunk_store, missing_ref, None).await,
             "a missing chunk ⇒ not reusable (recapture)",
         );
 
         // The prod shape: intact disk manifest + a missing MEMORY chunk (a
         // reaped base-memfile chunk) ⇒ not reusable.
         assert!(
-            !reuse_candidate_chunks_present(
-                &chunk_store,
-                blob.clone(),
-                present_ref,
-                Some(missing_ref),
-            )
-            .await,
+            !reuse_candidate_chunks_present(&chunk_store, present_ref, Some(missing_ref),).await,
             "present disk + missing memory chunk ⇒ not reusable",
         );
     }

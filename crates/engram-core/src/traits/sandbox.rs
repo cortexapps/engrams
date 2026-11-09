@@ -355,6 +355,10 @@ pub trait SandboxBackend: Send + Sync {
     /// in BlobStorage are the cross-host durability primitive and
     /// the local files are just a cache. Returns the metadata the
     /// coord persists to the `snapshots` row.
+    ///
+    /// The staging files can still be in the page cache when this
+    /// returns: a caller that relies on them across a host crash syncs
+    /// them first. The same holds for [`Self::snapshot_diff`].
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
     /// Capture without resuming. `diff` requests the same sparse format as snapshot_diff.
@@ -479,10 +483,9 @@ pub trait SandboxBackend: Send + Sync {
     /// artifact is `memory.diff` — a sparse file holding ONLY the
     /// pages dirtied since the last capture (KVM dirty bitmap, which
     /// resets on capture, so successive calls chain). The checkpoint
-    /// pipeline overlays it onto a rolling full memory image and
-    /// re-chunks incrementally; the returned metadata's
-    /// `memory_manifest` is patched by that pipeline, exactly like
-    /// `snapshot()`'s.
+    /// pipeline re-chunks only the chunks the diff touches; the returned
+    /// metadata's `memory_manifest` is patched by that pipeline, exactly
+    /// like `snapshot()`'s.
     ///
     /// Requires dirty tracking armed (`track_dirty_pages` at boot /
     /// `enable_diff_snapshots` at load). Default impl returns
@@ -508,6 +511,14 @@ pub trait SandboxBackend: Send + Sync {
     fn supports_diff_checkpoints(&self) -> bool {
         false
     }
+
+    /// Whether a capture (`snapshot`, `snapshot_diff`, `snapshot_hold`)
+    /// writes guest memory with its restore files: `state.bin`, the memory
+    /// file and the `manifest.json` sidecar. Firecracker does, with or
+    /// without dirty tracking; VZ and Process capture disk only. A caller
+    /// publishes the memory exactly when this holds, and a capture that
+    /// claims memory but left no memory file fails.
+    fn captures_guest_memory(&self) -> bool;
 
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
@@ -661,28 +672,14 @@ pub trait SandboxBackend: Send + Sync {
         "squashfs"
     }
 
-    /// ADR 0020 Route B: whether `restore` serves guest memory lazily
-    /// (UFFD, chunk-native) rather than from a materialized
-    /// `memory.bin`. When `true`, the wrapping `PooledBackend` skips
-    /// `materialize_memory_if_missing` on restore — the handler faults
-    /// chunks straight from the (prefetched) chunk cache, so rebuilding
-    /// the contiguous file would be pure overhead. Default `false`
-    /// (File mode: memory.bin is required before `load_snapshot`).
-    fn restore_memory_is_lazy(&self) -> bool {
-        false
-    }
-
-    /// ADR 0022 Option A: per-restore-flavor variant of
-    /// [`Self::restore_memory_is_lazy`]. `fresh == true` is a base
-    /// `session.create` (the `restore_fresh` flavor), which can use the
-    /// File backend against the resident per-template memfile even when
-    /// idle-resume (`fresh == false`) serves memory lazily via UFFD. The
-    /// `PooledBackend` calls this so it materializes the contiguous
-    /// `memory.bin` for base-create (File) and skips it for resume
-    /// (UFFD). Default delegates to the flavor-agnostic method so
-    /// backends that don't bifurcate (VZ, Process) need not implement it.
+    /// Whether a restore of this flavor serves guest memory lazily rather
+    /// than from a materialized `memory.bin`. When `true`, the wrapping
+    /// `PooledBackend` skips `materialize_memory_if_missing`: the backend
+    /// faults chunks straight from the chunk cache. `fresh == true` is a
+    /// base `session.create` (the `restore_fresh` flavor). Default `false`:
+    /// `memory.bin` is required before the load.
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
-        self.restore_memory_is_lazy()
+        false
     }
 
     /// ADR 0022 Option A: sample summed guest memory (PSS/RSS) across this
@@ -841,25 +838,12 @@ pub trait SandboxBackend: Send + Sync {
     /// files before reading.
     fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
 
-    /// ADR 0045 C2 (E2B fold): where this sandbox's uffd-handler dumps
-    /// its working-set trace (fault-order hot set), when the backend
-    /// runs one. The migration capture reads it best-effort to ship a
-    /// `hot_chunks` rider so the destination warms the guest's hot set
-    /// first. `None` = backend has no per-sandbox trace (VZ, process).
-    fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
-        None
-    }
-
-    /// ADR 0019 / telemetry restoration (#526): where this sandbox's
-    /// uffd-handler dumps its per-jail prefault-effectiveness snapshot
-    /// (`PrefaultStats` in `engram-uffd-handler`), a sibling of
-    /// [`working_set_trace_path`](Self::working_set_trace_path) in the
-    /// same jail dir. `PooledBackend::restore` reads it after a resume
-    /// completes and emits `engram_resume_prefault_*` — the standing
-    /// detector for "prefault shipped but silently stopped firing" (it
-    /// went inert three separate, undetected ways before this). `None`
-    /// = backend has no per-sandbox prefault detector (VZ, process).
-    fn prefault_stats_path(&self, _id: SandboxId) -> Option<PathBuf> {
+    /// Where this sandbox's uffd-handler writes its first-touch record
+    /// (the chunk positions the guest touched, in order), when the backend
+    /// runs one. The host-agent publishes it for the session's next
+    /// restore, and the migration capture reads it best-effort for the
+    /// `hot_chunks` rider. `None` = no handler (VZ, process).
+    fn first_touch_path(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }
 

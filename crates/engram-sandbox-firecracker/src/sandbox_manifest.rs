@@ -71,7 +71,7 @@ pub struct SandboxManifest {
     /// exclusive with `network`.
     #[serde(default)]
     pub netns: Option<NetnsRecord>,
-    /// Present iff `RestoreMode::Uffd` was used and the handler is
+    /// Present iff the sandbox was resumed and the handler is
     /// still alive. Same three-axis verification (pid + start_time +
     /// comm) on reattach. Like FC, the handler is detached (not
     /// killed) on host-agent shutdown and re-adopted by the successor.

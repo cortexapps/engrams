@@ -1068,7 +1068,6 @@ jobs:
             --test lifecycle \
             --test reattach_detach \
             --test snapshot \
-            --test snapshot_uffd \
             --test exec \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
@@ -1707,10 +1706,12 @@ jobs:
           # egress daemon (fail-closed), so the stack ships the daemon
           # binary beside it. `engram-cli` is the `engrams` binary the
           # e2e lane drives enable/registry/session with (ENGRAMS_BIN).
+          # Every resume spawns `engram-uffd-handler` beside the host agent.
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
               -p engram-egress-proxyd \
+              -p engram-uffd-handler \
               -p engram-publish-builtin-harness \
               -p engram-cli
 
@@ -1727,6 +1728,7 @@ jobs:
             target/release/engram-coordinator
             target/release/engram-host-agent
             target/release/engram-egress-proxyd
+            target/release/engram-uffd-handler
             target/release/engram-publish-builtin-harness
             target/release/engrams
             target/x86_64-unknown-linux-musl/release/engram-agentd
@@ -1943,10 +1945,10 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness}
+          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness}
           chmod +x target/release/engrams
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness} \
+          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,uffd-handler,publish-builtin-harness} \
                 target/release/engrams \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 

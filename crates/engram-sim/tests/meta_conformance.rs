@@ -1508,6 +1508,61 @@ async fn dead_host_lease(ctx: &Ctx) {
         .unwrap());
 }
 
+/// A fixed-cadence wait requeues like a backoff and gives back the
+/// attempt the claim counted; a stale epoch writes nothing.
+async fn op_requeue_wait_refunds_the_attempt(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:ops-wait")).await.unwrap();
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Teleport, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("first op must be Claimed")
+    };
+    assert_eq!(op.attempts, 1);
+    let epoch = op.epoch.unwrap();
+    assert!(!meta
+        .op_requeue_wait(op.id, epoch + 99, Duration::from_secs(1), "wait")
+        .await
+        .unwrap());
+    for _ in 0..3 {
+        let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(claimed.state, OpState::Running);
+        assert!(meta
+            .op_requeue_wait(
+                op.id,
+                claimed.epoch.unwrap(),
+                Duration::from_secs(1),
+                "wait"
+            )
+            .await
+            .unwrap());
+        let queued = meta.op_get(op.id).await.unwrap().expect("op row");
+        assert_eq!(queued.state, OpState::Queued);
+        assert_eq!(queued.attempts, 0, "the wait spends no attempt");
+        assert!(meta.op_claim_head(sid, "pod-a").await.unwrap().is_none());
+        ctx.clock.advance(Duration::from_secs(2));
+        let again = meta
+            .op_claim_head(sid, "pod-a")
+            .await
+            .unwrap()
+            .expect("due after the wait");
+        assert_eq!(again.attempts, 1);
+    }
+    let claimed = meta.op_get(op.id).await.unwrap().expect("op row");
+    assert!(meta
+        .op_requeue_with_backoff(op.id, claimed.epoch.unwrap(), Duration::ZERO, "transient")
+        .await
+        .unwrap());
+    let again = meta
+        .op_claim_head(sid, "pod-a")
+        .await
+        .unwrap()
+        .expect("due");
+    assert_eq!(again.attempts, 2, "a failure keeps its attempt");
+}
+
 /// The op pipeline: claim epochs fence writes; requeue backoff gates
 /// due-ness on the clock; reclaim bumps the epoch and fences out the
 /// stalled claimant.
@@ -4068,6 +4123,10 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(
+    t_op_requeue_wait_refunds_the_attempt,
+    super::op_requeue_wait_refunds_the_attempt
+);
 conformance!(t_op_terminal_writes, super::op_terminal_writes);
 conformance!(t_op_resume_failure_streak, super::op_resume_failure_streak);
 conformance!(
@@ -4256,9 +4315,78 @@ async fn enabled_image_config_update(ctx: &Ctx) {
     );
 }
 
+/// `capturing_disk_manifests` is the distinct disk manifests of the
+/// in-flight capture jobs; a finished job leaves the set, and a row that
+/// does not parse fails the read.
+async fn capturing_disk_manifests_in_flight(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::from(uuid::Uuid::from_u128(0xca9));
+    meta.upsert_host(host_record(host, "capturing-host", now))
+        .await
+        .unwrap();
+    let config = ImageConfig::default();
+    let disk = |n: u128, v: u64| engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(n),
+        version: v,
+    };
+    let mut jobs = Vec::new();
+    for (name, manifest) in [
+        ("a", disk(2, 1)),
+        ("b", disk(1, 3)),
+        ("c", disk(2, 1)),
+        ("done", disk(9, 9)),
+    ] {
+        let parent = meta
+            .create_or_get_enable_job(&format!("conf:capturing:{name}"), None, &config)
+            .await
+            .unwrap()
+            .id;
+        let mut row = new_capture(parent);
+        row.disk_manifest = manifest.to_string();
+        jobs.push(meta.insert_capture_job(row).await.unwrap());
+    }
+    let done = meta
+        .place_capture_job(jobs[3].id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: done.id,
+            epoch: done.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
+            }),
+        })
+        .await
+        .unwrap());
+
+    let mut capturing = meta.capturing_disk_manifests().await.unwrap();
+    capturing.sort_by_key(|r| (r.manifest_id, r.version));
+    assert_eq!(capturing, vec![disk(1, 3), disk(2, 1)]);
+
+    let parent = meta
+        .create_or_get_enable_job("conf:capturing:bad", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let mut bad = new_capture(parent);
+    bad.disk_manifest = "not-a-manifest".into();
+    meta.insert_capture_job(bad).await.unwrap();
+    assert!(matches!(
+        meta.capturing_disk_manifests().await,
+        Err(MetaError::Serialization(_))
+    ));
+}
+
 /// The enable/capture read surface over a store with no such jobs:
-/// `live_enable_work_by_host` is the empty map, while `list_prestaging_refs`
-/// and `capture_assignments_for_host` are empty — and registering or
+/// `live_enable_work_by_host` is the empty map, while
+/// `list_prestaging_refs`, `capturing_disk_manifests` and
+/// `capture_assignments_for_host` are empty — and registering or
 /// heartbeating a host fabricates none of them. (The sim models no
 /// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
 /// stores agree on the empty case, the only one conformance exercises.)
@@ -4270,6 +4398,7 @@ async fn live_enable_work_empty(ctx: &Ctx) {
         .unwrap()
         .is_empty());
     assert!(meta.list_prestaging_refs().await.unwrap().is_empty());
+    assert!(meta.capturing_disk_manifests().await.unwrap().is_empty());
     let host = HostId::new();
     let now = ctx.clock.now_utc();
     assert!(meta
@@ -5419,6 +5548,10 @@ conformance!(
     super::enabled_image_config_update
 );
 conformance!(t_live_enable_work_empty, super::live_enable_work_empty);
+conformance!(
+    t_capturing_disk_manifests_in_flight,
+    super::capturing_disk_manifests_in_flight
+);
 conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,

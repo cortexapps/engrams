@@ -67,6 +67,7 @@ async fn serial_restore_from_one_canonical_n_times() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -95,6 +96,7 @@ async fn serial_restore_from_one_canonical_n_times() {
         .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
 
     // Step 2: N serial restore→destroy cycles. This is the
@@ -168,6 +170,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -195,6 +198,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
         .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
     let source_vsock = work.path().join(format!("{source_id}.vsock"));
 
@@ -279,6 +283,7 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = std::sync::Arc::new(FirecrackerBackend::new(work.path(), cfg));
 
     let spec = SandboxSpec {
@@ -306,6 +311,7 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
         .expect("create source");
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    common::chunk_memory(&backend.snapshot_path_for(metadata.id), work.path()).await;
     backend.destroy(source_id).await.expect("destroy source");
 
     // Fire all N restores concurrently — overlapping, so their canonical-symlink

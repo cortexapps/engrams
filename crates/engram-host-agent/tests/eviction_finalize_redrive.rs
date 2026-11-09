@@ -54,9 +54,7 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit,
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// A `BlobStorage` whose first `put_streaming` after [`Self::arm`] blocks
@@ -187,7 +185,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     // bundle and point the backend at it.
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
-    cfg.restore_mode = RestoreMode::File;
+    common::resume_through_uffd(&mut cfg, &blob_root);
     cfg.track_dirty_pages = true; // required for snapshot_begin's diff-checkpoint gate
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let inner_a = Arc::new(FirecrackerBackend::new(work.path(), cfg.clone()));

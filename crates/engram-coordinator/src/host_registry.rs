@@ -26,6 +26,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId};
+use tracing::Instrument as _;
 
 /// Per-host record kept in-memory. ADR 0047 demoted this to a pure
 /// CONNECTION record: the heartbeat-derived scheduling state that used
@@ -405,7 +406,12 @@ impl HostRegistry {
         }
 
         // Read-through to PG.
-        let pg = match self.meta.host_for_sandbox(sandbox_id).await {
+        let pg = match self
+            .meta
+            .host_for_sandbox(sandbox_id)
+            .instrument(tracing::info_span!("coord.host_registry.host_for_sandbox"))
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(

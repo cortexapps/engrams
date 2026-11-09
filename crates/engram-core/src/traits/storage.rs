@@ -71,6 +71,42 @@ impl Stream for ByteStream {
     }
 }
 
+/// The first and last byte of `[offset, offset + len)`, as an HTTP
+/// `Range: bytes=first-last` names them, or
+/// [`BlobError::RangeOutOfBounds`] for an empty range.
+pub fn inclusive_range(offset: u64, len: u64) -> Result<(u64, u64), BlobError> {
+    match len.checked_sub(1).and_then(|n| offset.checked_add(n)) {
+        Some(last) => Ok((offset, last)),
+        None => Err(BlobError::RangeOutOfBounds { offset, len }),
+    }
+}
+
+/// The HTTP `Range` header value for `[offset, offset + len)`.
+pub fn range_header(offset: u64, len: u64) -> Result<String, BlobError> {
+    let (first, last) = inclusive_range(offset, len)?;
+    Ok(format!("bytes={first}-{last}"))
+}
+
+/// `bytes[offset..offset + len]`, or [`BlobError::RangeOutOfBounds`]
+/// when the range is empty or runs past `bytes`.
+pub fn cut_range(bytes: &Bytes, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+    let (first, last) = inclusive_range(offset, len)?;
+    if last >= bytes.len() as u64 {
+        return Err(BlobError::RangeOutOfBounds { offset, len });
+    }
+    Ok(bytes.slice(first as usize..=last as usize))
+}
+
+/// A ranged response, checked: a store that answers a range past the
+/// end with fewer bytes (HTTP allows it) is out of bounds here.
+pub fn checked_range(body: Bytes, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+    if body.len() as u64 == len {
+        Ok(body)
+    } else {
+        Err(BlobError::RangeOutOfBounds { offset, len })
+    }
+}
+
 /// Object metadata returned by `head` — analogous to `S3 HeadObject`
 /// or `GCS Objects: get` without body. Cheap; no body transfer.
 #[derive(Clone, Debug)]
@@ -138,6 +174,16 @@ pub trait BlobStorage: Send + Sync {
             buf.extend_from_slice(&frame);
         }
         Ok(buf.freeze())
+    }
+
+    /// The bytes `[offset, offset + len)` of the object. A `len` of 0, or
+    /// a range that runs past the end of the object, is
+    /// [`BlobError::RangeOutOfBounds`]. The default fetches the whole
+    /// object and cuts the range; a backend with a ranged request
+    /// overrides it so only the range moves.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes, BlobError> {
+        let whole = self.get(key).await?;
+        cut_range(&whole, offset, len)
     }
 
     /// Object metadata without body transfer.
@@ -236,4 +282,35 @@ pub struct ListPage {
     /// was the last page. Treat the value as backend-private — pass it
     /// back unmodified.
     pub next: Option<String>,
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn a_range_names_its_first_and_last_byte() {
+        assert_eq!(range_header(0, 1).unwrap(), "bytes=0-0");
+        assert_eq!(range_header(65_536, 65_536).unwrap(), "bytes=65536-131071");
+        assert!(matches!(
+            range_header(7, 0),
+            Err(BlobError::RangeOutOfBounds { offset: 7, len: 0 })
+        ));
+        assert!(range_header(u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn a_cut_range_reaches_the_last_byte_and_no_further() {
+        let body = Bytes::from_static(b"0123456789");
+        assert_eq!(&cut_range(&body, 7, 3).unwrap()[..], b"789");
+        assert!(cut_range(&body, 7, 4).is_err());
+        assert!(cut_range(&body, 10, 1).is_err());
+        assert!(cut_range(&body, 0, 0).is_err());
+    }
+
+    #[test]
+    fn a_short_ranged_response_is_out_of_bounds() {
+        assert!(checked_range(Bytes::from_static(b"abc"), 0, 3).is_ok());
+        assert!(checked_range(Bytes::from_static(b"ab"), 0, 3).is_err());
+    }
 }

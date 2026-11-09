@@ -596,3 +596,70 @@ pub fn disks(root: &Path) -> Option<engram_core::types::sandbox::SessionDisks> {
         swap: None,
     })
 }
+
+/// The workspace-built `engram-uffd-handler` that every resume spawns.
+/// Panics when it is missing: CI builds it (`fc-setup`), and a skip would
+/// hide the resume path.
+pub fn uffd_handler() -> PathBuf {
+    let handler =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/engram-uffd-handler");
+    assert!(
+        handler.exists(),
+        "engram-uffd-handler not built at {} — run `cargo build -p engram-uffd-handler`",
+        handler.display()
+    );
+    handler
+}
+
+/// The local blob store under `store` that [`chunk_memory`] fills and the
+/// resume handler reads.
+fn uffd_blob_root(store: &Path) -> PathBuf {
+    store.join("uffd-blobs")
+}
+
+/// A chunk store over the blob store under `store`.
+pub fn uffd_chunk_store(store: &Path) -> ChunkStore {
+    ChunkStore::new(std::sync::Arc::new(
+        engram_storage_local::LocalBlobStorage::new(uffd_blob_root(store)),
+    ))
+}
+
+/// Point `cfg`'s resumes at the built handler, reading chunks from the
+/// blob store under `store`.
+pub fn resume_through_uffd(cfg: &mut engram_sandbox_firecracker::FirecrackerConfig, store: &Path) {
+    cfg.uffd_handler_bin = uffd_handler();
+    cfg.uffd_blob_root = Some(uffd_blob_root(store));
+}
+
+/// What `PooledBackend::snapshot` does in production: chunk the snapshot's
+/// `memory.bin` into the blob store under `store` and name the manifest in
+/// the snapshot's `manifest.json`, which a resume reads.
+pub async fn chunk_memory(snapshot_dir: &Path, store: &Path) -> ManifestRef {
+    let chunk_store = uffd_chunk_store(store);
+    let manifest = chunk_store
+        .chunk_file(&snapshot_dir.join("memory.bin"), ManifestKind::Memory, None)
+        .await
+        .expect("chunk memory.bin");
+    let manifest_ref = ManifestRef::new();
+    chunk_store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put memory manifest");
+    let path = snapshot_dir.join("manifest.json");
+    let mut sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read manifest.json"))
+            .expect("parse manifest.json");
+    sidecar
+        .as_object_mut()
+        .expect("manifest.json is an object")
+        .insert(
+            "memory_manifest".into(),
+            serde_json::to_value(manifest_ref).expect("serialize memory manifest ref"),
+        );
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&sidecar).expect("serialize manifest.json"),
+    )
+    .expect("write manifest.json");
+    manifest_ref
+}

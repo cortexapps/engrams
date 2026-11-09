@@ -4,29 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Userfaultfd page-fault handler for Firecracker UFFD-backed snapshot restore. Receives the guest's UFFD over SCM_RIGHTS, mmaps memory.bin, and serves page faults on-demand."
+description = "Userfaultfd page-fault handler for Firecracker UFFD-backed snapshot restore. Receives the guest's UFFD over SCM_RIGHTS and serves page faults from content-addressed chunks."
 
 # UNSAFE-CODE CARVE-OUT
 #
-# The workspace lints forbid `unsafe_code`. This crate is the one
-# place we have to break that rule because the kernel surface
-# (userfaultfd, mmap, fd-from-cmsg) is fundamentally unsafe and
-# can't be wrapped without it.
-#
-# Four unsafe blocks live in src/runtime.rs, each with its own SAFETY
-# comment:
-#   - `Uffd::from_raw_fd` on the fd we just received from the kernel
-#     via SCM_RIGHTS in `recv_handshake`.
-#   - `libc::mmap` on the backing memory.bin file in `Runtime::new`
-#     (PROT_READ + MAP_PRIVATE + MAP_POPULATE — matches upstream's
-#     `on_demand_handler.rs` so the handler doesn't take its own
-#     page faults while servicing the guest's).
-#   - `Uffd::copy` in `serve_pagefault` (UFFDIO_COPY — writes a page
-#     into the guest's address space).
-#   - `libc::munmap` in `impl Drop for Runtime` to undo the mmap.
-#
-# `unsafe_code = "allow"` here, not `"warn"`, so that `cargo clippy
-# -- -D warnings` doesn't flag every legitimate block.
+# The workspace lints forbid `unsafe_code`. The kernel surface this
+# crate drives (userfaultfd ioctls, mmap of chunk files and shared
+# memory, fds from SCM_RIGHTS) cannot be used without it. Each unsafe
+# block carries a SAFETY comment. `allow`, not `warn`, so that
+# `cargo clippy -- -D warnings` passes.
 [lints.rust]
 unsafe_code = "allow"
 

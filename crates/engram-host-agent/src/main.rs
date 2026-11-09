@@ -19,7 +19,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use engram_cloud_static::StaticCloud;
 use engram_core::traits::SandboxBackend;
-use engram_host_agent::{HostAgent, HostAgentConfig, HostAgentError};
+use engram_host_agent::{HostAgent, HostAgentConfig, HostAgentError, IdleEvictionHarness};
 
 /// Picks which `SandboxBackend` the host-agent wraps. Mirrors the
 /// production half of `engram-coordinator`'s `--sandbox-backend`
@@ -218,6 +218,17 @@ struct Cli {
     /// when `--ca-source=aws-secrets-manager`.
     #[arg(long, env = "ENGRAM_EGRESS_CA_AWS_KEY_SECRET")]
     ca_aws_key_secret: Option<String>,
+
+    /// What an idle eviction does with the agent in the VM. `keep`
+    /// captures the running agent, and a resume continues the same
+    /// process. `drain` stops the agent before the capture, and a resume
+    /// starts it again from its saved conversation.
+    #[arg(
+        long,
+        env = "ENGRAM_IDLE_EVICTION_HARNESS",
+        default_value_t = IdleEvictionHarness::default()
+    )]
+    idle_eviction_harness: IdleEvictionHarness,
 }
 
 /// Choice of CA-loading backend. Extension points: HashiCorp Vault,
@@ -321,14 +332,10 @@ async fn main() -> Result<(), HostAgentError> {
             BackendChoice::Firecracker => "firecracker".to_string(),
             BackendChoice::Vz => "vz".to_string(),
         },
+        idle_eviction_harness: cli.idle_eviction_harness,
         ..HostAgentConfig::default()
     };
 
-    // ADR 0007 Phase 5: resolve the HostId early so the FC config can
-    // stamp it on snapshots' `trace_host_hint` and pass it as
-    // `--publish-trace-host` to the UFFD handler. Cross-host trace replay
-    // keys off this id — a snapshot taken by host A becomes restoreable on
-    // host B with B reusing A's recorded trace.
     // ADR 0044 K2 (GAP 1): STABLE across restarts (persisted in work_dir,
     // node-name-seeded on K8s) so a DaemonSet pod restart keeps its host
     // identity and the coordinator's session→host binding survives.
@@ -353,13 +360,6 @@ async fn main() -> Result<(), HostAgentError> {
         .await
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
 
-    // ADR 0088 addendum: ONE host-global upload budget shared by every
-    // ChunkStore this process builds — materialize chunking, capture
-    // memory-seed/diff chunking, and the disk checkpoint upload all acquire
-    // from the same FIFO pool, so concurrent bulk uploads share the
-    // NIC instead of stacking on it (`ENGRAM_UPLOAD_BUDGET_PERMITS`).
-    let upload_budget = engram_chunk_store::UploadBudget::from_env_or_default();
-
     // ADR 0009 §6: when the backend is FC, keep a typed Arc on the
     // side so the host-agent's startup live-attach pass can call
     // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
@@ -376,7 +376,6 @@ async fn main() -> Result<(), HostAgentError> {
                 )
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-            fc_cfg.host_id = Some(host_id);
             // ADR 0035/0062: read RO bundles from the same dir the host-agent
             // reports `current_bundles` from — ENGRAM_BUNDLE_DIR in dev/e2e, the
             // fleet-canonical SHARED_DIR in prod (env unset). Mirrors the VZ arm
@@ -434,10 +433,6 @@ async fn main() -> Result<(), HostAgentError> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
-            // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
-            // to the chunk-native UFFD handler (lazy memory, no memory.bin
-            // materialize). Defaults to File.
-            fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
             // Point the UFFD handler's READ-ONLY view at the SAME
             // chunk cache the PooledBackend's restore-prefetch warms
             // (`chunk-cache`, see below). ADR 0075: the handler never
@@ -626,24 +621,26 @@ async fn main() -> Result<(), HostAgentError> {
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
     // served locally on the next resume instead of re-fetched from GCS.
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob)
-        .with_chunk_cache(chunk_cache.clone())
-        .with_upload_budget(upload_budget);
+    let chunk_store =
+        engram_chunk_store::ChunkStore::new(blob).with_chunk_cache(chunk_cache.clone());
+    // The one fill engine on this host: every chunk fetch and upload below
+    // goes through it (uploads through `fill.store()`), so they share one
+    // class-ordered in-flight limit.
+    let fill = engram_fill::FillEngine::new(
+        chunk_store,
+        engram_fill::Config::from_env().map_err(HostAgentError::Config)?,
+    );
 
     // ADR 0075: spawn the substrate populate server now both halves
-    // exist. The uffd base dir mirrors the FC config default (env
-    // override first) so the tmpfs probe answers for the dir handlers
-    // actually use. FC-only (ADR 0096): its sole client is the UFFD
-    // handler, which exists only on the Firecracker backend — on VZ the
-    // server just sat on a Linux-shaped `/dev/shm/engram` default that
-    // doesn't exist on macOS.
+    // exist. Its tmpfs probe checks the same uffd base dir the handlers
+    // use; with none set, handlers use anonymous memory and the probe
+    // passes. Firecracker only: the uffd handler is its only client.
     let _substrate_server = match cli.sandbox_backend {
         BackendChoice::Firecracker => Some(
             engram_host_agent::substrate_server::SubstrateServer::new(
                 chunk_cache.clone(),
-                std::sync::Arc::new(chunk_store.clone()),
-                engram_sandbox_firecracker::uffd_base_dir_from_env()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
+                fill.clone(),
+                engram_sandbox_firecracker::uffd_base_dir_from_env(),
             )
             .spawn(cli.work_dir.join("substrate.sock"))
             .map_err(HostAgentError::Io)?,
@@ -687,7 +684,7 @@ async fn main() -> Result<(), HostAgentError> {
     let observe_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
-        .with_chunk_store(chunk_store)
+        .with_fill(fill)
         .with_chunk_cache(chunk_cache)
         .with_session_disk(session_disk)
         .with_image_cache(image_cache)

@@ -33,7 +33,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_sandbox_firecracker::client::FirecrackerClient;
-use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
 
 fn spec(label: &str, rootfs: PathBuf) -> SandboxSpec {
     SandboxSpec {
@@ -59,7 +59,6 @@ fn make_cfg(env: &common::CompatEnv, bin: PathBuf) -> FirecrackerConfig {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
     cfg.net_pool = None; // unprivileged test — see lifecycle.rs
     cfg.firecracker_bin = bin;
-    cfg.restore_mode = RestoreMode::File;
     // Public ubuntu rootfs has no /sbin/engram-init; boot to bash so the VM
     // survives the pre-snapshot sleep. See snapshot.rs.
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();

@@ -83,7 +83,6 @@ fn arb_valid_manifest() -> impl Strategy<Value = Manifest> {
                 total_bytes,
                 chunks,
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             }
         })
@@ -126,7 +125,6 @@ fn arb_valid_manifest_with_chunks(min_chunks: usize) -> impl Strategy<Value = Ma
                 total_bytes,
                 chunks,
                 parent: None,
-                working_set_trace: None,
                 annotations: serde_json::Value::Null,
             }
         })
@@ -174,7 +172,6 @@ proptest! {
             total_bytes,
             chunks,
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
 

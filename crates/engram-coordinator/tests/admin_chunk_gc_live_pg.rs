@@ -1227,34 +1227,38 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
 async fn promote_failure_preserves_mark_cursor_progress() {
     let Some(rig) = rig().await else { return };
 
-    // One pinned manifest, so each pin-set collect is exactly one
-    // manifest GET: the mark pass takes the first, the promote pass the
-    // second.
-    let session_disk = seed_manifest(&rig.chunk_store, &[b"keepme"], ManifestKind::Disk).await;
-    let session_id = rig
-        .meta
-        .create_session(SessionSpec {
-            image: format!("promote-fault:{}", Uuid::new_v4()),
-            mode: SessionMode::Agent,
-        })
-        .await
-        .expect("create session");
-    let sandbox_id = SandboxId::new();
-    rig.meta
-        .transition_session_created(session_id, sandbox_id)
-        .await
-        .expect("assign sandbox");
-    record_disk_snapshot(&rig, session_id, session_disk).await;
+    // A ChunkStore keeps its last 16 manifests. With 32 pinned, the mark
+    // pass makes 32 manifest GETs, and the promote pass must read at
+    // least 16 of them from the store again.
+    const PINNED: u64 = 32;
+    for i in 0..PINNED {
+        let content = format!("keepme-{i}");
+        let session_disk =
+            seed_manifest(&rig.chunk_store, &[content.as_bytes()], ManifestKind::Disk).await;
+        let session_id = rig
+            .meta
+            .create_session(SessionSpec {
+                image: format!("promote-fault:{}", Uuid::new_v4()),
+                mode: SessionMode::Agent,
+            })
+            .await
+            .expect("create session");
+        rig.meta
+            .transition_session_created(session_id, SandboxId::new())
+            .await
+            .expect("assign sandbox");
+        record_disk_snapshot(&rig, session_id, session_disk).await;
+    }
 
     let orphan = plant_orphan(rig.blob.as_ref()).await;
 
-    // Fail manifest GETs from the SECOND one on: the mark pass's collect
-    // succeeds, the promote pass's collect does not.
+    // Fail manifest GETs after the mark pass's: its collect succeeds, the
+    // promote pass's collect does not.
     let (faulty, _counters) = engram_testkit::storage::FaultyBlobStorage::arc(
         rig.blob.clone(),
         engram_testkit::storage::FaultPlan::new().with_get(engram_testkit::storage::GetFault {
             key: engram_testkit::storage::KeyMatch::Contains("manifests/".to_string()),
-            when: engram_testkit::storage::When::FromNth(2),
+            when: engram_testkit::storage::When::FromNth(PINNED + 1),
             kind: engram_testkit::storage::GetFaultKind::NotFound(
                 engram_testkit::storage::InjectedError::Sdk("injected promote fault".into()),
             ),

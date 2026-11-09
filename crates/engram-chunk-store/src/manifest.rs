@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{ChunkStoreError, Result};
-use crate::working_set::TraceRef;
 
 /// Current schema version. Bumped only on incompatible manifest
 /// format changes; backwards-compatible field additions don't bump.
@@ -251,12 +250,6 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ManifestRef>,
 
-    /// For memory manifests: the working-set trace the UFFD
-    /// handler should prefault before letting vCPUs run. Stored
-    /// separately under `traces/` because traces are host-local.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_set_trace: Option<TraceRef>,
-
     /// Free-form metadata. The chunk store doesn't interpret this;
     /// callers stash hints (image_tag, session_id, captured_at) for
     /// observability + tooling. Bounded by JSON sanity (a few KB).
@@ -319,7 +312,6 @@ impl Manifest {
             total_bytes,
             chunks: Vec::new(),
             parent: None,
-            working_set_trace: None,
             annotations: serde_json::Value::Null,
         }
     }

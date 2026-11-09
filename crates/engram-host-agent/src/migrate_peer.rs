@@ -715,6 +715,15 @@ where
     R: tokio::io::AsyncRead + Unpin,
     T: serde::de::DeserializeOwned,
 {
+    bincode::deserialize(&read_body_async(r).await?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+}
+
+/// The body of one length-prefixed frame, not yet decoded.
+pub(crate) async fn read_body_async<R>(r: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -729,8 +738,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    bincode::deserialize(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+    Ok(body)
 }
 
 /// Write one length-prefixed frame asynchronously (mirror of

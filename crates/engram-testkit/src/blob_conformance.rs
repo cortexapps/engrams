@@ -28,7 +28,7 @@ use engram_core::traits::{BlobStorage, ByteStream};
 
 /// A key prefix unique to this call within the process and across
 /// concurrent test invocations sharing an emulator: wall-clock nanos
-/// plus a process-local counter.
+/// plus the process id and a process-local counter.
 pub fn unique_prefix(ns: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -36,7 +36,8 @@ pub fn unique_prefix(ns: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("engram/conformance/{ns}/{nanos}-{seq}")
+    let pid = std::process::id();
+    format!("engram/conformance/{ns}/{nanos}-{pid}-{seq}")
 }
 
 /// The standard small test body: larger than one TCP frame so real
@@ -301,4 +302,42 @@ pub async fn list_prefix_page_walks_whole_prefix(store: &dyn BlobStorage, n: usi
         "the paged walk and the whole listing must agree"
     );
     assert_eq!(walked_set.len(), n, "expected {n} keys under {prefix}");
+}
+
+/// `get_range` returns exactly the asked bytes, the last byte of the
+/// object included; an empty range or one past the end is
+/// `RangeOutOfBounds`; a missing key is `NotFound`.
+pub async fn ranged_get(store: &dyn BlobStorage) {
+    let key = format!("{}/ranged.bin", unique_prefix("ranged"));
+    let body = patterned_body(200_000);
+    store
+        .put(&key, Bytes::from(body.clone()))
+        .await
+        .expect("put");
+    let size = body.len() as u64;
+
+    for (offset, len) in [(0, 1), (65_536, 65_536), (size - 1, 1), (size - 5, 5)] {
+        let got = store.get_range(&key, offset, len).await.expect("get_range");
+        assert_eq!(
+            &got[..],
+            &body[offset as usize..(offset + len) as usize],
+            "range [{offset}, +{len})"
+        );
+    }
+    for (offset, len) in [(size - 5, 6), (size, 1), (size + 10, 1), (0, 0)] {
+        let got = store.get_range(&key, offset, len).await;
+        assert!(
+            matches!(got, Err(BlobError::RangeOutOfBounds { .. })),
+            "range [{offset}, +{len}) must be out of bounds, got {:?}",
+            got.map(|b| b.len())
+        );
+    }
+    let missing = format!("{}/absent.bin", unique_prefix("ranged"));
+    let got = store.get_range(&missing, 0, 1).await;
+    assert!(
+        matches!(got, Err(BlobError::NotFound)),
+        "a missing key must be NotFound, got {:?}",
+        got.map(|b| b.len())
+    );
+    store.delete(&key).await.expect("delete");
 }

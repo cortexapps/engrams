@@ -66,20 +66,9 @@ pub struct SnapshotMetadata {
     /// represented via `disk_manifest` (chunked path) instead.
     #[serde(default)]
     pub rootfs_blob_key: Option<String>,
-    /// ADR 0014 M1.14: BlobStorage key for the snapshot's CANONICAL
-    /// working-set trace (`traces/<memory_manifest_id>/canonical.json`).
-    /// When present, a fresh base-snapshot restore consumes it to
-    /// narrow M1.13's parallel prefetch from "all chunks" to "just the
-    /// working set," shrinking cold-cache refill from ~2s to ~500ms.
-    ///
-    /// NOTE: no producer publishes a canonical trace today — the
-    /// bake-time profiling pass that would generate one was never
-    /// built, so this blob is effectively always absent and restore
-    /// falls back to M1.13's full-manifest prefetch. The per-host
-    /// trace mechanism at `traces/<manifest>/<host_id>.json` is
-    /// independent and live: the UFFD handler accumulates per-host
-    /// traces from real session activity at runtime and prefaults from
-    /// them on the next restore.
+    /// Unused: nothing sets or reads it. It stays because this struct is
+    /// bincode on the host wire, where fields are positional, so removing
+    /// it would need a wire version change.
     #[serde(default)]
     pub working_set_blob_key: Option<String>,
     /// ADR 0035: bundle generations this snapshot's device model
@@ -418,4 +407,7 @@ pub struct MigrationFrame {
     pub offset: u64,
     pub data: bytes::Bytes,
     pub last: bool,
+    /// On the last frame: blake3 of the whole item. `None` from a source
+    /// that predates it.
+    pub item_hash: Option<[u8; 32]>,
 }

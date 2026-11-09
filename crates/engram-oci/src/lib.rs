@@ -35,12 +35,10 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub mod chunk_resolver;
 pub mod docker_config;
 pub mod docker_image;
 pub mod media_types;
 
-pub use chunk_resolver::{OciBlobLocator, OciChunkIndex, OciChunkResolver};
 pub use docker_config::DockerConfigResolver;
 pub use docker_image::{DockerBlobRef, DockerImageManifest};
 pub use media_types::*;
@@ -94,6 +92,7 @@ pub struct OciClient {
     /// [`OciClient::pull_docker_blob_to_file`]). Production default;
     /// tests dial the backoff down via [`OciClient::with_blob_retry`].
     blob_retry: BlobRetryConfig,
+    ranged_pull: RangedPullConfig,
 }
 
 /// Transient-retry policy for streaming ONE (potentially multi-GB) blob
@@ -123,6 +122,29 @@ impl Default for BlobRetryConfig {
             max_attempts: 5,
             base_backoff: Duration::from_secs(1),
             rate_limit_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+/// How [`OciClient::pull_docker_blob_to_file`] splits a large blob into
+/// concurrent `Range` requests. One stream from a registry runs at tens
+/// of MB/s, so a multi-GB layer on one stream bounds the whole pull.
+#[derive(Clone, Copy, Debug)]
+pub struct RangedPullConfig {
+    /// Blobs smaller than this download on one stream.
+    pub min_blob_bytes: u64,
+    /// Bytes per range request.
+    pub part_bytes: u64,
+    /// Range requests in flight for one blob.
+    pub parts_in_flight: usize,
+}
+
+impl Default for RangedPullConfig {
+    fn default() -> Self {
+        Self {
+            min_blob_bytes: 256 << 20,
+            part_bytes: 64 << 20,
+            parts_in_flight: 8,
         }
     }
 }
@@ -171,6 +193,7 @@ impl OciClient {
             head_tokens: Arc::new(Mutex::new(HashMap::new())),
             auth,
             blob_retry: BlobRetryConfig::default(),
+            ranged_pull: RangedPullConfig::default(),
         }
     }
 
@@ -186,6 +209,13 @@ impl OciClient {
     /// The active per-blob retry policy (used by `docker_image.rs`).
     pub(crate) fn blob_retry(&self) -> BlobRetryConfig {
         self.blob_retry
+    }
+
+    /// Override how large blobs split into range requests. Production
+    /// runs on the default; tests use small parts.
+    pub fn with_ranged_pull(mut self, cfg: RangedPullConfig) -> Self {
+        self.ranged_pull = cfg;
+        self
     }
 
     /// The cached client whose protocol matches `reference`'s registry
@@ -288,10 +318,10 @@ impl OciClient {
     /// layers yields the same digest).
     ///
     /// ADR 0036: descriptor-driven. Chunk layers
-    /// ([`ENGRAM_CHUNK_MEDIA_TYPE`]) are **never** downloaded here —
-    /// a chunked image carries one OCI blob per 16 MiB chunk and the
-    /// runtime fetches individual chunks on fault via
-    /// [`Self::pull_chunk`]. The legacy `rootfs.ext4` layer (dev-only
+    /// ([`ENGRAM_CHUNK_MEDIA_TYPE`]) are **never** downloaded — a
+    /// chunked image carries one OCI blob per 16 MiB chunk, and the
+    /// runtime reads chunks from the chunk cache or the object store,
+    /// never from the registry. The legacy `rootfs.ext4` layer (dev-only
     /// non-chunked bakes) streams straight to disk rather than
     /// through memory.
     pub async fn pull_image(&self, uri: &str, dest: &Path) -> Result<PulledImage, OciError> {
@@ -333,9 +363,8 @@ impl OciClient {
                     disk_bootstrap_path = Some(p);
                 }
                 ENGRAM_CHUNK_MEDIA_TYPE => {
-                    // Chunks are fetched individually on fault
-                    // (tiered resolver) or at enable-time materialize
-                    // — never as part of a metadata pull.
+                    // The runtime reads chunks from the chunk cache
+                    // or the object store, never from the registry.
                 }
                 other => {
                     tracing::debug!(media_type = %other, "skipping unrecognized layer");
@@ -712,56 +741,6 @@ impl OciClient {
         };
         Ok(Digest256(url))
     }
-
-    /// Pull one chunk blob by digest (ADR 0036). `oci-client`
-    /// verifies the response body hashes to `digest` before this
-    /// returns, so the bytes are trustworthy as-is; callers that
-    /// address chunks by `ChunkHash` get verify-on-fetch for free
-    /// because the OCI digest *is* the chunk hash.
-    ///
-    /// Auth is lazy: the first pull (or one whose bearer token
-    /// expired mid-run) hits a 401, re-auths once, and retries.
-    /// Crucially the token then lives in the **cached** client's
-    /// token cache, so subsequent pulls are a single GET — not the
-    /// fresh-client-per-chunk token-mint storm that tripped GitHub's
-    /// rate limiting (ADR 0036).
-    ///
-    /// `size` pre-sizes the buffer (the bootstrap entry's `length`).
-    pub async fn pull_chunk(&self, uri: &str, digest: &str, size: u64) -> Result<Bytes, OciError> {
-        let reference: Reference = uri
-            .parse()
-            .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
-        let client = self.client_for(&reference);
-
-        let desc = OciDescriptor {
-            media_type: ENGRAM_CHUNK_MEDIA_TYPE.to_string(),
-            digest: digest.to_string(),
-            size: size as i64,
-            ..Default::default()
-        };
-        let mut buf = Vec::with_capacity(size as usize);
-        match client.pull_blob(&reference, &desc, &mut buf).await {
-            Ok(()) => {}
-            Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
-                let auth = self.auth_for(&reference).await?;
-                client
-                    .auth(&reference, &auth, RegistryOperation::Pull)
-                    .await
-                    .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))?;
-                buf.clear();
-                client
-                    .pull_blob(&reference, &desc, &mut buf)
-                    .await
-                    .map_err(|e| {
-                        OciError::Distribution(format!("pull chunk {digest} (re-authed): {e}"))
-                    })?;
-            }
-            Err(e) => {
-                return Err(OciError::Distribution(format!("pull chunk {digest}: {e}")));
-            }
-        }
-        Ok(Bytes::from(buf))
-    }
 }
 
 /// Parameters of a `WWW-Authenticate: Bearer …` challenge.
@@ -869,11 +848,10 @@ pub struct PulledImage {
     /// storage rollout, absent for older artifacts (we still
     /// accept those during the transition window).
     pub bundle_path: Option<PathBuf>,
-    /// ADR 0008 Phase 3 / ADR 0036: bootstrap layer for the disk
-    /// side. When `Some`, the artifact carries one OCI blob per
-    /// chunk and the host's tiered fault path can pull individual
-    /// chunks from the registry directly (the bootstrap entries
-    /// carry each chunk's blob digest).
+    /// ADR 0036: bootstrap layer for the disk side. When `Some`, the
+    /// artifact carries one OCI blob per chunk; the host rebuilds the
+    /// disk manifest from the bootstrap when its object store does not
+    /// hold it.
     pub disk_bootstrap_path: Option<PathBuf>,
     pub manifest_digest: Digest256,
 }
@@ -986,8 +964,7 @@ async fn tar_gz_dir(dir: &Path) -> Result<Vec<u8>, OciError> {
 }
 
 /// Pull one (small) OCI layer fully into a Vec. Used only for the
-/// metadata layers in `pull_template_metadata` — never chunk layers,
-/// which are pulled individually on demand via `pull_chunk`.
+/// metadata layers, never for chunk layers.
 async fn pull_layer_to_vec(
     client: &Client,
     reference: &Reference,

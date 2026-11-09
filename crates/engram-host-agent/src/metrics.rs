@@ -344,35 +344,6 @@ pub const EVICTION_FINALIZE_QUARANTINED_TOTAL: &str = "engram_eviction_finalize_
 /// Issue #529: wall-clock per finalize leg. Label `stage` =
 /// `disk`|`memory`|`blobs`|`terminal`.
 pub const EVICTION_FINALIZE_STAGE_SECONDS: &str = "engram_eviction_finalize_stage_seconds";
-/// ADR 0019 / telemetry restoration (#526): the resume-prefault
-/// effectiveness detector. The uffd-handler writes a per-jail
-/// `prefault-stats.json` (sibling of `working-set-trace.json`) at the
-/// end of `prefault_from_trace` (and, for the no-trace case, from
-/// `main.rs` before the fault loop starts); `restore()` here reads it
-/// after a resume completes and increments this by `outcome`:
-/// - `replayed`: a trace was loaded and prefault ran (installed may
-///   still be 0 — see `PREFAULT_CHUNKS_TOTAL`).
-/// - `no_trace`: no working-set trace was requested/loaded for this
-///   resume (base image, migration dest, or publish never landed).
-/// - `stats_missing`: a trace WAS requested but the stats file isn't
-///   there at all — the alarm condition. This is the exact class of
-///   bug that went inert 3x silently (d0e5ecf3, cf6e4d32, 7c2a7226):
-///   the handler died, or the wiring silently didn't fire, and nothing
-///   said so until someone went looking weeks later.
-///
-/// Convergence note: `prefault-admission-control` (same overhaul) reuses
-/// this exact counter name/labels against its own superset gate-file
-/// schema — this crate must not introduce a parallel `engram_prefault_*`
-/// family alongside it.
-pub const RESUME_PREFAULT_TOTAL: &str = "engram_resume_prefault_total";
-
-/// Companion to [`RESUME_PREFAULT_TOTAL`]: per-chunk install outcome
-/// from the same `prefault-stats.json`, labeled `result` =
-/// `installed` | `skipped`. A `replayed` outcome with `installed == 0`
-/// is itself worth alarming on (trace loaded, but the session-manifest
-/// no longer needs any chunk it names — a stale/mismatched trace).
-pub const RESUME_PREFAULT_CHUNKS_TOTAL: &str = "engram_resume_prefault_chunks_total";
-
 /// Issue #539: histogram of how long each named `[warm]`-hook stage ran,
 /// labelled by `stage` (the hook-declared name — cardinality is bounded by
 /// however many distinct stage names the fleet's warm hooks emit) and
@@ -454,7 +425,8 @@ pub const HOST_BASE_SHM_TMPFS_USED_MIB: &str = "engram_host_base_shm_tmpfs_used_
 pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skipped_total";
 
 /// Counter (ADR 0075). Populate requests served by the substrate
-/// writer. Labels: outcome = already_local | populated | error.
+/// writer. Labels: outcome = already_local | populated | error;
+/// proto = 1 | 2 (the protocol version of the connection).
 pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";
 
 /// ADR 0035 amendment D1: a startup pass that publishes the baked stamp's bundle

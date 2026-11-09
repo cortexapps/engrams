@@ -14,9 +14,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 mod common;
@@ -52,7 +50,6 @@ struct HostStack {
 fn build_host(
     label: &str,
     kernel: &Path,
-    handler: &Path,
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
@@ -68,9 +65,7 @@ fn build_host(
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
-    cfg.restore_mode = RestoreMode::File;
-    cfg.uffd_handler_bin = handler.to_path_buf();
-    cfg.uffd_blob_root = Some(blob_root.to_path_buf());
+    common::resume_through_uffd(&mut cfg, blob_root);
     cfg.uffd_cache_root = Some(work.path().join("chunk-cache"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -139,7 +134,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -173,22 +168,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "a",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
-    let (pooled_b, _work_b) = build_host(
-        "b",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
+    let (pooled_a, _work_a) =
+        build_host("a", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_b, _work_b) =
+        build_host("b", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -318,55 +301,34 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("capture");
     let moved = restore.await.unwrap().expect("restore");
     common::postcopy::drain(&host_b.pooled, moved).await;
-    let stats_path = host_b
+    // The handler replays its reports to each new subscriber, so the
+    // drain's terminal report is readable after the drain.
+    let control = host_b
         .pooled
-        .prefault_stats_path(moved)
-        .expect("handler stats path");
-    assert!(
-        common::poll_until_async(
-            std::time::Duration::from_secs(5),
-            std::time::Duration::from_millis(20),
-            || async {
-                std::fs::read(&stats_path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|stats| stats["fault_around_chunks_installed"].as_u64())
-                    .is_some()
-            },
-        )
-        .await,
-        "handler must report the demand-window install counter"
-    );
-    if idle_hint_probe() {
-        let path = host_b
-            .pooled
-            .prefault_stats_path(moved)
-            .expect("handler stats path");
-        assert!(
-            common::poll_until_async(
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_millis(10),
-                || {
-                    let path = path.clone();
-                    async move {
-                        tokio::fs::read(path)
-                            .await
-                            .ok()
-                            .and_then(|bytes| {
-                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                            })
-                            .is_some_and(|stats| stats["hot_hint_received"].as_bool().is_some())
-                    }
+        .post_copy_control_sock(moved)
+        .expect("handler control socket");
+    let hot_hint_received = tokio::task::spawn_blocking(move || {
+        let mut stream = std::os::unix::net::UnixStream::connect(control).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        loop {
+            match engram_migrate_proto::read_control_frame(&mut stream).expect("control frame") {
+                engram_migrate_proto::HandlerControl::DrainDone {
+                    hot_hint_received, ..
+                } => return hot_hint_received,
+                engram_migrate_proto::HandlerControl::PeerLost { detail, .. } => {
+                    panic!("drain lost its peer: {detail}")
                 }
-            )
-            .await,
-            "drain stats must be published"
-        );
-        let stats: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
-        assert_eq!(
-            stats["hot_hint_received"].as_bool(),
-            Some(true),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    if idle_hint_probe() {
+        assert!(
+            hot_hint_received,
             "the hint must arrive when the idle-page probes pass"
         );
     } else {
@@ -386,10 +348,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
     assert!(host_b.pooled.list().await.unwrap().contains(&moved));
-    assert!(
-        stats_path.is_file(),
-        "successful move retains handler stats"
-    );
 
     // G2: the post-checkpoint sentinel survives on B.
     let check = exec(
@@ -484,8 +442,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         "the mid-run harness keeps RUNNING on the destination (heartbeat advances)"
     );
 
-    // Durability catch-up on B, then B checkpoints the moved VM (the
-    // lineage continues on the new host).
+    // B's first checkpoint is a diff on the lineage the finish seeded
+    // (the seed is v1), and the lineage continues on the new host.
     let row = host_b
         .pooled
         .checkpoint_sandbox(moved)
@@ -493,6 +451,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("durable checkpoint");
     let durable_ref = row.memory_manifest.expect("durable memory manifest");
     assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
+    assert_eq!(
+        durable_ref.version, 2,
+        "the first checkpoint after the move diffs against the seeded lineage"
+    );
     chunk_store
         .get_manifest(durable_ref)
         .await
@@ -612,7 +574,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
@@ -673,7 +635,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     let (pooled_a, _work_a) = build_host(
         "pipe-a",
         &kernel,
-        &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
@@ -681,7 +642,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     let (pooled_b, _work_b) = build_host(
         "pipe-b",
         &kernel,
-        &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
@@ -904,7 +864,7 @@ impl DiskHosts {
             return None;
         }
         common::postcopy::fork_gate()?;
-        let (kernel, handler, agent, busybox) = gate()?;
+        let (kernel, agent, busybox) = gate()?;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
@@ -941,7 +901,6 @@ impl DiskHosts {
         let (pooled_a, work_a) = build_host(
             "disk-a",
             &kernel,
-            &handler,
             &blob_root,
             &staged.bundle_dir,
             &chunk_store,
@@ -949,7 +908,6 @@ impl DiskHosts {
         let (pooled_b, work_b) = build_host(
             "disk-b",
             &kernel,
-            &handler,
             &blob_root,
             &staged.bundle_dir,
             &chunk_store,
@@ -1282,7 +1240,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -1312,22 +1270,10 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "ka",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
-    let (pooled_b, _work_b) = build_host(
-        "kb",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
+    let (pooled_a, _work_a) =
+        build_host("ka", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_b, _work_b) =
+        build_host("kb", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -1412,7 +1358,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     host_b.peer.abort();
 }
 
-fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
@@ -1444,12 +1390,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: musl engram-agentd not built at {}", agent.display());
         return None;
     }
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!("SKIP: engram-uffd-handler not built");
-        return None;
-    }
-    Some((kernel, handler, agent, busybox))
+    Some((kernel, agent, busybox))
 }
 
 async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {
