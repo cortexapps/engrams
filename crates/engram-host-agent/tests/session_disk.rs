@@ -27,9 +27,7 @@ use engram_host_agent::pooled_backend::PooledBackend;
 use engram_host_core::disk::{Capacity, SessionDisk, Volume, VolumeName};
 use engram_host_core::SessionVolumes;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// The disk half of a checkpoint under full-rate writes: one page-cache
@@ -386,7 +384,7 @@ impl Rig {
         let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
         cfg.bundle_dir = staged.bundle_dir.clone();
         cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::File;
+        common::resume_through_uffd(&mut cfg, &work.path().join("blob"));
         cfg.track_dirty_pages = true;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();

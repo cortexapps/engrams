@@ -176,6 +176,7 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     // through CONFIG_IP_PNP from the kernel's `ip=` cmdline tail
     // appended by the backend.
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    common::resume_through_uffd(&mut cfg, work.path());
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -214,6 +215,7 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     // ADR 0007 Phase 6: backend owns its staging dir.
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
+    common::chunk_memory(&snap_dir, work.path()).await;
     let (orig_tap, orig_cidr) =
         manifest_carries_net_field(&snap_dir).expect("snapshot manifest must carry `net` field");
     println!("snapshot recorded tap={orig_tap} cidr={orig_cidr}/30");

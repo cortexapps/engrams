@@ -1725,19 +1725,13 @@ impl PooledBackend {
                 .snapshot_path_for(metadata.id)
                 .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
                 .exists();
-        // Memory is served lazily (UFFD faults / peer) for a substrate
-        // base-create, a UFFD resume, and every staged migration restore;
-        // a File-mode restore needs a contiguous `memory.bin`. One
-        // decision drives both the prefetch gate and the materialize gate.
-        let memory_is_lazy = self.inner.restore_memory_is_lazy_for(fresh)
-            || self
-                .inner
-                .snapshot_path_for(metadata.id)
-                .join("migration-session-manifest.json")
-                .exists();
+        // A resume serves memory lazily (UFFD faults / peer); a fresh
+        // create maps a contiguous `memory.bin`. One decision drives both
+        // the prefetch gate and the materialize gate.
+        let memory_is_lazy = self.inner.restore_memory_is_lazy_for(fresh);
 
-        // A File restore reads the whole memory before the VM starts, so its
-        // prefetch is on the critical path. A lazy restore faults after
+        // A fresh create materializes the whole memory file before the VM
+        // starts, so its prefetch is on the critical path. A lazy restore faults after
         // `inner.restore`; its prefetch starts once the sidecar is local
         // (below), because the sidecar names the session's first-touch prefix.
         if let (false, Some(fill)) = (memory_is_lazy, self.fill.clone()) {

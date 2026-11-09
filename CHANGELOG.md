@@ -52,6 +52,9 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 - **Fleet API.** `HostView` loses `nbd_slots_total` and `nbd_slots_in_use` and gains
   `pool_data_free_mib`, `pool_data_total_mib`, `pool_metadata_free_mib`, and
   `pool_metadata_total_mib`. `FlushSession` is gone.
+- **A Firecracker resume always restores memory lazily.** `ENGRAM_FC_RESTORE_MODE` and the
+  `firecracker.restoreMode` chart value (`engram-host-fleet`) are removed; delete them from
+  your values. Every resume spawns `engram-uffd-handler`, so the host image must ship it.
 
 ### Changed
 

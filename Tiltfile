@@ -576,14 +576,6 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_po
         # back to the Linux fleet path /var/lib/engram/shared (absent on
         # macOS) and every skill-enabled create 400s.
         'ENGRAM_BUNDLE_DIR': _bundle_dir,
-        # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
-        # (prod's FC-host image does), and the host-agent runs under sudo
-        # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
-        # The host-agent code default is now `uffd`, so pin `file` here to
-        # keep idle-resume on the no-handler path. Override to `uffd` only
-        # where the handler is present. (Base-create stays code-default
-        # `file`, which needs no handler.)
-        'ENGRAM_FC_RESTORE_MODE': env_or('ENGRAM_FC_RESTORE_MODE', 'file'),
         # ADR 0045 substrate (v2b): point at a tmpfs dir (e.g.
         # /dev/shm/engram) to back Uffd restores with a shared
         # per-template base shm. Empty = off (stock anonymous Uffd).
@@ -659,11 +651,8 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, egress_proxy_po
         env['ENGRAM_GRPC_LISTEN_ADDR'] = '0.0.0.0:' + grpc_port
         env['ENGRAM_COORDINATOR_ENDPOINT'] = 'http://192.168.5.2:8090'
         env['ENGRAM_FIRECRACKER_BIN'] = '/usr/local/bin/firecracker'
-        # We always cross-compile + sync engram-uffd-handler alongside
-        # engram-host-agent (below), so point at it explicitly rather than
-        # rely on the VM's PATH — ADR 0045's Uffd restore path becomes
-        # exercisable here for the first time (still opt-in via
-        # ENGRAM_FC_RESTORE_MODE=uffd; the dev default stays `file`).
+        # engram-uffd-handler is cross-compiled + synced alongside
+        # engram-host-agent (below); every resume spawns it.
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = '/opt/engram-dev/bin/engram-uffd-handler'
         # ADR 0121: the node-local egress daemon is cross-compiled and
         # synced alongside; host-agent spawns/adopts it by this path.

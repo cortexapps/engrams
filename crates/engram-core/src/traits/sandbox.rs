@@ -672,28 +672,14 @@ pub trait SandboxBackend: Send + Sync {
         "squashfs"
     }
 
-    /// ADR 0020 Route B: whether `restore` serves guest memory lazily
-    /// (UFFD, chunk-native) rather than from a materialized
-    /// `memory.bin`. When `true`, the wrapping `PooledBackend` skips
-    /// `materialize_memory_if_missing` on restore — the handler faults
-    /// chunks straight from the (prefetched) chunk cache, so rebuilding
-    /// the contiguous file would be pure overhead. Default `false`
-    /// (File mode: memory.bin is required before `load_snapshot`).
-    fn restore_memory_is_lazy(&self) -> bool {
-        false
-    }
-
-    /// ADR 0022 Option A: per-restore-flavor variant of
-    /// [`Self::restore_memory_is_lazy`]. `fresh == true` is a base
-    /// `session.create` (the `restore_fresh` flavor), which can use the
-    /// File backend against the resident per-template memfile even when
-    /// idle-resume (`fresh == false`) serves memory lazily via UFFD. The
-    /// `PooledBackend` calls this so it materializes the contiguous
-    /// `memory.bin` for base-create (File) and skips it for resume
-    /// (UFFD). Default delegates to the flavor-agnostic method so
-    /// backends that don't bifurcate (VZ, Process) need not implement it.
+    /// Whether a restore of this flavor serves guest memory lazily rather
+    /// than from a materialized `memory.bin`. When `true`, the wrapping
+    /// `PooledBackend` skips `materialize_memory_if_missing`: the backend
+    /// faults chunks straight from the chunk cache. `fresh == true` is a
+    /// base `session.create` (the `restore_fresh` flavor). Default `false`:
+    /// `memory.bin` is required before the load.
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
-        self.restore_memory_is_lazy()
+        false
     }
 
     /// ADR 0022 Option A: sample summed guest memory (PSS/RSS) across this

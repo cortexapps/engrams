@@ -1,7 +1,7 @@
 //! ADR 0045 C2 (2026-10-07 addendum): a File-mode FRESH create is a
 //! valid post-copy source.
 //!
-//! Production restores every fresh create on `RestoreMode::File` (a
+//! Production restores every fresh create with the File backend (a
 //! private mapping of the per-image memfile, ADR 0092). The first fleet
 //! run of the ADR 0123 teleport machine aborted every live move with
 //! "FC process maps no substrate base file" because the source check
@@ -33,9 +33,7 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit,
 use engram_host_agent::migrate_peer::PeerServer;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 #[tokio::test]
@@ -200,7 +198,6 @@ impl TestEnv {
         cfg.firecracker_bin = self.fork_bin.clone();
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::File;
         cfg.track_dirty_pages = true;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();

@@ -31,9 +31,6 @@ data:
   ENGRAM_S3_REGION: {{ . | quote }}
   {{- end }}
   {{- end }}
-  {{- with .Values.firecracker.restoreMode }}
-  ENGRAM_FC_RESTORE_MODE: {{ . | quote }}
-  {{- end }}
   {{- with .Values.firecracker.uffdBaseDir }}
   # ADR 0045 D3: the unified memory substrate. Node-prep mounts the tmpfs;
   # the host-agent derives everything else from this one switch.

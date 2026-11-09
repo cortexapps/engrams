@@ -506,3 +506,28 @@ pub fn session_volumes(
         engram_fill::FillEngine::new(chunk_store.clone(), engram_fill::Config::default()),
     ))
 }
+
+/// The workspace-built `engram-uffd-handler` that every resume spawns.
+/// Panics when it is missing: CI builds it (`fc-setup`), and a skip would
+/// hide the resume path.
+pub fn uffd_handler() -> PathBuf {
+    let handler =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/engram-uffd-handler");
+    assert!(
+        handler.exists(),
+        "engram-uffd-handler not built at {} — run `cargo build -p engram-uffd-handler`",
+        handler.display()
+    );
+    handler
+}
+
+/// Point `cfg`'s resumes at the built handler, reading chunks from the
+/// test's local blob store at `blob_root` (production reads them through
+/// the host agent's substrate socket).
+pub fn resume_through_uffd(
+    cfg: &mut engram_sandbox_firecracker::FirecrackerConfig,
+    blob_root: &Path,
+) {
+    cfg.uffd_handler_bin = uffd_handler();
+    cfg.uffd_blob_root = Some(blob_root.to_path_buf());
+}

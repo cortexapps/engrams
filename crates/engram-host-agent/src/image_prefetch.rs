@@ -250,7 +250,7 @@ enum BaseShmMode {
 }
 
 /// `ENGRAM_FC_BASE_SHM_MODE` ∈ {`full` (default), `lazy`}, read once at
-/// startup (mirrors `restore_mode_from_env`'s parse/warn shape).
+/// startup.
 fn base_shm_mode_from_env() -> BaseShmMode {
     static MODE: std::sync::OnceLock<BaseShmMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("ENGRAM_FC_BASE_SHM_MODE") {

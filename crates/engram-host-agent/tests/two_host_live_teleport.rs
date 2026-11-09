@@ -14,9 +14,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 mod common;
@@ -52,7 +50,6 @@ struct HostStack {
 fn build_host(
     label: &str,
     kernel: &Path,
-    handler: &Path,
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
@@ -68,9 +65,7 @@ fn build_host(
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
-    cfg.restore_mode = RestoreMode::File;
-    cfg.uffd_handler_bin = handler.to_path_buf();
-    cfg.uffd_blob_root = Some(blob_root.to_path_buf());
+    common::resume_through_uffd(&mut cfg, blob_root);
     cfg.uffd_cache_root = Some(work.path().join("chunk-cache"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -139,7 +134,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -173,22 +168,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "a",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
-    let (pooled_b, _work_b) = build_host(
-        "b",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
+    let (pooled_a, _work_a) =
+        build_host("a", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_b, _work_b) =
+        build_host("b", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -616,7 +599,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
@@ -677,7 +660,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     let (pooled_a, _work_a) = build_host(
         "pipe-a",
         &kernel,
-        &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
@@ -685,7 +667,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     let (pooled_b, _work_b) = build_host(
         "pipe-b",
         &kernel,
-        &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
@@ -908,7 +889,7 @@ impl DiskHosts {
             return None;
         }
         common::postcopy::fork_gate()?;
-        let (kernel, handler, agent, busybox) = gate()?;
+        let (kernel, agent, busybox) = gate()?;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
@@ -945,7 +926,6 @@ impl DiskHosts {
         let (pooled_a, work_a) = build_host(
             "disk-a",
             &kernel,
-            &handler,
             &blob_root,
             &staged.bundle_dir,
             &chunk_store,
@@ -953,7 +933,6 @@ impl DiskHosts {
         let (pooled_b, work_b) = build_host(
             "disk-b",
             &kernel,
-            &handler,
             &blob_root,
             &staged.bundle_dir,
             &chunk_store,
@@ -1286,7 +1265,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     if common::postcopy::fork_gate().is_none() {
         return;
     }
-    let Some((kernel, handler, agent, busybox)) = gate() else {
+    let Some((kernel, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -1316,22 +1295,10 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host(
-        "ka",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
-    let (pooled_b, _work_b) = build_host(
-        "kb",
-        &kernel,
-        &handler,
-        &blob_root,
-        &staged.bundle_dir,
-        &chunk_store,
-    );
+    let (pooled_a, _work_a) =
+        build_host("ka", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_b, _work_b) =
+        build_host("kb", &kernel, &blob_root, &staged.bundle_dir, &chunk_store);
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -1416,7 +1383,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     host_b.peer.abort();
 }
 
-fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
@@ -1448,12 +1415,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: musl engram-agentd not built at {}", agent.display());
         return None;
     }
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!("SKIP: engram-uffd-handler not built");
-        return None;
-    }
-    Some((kernel, handler, agent, busybox))
+    Some((kernel, agent, busybox))
 }
 
 async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {

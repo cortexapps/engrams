@@ -236,9 +236,9 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
 /// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
 /// (2026-07 core-ops fold: agentd installs the CA before spawning,
 /// one first-contact call instead of two).
-/// The baked rootfs file, the chunk store holding its manifest, and the
-/// manifest: a cold test boots the file, a warm test restores through
-/// session volumes staged from the manifest.
+/// The baked rootfs file, the chunk store holding its manifest, the
+/// manifest, and the store's blob root: a cold test boots the file, a warm
+/// test restores through session volumes staged from the manifest.
 async fn bake_harness_rootfs(
     harness_bin: &Path,
     claude_bin: &Path,
@@ -247,15 +247,15 @@ async fn bake_harness_rootfs(
     PathBuf,
     engram_chunk_store::ChunkStore,
     engram_core::ManifestRef,
+    PathBuf,
 ) {
     let images = tempfile::tempdir().expect("images");
     let images_path = images.path().to_path_buf();
     std::mem::forget(images);
-    let chunk_root = tempfile::tempdir().expect("chunk store");
+    let chunk_root = tempfile::tempdir().expect("chunk store").keep();
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
-        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
+        engram_storage_local::LocalBlobStorage::new(chunk_root.clone()),
     );
-    std::mem::forget(chunk_root);
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
     // ADR 0080 §D docker-free bake: busybox stands in for debian-slim's
@@ -296,7 +296,12 @@ async fn bake_harness_rootfs(
     )
     .await;
 
-    (outcome.rootfs_path, chunk_store, outcome.disk_manifest)
+    (
+        outcome.rootfs_path,
+        chunk_store,
+        outcome.disk_manifest,
+        chunk_root,
+    )
 }
 
 /// Spin up a real engram-egress-proxy + Registry + SystemResolver
@@ -717,7 +722,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let (rootfs_path, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (rootfs_path, _, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -800,7 +805,8 @@ async fn e2e_harness_warm_via_pooled_backend() {
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let (_, chunk_store, image) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (_, chunk_store, image, blob_root) =
+        bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -810,6 +816,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
+    common::resume_through_uffd(&mut cfg, &blob_root);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
     let pooled = Arc::new(
@@ -947,7 +954,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     // `/opt/engram/harness/harness`. If start_agent ignored the
     // empty argv and still tried to spawn, the test would surface that
     // as either a spawn failure or a sink event below.
-    let (rootfs_path, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
+    let (rootfs_path, _, _, _) = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());

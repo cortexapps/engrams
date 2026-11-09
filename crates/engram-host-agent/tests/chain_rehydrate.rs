@@ -50,9 +50,7 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit,
 use engram_host_agent::checkpoint::ChainHeadRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// A `BlobStorage` whose `put_streaming` fails while armed — the torn
@@ -166,7 +164,7 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
-    cfg.restore_mode = RestoreMode::File;
+    common::resume_through_uffd(&mut cfg, &work.path().join("blob"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let checkpoint_dir = work.path().join("checkpoints");

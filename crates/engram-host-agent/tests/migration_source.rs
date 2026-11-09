@@ -15,9 +15,7 @@ use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 mod common;
@@ -60,20 +58,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         eprintln!("SKIP: musl engram-agentd not built at {}", agent.display());
         return;
     }
-    // The teleport-restore leg is UFFD by construction (the migration
-    // override forces it regardless of the configured File mode), so
-    // the handler binary must exist — same convention as snapshot_uffd.
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
     // free-space floor and evict just-staged migration chunks mid-test.
     std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
-    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
-    if !handler.exists() {
-        eprintln!(
-            "SKIP: engram-uffd-handler not built at {} — run `cargo build -p engram-uffd-handler`",
-            handler.display()
-        );
-        return;
-    }
 
     // ---- 1. Bake an agentd-injected rootfs (docker-free, ADR 0080 §D) ----
     let images = tempfile::tempdir().expect("images dir");
@@ -105,14 +92,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // bundle and point the backend at it.
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
-    // File for ordinary creates/restores — the migration restore must
-    // OVERRIDE to Uffd on its own (the product fix this test pins).
-    cfg.restore_mode = RestoreMode::File;
-    cfg.uffd_handler_bin = handler;
     // The handler subprocess must reach the SAME blob store + NVMe
     // chunk cache the host-agent uses (prod wires both to shared
     // paths; the dest pull stages divergent chunks into this cache).
-    cfg.uffd_blob_root = Some(work.path().join("blob"));
+    common::resume_through_uffd(&mut cfg, &work.path().join("blob"));
     cfg.uffd_cache_root = Some(work.path().join("chunk-cache"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();

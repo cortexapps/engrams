@@ -16,13 +16,12 @@
 //!   handshake), sends a `WireExecRequest`, and translates the
 //!   streamed `WireExecEvent`s back into `engram_core::ExecEvent`s.
 //!
-//! `restore` has two memory backends. A fresh create always uses
-//! `RestoreMode::File`: FC maps the per-image memfile privately, no
-//! extra process, residency is reclaimable page cache (ADR 0092). A
-//! resume follows `FirecrackerConfig::restore_mode`: `Uffd` (lazy paging
-//! via the `engram-uffd-handler` companion process against the
-//! substrate base shm — production) or `File` (tests). Both are
-//! verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
+//! `restore` has two memory backends. A fresh create maps the per-image
+//! memfile privately (FC's File backend): no extra process, residency is
+//! reclaimable page cache (ADR 0092). A resume pages memory in lazily
+//! (FC's Uffd backend) through the `engram-uffd-handler` companion
+//! process, from the snapshot's chunked memory manifest.
+//! `tests/file_restore_shared_rss.rs` and `tests/snapshot.rs` verify them.
 //!
 //! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
 //! a static-musl `engram-agentd` exec'd out of its bundle slot (ADR 0080),
@@ -513,9 +512,8 @@ pub struct FirecrackerConfig {
     /// `firecracker` binary on PATH or absolute path. Override for
     /// testing or when a different build is required.
     pub firecracker_bin: PathBuf,
-    /// Path to the UFFD handler binary (engram-uffd-handler). Used
-    /// when `restore_mode == Uffd`. Defaults to `engram-uffd-handler`
-    /// (resolved via PATH).
+    /// Path to the UFFD handler binary that every resume spawns.
+    /// Defaults to `engram-uffd-handler` (resolved via PATH).
     pub uffd_handler_bin: PathBuf,
     /// ADR 0045 unified memory substrate (v2b). When set, Uffd-mode
     /// restores back guest memory `MAP_PRIVATE` on a per-template base
@@ -526,11 +524,6 @@ pub struct FirecrackerConfig {
     /// `UFFDIO_CONTINUE`. MUST point at a tmpfs/shmem mount (MINOR
     /// faults are shmem-only). `None` ⇒ stock anonymous Uffd restore.
     pub uffd_base_dir: Option<PathBuf>,
-    /// How to wire memory on a RESUME restore (a fresh create is always
-    /// File, ADR 0092). File mode maps memory.bin privately (no extra
-    /// processes). Uffd mode spawns engram-uffd-handler and serves pages
-    /// on demand (requires Linux + the handler binary on the host).
-    pub restore_mode: RestoreMode,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -654,26 +647,6 @@ pub fn cpu_template_from_env() -> Option<String> {
     }
 }
 
-/// ADR 0020 Route B / ADR 0039: pick the *idle-resume* memory backend
-/// from `ENGRAM_FC_RESTORE_MODE` (`uffd` | `file`). **Defaults to `uffd`**
-/// (ADR 0039 — UFFD lazy-fault is the one true resume path; cross-host
-/// idle-resume can't rely on a resident image, so File there would be a
-/// synchronous multi-GB reconstruct). `file` is the explicit opt-out
-/// (no chunk store / no `/dev/userfaultfd`). Because this is now the
-/// default, the Helm chart no longer needs to set the env. `uffd`
-/// requires `engram-uffd-handler` on PATH (or `uffd_handler_bin` set)
-/// and `/dev/userfaultfd` accessible to the host-agent.
-pub fn restore_mode_from_env() -> RestoreMode {
-    match std::env::var("ENGRAM_FC_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("file") => RestoreMode::File,
-        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("uffd") => {
-            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_RESTORE_MODE; defaulting to uffd");
-            RestoreMode::Uffd
-        }
-        _ => RestoreMode::Uffd,
-    }
-}
-
 /// ADR 0045 substrate (v2b): per-template base-shm directory for
 /// Uffd-mode restores from `ENGRAM_FC_UFFD_BASE_DIR`. Unset/empty ⇒
 /// `None` (stock anonymous Uffd restore — the D2 rollout gate; the
@@ -784,20 +757,6 @@ impl std::fmt::Display for ReattachError {
 
 impl std::error::Error for ReattachError {}
 
-/// Backing-memory strategy for `restore`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestoreMode {
-    /// `mem_backend = { backend_type: "File", ... }`: FC maps the memory
-    /// file `MAP_PRIVATE`; pages fault in from the page cache and guest
-    /// writes are copy-on-write. The only backend for a fresh create
-    /// (ADR 0092: the per-image memfile's residency is reclaimable).
-    File,
-    /// `mem_backend = { backend_type: "Uffd", ... }`. Lazy — pages
-    /// stream in on demand via a `engram-uffd-handler` process the
-    /// backend spawns alongside firecracker.
-    Uffd,
-}
-
 impl FirecrackerConfig {
     /// Convenience constructor for production wiring: just the kernel
     /// path; everything else uses defaults.
@@ -820,7 +779,6 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
-            restore_mode: RestoreMode::File,
             track_dirty_pages: false,
             balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
             uffd_cache_root: None,
@@ -876,9 +834,8 @@ impl Drop for AgentReadiness {
 /// over the `destroy` kill window, where the post-removal teardown also
 /// runs in a detached `tokio::spawn` ([`destroy_teardown`]) so a
 /// cancelled `destroy` can't orphan the VM.
-/// `uffd_handler` is `Some` only for sandboxes restored via
-/// `RestoreMode::Uffd`; it lives as long as the VM does and serves
-/// page faults from memory.bin.
+/// `uffd_handler` is `Some` only for resumed sandboxes; it lives as
+/// long as the VM does and serves its page faults.
 struct LiveSandbox {
     state: SandboxState,
     /// `Some` for sandboxes created or restored within this
@@ -999,11 +956,8 @@ struct FcSnapshotManifest {
     #[serde(default)]
     format: String,
     /// ADR 0007 / Phase 5: chunked memory manifest ref. Populated by
-    /// `PooledBackend::snapshot` after FC writes memory.bin; the
-    /// chunked UFFD restore path reads it to wire the handler. When
-    /// `None` (FC backend ran without `PooledBackend` chunking), UFFD
-    /// restore mode refuses to start — the operator must either wrap
-    /// with PooledBackend+chunk_store or switch to RestoreMode::File.
+    /// `PooledBackend::snapshot` after FC writes memory.bin; a resume
+    /// serves its memory from it and refuses to start without it.
     #[serde(default)]
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
     /// The session id, under which the session's first-touch prefix is
@@ -1117,15 +1071,13 @@ struct RestoreInputs {
     /// The disks this residence attaches; the sidecar's paths name the
     /// source residence's.
     disks: SessionDisks,
-    /// Fresh-create flavor: swap pinned aux bundles to this host's current
-    /// generation, load-paused (ADR 0035 §3).
-    swap_aux_to_current: bool,
+    /// Fresh-create flavor: map the image's memory file, and swap pinned
+    /// aux bundles to this host's current generation, load-paused (ADR
+    /// 0035 §3). A resume serves memory through the UFFD handler.
+    fresh: bool,
     /// Per-session skills assigned to reserved slots, patched in
     /// load-paused. Empty on resume.
     selected_mounts: Vec<AuxRoDrive>,
-    /// The memory backend for THIS restore: base-create may be File while
-    /// resume follows the host's configured mode.
-    restore_mode: RestoreMode,
     /// The image's base memory manifest. `Some` ⇒ substrate restores
     /// continue base-identical pages against the shared per-image base
     /// shm; `None` ⇒ canonical == session.
@@ -1326,26 +1278,9 @@ impl FirecrackerBackend {
         self.sandboxes.get(&id).map(|r| r.state.clone())
     }
 
-    /// The effective memory backend for one restore. `fresh` (the
-    /// `swap_aux_to_current` flavor) is a base `session.create` and is
-    /// always File: FC maps the per-image memfile privately, so its
-    /// residency is reclaimable page cache (ADR 0092). Idle-resume
-    /// (`fresh == false`) follows `restore_mode` — Uffd against the
-    /// substrate base shm in production, because `UFFDIO_CONTINUE` is
-    /// shmem-only and a resume's divergent pages come from its own
-    /// chain. Neither backend is configurable per fresh create; the
-    /// retired `ENGRAM_FC_FRESH_RESTORE_MODE` knob's job is fixed.
-    fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
-        if fresh {
-            RestoreMode::File
-        } else {
-            self.config.restore_mode
-        }
-    }
-
     /// Shared body of [`SandboxBackend::restore`] (resume flavor,
-    /// `swap_aux_to_current = false`) and
-    /// [`SandboxBackend::restore_fresh`] (fresh-create flavor, `true`).
+    /// `fresh = false`) and [`SandboxBackend::restore_fresh`]
+    /// (fresh-create flavor, `true`).
     /// See ADR 0035 §3 for why the flavors attach aux bundles
     /// differently.
     async fn restore_with(
@@ -1353,7 +1288,7 @@ impl FirecrackerBackend {
         sandbox_id: SandboxId,
         metadata: SnapshotMetadata,
         disks: Option<SessionDisks>,
-        swap_aux_to_current: bool,
+        fresh: bool,
         selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<(), SandboxError> {
         let disks = disks.ok_or_else(|| {
@@ -1377,20 +1312,10 @@ impl FirecrackerBackend {
         }
 
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
-        // A migration restore has no memory.bin: its memory is the staged
-        // session manifest plus cached chunks, so it is UFFD whatever the
-        // host's configured mode says.
-        let restore_mode = if src.join("migration-session-manifest.json").exists() {
-            RestoreMode::Uffd
-        } else {
-            self.effective_restore_mode(swap_aux_to_current)
-        };
-
         let inputs = RestoreInputs {
             disks,
-            swap_aux_to_current,
+            fresh,
             selected_mounts,
-            restore_mode,
             base_memory_manifest: metadata.base_memory_manifest,
         };
         match self
@@ -3030,9 +2955,8 @@ impl FirecrackerBackend {
     ) -> Result<(), SandboxError> {
         let RestoreInputs {
             disks,
-            swap_aux_to_current,
+            fresh,
             selected_mounts,
-            restore_mode,
             base_memory_manifest,
         } = inputs;
         let state_path = snapshot_dir.join("state.bin");
@@ -3064,7 +2988,7 @@ impl FirecrackerBackend {
                     )));
                 }
             }
-            if swap_aux_to_current {
+            if fresh {
                 match self.read_bundle_stamp().await {
                     Ok(stamp) => {
                         for aux in &mut live_spec.aux_ro_drives {
@@ -3150,9 +3074,9 @@ impl FirecrackerBackend {
                 state_path.display()
             )));
         }
-        // UFFD mode faults pages from chunks through the handler and never
-        // reads memory.bin, which a cross-host receive does not stage.
-        if matches!(restore_mode, RestoreMode::File) && !mem_path.exists() {
+        // A fresh create maps memory.bin. A resume faults its pages from
+        // chunks through the handler, so a cross-host receive stages none.
+        if fresh && !mem_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot memory.bin missing at {}",
                 mem_path.display()
@@ -3195,14 +3119,16 @@ impl FirecrackerBackend {
         };
 
         // The UFFD page-fault handler listens before `load_snapshot`
-        // connects; File mode has none.
+        // connects; a fresh create maps the memory file and has none.
         let leg_uffd = async {
-            match restore_mode {
-                RestoreMode::File => Ok::<_, SandboxError>(None),
-                RestoreMode::Uffd => {
+            if fresh {
+                return Ok::<_, SandboxError>(None);
+            }
                     let session_ref = manifest.memory_manifest.ok_or_else(|| {
                         SandboxError::Snapshot(
-                            "RestoreMode::Uffd requires manifest.memory_manifest".into(),
+                    "a resume needs the snapshot's chunked memory manifest, and this \
+                     snapshot has none"
+                        .into(),
                         )
                     })?;
                     // Base-identical pages continue against the shared
@@ -3213,8 +3139,7 @@ impl FirecrackerBackend {
                     // A migration destination stages the not-yet-durable
                     // session manifest as a local file.
                     let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
-                    let migration_manifest =
-                        migration_manifest.exists().then_some(migration_manifest);
+            let migration_manifest = migration_manifest.exists().then_some(migration_manifest);
                     let staged = |r| {
                         let path = staged_manifest_path(snapshot_dir, sandbox_id, &r);
                         path.exists().then_some(path)
@@ -3246,8 +3171,6 @@ impl FirecrackerBackend {
                         )
                         .await?;
                     Ok(Some((handler, uffd_uds, uffd_guard)))
-                }
-            }
         };
 
         let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
@@ -3495,9 +3418,10 @@ impl FirecrackerBackend {
             // What guest RAM is a private mapping of (Uffd: the base the
             // load named, None for anonymous RAM), in the absolute,
             // symlink-resolved form `/proc/<pid>/maps` prints.
-            memory_backing: match restore_mode {
-                RestoreMode::File => Some(mem_path.clone()),
-                RestoreMode::Uffd => uffd_base,
+            memory_backing: if fresh {
+                Some(mem_path.clone())
+            } else {
+                uffd_base
             }
             .map(canonical_backing_path),
         };
@@ -3581,7 +3505,7 @@ impl FirecrackerBackend {
             %sandbox_id,
             jail = %jail_dir.display(),
             from = %snapshot_dir.display(),
-            mode = ?restore_mode,
+            fresh,
             "firecracker microVM restored from snapshot",
         );
         Ok(())
@@ -5058,14 +4982,10 @@ impl SandboxBackend for FirecrackerBackend {
     /// ADR 0019 / telemetry restoration (#526): the per-jail prefault
     /// stats, written by the uffd-handler at startup.
     ///
-    /// `None` unless a uffd-handler actually exists for this sandbox
-    /// (`uffd_pid.is_some()` — populated for `RestoreMode::Uffd`
-    /// restores AND pidfd-reattached Uffd sandboxes, ADR 0044 K2).
-    /// `RestoreMode::File` restores (the default when there's no
-    /// `chunk_store`, and the documented `ENGRAM_FC_RESTORE_MODE=file`
-    /// fleet knob) never spawn a handler, so nothing can ever write
-    /// this file — returning `Some` there would make every File-mode
-    /// resume alarm as `stats_missing`. Trait contract: `None` = "this
+    /// `None` unless a uffd-handler exists for this sandbox
+    /// (`uffd_pid.is_some()`: a resume, or a pidfd-reattached resumed
+    /// sandbox, ADR 0044 K2). A fresh create spawns no handler, so
+    /// nothing writes this file for it. Trait contract: `None` = "this
     /// backend/sandbox has no per-sandbox prefault detector" (mirrors
     /// the VZ/Process default).
     fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
@@ -5338,13 +5258,7 @@ impl SandboxBackend for FirecrackerBackend {
         metadata: SnapshotMetadata,
         disks: Option<SessionDisks>,
     ) -> Result<(), SandboxError> {
-        self.restore_with(
-            id,
-            metadata,
-            disks,
-            /*swap_aux_to_current=*/ false,
-            Vec::new(),
-        )
+        self.restore_with(id, metadata, disks, /*fresh=*/ false, Vec::new())
         .await
     }
 
@@ -5358,13 +5272,7 @@ impl SandboxBackend for FirecrackerBackend {
         // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
         // generations AND patch the per-session selected skills into reserved
         // slots; both swaps happen load-paused inside restore_in_jail.
-        self.restore_with(
-            id,
-            metadata,
-            disks,
-            /*swap_aux_to_current=*/ true,
-            selected_mounts,
-        )
+        self.restore_with(id, metadata, disks, /*fresh=*/ true, selected_mounts)
         .await
     }
 
@@ -5980,11 +5888,7 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
-        // ADR 0022 Option A: mirror `effective_restore_mode` exactly so
-        // the materialize decision can't drift from the load decision —
-        // base-create under File materializes the (shared) memfile;
-        // resume under UFFD stays lazy.
-        matches!(self.effective_restore_mode(fresh), RestoreMode::Uffd)
+        !fresh
     }
 
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
@@ -7385,7 +7289,6 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
-            restore_mode: RestoreMode::File,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
@@ -7704,7 +7607,8 @@ mod tests {
             source_harness_canonical: None,
             source_vsock_canonical: None,
         };
-        // A missing memory file fails before any process or load request.
+        // Setup fails before any load request: a resume has no state.bin, a
+        // post-copy destination (which waits for state.bin) cannot spawn FC.
         for post_copy in [false, true] {
             if post_copy {
                 std::fs::write(work.path().join(MIGRATION_PEER_FILE), b"{}").unwrap();
@@ -7717,9 +7621,8 @@ mod tests {
                     &manifest,
                     RestoreInputs {
                         disks: test_disks().unwrap(),
-                        swap_aux_to_current: false,
+                        fresh: false,
                         selected_mounts: Vec::new(),
-                        restore_mode: RestoreMode::File,
                         base_memory_manifest: None,
                     },
                 )
@@ -7729,7 +7632,6 @@ mod tests {
                 error.to_string().contains("postcopy-never-loaded:"),
                 post_copy
             );
-            assert!(error.to_string().contains("missing"));
         }
     }
 
@@ -8962,49 +8864,6 @@ mod tests {
         }
     }
 
-    // ---- effective_restore_mode: fresh = File, resume = restore_mode ----
-
-    #[test]
-    fn effective_restore_mode_fresh_is_file_and_resume_follows_config() {
-        let (mut be, _dir) = backend();
-        be.config.restore_mode = RestoreMode::Uffd;
-        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
-            be.config.uffd_base_dir = base_dir;
-            assert_eq!(
-                be.effective_restore_mode(/*fresh=*/ true),
-                RestoreMode::File,
-                "a fresh create maps the per-image memfile (ADR 0092), substrate or not",
-            );
-            assert_eq!(
-                be.effective_restore_mode(/*fresh=*/ false),
-                RestoreMode::Uffd,
-                "a resume follows restore_mode",
-            );
-        }
-        be.config.restore_mode = RestoreMode::File;
-        assert_eq!(be.effective_restore_mode(false), RestoreMode::File);
-    }
-
-    #[test]
-    fn restore_memory_is_lazy_for_tracks_effective_mode() {
-        // The host-agent restore path keys BOTH its prefetch-block gate and its
-        // memory.bin-materialize gate on `restore_memory_is_lazy_for(fresh)`, so
-        // lock that it mirrors `effective_restore_mode`: lazy iff Uffd.
-        let (mut be, _dir) = backend();
-        be.config.restore_mode = RestoreMode::Uffd;
-        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
-            be.config.uffd_base_dir = base_dir;
-            assert!(
-                !be.restore_memory_is_lazy_for(/*fresh=*/ true),
-                "a File fresh create must materialize memory.bin (not lazy)",
-            );
-            assert!(
-                be.restore_memory_is_lazy_for(/*fresh=*/ false),
-                "a UFFD resume serves memory lazily",
-            );
-        }
-    }
-
     /// The load maps only the base the handler acked. An empty ack (the
     /// canonical/session mismatch fallback) maps none; this is the case
     /// that failed every resume with ENOENT when the load derived the path.
@@ -9098,14 +8957,10 @@ mod tests {
         assert!(be.post_copy_source_view(id).is_none());
     }
 
-    /// Review finding 2 regression test: `prefault_stats_path` must be
-    /// `None` for a sandbox with no live uffd-handler — `RestoreMode::File`
-    /// (the config default, and the documented `ENGRAM_FC_RESTORE_MODE=file`
-    /// fleet knob) never spawns one, so nothing could ever write the file;
-    /// returning `Some` there made every File-mode resume falsely alarm as
-    /// `stats_missing`. Keyed off `uffd_pid` (populated for
-    /// `RestoreMode::Uffd` restores AND pidfd-reattached Uffd sandboxes),
-    /// not the backend's static config — a fleet can run both modes.
+    /// `prefault_stats_path` is `None` for a sandbox with no live
+    /// uffd-handler (a fresh create spawns none, so nothing writes the
+    /// file). It keys off `uffd_pid`, which a resume and a pidfd-reattached
+    /// resumed sandbox both carry.
     #[test]
     fn prefault_stats_path_none_without_a_uffd_handler() {
         let (be, _dir) = backend();
@@ -9143,12 +8998,12 @@ mod tests {
             }
         };
 
-        // Live, but File-mode restore: no uffd_pid → still None.
+        // Live, but a fresh create: no uffd_pid → still None.
         be.sandboxes.insert(id, live_without_uffd(None));
         assert_eq!(
             be.prefault_stats_path(id),
             None,
-            "File-mode sandboxes never spawn a handler; must not alarm as stats_missing",
+            "a fresh create never spawns a handler; must not alarm as stats_missing",
         );
 
         // Live Uffd-mode restore (or a pidfd-reattached one): uffd_pid is

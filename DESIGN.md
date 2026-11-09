@@ -1002,7 +1002,7 @@ For Phase 2 the equivalent end-to-end is the FC integration suite (each test is 
 
 ```bash
 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
-# boot, lifecycle, snapshot (file-backed), snapshot_uffd (lazy paging),
+# boot, lifecycle, snapshot (lazy-paging resume),
 # exec_real_vm (busybox-fixture rootfs → boot → vsock CONNECT → exec → assert stdout)
 ```
 

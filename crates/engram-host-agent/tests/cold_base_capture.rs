@@ -55,9 +55,7 @@ use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
-use engram_sandbox_firecracker::{
-    FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
-};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use futures::StreamExt;
 
 /// Wraps a real `BlobStorage` and counts `put_streaming` calls — the
@@ -542,7 +540,6 @@ impl TestEnv {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
-        cfg.restore_mode = RestoreMode::File;
         cfg.track_dirty_pages = true;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();

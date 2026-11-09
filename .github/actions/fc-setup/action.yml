@@ -199,10 +199,9 @@ runs:
         path: ~/.cache/engram-fc-test
         key: ${{ steps.fc-artifacts.outputs.cache-primary-key }}
 
-    # snapshot_uffd needs the host-side handler binary in
-    # `target/debug/` (the test resolves it relative to
-    # CARGO_MANIFEST_DIR); the host-agent PooledBackend suites use it
-    # for UFFD-backed restores. Cheap when the rust-cache is warm.
+    # Every resume spawns the host-side handler; the FC and host-agent
+    # tests resolve it at `target/debug/` and fail without it. Cheap
+    # when the rust-cache is warm.
     - name: Build engram-uffd-handler
       shell: bash
       run: cargo build -p engram-uffd-handler

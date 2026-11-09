@@ -58,16 +58,13 @@ firecracker:
   # /opt/engram by the node-assets init container (see nodeAssets); the
   # host-agent reads them from there (ENGRAM_FIRECRACKER_BIN + the configmap
   # ENGRAM_KERNEL_IMAGE_PATH). No node hostPath for them anymore.
-  restoreMode: ""     # "" (binary default) | file | uffd
   # ADR 0045 D3 (the unified memory substrate, v2b): a tmpfs directory for
-  # per-template base shm files. When set: node-prep mounts a tmpfs there,
-  # Uffd restores back guest memory MAP_PRIVATE on the shared base
-  # (canonical pages CONTINUE-shared across same-template VMs), and
-  # fresh-creates flip from File mode to the substrate (parity-gated:
-  # density 35%==35%, restore median 61ms vs 56ms). "" = off (File-mode
-  # fresh-creates + anonymous-Uffd resumes, today's behavior). Requires
-  # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
-  # survives pod restarts (K2 reattach).
+  # per-template base shm files. When set, node-prep mounts a tmpfs there
+  # and a resume backs guest memory MAP_PRIVATE on the shared base
+  # (canonical pages CONTINUE-shared across same-template VMs). "" = off
+  # (anonymous-memory resumes). A fresh create always maps the image's
+  # memory file. Requires the v2 forked firecracker. Under workDirHostPath
+  # so it survives pod restarts (K2 reattach).
   uffdBaseDir: ""     # e.g. /var/lib/engram/shm
   # ADR 0092: the density knobs. Chart-DEFAULTED to the reclaimable-
   # residency config (prod-canaried 2026-07-14: TTFM parity, File-mode

@@ -433,10 +433,6 @@ async fn main() -> Result<(), HostAgentError> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
-            // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
-            // to the chunk-native UFFD handler (lazy memory, no memory.bin
-            // materialize). Defaults to File.
-            fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
             // Point the UFFD handler's READ-ONLY view at the SAME
             // chunk cache the PooledBackend's restore-prefetch warms
             // (`chunk-cache`, see below). ADR 0075: the handler never
