@@ -143,6 +143,8 @@ export function verifyPoolIdentity(
   expected: PoolInventory,
   actual: PoolInventory,
 ) {
+  const backingIdentity = ({ allocated: _allocated, ...identity }: Backing) =>
+    identity;
   const identity = (p: PoolInventory) => ({
     name: p.name,
     directory: p.directory,
@@ -150,8 +152,8 @@ export function verifyPoolIdentity(
     path: p.path,
     table: p.table,
     major: p.major,
-    metadata: p.metadata,
-    data: p.data,
+    metadata: backingIdentity(p.metadata),
+    data: backingIdentity(p.data),
     control: p.control,
     node: p.node,
     otherTables: p.otherTables,
@@ -160,6 +162,12 @@ export function verifyPoolIdentity(
     JSON.stringify(identity(expected)) === JSON.stringify(identity(actual)),
     "fc_pool_identity_changed",
   );
+  for (const pool of [expected, actual])
+    for (const backing of [pool.data, pool.metadata])
+      check(
+        BigInt(backing.allocated) >= BigInt(backing.bytes),
+        "fc_pool_sparse_backing",
+      );
 }
 export async function dm(args: string[]) {
   return (await command("/usr/sbin/dmsetup", args, "/", childEnvironment("/")))

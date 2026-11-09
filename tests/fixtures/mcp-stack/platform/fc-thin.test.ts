@@ -89,6 +89,55 @@ test("pool identity binds table, backing inode and actual device across launch",
       "fc_pool_identity_changed",
     );
 });
+test("pool identity permits only fully allocated backing accounting changes", () => {
+  const good = poolFixture();
+  for (const kind of ["data", "metadata"] as const) {
+    const grown = {
+      ...good,
+      [kind]: {
+        ...good[kind],
+        allocated: String(BigInt(good[kind].allocated) + 204800n),
+      },
+    };
+    expect(() => verifyPoolIdentity(good, grown)).not.toThrow();
+    expect(() => verifyPoolIdentity(grown, good)).not.toThrow();
+    const sparse = {
+      ...good,
+      [kind]: {
+        ...good[kind],
+        allocated: String(BigInt(good[kind].bytes) - 1n),
+      },
+    };
+    expect(() => verifyPoolIdentity(good, sparse)).toThrow(
+      "fc_pool_sparse_backing",
+    );
+    expect(() => verifyPoolIdentity(sparse, good)).toThrow(
+      "fc_pool_sparse_backing",
+    );
+    for (const [field, value] of Object.entries(good[kind])) {
+      if (field === "allocated") continue;
+      const changed = {
+        ...good,
+        [kind]: { ...good[kind], [field]: value + "1" },
+      };
+      expect(() => verifyPoolIdentity(good, changed)).toThrow(
+        "fc_pool_identity_changed",
+      );
+    }
+  }
+  for (const patch of [
+    { path: "/dev/dm-1" },
+    { major: "254" },
+    { name: "other" },
+    { directory: "/owned/other" },
+    { otherTables: "foreign: 0 8 linear 7:2 0" },
+    { node: { ...good.node, ino: "99" } },
+    { control: { ...good.control, rdev: "99" } },
+  ])
+    expect(() => verifyPoolIdentity(good, { ...good, ...patch })).toThrow(
+      "fc_pool_identity_changed",
+    );
+});
 test("thin table and status reject alternate targets, features and unhealthy metadata", () => {
   expect(parsePoolTable(poolFixture().table).blockSectors).toBe(128n);
   expect(() => parsePoolTable("0 10 linear 7:0 0")).toThrow();
