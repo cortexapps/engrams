@@ -34,7 +34,7 @@ import {
 import { address, dnsHosts, dnsRecords } from "./network.ts";
 import { type Inputs, REPO } from "./preflight.ts";
 import type { Identity } from "./identity.ts";
-import { Engine } from "./engine.ts";
+import { Engine, drainChecks } from "./engine.ts";
 import type { stageAssets } from "./assets.ts";
 import type { generateConfiguration } from "./configuration.ts";
 
@@ -1052,93 +1052,97 @@ export class Stack {
     throw new PlatformFailure("FAILED", "role_readiness");
   }
   async status(ctx: Context): Promise<SupervisorStatus> {
-    const states: SupervisorStatus["roles"] = [];
-    for (const role of ROLES) {
-      const active = this.active.get(role);
-      check(active, "role_identity");
-      const artifact =
-        role === "host-agent"
-          ? ctx.artifacts.hostAgent
-          : role.startsWith("fixture-")
-            ? ctx.artifacts.fixture
-            : ctx.artifacts[role as "worker" | "orchestrator" | "coordinator"];
-      await verifyPin(artifact);
-      const config =
-        role === "fixture-modern" || role === "fixture-legacy"
-          ? ctx.protocolFixtures[
-              role === "fixture-modern" ? "modern" : "legacy"
-            ].configuration
-          : role === "orchestrator"
-            ? ctx.supervisor.configurations.orchestrator[active.configuration]
-            : ctx.supervisor.configurations[role].normal;
-      check(config, "role_configuration");
-      await verifyPin(config);
-      if (
-        role === "orchestrator" ||
-        role === "coordinator" ||
-        role === "worker" ||
-        role === "host-agent"
-      ) {
-        const current = this.configs.get(role)?.[active.configuration];
-        check(current, "role_configuration");
-        for (const file of Object.values(current.files)) await verifyPin(file);
-        const envFile = this.environmentFiles.get(
-          `${role}-${active.configuration}`,
-        );
-        if (envFile) await verifyPin(envFile);
-      }
-      let running = false;
-      if (role === "host-agent") {
-        if (this.inputs.backend === "firecracker") {
-          if (!this.stopped.has(role)) {
+    const states = await drainChecks(
+      ROLES.map(async (role): Promise<SupervisorStatus["roles"][number]> => {
+        const active = this.active.get(role);
+        check(active, "role_identity");
+        const artifact =
+          role === "host-agent"
+            ? ctx.artifacts.hostAgent
+            : role.startsWith("fixture-")
+              ? ctx.artifacts.fixture
+              : ctx.artifacts[
+                  role as "worker" | "orchestrator" | "coordinator"
+                ];
+        await verifyPin(artifact);
+        const config =
+          role === "fixture-modern" || role === "fixture-legacy"
+            ? ctx.protocolFixtures[
+                role === "fixture-modern" ? "modern" : "legacy"
+              ].configuration
+            : role === "orchestrator"
+              ? ctx.supervisor.configurations.orchestrator[active.configuration]
+              : ctx.supervisor.configurations[role].normal;
+        check(config, "role_configuration");
+        await verifyPin(config);
+        if (
+          role === "orchestrator" ||
+          role === "coordinator" ||
+          role === "worker" ||
+          role === "host-agent"
+        ) {
+          const current = this.configs.get(role)?.[active.configuration];
+          check(current, "role_configuration");
+          for (const file of Object.values(current.files))
+            await verifyPin(file);
+          const envFile = this.environmentFiles.get(
+            `${role}-${active.configuration}`,
+          );
+          if (envFile) await verifyPin(envFile);
+        }
+        let running = false;
+        if (role === "host-agent") {
+          if (this.inputs.backend === "firecracker") {
+            if (!this.stopped.has(role)) {
+              running =
+                (await this.engine.audit(active.id)).State.Running === true;
+              await this.engine.verifyResolver(active.id);
+            }
+          } else {
+            const native = await this.nativeProcesses();
             running =
-              (await this.engine.audit(active.id)).State.Running === true;
-            await this.engine.verifyResolver(active.id);
+              !!this.host?.running() &&
+              native.some((p) => p.pid === this.host?.child.pid);
           }
-        } else {
-          const native = await this.nativeProcesses();
-          running =
-            !!this.host?.running() &&
-            native.some((p) => p.pid === this.host?.child.pid);
+        } else if (!this.stopped.has(role)) {
+          try {
+            const actual = await this.engine.audit(active.id);
+            await this.engine.verifyResolver(active.id);
+            running = actual.State.Running === true;
+            check(
+              actual.Image ===
+                this.inputs.images[
+                  role.startsWith("fixture-")
+                    ? "fixture"
+                    : (role as "worker" | "orchestrator" | "coordinator")
+                ].id,
+              "running_artifact",
+            );
+          } catch (error) {
+            throw error;
+          }
         }
-      } else if (!this.stopped.has(role)) {
-        try {
-          const actual = await this.engine.audit(active.id);
-          await this.engine.verifyResolver(active.id);
-          running = actual.State.Running === true;
-          check(
-            actual.Image ===
-              this.inputs.images[
-                role.startsWith("fixture-")
-                  ? "fixture"
-                  : (role as "worker" | "orchestrator" | "coordinator")
-              ].id,
-            "running_artifact",
-          );
-        } catch (error) {
-          throw error;
+        if (role === "host-agent" && running) {
+          if (this.inputs.backend === "firecracker") {
+            await this.engine.qualifyFcHost(active.id);
+            check(this.engine.fc, "fc_inventory_missing");
+            await this.engine.fc.qualifyKernel(
+              (await this.engine.inspect(active.id)).State.Pid,
+            );
+            await this.engine.fc.observe();
+          }
+          await this.engine.qualifyNativeHost(this.nativeHostTls());
         }
-      }
-      if (role === "host-agent" && running) {
-        if (this.inputs.backend === "firecracker") {
-          await this.engine.qualifyFcHost(active.id);
-          check(this.engine.fc, "fc_inventory_missing");
-          await this.engine.fc.qualifyKernel(
-            (await this.engine.inspect(active.id)).State.Pid,
-          );
-          await this.engine.fc.observe();
-        }
-        await this.engine.qualifyNativeHost(this.nativeHostTls());
-      }
-      states.push({
-        role,
-        state: running ? "running" : "stopped",
-        bootId: active.id,
-        artifactSha256: artifact.sha256,
-        configurationId: active.configuration,
-        configurationSha256: config.sha256,
-      });
-    }
+        return {
+          role,
+          state: running ? "running" : "stopped",
+          bootId: active.id,
+          artifactSha256: artifact.sha256,
+          configurationId: active.configuration,
+          configurationSha256: config.sha256,
+        };
+      }),
+    );
     return {
       version: 1,
       runId: ctx.runId,

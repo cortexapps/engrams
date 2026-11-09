@@ -33,6 +33,18 @@ import {
   validateEngineConfig,
 } from "./preflight.ts";
 
+// Every check keeps its own command lifetime. Drain all siblings before the
+// control scope can release its shared cancellation signal.
+export async function drainChecks<T>(
+  checks: readonly Promise<T>[],
+): Promise<T[]> {
+  const results = await Promise.allSettled(checks);
+  return results.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
+}
+
 type NativeRoute = { gateway: string; dev: string; source: string };
 const ipv4 = (value: string) => {
   const parts = value.split(".").map(Number);
@@ -1740,7 +1752,6 @@ export class Engine {
   }
   async verifyNetwork(probes: boolean) {
     check(this.guardIds.size === 3 && this.networkId, "guard_set");
-    const results: string[] = [];
     await this.verifyNativeRoute();
     const [network] = JSON.parse(
       (await this.call(["network", "inspect", this.networkId])).toString(),
@@ -1751,30 +1762,30 @@ export class Engine {
         network.Labels?.["engrams.mcp.run"] === this.runId,
       "network_changed",
     );
-    for (const role of GUARDS) {
-      const id = this.guardIds.get(role)!;
-      const guard = await this.audit(id);
-      await this.verifyResolver(id);
-      check(
-        guard.State?.Running === true &&
-          guard.NetworkSettings?.Networks?.[this.name("network")]?.IPAddress ===
-            address(this.inputs, role),
-        "guard_identity",
-      );
-      check(
-        JSON.stringify(Object.keys(guard.NetworkSettings.Networks).sort()) ===
-          JSON.stringify(
-            [
-              this.name("network"),
-              ...(role === "coordinator" && this.inputs.backend === "vz"
-                ? [this.name("native-network")]
-                : []),
-            ].sort(),
-          ),
-        "guard_network_membership",
-      );
-      results.push(
-        effectiveRules(
+    const results = await drainChecks(
+      GUARDS.map(async (role) => {
+        const id = this.guardIds.get(role)!;
+        const guard = await this.audit(id);
+        await this.verifyResolver(id);
+        check(
+          guard.State?.Running === true &&
+            guard.NetworkSettings?.Networks?.[this.name("network")]
+              ?.IPAddress === address(this.inputs, role),
+          "guard_identity",
+        );
+        check(
+          JSON.stringify(Object.keys(guard.NetworkSettings.Networks).sort()) ===
+            JSON.stringify(
+              [
+                this.name("network"),
+                ...(role === "coordinator" && this.inputs.backend === "vz"
+                  ? [this.name("native-network")]
+                  : []),
+              ].sort(),
+            ),
+          "guard_network_membership",
+        );
+        const enforcement = effectiveRules(
           JSON.parse(
             (
               await this.call([
@@ -1790,85 +1801,86 @@ export class Engine {
             ).toString(),
           ),
           rules(this.inputs, role),
-        ),
-      );
-      if (probes) {
-        // The owned fixture is reachable. The owned denial sink is live but not allowed.
-        for (const fixture of ["modern", "legacy"] as const) {
-          await this.call([
+        );
+        if (probes) {
+          // The owned fixture is reachable. The owned denial sink is live but not allowed.
+          for (const fixture of ["modern", "legacy"] as const) {
+            await this.call([
+              "exec",
+              id,
+              "/usr/bin/nc",
+              "-z",
+              "-w",
+              "2",
+              address(this.inputs, fixture),
+              "8443",
+            ]);
+            await this.call([
+              "exec",
+              id,
+              "/usr/bin/curl",
+              "--silent",
+              "--show-error",
+              "--max-time",
+              "2",
+              "--cacert",
+              "/etc/mcp-probe/ca.pem",
+              "--output",
+              "/dev/null",
+              `https://resource.${fixture}.fixture.example:8443/`,
+            ]);
+          }
+          // No external packet is sent: both probes target the owned DNS namespace or the blocked embedded stub.
+          const dns = await this.call([
             "exec",
             id,
-            "/usr/bin/nc",
-            "-z",
-            "-w",
-            "2",
-            address(this.inputs, fixture),
-            "8443",
+            "/usr/bin/dig",
+            "+time=1",
+            "+tries=1",
+            "+short",
+            "resource.modern.fixture.example",
+            "A",
           ]);
-          await this.call([
+          check(
+            dns.toString().trim() === address(this.inputs, "modern"),
+            "fixture_dns",
+          );
+          const unknown = await this.call([
             "exec",
             id,
-            "/usr/bin/curl",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "2",
-            "--cacert",
-            "/etc/mcp-probe/ca.pem",
-            "--output",
-            "/dev/null",
-            `https://resource.${fixture}.fixture.example:8443/`,
+            "/usr/bin/dig",
+            "+time=1",
+            "+tries=1",
+            "+comments",
+            `@${address(this.inputs, "dns")}`,
+            "unrouted.invalid",
+            "A",
           ]);
-        }
-        // No external packet is sent: both probes target the owned DNS namespace or the blocked embedded stub.
-        const dns = await this.call([
-          "exec",
-          id,
-          "/usr/bin/dig",
-          "+time=1",
-          "+tries=1",
-          "+short",
-          "resource.modern.fixture.example",
-          "A",
-        ]);
-        check(
-          dns.toString().trim() === address(this.inputs, "modern"),
-          "fixture_dns",
-        );
-        const unknown = await this.call([
-          "exec",
-          id,
-          "/usr/bin/dig",
-          "+time=1",
-          "+tries=1",
-          "+comments",
-          `@${address(this.inputs, "dns")}`,
-          "unrouted.invalid",
-          "A",
-        ]);
-        check(
-          /status: (NXDOMAIN|SERVFAIL),/.test(unknown.toString()) &&
-            /ANSWER: 0,/.test(unknown.toString()),
-          "external_dns",
-        );
-        // Start the three fixed negative probes together, then wait for all of
-        // them. Their one-second bounds also keep restart controls bounded.
-        const negative = await this.call([
-          "exec",
-          id,
-          "/bin/sh",
-          "-ec",
-          `
+          check(
+            /status: (NXDOMAIN|SERVFAIL),/.test(unknown.toString()) &&
+              /ANSWER: 0,/.test(unknown.toString()),
+            "external_dns",
+          );
+          // Start the three fixed negative probes together, then wait for all of
+          // them. Their one-second bounds also keep restart controls bounded.
+          const negative = await this.call([
+            "exec",
+            id,
+            "/bin/sh",
+            "-ec",
+            `
           deny() { if /usr/bin/nc -z -w 1 ${address(this.inputs, "denied")} 8080; then return 1; else code=$?; test "$code" = 1; fi; }
           block() { if /usr/bin/dig +time=1 +tries=1 "@$1" unrouted.invalid A >/dev/null 2>&1; then return 1; else code=$?; test "$code" = 9; fi; }
           deny & first=$!; block 127.0.0.11 & second=$!; block ${address(this.inputs, "denied")} & third=$!
           failed=0; wait "$first" || failed=1; wait "$second" || failed=1; wait "$third" || failed=1
           test "$failed" = 0; printf blocked
         `,
-        ]);
-        check(negative.toString() === "blocked", "negative_network_probes");
-      }
-    }
+          ]);
+          check(negative.toString() === "blocked", "negative_network_probes");
+        }
+        return enforcement;
+      }),
+    );
     const enforcementSha256 = hash(results.join("\n"));
     if (this.baseline)
       check(this.baseline === enforcementSha256, "network_generation");
