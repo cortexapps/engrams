@@ -75,6 +75,16 @@ impl ThinPoolDisk {
             next_id: Arc::new(AtomicU32::new(1)),
             metadata_snap: tokio::sync::Mutex::new(()),
         };
+        // A host-agent that died inside `while_suspended` left a device
+        // holding every I/O; its inactive table, if any, is the one it
+        // meant to make live.
+        let prefix = format!("{pool}.");
+        for (device, _) in disk.dm.list().await? {
+            if device.starts_with(&prefix) && disk.dm.suspended(&device).await? {
+                tracing::warn!(device, "resuming a device left suspended");
+                disk.dm.resume(&device).await?;
+            }
+        }
         let in_pool = disk.thin_ids().await?;
         let active = disk.active_ids().await?;
         for id in in_pool.iter().filter(|id| !active.contains(id)) {
@@ -173,6 +183,30 @@ impl ThinPoolDisk {
             ));
         }
         Ok((params, target.length_sectors))
+    }
+
+    /// Run `op` while `device` is suspended, then resume it, as one owned
+    /// task: a suspended device holds every I/O, so the resume runs
+    /// whatever happens to the caller. Both outcomes come back; what a
+    /// failed resume costs is the caller's to decide.
+    async fn while_suspended<T, Fut>(
+        &self,
+        device: String,
+        op: impl FnOnce(dm::Dm) -> Fut + Send + 'static,
+    ) -> io::Result<(io::Result<T>, io::Result<()>)>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+    {
+        let dm = self.dm.clone();
+        tokio::spawn(async move {
+            dm.suspend(&device).await?;
+            let done = op(dm.clone()).await;
+            let resumed = dm.resume(&device).await;
+            Ok((done, resumed))
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// Remove the device, waiting a bounded time for the last holder to
@@ -364,40 +398,33 @@ impl SessionDisk for ThinPoolDisk {
 
     async fn snapshot(&self, origin: &Volume, name: &VolumeName) -> io::Result<Volume> {
         let (thin, sectors) = self.thin_of(&origin.name).await?;
-        let dm = self.dm.clone();
         let pool = self.pool.clone();
         let next_id = self.next_id.clone();
-        let origin_name = self.device_name(&origin.name);
-        // The origin holds all I/O while it is suspended, so the resume
-        // must run whatever happens to the caller: the calls are one owned
-        // task.
-        let id = tokio::spawn(async move {
-            dm.suspend(&origin_name).await?;
-            let created = loop {
-                let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
-                match dm
-                    .message(&pool, &format!("create_snap {id} {}", thin.id))
-                    .await
-                {
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                    created => break created.map(|()| id),
-                }
-            };
-            let resumed = dm.resume(&origin_name).await;
-            match (created, resumed) {
-                (Ok(id), Ok(())) => Ok(id),
-                (Ok(id), Err(e)) => {
-                    // The snapshot exists but nothing will activate it.
-                    if let Err(error) = dm.message(&pool, &format!("delete {id}")).await {
-                        tracing::warn!(pool = %pool, id, %error, "thin left behind by a failed resume");
+        let (created, resumed) = self
+            .while_suspended(self.device_name(&origin.name), move |dm| async move {
+                loop {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed) & ID_MASK;
+                    match dm
+                        .message(&pool, &format!("create_snap {id} {}", thin.id))
+                        .await
+                    {
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                        created => return created.map(|()| id),
                     }
-                    Err(e)
                 }
-                (Err(e), _) => Err(e),
+            })
+            .await?;
+        let id = match (created, resumed) {
+            (Ok(id), Ok(())) => id,
+            (Ok(id), Err(e)) => {
+                // The snapshot exists but nothing will activate it.
+                if let Err(error) = self.dm.message(&self.pool, &format!("delete {id}")).await {
+                    tracing::warn!(pool = %self.pool, id, %error, "thin left behind by a failed resume");
+                }
+                return Err(e);
             }
-        })
-        .await
-        .map_err(io::Error::other)??;
+            (Err(e), _) => return Err(e),
+        };
         self.activate(name, id, sectors).await
     }
 
@@ -528,9 +555,8 @@ impl SessionDisk for ThinPoolDisk {
         }
     }
 
-    /// Reloads the device as `linear` over `dest`. The suspend holds the
-    /// guest's I/O for the reload, so the three calls are one owned task.
-    /// A failed reload resumes the clone table. The metadata thin goes
+    /// Reloads the device as `linear` over `dest` under a suspend. A
+    /// failed reload resumes the clone table. The metadata thin goes
     /// last: the kernel closes it when the clone table is destroyed.
     async fn settle(&self, name: &VolumeName, dest: &Volume) -> io::Result<()> {
         match self.hydration(name).await? {
@@ -543,16 +569,13 @@ impl SessionDisk for ThinPoolDisk {
             Hydration::Hydrating { .. } => {
                 let (_, sectors) = self.thin_of(&dest.name).await?;
                 let params = format!("{} 0", dm::devno_of(&dest.path)?);
-                let dm = self.dm.clone();
                 let device = self.device_name(name);
-                tokio::spawn(async move {
-                    dm.suspend(&device).await?;
-                    let loaded = dm.load(&device, sectors, "linear", &params).await;
-                    let resumed = dm.resume(&device).await;
-                    loaded.and(resumed)
-                })
-                .await
-                .map_err(io::Error::other)??;
+                let (loaded, resumed) = self
+                    .while_suspended(device.clone(), move |dm| async move {
+                        dm.load(&device, sectors, "linear", &params).await
+                    })
+                    .await?;
+                loaded.and(resumed)?;
             }
             Hydration::Settled => {}
         }

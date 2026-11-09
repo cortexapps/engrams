@@ -420,6 +420,21 @@ impl Dm {
         .map(drop)
     }
 
+    /// Whether `name` is suspended: the kernel sets `DM_SUSPEND_FLAG` in
+    /// every reply about a suspended device.
+    pub async fn suspended(&self, name: &str) -> io::Result<bool> {
+        let reply = self
+            .call(
+                "status",
+                name,
+                Request::new(name, 0)?,
+                DM_DEV_STATUS_CMD,
+                io::ErrorKind::ResourceBusy,
+            )
+            .await?;
+        Ok(reply.flags() & DM_SUSPEND_FLAG != 0)
+    }
+
     pub async fn resume(&self, name: &str) -> io::Result<()> {
         self.call(
             "resume",
