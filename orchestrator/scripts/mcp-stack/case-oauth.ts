@@ -362,6 +362,8 @@ export const oauthAuthorityDriver: CaseDriver = async ({
             expectedRevision: current.current.connection.configRevision,
             expectedGeneration: current.current.connection.authGeneration,
           });
+          // Short-expiry checks are complete. Keep the probe credential valid through rebind.
+          await fixture.oauth({ expiresInSeconds: 3600 });
           await authorizeOAuth(ctx, principals.admin, scenario.connection.id);
         } else {
           await fixture.oauth(
