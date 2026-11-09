@@ -153,6 +153,7 @@ async fn export(volume: &Volume, destination: &Path) -> io::Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(destination)
         .await?;
     for index in (0..volume.chunk_count()).map(ChunkIndex) {
@@ -173,6 +174,7 @@ async fn export(volume: &Volume, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use engram_host_core::FileDisk;
+    use std::os::unix::fs::PermissionsExt;
 
     struct BusyDisk {
         inner: FileDisk,
@@ -351,6 +353,11 @@ mod tests {
             .unwrap();
         let output = dir.path().join("capture");
         export(&snap, &output).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "capture must be private at creation"
+        );
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
         assert!(
             export(&snap, &output).await.is_err(),
