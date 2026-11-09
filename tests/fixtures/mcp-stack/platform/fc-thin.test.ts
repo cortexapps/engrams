@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   admitPool,
+  inspectPool,
   OfflinePoolAccess,
+  parseThinPool,
   readThinIds as reservedThinIds,
   verifyThinIds,
   type MetadataReadState,
@@ -11,6 +16,29 @@ import {
   parsePoolStatus,
 } from "./fc-thin.ts";
 import { poolFixture } from "./fc-thin-fixture.ts";
+
+test("expanded pool reinspection keeps its name budget and public input stays strict", async () => {
+  const directory = await realpath(
+    await mkdtemp(join(tmpdir(), "mcp-pool-reinspection-")),
+  );
+  try {
+    const input = { name: "suite", directory };
+    expect(parseThinPool(input)).toEqual(input);
+    expect(() => parseThinPool({ ...poolFixture(), directory })).toThrow(
+      "object_keys",
+    );
+    const inventory = { ...poolFixture(), directory, name: "a".repeat(27) };
+    await expect(
+      new OfflinePoolAccess().inspect(
+        async () => {},
+        (lease) => inspectPool(inventory, lease),
+      ),
+    ).rejects.toThrow("fc_pool_name_volume_budget");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function readThinIds(
   name: string,
   path: string,
@@ -225,8 +253,9 @@ test("release keeps only recorded closed image/checkpoint volumes with exact ide
 });
 
 test("managed boot selects only the current exact API socket and retains its disk contract", async () => {
-  const { managedBootPaths, selectManagedProcess } =
-    await import("./fc-runtime.ts");
+  const { managedBootPaths, selectManagedProcess } = await import(
+    "./fc-runtime.ts"
+  );
   const sandbox = "11111111-1111-4111-8111-111111111111";
   const one = managedBootPaths("/owned/host", sandbox, "boot-1");
   const next = managedBootPaths("/owned/host", sandbox, "boot-2");

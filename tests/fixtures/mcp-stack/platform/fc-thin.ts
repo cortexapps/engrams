@@ -336,7 +336,7 @@ export async function inspectPool(
   input: ThinPoolInput,
   lease?: OfflinePoolLease,
 ): Promise<PoolInventory> {
-  parseThinPool(input);
+  input = parseThinPool({ name: input.name, directory: input.directory });
   check(input.name.length <= 26, "fc_pool_name_volume_budget");
   const table = await dm(["table", input.name]);
   const parsed = parsePoolTable(table);
