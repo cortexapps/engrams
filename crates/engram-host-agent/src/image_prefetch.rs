@@ -505,7 +505,7 @@ async fn reconcile(
             // ADR 0039 (honest readiness): a `ready` image must still have
             // ALL its base chunks locally resolvable. Re-verify against the
             // pinned set (the disk + memory hashes recorded at prefetch) —
-            // if the LRU evicted any, or a `write_local` silently failed so a
+            // if the LRU evicted any, or a `put_trusted` silently failed so a
             // pinned hash never actually landed on NVMe, flip to not-ready so
             // this round re-prefetches. Without this the host keeps
             // advertising `ready` while a restore cold-fetches (or EIOs) the
@@ -1549,7 +1549,7 @@ mod tests {
     async fn reconcile_flips_ready_to_unready_when_base_chunk_is_gone() {
         // ADR 0039 (honest readiness): if a `ready` image's base chunks are
         // no longer resolvable on local NVMe (LRU eviction / a silently-
-        // failed write_local), the next reconcile must flip it back to
+        // failed put_trusted), the next reconcile must flip it back to
         // not-ready so a restore never lands on a ready-but-cold host.
         let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let fill = FillEngine::new(store.clone(), engram_fill::Config::default());
@@ -1591,7 +1591,7 @@ mod tests {
 
         // Simulate the chunk going cold: delete one pinned chunk's on-disk
         // cache file out from under the cache (what an LRU sweep or a failed
-        // write_local would leave behind — pinned-but-not-resident).
+        // put_trusted would leave behind — pinned-but-not-resident).
         let victim = *pinned
             .lock()
             .get(&img.manifest_digest)

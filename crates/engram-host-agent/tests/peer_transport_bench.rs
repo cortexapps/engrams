@@ -165,7 +165,14 @@ async fn bench_engine_peer_fill() {
         b[1] = 0xD1;
         let h = ChunkHash::of(&b);
         total_bytes += b.len();
-        serve_cache.put(h, bytes::Bytes::from(b)).await.unwrap();
+        serve_cache
+            .put_trusted(
+                h,
+                bytes::Bytes::from(b),
+                engram_chunk_store::Class::Background,
+            )
+            .await
+            .unwrap();
         hashes.push(h);
     }
     for i in 0..mem_chunks {
@@ -175,7 +182,14 @@ async fn bench_engine_peer_fill() {
         b[2] = 0x3E;
         let h = ChunkHash::of(&b);
         total_bytes += b.len();
-        serve_cache.put(h, bytes::Bytes::from(b)).await.unwrap();
+        serve_cache
+            .put_trusted(
+                h,
+                bytes::Bytes::from(b),
+                engram_chunk_store::Class::Background,
+            )
+            .await
+            .unwrap();
         hashes.push(h);
     }
     let ready = ImageReadiness::new();

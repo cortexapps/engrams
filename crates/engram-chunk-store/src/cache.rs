@@ -46,7 +46,7 @@
 //!   (the prod incident where a 200 GiB byte-budget never tripped on a
 //!   ~98 GiB FC host).
 //! - **Periodic enforcement**: eviction runs both on the populate path
-//!   (debounced, see `write_local`) AND on an independent timer
+//!   (debounced, see `put_trusted`) AND on an independent timer
 //!   ([`ChunkCache::spawn_sweeper`]) — a host under disk pressure from
 //!   non-cache writers, or one that just came back from a pod restart
 //!   with zero populate traffic, still gets swept (ADR 0070).
@@ -103,7 +103,7 @@ use crate::admission::{Admission, Class, Permit};
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::ChunkHash;
 
-/// Default populate-path sweep debounce (see `write_local`).
+/// Default populate-path sweep debounce (see `put_trusted`).
 pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 
 /// ADR 0019 / telemetry restoration (#526), review finding 7: the
@@ -115,11 +115,11 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 /// - `source="gcs"` / `source="peer"`: incremented in
 ///   [`ChunkCache::fill_with`] after the winning leader's write, with
 ///   the label the fetch reported (ADR 0095: the fetch is the one place
-///   that knows the backend), only when `write_local` landed the bytes on
+///   that knows the backend), only when `put_trusted` landed the bytes on
 ///   disk (a failed write means the fetch happened but the cache did NOT
 ///   fill).
 /// - `source="peer"` is ALSO incremented by
-///   `engram-host-agent::peer_fill` at its bulk [`ChunkCache::put`]
+///   `engram-host-agent::peer_fill` at its bulk [`ChunkCache::put_trusted`]
 ///   landings (ADR 0095).
 pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
 
@@ -189,7 +189,7 @@ pub struct ChunkCacheConfig {
     /// entries.
     pub budget_bytes: u64,
     /// Minimum interval between populate-path eviction sweeps (see
-    /// `write_local`). 0 = sweep on every populate (test determinism).
+    /// `put_trusted`). 0 = sweep on every populate (test determinism).
     pub sweep_debounce_ms: i64,
     /// Single-evictor switch (ADR 0070). `true` (default): this cache's
     /// `sweep()` (populate-path debounce AND [`ChunkCache::spawn_sweeper`])
@@ -626,7 +626,7 @@ struct CacheInner {
     /// `engram_chunk_cache_refetch_after_evict_total`.
     evicted_ring: Mutex<EvictedRing>,
     /// Debounce for the populate-path eviction sweep (unix millis of
-    /// the last sweep). See `write_local`.
+    /// the last sweep). See `put_trusted`.
     last_sweep_ms: std::sync::atomic::AtomicI64,
     /// ADR 0092: allocated bytes co-tenant consumers currently hold on
     /// the cache's filesystem that the sweeper cannot evict (today: the
@@ -1271,7 +1271,7 @@ impl ChunkCache {
         // still return, but the chunk is not cached and every later read
         // fetches it again — which looks like "warming ran but reads
         // still miss". Log it loudly rather than swallow it.
-        let written = match self.write_local(hash, bytes.clone(), class).await {
+        let written = match self.put_trusted(hash, bytes.clone(), class).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
@@ -1279,7 +1279,7 @@ impl ChunkCache {
                     root = %self.inner.config.root.display(),
                     bytes = bytes.len(),
                     error = %e,
-                    "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                    "chunk cache write failed — chunk not cached (reads will miss → GCS)",
                 );
                 false
             }
@@ -1452,27 +1452,11 @@ impl ChunkCache {
         })
     }
 
-    /// Store a chunk after checking that `bytes` hash to `hash`, at
-    /// `Background`.
-    pub async fn put(&self, hash: ChunkHash, bytes: Bytes) -> Result<()> {
-        check_hash(hash, &bytes)?;
-        self.write_local(hash, bytes, Class::Background).await
-    }
-
-    /// Store a chunk the caller trusts without hashing it (a peer's chunk,
-    /// or one the caller just hashed), at `class`.
+    /// Store a chunk at `class`, then run the debounced budget sweep. The
+    /// one way into the cache: the caller guarantees that `bytes` hash to
+    /// `hash` (a fill checked them, a peer checked them when it stored
+    /// them, or the caller hashed them to upload them).
     pub async fn put_trusted(&self, hash: ChunkHash, bytes: Bytes, class: Class) -> Result<()> {
-        self.write_local(hash, bytes, class).await
-    }
-
-    /// Store a chunk whose hash the caller guarantees, then run the
-    /// debounced budget sweep.
-    pub(crate) async fn write_local(
-        &self,
-        hash: ChunkHash,
-        bytes: Bytes,
-        class: Class,
-    ) -> Result<()> {
         self.store_file(hash, bytes, class).await?;
 
         // Best-effort eviction sweep, DEBOUNCED to at most once per
@@ -2041,18 +2025,6 @@ fn range_in(hash: ChunkHash, offset: u64, len: usize, size: u64) -> Result<std::
     }
 }
 
-/// `Err(HashMismatch)` unless `bytes` hash to `hash`.
-fn check_hash(hash: ChunkHash, bytes: &[u8]) -> Result<()> {
-    let actual = ChunkHash::of(bytes);
-    if actual != hash {
-        return Err(ChunkStoreError::HashMismatch {
-            expected: hash.to_hex(),
-            actual: actual.to_hex(),
-        });
-    }
-    Ok(())
-}
-
 /// A writer-unique sibling temp path for `target`:
 /// `<target-filename>.partial.<pid>.<seq>`. The process-global counter
 /// disambiguates concurrent writers within this process; the pid keeps a
@@ -2293,11 +2265,15 @@ mod tests {
         cache.get(h, || store.get_chunk(h)).await
     }
 
+    async fn put(cache: &ChunkCache, h: ChunkHash, bytes: Bytes) -> Result<()> {
+        cache.put_trusted(h, bytes, Class::Background).await
+    }
+
     /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
     /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
     /// before returning — this must be pure instrumentation, not a
     /// semantic change. Round-trip a chunk through a genuine miss (fetcher
-    /// fires, bytes land via `write_local`) and then a genuine NVMe hit
+    /// fires, bytes land via `put_trusted`) and then a genuine NVMe hit
     /// (fetcher must NOT fire again), and assert both arms still return the
     /// exact, hash-verified bytes.
     #[tokio::test]
@@ -2337,7 +2313,7 @@ mod tests {
     /// `No such file or directory` (the winner had already renamed the
     /// shared temp away). The chunk then stayed uncached and every read
     /// fell through to GCS — a ~92 s prod cold-recovery resume.
-    /// (`put` writes straight through `write_local`, bypassing `get`'s
+    /// (`put_trusted` bypasses `get`'s
     /// singleflight, so even one cache reproduces the race; the two-cache
     /// split mirrors the real cross-process shape.)
     #[tokio::test]
@@ -2373,7 +2349,7 @@ mod tests {
                 };
                 let body = body.clone();
                 tasks.push(tokio::spawn(async move {
-                    cache.put(h, Bytes::copy_from_slice(&body)).await
+                    put(&cache, h, Bytes::copy_from_slice(&body)).await
                 }));
             }
         }
@@ -2427,24 +2403,13 @@ mod tests {
         let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
         let body = b"prepopulated";
         let h = ChunkHash::of(body);
-        // Don't write to the remote store. The cache.put primes
-        // the local file directly.
-        cache.put(h, Bytes::copy_from_slice(body)).await.unwrap();
+        // Don't write to the remote store. The put primes the local
+        // file directly.
+        put(&cache, h, Bytes::copy_from_slice(body)).await.unwrap();
         let got = cache_get_from(&cache, &store, h).await.unwrap();
         assert_eq!(&got[..], body);
         // Confirm the remote store doesn't have it.
         assert!(!store.chunk_exists(h).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn put_rejects_mismatched_hash() {
-        let (cache, _s, _b, _c) = setup(1024 * 1024 * 1024).await;
-        let body = b"a";
-        let wrong_hash = ChunkHash::of(b"b");
-        match cache.put(wrong_hash, Bytes::copy_from_slice(body)).await {
-            Err(ChunkStoreError::HashMismatch { .. }) => {}
-            other => panic!("expected HashMismatch, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -2458,12 +2423,12 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         // tiny sleep so mtimes differ
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
 
         // The oldest (a) should be gone; b and c should remain.
         // Note: the eviction sweep runs after each put, so the
@@ -2471,7 +2436,7 @@ mod tests {
         // eviction. We need a fourth to actually trip eviction.
         let d = b"dddddddddd";
         let hd = ChunkHash::of(d);
-        cache.put(hd, Bytes::copy_from_slice(d)).await.unwrap();
+        put(&cache, hd, Bytes::copy_from_slice(d)).await.unwrap();
         assert!(!cache.contains(ha), "a should be evicted");
         assert!(cache.contains(hb));
         assert!(cache.contains(hc));
@@ -2496,8 +2461,8 @@ mod tests {
         cache.sweep().await.unwrap();
         let (old, new) = (b"written a while ago", b"written just now");
         let (h_old, h_new) = (ChunkHash::of(old), ChunkHash::of(new));
-        cache.put(h_old, Bytes::from_static(old)).await.unwrap();
-        cache.put(h_new, Bytes::from_static(new)).await.unwrap();
+        put(&cache, h_old, Bytes::from_static(old)).await.unwrap();
+        put(&cache, h_new, Bytes::from_static(new)).await.unwrap();
         if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
             idx.entries.get_mut(&h_old).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
         }
@@ -2513,13 +2478,11 @@ mod tests {
     async fn the_ceiling_evicts_a_chunk_just_written() {
         let (cache, _store, _b, _c) = setup(10).await;
         let (a, b) = (b"aaaaaaaaaa", b"bbbbbbbbbb");
-        cache
-            .put(ChunkHash::of(a), Bytes::from_static(a))
+        put(&cache, ChunkHash::of(a), Bytes::from_static(a))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache
-            .put(ChunkHash::of(b), Bytes::from_static(b))
+        put(&cache, ChunkHash::of(b), Bytes::from_static(b))
             .await
             .unwrap();
         assert!(!cache.contains(ChunkHash::of(a)));
@@ -2540,11 +2503,11 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
         cache.sweep().await.unwrap();
         assert!(
             cache.contains(ha) && cache.contains(hb) && cache.contains(hc),
@@ -2574,10 +2537,10 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
 
         cache.set_co_tenant_reserved("test", 1_000_000);
         cache.sweep().await.unwrap();
@@ -2603,14 +2566,14 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // Putting c pushes us to 30; eviction targets the oldest
         // un-pinned (b), not the pinned a.
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
         assert!(cache.contains(ha), "pinned a must survive");
         assert!(!cache.contains(hb), "unpinned b should evict");
         assert!(cache.contains(hc));
@@ -2629,7 +2592,7 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         // Two holders pin `a`.
         cache.pin(ha);
         cache.pin(ha);
@@ -2638,9 +2601,9 @@ mod tests {
         cache.unpin(ha);
         assert_eq!(cache.pinned_count(), 1, "still pinned after one unpin");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
         assert!(cache.contains(ha), "a still pinned (refcount 1)");
         assert!(!cache.contains(hb), "unpinned b evicts");
         assert!(cache.contains(hc));
@@ -2698,14 +2661,16 @@ mod tests {
     async fn size_bytes_reports_total() {
         let (cache, _s, _b, _c) = setup(1024 * 1024).await;
         assert_eq!(cache.size_bytes().await.unwrap(), 0);
-        cache
-            .put(ChunkHash::of(b"abc"), Bytes::from_static(b"abc"))
+        put(&cache, ChunkHash::of(b"abc"), Bytes::from_static(b"abc"))
             .await
             .unwrap();
-        cache
-            .put(ChunkHash::of(b"defgh"), Bytes::from_static(b"defgh"))
-            .await
-            .unwrap();
+        put(
+            &cache,
+            ChunkHash::of(b"defgh"),
+            Bytes::from_static(b"defgh"),
+        )
+        .await
+        .unwrap();
         assert_eq!(cache.size_bytes().await.unwrap(), 8);
     }
 
@@ -2995,13 +2960,13 @@ mod tests {
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
         let hc = ChunkHash::of(c);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         cache.clear_pins();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
         // With pin released, a (oldest) gets evicted.
         assert!(!cache.contains(ha));
         assert!(cache.contains(hc));
@@ -3403,13 +3368,11 @@ mod tests {
         // sweep see the not-yet-pinned 10-byte chunk alone exceed the
         // 5-byte budget and evict it before `pin()` ever runs.
         cache.pin(hp);
-        cache
-            .put(hp, Bytes::copy_from_slice(pinned_body))
+        put(&cache, hp, Bytes::copy_from_slice(pinned_body))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache
-            .put(he, Bytes::copy_from_slice(evictable_body))
+        put(&cache, he, Bytes::copy_from_slice(evictable_body))
             .await
             .unwrap();
 
@@ -3427,7 +3390,7 @@ mod tests {
         let (cache, _store, _b, _c) = setup(1024 * 1024).await;
         let body = b"aaaaaaaaaa";
         let h = ChunkHash::of(body);
-        cache.put(h, Bytes::copy_from_slice(body)).await.unwrap();
+        put(&cache, h, Bytes::copy_from_slice(body)).await.unwrap();
         cache.pin(h);
         cache.sweep().await.unwrap();
         assert!(cache.contains(h), "far under budget: nothing evicts");
@@ -3451,8 +3414,8 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let ha = ChunkHash::of(a);
         let hb = ChunkHash::of(b);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         cache.sweep().await.unwrap();
         assert!(cache.contains(ha), "eviction disabled: a must survive");
         assert!(cache.contains(hb), "eviction disabled: b must survive");
@@ -3619,7 +3582,7 @@ mod tests {
     #[tokio::test]
     async fn populate_path_sweep_evicts_through_the_index() {
         // Three 10-byte chunks against a 25-byte ceiling, populated via
-        // `put` (the write_local path, debounce 0 ⇒ every write sweeps).
+        // `put_trusted` (debounce 0 ⇒ every write sweeps).
         // The sweeps run against the in-memory index — the oldest chunk
         // must go, the newest must stay, purely through index-tracked
         // populates and evictions.
@@ -3628,13 +3591,13 @@ mod tests {
         let b = b"bbbbbbbbbb";
         let c = b"cccccccccc";
         let (ha, hb, hc) = (ChunkHash::of(a), ChunkHash::of(b), ChunkHash::of(c));
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         // Distinct populate times: eviction orders by populated_ms
         // (millisecond resolution).
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hc, Bytes::copy_from_slice(c)).await.unwrap();
+        put(&cache, hc, Bytes::copy_from_slice(c)).await.unwrap();
 
         assert!(
             !cache.contains(ha),
@@ -3650,7 +3613,7 @@ mod tests {
         let (cache, _store, _b, _c) = setup(NO_CEILING).await;
         let body = Bytes::from_static(b"landed by an earlier build");
         let h = ChunkHash::of(&body);
-        cache.put(h, body).await.unwrap();
+        put(&cache, h, body).await.unwrap();
         let mut sidecar = cache.path_for(h).into_os_string();
         sidecar.push(".unverified");
         std::fs::write(&sidecar, b"").unwrap();
@@ -3705,10 +3668,10 @@ mod tests {
         let (cache, _store, _b, _c) = setup(1024).await;
         let body = b"resident chunk";
         let h = ChunkHash::of(body);
-        cache.put(h, Bytes::from_static(body)).await.unwrap();
+        put(&cache, h, Bytes::from_static(body)).await.unwrap();
         let first = std::fs::metadata(cache.on_disk_path(h)).unwrap();
 
-        cache.put(h, Bytes::from_static(body)).await.unwrap();
+        put(&cache, h, Bytes::from_static(body)).await.unwrap();
 
         let again = std::fs::metadata(cache.on_disk_path(h)).unwrap();
         use std::os::unix::fs::MetadataExt;
@@ -3758,9 +3721,9 @@ mod tests {
         let (cache, _store, _b, _c) = setup(10).await;
         let a = b"aaaaaaaaaa";
         let ha = ChunkHash::of(a);
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         assert!(
             cache.contains(ha),
             "re-populating one in-budget hash must not inflate the index total and self-evict",
@@ -3776,9 +3739,9 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
         let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
         assert!(!cache.contains(ha), "over-ceiling: oldest evicted");
         assert!(cache.contains(hb));
 
@@ -3810,11 +3773,11 @@ mod tests {
         let a = b"aaaaaaaaaa";
         let b = b"bbbbbbbbbb";
         let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         // 20 bytes against a 15-byte ceiling. The put itself must not
         // block on a walk; the spawned build + its tail sweep evict.
-        cache.put(hb, Bytes::copy_from_slice(b)).await.unwrap();
+        put(&cache, hb, Bytes::copy_from_slice(b)).await.unwrap();
 
         let deadline = tokio::time::Duration::from_secs(5);
         let evicted = tokio::time::timeout(deadline, async {
@@ -3930,7 +3893,7 @@ mod tests {
         cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         // Older than the floor's spare window.
         if let IndexState::Ready(idx) = &mut *cache.inner.index.lock() {
             idx.entries.get_mut(&ha).unwrap().populated_ms -= 2 * RECENT_SPARE_MS;
@@ -3968,11 +3931,11 @@ mod tests {
         cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         cache.pin(ha);
         // Trigger another sweep via a second put of the same (idempotent)
         // chunk; the pinned chunk must survive the floor pressure.
-        cache.put(ha, Bytes::copy_from_slice(a)).await.unwrap();
+        put(&cache, ha, Bytes::copy_from_slice(a)).await.unwrap();
         assert!(
             cache.contains(ha),
             "pinned chunk must survive free-space-floor eviction",

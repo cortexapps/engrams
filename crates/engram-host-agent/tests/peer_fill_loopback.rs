@@ -158,14 +158,18 @@ async fn boot_peer_server(peer: Arc<PeerServe>) -> String {
     }
 }
 
-/// Seed a serving cache with verified (servable) chunks. Uses the
-/// verifying `put` — same terminal state a GCS populate leaves.
+/// Seed a serving cache with the chunks of `bodies`, hashed here — the
+/// same terminal state a GCS populate leaves.
 async fn seed_verified(cache: &ChunkCache, bodies: &[Vec<u8>]) -> Vec<ChunkHash> {
     let mut hashes = Vec::new();
     for b in bodies {
         let h = ChunkHash::of(b);
         cache
-            .put(h, bytes::Bytes::copy_from_slice(b))
+            .put_trusted(
+                h,
+                bytes::Bytes::copy_from_slice(b),
+                engram_chunk_store::Class::Background,
+            )
             .await
             .expect("seed put");
         hashes.push(h);

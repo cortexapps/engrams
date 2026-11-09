@@ -364,14 +364,14 @@ impl ChunkStore {
 
     /// Write-through the local cache (if wired): the host that produced
     /// this chunk reads it back locally on the next resume instead of
-    /// fetching it from the blob store. `write_local` runs the cache's
+    /// fetching it from the blob store. `put_trusted` runs the cache's
     /// debounced budget sweep, so a burst of write-throughs enforces the
     /// free-space floor at most once per interval. Best-effort: the chunk
     /// is already durable in `inner`, so a failed cache write only costs
     /// a later fetch.
     async fn warm_local(&self, hash: ChunkHash, body: Bytes) {
         if let Some(cache) = &self.cache {
-            if let Err(e) = cache.write_local(hash, body, self.class).await {
+            if let Err(e) = cache.put_trusted(hash, body, self.class).await {
                 tracing::debug!(
                     hash = %hash,
                     error = %e,

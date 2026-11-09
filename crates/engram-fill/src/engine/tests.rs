@@ -101,7 +101,7 @@ async fn fill_fetches_each_missing_chunk_once_and_skips_resident_ones() {
     let b = put(&f, b"chunk b").await;
     let c = put(&f, b"chunk c").await;
     f.cache
-        .put(c, Bytes::from_static(b"chunk c"))
+        .put_trusted(c, Bytes::from_static(b"chunk c"), Class::Background)
         .await
         .unwrap();
     let resolver = counting(&f, None);
@@ -145,7 +145,7 @@ async fn a_cache_hit_takes_no_slot() {
     let f = fixture();
     let hash = put(&f, b"resident").await;
     f.cache
-        .put(hash, Bytes::from_static(b"resident"))
+        .put_trusted(hash, Bytes::from_static(b"resident"), Class::Background)
         .await
         .unwrap();
     let engine = engine_over(&f, counting(&f, None), Config::default());
@@ -568,7 +568,10 @@ async fn a_range_of_a_resident_chunk_takes_no_store_request() {
     let f = fixture();
     let body = wide_body();
     let hash = put(&f, &body).await;
-    f.cache.put(hash, Bytes::from(body.clone())).await.unwrap();
+    f.cache
+        .put_trusted(hash, Bytes::from(body.clone()), Class::Background)
+        .await
+        .unwrap();
     let resolver = counting(&f, None);
     let engine = engine_over(&f, resolver.clone(), Config::default());
 
