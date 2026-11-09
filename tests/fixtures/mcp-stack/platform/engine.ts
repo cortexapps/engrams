@@ -622,7 +622,12 @@ export class Engine {
         "--security-opt",
         "no-new-privileges",
         ...(host && this.inputs.backend === "firecracker"
-          ? ["--security-opt", "apparmor=unconfined"]
+          ? [
+              "--security-opt",
+              "apparmor=unconfined",
+              "--security-opt",
+              "systempaths=unconfined",
+            ]
           : []),
         "--cap-drop",
         "ALL",
@@ -762,18 +767,29 @@ export class Engine {
       spec.role === "host-agent" &&
       this.inputs.backend === "firecracker" &&
       h.PidMode === "host";
-    // The FC host creates named network namespaces; Docker can also derive a SELinux label option.
+    // Docker consumes systempaths into path lists and can derive a SELinux label option.
     const expectedSecurity = fcHost
       ? actual.AppArmorProfile === "unconfined" &&
+        Array.isArray(h.MaskedPaths) &&
+        h.MaskedPaths.length === 0 &&
+        Array.isArray(h.ReadonlyPaths) &&
+        h.ReadonlyPaths.length === 0 &&
         (securityOptions === '["apparmor=unconfined","no-new-privileges"]' ||
           securityOptions ===
             '["apparmor=unconfined","label=disable","no-new-privileges"]')
       : actual.AppArmorProfile !== "unconfined" &&
+        Array.isArray(h.MaskedPaths) &&
+        h.MaskedPaths.length > 0 &&
+        Array.isArray(h.ReadonlyPaths) &&
+        h.ReadonlyPaths.length > 0 &&
         securityOptions === '["no-new-privileges"]';
     check(
-      (spec.role === "dns" || spec.role === "denied-dns"
-        ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
-        : !addedCapabilities.includes("NET_BIND_SERVICE")) &&
+      (fcHost
+        ? JSON.stringify(addedCapabilities) ===
+          '["MKNOD","NET_ADMIN","NET_BIND_SERVICE","SYS_ADMIN"]'
+        : spec.role === "dns" || spec.role === "denied-dns"
+          ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
+          : !addedCapabilities.includes("NET_BIND_SERVICE")) &&
         JSON.stringify([...(h.CapDrop ?? [])].sort()) === '["ALL"]' &&
         JSON.stringify(
           (h.CapAdd ?? [])

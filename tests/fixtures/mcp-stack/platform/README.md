@@ -107,13 +107,16 @@ prove migration compatibility.
 Blob uses `/bin/fake-gcs-server` on HTTP 4443 with UID 1000 and `/data` storage.
 Registry uses its inspected entrypoint, UID 1000, and `/var/lib/registry`.
 CoreDNS uses `/coredns`, UID 1000, and the generated no-forward Corefile.
-Only the fixed `dns` and `denied-dns` fixture roles add NET_BIND_SERVICE after
-all default capabilities are dropped. The pinned executable has a file
+The fixed `dns` and `denied-dns` fixture roles add NET_BIND_SERVICE after
+all default capabilities are dropped. The pinned CoreDNS executable has a file
 capability that requires this capability in its bounding set, even when port
 53 is unprivileged. Each effective audit requires exactly this one added
-capability for these two roles and rejects it for every other role. Both DNS
-roles retain read-only roots, no-new-privileges, default seccomp, and private
-config projections. Worker and application capabilities do not change.
+capability for these two DNS roles. Both DNS roles retain read-only roots,
+no-new-privileges, default seccomp, and private config projections.
+The trusted Firecracker host also adds NET_BIND_SERVICE to bind its private
+managed DNS listener on port 53 and requires its exact four-capability set.
+Every other role rejects NET_BIND_SERVICE. Worker and application capabilities
+do not change.
 The TLS edge uses `/usr/sbin/nginx`, generated config, and writable `/tmp`.
 Select upstream image bytes that meet these explicit user, path, environment,
 and volume contracts. Automatic image volumes and unexpected image environment
@@ -152,9 +155,9 @@ pool, changes node modes, clears caches, or force-removes devices.
 
 Only the trusted FC host joins the initial host PID namespace. It retains a
 private cgroup and mount namespace, C's owned network namespace, default
-seccomp, read-only root/proc-sys/sysfs/cgroup mounts, and bounded resources.
-It has NET_ADMIN, SYS_ADMIN and MKNOD. Exact KVM, TUN, mapper control, pool,
-and read-only metadata nodes are projected. A block-device cgroup rule grants
+seccomp, a read-only root, sysfs and cgroup mounts, and bounded resources.
+It has NET_ADMIN, NET_BIND_SERVICE, SYS_ADMIN and MKNOD. Exact KVM, TUN, mapper
+control, pool, and read-only metadata nodes are projected. A block-device cgroup rule grants
 `rwm` only for the running kernel's DM major; `/dev/engram` binds one private
 run-owned node directory. This is global DM control on the exclusive runner.
 All other roles, including the worker, retain private PID namespaces and no
@@ -172,11 +175,19 @@ a serial-suite budget, not a volume count based on the 24 cases. A larger sparse
 file cannot satisfy it. The production File memory restore mode stays unchanged;
 UFFD helper bytes remain pinned without a claim of UFFD runtime qualification.
 
-Only the Firecracker host container sets `apparmor=unconfined` so the production
-host can create and bind named network namespaces. Its audit requires that exact
-inspected AppArmor profile. Other roles keep the default profile. The host keeps
+Only the Firecracker host container sets `apparmor=unconfined` and
+`systempaths=unconfined`. The production host creates private network namespaces
+and sets their IPv6 sysctls. Its audit requires the exact inspected AppArmor
+profile and empty masked and read-only system-path lists. Docker consumes the
+`systempaths` flag into those lists. The audit requires exact no-new-privileges
+and AppArmor options, with only Docker's derived `label=disable` also allowed. Other
+roles keep the default profile and system-path protections. The host keeps
 no-new-privileges, default seccomp, exact capabilities, and all device and mount
-bounds.
+bounds. Native qualification reads the effective proc mount and requires writable
+`/proc/sys`, while `/sys` and `/sys/fs/cgroup` remain read-only. It checks all
+three effective, permitted and bounding masks against the four host capabilities.
+Ordinary and VZ role audits reject empty masked or read-only system-path lists,
+even when Docker has consumed the systempaths option.
 
 FC's listener is `0.0.0.0:9101` only inside its owned namespace. C's guard
 publishes only the verified `nativeHostIp:9101`. The advertised TLS authority

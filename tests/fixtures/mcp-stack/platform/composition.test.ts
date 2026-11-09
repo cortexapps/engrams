@@ -580,6 +580,8 @@ function inspectedContainer(
       CapDrop: ["ALL"],
       CapAdd: Array<string>(),
       SecurityOpt: ["no-new-privileges"],
+      MaskedPaths: ["/proc/kcore"],
+      ReadonlyPaths: ["/proc/sys"],
       Binds: [],
       VolumesFrom: [],
       Devices: [],
@@ -633,6 +635,9 @@ async function inspectedHost(firecrackerPool?: string) {
   if (firecrackerPool) {
     state.AppArmorProfile = "unconfined";
     state.HostConfig.SecurityOpt = ["no-new-privileges", "apparmor=unconfined"];
+    state.HostConfig.MaskedPaths = [];
+    state.HostConfig.ReadonlyPaths = [];
+    state.HostConfig.CapAdd.push("CAP_NET_BIND_SERVICE");
   }
   state.Config.User = "0:0";
   options[options.indexOf("--user") + 1] = "0:0";
@@ -656,10 +661,12 @@ async function inspectedHost(firecrackerPool?: string) {
         ...(firecrackerPool ? ["--pid", "host"] : []),
         "--cgroupns",
         "private",
-        ...["NET_ADMIN", "SYS_ADMIN", "MKNOD"].flatMap((capability) => [
-          "--cap-add",
-          capability,
-        ]),
+        ...[
+          "NET_ADMIN",
+          "SYS_ADMIN",
+          "MKNOD",
+          ...(firecrackerPool ? ["NET_BIND_SERVICE"] : []),
+        ].flatMap((capability) => ["--cap-add", capability]),
       ]),
     ).rejects.toThrow("test stop before start");
   } finally {
@@ -667,13 +674,13 @@ async function inspectedHost(firecrackerPool?: string) {
   }
   expect(createdOptions).toEqual(
     firecrackerPool
-      ? ["no-new-privileges", "apparmor=unconfined"]
+      ? ["no-new-privileges", "apparmor=unconfined", "systempaths=unconfined"]
       : ["no-new-privileges"],
   );
   return fixture;
 }
 
-test("FC host PID audit accepts only Docker's exact derived label option", async () => {
+test("FC host PID audit accepts only the exact managed namespace posture", async () => {
   const directory = await realpath(
     await mkdtemp(
       join(process.cwd(), "var/mcp-platform-composition/host-label-"),
@@ -681,15 +688,21 @@ test("FC host PID audit accepts only Docker's exact derived label option", async
   );
   try {
     const { engine, state, id } = await inspectedHost(directory);
+    const required = ["no-new-privileges", "apparmor=unconfined"];
     for (const options of [
-      ["no-new-privileges", "apparmor=unconfined"],
-      ["no-new-privileges", "apparmor=unconfined", "label=disable"],
-      ["label=disable", "no-new-privileges", "apparmor=unconfined"],
+      required,
+      [...required, "label=disable"],
+      ["label=disable", ...required.slice().reverse()],
     ]) {
       state.HostConfig.SecurityOpt = options;
       expect(await engine.audit(id)).toBeDefined();
     }
     for (const options of [
+      [...required, "systempaths=unconfined"],
+      [...required, "systempaths=other"],
+      [...required, "seccomp=unconfined"],
+      [...required, "apparmor=other"],
+      [...required, "label=disable", "label=disable"],
       [],
       ["no-new-privileges"],
       ["apparmor=unconfined"],
@@ -708,11 +721,22 @@ test("FC host PID audit accepts only Docker's exact derived label option", async
       state.HostConfig.SecurityOpt = options;
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
     }
-    state.HostConfig.SecurityOpt = [
-      "no-new-privileges",
-      "apparmor=unconfined",
-      "label=disable",
-    ];
+    state.HostConfig.SecurityOpt = [...required, "label=disable"];
+    for (const paths of ["MaskedPaths", "ReadonlyPaths"] as const) {
+      state.HostConfig[paths] = ["/proc/sys"];
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+      state.HostConfig[paths] = [];
+    }
+    const exactCapabilities = [...state.HostConfig.CapAdd];
+    for (const capabilities of [
+      exactCapabilities.filter((value) => value !== "CAP_NET_BIND_SERVICE"),
+      [...exactCapabilities, "CAP_NET_BIND_SERVICE"],
+      [...exactCapabilities, "CAP_SYS_PTRACE"],
+    ]) {
+      state.HostConfig.CapAdd = capabilities;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.HostConfig.CapAdd = exactCapabilities;
     for (const profile of ["", "docker-default", "other"]) {
       state.AppArmorProfile = profile;
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
@@ -744,6 +768,8 @@ test("ordinary containers and VZ hosts reject Docker's host PID label option", a
     for (const { engine, state, id } of [ordinary, vz]) {
       for (const options of [
         ["no-new-privileges", "label=disable"],
+        ["no-new-privileges", "systempaths=unconfined"],
+        ["no-new-privileges", "apparmor=unconfined", "systempaths=unconfined"],
         ["no-new-privileges", "apparmor=unconfined"],
         ["no-new-privileges", "apparmor=unconfined", "label=disable"],
       ]) {
@@ -753,6 +779,17 @@ test("ordinary containers and VZ hosts reject Docker's host PID label option", a
         );
       }
       state.HostConfig.SecurityOpt = ["no-new-privileges"];
+      for (const paths of ["MaskedPaths", "ReadonlyPaths"] as const) {
+        const protectedPaths = state.HostConfig[paths];
+        state.HostConfig[paths] = [];
+        await expect(engine.audit(id)).rejects.toThrow(
+          "container_capabilities",
+        );
+        state.HostConfig[paths] = protectedPaths;
+      }
+      state.HostConfig.CapAdd.push("CAP_NET_BIND_SERVICE");
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+      state.HostConfig.CapAdd.pop();
       state.AppArmorProfile = "unconfined";
       await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
     }
@@ -1831,6 +1868,13 @@ test("FC launch uses the declared configuration, private namespace and original 
     await stack.startRole(ctx, "host-agent", "normal");
     const launch = launches[0]!;
     expect(launch.role).toBe("host-agent");
+    expect(
+      launch.options
+        .flatMap((value, index) =>
+          value === "--cap-add" ? [launch.options[index + 1]!] : [],
+        )
+        .sort(),
+    ).toEqual(["MKNOD", "NET_ADMIN", "NET_BIND_SERVICE", "SYS_ADMIN"]);
     expect(launch.entrypoint).toBeUndefined();
     expect(launch.args).toBeUndefined();
     expect(launch.options).toContain(`container:${"e".repeat(64)}`);
@@ -1985,7 +2029,7 @@ test("FC launch uses the declared configuration, private namespace and original 
       ).toEqual(["NET_BIND_SERVICE"]);
     }
     for (const launch of launches.filter(
-      (v) => !["dns", "denied-dns"].includes(v.role),
+      (v) => !["dns", "denied-dns", "host-agent"].includes(v.role),
     ))
       expect(launch.options).not.toContain("NET_BIND_SERVICE");
   } finally {
@@ -2241,6 +2285,8 @@ test("resolver uses only a readonly named file projection and rejects source, su
       CapDrop: ["ALL"],
       CapAdd: [],
       SecurityOpt: ["no-new-privileges"],
+      MaskedPaths: ["/proc/kcore"],
+      ReadonlyPaths: ["/proc/sys"],
       Binds: [],
       VolumesFrom: [],
       Devices: [],

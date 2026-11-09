@@ -56,6 +56,52 @@ import { generateIdentity } from "./identity.ts";
 import { generateConfiguration } from "./configuration.ts";
 
 import { Engine } from "./engine.ts";
+import { verifyFcKernelPosture } from "./fc-runtime.ts";
+
+test("FC kernel posture requires writable private proc sys and exactly four capabilities", () => {
+  const mounts = [
+    "31 20 0:27 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+    "32 20 0:28 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
+    "33 32 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw",
+  ].join("\n");
+  const status =
+    "CapEff:\t0000000008201400\nCapPrm:\t0000000008201400\nCapBnd:\t0000000008201400\nNoNewPrivs:\t1\nSeccomp:\t2\n";
+  expect(verifyFcKernelPosture(mounts, status)).toHaveLength(3);
+  expect(() =>
+    verifyFcKernelPosture(
+      mounts + "\n34 31 0:27 /sys /proc/sys rw - proc proc rw",
+      status,
+    ),
+  ).not.toThrow();
+  for (const changed of [
+    mounts.replace("/proc rw,", "/proc ro,"),
+    mounts + "\n34 31 0:27 /sys /proc/sys ro - proc proc rw",
+    mounts.replace("/sys ro,", "/sys rw,"),
+    mounts.replace("/sys/fs/cgroup ro,", "/sys/fs/cgroup rw,"),
+    mounts
+      .split("\n")
+      .filter((line) => !line.includes(" /proc "))
+      .join("\n"),
+  ])
+    expect(() => verifyFcKernelPosture(changed, status)).toThrow();
+  for (const field of ["CapEff", "CapPrm", "CapBnd"]) {
+    for (const mask of ["0000000008201000", "0000000008281400"]) {
+      expect(() =>
+        verifyFcKernelPosture(
+          mounts,
+          status.replace(field + ":\t0000000008201400", field + ":\t" + mask),
+        ),
+      ).toThrow("fc_host_effective_capabilities");
+    }
+  }
+  for (const changed of [
+    status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+    status.replace("Seccomp:\t2", "Seccomp:\t0"),
+  ])
+    expect(() => verifyFcKernelPosture(mounts, changed)).toThrow(
+      "fc_host_effective_confinement",
+    );
+});
 
 test("the disposable host TLS probe stops without delaying other roles", async () => {
   const runId = "mcp-123456789012345678901234";

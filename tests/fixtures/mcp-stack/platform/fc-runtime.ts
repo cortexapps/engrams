@@ -310,6 +310,48 @@ async function requireStorageQuiescence(
   );
 }
 
+export function verifyFcKernelPosture(mountinfo: string, status: string) {
+  const mounts = mountinfo
+    .trim()
+    .split("\n")
+    .map((line) => line.split(" "));
+  for (const target of ["/sys", "/sys/fs/cgroup"])
+    check(
+      mounts.some(
+        (fields) =>
+          fields[4] === target && fields[5]?.split(",").includes("ro"),
+      ),
+      "fc_host_readonly_kernel_mount",
+    );
+  const procMounts = mounts
+    .filter((fields) => fields[4] === "/proc" || fields[4] === "/proc/sys")
+    .sort((left, right) => right[4]!.length - left[4]!.length);
+  const effectiveProc = procMounts[0];
+  check(
+    effectiveProc &&
+      procMounts.filter((fields) => fields[4] === effectiveProc[4]).length ===
+        1 &&
+      effectiveProc[5]?.split(",").includes("rw") &&
+      !effectiveProc[5]?.split(",").includes("ro") &&
+      effectiveProc[effectiveProc.indexOf("-") + 1] === "proc",
+    "fc_host_writable_proc_sys",
+  );
+  const capabilities = (1n << 10n) | (1n << 12n) | (1n << 21n) | (1n << 27n);
+  for (const field of ["CapEff", "CapPrm", "CapBnd"]) {
+    const value = new RegExp(`^${field}:\\s+([a-f0-9]+)$`, "m").exec(
+      status,
+    )?.[1];
+    check(
+      value && BigInt("0x" + value) === capabilities,
+      "fc_host_effective_capabilities",
+    );
+  }
+  check(
+    /^NoNewPrivs:\s+1$/m.test(status) && /^Seccomp:\s+2$/m.test(status),
+    "fc_host_effective_confinement",
+  );
+  return mounts;
+}
 /** The runner owns the whole disposable kernel. Device cgroups cannot
  * isolate device-mapper control from other host workloads. */
 export class FcRuntime {
@@ -412,18 +454,10 @@ export class FcRuntime {
       this.inventory.pool,
       await inspectPool(this.inventory.pool),
     );
-    const mounts = (await readFile(`/proc/${pid}/mountinfo`, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => line.split(" "));
-    for (const target of ["/proc/sys", "/sys", "/sys/fs/cgroup"])
-      check(
-        mounts.some(
-          (fields) =>
-            fields[4] === target && fields[5]?.split(",").includes("ro"),
-        ),
-        "fc_host_readonly_kernel_mount",
-      );
+    const mounts = verifyFcKernelPosture(
+      await readFile(`/proc/${pid}/mountinfo`, "utf8"),
+      await readFile(`/proc/${pid}/status`, "utf8"),
+    );
     check(
       JSON.stringify(await kernelIdentity()) ===
         JSON.stringify({
@@ -438,21 +472,6 @@ export class FcRuntime {
         (await readlink(`/proc/${pid}/ns/cgroup`)) !==
           (await readlink("/proc/self/ns/cgroup")),
       "fc_host_kernel_namespace",
-    );
-    const status = await readFile(`/proc/${pid}/status`, "utf8");
-    const capabilities = (1n << 12n) | (1n << 21n) | (1n << 27n);
-    for (const field of ["CapEff", "CapPrm", "CapBnd"]) {
-      const value = new RegExp(`^${field}:\\s+([a-f0-9]+)$`, "m").exec(
-        status,
-      )?.[1];
-      check(
-        value && BigInt("0x" + value) === capabilities,
-        "fc_host_effective_capabilities",
-      );
-    }
-    check(
-      /^NoNewPrivs:\s+1$/m.test(status) && /^Seccomp:\s+2$/m.test(status),
-      "fc_host_effective_confinement",
     );
     const current = await processIdentity(pid, this.inventory.bootId);
     check(
