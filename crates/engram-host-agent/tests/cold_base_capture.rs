@@ -540,6 +540,8 @@ impl TestEnv {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
+        // A cold-base hit restores the captured base: a resume.
+        common::resume_through_uffd(&mut cfg, &self.work.path().join("blob"));
         cfg.track_dirty_pages = true;
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
