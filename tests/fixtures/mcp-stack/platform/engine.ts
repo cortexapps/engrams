@@ -713,6 +713,13 @@ export class Engine {
       "container_namespace",
     );
     const addedCapabilities = values("--cap-add").sort();
+    const securityOptions = JSON.stringify([...(h.SecurityOpt ?? [])].sort());
+    // Docker derives this SELinux option for the host PID namespace.
+    const hostPidLabel =
+      spec.role === "host-agent" &&
+      this.inputs.backend === "firecracker" &&
+      h.PidMode === "host" &&
+      securityOptions === '["label=disable","no-new-privileges"]';
     check(
       (spec.role === "dns" || spec.role === "denied-dns"
         ? JSON.stringify(addedCapabilities) === '["NET_BIND_SERVICE"]'
@@ -723,7 +730,7 @@ export class Engine {
             .map((capability: string) => capability.replace(/^CAP_/, ""))
             .sort(),
         ) === JSON.stringify(addedCapabilities) &&
-        JSON.stringify(h.SecurityOpt ?? []) === '["no-new-privileges"]',
+        (securityOptions === '["no-new-privileges"]' || hostPidLabel),
       "container_capabilities",
     );
     check(

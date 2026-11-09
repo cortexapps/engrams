@@ -501,13 +501,16 @@ test("cancelled engine control runs no command and drains its control lease", as
   expect(called).toBe(true);
 });
 
-function inspectedContainer(imageRole: (typeof IMAGES)[number] = "worker") {
+function inspectedContainer(
+  imageRole: (typeof IMAGES)[number] = "worker",
+  firecrackerPool?: string,
+) {
   const pin = { path: "/owned/binary", sha256: "a".repeat(64) };
   const inputs = parseInputs(
     {
       version: 1,
-      backend: "vz",
-      architecture: "arm64",
+      backend: firecrackerPool ? "firecracker" : "vz",
+      architecture: firecrackerPool ? "amd64" : "arm64",
       sourceCommit: "b".repeat(40),
       engineSocket: "/owned/socket",
       engineConfig: "/owned/config",
@@ -516,23 +519,41 @@ function inspectedContainer(imageRole: (typeof IMAGES)[number] = "worker") {
       subnet: "10.42.3.0/24",
       nativeHostIp: "10.42.4.1",
       proxy: pin,
-      nativeProbe: pin,
+      ...(firecrackerPool
+        ? {
+            firecracker: pin,
+            thinPool: { name: "suite", directory: firecrackerPool },
+          }
+        : { nativeProbe: pin }),
       binaries: Object.fromEntries(BINARIES.map((role) => [role, pin])),
-      images: Object.fromEntries(
-        IMAGES.map((role, index) => [
-          role,
-          {
-            archive: pin,
-            id: `sha256:${index.toString(16).repeat(64)}`,
-            manifestDigest: `sha256:${"d".repeat(64)}`,
-          },
-        ]),
-      ),
+      images: {
+        ...Object.fromEntries(
+          IMAGES.map((role, index) => [
+            role,
+            {
+              archive: pin,
+              id: `sha256:${index.toString(16).repeat(64)}`,
+              manifestDigest: `sha256:${"d".repeat(64)}`,
+            },
+          ]),
+        ),
+        ...(firecrackerPool
+          ? {
+              hostAgent: {
+                archive: pin,
+                id: `sha256:${"c".repeat(64)}`,
+                manifestDigest: `sha256:${"d".repeat(64)}`,
+              },
+            }
+          : {}),
+      },
     },
-    "vz",
+    firecrackerPool ? "firecracker" : "vz",
   );
   const id = "a".repeat(64),
-    image = inputs.images[imageRole].id,
+    image = firecrackerPool
+      ? inputs.images.hostAgent!.id
+      : inputs.images[imageRole].id,
     runId = "mcp-123456789012345678901234";
   const state = {
     Id: id,
@@ -554,6 +575,7 @@ function inspectedContainer(imageRole: (typeof IMAGES)[number] = "worker") {
       NetworkMode: "none",
       PidMode: "",
       IpcMode: "private",
+      CgroupnsMode: "private",
       CapDrop: ["ALL"],
       CapAdd: Array<string>(),
       SecurityOpt: ["no-new-privileges"],
@@ -596,6 +618,107 @@ function inspectedContainer(imageRole: (typeof IMAGES)[number] = "worker") {
   ];
   return { engine, state, imageState, id, image, options };
 }
+
+async function inspectedHost(firecrackerPool?: string) {
+  const fixture = inspectedContainer("worker", firecrackerPool);
+  const { engine, state, image, options } = fixture;
+  Object.assign(state.HostConfig, {
+    PidsLimit: 1024,
+    Memory: 8589934592,
+    NanoCpus: 4000000000,
+    PidMode: firecrackerPool ? "host" : "",
+    CapAdd: ["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_MKNOD"],
+  });
+  state.Config.User = "0:0";
+  options[options.indexOf("--user") + 1] = "0:0";
+  const call = engine.call.bind(engine);
+  const intercepted = spyOn(engine, "call").mockImplementation(async (args) => {
+    if (args[0] === "create") {
+      state.Config.Entrypoint = [args[args.indexOf("--entrypoint") + 1]!];
+      state.Config.Cmd = args.slice(args.indexOf(image) + 1);
+    }
+    if (args[0] === "start") throw Error("test stop before start");
+    return call(args);
+  });
+  try {
+    await expect(
+      engine.create("host-agent", image, [
+        ...options,
+        ...(firecrackerPool ? ["--pid", "host"] : []),
+        "--cgroupns",
+        "private",
+        ...["NET_ADMIN", "SYS_ADMIN", "MKNOD"].flatMap((capability) => [
+          "--cap-add",
+          capability,
+        ]),
+      ]),
+    ).rejects.toThrow("test stop before start");
+  } finally {
+    intercepted.mockRestore();
+  }
+  return fixture;
+}
+
+test("FC host PID audit accepts only Docker's exact derived label option", async () => {
+  const directory = await realpath(
+    await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/host-label-"),
+    ),
+  );
+  try {
+    const { engine, state, id } = await inspectedHost(directory);
+    for (const options of [
+      ["no-new-privileges"],
+      ["no-new-privileges", "label=disable"],
+      ["label=disable", "no-new-privileges"],
+    ]) {
+      state.HostConfig.SecurityOpt = options;
+      expect(await engine.audit(id)).toBeDefined();
+    }
+    for (const options of [
+      [],
+      ["label=disable"],
+      ["no-new-privileges", "no-new-privileges"],
+      ["no-new-privileges", "label=disable", "label=disable"],
+      ["no-new-privileges", "label=disable", "apparmor=unconfined"],
+      ["no-new-privileges", "label=disable", "seccomp=unconfined"],
+      ["no-new-privileges", "label=type:container_t"],
+    ]) {
+      state.HostConfig.SecurityOpt = options;
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+    state.HostConfig.SecurityOpt = ["no-new-privileges", "label=disable"];
+    state.HostConfig.CapAdd.push("CAP_SYS_PTRACE");
+    await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    state.HostConfig.CapAdd.pop();
+    state.HostConfig.Privileged = true;
+    await expect(engine.audit(id)).rejects.toThrow("container_resources");
+    state.HostConfig.Privileged = false;
+    state.HostConfig.PidMode = "";
+    await expect(engine.audit(id)).rejects.toThrow("container_namespace");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ordinary containers and VZ hosts reject Docker's host PID label option", async () => {
+  const directory = await realpath(
+    await mkdtemp(
+      join(process.cwd(), "var/mcp-platform-composition/nonhost-label-"),
+    ),
+  );
+  try {
+    const ordinary = inspectedContainer("worker", directory);
+    await ordinary.engine.create("probe", ordinary.image, ordinary.options);
+    const vz = await inspectedHost();
+    for (const { engine, state, id } of [ordinary, vz]) {
+      state.HostConfig.SecurityOpt = ["no-new-privileges", "label=disable"];
+      await expect(engine.audit(id)).rejects.toThrow("container_capabilities");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 const pinnedImageDefaults = [
   {
