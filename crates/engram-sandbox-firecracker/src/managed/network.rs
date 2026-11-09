@@ -79,7 +79,7 @@ table inet strict {{
   iifname "{TAP}" ip saddr {guest} ip daddr != {gateway} tcp dport 53 drop
   iifname "{TAP}" ip saddr {guest} meta l4proto tcp accept
  }}
- chain redirect {{ type nat hook prerouting priority -110; policy accept;
+ chain proxy_redirect {{ type nat hook prerouting priority -110; policy accept;
   iifname "{TAP}" ip saddr {guest} meta l4proto tcp redirect to :{PROXY_PORT}
  }}
  chain input {{ type filter hook input priority -100; policy drop;
