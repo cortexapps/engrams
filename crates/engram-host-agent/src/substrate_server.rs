@@ -34,8 +34,9 @@ pub struct SubstrateServer {
     cache: ChunkCache,
     fill: FillEngine,
     /// The uffd base-shm dir; `HelloAck.tmpfs_ok` is a live statfs of
-    /// this path.
-    uffd_base_dir: PathBuf,
+    /// this path. With none, restores use anonymous memory and need no
+    /// tmpfs.
+    uffd_base_dir: Option<PathBuf>,
     /// The pinned chunk set of each session manifest that a live
     /// connection names. All connections for one manifest share one
     /// entry, so the manifest is read and pinned once, not per dial.
@@ -92,7 +93,7 @@ impl Drop for SessionPins {
 }
 
 impl SubstrateServer {
-    pub fn new(cache: ChunkCache, fill: FillEngine, uffd_base_dir: PathBuf) -> Self {
+    pub fn new(cache: ChunkCache, fill: FillEngine, uffd_base_dir: Option<PathBuf>) -> Self {
         Self {
             cache,
             fill,
@@ -255,7 +256,7 @@ impl SubstrateServer {
         let dir = self.uffd_base_dir.clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || FromWriter::HelloAck {
-            tmpfs_ok: dir_is_tmpfs(&dir),
+            tmpfs_ok: dir.as_deref().is_none_or(dir_is_tmpfs),
             cache_writable: cache.root_writable_probe(),
         })
         .await
@@ -523,8 +524,21 @@ mod tests {
         let hash = store.put_chunk(&bytes).await.expect("seed chunk");
         blob.gets.store(0, Ordering::SeqCst);
         let fill = FillEngine::new(store, engram_fill::Config::default());
-        let server = SubstrateServer::new(cache, fill, dir.join("shm"));
+        let server = SubstrateServer::new(cache, fill, Some(dir.join("shm")));
         (server, blob, hash, bytes)
+    }
+
+    /// With no uffd base dir, restores use anonymous memory: the handler
+    /// must not refuse to serve because no tmpfs is there.
+    #[tokio::test]
+    async fn no_base_dir_needs_no_tmpfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut server, _, _, _) = server_fixture(dir.path()).await;
+        server.uffd_base_dir = None;
+        match server.hello_ack().await.unwrap() {
+            FromWriter::HelloAck { tmpfs_ok, .. } => assert!(tmpfs_ok),
+            other => panic!("expected a HelloAck, got {other:?}"),
+        }
     }
 
     fn hello(stream: &mut StdUnixStream, proto_version: u32) -> FromWriter {

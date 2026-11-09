@@ -632,19 +632,15 @@ async fn main() -> Result<(), HostAgentError> {
     );
 
     // ADR 0075: spawn the substrate populate server now both halves
-    // exist. The uffd base dir mirrors the FC config default (env
-    // override first) so the tmpfs probe answers for the dir handlers
-    // actually use. FC-only (ADR 0096): its sole client is the UFFD
-    // handler, which exists only on the Firecracker backend — on VZ the
-    // server just sat on a Linux-shaped `/dev/shm/engram` default that
-    // doesn't exist on macOS.
+    // exist. Its tmpfs probe checks the same uffd base dir the handlers
+    // use; with none set, handlers use anonymous memory and the probe
+    // passes. Firecracker only: the uffd handler is its only client.
     let _substrate_server = match cli.sandbox_backend {
         BackendChoice::Firecracker => Some(
             engram_host_agent::substrate_server::SubstrateServer::new(
                 chunk_cache.clone(),
                 fill.clone(),
-                engram_sandbox_firecracker::uffd_base_dir_from_env()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
+                engram_sandbox_firecracker::uffd_base_dir_from_env(),
             )
             .spawn(cli.work_dir.join("substrate.sock"))
             .map_err(HostAgentError::Io)?,
