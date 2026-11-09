@@ -23,7 +23,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore, SessionFence};
 use engram_core::types::host::{
-    CapStatus, HostRecord, HostStatus, ReservedBudget, HOST_POOL_METADATA_FLOOR_MIB,
+    CapStatus, HostHeadroom, HostRecord, HostStatus, ReservedBudget, HOST_POOL_METADATA_FLOOR_MIB,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId};
@@ -558,25 +558,22 @@ pub fn pick_from(
     }
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
     let need_vcpus = ctx.cpu_budget_vcpus.unwrap_or(0) as i64;
+    let headroom = |id: HostId| -> Option<HostHeadroom> {
+        let h = hosts.iter().find(|h| h.id == id)?;
+        Some(HostHeadroom::of(
+            h,
+            reserved.get(&id).copied().unwrap_or_default(),
+        ))
+    };
     // Free RAM for `id`: None ⇒ unmeasured (treated as "fits" softly).
     let free_mib_of = |id: HostId| -> Option<i64> {
-        let h = hosts.iter().find(|h| h.id == id)?;
-        let alloc = h.utilization.allocatable_mib as i64;
-        if alloc <= 0 {
-            return None;
-        }
-        Some(alloc - reserved.get(&id).map(|r| r.mem_mib).unwrap_or(0))
+        headroom(id)
+            .filter(HostHeadroom::measured)
+            .map(|r| r.free_mib())
     };
-    // CPU fit for `id`: a host with budget 0 (unreported) doesn't gate.
+    // CPU fit for `id`: a host with no reported cores doesn't gate.
     let cpu_fits = |id: HostId| -> bool {
-        let Some(h) = hosts.iter().find(|h| h.id == id) else {
-            return false;
-        };
-        let budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
-        if budget <= 0 {
-            return true;
-        }
-        budget - reserved.get(&id).map(|r| r.vcpus).unwrap_or(0) >= need_vcpus
+        headroom(id).is_some_and(|r| r.free_vcpus().is_none_or(|free| free >= need_vcpus))
     };
     // Tier 0 (ADR 0078): authoritative snapshot-host affinity. If the
     // host that holds this snapshot's chunks is alive, schedulable, and
@@ -734,25 +731,10 @@ pub async fn placement_preview(
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
     let ranked = rank_hosts(&hosts, ctx, now, placement_ttl());
     Ok(ranked.hosts.iter().any(|id| {
-        let Some(h) = hosts.iter().find(|h| h.id == *id) else {
-            return false;
-        };
-        let alloc = h.utilization.allocatable_mib as i64;
-        if alloc <= 0 {
-            return true; // unmeasured → soft fallback fits
-        }
-        let free_mib = alloc - reserved.get(id).map(|r| r.mem_mib).unwrap_or(0);
-        if free_mib < mem_mib {
-            return false;
-        }
-        let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
-        if cpu_budget > 0 {
-            let free_vcpus = cpu_budget - reserved.get(id).map(|r| r.vcpus).unwrap_or(0);
-            if free_vcpus < cpu_vcpus {
-                return false;
-            }
-        }
-        true
+        hosts.iter().find(|h| h.id == *id).is_some_and(|h| {
+            HostHeadroom::of(h, reserved.get(id).copied().unwrap_or_default())
+                .fits(mem_mib, cpu_vcpus)
+        })
     }))
 }
 
@@ -1198,12 +1180,11 @@ pub async fn fleet_snapshot(
         }
         if host_counts_as_capacity(h, now, ttl) {
             m.schedulable_hosts += 1;
-            m.total_mib += h.utilization.allocatable_mib;
-            let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
-            m.total_vcpus += cpu_budget as u64;
-            let r = reserved.get(&h.id).copied().unwrap_or_default();
-            m.free_vcpus += (cpu_budget - r.vcpus).max(0) as u64;
-            m.free_mib += (h.utilization.allocatable_mib as i64 - r.mem_mib).max(0) as u64;
+            let room = HostHeadroom::of(h, reserved.get(&h.id).copied().unwrap_or_default());
+            m.total_mib += room.allocatable_mib.max(0) as u64;
+            m.total_vcpus += room.cpu_budget.max(0) as u64;
+            m.free_vcpus += room.free_vcpus().unwrap_or(0).max(0) as u64;
+            m.free_mib += room.free_mib().max(0) as u64;
         }
     }
     Ok(m)
