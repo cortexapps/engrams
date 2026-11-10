@@ -211,7 +211,7 @@ pub struct PeerServer {
     /// coordinator, which pairs it with the source's host address).
     port: u16,
     /// How long an unknown-export `Hello` parks awaiting the capture's
-    /// registration (export-TTL scale in production; tests shrink it).
+    /// registration (`EXPORT_PARK_BUDGET` in production; tests shrink it).
     park_budget: std::time::Duration,
     exports: DashMap<String, Arc<PeerExport>>,
     /// Notified on every [`PeerServer::register`] so parked Hellos wake
@@ -225,7 +225,7 @@ pub struct PeerServer {
 
 impl PeerServer {
     pub fn new(port: u16) -> Arc<Self> {
-        Self::new_with_park_budget(port, std::time::Duration::from_secs(120))
+        Self::new_with_park_budget(port, engram_migrate_proto::EXPORT_PARK_BUDGET)
     }
 
     /// Test seam: shrink the unknown-export park window.
