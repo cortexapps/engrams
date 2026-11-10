@@ -12192,6 +12192,17 @@ async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
         "intent does not itself interrupt a guest"
     );
     ctx.meta
+        .advance_managed_boot(&request.key, row.revision, ManagedBootAdvance::Interrupt)
+        .await
+        .unwrap();
+    ctx.meta
+        .reserve_managed_capture(&ManagedCaptureRequest {
+            key: request.key.clone(),
+            capture_id,
+        })
+        .await
+        .unwrap();
+    ctx.meta
         .transition_session(
             ws.session_id,
             SessionState::Failed,
@@ -12216,8 +12227,58 @@ async fn managed_bridge_claim_reconcile_and_recovery(ctx: &Ctx) {
             .state,
         ManagedCreationPhase::Terminal
     );
+    let history = managed_history(ctx, ws.session_id).await;
+    ctx.meta
+        .set_host_status(host, HostStatus::Dead)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.delete_host(host).await.unwrap(),
+        engram_core::types::host::DeleteHostOutcome::Deleted
+    );
+    assert!(ctx.meta.get_host(host).await.unwrap().is_none());
+    assert!(matches!(
+        ctx.meta.claim_managed_boot(request.clone()).await,
+        Err(MetaError::NotFound)
+    ));
+    assert_eq!(managed_history(ctx, ws.session_id).await, history);
+    assert_eq!(
+        ctx.meta.managed_sandbox_open(i.sandbox_id).await.unwrap(),
+        Some(false)
+    );
+    let mut held = managed_creation_ws(SessionId::new());
+    held.spec.image = ws.spec.image.clone();
+    ctx.meta
+        .reserve_and_persist_create(held.clone(), &[], 0)
+        .await
+        .unwrap();
+    assert!(ctx
+        .meta
+        .claim_managed_boot(managed_boot_request(&held, host))
+        .await
+        .is_err());
+    assert!(ctx
+        .meta
+        .get_managed_boot(&held.managed_creation.unwrap().identity)
+        .await
+        .unwrap()
+        .is_none());
 }
 conformance!(
     t_managed_bridge_claim_reconcile_and_recovery,
     managed_bridge_claim_reconcile_and_recovery
 );
+
+async fn managed_history(ctx: &Ctx, sid: SessionId) -> serde_json::Value {
+    if let Some(sim) = &ctx.sim {
+        sim.with_db(|db| serde_json::json!({
+            "boot": db.managed_boots.get(&sid),
+            "captures": db.managed_captures.values().filter(|(r, _)| r.key.creation.session_id == sid).collect::<Vec<_>>(),
+            "intents": db.managed_boot_intents.values().filter(|i| i.query.identity.session_id == sid).collect::<Vec<_>>(),
+            "selection": db.managed_boot_selections.get(&sid),
+        }))
+    } else {
+        sqlx::query_scalar("SELECT jsonb_build_object('boot',(SELECT record FROM session_managed_boots WHERE session_id=$1),'captures',(SELECT jsonb_agg(jsonb_build_array(request,authority) ORDER BY capture_id) FROM session_managed_captures WHERE session_id=$1),'intents',(SELECT jsonb_agg(record ORDER BY intent_id) FROM session_managed_boot_intents WHERE session_id=$1),'selection',(SELECT selection FROM session_managed_boot_selections WHERE session_id=$1))")
+            .bind(sid.as_uuid()).fetch_one(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap()
+    }
+}
