@@ -230,9 +230,40 @@ the test named beside it.
   `thin_delta_reports_exactly_what_the_full_compare_reports`). Under a guest writing at
   full rate the sync and snapshot stay under two seconds however much it wrote
   (`the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate`).
+- A resume boots before its disk is copied in. The live volume is a dm-clone device over
+  a snapshot of the nearest base the host holds: the kept checkpoint volume or staged image
+  version that shares the most chunks with the session's manifest at the same offset, so an
+  image whose tag moved still supplies the blocks it shares
+  (`a_resume_starts_from_the_staged_volume_that_shares_the_most`), or an empty volume when
+  none shares any; regions the base holds in final form are marked copied by
+  a discard, and the kernel copies the rest in behind the running guest from a ublk source
+  the host agent serves out of the fill engine. A guest read of a region the copy has not
+  reached goes through the source at `Demand`; the chunks the guest read first on the
+  session's last window are fetched at `Prefix` ahead of the copy. When every region is
+  copied the device is reloaded as a thin snapshot of its destination and the source
+  stops; the path Firecracker opened never changes
+  (`a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destination`,
+  `a_lazy_resume_reads_cold_chunks_through_the_source_and_settles`). A checkpoint in the
+  window reads nothing through the source and loses no write: a block whose mapping
+  changed since the base is the snapshot's, any other is the manifest's
+  (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
+  `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`). Only a
+  snapshot taken after the settle becomes a checkpoint volume
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`). The periodic
+  checkpoint waits for the settle, for at most 10 minutes
+  (`a_running_settle_holds_the_periodic_checkpoint_for_a_bounded_time`); an eviction or
+  a snapshot does not wait. A whole chunk read for a volume is not hashed
+  (`read_does_not_hash_what_the_store_returns`). A
+  host-agent restart serves every hydrating volume again from the pool's names, and never
+  deletes one it does not serve (`a_killed_process_leaves_a_volume_the_next_one_serves_again`).
+  A store error that can pass stalls a read of the source; it does not fail it.
+  A node needs `ublk_drv`; node-prep loads it beside `dm_thin_pool`. Without the ublk
+  control device a host writes each volume in full before its guest starts.
 - A live move carries the disk in 64 KiB blocks in three tiers: the checkpoint the source
   advertises, the blocks a snapshot taken while the guest runs changed since it, and the
-  blocks the snapshot under the pause changed since that one. The pause carries only what
+  blocks the snapshot under the pause changed since that one. A source with no checkpoint
+  volume (hydrating, or settled before its first checkpoint) moves by snapshot
+  (`a_role_without_a_checkpoint_volume_refuses_a_live_move`). The pause carries only what
   the guest wrote during the precopy
   (`two_host_teleport_seals_only_the_residual_under_steady_writes`,
   `a_precopy_snapshot_lives_beside_the_one_the_capture_takes`), and the destination's

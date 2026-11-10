@@ -185,8 +185,10 @@ pub const WIRE_VERSION: u32 = 38;
 /// build that reports nothing counts as 0. 2: the uffd handler speaks only
 /// substrate protocol version 2 and later, a post-copy `DrainDone` carries
 /// the hot-set fields, a snapshot create always sends `defer_sync`, and a
-/// migration item always carries its hash.
-pub const REATTACH_GENERATION: u32 = 2;
+/// migration item always carries its hash. 3: a session disk hydrates
+/// behind the running guest from a ublk device the host-agent serves,
+/// which an earlier build cannot serve again after a restart.
+pub const REATTACH_GENERATION: u32 = 3;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

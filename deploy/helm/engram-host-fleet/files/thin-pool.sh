@@ -31,6 +31,10 @@ DATA="$POOL_DIR/data.img"
 
 log() { echo "[thin-pool] $*"; }
 
+# The host agent serves the source a resuming session's disk fills from
+# as a ublk device; the module is loaded on every start, pool or not.
+modprobe ublk_drv 2>/dev/null || true
+
 if dmsetup info "$POOL_NAME" >/dev/null 2>&1; then
     log "$POOL_NAME is active"
     dmsetup status "$POOL_NAME"

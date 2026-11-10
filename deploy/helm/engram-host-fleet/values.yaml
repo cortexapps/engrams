@@ -233,6 +233,14 @@ thinPool:
   blockSizeSectors: 128
   # Blocks; 32768 = 2 GiB at 64 KiB.
   lowWaterMarkBlocks: 32768
+  # A resumed session's disk is copied in behind the running VM. Larger
+  # values copy faster until the pool's disk is the limit.
+  hydration:
+    # Whole chunks (16 MiB) fetched ahead of the kernel's copy, per disk.
+    # The host-agent holds up to this many plus two in memory per disk.
+    windowChunks: 12
+    # Pool blocks the kernel copies at one time, per disk.
+    inFlightRegions: 512
 
 hostAgent:
   grpcPort: 9101

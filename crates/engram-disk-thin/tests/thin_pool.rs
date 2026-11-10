@@ -318,6 +318,37 @@ async fn open_deletes_a_thin_whose_device_is_gone_and_create_skips_a_taken_id() 
     assert!(deleted.success());
 }
 
+/// A host-agent that died between a suspend and its resume left the
+/// device holding every I/O; the next `open` resumes it.
+#[tokio::test]
+#[ignore]
+async fn open_resumes_a_device_left_suspended() {
+    let disk = pool_or_skip!();
+    let held = name("suspended", "v");
+    let v = disk.create(&held, CHUNK).await.unwrap();
+    let suspended = tokio::process::Command::new("dmsetup")
+        .args(["suspend", &disk.device_name(&held)])
+        .status()
+        .await
+        .unwrap();
+    assert!(suspended.success());
+
+    let disk = ThinPoolDisk::open(disk.pool(), CHUNK, Path::new("/dev/engram-test"))
+        .await
+        .unwrap();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        v.read_chunk(ChunkIndex(0)),
+    )
+    .await
+    .expect("the device was resumed")
+    .unwrap();
+    assert_eq!(read, fill(0));
+
+    drop(v);
+    disk.delete(&held).await.unwrap();
+}
+
 /// A reserve left behind by a holder that died: the next read releases
 /// it, reserves its own and releases that one too.
 #[tokio::test]

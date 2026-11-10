@@ -87,6 +87,8 @@ pub(crate) mod snapshot_post;
 pub mod substrate_server;
 pub use host_client::{IdleEvictionHarness, LocalHostClient};
 #[cfg(target_os = "linux")]
+pub mod blk_source;
+#[cfg(target_os = "linux")]
 pub mod heap_profile;
 pub mod heartbeat;
 pub mod idle_evictor;
@@ -108,7 +110,7 @@ mod time_source;
 pub mod util;
 pub mod warm_progress;
 
-pub use config::HostAgentConfig;
+pub use config::{HostAgentConfig, DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS};
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
@@ -302,9 +304,22 @@ impl HostAgent {
                 }
                 if let Some(fill) = self.fill.clone() {
                     if let Some(disk) = self.session_disk.clone() {
-                        p = p.with_session_volumes(Arc::new(
-                            engram_host_core::SessionVolumes::new(disk, fill.clone()),
-                        ));
+                        let volumes = engram_host_core::SessionVolumes::new(disk, fill.clone());
+                        #[cfg(target_os = "linux")]
+                        let volumes = match blk_source::available() {
+                            Ok(()) => volumes.with_sources(Arc::new(blk_source::UblkSources {
+                                window_ahead: self.cfg.disk_hydration_window_chunks,
+                            })),
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "no ublk control device (is ublk_drv loaded?): every resume \
+                                     writes its whole disk before the guest starts"
+                                );
+                                volumes
+                            }
+                        };
+                        p = p.with_session_volumes(Arc::new(volumes));
                     }
                     p = p.with_fill(fill);
                     // ADR 0080 §C: the MaterializeImage scratch root —

@@ -357,15 +357,17 @@ impl FillEngine {
     }
 
     /// The chunk's bytes for a caller that keeps them itself (a volume
-    /// write): a cache hit is served, a miss is fetched and verified but
-    /// not stored in the cache, so the bytes are written to disk once.
+    /// write): a cache hit is served, a miss is fetched but not stored in
+    /// the cache, so the bytes are written to disk once. The fetched
+    /// bytes are not hashed: a chunk is checked when it is written to the
+    /// store or to the cache, not when it is read.
     pub async fn read(&self, hash: ChunkHash, class: Class) -> Result<Bytes> {
         if let Some(cache) = self.store().chunk_cache() {
             if let Some(bytes) = cache.read_resident(hash).await? {
                 return Ok(bytes);
             }
         }
-        self.fetch_verified(hash, class, None).await
+        Ok(self.fetch_unverified(hash, class, None).await?.0)
     }
 
     /// `len` bytes at `offset` of a chunk, for a reader that needs part of
@@ -381,10 +383,9 @@ impl FillEngine {
     ///   `Hydrate` starts beside it (one flight with every other fill of
     ///   the chunk). Without a cache there is no fill.
     ///
-    /// The ranged bytes are not hash-checked: only a whole chunk can be.
-    /// They go to the caller only, never to the cache; the cache stores
-    /// the chunk only from the whole-chunk fill, after its hash check.
-    /// A caller that needs checked bytes uses [`Self::get`].
+    /// The ranged bytes are not hashed and go to the caller only; the
+    /// cache stores the chunk only from the whole-chunk fill, after its
+    /// hash check.
     pub async fn read_range(
         &self,
         hash: ChunkHash,
@@ -530,7 +531,8 @@ impl FillEngine {
     /// against a peer that has not answered after `peer_race_after`. The
     /// slot is freed when the bytes are in hand (before the cache writes
     /// them); a peer answer frees it without a report to the adaptive
-    /// limit. The caller hashes what came from the store.
+    /// limit. A caller that stores the bytes under their hash checks
+    /// what came from the store.
     async fn fetch_unverified(
         &self,
         hash: ChunkHash,

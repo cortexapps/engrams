@@ -53,7 +53,14 @@ pub struct HostAgentConfig {
     /// Whether an idle-eviction capture keeps the in-guest harness alive
     /// or stops it first.
     pub idle_eviction_harness: crate::host_client::IdleEvictionHarness,
+    /// Whole chunks a hydrating disk's source fetches ahead of the
+    /// kernel's copy.
+    pub disk_hydration_window_chunks: usize,
 }
+
+/// With 16 MiB chunks, 192 MiB in flight per hydrating disk: enough that
+/// the pool's disk limits the copy and not the fetches.
+pub const DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS: usize = 12;
 
 impl Default for HostAgentConfig {
     fn default() -> Self {
@@ -71,6 +78,7 @@ impl Default for HostAgentConfig {
             migrate_peer_listen_addr: None,
             backend_name: "process".to_string(),
             idle_eviction_harness: Default::default(),
+            disk_hydration_window_chunks: DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS,
         }
     }
 }

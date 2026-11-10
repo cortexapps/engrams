@@ -34,6 +34,13 @@ impl FirstTouch {
         format!("traces/{session}/first-touch-rest.v1")
     }
 
+    /// The store key of the root disk chunks a session read before the
+    /// copy of a hydrating restore reached them, in order, encoded as for
+    /// [`Self::key`]. The next restore fetches the ones it must copy first.
+    pub fn disk_key(session: Uuid) -> String {
+        format!("traces/{session}/disk-first-touch.v1")
+    }
+
     /// The indices touched up to and including `until_ms`, in order.
     pub fn until(&self, until_ms: i64) -> Vec<u32> {
         self.entries

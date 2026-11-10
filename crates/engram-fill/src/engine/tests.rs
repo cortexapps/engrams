@@ -284,22 +284,32 @@ async fn fill_returns_the_first_error_after_the_other_fetches_finish() {
 }
 
 #[tokio::test]
-async fn read_verifies_and_leaves_the_cache_alone() {
+async fn read_leaves_the_cache_alone() {
     let f = fixture();
-    let good = put(&f, b"volume bytes").await;
-    let bad = ChunkHash::of(b"expected");
+    let hash = put(&f, b"volume bytes").await;
+    let engine = engine_over(&f, counting(&f, None), Config::default());
+
+    assert_eq!(
+        &engine.read(hash, Class::Demand).await.unwrap()[..],
+        b"volume bytes"
+    );
+    assert!(!f.cache.contains_on_disk(hash));
+}
+
+#[tokio::test]
+async fn read_does_not_hash_what_the_store_returns() {
+    let f = fixture();
+    let hash = ChunkHash::of(b"expected");
     f.blob
-        .put(&bad.storage_key(), Bytes::from_static(b"tampered"))
+        .put(&hash.storage_key(), Bytes::from_static(b"other bytes"))
         .await
         .unwrap();
     let engine = engine_over(&f, counting(&f, None), Config::default());
 
     assert_eq!(
-        &engine.read(good, Class::Demand).await.unwrap()[..],
-        b"volume bytes"
+        &engine.read(hash, Class::Demand).await.unwrap()[..],
+        b"other bytes"
     );
-    assert!(!f.cache.contains_on_disk(good));
-    assert!(engine.read(bad, Class::Demand).await.is_err());
 }
 
 #[tokio::test]
