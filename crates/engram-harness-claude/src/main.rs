@@ -801,18 +801,18 @@ mod adapter {
                         // see `take_stashed_result`).
                         HookVerdict::Allow
                     }
-                    Some(_) => {
-                        // Claude #64389 can issue the same logical deferred
-                        // call twice with distinct ids in one turn. Decide and
-                        // insert under one lock so concurrent hook connections
-                        // cannot both become host-visible.
+                    Some(tool) => {
+                        // External calls have distinct journal identities even
+                        // when their names and arguments match. The same-name
+                        // workaround applies only to internal deferred tools.
                         let (first_request, duplicate) = {
                             let mut calls = deferred_calls.lock().await;
                             if calls.contains_key(&req.tool_use_id) {
                                 (false, false)
-                            } else if calls
-                                .values()
-                                .any(|call| call.run_id == run_id && call.tool_name == name)
+                            } else if tool.result_format != super::ResultFormat::Mcp
+                                && calls
+                                    .values()
+                                    .any(|call| call.run_id == run_id && call.tool_name == name)
                             {
                                 (false, true)
                             } else {
@@ -2010,11 +2010,7 @@ mod adapter {
     }
 
     /// Always limit Claude to the trusted bridge, including an empty manifest.
-    async fn write_mcp_config(
-        path: &Path,
-        _manifest: &ToolManifest,
-        self_exe: &Path,
-    ) -> std::io::Result<bool> {
+    async fn write_mcp_config(path: &Path, self_exe: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -2046,8 +2042,7 @@ mod adapter {
             path,
             serde_json::to_vec(&config).expect("MCP config contains only serializable values"),
         )
-        .await?;
-        Ok(true)
+        .await
     }
 
     /// The long-lived run engine. Owns the persistent `claude` process
@@ -2155,15 +2150,11 @@ mod adapter {
         let self_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("engram-harness-claude"));
         let mcp_config_file = state.claude_mcp_config();
-        let mcp_config_path =
-            match write_mcp_config(&mcp_config_file, &cli.tool_manifest, &self_exe).await {
-                Ok(true) => Some(mcp_config_file.as_path()),
-                Ok(false) => None,
-                Err(e) => {
-                    tracing::error!(error = %e, "could not write strict Claude MCP config");
-                    return ExitCode::FAILURE;
-                }
-            };
+        if let Err(error) = write_mcp_config(&mcp_config_file, &self_exe).await {
+            tracing::error!(%error, "could not write strict Claude MCP config");
+            return ExitCode::FAILURE;
+        }
+        let mcp_config_path = mcp_config_file.as_path();
         let hook_sock_path = state.hook_sock();
         let _ = tokio::fs::remove_file(&hook_sock_path).await; // clear a stale bind
         let _sock_guard = match tokio::net::UnixListener::bind(&hook_sock_path) {
@@ -2556,7 +2547,7 @@ mod adapter {
         // `run_engine` so it survives a respawn; populated at turn-end here.
         scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
         duplicate_deferred_ids: &hook_server::DuplicateDeferredIds,
-        mcp_config_path: Option<&Path>,
+        mcp_config_path: &Path,
     ) -> SessionOutcome {
         // A socket call outside a turn must carry the wire-mandated empty
         // run_id, never the previous turn's id.
@@ -3998,7 +3989,7 @@ mod adapter {
     fn build_claude_argv(
         resume_id: &Option<String>,
         append_system_prompt: Option<&str>,
-        mcp_config_path: Option<&Path>,
+        mcp_config_path: &Path,
         // ADR 0107: the latched session mode (from the workspace stamp, read
         // per spawn). `plan` maps to the CLI's native plan permission mode;
         // anything else adds no flag. Changing mode therefore = a clean
@@ -4044,13 +4035,9 @@ mod adapter {
             argv.push("--resume".into());
             argv.push(id.clone());
         }
-        if let Some(path) = mcp_config_path {
-            argv.push("--mcp-config".into());
-            argv.push(path.to_string_lossy().into_owned());
-            // Without strict mode claude merges the guest user's own MCP
-            // configuration, exposing servers outside the orchestrator's
-            // per-session manifest (ADR 0089 spike, Claude 2.1.207).
-        }
+        argv.push("--mcp-config".into());
+        argv.push(mcp_config_path.to_string_lossy().into_owned());
+        // Strict mode excludes guest MCP servers outside the session manifest.
         argv.push("--strict-mcp-config".into());
         // ADR 0060: an external trigger (e.g. Slack) flavors the agent's system
         // prompt via ENGRAM_APPEND_SYSTEM_PROMPT (carried through harness_env).
@@ -4803,8 +4790,11 @@ mod adapter {
         // This budget bounds liveness only; event-order assertions stay exact.
         const SUBPROCESS_TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 
-        /// The generated hook settings path an argv test doesn't care about
-        /// (production derives it from the state dir).
+        fn test_mcp_config() -> &'static Path {
+            Path::new("/tmp/mcp-config.json")
+        }
+
+        /// The hook settings path for argv tests; production uses the state dir.
         fn test_settings() -> &'static Path {
             Path::new("/tmp/engram-test-state/claude-settings.json")
         }
@@ -4817,7 +4807,7 @@ mod adapter {
             let argv = build_claude_argv(
                 &None,
                 Some("You were triggered from a Slack thread."),
-                None,
+                test_mcp_config(),
                 "default",
                 test_settings(),
             );
@@ -4834,7 +4824,8 @@ mod adapter {
         #[test]
         fn argv_omits_append_system_prompt_when_absent_or_empty() {
             for v in [None, Some("")] {
-                let argv = build_claude_argv(&None, v, None, "default", test_settings());
+                let argv =
+                    build_claude_argv(&None, v, test_mcp_config(), "default", test_settings());
                 assert!(
                     !argv.iter().any(|a| a == "--append-system-prompt"),
                     "flag must be absent for {v:?}",
@@ -4903,7 +4894,7 @@ mod adapter {
         // permission mode; the mode comes from the workspace stamp per spawn.
         #[test]
         fn argv_carries_permission_mode_plan_only_for_plan() {
-            let argv = build_claude_argv(&None, None, None, "plan", test_settings());
+            let argv = build_claude_argv(&None, None, test_mcp_config(), "plan", test_settings());
             let pos = argv
                 .iter()
                 .position(|a| a == "--permission-mode")
@@ -4911,7 +4902,7 @@ mod adapter {
             assert_eq!(argv.get(pos + 1).map(String::as_str), Some("plan"));
 
             for mode in ["default", "", "build"] {
-                let argv = build_claude_argv(&None, None, None, mode, test_settings());
+                let argv = build_claude_argv(&None, None, test_mcp_config(), mode, test_settings());
                 assert!(
                     !argv.iter().any(|a| a == "--permission-mode"),
                     "no permission-mode flag for {mode:?}",
@@ -4921,13 +4912,8 @@ mod adapter {
 
         #[test]
         fn argv_carries_strict_mcp_config_when_injected_tools_exist() {
-            let argv = build_claude_argv(
-                &None,
-                None,
-                Some(Path::new("/tmp/mcp-config.json")),
-                "default",
-                test_settings(),
-            );
+            let argv =
+                build_claude_argv(&None, None, test_mcp_config(), "default", test_settings());
             let pos = argv
                 .iter()
                 .position(|arg| arg == "--mcp-config")
@@ -4944,8 +4930,11 @@ mod adapter {
 
         #[test]
         fn argv_keeps_strict_mcp_flags_without_injected_tools() {
-            let argv = build_claude_argv(&None, None, None, "default", test_settings());
-            assert!(!argv.iter().any(|arg| arg == "--mcp-config"));
+            let argv =
+                build_claude_argv(&None, None, test_mcp_config(), "default", test_settings());
+            assert!(argv
+                .windows(2)
+                .any(|args| args == ["--mcp-config", "/tmp/mcp-config.json"]));
             assert!(argv.iter().any(|arg| arg == "--strict-mcp-config"));
         }
 
@@ -4955,19 +4944,9 @@ mod adapter {
                 .join(format!("engram-mcp-config-test-{}", uuid::Uuid::new_v4()));
             tokio::fs::create_dir_all(&dir).await.unwrap();
             let path = dir.join("mcp-config.json");
-            let manifest = parse_tool_manifest(
-                r#"[
-                    {"name":"save_memory","description":"Save it","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{}},
-                    {"name":"ask_user_question","description":"Ask","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"claude":"AskUserQuestion"}}
-                ]"#,
-            )
-            .unwrap();
-
-            assert!(
-                write_mcp_config(&path, &manifest, Path::new("/sbin/engram-harness-claude"))
-                    .await
-                    .unwrap()
-            );
+            write_mcp_config(&path, Path::new("/sbin/engram-harness-claude"))
+                .await
+                .unwrap();
             let config: Value =
                 serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
             assert_eq!(
@@ -4987,17 +4966,6 @@ mod adapter {
                 })
             );
 
-            let native_only = parse_tool_manifest(
-                r#"[{"name":"ask_user_question","description":"Ask","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"claude":"AskUserQuestion"}}]"#,
-            )
-            .unwrap();
-            assert!(
-                write_mcp_config(&path, &native_only, Path::new("/sbin/harness"))
-                    .await
-                    .unwrap(),
-                "a native-only manifest must keep the strict bridge config"
-            );
-            assert!(tokio::fs::metadata(&path).await.is_ok());
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
 
@@ -8064,6 +8032,67 @@ mod adapter {
                 HashSet::from(["toolu_first".to_string()]),
                 "only the original host-visible call remains outstanding"
             );
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
+        async fn external_deferred_calls_keep_distinct_ids_for_the_same_tool() {
+            let mut tool = generic_tool("write_record", ToolExecution::Deferred);
+            tool.result_format = ResultFormat::Mcp;
+            let manifest = vec![tool];
+            let (sock, results, pending, mut events, duplicates, _) =
+                spawn_manifest_hook_server(manifest.clone()).await;
+            for (id, value) in [("first", 1), ("second", 2), ("third", 2)] {
+                assert!(matches!(
+                    hook_fire_named(
+                        &sock,
+                        id,
+                        "mcp__engrams__write_record",
+                        serde_json::json!({"value": value}),
+                    )
+                    .await,
+                    hook_server::HookVerdict::Defer
+                ));
+                assert!(
+                    matches!(
+                        events.try_recv(),
+                        Ok(HarnessEvent::ToolCallRequested { call_id, args_json, .. })
+                            if call_id == id && args_json == format!("{{\"value\":{value}}}")
+                    ),
+                    "each distinct ID must reach the host"
+                );
+            }
+            assert!(duplicates.lock().await.is_empty());
+            assert_eq!(
+                unresolved_deferred_ids(
+                    "run-x",
+                    &*pending.lock().await,
+                    &*results.lock().await,
+                    &manifest,
+                ),
+                ["first", "second", "third"]
+            );
+            assert!(matches!(
+                hook_fire_named(
+                    &sock,
+                    "second",
+                    "mcp__engrams__write_record",
+                    serde_json::json!({"value": 2}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                events.try_recv().is_err(),
+                "an exact-ID replay stays deduplicated"
+            );
+            for id in ["first", "second", "third"] {
+                results.lock().await.insert(id.into(), id.into());
+                assert_eq!(
+                    mcp_server::take_stashed_result(&results, &pending, id, "write_record").await,
+                    Some((id.into(), id.into()))
+                );
+            }
             let _ = tokio::fs::remove_file(sock).await;
         }
 
