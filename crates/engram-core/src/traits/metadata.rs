@@ -1038,8 +1038,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
     /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
     /// the read-side twin of `reserve_and_persist_create`'s aggregate, for the
-    /// capacity-soft resume/evac picker and the fleet view. Default impl
-    /// (mocks): empty map (no reservations).
+    /// capacity-soft resume/evac picker, the fleet view and the parking
+    /// headroom gate. Default impl (mocks): empty map (no reservations).
     async fn per_host_reserved(
         &self,
     ) -> Result<std::collections::HashMap<HostId, crate::types::host::ReservedBudget>, MetaError>

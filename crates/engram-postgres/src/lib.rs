@@ -8,7 +8,8 @@
 //! ship a `.sqlx/` cache.
 
 use engram_core::types::host::{
-    CordonOwner, HeartbeatAck, RetirementBlocker, RetirementGrant, RetirementStatus,
+    CordonOwner, HeartbeatAck, HostHeadroom, ReservedBudget, RetirementBlocker, RetirementGrant,
+    RetirementStatus,
 };
 use engram_core::types::ids::TeleportId;
 use engram_core::types::teleport::*;
@@ -519,15 +520,82 @@ fn catalog_harness_from_row(row: HarnessRow) -> engram_core::types::CatalogHarne
 const HARNESS_ROW_COLS: &str =
     "id, owner, name, oci_ref, manifest_digest, descriptor_toml, squashfs_sha256, squashfs_size_bytes, created_at";
 
-/// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
-/// RAM headroom (`<= 0` = unmeasured); `cpu_budget` is `total_vcpus ×
-/// overcommit` (`0` = host hasn't reported its core count → no CPU gate).
-#[derive(Clone, Copy, Debug, Default)]
-struct HostFit {
-    alloc_mib: i64,
-    reserved_mib: i64,
-    cpu_budget: i64,
-    reserved_vcpus: i64,
+/// The one SQL of the reservations on hosts (ADR 0046/0048/0081/0084):
+/// per host, Σ `mem_budget_mib` and Σ `cpu_budget_vcpus` over the sessions
+/// in a memory-reserving state (the SQL twin of
+/// `SessionState::host_memory_reserving_states()`, a parked VM included),
+/// the capture VMs of non-terminal capture jobs, and the reserving
+/// teleport legs (destination and source). `hosts` is the host predicate
+/// of the session and capture branches, e.g. `= ANY($1)` or `IS NOT NULL`.
+/// Columns: `host_id`, `reserved_mib`, `reserved_vcpus`.
+///
+/// R3 (#722): a `pending` row reserves unconditionally until it leaves the
+/// reserving state. The ADR 0079 backstop reclaims a crash-orphan by a real
+/// `pending → failed` transition, so placement never re-sells a slot a
+/// revival could reclaim (Σ reserved > allocatable).
+fn reserved_by_host_sql(hosts: &str) -> String {
+    format!(
+        r#"
+        SELECT host_id,
+               COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
+               COALESCE(SUM(cpu), 0)::BIGINT AS reserved_vcpus
+        FROM (
+            SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
+            FROM sessions
+            WHERE host_id {hosts}
+              AND status IN ({reserving})
+            UNION ALL
+            SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM capture_jobs
+            WHERE host_id {hosts}
+              AND stage NOT IN ('done','failed')
+            UNION ALL
+            SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM session_teleports WHERE phase IN ({teleport_reserving})
+            UNION ALL
+            SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM session_teleports WHERE phase IN ({source_reserving})
+        ) reserved
+        GROUP BY host_id
+        "#,
+        reserving = reserving_states_sql(),
+        teleport_reserving = engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
+        source_reserving =
+            engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
+    )
+}
+
+/// The fit map: each host row's [`HostHeadroom`] (`id`, `allocatable_mib`,
+/// `total_vcpus` columns) with the reservations of [`reserved_by_host_sql`]
+/// applied. A reservation on a host not in `host_rows` is dropped.
+fn headroom_map(
+    host_rows: &[sqlx::postgres::PgRow],
+    reserved_rows: &[sqlx::postgres::PgRow],
+) -> Result<std::collections::HashMap<uuid::Uuid, HostHeadroom>, MetaError> {
+    let mut fit = std::collections::HashMap::with_capacity(host_rows.len());
+    for r in host_rows {
+        let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+        let allocatable_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+        let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
+        fit.insert(
+            hid,
+            HostHeadroom {
+                allocatable_mib,
+                cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
+                reserved: ReservedBudget::default(),
+            },
+        );
+    }
+    for r in reserved_rows {
+        let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
+        if let Some(f) = fit.get_mut(&h) {
+            f.reserved = ReservedBudget {
+                mem_mib: sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?,
+                vcpus: sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?,
+            };
+        }
+    }
+    Ok(fit)
 }
 
 /// ADR 0046/0048: BEST-FIT, 2D placement among `candidates` (ranked, with the
@@ -543,19 +611,21 @@ struct HostFit {
 fn choose_placement_host(
     candidates: &[uuid::Uuid],
     affinity_len: usize,
-    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
+    fit: &std::collections::HashMap<uuid::Uuid, HostHeadroom>,
     budget_mib: i64,
     budget_vcpus: i64,
 ) -> Option<uuid::Uuid> {
     let split = affinity_len.min(candidates.len());
     best_fit_measured(&candidates[..split], fit, budget_mib, budget_vcpus)
         .or_else(|| best_fit_measured(&candidates[split..], fit, budget_mib, budget_vcpus))
-        // Last resort across BOTH tiers: a host with no allocatable
-        // measurement yet (don't gate on a bogus 0; let dev/new hosts work).
+        // Unmeasured RAM is a last resort; reported CPU must still fit.
         .or_else(|| {
             candidates
                 .iter()
-                .find(|h| fit.get(h).is_some_and(|f| f.alloc_mib <= 0))
+                .find(|h| {
+                    fit.get(h)
+                        .is_some_and(|f| !f.measured() && f.fits(budget_mib, budget_vcpus))
+                })
                 .copied()
         })
 }
@@ -567,7 +637,7 @@ fn choose_placement_host(
 /// unit-tested without a database.
 fn classify_no_fit(
     candidates: &[uuid::Uuid],
-    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
+    fit: &std::collections::HashMap<uuid::Uuid, HostHeadroom>,
     budget_mib: i64,
     budget_vcpus: i64,
 ) -> Vec<engram_core::traits::PlacementNoFit> {
@@ -582,21 +652,18 @@ fn classify_no_fit(
                     free_vcpus: 0,
                 };
             };
-            let free_vcpus = if f.cpu_budget > 0 {
-                f.cpu_budget - f.reserved_vcpus
-            } else {
-                i64::MAX
-            };
-            let free_mib = f.alloc_mib - f.reserved_mib;
-            let reason = if f.alloc_mib <= 0 {
-                "unmeasured"
-            } else if free_mib < budget_mib {
+            let free_vcpus = f.free_vcpus().unwrap_or(i64::MAX);
+            let free_mib = f.free_mib();
+            let reason = if f.fits(budget_mib, budget_vcpus) {
+                if f.measured() {
+                    "fits_now"
+                } else {
+                    "unmeasured"
+                }
+            } else if f.measured() && free_mib < budget_mib {
                 "ram_full"
-            } else if free_vcpus < budget_vcpus {
-                "cpu_full"
             } else {
-                // Capacity changed after the locked placement attempt.
-                "fits_now"
+                "cpu_full"
             };
             engram_core::traits::PlacementNoFit {
                 host_id: HostId(*h),
@@ -611,7 +678,7 @@ fn classify_no_fit(
 /// Best-fit (smallest free RAM that fits both dims) among MEASURED hosts.
 fn best_fit_measured(
     candidates: &[uuid::Uuid],
-    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
+    fit: &std::collections::HashMap<uuid::Uuid, HostHeadroom>,
     budget_mib: i64,
     budget_vcpus: i64,
 ) -> Option<uuid::Uuid> {
@@ -620,17 +687,13 @@ fn best_fit_measured(
         let Some(f) = fit.get(h) else {
             continue; // not ready/draining at lock time
         };
-        if f.alloc_mib <= 0 {
+        if !f.measured() {
             continue; // unmeasured — handled by the fallback tier
         }
-        let free_mib = f.alloc_mib - f.reserved_mib;
-        if free_mib < budget_mib {
+        if !f.fits(budget_mib, budget_vcpus) {
             continue;
         }
-        // CPU dimension: only gate when the host reported a budget.
-        if f.cpu_budget > 0 && f.cpu_budget - f.reserved_vcpus < budget_vcpus {
-            continue;
-        }
+        let free_mib = f.free_mib();
         // SMALLEST free that fits (best-fit); ties toward the earlier
         // (higher-ranked) candidate.
         match best {
@@ -692,91 +755,14 @@ async fn pick_host_2d(
     .fetch_all(&mut **tx)
     .await
     .map_err(db_err)?;
-    // ADR 0046/0048: build the 2D fit map. allocatable_mib is the
-    // host-measured RAM headroom (nets out daemon/OS/chunk-cache/mlock
-    // baseline; 0 = unmeasured). The CPU budget is total_vcpus ×
-    // overcommit (0 = host hasn't reported its core count → no CPU gate).
-    let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
-        std::collections::HashMap::with_capacity(host_rows.len());
-    for r in &host_rows {
-        let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-        let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
-        let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
-        fit.insert(
-            hid,
-            HostFit {
-                alloc_mib,
-                reserved_mib: 0,
-                cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
-                reserved_vcpus: 0,
-            },
-        );
-    }
-    // Reserved within the txn — sees the committed reservations of
-    // placers that locked these hosts before us. The sessions branch is
-    // the SQL twin of `SessionState::host_memory_reserving_states()`
-    // (interpolated from the const — see `reserving_states_sql`);
-    // the enable_jobs branch is ADR 0081's capture-VM reservation.
-    let res_sql = format!(
-        r#"
-        SELECT host_id,
-               COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
-               COALESCE(SUM(cpu), 0)::BIGINT AS reserved_vcpus
-        FROM (
-            SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
-            FROM sessions
-            WHERE host_id = ANY($1)
-              AND status IN ({reserving})
-              -- R3 (#722): ONE reservation authority — a `pending` pinned to
-              -- a host reserves its budget UNCONDITIONALLY, for exactly as
-              -- long as it is `pending`. No wall-age / live-op exclusion: an
-              -- aged crash-orphan physically holds its slot until it LEAVES
-              -- the reserving state, and the ADR 0079 pending-orphan backstop
-              -- reclaims it by a REAL `pending → failed` transition (the sole
-              -- reclaimer) — never by a placement-side exclusion. The old
-              -- 10-minute crash-orphan gate stopped counting an aged pending
-              -- while the backstop could still revive it, so a revival landed
-              -- on re-sold capacity (Σ reserved > allocatable). This predicate
-              -- now equals the unconditional placement-accounting oracle by
-              -- construction (engram-dst invariants.rs).
-            UNION ALL
-            -- ADR 0084 (c): a capture VM reserves like a session. The
-            -- reservation lives on `capture_jobs` now (moved off
-            -- `enable_jobs`); a non-terminal row with a bound host_id
-            -- holds its budget. Release is implicit — a terminal stage
-            -- drops out of this SUM.
-            SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-            FROM capture_jobs
-            WHERE host_id = ANY($1)
-              AND stage NOT IN ('done','failed')
-            UNION ALL
-            SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-            FROM session_teleports WHERE phase IN ({teleport_reserving})
-            UNION ALL
-            SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-            FROM session_teleports WHERE phase IN ({source_reserving})
-        ) reserved
-        GROUP BY host_id
-        "#,
-        reserving = reserving_states_sql(),
-        teleport_reserving = engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
-        source_reserving =
-            engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
-    );
-    let res_rows = sqlx::query(&res_sql)
+    // Reserved within the txn: sees the committed reservations of placers
+    // that locked these hosts before us.
+    let res_rows = sqlx::query(&reserved_by_host_sql("= ANY($1)"))
         .bind(cand)
         .fetch_all(&mut **tx)
         .await
         .map_err(db_err)?;
-    for r in &res_rows {
-        let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
-        let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
-        let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
-        if let Some(f) = fit.get_mut(&h) {
-            f.reserved_mib = mem;
-            f.reserved_vcpus = cpu;
-        }
-    }
+    let fit = headroom_map(&host_rows, &res_rows)?;
     Ok(choose_placement_host(
         cand,
         affinity_len,
@@ -791,7 +777,8 @@ async fn pick_host_2d(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod placement_tests {
-    use super::{choose_placement_host, HostFit};
+    use super::choose_placement_host;
+    use engram_core::types::host::{HostHeadroom, ReservedBudget};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -799,22 +786,28 @@ mod placement_tests {
         (1..=n as u128).map(Uuid::from_u128).collect()
     }
 
+    fn headroom(
+        alloc: i64,
+        reserved_mib: i64,
+        cpu_budget: i64,
+        reserved_vcpus: i64,
+    ) -> HostHeadroom {
+        HostHeadroom {
+            allocatable_mib: alloc,
+            cpu_budget,
+            reserved: ReservedBudget {
+                mem_mib: reserved_mib,
+                vcpus: reserved_vcpus,
+            },
+        }
+    }
+
     /// Build a fit map from (alloc_mib, reserved_mib) pairs; CPU budget
     /// left at 0 (= no CPU gate) unless a test overrides it.
-    fn ram_fit(entries: &[(Uuid, i64, i64)]) -> HashMap<Uuid, HostFit> {
+    fn ram_fit(entries: &[(Uuid, i64, i64)]) -> HashMap<Uuid, HostHeadroom> {
         entries
             .iter()
-            .map(|&(id, alloc, reserved)| {
-                (
-                    id,
-                    HostFit {
-                        alloc_mib: alloc,
-                        reserved_mib: reserved,
-                        cpu_budget: 0,
-                        reserved_vcpus: 0,
-                    },
-                )
-            })
+            .map(|&(id, alloc, reserved)| (id, headroom(alloc, reserved, 0, 0)))
             .collect()
     }
 
@@ -839,12 +832,7 @@ mod placement_tests {
         ]);
         fit.insert(
             h[2],
-            HostFit {
-                alloc_mib: 32768,
-                reserved_mib: 0,
-                cpu_budget: 8,
-                reserved_vcpus: 8, // free 0 < 2 → cpu_full
-            },
+            headroom(32768, 0, 8, 8), // free 0 < 2 → cpu_full
         );
         // h[3] deliberately absent from the map → not_lockable.
         let details = super::classify_no_fit(&h, &fit, 4096, 2);
@@ -887,24 +875,8 @@ mod placement_tests {
         // land on h1 despite h0 being the tighter RAM fit.
         let h = ids(2);
         let fit: HashMap<_, _> = [
-            (
-                h[0],
-                HostFit {
-                    alloc_mib: 32768,
-                    reserved_mib: 28000,
-                    cpu_budget: 8,
-                    reserved_vcpus: 8,
-                },
-            ),
-            (
-                h[1],
-                HostFit {
-                    alloc_mib: 32768,
-                    reserved_mib: 0,
-                    cpu_budget: 32,
-                    reserved_vcpus: 0,
-                },
-            ),
+            (h[0], headroom(32768, 28000, 8, 8)),
+            (h[1], headroom(32768, 0, 32, 0)),
         ]
         .into();
         assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 2), Some(h[1]));
@@ -3115,54 +3087,14 @@ impl MetadataStore for PostgresStore {
         std::collections::HashMap<HostId, engram_core::types::host::ReservedBudget>,
         MetaError,
     > {
-        // Same predicate as `pick_host_2d` / `fleet_free_mib` — the
-        // memory-reserving states (R3 #722: a `pending` reserves
-        // UNCONDITIONALLY until it leaves that state; no crash-orphan gate),
-        // UNION the capturing enable jobs (ADR 0081) — summing BOTH budget
-        // dimensions (ADR 0048).
-        let sql = format!(
-            r#"
-            SELECT host_id,
-                   COALESCE(SUM(mem), 0)::BIGINT,
-                   COALESCE(SUM(cpu), 0)::BIGINT
-            FROM (
-                SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
-                FROM sessions
-                WHERE host_id IS NOT NULL
-                  AND status IN ({reserving})
-                UNION ALL
-                -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
-                SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM capture_jobs
-                WHERE host_id IS NOT NULL
-                  AND stage NOT IN ('done','failed')
-                UNION ALL
-                SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM session_teleports WHERE phase IN ({teleport_reserving})
-                UNION ALL
-                SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM session_teleports WHERE phase IN ({source_reserving})
-            ) reserved
-            GROUP BY host_id
-            "#,
-            reserving = reserving_states_sql(),
-            teleport_reserving =
-                engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
-            source_reserving =
-                engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
-        );
+        let sql = reserved_by_host_sql("IS NOT NULL");
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(&sql)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|(h, mem_mib, vcpus)| {
-                (
-                    HostId(h),
-                    engram_core::types::host::ReservedBudget { mem_mib, vcpus },
-                )
-            })
+            .map(|(h, mem_mib, vcpus)| (HostId(h), ReservedBudget { mem_mib, vcpus }))
             .collect())
     }
 
@@ -3251,75 +3183,12 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
-            std::collections::HashMap::with_capacity(host_rows.len());
-        for r in &host_rows {
-            let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-            let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
-            let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
-            fit.insert(
-                hid,
-                HostFit {
-                    alloc_mib,
-                    reserved_mib: 0,
-                    cpu_budget: engram_core::types::host::host_cpu_budget(
-                        total_vcpus.max(0) as u32
-                    ),
-                    reserved_vcpus: 0,
-                },
-            );
-        }
-        let res_sql = format!(
-            r#"
-            SELECT host_id,
-                   COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
-                   COALESCE(SUM(cpu), 0)::BIGINT AS reserved_vcpus
-            FROM (
-                SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
-                FROM sessions
-                WHERE host_id = ANY($1)
-                  AND status IN ({reserving})
-                  -- R3 (#722): a `pending` reserves UNCONDITIONALLY until it
-                  -- leaves the reserving state — no wall-age / live-op gate.
-                  -- The ADR 0079 backstop reclaims a true crash-orphan by a
-                  -- real `pending → failed` transition (the sole reclaimer),
-                  -- so placement never re-sells a slot a revival could reclaim
-                  -- (Σ reserved > allocatable). Matches the unconditional
-                  -- placement-accounting oracle by construction.
-                UNION ALL
-                SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM capture_jobs
-                WHERE host_id = ANY($1)
-                  AND stage NOT IN ('done','failed')
-                UNION ALL
-                SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM session_teleports WHERE phase IN ({teleport_reserving})
-                UNION ALL
-                SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM session_teleports WHERE phase IN ({source_reserving})
-            ) reserved
-            GROUP BY host_id
-            "#,
-            reserving = reserving_states_sql(),
-            teleport_reserving =
-                engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
-            source_reserving =
-                engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
-        );
-        let res_rows = sqlx::query(&res_sql)
+        let res_rows = sqlx::query(&reserved_by_host_sql("= ANY($1)"))
             .bind(&cand)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        for r in &res_rows {
-            let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
-            let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
-            let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
-            if let Some(f) = fit.get_mut(&h) {
-                f.reserved_mib = mem;
-                f.reserved_vcpus = cpu;
-            }
-        }
+        let fit = headroom_map(&host_rows, &res_rows)?;
         Ok(classify_no_fit(
             &cand,
             &fit,

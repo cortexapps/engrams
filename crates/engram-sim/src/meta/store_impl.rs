@@ -61,6 +61,16 @@ fn reserves(state: SessionState) -> bool {
     state.reserves_host_memory()
 }
 
+/// `h`'s [`engram_core::types::host::HostHeadroom`] with the reservations
+/// of [`reserved_budgets`].
+fn headroom_of(
+    h: &HostRecord,
+    reserved: &std::collections::BTreeMap<HostId, (i64, i64)>,
+) -> engram_core::types::host::HostHeadroom {
+    let (mem_mib, vcpus) = reserved.get(&h.id).copied().unwrap_or((0, 0));
+    engram_core::types::host::HostHeadroom::of(h, ReservedBudget { mem_mib, vcpus })
+}
+
 fn reserved_budgets(db: &SimDb) -> std::collections::BTreeMap<HostId, (i64, i64)> {
     let mut out = std::collections::BTreeMap::<HostId, (i64, i64)>::new();
     let sessions = db
@@ -239,8 +249,7 @@ impl SimMetadataStore {
     /// unconditionally — no crash-orphan exclusion); best-fit = smallest
     /// allocatable-minus-reserved RAM that fits both budgets, affinity tier
     /// (`candidates[..affinity_len]`) first, then the rest, then any
-    /// unmeasured host (allocatable == 0) as a last resort.
-    ///
+    /// unmeasured-RAM host whose reported CPU fits as a last resort.
     fn pick_host_2d(
         db: &SimDb,
         candidates: &[HostId],
@@ -257,18 +266,12 @@ impl SimMetadataStore {
             return None;
         }
         let reserved = reserved_budgets(db);
+        // Measured hosts that fit, with their free RAM; an unmeasured host
+        // is the last-resort tier below.
         let fits = |h: &&HostRecord| -> Option<i64> {
-            let alloc = h.utilization.allocatable_mib as i64;
-            if alloc <= 0 {
-                return None; // unmeasured — last-resort tier
-            }
-            let (mem_res, cpu_res) = reserved.get(&h.id).copied().unwrap_or((0, 0));
-            let free_mem = alloc - mem_res;
-            // CPU budgets are OVERCOMMITTED (host_cpu_budget = vcpus x
-            // factor) — conformance caught SimMeta using raw vcpus.
-            let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
-            let free_cpu = cpu_budget - cpu_res;
-            (free_mem >= mem_budget_mib && free_cpu >= cpu_budget_vcpus).then_some(free_mem)
+            let room = headroom_of(h, &reserved);
+            (room.measured() && room.fits(mem_budget_mib, cpu_budget_vcpus))
+                .then_some(room.free_mib())
         };
         let best_of = |tier: &[&HostRecord]| -> Option<HostId> {
             tier.iter()
@@ -283,10 +286,13 @@ impl SimMetadataStore {
             .copied()
             .partition(|h| prefix.contains(&h.id));
         best_of(&affinity).or_else(|| best_of(&rest)).or_else(|| {
-            // Unmeasured hosts as last resort, affinity order.
+            // Unmeasured RAM is a last resort; reported CPU must still fit.
             eligible
                 .iter()
-                .find(|h| h.utilization.allocatable_mib == 0)
+                .find(|h| {
+                    let room = headroom_of(h, &reserved);
+                    !room.measured() && room.fits(mem_budget_mib, cpu_budget_vcpus)
+                })
                 .map(|h| h.id)
         })
     }
@@ -6109,23 +6115,19 @@ impl MetadataStore for SimMetadataStore {
                         free_vcpus: 0,
                     };
                 };
-                let (res_mib, res_vcpus) = reserved.get(id).copied().unwrap_or((0, 0));
-                let alloc = h.utilization.allocatable_mib as i64;
-                let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
-                let free_vcpus = if cpu_budget > 0 {
-                    cpu_budget - res_vcpus
-                } else {
-                    i64::MAX
-                };
-                let free_mib = alloc - res_mib;
-                let reason = if alloc <= 0 {
-                    "unmeasured"
-                } else if free_mib < mem_budget_mib {
+                let room = headroom_of(h, &reserved);
+                let free_vcpus = room.free_vcpus().unwrap_or(i64::MAX);
+                let free_mib = room.free_mib();
+                let reason = if room.fits(mem_budget_mib, i64::from(cpu_budget_vcpus)) {
+                    if room.measured() {
+                        "fits_now"
+                    } else {
+                        "unmeasured"
+                    }
+                } else if room.measured() && free_mib < mem_budget_mib {
                     "ram_full"
-                } else if free_vcpus < i64::from(cpu_budget_vcpus) {
-                    "cpu_full"
                 } else {
-                    "fits_now"
+                    "cpu_full"
                 };
                 PlacementNoFit {
                     host_id: *id,

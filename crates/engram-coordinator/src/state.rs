@@ -2475,6 +2475,14 @@ pub(crate) mod tests {
         /// `send_prompt_core`'s `harness_mode` validation is exercisable
         /// (the trait default returns `None`, which rejects every mode).
         pub(crate) harness: PlMutex<Option<String>>,
+        /// `per_host_reserved`'s answer: the reservations tests stage on
+        /// the seeded hosts (empty = nothing reserved).
+        pub(crate) reserved:
+            PlMutex<std::collections::HashMap<HostId, engram_core::types::host::ReservedBudget>>,
+        /// Makes `per_host_reserved` fail, as a database error does.
+        pub(crate) reserved_read_fails: PlMutex<bool>,
+        /// `list_queued_sessions_fifo`'s answer.
+        pub(crate) queued: PlMutex<Vec<engram_core::types::session::QueuedSession>>,
     }
 
     impl MiniMeta {
@@ -2532,6 +2540,9 @@ pub(crate) mod tests {
                 ops: engram_core::types::session_op::InMemoryOpLog::default(),
                 outbox: PlMutex::new(Vec::new()),
                 harness: PlMutex::new(None),
+                reserved: PlMutex::new(Default::default()),
+                reserved_read_fails: PlMutex::new(false),
+                queued: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -2814,6 +2825,22 @@ pub(crate) mod tests {
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
             Ok(self.hosts.lock().clone())
+        }
+        async fn list_queued_sessions_fifo(
+            &self,
+        ) -> Result<Vec<engram_core::types::session::QueuedSession>, MetaError> {
+            Ok(self.queued.lock().clone())
+        }
+        async fn per_host_reserved(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<HostId, engram_core::types::host::ReservedBudget>,
+            MetaError,
+        > {
+            if *self.reserved_read_fails.lock() {
+                return Err(MetaError::Db("staged read failure".into()));
+            }
+            Ok(self.reserved.lock().clone())
         }
         async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
             Ok(())

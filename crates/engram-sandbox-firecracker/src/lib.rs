@@ -3307,8 +3307,14 @@ impl FirecrackerBackend {
                             if let Some(status) = handler.try_wait().map_err(|e| {
                                 SandboxError::Snapshot(format!("check uffd handler: {e}"))
                             })? {
+                                // The handler's log holds the only reason.
+                                let log = read_tail(&jail_dir.join("uffd-handler.log"), 2048)
+                                    .await
+                                    .unwrap_or_default();
                                 return Err(SandboxError::Snapshot(format!(
-                                    "uffd handler exited before the load ({status})"
+                                    "uffd handler exited before the load ({status}); \
+                                     handler log: {}",
+                                    log.trim().replace('\n', " | ")
                                 )));
                             }
                             if uffd_uds.exists() && state_path.exists() {

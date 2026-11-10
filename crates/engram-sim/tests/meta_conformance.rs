@@ -3046,6 +3046,114 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
+/// Missing resource measurements soften only their own placement dimension.
+async fn a_host_without_reported_cores_has_no_cpu_gate(ctx: &Ctx) {
+    use engram_core::traits::{CreateDisposition, SessionCreateWriteSet};
+    let meta = &ctx.meta;
+    let host = HostId::new();
+    meta.upsert_host(host_record(
+        host,
+        "conf-soft-measurements",
+        ctx.clock.now_utc(),
+    ))
+    .await
+    .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.utilization.allocatable_mib = 8192;
+    hb.total_vcpus = 0;
+    meta.touch_host_heartbeat(host, hb.clone()).await.unwrap();
+    let mut ws = SessionCreateWriteSet {
+        managed_boot_selection: None,
+        managed_initial_prompt: None,
+        managed_creation: None,
+        mcp_policy: None,
+        session_id: SessionId::new(),
+        spec: spec("conf:soft-measurements"),
+        mem_budget_mib: 4096,
+        cpu_budget_vcpus: 2,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
+        oauth_binding: None,
+    };
+    let details = meta
+        .placement_no_fit_details(&[host], 4096, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "fits_now");
+    assert_eq!(
+        meta.reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
+
+    ws.session_id = SessionId::new();
+    ws.mem_budget_mib = 8192;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 2)
+        .await
+        .unwrap();
+    let placed = meta
+        .reserve_and_persist_create(ws.clone(), &[host], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (details[0].reason, placed),
+        ("ram_full", CreateDisposition::Queued)
+    );
+
+    hb.utilization.allocatable_mib = 0;
+    hb.total_vcpus = 1;
+    meta.touch_host_heartbeat(host, hb.clone()).await.unwrap();
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 3;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 3)
+        .await
+        .unwrap();
+    let placed = meta
+        .reserve_and_persist_create(ws.clone(), &[host], 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (details[0].reason, placed),
+        ("cpu_full", CreateDisposition::Queued)
+    );
+
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 2;
+    let details = meta
+        .placement_no_fit_details(&[host], 8192, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "unmeasured");
+    assert_eq!(
+        meta.reserve_and_persist_create(ws.clone(), &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
+    assert_eq!(meta.per_host_reserved().await.unwrap()[&host].vcpus, 4);
+
+    hb.total_vcpus = 0;
+    meta.touch_host_heartbeat(host, hb).await.unwrap();
+    ws.session_id = SessionId::new();
+    ws.cpu_budget_vcpus = 8;
+    assert_eq!(
+        meta.reserve_and_persist_create(ws, &[host], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(host)
+    );
+}
+
 /// The register-time rehydrate list and the reconcile assignment list are
 /// one listing: every VM-resident state with a bound sandbox on the host.
 /// A rung-parked `Evicting` survivor and a `Created` survivor are as
@@ -5617,6 +5725,10 @@ conformance!(
     super::events_limit_clamps_identically_both_directions
 );
 conformance!(t_placement_no_fit, super::placement_no_fit);
+conformance!(
+    t_a_host_without_reported_cores_has_no_cpu_gate,
+    super::a_host_without_reported_cores_has_no_cpu_gate
+);
 conformance!(
     t_enabled_image_config_update,
     super::enabled_image_config_update

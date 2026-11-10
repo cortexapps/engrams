@@ -559,14 +559,70 @@ pub struct HostHeartbeat {
     pub lease_renew_until: Option<DateTime<Utc>>,
 }
 
-/// Per-host reserved memory and CPU: Σ over the memory-reserving session
-/// states of `mem_budget_mib` and `cpu_budget_vcpus`. The read-side twin
-/// of `reserve_placement`'s in-transaction aggregate, for the resume/evac
-/// picker and the fleet view.
-#[derive(Clone, Copy, Debug, Default)]
+/// Per-host reserved memory and CPU: Σ of `mem_budget_mib` and
+/// `cpu_budget_vcpus` over the sessions in a memory-reserving state (a
+/// parked VM included), the capturing VMs and the reserving teleport legs
+/// on the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReservedBudget {
     pub mem_mib: i64,
     pub vcpus: i64,
+}
+
+/// One host's resource accounting: what the host can hold, what the
+/// coordinator has reserved on it, and what is left. Every decision that
+/// asks "is there room on this host" reads it: placement (create, resume,
+/// queue, capture, teleport, drain guard), parking, and the fleet's
+/// autoscaling signal.
+///
+/// The host measures `allocatable_mib`: the RAM a reservation may use,
+/// with every resident VM's memory added back, so a VM's RAM counts once,
+/// in `reserved`. The coordinator owns `reserved`. Free is the
+/// difference: a parked VM keeps its reservation until it descends, so
+/// it is not free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostHeadroom {
+    /// Host-measured `allocatable_mib`; `<= 0` means unmeasured (a host
+    /// that has not sampled its RAM yet).
+    pub allocatable_mib: i64,
+    /// `total_vcpus × overcommit` ([`host_cpu_budget`]); `0` means the
+    /// host has not reported its cores.
+    pub cpu_budget: i64,
+    pub reserved: ReservedBudget,
+}
+
+impl HostHeadroom {
+    pub fn of(host: &HostRecord, reserved: ReservedBudget) -> Self {
+        Self {
+            allocatable_mib: host.utilization.allocatable_mib as i64,
+            cpu_budget: host_cpu_budget(host.total_vcpus),
+            reserved,
+        }
+    }
+
+    /// Whether the host has measured its RAM. Unmeasured RAM does not
+    /// gate placement; a reported CPU budget still gates. A host with
+    /// unmeasured RAM never parks a session.
+    pub fn measured(&self) -> bool {
+        self.allocatable_mib > 0
+    }
+
+    /// Unreserved RAM. Only meaningful when [`Self::measured`].
+    pub fn free_mib(&self) -> i64 {
+        self.allocatable_mib - self.reserved.mem_mib
+    }
+
+    /// Unreserved vCPU budget; `None` when the host reports no cores.
+    pub fn free_vcpus(&self) -> Option<i64> {
+        (self.cpu_budget > 0).then(|| self.cpu_budget - self.reserved.vcpus)
+    }
+
+    /// Whether a reservation of `mem_mib` and `vcpus` fits now. An
+    /// unmeasured RAM figure or an unreported core count does not gate.
+    pub fn fits(&self, mem_mib: i64, vcpus: i64) -> bool {
+        (!self.measured() || self.free_mib() >= mem_mib)
+            && self.free_vcpus().is_none_or(|free| free >= vcpus)
+    }
 }
 
 /// ADR 0048: the CPU overcommit factor. The host CPU budget is
@@ -948,5 +1004,44 @@ mod retirement_tests {
             assert_eq!(b.kind(), kind);
             assert_eq!(b.count(), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::{HostHeadroom, ReservedBudget};
+
+    fn room(allocatable_mib: i64, cpu_budget: i64, mem_mib: i64, vcpus: i64) -> HostHeadroom {
+        HostHeadroom {
+            allocatable_mib,
+            cpu_budget,
+            reserved: ReservedBudget { mem_mib, vcpus },
+        }
+    }
+
+    #[test]
+    fn free_is_allocatable_less_reserved_in_both_dimensions() {
+        let r = room(32_768, 32, 28_000, 30);
+        assert_eq!(r.free_mib(), 4_768);
+        assert_eq!(r.free_vcpus(), Some(2));
+        assert!(r.fits(4_096, 2));
+        assert!(!r.fits(8_192, 2), "RAM binds");
+        assert!(!r.fits(4_096, 4), "CPU binds");
+    }
+
+    #[test]
+    fn an_unmeasured_host_does_not_gate_placement() {
+        let r = room(0, 0, 0, 0);
+        assert!(!r.measured());
+        assert!(
+            r.fits(65_536, 64),
+            "unmeasured RAM and unreported cores do not gate"
+        );
+        assert_eq!(room(32_768, 0, 0, 0).free_vcpus(), None);
+    }
+
+    #[test]
+    fn an_over_reserved_host_has_negative_free_ram() {
+        assert_eq!(room(60_000, 0, 70_000, 0).free_mib(), -10_000);
     }
 }
