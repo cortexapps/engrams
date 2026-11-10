@@ -90,7 +90,10 @@ class HelperGate(unittest.TestCase):
         self.assertIn('shasum -a 256 engram-sandbox-netstack > SHA256SUMS', producer)
         self.assertIn('name: sandbox-netstack-${{ matrix.platform }}', producer)
         self.assertIn('if-no-files-found: error', producer)
-        self.assertEqual(workflow.count("-s .github/scripts/tests -p 'test_mcp*.py'"), 2)
+        discovery = "python3 -m unittest discover -s .github/scripts/tests -p 'test_mcp*.py'"
+        self.assertEqual(workflow.count(discovery), 1)
+        detector = workflow.split('  detect:', 1)[1].split('      - name: Detect changed lanes', 1)[0]
+        self.assertIn(f'run: {discovery}', detector)
 
 
 if __name__ == '__main__':
