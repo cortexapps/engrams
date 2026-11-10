@@ -287,6 +287,11 @@ pub struct PendingCheckpoint {
     role: DiskRole,
     snapshot: Volume,
     previous: ManifestRef,
+    /// The live volume held its whole manifest when the snapshot was
+    /// taken: it was not hydrating. Only such a snapshot can become a
+    /// checkpoint volume; a snapshot of a hydrating volume still shows
+    /// the base where the copy had not reached.
+    whole: bool,
 }
 
 impl PendingCheckpoint {
@@ -1109,18 +1114,25 @@ impl SessionVolumes {
         let tmp = transient_name(sandbox, role);
         self.delete_if_present(&tmp).await?;
         let live = self.live(sandbox, role).await?;
+        // Read before the snapshot: a settle between the two only makes
+        // a whole snapshot count as partial, which costs one more
+        // checkpoint before the role has its checkpoint volume.
+        let whole = self.disk.hydration(&live.name).await? == Hydration::Settled;
         let snapshot = checkpoint_split::take(self.disk.as_ref(), &live, &tmp).await?;
         Ok(PendingCheckpoint {
             sandbox,
             role,
             snapshot,
             previous,
+            whole,
         })
     }
 
     /// The checkpoint a `take` left unpublished, found by name: a new
     /// process redrives the publish after a crash. `NotFound` when
-    /// there is none.
+    /// there is none. Whether the volume was hydrating at the take is
+    /// not recorded, so the snapshot never becomes the first checkpoint
+    /// volume of a role brought up on a hydrating device.
     pub async fn pending(
         &self,
         sandbox: SandboxId,
@@ -1133,6 +1145,7 @@ impl SessionVolumes {
             role,
             snapshot,
             previous,
+            whole: false,
         })
     }
 
@@ -1175,6 +1188,7 @@ impl SessionVolumes {
             role,
             snapshot,
             previous,
+            whole: true,
         })
     }
 
@@ -1220,18 +1234,20 @@ impl SessionVolumes {
     /// A role with no checkpoint volume is on a hydrating device, and
     /// `previous` is its destination's manifest: the upload lays the
     /// blocks that changed since the base over it
-    /// ([`checkpoint_split::upload_hydrating`]). While the device still
-    /// hydrates, the destination takes the published manifest's name
-    /// and the snapshot goes, so the names stay the record and no
-    /// checkpoint volume exists before the settle; once settled, the
-    /// snapshot becomes the checkpoint volume and the destination and
-    /// base names go with the layout they described.
+    /// ([`checkpoint_split::upload_hydrating`]). A snapshot taken while
+    /// the device hydrated holds base bytes where the copy had not
+    /// reached, so it goes, and the destination takes the published
+    /// manifest's name: the names stay the record and no checkpoint
+    /// volume exists yet. A snapshot taken after the settle becomes the
+    /// checkpoint volume, and the destination and base names go with
+    /// the layout they described.
     pub async fn publish(&self, pending: PendingCheckpoint) -> io::Result<ManifestRef> {
         let PendingCheckpoint {
             sandbox,
             role,
             snapshot,
             previous,
+            whole,
         } = pending;
         let previous_manifest = self.manifest(previous).await?;
         let previous_name = checkpoint_name(sandbox, role, previous);
@@ -1301,19 +1317,17 @@ impl SessionVolumes {
                 self.disk.rename(&tmp, &published).await?;
                 self.disk.delete(&previous_name).await?;
             }
-            Some((dest, base)) => match self.disk.hydration(&live_name(sandbox, role)).await? {
-                Hydration::Hydrating { .. } => {
-                    self.disk
-                        .rename(&dest, &dest_name(sandbox, role, next))
-                        .await?;
-                    self.disk.delete(&tmp).await?;
-                }
-                Hydration::Settled => {
-                    self.disk.rename(&tmp, &published).await?;
-                    self.disk.delete(&dest).await?;
-                    self.disk.delete(&base).await?;
-                }
-            },
+            Some((dest, base)) if whole => {
+                self.disk.rename(&tmp, &published).await?;
+                self.disk.delete(&dest).await?;
+                self.disk.delete(&base).await?;
+            }
+            Some((dest, _)) => {
+                self.disk
+                    .rename(&dest, &dest_name(sandbox, role, next))
+                    .await?;
+                self.disk.delete(&tmp).await?;
+            }
         }
         Ok(next)
     }
@@ -2880,6 +2894,62 @@ mod tests {
         );
         r.volumes.release(resumed).await.unwrap();
         assert!(r.volumes.first_touch(resumed, DiskRole::Root).is_empty());
+    }
+
+    /// Base [1, 2, 3], wanted [1, 9, 8]. A snapshot taken when only
+    /// chunk 1 is copied shows the base's 3 in chunk 2. The volume
+    /// settles before the publish: the manifest is the wanted disk, and
+    /// the snapshot does not become the checkpoint volume a resume on
+    /// this host would boot. The next checkpoint's snapshot does.
+    #[tokio::test]
+    async fn a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume() {
+        let r = lazy_rig();
+        let image = staged_image(&r, &[1, 2, 3]).await;
+        let first = SandboxId::new();
+        let p = r.volumes.provision(first, fork(image), None).await.unwrap();
+        write_byte(&p.root, 1, 9).await;
+        write_byte(&p.root, 2, 8).await;
+        let wanted = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.release(first).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+
+        let resumed = SandboxId::new();
+        let source = Source::Continue {
+            manifest: wanted,
+            first_touch: vec![],
+        };
+        r.volumes.provision(resumed, source, None).await.unwrap();
+        let pending = r.volumes.take(resumed, DiskRole::Root).await.unwrap();
+        assert_eq!(
+            bytes_at(&pending.snapshot().path).await,
+            vec![1, 9, 3],
+            "the snapshot holds the base where the copy has not reached"
+        );
+        settled(&r, resumed, DiskRole::Root).await;
+
+        let mid = r.volumes.publish(pending).await.unwrap();
+        assert_eq!(manifest_bytes(&r, mid).await, vec![1, 9, 8]);
+        assert_eq!(
+            checkpoints_of(&r, resumed, DiskRole::Root).await,
+            vec![],
+            "no checkpoint volume from a partial snapshot"
+        );
+        assert!(names(&r)
+            .await
+            .contains(&dest_name(resumed, DiskRole::Root, mid).to_string()));
+
+        let after = r.volumes.checkpoint(resumed, DiskRole::Root).await.unwrap();
+        assert_eq!(
+            checkpoints_of(&r, resumed, DiskRole::Root).await,
+            vec![after]
+        );
+        let kept = r
+            .volumes
+            .disk()
+            .open(&checkpoint_name(resumed, DiskRole::Root, after))
+            .await
+            .unwrap();
+        assert_eq!(bytes_at(&kept.path).await, vec![1, 9, 8]);
     }
 
     /// A live move carries the blocks changed since the checkpoint
