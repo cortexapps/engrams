@@ -489,6 +489,10 @@ impl McpAuthority {
             bundle.access_token = grant.access_token;
             bundle.refresh_token = grant.refresh_token.or(Some(refresh_token));
             bundle.expires_at = grant.expires_at;
+            if let Some(account) = grant.account {
+                bundle.provider_account = Some(account);
+                bundle.identity_source = "provider_response".into();
+            }
             self.manager
                 .meta
                 .complete_mcp_refresh(self.credential(&bundle).await?, &claim)

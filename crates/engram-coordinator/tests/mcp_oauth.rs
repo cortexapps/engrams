@@ -370,6 +370,59 @@ async fn provider_account_change_and_scope_expansion_fail_refresh() {
     }
 }
 #[tokio::test]
+async fn account_first_observed_during_refresh_remains_pinned() {
+    let mut known = grant("known-account");
+    known["account"] = json!("account-a");
+    let mut changed = grant("changed-account");
+    changed["account"] = json!("account-b");
+    let f = fixture(vec![
+        changed,
+        grant("account-omitted"),
+        known,
+        grant("initial"),
+    ]);
+    let initial = f
+        .authority
+        .callback(&callback(&begin(&f).await))
+        .await
+        .unwrap();
+    for token in ["known-account", "account-omitted"] {
+        f.clock.advance(std::time::Duration::from_secs(61));
+        assert_eq!(
+            f.replica.lease(&lease(&f, &initial)).await.unwrap().value,
+            format!("Bearer {token}")
+        );
+        let current = f
+            .authority
+            .status(&f.change.connection_id, &initial.reference)
+            .await
+            .unwrap();
+        assert_eq!(current.context, initial.context);
+        assert_eq!(current.reference, initial.reference);
+    }
+    f.clock.advance(std::time::Duration::from_secs(61));
+    assert!(matches!(
+        f.authority.lease(&lease(&f, &initial)).await,
+        Err(McpError::Denied)
+    ));
+    assert!(matches!(
+        f.replica.lease(&lease(&f, &initial)).await,
+        Err(McpError::Unavailable)
+    ));
+    assert_eq!(
+        f.provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["kind"] == "token")
+            .count(),
+        4,
+        "a rejected rotating exchange must not be retried"
+    );
+}
+
+#[tokio::test]
 async fn confidential_secret_rotation_fences_oauth_even_without_orchestrator_update() {
     use engram_core::types::org_secret::McpSecretRole;
     let f = fixture_with_client(vec![grant("token")], true);
