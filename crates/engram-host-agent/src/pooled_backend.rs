@@ -2050,9 +2050,8 @@ impl PooledBackend {
         let manifest = metadata.disk_manifest.ok_or_else(|| {
             SandboxError::MemoryImageUnusable("snapshot has no disk manifest".into())
         })?;
-        let base = metadata.base_disk_manifest;
         let root = if fork_disk {
-            Source::Fork { manifest, base }
+            Source::Fork { manifest }
         } else {
             let first_touch = match (read_trace_lineage(src).await, self.chunk_store.as_ref()) {
                 (Some(session), Some(store)) => {
@@ -2063,7 +2062,6 @@ impl PooledBackend {
             };
             Source::Continue {
                 manifest,
-                base,
                 first_touch,
             }
         };
@@ -2082,7 +2080,6 @@ impl PooledBackend {
             }
             (Some(manifest), _) => Some(Source::Continue {
                 manifest,
-                base: None,
                 first_touch: Vec::new(),
             }),
             (None, _) if !fresh && !sidecar.base_capture => {
@@ -4739,7 +4736,6 @@ impl SandboxBackend for PooledBackend {
             let root = match spec.rootfs_manifest {
                 Some(manifest) => Source::Continue {
                     manifest,
-                    base: None,
                     first_touch: Vec::new(),
                 },
                 None => {
@@ -4767,7 +4763,6 @@ impl SandboxBackend for PooledBackend {
             let swap = match (spec.swap_manifest, spec.swap_mib.filter(|m| *m > 0)) {
                 (Some(manifest), _) => Some(Source::Continue {
                     manifest,
-                    base: None,
                     first_touch: Vec::new(),
                 }),
                 (None, Some(mib)) => Some(Source::Empty {

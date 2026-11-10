@@ -44,7 +44,9 @@ use uuid::Uuid;
 use crate::disk::{
     Capacity, Hydration, SessionDisk, SourceDevice, SourceServer, Volume, VolumeName,
 };
-use crate::disk_flows::{checkpoint_split, hydration_plan, prefix_hashes, shape_matches, stage};
+use crate::disk_flows::{
+    checkpoint_split, hydration_plan, prefix_hashes, shape_matches, shared_chunks, stage,
+};
 use crate::image_volumes::{self, ImageVolumes};
 
 const LIVE_PREFIX: &str = "sb-";
@@ -239,17 +241,13 @@ pub enum Source {
     Image { manifest: ManifestRef },
     /// A manifest many sandboxes share: the volume starts a new lineage
     /// that holds a copy of it.
-    Fork {
-        manifest: ManifestRef,
-        base: Option<ManifestRef>,
-    },
+    Fork { manifest: ManifestRef },
     /// The sandbox's own manifest: the volume continues its lineage.
     /// `first_touch` lists the chunks the guest read before the copy
     /// reached them on its last hydrating restore, in order; the ones
     /// this restore must copy are fetched first.
     Continue {
         manifest: ManifestRef,
-        base: Option<ManifestRef>,
         first_touch: Vec<u32>,
     },
     /// Zeros, in a new lineage.
@@ -486,7 +484,7 @@ impl SessionVolumes {
                 let live = self.commit_live(&tmp, sandbox, role, lineage).await?;
                 (live, lineage, StagePath::ImageFork)
             }
-            Source::Fork { manifest, base } => {
+            Source::Fork { manifest } => {
                 let wanted = self.manifest(manifest).await?;
                 let lineage = self.new_lineage(&wanted).await?;
                 match self.staged(manifest).await {
@@ -496,7 +494,7 @@ impl SessionVolumes {
                         (live, lineage, StagePath::StagedSnapshot)
                     }
                     None => {
-                        let base = self.image_base(base).await;
+                        let base = self.nearest_base(&wanted, None).await?;
                         let (live, path) = self
                             .bring_up(
                                 fill,
@@ -516,7 +514,6 @@ impl SessionVolumes {
             }
             Source::Continue {
                 manifest,
-                base,
                 first_touch,
             } => match self.kept(sandbox, role, manifest).await? {
                 Some((owner, volume, _, held)) if held == manifest => {
@@ -526,19 +523,7 @@ impl SessionVolumes {
                 }
                 kept => {
                     let wanted = self.manifest(manifest).await?;
-                    let base = match kept {
-                        Some((owner, volume, held_manifest, held))
-                            if volume.size_bytes == wanted.total_bytes =>
-                        {
-                            Some(Base {
-                                volume,
-                                manifest: held_manifest,
-                                manifest_ref: held,
-                                kept_by: Some(owner),
-                            })
-                        }
-                        _ => self.image_base(base).await,
-                    };
+                    let base = self.nearest_base(&wanted, kept).await?;
                     let (live, path) = self
                         .bring_up(
                             fill,
@@ -796,16 +781,50 @@ impl SessionVolumes {
         Ok(live)
     }
 
-    /// The staged volume of `image` as a base, when this host has it.
-    async fn image_base(&self, image: Option<ManifestRef>) -> Option<Base> {
-        let image = image?;
-        let (volume, manifest) = self.staged(image).await?;
-        Some(Base {
-            volume,
-            manifest,
-            manifest_ref: image,
-            kept_by: None,
-        })
+    /// The volume on this host that holds the most of `wanted` in
+    /// place, as a base: the lineage's `kept` checkpoint or a staged
+    /// image version, whichever shares more chunks with `wanted` at the
+    /// same offset (the kept one on a tie). No snapshot names it: an
+    /// image whose tag moved since the session began is as good a base
+    /// as the chunks it still shares. `None` when no volume of
+    /// `wanted`'s shape shares a chunk.
+    async fn nearest_base(
+        &self,
+        wanted: &Manifest,
+        kept: Option<(SandboxId, Volume, Manifest, ManifestRef)>,
+    ) -> io::Result<Option<Base>> {
+        let mut candidates: Vec<Base> = kept
+            .into_iter()
+            .map(|(owner, volume, manifest, manifest_ref)| Base {
+                volume,
+                manifest,
+                manifest_ref,
+                kept_by: Some(owner),
+            })
+            .collect();
+        for image in image_volumes::staged(&self.disk.list().await?) {
+            if let Some((volume, manifest)) = self.staged(image).await {
+                candidates.push(Base {
+                    volume,
+                    manifest,
+                    manifest_ref: image,
+                    kept_by: None,
+                });
+            }
+        }
+        let mut best: Option<(usize, Base)> = None;
+        for base in candidates {
+            if base.volume.size_bytes != wanted.total_bytes {
+                continue;
+            }
+            let Some(shared) = shared_chunks(wanted, &base.manifest) else {
+                continue;
+            };
+            if shared > best.as_ref().map_or(0, |(most, _)| *most) {
+                best = Some((shared, base));
+            }
+        }
+        Ok(best.map(|(_, base)| base))
     }
 
     /// The newest checkpoint volume of `role` that `sandbox` or a released
@@ -1666,10 +1685,7 @@ mod tests {
     }
 
     fn fork(image: ManifestRef) -> Source {
-        Source::Fork {
-            manifest: image,
-            base: None,
-        }
+        Source::Fork { manifest: image }
     }
 
     /// Publish an image whose chunk `i` holds byte `pattern[i]` (0 is a
@@ -1866,14 +1882,7 @@ mod tests {
 
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         assert_eq!(bytes_at(&p.root).await, vec![1, 0, 3]);
@@ -1912,14 +1921,7 @@ mod tests {
         let first = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                first,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(first, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         write_byte(&p.root, 1, 9).await;
@@ -1933,7 +1935,6 @@ mod tests {
                 second,
                 Source::Continue {
                     manifest: published,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -1954,7 +1955,6 @@ mod tests {
                 third,
                 Source::Continue {
                     manifest: published,
-                    base: None,
                     first_touch: vec![],
                 },
                 None,
@@ -2004,7 +2004,6 @@ mod tests {
                 second,
                 Source::Continue {
                     manifest: published,
-                    base: None,
                     first_touch: vec![],
                 },
                 None,
@@ -2023,14 +2022,7 @@ mod tests {
         let first = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                first,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(first, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         write_byte(&p.root, 1, 9).await;
@@ -2045,7 +2037,6 @@ mod tests {
                     sandbox,
                     Source::Fork {
                         manifest: published,
-                        base: Some(image),
                     },
                     None,
                 )
@@ -2074,14 +2065,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         write_byte(&p.root, 0, 7).await;
@@ -2105,10 +2089,7 @@ mod tests {
             .volumes
             .provision(
                 sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
+                Source::Fork { manifest: image },
                 Some(Source::Empty {
                     size_bytes: CHUNK * 2,
                 }),
@@ -2140,13 +2121,9 @@ mod tests {
             .volumes
             .provision(
                 sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
+                Source::Fork { manifest: image },
                 Some(Source::Continue {
                     manifest: ManifestRef::new(),
-                    base: None,
                     first_touch: vec![],
                 }),
             )
@@ -2166,14 +2143,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
@@ -2209,7 +2179,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: v3,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2226,14 +2195,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         write_byte(&p.root, 0, 5).await;
@@ -2255,14 +2217,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         let half = CHUNK / 2;
@@ -2321,14 +2276,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2376,14 +2324,7 @@ mod tests {
         let sandbox = SandboxId::new();
         let p = r
             .volumes
-            .provision(
-                sandbox,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(sandbox, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, sandbox, DiskRole::Root).await[0];
@@ -2421,23 +2362,13 @@ mod tests {
         r.volumes
             .provision(
                 live,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
+                Source::Fork { manifest: image },
                 Some(Source::Empty { size_bytes: CHUNK }),
             )
             .await
             .unwrap();
         r.volumes
-            .provision(
-                dead,
-                Source::Fork {
-                    manifest: image,
-                    base: None,
-                },
-                None,
-            )
+            .provision(dead, Source::Fork { manifest: image }, None)
             .await
             .unwrap();
         let lineage = checkpoints_of(&r, live, DiskRole::Root).await[0];
@@ -2567,7 +2498,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: published,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2609,7 +2539,6 @@ mod tests {
                 destination,
                 Source::Continue {
                     manifest: published,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2654,7 +2583,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: next,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2728,7 +2656,6 @@ mod tests {
                 sandbox,
                 Source::Continue {
                     manifest: published,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2792,7 +2719,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: published,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2880,7 +2806,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: wanted,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -2978,7 +2903,6 @@ mod tests {
                 resumed,
                 Source::Continue {
                     manifest: wanted,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -3050,7 +2974,6 @@ mod tests {
                 sandbox,
                 Source::Continue {
                     manifest: next,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -3090,7 +3013,6 @@ mod tests {
                 sandbox,
                 Source::Continue {
                     manifest: next,
-                    base: Some(image),
                     first_touch: vec![],
                 },
                 None,
@@ -3127,12 +3049,70 @@ mod tests {
         assert!(restarted.reattach(sandbox).await.unwrap().is_empty());
     }
 
-    /// Without a base on the host, the destination starts from zeros and
-    /// every listed chunk is the delta.
+    /// The session began on image [1, 2, 3, 4, 5] and holds
+    /// [1, 2, 3, 9, 5]. The image's tag moved: the host stages only
+    /// [1, 2, 3, 4, 6] now, and a second image that shares one chunk.
+    /// The resume starts from the moved image, which holds three of the
+    /// session's chunks in place, and copies the other two.
+    #[tokio::test]
+    async fn a_resume_starts_from_the_staged_volume_that_shares_the_most() {
+        let r = lazy_rig();
+        let began_on = staged_image(&r, &[1, 2, 3, 4, 5]).await;
+        let first = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(first, fork(began_on), None)
+            .await
+            .unwrap();
+        write_byte(&p.root, 3, 9).await;
+        let wanted = r.volumes.checkpoint(first, DiskRole::Root).await.unwrap();
+        r.volumes.release(first).await.unwrap();
+        r.volumes.purge(first).await.unwrap();
+
+        let other = staged_image(&r, &[1, 7, 7, 7, 7]).await;
+        let moved = staged_image(&r, &[1, 2, 3, 4, 6]).await;
+        r.volumes.images().reconcile(&[other, moved]).await.unwrap();
+        assert!(!names(&r)
+            .await
+            .contains(&image_volumes::volume_name(began_on).to_string()));
+
+        let resumed = SandboxId::new();
+        let p = r
+            .volumes
+            .provision(
+                resumed,
+                Source::Continue {
+                    manifest: wanted,
+                    first_touch: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.root_stage, StagePath::Lazy);
+        assert!(
+            names(&r)
+                .await
+                .contains(&base_name(resumed, DiskRole::Root, Some(moved)).to_string()),
+            "the base is the staged image that shares the most chunks"
+        );
+        assert_eq!(
+            r.volumes.first_touch(resumed, DiskRole::Root),
+            vec![3, 4],
+            "the copy brings only the chunks the moved image lacks (the fake reports the delta)"
+        );
+        settled(&r, resumed, DiskRole::Root).await;
+        assert_eq!(bytes_at(&p.root).await, vec![1, 2, 3, 9, 5]);
+        r.volumes.release(resumed).await.unwrap();
+    }
+
+    /// With no volume on the host that shares a chunk, the destination
+    /// starts from zeros and every listed chunk is the delta.
     #[tokio::test]
     async fn a_lazy_resume_without_a_base_starts_from_zeros() {
         let r = lazy_rig();
         let image = staged_image(&r, &[1, 0, 3]).await;
+        r.volumes.images().reconcile(&[]).await.unwrap();
         let sandbox = SandboxId::new();
         let p = r
             .volumes
@@ -3140,7 +3120,6 @@ mod tests {
                 sandbox,
                 Source::Continue {
                     manifest: image,
-                    base: None,
                     first_touch: vec![],
                 },
                 None,

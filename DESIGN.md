@@ -231,8 +231,11 @@ the test named beside it.
   full rate the sync and snapshot stay under two seconds however much it wrote
   (`the_disk_pause_is_bounded_while_the_guest_writes_at_full_rate`).
 - A resume boots before its disk is copied in. The live volume is a dm-clone device over
-  a snapshot of the nearest base the host holds (the kept checkpoint volume, else the image
-  volume, else an empty volume); regions the base holds in final form are marked copied by
+  a snapshot of the nearest base the host holds: the kept checkpoint volume or staged image
+  version that shares the most chunks with the session's manifest at the same offset, so an
+  image whose tag moved still supplies the blocks it shares
+  (`a_resume_starts_from_the_staged_volume_that_shares_the_most`), or an empty volume when
+  none shares any; regions the base holds in final form are marked copied by
   a discard, and the kernel copies the rest in behind the running guest from a ublk source
   the host agent serves out of the fill engine. A guest read of a region the copy has not
   reached goes through the source at `Demand`; the chunks the guest read first on the

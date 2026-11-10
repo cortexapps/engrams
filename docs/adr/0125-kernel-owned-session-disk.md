@@ -182,8 +182,10 @@ thin-provisioning tools it calls at run time (`thin_dump`,
    readiness.
 3. **A session disk is a thin snapshot.** A fresh session's root disk
    is a snapshot of its image volume. A resumed session's root disk is
-   a snapshot of the nearest base this host holds (its kept checkpoint
-   volume, else the base image volume, else an empty volume) under a
+   a snapshot of the nearest base this host holds (the kept checkpoint
+   volume or staged image version that shares the most chunks with the
+   session's manifest at the same offset; an empty volume when none
+   shares any) under a
    dm-clone device that copies the difference to its manifest in
    behind the running guest; the guest starts at once and reads a
    region the copy has not reached through the device's source, a
@@ -713,6 +715,12 @@ thin-pool host and the reverse.
   checkpoint rule covers like a guest write. The heartbeat gains no
   field and `sandbox.json` records no device: the pool's names are the
   record, and a restart serves every hydrating volume again from them.
+  The base is chosen by content, not by name: the restore compares the
+  session's manifest with the kept checkpoint and every staged image
+  version and snapshots the one that holds the most chunks in place,
+  so an image whose tag moved since the session began still supplies
+  the blocks it shares. The snapshot's `base_disk_manifest` no longer
+  steers the disk.
 
 ## Facts this ADR establishes
 
@@ -760,6 +768,9 @@ names the test that guards each one. As landed, the guards are:
   `a_restart_serves_a_hydrating_volume_again`)
 - A role without a checkpoint volume moves by snapshot.
   (`a_role_without_a_checkpoint_volume_refuses_a_live_move`)
+- A resume starts from the volume on the host that shares the most
+  chunks with its manifest, whichever image version that is.
+  (`a_resume_starts_from_the_staged_volume_that_shares_the_most`)
 - The heartbeat carries observed facts only; no field asks the
   coordinator to take an action.
 

@@ -230,6 +230,14 @@ pub fn hydration_plan(wanted: &Manifest, base: Option<&Manifest>) -> io::Result<
     })
 }
 
+/// How many chunks of `wanted` a volume holding `base` already has in
+/// place: the same hash at the same offset. `None` when the two differ
+/// in shape, so the volume cannot be a base at all.
+pub(crate) fn shared_chunks(wanted: &Manifest, base: &Manifest) -> Option<usize> {
+    let delta = wanted.delta_from(base).ok()?;
+    Some(wanted.chunks.len() - delta.write.len())
+}
+
 /// The chunks of `first_touch` (guest reads of a hydrating volume, in
 /// order) that `delta` copies, as `wanted`'s hashes: what a restore
 /// fetches at `Prefix` before the copy reaches them. Chunks the base
@@ -659,6 +667,28 @@ mod tests {
                 .to_vec(),
             expected[1]
         );
+    }
+
+    #[test]
+    fn shared_chunks_counts_equal_hashes_at_equal_offsets() {
+        let disk = |bytes: &[u8]| Manifest {
+            chunk_size: ChunkSize::bytes(CHUNK),
+            chunks: bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b != 0)
+                .map(|(i, b)| ChunkRef {
+                    offset: i as u64 * CHUNK,
+                    hash: ChunkHash::of(&fill(*b)),
+                })
+                .collect(),
+            ..Manifest::empty(ManifestKind::Disk, CHUNK * bytes.len() as u64)
+        };
+        let wanted = disk(&[1, 2, 0, 4]);
+        assert_eq!(shared_chunks(&wanted, &disk(&[1, 2, 3, 9])), Some(2));
+        // The same bytes at another offset are not in place.
+        assert_eq!(shared_chunks(&wanted, &disk(&[2, 1, 0, 0])), Some(0));
+        assert_eq!(shared_chunks(&wanted, &disk(&[1, 2, 0])), None);
     }
 
     /// Reads of chunks 3, 0 and 4 came first; the copy brings 1 and 3,
