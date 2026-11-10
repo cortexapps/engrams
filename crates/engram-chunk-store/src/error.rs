@@ -115,6 +115,7 @@ impl ChunkStoreError {
             Self::Blob(b) => Self::Blob(match b {
                 BlobError::NotFound => BlobError::NotFound,
                 BlobError::Sdk(e) => BlobError::Sdk(e.to_string().into()),
+                BlobError::Throttled(e) => BlobError::Throttled(e.to_string().into()),
                 BlobError::Config(m) => BlobError::Config(m.clone()),
                 BlobError::Protocol(m) => BlobError::Protocol(m.clone()),
                 BlobError::Io(e) => BlobError::Io(io(e)),
