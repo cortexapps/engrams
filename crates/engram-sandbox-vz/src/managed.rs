@@ -116,9 +116,7 @@ impl PreparedManagedVz {
         }
         self.started = true;
         // Preserve the exact source through an unknown start, Drop or close.
-        self._files
-            .retain
-            .store(true, std::sync::atomic::Ordering::Release);
+        self._files.retain_source();
         self.failed = true;
         self.vm.start().await?;
         let dir = engram_core::socket::short_socket_dir();
@@ -253,9 +251,7 @@ impl PreparedManagedVz {
         if self.failed {
             return Err(io::Error::other("managed capture source unavailable").into());
         }
-        self._files
-            .retain
-            .store(true, std::sync::atomic::Ordering::Release);
+        self._files.retain_source();
         if !self.started {
             if let Some(epoch) = self.released_epoch {
                 self.check_ready(epoch).await?;
@@ -264,14 +260,14 @@ impl PreparedManagedVz {
             }
         }
         self.failed = true;
-        if self.started {
-            self.vm.pause().await?;
-            self.vm.stop().await?;
-        }
-        if let Some(mut bridge) = self.bridge.take() {
-            bridge.stop().await;
-        }
-        self.helper.close().await?;
+        let paused = if self.started {
+            self.vm.pause().await.map_err(SandboxError::from)
+        } else {
+            Ok(())
+        };
+        let cleanup = self.stop_resources().await;
+        paused?;
+        cleanup?;
         let source = self._files.path.join("rootfs.ext4");
         let destination = destination.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -281,20 +277,55 @@ impl PreparedManagedVz {
         })
         .await
         .map_err(io::Error::other)??;
+        self._files.capture_exported();
         Ok(())
     }
-    /// Await owned process cleanup without blocking the executor. Drop starts
-    /// cleanup but does not wait for its result. Success does not acknowledge the proxy
-    /// policy barrier. Only that proxy can release its lease or poison its gate.
-    pub async fn close(mut self) -> Result<(), engram_core::SandboxError> {
-        self.failed = true;
-        if self.started {
-            let _ = self.vm.stop().await;
+    /// The host has durably recorded the exported file's exact hash and size.
+    pub fn capture_stored(&mut self) -> Result<(), SandboxError> {
+        self._files.capture_stored()?;
+        Ok(())
+    }
+
+    async fn stop_resources(&mut self) -> Result<(), SandboxError> {
+        let stopped = async {
+            if !self.vm.managed_attachment_closed().await {
+                self.vm.stop().await?;
+                if !self.vm.managed_attachment_closed().await {
+                    return Err(io::Error::other("managed VM stop was not confirmed").into());
+                }
+            }
+            self.started = false;
+            Ok::<_, SandboxError>(())
         }
+        .await;
         if let Some(mut bridge) = self.bridge.take() {
             bridge.stop().await;
         }
-        self.helper.close().await?;
+        self.connector = None;
+        let network = self.helper.close().await;
+        stopped?;
+        network?;
+        Ok(())
+    }
+
+    /// Await owned process cleanup without blocking the executor. Drop starts
+    /// cleanup but does not wait for its result. Success does not acknowledge the proxy
+    /// policy barrier. Only that proxy can release its lease or poison its gate.
+    pub async fn close(self) -> Result<(), engram_core::SandboxError> {
+        self.close_inner(false).await
+    }
+    /// An authenticated delete can release a known source after native cleanup.
+    pub async fn destroy(self) -> Result<(), engram_core::SandboxError> {
+        self.close_inner(true).await
+    }
+    async fn close_inner(mut self, destroy: bool) -> Result<(), SandboxError> {
+        let release = self._files.begin_close(destroy, self.failed);
+        self.failed = true;
+        self.stop_resources().await?;
+        if !release {
+            return Err(io::Error::other("managed capture source retained").into());
+        }
+        self._files.release().await?;
         Ok(())
     }
 }
@@ -452,11 +483,47 @@ fn configure_packet(socket: &std::os::unix::net::UnixDatagram) -> io::Result<()>
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum Retention {
+    Disposable,
+    Source,
+    Exported,
+    Stored,
+}
+
 struct PinnedFiles {
-    retain: std::sync::atomic::AtomicBool,
+    retention: Retention,
     path: std::path::PathBuf,
 }
 impl PinnedFiles {
+    fn retain_source(&mut self) {
+        self.retention = Retention::Source;
+    }
+    fn capture_exported(&mut self) {
+        self.retention = Retention::Exported;
+    }
+    fn capture_stored(&mut self) -> io::Result<()> {
+        match self.retention {
+            Retention::Exported | Retention::Stored => {
+                self.retention = Retention::Stored;
+                Ok(())
+            }
+            _ => Err(io::Error::other("managed capture export incomplete")),
+        }
+    }
+    fn begin_close(&mut self, destroy: bool, uncertain: bool) -> bool {
+        let release = matches!(self.retention, Retention::Disposable | Retention::Stored)
+            || (destroy && !uncertain);
+        // Cancellation or a failed native stop must retain even a prepared disk.
+        self.retain_source();
+        release
+    }
+    async fn release(&mut self) -> io::Result<()> {
+        tokio::fs::remove_dir_all(&self.path).await?;
+        self.retention = Retention::Disposable;
+        Ok(())
+    }
+
     fn prepare(
         work_dir: &Path,
         cfg: &crate::backend::VzConfig,
@@ -475,7 +542,7 @@ impl PinnedFiles {
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         let files = Self {
             path,
-            retain: std::sync::atomic::AtomicBool::new(false),
+            retention: Retention::Disposable,
         };
         files.pin(
             spec.rootfs_source
@@ -538,7 +605,7 @@ impl PinnedFiles {
 }
 impl Drop for PinnedFiles {
     fn drop(&mut self) {
-        if self.retain.load(std::sync::atomic::Ordering::Acquire) {
+        if !matches!(self.retention, Retention::Disposable) {
             return;
         }
         let _ = std::fs::remove_dir_all(&self.path);
@@ -549,6 +616,77 @@ impl Drop for PinnedFiles {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn approved_cleanup_releases_only_recorded_capture_or_known_destroy() {
+        for (destroy, uncertain, exported, recorded, released) in [
+            (true, false, false, false, true),
+            (false, false, false, false, false),
+            (true, true, false, false, false),
+            (true, true, true, false, false),
+            (false, true, true, true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, spec, artifact) = inputs(dir.path());
+            let mut files = PinnedFiles::prepare(
+                &dir.path().join("owned"),
+                &cfg,
+                &request,
+                &spec,
+                &artifact,
+                tempfile::tempdir().unwrap(),
+            )
+            .unwrap();
+            let source = files.path.clone();
+            files.retain_source();
+            assert!(files.capture_stored().is_err());
+            if exported {
+                files.capture_exported();
+            }
+            if recorded {
+                files.capture_stored().unwrap();
+            }
+            let authorized = files.begin_close(destroy, uncertain);
+            assert_eq!(authorized, released);
+            if authorized {
+                files.release().await.unwrap();
+            }
+            drop(files);
+            assert_eq!(!source.exists(), released);
+            assert_eq!(std::fs::read(dir.path().join("disk")).unwrap(), b"disk-a");
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_cleanup_and_file_removal_error_preserve_source() {
+        for removal_error in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, request, spec, artifact) = inputs(dir.path());
+            let mut files = PinnedFiles::prepare(
+                &dir.path().join("owned"),
+                &cfg,
+                &request,
+                &spec,
+                &artifact,
+                tempfile::tempdir().unwrap(),
+            )
+            .unwrap();
+            let source = files.path.clone();
+            files.retain_source();
+            assert!(files.begin_close(true, false));
+            if removal_error {
+                std::fs::remove_dir_all(&source).unwrap();
+                std::fs::write(&source, b"retained").unwrap();
+                assert_eq!(
+                    files.release().await.unwrap_err().kind(),
+                    io::ErrorKind::NotADirectory
+                );
+            }
+            // Native cleanup failure or cancellation must not grant file release.
+            drop(files);
+            assert!(source.exists());
+        }
+    }
     #[tokio::test]
     async fn proxy_stop_is_observed_before_any_helper_or_packet_work() {
         use tokio::io::AsyncWriteExt;
@@ -670,7 +808,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (cfg, request, spec, artifact) = inputs(dir.path());
-        let files = PinnedFiles::prepare(
+        let mut files = PinnedFiles::prepare(
             &dir.path().join("owned"),
             &cfg,
             &request,
@@ -680,9 +818,7 @@ mod tests {
         )
         .unwrap();
         let path = files.path.clone();
-        files
-            .retain
-            .store(true, std::sync::atomic::Ordering::Release);
+        files.retain_source();
         drop(files);
         assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
         std::fs::set_permissions(&artifact.path, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -900,7 +1036,7 @@ mod tests {
         let owned = dir.path().join("private");
         std::fs::create_dir(&owned).unwrap();
         let files = PinnedFiles {
-            retain: std::sync::atomic::AtomicBool::new(false),
+            retention: Retention::Disposable,
             path: owned.clone(),
         };
         let digest = hex::encode(Sha256::digest(b"disk-a"));

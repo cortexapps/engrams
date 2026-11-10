@@ -234,7 +234,7 @@ impl Owner {
             #[cfg(target_os = "linux")]
             Self::Firecracker(owner) => owner.capture_stored(),
             #[cfg(target_os = "macos")]
-            Self::Vz(_) => Ok(()),
+            Self::Vz(owner) => owner.capture_stored(),
         }
     }
     async fn close(self, destroy: bool) -> Result<(), SandboxError> {
@@ -261,9 +261,11 @@ impl Owner {
             }
             #[cfg(target_os = "macos")]
             Self::Vz(owner) => {
-                // VZ uses its existing close policy for both caller intents.
-                let _ = destroy;
-                (*owner).close().await
+                if destroy {
+                    (*owner).destroy().await
+                } else {
+                    (*owner).close().await
+                }
             }
         }
     }

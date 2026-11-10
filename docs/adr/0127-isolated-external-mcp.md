@@ -702,7 +702,10 @@ an applied-policy ACK. `ManagedRecoveryRequired` has an exact bounded gRPC
 status marker, but is not retirement proof; callers must read the exact Retired
 receipt. Later requests preserve that proof. Source retention latches before
 native start and survives unknown replies, Drop and close until explicit artifact
-cleanup. Explicit capture reserves its deterministic manifest
+cleanup. Both backends release a recorded capture source or an authorized known
+live source only after VM and network cleanup succeeds. VZ confirms the stopped
+attachment before file release; a stop or cleanup error retains the source.
+Explicit capture reserves its deterministic manifest
 before upload. Capture pauses and retires the source, syncs the disk, stores its
 hash and size, and uploads that exact cut. Retries use the same source key,
 capture ID and immutable manifest. A completed manifest write with a lost reply
