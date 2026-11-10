@@ -595,8 +595,7 @@ fn classify_no_fit(
             } else if free_vcpus < budget_vcpus {
                 "cpu_full"
             } else {
-                // Fits at read time — the pick ran earlier under FOR
-                // UPDATE and lost a race; honest label beats a lie.
+                // Capacity changed after the locked placement attempt.
                 "fits_now"
             };
             engram_core::traits::PlacementNoFit {
@@ -642,20 +641,33 @@ fn best_fit_measured(
     best.map(|(_, h)| h)
 }
 
-/// ADR 0046/0048/0081: the shared `FOR UPDATE` 2D pick every reserving
-/// placer runs — session create (`reserve_and_persist_create`), the
-/// queue scanner (`place_queued_session`), and capture reservation
-/// (`place_capture_job` / `reassign_capture_job`). Locks the candidate host rows in PK order
-/// so all placers (any replica) serialize on the overlap without
-/// deadlock, builds the fit map from host-measured `allocatable_mib`
-/// (0 = unmeasured → soft) + the vCPU budget, subtracts the reserved
-/// SUM — memory-reserving sessions UNION capturing enable jobs (ADR
-/// 0081: sessions and captures are mutually visible) — and best-fit
-/// chooses via [`choose_placement_host`].
-///
-/// `Ok(None)` = nothing fits (or no candidates); the caller decides
-/// queue-vs-reject and owns the commit/rollback — the lock is held for
-/// the REST of the caller's transaction.
+/// Placement locks hosts before sessions, including exact claim retries.
+async fn lock_placement_host(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    host: HostId,
+) -> Result<bool, MetaError> {
+    Ok(!lock_placement_hosts(tx, &[host.as_uuid()])
+        .await?
+        .is_empty())
+}
+
+/// Capacity writers serialize without blocking foreign-key KEY SHARE locks.
+async fn lock_placement_hosts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    hosts: &[Uuid],
+) -> Result<Vec<Uuid>, MetaError> {
+    sqlx::query_scalar("SELECT id FROM hosts WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE")
+        .bind(hosts)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)
+}
+
+/// Locks candidate hosts in ID order, then chooses the best two-dimensional fit.
+/// Host-measured memory and CPU budgets include reservations by sessions,
+/// captures and teleports. NO KEY UPDATE serializes capacity writers while
+/// allowing foreign-key checks from session rebinds. Locks last until commit;
+/// the caller decides whether no fit means queueing or refusal.
 async fn pick_host_2d(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cand: &[uuid::Uuid],
@@ -671,14 +683,9 @@ async fn pick_host_2d(
         SELECT id, allocatable_mib, total_vcpus
         FROM hosts
         WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
-        -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica)
-        -- locks the overlapping host rows in the SAME (PK) order, so a
-        -- burst can't lock {A,B} vs {B,A} and deadlock. The LockRows
-        -- executor node sits atop the sort, so rows are locked in id
-        -- order. (Load test: `deadlock detected` under concurrent
-        -- creates before this.)
+        -- Overlapping placers lock rows in the same primary-key order.
         ORDER BY id
-        FOR UPDATE
+        FOR NO KEY UPDATE
         "#,
     )
     .bind(cand)
@@ -1205,7 +1212,17 @@ impl MetadataStore for PostgresStore {
         &self,
         req: TeleportAdmitRequest,
     ) -> Result<TeleportAdmitOutcome, MetaError> {
+        let mut candidates: Vec<Uuid> = req
+            .pinned_dest
+            .map(|h| vec![h])
+            .unwrap_or(req.candidates)
+            .into_iter()
+            .map(|h| h.as_uuid())
+            .collect();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Policy-child creation locks candidate hosts before its parent session.
+        let locked = lock_placement_hosts(&mut tx, &candidates).await?;
+        candidates.retain(|host| locked.contains(host));
         let Some(session) = sqlx::query("SELECT status, host_id, sandbox_id FROM sessions WHERE id=$1 AND current_epoch=$2 FOR UPDATE")
             .bind(req.session_id.as_uuid()).bind(req.epoch).fetch_optional(&mut *tx).await.map_err(db_err)? else { return Ok(TeleportAdmitOutcome::Fenced) };
         let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM session_teleports WHERE session_id=$1 AND phase NOT IN ('done','aborted','failed'))")
@@ -1228,20 +1245,7 @@ impl MetadataStore for PostgresStore {
                 "active session has no source binding".into(),
             ));
         };
-        let mut candidates: Vec<Uuid> = req
-            .pinned_dest
-            .map(|h| vec![h])
-            .unwrap_or(req.candidates)
-            .into_iter()
-            .map(|h| h.as_uuid())
-            .filter(|h| *h != source)
-            .collect();
-        // Lock before counting open moves. Every placement writer uses this order.
-        sqlx::query("SELECT id FROM hosts WHERE id=ANY($1) ORDER BY id FOR UPDATE")
-            .bind(&candidates)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        candidates.retain(|host| *host != source);
         let capped: Vec<Uuid> = sqlx::query_scalar("SELECT dest_host_id FROM session_teleports WHERE dest_host_id=ANY($1) AND phase NOT IN ('done','aborted','failed') GROUP BY dest_host_id HAVING COUNT(*) >= $2")
             .bind(&candidates).bind(i64::from(req.max_open_per_dest)).fetch_all(&mut *tx).await.map_err(db_err)?;
         candidates.retain(|h| req.max_open_per_dest > 0 && !capped.contains(h));
@@ -1783,18 +1787,8 @@ impl MetadataStore for PostgresStore {
             affinity_len
         };
 
-        // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
-        // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
-        // pick (now shared with `place_queued_session` and ADR 0084's
-        // `place_capture_job` / `reassign_capture_job`) — extended below so the SAME transaction
-        // also writes the satellites instead of stopping at the bare row
-        // insert. The candidate host-row locks are held for the REST of the
-        // transaction, not just the pick + insert — `tx.commit()` is at the
-        // bottom of this function, after the sealed-secrets insert, the
-        // per-capability insert loop, and the integration-policy upsert all
-        // run on the same `tx`. A many-capability create serializes
-        // concurrent placers on that whole multi-round-trip critical
-        // section, not a sub-ms window.
+        // Creation satellites and the capacity reservation share one transaction.
+        // The host lock lasts until all satellites are written and committed.
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
         let picked: Option<uuid::Uuid> = pick_host_2d(
             &mut tx,
@@ -3042,8 +3036,7 @@ impl MetadataStore for PostgresStore {
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Same FOR UPDATE serialization + 2D fit as every reserving placer
-        // (shared `pick_host_2d`, ADR 0046/0048/0081).
+        // Capacity accounting uses the same row lock as every placement writer.
         let Some(picked) = pick_host_2d(
             &mut tx,
             &cand,
@@ -3235,11 +3228,8 @@ impl MetadataStore for PostgresStore {
         Ok(row.map(SessionId))
     }
 
-    /// Diagnostic twin of `pick_host_2d`, without the `FOR UPDATE`: same
-    /// fit-map construction (same status/cordon predicate, same reserved
-    /// SUM incl. capture jobs — R3 #722: a `pending` reserves
-    /// unconditionally, no crash-orphan gate), then the pure
-    /// [`classify_no_fit`]. Runs only on the no-capacity path.
+    /// Builds the placement fit map without row locks, then classifies refusal.
+    /// Runs only on the no-capacity path.
     async fn placement_no_fit_details(
         &self,
         candidates: &[HostId],

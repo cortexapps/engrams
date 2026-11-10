@@ -1,4 +1,4 @@
-//! Held-input and intent CAS. Gate then session locks; no external I/O in a transaction.
+//! Held-input and intent CAS. Gate, host, then session locks; no external I/O.
 use crate::{db_err, managed_create, PostgresStore};
 use engram_core::{
     types::{managed_boot::ManagedBootRecord, managed_bridge::*, session::SessionState},
@@ -208,6 +208,12 @@ impl PostgresStore {
         .await
         .map_err(db_err)?
         .ok_or_else(conflict)?;
+        let placement_host = match &c {
+            ManagedIntentAdvance::SelectHost(host) => {
+                Some((*host, crate::lock_placement_host(&mut tx, *host).await?))
+            }
+            _ => None,
+        };
         lock(&mut tx, sid.into()).await?;
         let v = sqlx::query_scalar(
             "SELECT record FROM session_managed_boot_intents WHERE intent_id=$1",
@@ -245,7 +251,10 @@ impl PostgresStore {
                 return Err(conflict());
             }
         }
-        if let ManagedIntentAdvance::SelectHost(host) = &c {
+        if let Some((host, present)) = placement_host {
+            if !present {
+                return Err(conflict());
+            }
             if crate::pick_host_2d(
                 &mut tx,
                 &[host.as_uuid()],

@@ -43,6 +43,7 @@ impl PostgresStore {
         let t = &k.context.target;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         crate::managed_operator_gate::require(&mut tx, k).await?;
+        let host_present = crate::lock_placement_host(&mut tx, t.host_id).await?;
         let s = sqlx::query("SELECT status,host_id,sandbox_id,binding_epoch,image_uri,mem_budget_mib,cpu_budget_vcpus FROM sessions WHERE id=$1 FOR UPDATE")
             .bind(t.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?.ok_or(MetaError::NotFound)?;
         if spec.image != s.try_get::<String, _>("image_uri").map_err(db_err)?
@@ -139,6 +140,9 @@ impl PostgresStore {
             &request.bootstrap_policy,
         )
         .map_err(MetaError::Conflict)?;
+        if !host_present {
+            return Err(conflict());
+        }
         let picked = pick_host_2d(
             &mut tx,
             &[t.host_id.as_uuid()],

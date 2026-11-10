@@ -12282,3 +12282,442 @@ async fn managed_history(ctx: &Ctx, sid: SessionId) -> serde_json::Value {
             .bind(sid.as_uuid()).fetch_one(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap()
     }
 }
+
+async fn wait_for_placement_lock(db: &engram_testkit::pg::TestDb, advisory: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND CASE WHEN $1 THEN wait_event='advisory' ELSE query LIKE '%hosts%' END)")
+                .bind(advisory).fetch_one(db.store.pool()).await.unwrap();
+            if waiting { return; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("placement did not reach its lock barrier");
+}
+
+async fn managed_placement_and_policy_child(ctx: &Ctx, claim: bool) {
+    use engram_core::types::managed_bridge::*;
+    engram_testkit::operator::publish_empty(ctx.meta.as_ref()).await;
+    let host = HostId::new();
+    ctx.meta
+        .upsert_host(host_record(
+            host,
+            &format!("placement-{claim}"),
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    let mut heartbeat = heartbeat_fixture();
+    heartbeat.utilization.allocatable_mib = 1024;
+    ctx.meta
+        .touch_host_heartbeat(host, heartbeat)
+        .await
+        .unwrap();
+    let mut parent = managed_creation_ws(SessionId::new());
+    let intent = bridge_intent(&parent);
+    if !claim {
+        parent.managed_boot_selection = Some(intent.selection.clone());
+    }
+    ctx.meta
+        .reserve_and_persist_create(parent.clone(), &[], 0)
+        .await
+        .unwrap();
+    if !claim {
+        ctx.meta
+            .begin_managed_boot_intent(intent.clone())
+            .await
+            .unwrap();
+    }
+    let request = managed_boot_request(&parent, host);
+    managed_operator_gate_fixture(ctx, &request.key, true).await;
+    let mut child = managed_creation_ws(SessionId::new());
+    child.managed_creation = None;
+    child.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent.session_id);
+    let child_id = child.session_id;
+    let mut barrier = None;
+    if let Some(db) = &ctx._pg {
+        // The child holds its host row before it can lock the policy parent.
+        let trigger = format!("CREATE OR REPLACE FUNCTION wait_policy_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='{}'::uuid THEN PERFORM pg_advisory_xact_lock(80402); END IF; RETURN NEW; END; $$", child_id);
+        sqlx::query(&trigger)
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER wait_policy_child BEFORE INSERT ON sessions FOR EACH ROW EXECUTE FUNCTION wait_policy_child()")
+            .execute(db.store.pool()).await.unwrap();
+        let mut tx = db.store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(80402)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        barrier = Some(tx);
+    }
+    let child_meta = ctx.meta.clone();
+    let child_task = tokio::spawn(async move {
+        child_meta
+            .reserve_and_persist_create(child, &[host], 0)
+            .await
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, true).await;
+    }
+    let retry = request.clone();
+    let parent_meta = ctx.meta.clone();
+    let parent_task = tokio::spawn(async move {
+        if claim {
+            parent_meta.claim_managed_boot(request).await.map(|_| ())
+        } else {
+            parent_meta
+                .advance_managed_boot_intent(
+                    &intent.intent_id,
+                    intent.revision,
+                    ManagedIntentAdvance::SelectHost(host),
+                )
+                .await
+                .map(|_| ())
+        }
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, false).await;
+    }
+    if let Some(tx) = barrier {
+        tx.commit().await.unwrap();
+    }
+    let (child_result, parent_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(child_task, parent_task)
+    })
+    .await
+    .expect("placement operations did not complete");
+    assert!(
+        child_result.as_ref().unwrap().is_ok(),
+        "policy child creation failed: {child_result:?}"
+    );
+    assert!(
+        parent_result.as_ref().unwrap().is_ok(),
+        "managed placement failed: {parent_result:?}"
+    );
+    assert_eq!(
+        ctx.meta.get_session(child_id).await.unwrap().host_id,
+        Some(host)
+    );
+    if claim {
+        assert_eq!(
+            ctx.meta.per_host_reserved().await.unwrap()[&host].mem_mib,
+            1024
+        );
+        assert!(
+            ctx.meta.claim_managed_boot(retry).await.is_ok(),
+            "an exact retry needs no extra capacity"
+        );
+    }
+    if let Some(db) = &ctx._pg {
+        sqlx::query("DROP TRIGGER wait_policy_child ON sessions")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+    }
+}
+async fn managed_placement_and_policy_child_do_not_deadlock(ctx: &Ctx) {
+    managed_placement_and_policy_child(ctx, false).await;
+}
+async fn managed_claim_and_policy_child_do_not_deadlock(ctx: &Ctx) {
+    managed_placement_and_policy_child(ctx, true).await;
+}
+
+conformance!(
+    t_managed_placement_and_policy_child_do_not_deadlock,
+    managed_placement_and_policy_child_do_not_deadlock
+);
+
+conformance!(
+    t_managed_claim_and_policy_child_do_not_deadlock,
+    managed_claim_and_policy_child_do_not_deadlock
+);
+
+async fn teleport_and_ordinary_policy_child(ctx: &Ctx, commit: bool) {
+    use engram_core::traits::CreateDisposition;
+    use engram_core::types::teleport::*;
+
+    let source = HostId::new();
+    let dest = HostId::new();
+    for host in [source, dest] {
+        ctx.meta
+            .upsert_host(host_record(host, "policy-teleport", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+        let mut heartbeat = heartbeat_fixture();
+        heartbeat.utilization.allocatable_mib = 4096;
+        ctx.meta
+            .touch_host_heartbeat(host, heartbeat)
+            .await
+            .unwrap();
+    }
+    let mut parent = managed_creation_ws(SessionId::new());
+    parent.managed_creation = None;
+    assert_eq!(
+        ctx.meta
+            .reserve_and_persist_create(parent.clone(), &[source], 0)
+            .await
+            .unwrap(),
+        CreateDisposition::Placed(source)
+    );
+    assert_eq!(
+        ctx.meta.managed_boot_open(parent.session_id).await.unwrap(),
+        None
+    );
+    let policy = ctx
+        .meta
+        .read_mcp_write_policy(parent.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        policy.write_eligibility,
+        engram_core::types::mcp_policy::WriteEligibility::ReadOnly
+    );
+    ctx.meta
+        .transition_session_created(parent.session_id, engram_core::SandboxId::new())
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(
+            parent.session_id,
+            SessionState::Active,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    let mut child = managed_creation_ws(SessionId::new());
+    child.managed_creation = None;
+    child.mcp_policy.as_mut().unwrap().parent_session_id = Some(parent.session_id);
+    let child_id = child.session_id;
+    let request = TeleportAdmitRequest {
+        id: engram_core::TeleportId::new(),
+        session_id: parent.session_id,
+        reason: TeleportReason::Ui,
+        epoch: 0,
+        candidates: vec![source, dest],
+        pinned_dest: Some(dest),
+        mem_budget_mib: parent.mem_budget_mib,
+        cpu_budget_vcpus: i64::from(parent.cpu_budget_vcpus),
+        max_open_per_dest: 1,
+        kind: TeleportKind::Live,
+    };
+    if commit {
+        admit_teleport(ctx, request.clone()).await;
+        for (from, to, patch) in [
+            (
+                TeleportPhase::Admitted,
+                TeleportPhase::Captured,
+                TeleportPatch::default(),
+            ),
+            (
+                TeleportPhase::Captured,
+                TeleportPhase::Restored,
+                TeleportPatch {
+                    dest_sandbox_id: Some(engram_core::SandboxId::new()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(ctx
+                .meta
+                .teleport_advance(request.id, from, to, patch, 0)
+                .await
+                .unwrap());
+        }
+    }
+    let mut barrier = None;
+    if let Some(db) = &ctx._pg {
+        // Pause the real create method after it locks H, before policy ancestry P.
+        let trigger = format!("CREATE FUNCTION wait_teleport_policy_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='{}'::uuid THEN PERFORM pg_advisory_xact_lock(80403); END IF; RETURN NEW; END; $$", child_id);
+        sqlx::query(&trigger)
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER wait_teleport_policy_child BEFORE INSERT ON sessions FOR EACH ROW EXECUTE FUNCTION wait_teleport_policy_child()")
+            .execute(db.store.pool()).await.unwrap();
+        let mut tx = db.store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(80403)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        barrier = Some(tx);
+    }
+    let child_meta = ctx.meta.clone();
+    let child_task = tokio::spawn(async move {
+        child_meta
+            .reserve_and_persist_create(child, &[dest], 0)
+            .await
+    });
+    if let Some(db) = &ctx._pg {
+        wait_for_placement_lock(db, true).await;
+    }
+    let parent_meta = ctx.meta.clone();
+    let mut parent_task = tokio::spawn(async move {
+        if commit {
+            assert!(parent_meta.teleport_commit(request.id, 0).await?.is_some());
+            Ok(None)
+        } else {
+            parent_meta.teleport_admit(request).await.map(Some)
+        }
+    });
+    let completed_parent = if commit {
+        // FK checks can finish while a placement writer still holds the host.
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), &mut parent_task)
+                .await
+                .expect("teleport commit blocked behind child placement"),
+        )
+    } else {
+        if let Some(db) = &ctx._pg {
+            wait_for_placement_lock(db, false).await;
+        }
+        None
+    };
+    if let Some(tx) = barrier {
+        tx.commit().await.unwrap();
+    }
+    let child_result = tokio::time::timeout(Duration::from_secs(5), child_task)
+        .await
+        .expect("policy child did not complete");
+    let parent_result = match completed_parent {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(5), parent_task)
+            .await
+            .expect("teleport admission did not complete"),
+    };
+    assert_eq!(
+        child_result.unwrap().unwrap(),
+        CreateDisposition::Placed(dest)
+    );
+    let parent_result = parent_result
+        .unwrap()
+        .expect("ordinary policy-parent teleport failed");
+    if let Some(parent_result) = parent_result {
+        let TeleportAdmitOutcome::Admitted(row) = parent_result else {
+            panic!("teleport refused: {parent_result:?}")
+        };
+        assert_eq!(row.source_host_id, source);
+        assert_eq!(row.dest_host_id, dest);
+    } else {
+        assert_eq!(
+            ctx.meta
+                .get_session(parent.session_id)
+                .await
+                .unwrap()
+                .host_id,
+            Some(dest)
+        );
+    }
+    assert_eq!(
+        ctx.meta.get_session(child_id).await.unwrap().host_id,
+        Some(dest)
+    );
+    assert_eq!(
+        ctx.meta.per_host_reserved().await.unwrap()[&dest].mem_mib,
+        1024
+    );
+    if let Some(db) = &ctx._pg {
+        sqlx::query("DROP TRIGGER wait_teleport_policy_child ON sessions")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION wait_teleport_policy_child()")
+            .execute(db.store.pool())
+            .await
+            .unwrap();
+    }
+}
+
+async fn teleport_and_ordinary_policy_child_do_not_deadlock(ctx: &Ctx) {
+    teleport_and_ordinary_policy_child(ctx, false).await;
+}
+async fn teleport_commit_and_ordinary_policy_child_do_not_deadlock(ctx: &Ctx) {
+    teleport_and_ordinary_policy_child(ctx, true).await;
+}
+
+async fn teleport_destination_refusals_preserve_session_precedence(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let mut request = teleport_admission_fixture(ctx).await;
+    let dest = request.candidates[1];
+    request.pinned_dest = Some(HostId::new());
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    let mut missing_session = request.clone();
+    missing_session.session_id = SessionId::new();
+    assert!(matches!(
+        ctx.meta.teleport_admit(missing_session).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    let mut stale = request.clone();
+    stale.epoch += 1;
+    assert!(matches!(
+        ctx.meta.teleport_admit(stale).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    assert!(ctx
+        .meta
+        .request_host_retirement(
+            dest,
+            engram_core::types::host::CordonOwner::Operator,
+            "retire",
+            ctx.clock.now_utc()
+        )
+        .await
+        .unwrap());
+    ctx.clock.advance(Duration::from_secs(1));
+    ctx.meta
+        .touch_host_heartbeat(dest, heartbeat_fixture())
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .grant_host_retirement(dest, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        engram_core::types::host::RetirementGrant::Granted
+    );
+    request.pinned_dest = Some(dest);
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    ctx.meta
+        .transition_session(
+            request.session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.meta.teleport_admit(request.clone()).await.unwrap(),
+        TeleportAdmitOutcome::SessionNotActive(SessionState::Evicting)
+    ));
+    request.epoch += 1;
+    assert!(matches!(
+        ctx.meta.teleport_admit(request).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    let mut open = teleport_admission_fixture(ctx).await;
+    admit_teleport(ctx, open.clone()).await;
+    open.pinned_dest = Some(HostId::new());
+    assert!(matches!(
+        ctx.meta.teleport_admit(open).await,
+        Err(MetaError::Conflict(_))
+    ));
+}
+
+conformance!(
+    t_teleport_and_ordinary_policy_child_do_not_deadlock,
+    teleport_and_ordinary_policy_child_do_not_deadlock
+);
+conformance!(
+    t_teleport_destination_refusals_preserve_session_precedence,
+    teleport_destination_refusals_preserve_session_precedence
+);
+
+conformance!(
+    t_teleport_commit_and_ordinary_policy_child_do_not_deadlock,
+    teleport_commit_and_ordinary_policy_child_do_not_deadlock
+);
