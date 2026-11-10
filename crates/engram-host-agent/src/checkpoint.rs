@@ -551,6 +551,15 @@ pub async fn run_checkpoint_pass(
             );
             continue;
         }
+        if backend.disks_hydrating(sandbox_id) {
+            metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
+            tracing::debug!(
+                %sandbox_id,
+                %session_id,
+                "skipping periodic checkpoint; the disks still hydrate",
+            );
+            continue;
+        }
         // A root span: the driver runs on its own timer, not for a request.
         let span = tracing::info_span!(
             parent: None,

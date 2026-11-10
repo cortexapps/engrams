@@ -188,6 +188,25 @@ mod item_assembler_tests {
 }
 
 #[cfg(test)]
+mod settle_hold_tests {
+    use super::{settle_holds_checkpoint, SETTLE_HOLDS_CHECKPOINT};
+
+    #[test]
+    fn a_running_settle_holds_the_periodic_checkpoint_for_a_bounded_time() {
+        let started = chrono::DateTime::UNIX_EPOCH;
+        let just_inside = started + SETTLE_HOLDS_CHECKPOINT - chrono::TimeDelta::seconds(1);
+
+        assert!(settle_holds_checkpoint(false, started, just_inside));
+        assert!(!settle_holds_checkpoint(true, started, just_inside));
+        assert!(!settle_holds_checkpoint(
+            false,
+            started,
+            started + SETTLE_HOLDS_CHECKPOINT
+        ));
+    }
+}
+
+#[cfg(test)]
 mod first_touch_tests {
     use super::*;
 
@@ -861,7 +880,7 @@ pub struct PooledBackend {
     /// The driver that settles a sandbox's hydrating disks; dropping the
     /// entry ends it. Destroy drops it before the VM goes, so no settle
     /// runs against a volume being released.
-    disk_settles: DashMap<SandboxId, AbortTaskOnDrop>,
+    disk_settles: DashMap<SandboxId, DiskSettle>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1111,6 +1130,24 @@ async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId) {
 /// the guard goes out of scope — on every path, including an early
 /// `?`-return, since `Drop` runs during unwind too.
 struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+struct DiskSettle {
+    task: AbortTaskOnDrop,
+    started: chrono::DateTime<chrono::Utc>,
+}
+
+/// How long a settle driver that has not finished holds the periodic
+/// checkpoint. A driver that cannot settle (a chunk the store lost)
+/// runs for ever, and the session still needs checkpoints.
+const SETTLE_HOLDS_CHECKPOINT: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+fn settle_holds_checkpoint(
+    finished: bool,
+    started: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !finished && now - started < SETTLE_HOLDS_CHECKPOINT
+}
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
@@ -2028,7 +2065,26 @@ impl PooledBackend {
             settle_disks(volumes, id)
                 .instrument(tracing::info_span!("disk.settle", sandbox_id = %id)),
         );
-        self.disk_settles.insert(id, AbortTaskOnDrop(task));
+        self.disk_settles.insert(
+            id,
+            DiskSettle {
+                task: AbortTaskOnDrop(task),
+                started: self.clock.now_utc(),
+            },
+        );
+    }
+
+    /// Whether the kernel still copies the sandbox's disks in. A
+    /// checkpoint taken now reads every copied block back from the pool's
+    /// disk, which nearly stops the copy, so the periodic driver waits.
+    pub fn disks_hydrating(&self, id: SandboxId) -> bool {
+        self.disk_settles.get(&id).is_some_and(|settle| {
+            settle_holds_checkpoint(
+                settle.task.0.is_finished(),
+                settle.started,
+                self.clock.now_utc(),
+            )
+        })
     }
 
     /// End a restore's memory fetches: cancel its background prefetch and
