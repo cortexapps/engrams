@@ -30,6 +30,7 @@ use parking_lot::Mutex;
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<(&'static str, SandboxId)>>,
+    prompt_bytes: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -100,10 +101,11 @@ impl HostClient for FakeHost {
         &self,
         _: SandboxId,
         _: String,
-        _: String,
+        text: String,
         _: Option<String>,
     ) -> Result<(), SandboxError> {
-        unreachable!()
+        self.prompt_bytes.lock().push(text.len());
+        Ok(())
     }
     async fn proxy_shell(&self, _: SandboxId) -> Result<ShellTunnel, SandboxError> {
         unreachable!()
@@ -181,4 +183,21 @@ async fn pause_then_resume_round_trip_to_the_host_with_the_right_sandbox() {
         vec![("pause", sandbox_id), ("resume", sandbox_id)],
         "pause/resume did not round-trip in order with the right sandbox id",
     );
+}
+
+/// A move's restore request carries the VM's memory manifest and is larger
+/// than tonic's 4 MiB default decode limit. The host accepts it.
+#[tokio::test]
+async fn the_host_accepts_a_request_above_the_tonic_default_limit() {
+    let host = Arc::new(FakeHost::default());
+    let addr = boot_grpc_server(host.clone()).await;
+    let client = connect_grpc_client(addr).await;
+
+    let text = "x".repeat(6 * 1024 * 1024);
+    client
+        .send_prompt(SandboxId::new(), "p1".into(), text.clone(), None)
+        .await
+        .expect("a 6 MiB request reaches the host");
+
+    assert_eq!(*host.prompt_bytes.lock(), vec![text.len()]);
 }

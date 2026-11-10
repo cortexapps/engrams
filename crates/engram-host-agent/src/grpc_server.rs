@@ -39,7 +39,7 @@ use engram_protocol::grpc::{
     SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
-use engram_protocol::grpc_client::link_remote_parent;
+use engram_protocol::grpc_client::{link_remote_parent, HOST_RPC_MAX_MESSAGE_BYTES};
 use engram_protocol::wire::WireExecRequest;
 use futures::Stream;
 use std::pin::Pin;
@@ -191,7 +191,11 @@ pub async fn serve(
         .initial_stream_window_size(Some(16 * 1024 * 1024))
         .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_adaptive_window(Some(true))
-        .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
+        .add_service(
+            HostServiceServer::new(svc)
+                .max_encoding_message_size(HOST_RPC_MAX_MESSAGE_BYTES)
+                .max_decoding_message_size(HOST_RPC_MAX_MESSAGE_BYTES),
+        )
         .serve_with_incoming(incoming)
         .await
 }
