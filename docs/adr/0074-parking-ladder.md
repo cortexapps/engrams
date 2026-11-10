@@ -152,6 +152,21 @@ ladder descends to.
   this (the `ensure_active` hold loop; the next scanner tick); the unit
   tests poll `wait_for_lease_free` before the follow-on step. No product
   code change — the retry paths already existed for rung 1.
+- **A park holds until a queued session has no room (2026-11-10).** The
+  headroom gate read `allocatable_mib` as a share of total RAM. The
+  ledger does not net out parked VMs (the host adds a parked VM's memory
+  back, and the park keeps its reservation), so a host whose parks had
+  reserved its RAM read as roomy, held every park, and a queued resume
+  never placed on it. A percentage of unreserved RAM is no better: on a
+  packed host it refuses every park while nothing waits. The gate now
+  reads demand (`ParkView` in `idle_evictor.rs`): a session parks, and a
+  park holds, while every queued session fits on a host placement ranks.
+  When one does not, one park per host yields per reaper pass (the
+  oldest, on the host nearest to a fit; none where an eviction already
+  runs). A host reserved beyond its measured RAM yields a park too.
+  `ENGRAM_PARK_HEADROOM_FLOOR_PCT` and the raw `mem_total − mem_used`
+  fallback are gone; an unmeasured host (`allocatable_mib == 0`) does
+  not park.
 
 ### Post-ship incident: the un-pause vsock black-hole (2026-07-06)
 

@@ -2974,6 +2974,55 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
+/// A host that measures its RAM but reports no cores places a session
+/// that asks for CPU: an unreported core count is no CPU gate.
+async fn a_host_without_reported_cores_has_no_cpu_gate(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-no-cores", now))
+        .await
+        .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.utilization =
+        serde_json::from_value(serde_json::json!({"allocatable_mib": 8192})).expect("utilization");
+    hb.total_vcpus = 0;
+    meta.touch_host_heartbeat(host, hb).await.unwrap();
+
+    let details = meta
+        .placement_no_fit_details(&[host], 4096, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "fits_now");
+    let placed = meta
+        .reserve_and_persist_create(
+            engram_core::traits::metadata::SessionCreateWriteSet {
+                session_id: SessionId::new(),
+                spec: spec("conf:no-cores"),
+                mem_budget_mib: 4096,
+                cpu_budget_vcpus: 2,
+                sealed_secrets: None,
+                capabilities: Vec::new(),
+                integration_policy_json: None,
+                runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+                oauth_binding: None,
+            },
+            &[host],
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        placed,
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+}
+
 /// The register-time rehydrate list and the reconcile assignment list are
 /// one listing: every VM-resident state with a bound sandbox on the host.
 /// A rung-parked `Evicting` survivor and a `Created` survivor are as
@@ -5543,6 +5592,10 @@ conformance!(
     super::events_limit_clamps_identically_both_directions
 );
 conformance!(t_placement_no_fit, super::placement_no_fit);
+conformance!(
+    t_a_host_without_reported_cores_has_no_cpu_gate,
+    super::a_host_without_reported_cores_has_no_cpu_gate
+);
 conformance!(
     t_enabled_image_config_update,
     super::enabled_image_config_update

@@ -222,7 +222,9 @@ impl Cosim {
         // AND `session_ops::enqueue(Evict)` — but that enqueue is the same
         // detached spawn that starves the real capture I/O here, so rung 1
         // applies the nomination transition directly and drives the Evict
-        // verb inline below (identical to what the detector enqueues).
+        // verb inline below. `allow_park` is false, as in a park's descent:
+        // the roomy simulated host would park, and the capture is what the
+        // callers exercise.
         let _ = self
             .world
             .meta
@@ -236,7 +238,7 @@ impl Cosim {
         self.enqueue_and_drive(
             session_id,
             OpKind::Evict,
-            serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+            serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
             &key,
         )
         .await;
