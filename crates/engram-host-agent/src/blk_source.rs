@@ -126,7 +126,13 @@ impl BlkSource {
             .nr_queues(1)
             .depth(QUEUE_DEPTH)
             .io_buf_bytes(IO_BUF_BYTES)
-            .ctrl_flags((sys::UBLK_F_USER_RECOVERY | sys::UBLK_F_USER_RECOVERY_REISSUE) as u64);
+            // No partition scan: the bytes are a guest's, and the host
+            // has no use for partitions of them. A kernel that does not
+            // know the flag drops it.
+            .ctrl_flags(
+                (sys::UBLK_F_USER_RECOVERY | sys::UBLK_F_USER_RECOVERY_REISSUE) as u64
+                    | sys::UBLK_F_NO_AUTO_PART_SCAN as u64,
+            );
         let builder = match recover {
             None => builder.dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV),
             Some(id) => builder

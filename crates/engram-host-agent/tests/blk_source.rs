@@ -77,6 +77,15 @@ fn read_at(device: &File, offset: u64, len: usize) -> Vec<u8> {
     buf.as_slice().to_vec()
 }
 
+/// An open off the runtime: the source's dispatch runs on it, and an
+/// open waits for the kernel's partition scan, which reads the device.
+async fn open_off_runtime(path: &Path) -> Arc<File> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || Arc::new(open_direct(&path)))
+        .await
+        .unwrap()
+}
+
 /// A read off the runtime: the source's dispatch runs on it, so a read
 /// that blocks a runtime thread waits for itself.
 async fn read_off_runtime(device: &Arc<File>, offset: u64, len: usize) -> Vec<u8> {
@@ -98,7 +107,7 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
         .await
         .unwrap();
     let path = source.path().to_path_buf();
-    let device = Arc::new(open_direct(&path));
+    let device = open_off_runtime(&path).await;
     let image = image();
 
     // A guest read far from where the copy starts: served, and recorded.
