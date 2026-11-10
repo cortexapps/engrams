@@ -80,7 +80,10 @@ async function fixture(
       proxy: await staged("proxy"),
       ...(backend === "vz"
         ? { nativeProbe: await staged("native-probe") }
-        : { firecracker: await staged("firecracker") }),
+        : {
+            firecracker: await staged("firecracker"),
+            thinPool: { name: "fixture-pool", directory: root },
+          }),
     };
     const source = join(root, "template.json"),
       output = join(root, "inputs.json");
@@ -97,11 +100,14 @@ async function absent(path: string) {
 
 for (const backend of ["firecracker", "vz"] as const) {
   test(`${backend}: hashes fresh staged files and preserves distinct producer facts`, async () => {
-    await fixture(backend, async ({ template, source, output }) => {
+    await fixture(backend, async ({ root, template, source, output }) => {
       const inputs = await materializeInputs(backend, source, output);
       assert.deepEqual(parseInputs(JSON.parse(await readFile(output, "utf8")), backend), inputs);
       assert.equal((await lstat(output)).mode & 0o777, 0o600);
       assert.equal(inputs.sourceCommit, template.sourceCommit);
+      if (backend === "firecracker")
+        assert.deepEqual(inputs.thinPool, { name: "fixture-pool", directory: root });
+      else assert.equal(Object.hasOwn(inputs, "thinPool"), false);
       const pins = [
         ...Object.values(inputs.binaries),
         ...Object.values(inputs.images).map((i) => i.archive),
@@ -179,21 +185,73 @@ for (const [name, mutate] of Object.entries(invalidTemplates))
   });
 
 test("FC rejects a missing host image, a native probe, and a supplied firecracker hash", async () => {
-  for (const mutate of [
-    (t: Template) => {
-      delete t.images.hostAgent;
-    },
-    (t: Template) => {
-      t.nativeProbe = t.proxy;
-    },
-    (t: Template) => Object.assign(t.firecracker!, { sha256: "a".repeat(64) }),
-  ])
+  const cases: [(t: Template) => void, string][] = [
+    [
+      (t) => {
+        delete t.images.hostAgent;
+      },
+      "object_keys",
+    ],
+    [
+      (t) => {
+        t.nativeProbe = t.proxy;
+      },
+      "fc_artifacts",
+    ],
+    [(t) => Object.assign(t.firecracker!, { sha256: "a".repeat(64) }), "object_keys"],
+  ];
+  for (const [mutate, seam] of cases)
     await fixture("firecracker", async ({ template, source, output, save }) => {
       mutate(template);
       await save();
-      await assert.rejects(materializeInputs("firecracker", source, output));
+      await assert.rejects(materializeInputs("firecracker", source, output), {
+        code: "INVALID_CONTEXT",
+        seam,
+      });
       await absent(output);
     });
+});
+
+for (const [kind, seam] of [
+  ["missing", "fc_pool_required"],
+  ["invalid-name", "fc_pool_name"],
+  ["noncanonical", "fc_pool_directory"],
+  ["public", "fc_pool_directory_owner_mode"],
+  ["symlink", "fc_pool_directory_symlink"],
+] as const)
+  test(`FC rejects ${kind} thin pool without output`, async () => {
+    await fixture("firecracker", async ({ root, template, source, output, save }) => {
+      if (kind === "missing") delete template.thinPool;
+      else if (kind === "invalid-name") template.thinPool!.name = "../pool";
+      else if (kind === "noncanonical") template.thinPool!.directory = `${root}/.`;
+      else {
+        const directory = join(root, "pool");
+        if (kind === "symlink") await symlink(root, directory);
+        else {
+          await mkdir(directory);
+          await chmod(directory, 0o755);
+        }
+        template.thinPool!.directory = directory;
+      }
+      await save();
+      await assert.rejects(materializeInputs("firecracker", source, output), {
+        code: "INVALID_CONTEXT",
+        seam,
+      });
+      await absent(output);
+    });
+  });
+
+test("VZ rejects a thin pool without output", async () => {
+  await fixture("vz", async ({ root, template, source, output, save }) => {
+    template.thinPool = { name: "fixture-pool", directory: root };
+    await save();
+    await assert.rejects(materializeInputs("vz", source, output), {
+      code: "INVALID_CONTEXT",
+      seam: "vz_architecture",
+    });
+    await absent(output);
+  });
 });
 
 for (const kind of [
@@ -345,7 +403,9 @@ test("CLI writes Inputs from a source snapshot before dependencies are installed
     assert.equal(inputs.sourceCommit, template.sourceCommit);
     assert.equal(
       inputs.binaries.node.sha256,
-      createHash("sha256").update(await readFile(template.binaries.node.path)).digest("hex"),
+      createHash("sha256")
+        .update(await readFile(template.binaries.node.path))
+        .digest("hex"),
     );
     assert.equal(inputs.images.guest.id, template.images.guest!.id);
     assert.equal(inputs.images.guest.manifestDigest, template.images.guest!.manifestDigest);
