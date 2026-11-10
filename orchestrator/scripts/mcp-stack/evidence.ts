@@ -226,6 +226,7 @@ class EvidenceState {
       this.infrastructureVerified,
       "infrastructure_evidence_required",
     );
+    requireThat(this.prerequisitesRecorded, "prerequisites_evidence_required");
     this.completed = true;
     return {
       version: 1,

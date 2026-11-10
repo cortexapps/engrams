@@ -12,6 +12,18 @@ import { canonicalJson } from "./guest.ts";
 
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const cleanupIdentitySchema = z.strictObject({
+  host_id: z.uuid().nullable(),
+  sandbox_id: z.uuid().nullable(),
+  binding_epoch: z.string().regex(/^[1-9][0-9]*$/),
+  managed_task_id: z.string().min(1).nullable(),
+  managed_host_id: z.uuid().nullable(),
+  managed_sandbox_id: z.uuid().nullable(),
+  managed_binding_epoch: z
+    .string()
+    .regex(/^[1-9][0-9]*$/)
+    .nullable(),
+});
 export const sourceKeySchema = z.object({
   creation: z.object({
     session_id: z.uuid(),
@@ -203,6 +215,15 @@ export class FixtureObserver {
 /** No caller SQL. Every observation is scoped to a task/session obtained from public CreateTask. */
 export class DatabaseObserver {
   private readonly owned = new Map<string, string>();
+  private readonly cleanupTargets = new Map<
+    string,
+    {
+      hostId: string;
+      sandboxId: string;
+      bindingEpoch: string;
+      managed: boolean;
+    }
+  >();
   private constructor(
     private readonly coordinator: pg.Pool,
     private readonly orchestrator: pg.Pool,
@@ -246,6 +267,13 @@ export class DatabaseObserver {
   async prerequisites() {
     const expected = {
       coordinator: [
+        "sessions.id:uuid",
+        "sessions.status:text",
+        "sessions.host_id:uuid",
+        "sessions.sandbox_id:uuid",
+        "sessions.binding_epoch:bigint",
+        "sandbox_tombstones.host_id:uuid",
+        "sandbox_tombstones.sandbox_id:uuid",
         "session_ops.id:bigint",
         "session_ops.session_id:uuid",
         "session_ops.kind:text",
@@ -257,6 +285,7 @@ export class DatabaseObserver {
         "session_managed_creations.native_digest:text",
         "session_managed_boots.session_id:uuid",
         "session_managed_boots.host_id:uuid",
+        "session_managed_boots.sandbox_id:uuid",
         "session_managed_boots.binding_epoch:bigint",
         "session_managed_boots.boot_attempt:text",
         "session_managed_boots.phase:text",
@@ -331,6 +360,84 @@ export class DatabaseObserver {
     const task = this.owned.get(sessionId);
     requireThat(task, "observer_unowned_session");
     return task;
+  }
+  async retainCleanupTarget(sessionId: string, hostId: string) {
+    const taskId = this.task(sessionId);
+    requireThat(z.uuid().safeParse(hostId).success, "cleanup_expected_host");
+    const result = await this.coordinator.query(
+      "SELECT s.host_id::text,s.sandbox_id::text,s.binding_epoch::text,c.task_id AS managed_task_id,b.host_id::text AS managed_host_id,b.sandbox_id::text AS managed_sandbox_id,b.binding_epoch::text AS managed_binding_epoch FROM sessions s LEFT JOIN session_managed_creations c ON c.session_id=s.id LEFT JOIN session_managed_boots b ON b.session_id=s.id WHERE s.id=$1",
+      [sessionId],
+    );
+    requireThat(result.rowCount === 1, "cleanup_target_row");
+    const row = cleanupIdentitySchema.parse(result.rows[0]);
+    const managed = row.managed_task_id !== null;
+    const sandboxId = row.sandbox_id ?? row.managed_sandbox_id;
+    requireThat(
+      sandboxId &&
+        (row.host_id ?? row.managed_host_id) === hostId &&
+        (managed
+          ? row.managed_task_id === taskId &&
+            row.managed_host_id === hostId &&
+            row.managed_sandbox_id === sandboxId &&
+            row.managed_binding_epoch === row.binding_epoch
+          : row.managed_host_id === null &&
+            row.managed_sandbox_id === null &&
+            row.managed_binding_epoch === null),
+      "cleanup_exact_owned_target",
+    );
+    const target = {
+      hostId,
+      sandboxId,
+      bindingEpoch: row.binding_epoch,
+      managed,
+    };
+    const prior = this.cleanupTargets.get(sessionId);
+    requireThat(
+      !prior || canonicalJson(prior) === canonicalJson(target),
+      "cleanup_target_changed",
+    );
+    this.cleanupTargets.set(sessionId, target);
+  }
+  /** Completed cleanup obligations are metadata confirmation, not physical owner proof. */
+  async cleanupSettled(sessionId: string) {
+    const taskId = this.task(sessionId);
+    const target = this.cleanupTargets.get(sessionId);
+    requireThat(target, "cleanup_target_not_retained");
+    const result = await this.coordinator.query(
+      "SELECT s.host_id::text,s.sandbox_id::text,s.binding_epoch::text,c.task_id AS managed_task_id,b.host_id::text AS managed_host_id,b.sandbox_id::text AS managed_sandbox_id,b.binding_epoch::text AS managed_binding_epoch,s.status,EXISTS(SELECT 1 FROM session_ops WHERE session_id=$1 AND state IN ('queued','running')) AS pending_operations,EXISTS(SELECT 1 FROM session_managed_boot_intents WHERE session_id=$1 AND NOT completed) AS pending_boots,EXISTS(SELECT 1 FROM sandbox_tombstones WHERE host_id=$2 AND sandbox_id=$3) AS pending_tombstone FROM sessions s LEFT JOIN session_managed_creations c ON c.session_id=s.id LEFT JOIN session_managed_boots b ON b.session_id=s.id WHERE s.id=$1",
+      [sessionId, target.hostId, target.sandboxId],
+    );
+    requireThat(result.rowCount === 1, "cleanup_settled_row");
+    const row = cleanupIdentitySchema
+      .extend({
+        status: z.string(),
+        pending_operations: z.boolean(),
+        pending_boots: z.boolean(),
+        pending_tombstone: z.boolean(),
+      })
+      .parse(result.rows[0]);
+    requireThat(
+      row.binding_epoch === target.bindingEpoch &&
+        (row.host_id === null || row.host_id === target.hostId) &&
+        (row.sandbox_id === null || row.sandbox_id === target.sandboxId) &&
+        (target.managed
+          ? row.managed_task_id === taskId &&
+            row.managed_host_id === target.hostId &&
+            row.managed_sandbox_id === target.sandboxId &&
+            row.managed_binding_epoch === target.bindingEpoch
+          : row.managed_task_id === null &&
+            row.managed_host_id === null &&
+            row.managed_sandbox_id === null &&
+            row.managed_binding_epoch === null),
+      "cleanup_target_changed",
+    );
+    return (
+      ["completed", "failed", "dead"].includes(row.status) &&
+      row.sandbox_id === null &&
+      !row.pending_operations &&
+      !row.pending_boots &&
+      !row.pending_tombstone
+    );
   }
   async destroyOperation(sessionId: string) {
     this.task(sessionId);

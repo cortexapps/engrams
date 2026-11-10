@@ -32,7 +32,7 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { ExecOutputSchema } from "../../src/gen/engram/app/v1/session_pb.ts";
 import { StatusSchema } from "./supervisor.ts";
-import { Evidence } from "./evidence.ts";
+import { Evidence, verifyEvidence } from "./evidence.ts";
 import { requirePrerequisites } from "./preflight.ts";
 import { safeFailure, validateDrivers } from "./runner.ts";
 import { caseBodyFailure, completeCaseCleanup } from "./scenario-runtime.ts";
@@ -1644,6 +1644,80 @@ const infrastructureRows = () =>
     unauthenticatedStatus: 401 as const,
     nonOwnerStatus: 404 as const,
   }));
+for (const selection of [
+  { stage: "infrastructure" },
+  { stage: "matrix", matrix: REQUIRED_CASES[0]!.key },
+  { stage: "matrix", matrix: "all" },
+] as const)
+  for (const mode of ["writer", "replay"] as const)
+    test(`evidence ${mode} requires prerequisite provenance for ${selection.stage === "matrix" ? selection.matrix : selection.stage}`, async () => {
+      const ctx = ContextSchema.parse(validContext());
+      ctx.evidenceFile = join(
+        root,
+        `prerequisites-${mode}-${selection.stage === "matrix" ? selection.matrix.replaceAll("/", "-") : selection.stage}.jsonl`,
+      );
+      const evidence = await Evidence.create(ctx, selection);
+      try {
+        const cases =
+          selection.stage === "matrix" ? selectMatrix(selection.matrix) : [];
+        const full = selection.stage === "matrix" && selection.matrix === "all";
+        await recordCases(evidence, cases);
+        await evidence.infrastructure(infrastructureRows());
+        if (mode === "writer") {
+          await expect(evidence.finish()).rejects.toThrow(
+            "prerequisites_evidence_required",
+          );
+        } else {
+          const source = await readFile(ctx.evidenceFile, "utf8");
+          const terminal = {
+            version: 1,
+            kind: full ? "complete" : "stage-complete",
+            ...selection,
+            selected: cases.length,
+            passed: cases.length,
+            stageCompleted: !full,
+            matrixCompleted: full,
+            physicalAcceptance: full,
+          };
+          expect(() =>
+            verifyEvidence(
+              ctx,
+              selection,
+              source + JSON.stringify(terminal) + "\n",
+            ),
+          ).toThrow("prerequisites_evidence_required");
+        }
+        await recordPrerequisites(evidence);
+        await expect(recordPrerequisites(evidence)).rejects.toThrow(
+          "prerequisites_evidence_duplicate",
+        );
+        await evidence.finish();
+        const source = await readFile(ctx.evidenceFile, "utf8");
+        expect(() => verifyEvidence(ctx, selection, source)).not.toThrow();
+        const prerequisite = source
+          .split("\n")
+          .find((line) => line.includes('"kind":"prerequisites"'))!;
+        expect(() =>
+          verifyEvidence(
+            ctx,
+            selection,
+            source.replace(
+              prerequisite + "\n",
+              prerequisite + "\n" + prerequisite + "\n",
+            ),
+          ),
+        ).toThrow("prerequisites_evidence_duplicate");
+      } finally {
+        await evidence.close();
+      }
+    });
+async function recordPrerequisites(evidence: Evidence) {
+  await evidence.prerequisites({
+    supervisorSha256: h,
+    publicationSha256: h,
+    publicStateSha256: h,
+  });
+}
 async function recordCases(evidence: Evidence, cases = REQUIRED_CASES) {
   for (const selected of cases) {
     const digest = await evidence.observe({
@@ -1685,6 +1759,7 @@ test("full evidence needs successful ordered infrastructure before acceptance", 
     await expect(evidence.infrastructure(infrastructureRows())).rejects.toThrow(
       "infrastructure_evidence_duplicate",
     );
+    await recordPrerequisites(evidence);
     await evidence.finish();
   } finally {
     await evidence.close();
@@ -1734,6 +1809,7 @@ for (const stage of [
         await recordCases(evidence, cases);
         await evidence.infrastructure(infrastructureRows());
       }
+      await recordPrerequisites(evidence);
       await evidence.finish();
     } finally {
       await evidence.close();
@@ -1930,6 +2006,7 @@ test("selected dispatcher collects cleaned case failures and stops on unsafe fai
       "codex/catalog-fidelity",
     ]);
     await evidence.infrastructure(infrastructureRows());
+    await recordPrerequisites(evidence);
     await evidence.finish();
   } finally {
     await evidence.close();

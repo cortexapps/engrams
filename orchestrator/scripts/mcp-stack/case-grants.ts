@@ -25,6 +25,7 @@ import {
   completeCaseCleanup,
   approveOnce,
   closeScenario,
+  closeScenarioSession,
   execution,
   pollProof,
   pollGuestObservation,
@@ -1187,12 +1188,11 @@ export const planChildIntersectionDriver: CaseDriver = async (input) => {
     throw caseBodyFailure(error);
   } finally {
     await completeCaseCleanup(async () => {
-      try {
-        if (child)
-          await principals.admin.tasks.deleteTask({ taskId: child.taskId });
-      } finally {
-        await closeScenario(principals, parent);
+      if (child) {
+        await closeScenarioSession(principals.admin.sessions, child);
+        await principals.admin.tasks.deleteTask({ taskId: child.taskId });
       }
+      await closeScenario(principals, parent);
     });
   }
   return completeAssertions("plan-child-intersection", assertions);

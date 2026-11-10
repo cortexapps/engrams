@@ -5,7 +5,7 @@ import {
   createClient,
   createRouterTransport,
 } from "@connectrpc/connect";
-import { closeScenario } from "./scenario-runtime.ts";
+import { closeScenario, closeScenarioSession } from "./scenario-runtime.ts";
 import {
   AutomationService,
   AutomationRunService,
@@ -20,13 +20,22 @@ function cleanupFixture(
     runStatus?: string;
     statuses?: string[];
     wrongSession?: boolean;
-    failure?: "stop" | "delete" | "get";
+    failure?: "stop" | "delete" | "get" | "retain" | "destroy" | "settled";
+    destroyStates?: Array<
+      "queued" | "running" | "done" | "failed" | "cancelled"
+    >;
+    settled?: boolean[];
   } = {},
 ) {
   const events: string[] = [];
   const sessionId = "11111111-1111-4111-8111-111111111111";
-  const ctx = { deadlines: { requestMs: 1000, stepMs: 0, totalMs: 10000 } };
+  const ctx = {
+    hostId: "22222222-2222-4222-8222-222222222222",
+    deadlines: { requestMs: 1000, stepMs: 0, totalMs: 10000 },
+  };
   const statuses = [...(input.statuses ?? ["completed"])];
+  const destroyStates = [...(input.destroyStates ?? ["done"])];
+  const settled = [...(input.settled ?? [true])];
   const transport = createRouterTransport((router) => {
     router.service(AutomationRunService, {
       getRun(request) {
@@ -98,6 +107,29 @@ function cleanupFixture(
   };
   const scenario = {
     ctx,
+    database: {
+      async retainCleanupTarget(id: string, hostId: string) {
+        expect(id).toBe(sessionId);
+        expect(hostId).toBe(ctx.hostId);
+        events.push("retainTarget");
+        if (input.failure === "retain") throw new Error("retain failed");
+      },
+      async destroyOperation(id: string) {
+        expect(id).toBe(sessionId);
+        const state =
+          destroyStates.length > 1 ? destroyStates.shift()! : destroyStates[0]!;
+        events.push(`destroy:${state}`);
+        if (input.failure === "destroy") throw new Error("destroy failed");
+        return { id: "1", state };
+      },
+      async cleanupSettled(id: string) {
+        expect(id).toBe(sessionId);
+        const value = settled.length > 1 ? settled.shift()! : settled[0]!;
+        events.push(`settled:${value}`);
+        if (input.failure === "settled") throw new Error("settled failed");
+        return value;
+      },
+    },
     taskId: "fixture-task",
     sessionId,
     profileId: "fixture-profile",
@@ -113,7 +145,13 @@ function cleanupFixture(
             definitionSha256: "a".repeat(64),
           },
   };
-  return { events, ctx, close: () => closeScenario(principals, scenario) };
+  return {
+    events,
+    ctx,
+    close: () => closeScenario(principals, scenario),
+    closeSession: () =>
+      closeScenarioSession(principals.admin.sessions, scenario),
+  };
 }
 
 test("automation cleanup waits for the exact primary session before removing ownership", async () => {
@@ -123,9 +161,12 @@ test("automation cleanup waits for the exact primary session before removing own
   expect(fixture.events).toEqual([
     "getRun",
     "stopRun",
+    "retainTarget",
     "deleteSession",
     "getSession",
     "getSession",
+    "destroy:done",
+    "settled:true",
     "archiveAutomation",
     "deleteTask",
     "deleteProfile",
@@ -141,8 +182,11 @@ test("terminal automation runs still require primary session cleanup", async () 
     await fixture.close();
     expect(fixture.events).toEqual([
       "getRun",
+      "retainTarget",
       "deleteSession",
       "getSession",
+      "destroy:done",
+      "settled:true",
       "archiveAutomation",
       "deleteTask",
       "deleteProfile",
@@ -154,15 +198,25 @@ test("human cleanup deletes and confirms the exact primary session", async () =>
   const fixture = cleanupFixture({ automation: false });
   await fixture.close();
   expect(fixture.events).toEqual([
+    "retainTarget",
     "deleteSession",
     "getSession",
+    "destroy:done",
+    "settled:true",
     "deleteTask",
     "deleteProfile",
   ]);
 });
 
 test("cleanup errors retain the task and definition", async () => {
-  for (const failure of ["stop", "delete", "get"] as const) {
+  for (const failure of [
+    "stop",
+    "delete",
+    "get",
+    "retain",
+    "destroy",
+    "settled",
+  ] as const) {
     const fixture = cleanupFixture({ failure });
     await expect(fixture.close()).rejects.toThrow(`${failure} failed`);
     expect(fixture.events).not.toContain("archiveAutomation");
@@ -179,6 +233,7 @@ test("wrong session identity cannot authorize ownership deletion", async () => {
   expect(fixture.events).toEqual([
     "getRun",
     "stopRun",
+    "retainTarget",
     "deleteSession",
     "getSession",
   ]);
@@ -190,7 +245,72 @@ test("nonterminal session timeout retains ownership", async () => {
   expect(fixture.events).toEqual([
     "getRun",
     "stopRun",
+    "retainTarget",
     "deleteSession",
     "getSession",
   ]);
+});
+
+for (const state of ["queued", "running", "failed", "cancelled"] as const)
+  test(`terminal session with destroy ${state} retains ownership`, async () => {
+    const fixture = cleanupFixture({ destroyStates: [state] });
+    await expect(fixture.close()).rejects.toThrow();
+    expect(fixture.events).toContain(`destroy:${state}`);
+    expect(fixture.events).not.toContain("archiveAutomation");
+    expect(fixture.events).not.toContain("deleteTask");
+    expect(fixture.events).not.toContain("deleteProfile");
+  });
+
+test("completed destroy with pending cleanup obligations retains ownership", async () => {
+  const fixture = cleanupFixture({ settled: [false] });
+  await expect(fixture.close()).rejects.toThrow();
+  expect(fixture.events).toContain("settled:false");
+  expect(fixture.events).not.toContain("deleteTask");
+  expect(fixture.events).not.toContain("deleteProfile");
+});
+
+test("child session uses the same retirement barrier before task ownership can be removed", async () => {
+  const blocked = cleanupFixture({ automation: false, settled: [false] });
+  await expect(blocked.closeSession()).rejects.toThrow(
+    "scenario_cleanup_obligations",
+  );
+  expect(blocked.events).toEqual([
+    "retainTarget",
+    "deleteSession",
+    "getSession",
+    "destroy:done",
+    "settled:false",
+  ]);
+  const settled = cleanupFixture({ automation: false });
+  await settled.closeSession();
+  expect(settled.events).toEqual([
+    "retainTarget",
+    "deleteSession",
+    "getSession",
+    "destroy:done",
+    "settled:true",
+  ]);
+});
+
+test("cleanup waits for destroy and obligations before the next case can start", async () => {
+  const fixture = cleanupFixture({
+    destroyStates: ["running", "done"],
+    settled: [false, true],
+  });
+  fixture.ctx.deadlines.stepMs = 1000;
+  await fixture.close();
+  fixture.events.push("nextCase");
+  expect(fixture.events.slice(-8)).toEqual([
+    "destroy:done",
+    "settled:false",
+    "destroy:done",
+    "settled:true",
+    "archiveAutomation",
+    "deleteTask",
+    "deleteProfile",
+    "nextCase",
+  ]);
+  expect(fixture.events.indexOf("retainTarget")).toBeLessThan(
+    fixture.events.indexOf("deleteSession"),
+  );
 });

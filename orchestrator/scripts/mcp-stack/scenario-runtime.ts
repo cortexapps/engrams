@@ -188,6 +188,7 @@ export async function startScenario(
   await guestReady(ctx, client, task.sessionId);
   return {
     ctx,
+    database,
     ...task,
     ...profile,
     client,
@@ -636,6 +637,55 @@ export function selectProofRecords(
   );
 }
 
+type ScenarioCleanup = Pick<StartedScenario, "sessionId"> & {
+  ctx: Pick<Context, "deadlines" | "hostId">;
+  database: Pick<
+    DatabaseObserver,
+    "retainCleanupTarget" | "destroyOperation" | "cleanupSettled"
+  >;
+};
+
+export async function closeScenarioSession(
+  sessions: Pick<PublicClient["sessions"], "deleteSession" | "getSession">,
+  scenario: ScenarioCleanup,
+) {
+  await scenario.database.retainCleanupTarget(
+    scenario.sessionId,
+    scenario.ctx.hostId,
+  );
+  await sessions.deleteSession({ sessionId: scenario.sessionId });
+  await waitFor(
+    scenario.ctx,
+    "scenario_cleanup_session_terminal",
+    () => sessions.getSession({ sessionId: scenario.sessionId }),
+    (value) => {
+      requireThat(
+        value.session?.id === scenario.sessionId,
+        "scenario_cleanup_session_identity",
+      );
+      return ["completed", "failed", "dead"].includes(value.session.status);
+    },
+  );
+  await waitFor(
+    scenario.ctx,
+    "scenario_cleanup_obligations",
+    async () => {
+      const destroy = await scenario.database.destroyOperation(
+        scenario.sessionId,
+      );
+      requireThat(
+        destroy?.state !== "failed" && destroy?.state !== "cancelled",
+        "scenario_cleanup_destroy_failed",
+      );
+      return (
+        destroy?.state === "done" &&
+        (await scenario.database.cleanupSettled(scenario.sessionId))
+      );
+    },
+    (settled) => settled,
+  );
+}
+
 export async function closeScenario(
   principals: {
     automation: Pick<PublicClient, "automationRuns">;
@@ -647,7 +697,8 @@ export async function closeScenario(
   scenario: Pick<
     StartedScenario,
     "automation" | "sessionId" | "taskId" | "profileId"
-  > & { ctx: Pick<Context, "deadlines"> },
+  > &
+    ScenarioCleanup,
 ) {
   if (scenario.automation) {
     const run = await principals.automation.automationRuns.getRun({
@@ -669,22 +720,7 @@ export async function closeScenario(
         reason: "Fixture cleanup",
       });
   }
-  await principals.admin.sessions.deleteSession({
-    sessionId: scenario.sessionId,
-  });
-  await waitFor(
-    scenario.ctx,
-    "scenario_cleanup_session_terminal",
-    () =>
-      principals.admin.sessions.getSession({ sessionId: scenario.sessionId }),
-    (value) => {
-      requireThat(
-        value.session?.id === scenario.sessionId,
-        "scenario_cleanup_session_identity",
-      );
-      return ["completed", "failed", "dead"].includes(value.session.status);
-    },
-  );
+  await closeScenarioSession(principals.admin.sessions, scenario);
   if (scenario.automation) {
     await principals.admin.automations.archiveAutomation({
       id: scenario.automation.id,
