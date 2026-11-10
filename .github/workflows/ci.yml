@@ -1178,7 +1178,16 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
           sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
             sh deploy/helm/engram-host-fleet/files/thin-pool.sh
-          sudo modprobe ublk_drv
+          # ublk is a module on some kernels and built in on others.
+          sudo modprobe ublk_drv || true
+          if [ ! -e /dev/ublk-control ]; then
+            echo "this runner's kernel has no ublk driver:"
+            uname -r
+            grep -h -E 'CONFIG_BLK_DEV_UBLK|CONFIG_DM_CLONE' "/boot/config-$(uname -r)" || true
+            zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_BLK_DEV_UBLK|CONFIG_DM_CLONE' || true
+            ls "/lib/modules/$(uname -r)" || true
+            exit 1
+          fi
 
       # Every state node prep can find: a used disk, a disk without room,
       # a crash before the first activation, a restart.
