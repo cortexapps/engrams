@@ -1,25 +1,19 @@
 //! Accept loop + per-connection dispatcher.
 //!
-//! Listens on `bind_addr` (TCP) for connections REDIRECTed by
-//! iptables out of the FC TAPs. For each accepted connection:
+//! Accepts redirected TCP connections and host-private streams. For each stream:
 //!
-//! 1. Recover the original destination via `SO_ORIGINAL_DST`. (Linux
-//!    only — on macOS we just use the local addr; the proxy doesn't
-//!    actually run on macOS, that's compile-only.)
-//! 2. Recover the source IP via `peer_addr`. Look up the matching
-//!    `SessionState` from the registry. No match → drop.
-//! 3. Peek the SNI (TLS) or the HTTP `Host:` (plain HTTP — TODO).
-//!    For now, this proxy is HTTPS-only; iptables shouldn't
-//!    REDIRECT port 80 yet.
+//! 1. Use the original destination supplied by the private ingress or
+//!    recovered with Linux `SO_ORIGINAL_DST` for redirected connections.
+//! 2. Use the private ingress's session lease or enroll the source IP
+//!    in the registry. No session → drop.
+//! 3. Peek the TLS SNI and preserve the original destination port.
 //! 4. Decide via `SessionState::decide(sni)`:
 //!      - Reject → close.
 //!      - Bypass → splice via `bypass::relay`.
 //!      - Intercept → MITM via `intercept::run`.
 //!
-//! Errors are logged but not propagated; the proxy is a best-effort
-//! dispatcher. The most important failure mode is "violation" (a
-//! placeholder appearing where it shouldn't) — those get a `WARN`
-//! log so operators see them.
+//! Redirected connection errors are logged; private dispatch returns errors
+//! to its owner. Credential violations close the connection and emit a warning.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -49,12 +43,8 @@ pub struct ProxyConfig {
     /// `SystemResolver` (host's DNS). Tests pass a `StaticResolver`
     /// to point a fixed hostname at a loopback fixture.
     pub resolver: Arc<dyn UpstreamResolver>,
-    /// Where the filtering DNS proxy listens (both UDP and TCP).
-    /// `None` disables the DNS path entirely — iptables would then
-    /// need to keep the unconditional `ACCEPT VM→1.1.1.1:53` rules
-    /// so the guest can resolve at all, accepting the DNS-exfil
-    /// channel. Production sets `Some(0.0.0.0:53)` and pairs it
-    /// with iptables `REDIRECT VM→{udp,tcp}/53 → :53`.
+    /// Where the filtering DNS proxy listens for redirected UDP and TCP.
+    /// `None` disables these listeners. Managed private DNS uses `resolve_private`.
     pub dns_bind_addr: Option<SocketAddr>,
     /// Where the session-scoped guest gateway listens. `None` disables it.
     pub guest_gateway_bind_addr: Option<SocketAddr>,
@@ -66,10 +56,8 @@ pub struct ProxyConfig {
     /// The host-agent wires this to its coordinator bridge; tests pass a
     /// collecting closure.
     pub observe_sink: Option<crate::observe::ObserveSink>,
-    /// WS4: seam to re-mint a near-expiry inject credential via the coordinator.
-    /// `None` disables refresh (a minted inject then rides its boot token until
-    /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
-    /// client; tests pass a stub.
+    /// Refresh near-expiry inject credentials through the coordinator.
+    /// `None` disables refresh.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
     /// ADR 0118: opens a byte stream to a port inside a session's guest, so a
     /// call to one of the session's OWN app hostnames is spliced back into the
@@ -87,7 +75,7 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     /// Convenience constructor: production wiring with the system
     /// DNS resolver and the bind addr / registry / mint the caller
-    /// provides. DNS filter on by default at port 53 with 1.1.1.1
+    /// provides. DNS filter on by default at port 5353 with 1.1.1.1
     /// upstream — disable by setting `dns_bind_addr = None`.
     pub fn new(bind_addr: SocketAddr, registry: Arc<Registry>, mint: Arc<CertMint>) -> Self {
         Self {
@@ -170,7 +158,7 @@ impl Proxy {
         dns::resolve_private(query, session, self.cfg.dns_upstream).await
     }
 
-    /// Bind the 443 listener and (when configured) the DNS sockets,
+    /// Bind the redirected TLS listener and (when configured) the DNS sockets,
     /// returning just the sockets for [`serve`](Self::serve) to run.
     ///
     /// Bind is split from serve so a bind failure is a value the caller
@@ -291,7 +279,7 @@ impl Proxy {
 }
 
 /// The bound listeners handed from [`Proxy::bind`] to [`Proxy::serve`]:
-/// the 443 TCP listener and, when the DNS filter is enabled, its
+/// the redirected TCP listener and, when the DNS filter is enabled, its
 /// UDP+TCP sockets. An opaque token — all proxy state stays on `Proxy`.
 pub struct Listeners {
     tcp: TcpListener,
@@ -311,35 +299,15 @@ async fn handle<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send +
     inject_refresher: Option<Arc<dyn InjectRefresher>>,
     guest_port_dialer: Option<crate::app_relay::SharedGuestPortDialer>,
 ) -> Result<(), HandleError> {
-    // Pre-REDIRECT destination — useful only for logs. We don't
-    // dial it; the upstream is resolved fresh by SNI on the host.
-    // On non-Linux this errors (no SO_ORIGINAL_DST) — fine, we
-    // just log "unknown".
-
     let (sni, peeked) = sni::peek_sni(&mut stream, SNI_PEEK_BYTES, SNI_PEEK_BUDGET)
         .await
         .map_err(HandleError::SniPeek)?;
-    // The proxy only handles port 443 today (iptables only REDIRECTs
-    // tcp/443). The port the upstream listens on is the same.
+    // Resolve the host by SNI and retain the original port. Ordinary redirected
+    // connections without a recovered destination use port 443.
     let port = original_dst.map(|(_, p)| p).unwrap_or(443);
 
-    // WS4 (campaign C2 audit — empty-body-looks-like-204 hazard): every reject
-    // path below closes the connection WITHOUT writing any HTTP bytes to the
-    // guest — `Reject` before any TLS at all, `RequestRejected`/`GraphqlRejected`
-    // after the guest-side TLS handshake but before a single response byte. The
-    // guest's HTTP client sees an unambiguous connection close (curl: "empty
-    // reply from server"; gh: transport error), NEVER a synthesized 2xx/204. And
-    // the intercept path streams the upstream response VERBATIM
-    // (`copy_bidirectional` / `pump_and_observe` — no status/body synthesis), so a
-    // real upstream 401 reaches the guest AS a 401. Therefore the campaign's
-    // "branch DELETE returned an empty body indistinguishable from 204 while the
-    // branch survived" was NOT produced here: the DELETE matched its inject policy
-    // (a permitted write), so it was forwarded with the boot-time injected token
-    // that had gone stale ~1h in — GitHub 401'd it, and `gh`'s own handling
-    // rendered that 401 as an empty body. The root cause is the stale token, fixed
-    // by the TTL-aware re-mint above (`InjectEntry::refresh_if_stale`), not a
-    // proxy-synthesized success. No proxy-side fix is warranted; do NOT add a path
-    // here that forwards or synthesizes an empty success-shaped reply.
+    // Rejection closes without an HTTP response. Interception preserves the
+    // upstream status and body; neither path synthesizes success.
     match session.decide(&sni) {
         Decision::Reject => {
             tracing::info!(
@@ -501,9 +469,8 @@ impl std::error::Error for HandleError {}
 
 /// Recover the original destination of a REDIRECTed connection via
 /// `getsockopt(SOL_IP, SO_ORIGINAL_DST)`, exposed by socket2 as
-/// `SockRef::original_dst()`. Linux-only; on macOS the call returns
-/// `Unsupported` (the proxy doesn't actually run on macOS, but this
-/// branch keeps `cargo check --workspace` clean).
+/// `SockRef::original_dst_v4()`. Other platforms return `Unsupported`;
+/// host-private ingress supplies its destination directly.
 fn original_destination(stream: &TcpStream) -> Result<(IpAddr, u16), HandleError> {
     #[cfg(target_os = "linux")]
     {

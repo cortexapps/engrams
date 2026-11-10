@@ -20,7 +20,7 @@
         "id": "registered-public",
         "clientId": "registered-client-id",
         "confidential": false,
-        "redirectUri": "https://app.example/mcp/callback",
+        "redirectUri": "https://app.example/integrations/mcp/callback",
         "issuer": "https://auth.example/",
         "resource": {
           "zoneId": "public",

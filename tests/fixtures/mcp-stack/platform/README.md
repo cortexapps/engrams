@@ -21,8 +21,11 @@ bun orchestrator/scripts/mcp-stack/run.ts --context /private/absent-run/context.
 ```
 
 A missing prerequisite, invalid input, failed readiness check, failed matrix,
-or cleanup failure returns nonzero. There is no successful skip or alternate
-case list. Deployment defaults remain disabled.
+or cleanup failure returns nonzero. The wrappers default to the full matrix.
+They also accept `--matrix <comma-separated case keys>` or
+`--stage infrastructure` through the same runner. A focused run records stage
+completion only; full matrix completion and physical acceptance require
+`--matrix all`. Deployment defaults remain disabled.
 
 ## Operator inputs
 
@@ -227,7 +230,9 @@ Only the FC C guard has `net.ipv4.ip_forward=1` and
 The actual FC host and guard must share a network namespace and read both
 values as 1. Qualification checks the actual production INPUT, FORWARD,
 PREROUTING, and POSTROUTING rules and their order after readiness, status,
-and restart. Read-only proc/sys remains in place.
+and restart. Only the trusted FC host requires writable `/proc/sys` in its
+private mount namespace; `/sys` and `/sys/fs/cgroup` remain read-only. Other
+roles retain their default system-path protections.
 
 A named volume contains only the fixed `resolv.conf`, with file mode 0644 and
 directory mode 0755. A read-only `volume-subpath=resolv.conf,volume-nocopy`
@@ -268,7 +273,9 @@ agentd, and the exact committed production init shim remain intact.
 
 ## Cleanup and evidence
 
-The supervisor permits only its fixed six-role status/restart/stop protocol.
+The supervisor permits only its fixed role status/restart/stop protocol and
+the FC-only infrastructure and disk-read checkpoints. Fixture roles are
+status-only.
 O disable variants change only O's enable switch; C, worker, host, operator
 candidate, PG, blob, fixtures, and namespace identities remain normal.
 

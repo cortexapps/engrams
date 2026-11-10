@@ -5,19 +5,25 @@ execution. The runner and all twelve driver families are implemented under
 `orchestrator/scripts/mcp-stack`. The required-case manifest and unit tests are
 not physical results. Platform adapters must not treat them as acceptance evidence.
 
-The proposed command is:
+The full-matrix command is:
 
 ```sh
 bun orchestrator/scripts/mcp-stack/run.ts --context /owned/run/context.json --matrix all
 ```
 
-The parser requires both flags exactly once. It accepts only `all`, which selects
-12 cases for Claude and the same 12 for Codex. A result cannot pass if a case or
-required subassertion is absent. The entrypoint validates the exact driver set,
+The parser requires `--context` once. An omitted selector defaults to
+`--matrix all`, which selects 12 cases for Claude and the same 12 for Codex.
+`--matrix` also accepts unique comma-separated case keys from `manifest.ts`.
+`--stage infrastructure` runs only the shared infrastructure checks. The two
+selectors are mutually exclusive. Focused runs record stage completion only;
+full matrix completion and physical acceptance require `--matrix all` with
+every required case and subassertion. The entrypoint validates the exact driver set,
 context, fixed supervisor controls, scoped database schema and both fixtures
 before publication or signup. Public enabled-image and enrolled-host checks
-precede all cases. It stops on the first failed case and leaves incomplete
-evidence. A total watchdog exits 124; the adapter must tear down owned services
+precede all cases. After an assertion failure with successful case cleanup,
+the runner continues only after fresh readiness checks. Transport, cleanup,
+prerequisite and unclassified failures stop the run. Any failed case leaves
+incomplete evidence. A total watchdog exits 124; the adapter must tear down owned services
 on every exit. Do not activate physical CI until the assembly passes review.
 
 ## Context fields
@@ -95,7 +101,9 @@ for O, coordinator and worker before boot and across restart.
 
 POST `/v1/control` over the private Unix socket. Bearer token comes only from
 its file. Request is exactly `{version:1,runId,operation,role?,configurationId?}`. Operations are
-`status`, `restart`, `stop`. Roles are `orchestrator`, `worker`, `coordinator`,
+`status`, `restart`, `stop`, `infrastructure-ready`, `prepare-disk-read`, and
+`verify-disk-read`. The last three are fixed Firecracker checkpoints with no
+role or configuration argument. Roles are `orchestrator`, `worker`, `coordinator`,
 `host-agent`, `fixture-modern`, `fixture-legacy`. The runner can inspect fixture
 status but cannot stop or restart either fixture. The adapter owns fixture cleanup after the runner terminates.
 
@@ -137,9 +145,9 @@ requires an owned session. Coordinator queries join the exact managed creation
 relay status and `acked_at` for `tool_result:<session>:<call>`. Orchestrator queries
 check actual session listener ownership for the same task/session. Pools set
 `default_transaction_read_only=on`, one connection and bounded statements. They
-never select credentials, raw arguments/results or mutate state. O managed
-lifecycle/Started observation still needs the accepted producer schema after
-coherent integration; listener lease alone does not establish Started.
+never select credentials, raw arguments/results or mutate state. The observer
+checks O's managed lifecycle row against the coordinator's exact Started boot
+identity. A listener lease alone does not establish Started.
 
 The public journal result and its settlement field, fixture effect count,
 coordinator outbox ACK and actual guest proof are different observations. A
@@ -149,13 +157,14 @@ records bounded states, counts, sizes and hashes; it refuses unknown payload
 fields and case results that cite observations not collected for that case.
 It does not print exceptions, credentials, cookies, codes, arguments or results.
 
-## Required unresolved seams
+## Implemented source and remaining physical gates
 
-1. The runner consumes the separately owned additive CLI contract: bounded
+1. The runner consumes the implemented CLI contract: bounded
    scalar arguments/call IDs/native expected result, or an immutable fixed call
    plan with explicit prompt markers. Plans exclude scalar settings. Actual
    exposure name-set hashes and native response hashes are verified. The CLI
-   source must be integrated before physical runs.
+   source is in `tests/fixtures/mcp-model-cli`; actual guest execution remains
+   a physical acceptance requirement.
 2. Guest proof files are JSONL, one flushed completion per line, including
    multiple turns in one process. Each record is validated and hashed separately.
    Repeated markers retain call IDs; each prompt attempt uses a distinct prompt
@@ -164,23 +173,27 @@ It does not print exceptions, credentials, cookies, codes, arguments or results.
    and upstream name, then must match paginated public GetSessionMcpState before
    prompting. No description-based selector or guessed alias prefix is needed.
 4. Modern and legacy MCP protocol is fixed for a standalone fixture lifetime.
-   The context now requires two independent fixture instances. The adapters
-   still need to implement both real lifetimes.
+   The context requires two independent fixture instances. The adapters
+   implement both lifetimes in `platform/launch.ts`. Real startup and
+   persistence across restarts remain physical checks.
 5. No public global/zone flag setter exists. The fixed orchestrator-only
    configuration contract above uses the actual startup switches. Adapters
-   must implement it without changing operator publication or network trust.
+   implement the fixed variants and verify unchanged operator publication and
+   network trust. Effective deployment behavior remains a physical check.
 6. Child grant intersection needs an actual native child-task invocation.
-   The separately owned fixed plan supports an exact native spawn step and a
-   child message marker. Its implementation must be integrated first.
+   The fixed CLI plan supports an exact native spawn step and a child message
+   marker. The runner uses that plan through the normal harness transport.
    Forged guest completion and direct bypass probes need actual guest transport,
    not a human owner's public call labeled as guest traffic.
-7. The fixture OAuth control contract adds future-issued `expiresInSeconds`
+7. The fixture OAuth control contract implements future-issued `expiresInSeconds`
    (integer 1–3600; default 3600), observed under `oauth.expiresInSeconds`. The
    runner uses 2 seconds and the actual coordinator clock. Existing token
-   deadlines do not change when the configuration changes. This separately
-   owned fixture extension must be integrated before a run.
-8. Coherent production startup and both physical adapters remain external work.
-   No helper module or unit test in this directory establishes physical proof.
+   deadlines do not change when the configuration changes. The standalone
+   fixture and worker fixture implement this control.
+8. Both adapters implement production startup, private configuration and
+   supervision under `platform/`. Source assembly and unit tests do not prove
+   coherent service startup or either physical backend result. Real capable
+   runners, exact assets and current-head CI remain required.
 
 The fixed call plan can assert `expectExposure: "absent"` for an exact MCP
 alias. Such a step must observe a real protocol denial and cannot include an
@@ -194,8 +207,8 @@ nonce, separated by a hyphen. Discovery accepts only
 `<scenario suffix>-<PID>-<32 lowercase hex>.json`. It has no PID-only fallback.
 Exclusive creation preserves every old proof across disk recovery even when
 the new guest reuses a PID. Nonces are observation filenames, not authority.
-The CLI implementation of this additive token must be reviewed and integrated
-before physical execution; legacy literal and `{pid}` modes are not used here.
+The CLI implements this token with exclusive file creation and OS entropy;
+legacy literal and `{pid}` modes are not used by these acceptance profiles.
 
 The common runner exposes only two release files under the fixed guest state
 root: `completion-release` and `premature-release`. Profile options enable the

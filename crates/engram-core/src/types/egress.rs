@@ -1,5 +1,5 @@
 //! Egress-policy types used by `SandboxBackend::notify_session_policy`
-//! and the wire-protocol `NotifyKind::SessionEgressPolicy` frame.
+//! and the policy bundled with `HostClient::start_agent`.
 //!
 //! These intentionally use flat `Vec<String>` for host allow-lists
 //! rather than the `engram-egress-proxy::HostList` type — the proxy
@@ -20,8 +20,8 @@ use crate::{SandboxId, SessionId};
 
 /// Per-session egress policy the host-agent's proxy registers
 /// against a session's `guest_ip`. Built by the coordinator from
-/// the image manifest + resolved secret bundle, shipped to the
-/// owning host over the WS, applied locally by the host-agent.
+/// the image manifest + resolved secret bundle and sent with the agent
+/// in the host start RPC. The host-agent applies it before spawn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEgressPolicy {
     pub session_id: SessionId,
