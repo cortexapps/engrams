@@ -95,6 +95,16 @@ async fn read_off_runtime(device: &Arc<File>, offset: u64, len: usize) -> Vec<u8
         .unwrap()
 }
 
+/// The chunks the source recorded as read cold, less the first chunk. The
+/// kernel's partition scan reads the start of the device at a time of its
+/// own (in a work item on newer kernels), and the source records that
+/// read like a guest's.
+fn guest_reads(source: &BlkSource) -> Vec<u32> {
+    let mut touched = source.touched();
+    touched.retain(|chunk| *chunk != 0);
+    touched
+}
+
 #[tokio::test]
 #[ignore = "requires root and the ublk_drv module"]
 async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
@@ -116,7 +126,7 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
         read_off_runtime(&device, at, 4096).await,
         image[at as usize..at as usize + 4096]
     );
-    assert_eq!(source.touched(), vec![3]);
+    assert_eq!(guest_reads(&source), vec![3]);
 
     // The copy's stream: the whole device, region by region, ascending.
     for at in (0..CHUNKS * CHUNK).step_by(REGION as usize) {
@@ -126,7 +136,7 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
             "region at {at}"
         );
     }
-    assert_eq!(source.touched(), vec![3], "the stream is not a guest read");
+    assert_eq!(guest_reads(&source), vec![3], "the stream is not a guest read");
 
     drop(device);
     source.stop().await.unwrap();
