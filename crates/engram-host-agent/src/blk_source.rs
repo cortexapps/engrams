@@ -397,8 +397,14 @@ impl Shared {
                                 .await?;
                             whole.slice(in_chunk as usize..(in_chunk + piece) as usize)
                         }
-                        Serve::Stream(_) | Serve::Demand => {
-                            self.touch(chunk);
+                        served => {
+                            // A chunk in the window arrives without help,
+                            // and the host's own probe of a new device
+                            // reads there: only a read outside it counts
+                            // as the guest's first touch.
+                            if matches!(served, Serve::Demand) {
+                                self.touch(chunk);
+                            }
                             self.until_fetched(chunk, || {
                                 self.engine.read_range(
                                     hash,
