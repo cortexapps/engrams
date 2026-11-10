@@ -249,7 +249,11 @@ the test named beside it.
   (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
   `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`). Only a
   snapshot taken after the settle becomes a checkpoint volume
-  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`). A
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`). The periodic
+  checkpoint waits for the settle, for at most 10 minutes
+  (`a_running_settle_holds_the_periodic_checkpoint_for_a_bounded_time`); an eviction or
+  a snapshot does not wait. A whole chunk read for a volume is not hashed
+  (`read_does_not_hash_what_the_store_returns`). A
   host-agent restart serves every hydrating volume again from the pool's names, and never
   deletes one it does not serve (`a_killed_process_leaves_a_volume_the_next_one_serves_again`).
   A store error that can pass stalls a read of the source; it does not fail it.

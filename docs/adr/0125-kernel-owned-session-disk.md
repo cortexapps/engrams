@@ -715,7 +715,12 @@ thin-pool host and the reverse.
   on the device, and a checkpoint in the window reads every copied
   block back from the same disk (a copied block and a written block
   look the same in the pool's mapping), which nearly stops the copy
-  while it runs. The copy starts about 1 s after hydration is turned
+  while it runs. So the periodic checkpoint waits for the settle, for
+  at most 10 minutes; an eviction or a snapshot does not wait. The two
+  values are host-fleet chart values (`thinPool.hydration`). A whole
+  chunk read for a volume is not hashed: a chunk is checked when it is
+  written to the store or to the cache. The copy starts about 1 s after
+  hydration is turned
   on; a `dmsetup remove` right after a create meets udev's open for
   about 0.2 s and is retried. Libublk's control commands run on a
   thread-local ring, so every thread that stops, recovers or deletes a
