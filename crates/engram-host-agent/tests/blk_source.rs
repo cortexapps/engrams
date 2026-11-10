@@ -136,7 +136,11 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
             "region at {at}"
         );
     }
-    assert_eq!(guest_reads(&source), vec![3], "the stream is not a guest read");
+    assert_eq!(
+        guest_reads(&source),
+        vec![3],
+        "the stream is not a guest read"
+    );
 
     drop(device);
     source.stop().await.unwrap();
