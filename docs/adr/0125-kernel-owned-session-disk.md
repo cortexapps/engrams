@@ -2,7 +2,9 @@
 
 - Status: Accepted (2026-11-04). This ADR supersedes ADR 0110 (honest
   writes) and Decision 3 of ADR 0090 (the quarantined survivor channel),
-  and retires ADR 0049 (the NBD slot allocator).
+  and retires ADR 0049 (the NBD slot allocator). Amended 2026-11-09:
+  a resume hydrates the disk behind the running guest (Decision 3, the
+  Resume lifecycle, and the dated divergence entry).
 - Date: 2026-11-03
 - Commit chain (branch `disk/session-disk-seam`, one PR): step 1
   `ed6186b7c`..`08403960d` (the seam, `FileDisk`, `CrashDisk`, the two
@@ -180,11 +182,19 @@ thin-provisioning tools it calls at run time (`thin_dump`,
    readiness.
 3. **A session disk is a thin snapshot.** A fresh session's root disk
    is a snapshot of its image volume. A resumed session's root disk is
-   a snapshot of its base image volume with the session's dirty chunks
-   written in. Guest swap (ADR 0112) starts as a fresh thin volume
-   with no origin and is checkpointed with the root disk from then on
-   (see the divergences). Every volume a session owns is recorded in
-   its `sandbox.json`.
+   a snapshot of the nearest base this host holds (the kept checkpoint
+   volume or staged image version that shares the most chunks with the
+   session's manifest at the same offset; an empty volume when none
+   shares any) under a
+   dm-clone device that copies the difference to its manifest in
+   behind the running guest; the guest starts at once and reads a
+   region the copy has not reached through the device's source, a
+   ublk device the host-agent serves from the fill engine. Once every
+   region is copied the device is reloaded as a thin snapshot of its
+   destination and the source goes. Guest swap (ADR 0112) starts as a
+   fresh thin volume with no origin and is checkpointed with the root
+   disk from then on (see the divergences). The pool's volume names
+   are the record of what a session owns.
 4. **Firecracker opens the device path.** The guest's virtio-blk drive
    is a device node the host-agent makes itself under `/dev/engram/`
    (`mknod` from the kernel's major:minor, so no udev rule is in the
@@ -251,7 +261,10 @@ thin-provisioning tools it calls at run time (`thin_dump`,
 /dev/engram/engram-pool.sb-<sandbox_id>-root         session root disk (snapshot of an image volume)
 /dev/engram/engram-pool.sb-<sandbox_id>-swap         session swap (a fresh volume at first; checkpointed like root)
 /dev/engram/engram-pool.sb-<sandbox_id>-ckpt-<K>     a checkpoint snapshot, transient
-<work_dir>/<sandbox_id>/sandbox.json                 records the volume names
+/dev/engram/engram-pool.sb-<sandbox_id>-<role>-dest-<manifest>  the destination a hydrating live volume copies into
+/dev/engram/engram-pool.sb-<sandbox_id>-<role>-base-<manifest>  the base that destination is a snapshot of
+/dev/ublkb<N>                                        the source a hydrating live volume reads cold regions from
+<work_dir>/<sandbox_id>/sandbox.json                 records the sandbox; the volume names are the pool's
 ```
 
 The pool's metadata is the only record of which thins exist and the
@@ -312,9 +325,34 @@ space falls under twice the placement floor. The eviction finalize
 (`eviction_finalize.rs`) keeps its shape: a host-owned job over durable
 artifacts, now the checkpoint snapshot instead of a frozen dirty file.
 
-**Resume.** Decision 3. The dirty chunks are written before the VM
-starts; nothing is faulted lazily from the chunk store on the disk path.
-The memory path keeps its lazy base (ADR 0092).
+**Resume.** Decision 3. The host snapshots the nearest base it holds
+under the `dest` name, makes the live volume a dm-clone device over it
+with hydration off and discard passdown off, discards every region the
+base already holds in final form and every region the manifest leaves
+out (a discard on the clone marks the region hydrated without a copy;
+the guest never discards, so a discard always means "already correct"),
+starts the source and turns hydration on with a tuned batch and
+threshold, and boots the VM. The source answers a guest read of a cold
+region with a ranged `Demand` read and the kernel's ascending copy
+with whole-chunk `Hydrate` reads; the chunks the guest read first on
+the session's last window are fetched at `Prefix` before the copy
+reaches them. A settle task polls the clone's status and, when every
+region is copied, suspends the device, reloads it as a thin snapshot of the
+destination, resumes it and stops the source: the path Firecracker
+opened never changes. A checkpoint in the window diffs the snapshot's
+mapping against the base: a block whose mapping changed (copied or
+written) is the snapshot's, any other is the manifest's, so nothing is
+read through the source and no write is lost; the published manifest
+takes the destination's name, and only a snapshot taken after the
+settle becomes a checkpoint volume: one taken in the window holds base
+bytes where the copy had not reached. A live volume that hydrates and
+whose source this process does not serve is never deleted; the next
+host-agent serves it again from the names alone, and retries until the
+store answers. A store error that can pass stalls a read of the source
+instead of failing it, so the guest never sees an I/O error for an
+outage. A host without the ublk control device writes each volume in
+full before its guest starts and logs an error at startup. The memory
+path keeps its lazy base (ADR 0092).
 
 **Teleport (ADR 0123).** A live move carries the disk in three tiers.
 The target stages the checkpoint the source advertises at presetup. The
@@ -510,11 +548,20 @@ that adds code without retiring the row it replaces is incomplete.
   repair use `thin_check`, `thin_dump` and `thin_repair`. `thin_check`
   on a 750 GiB pool takes about 4 s. Operators lose `ls` on a dirty
   file and gain `dmsetup status`.
-- **Staging precedes the first boot on a node.** The prefetch
+- **Staging an image precedes the first boot on a node.** The prefetch
   supervisor already downloads and pins the full base before marking an
   image ready, so this is the same cost moved from a cache directory to
-  a volume. It is listed here because it is now structural: there is no
-  lazy fallback.
+  a volume. A session's own difference from the image is not staged:
+  it hydrates behind the running guest.
+- **A hydrating window has a userspace process on the cold-region
+  path.** The host-agent serves the clone's source; a guest read of a
+  region the copy has not reached waits on it, and on a host-agent
+  restart waits until the next process serves the volume again (the
+  kernel queues the request, under ublk user recovery). The window is
+  seconds long and bounded by the copy rate; after it the kernel alone
+  is in the path. Stopping a ublk device with a request queued and no
+  server blocks in the kernel until reboot, so a source is stopped only
+  after the device that mapped onto it is gone.
 
 ## Testing
 
@@ -648,6 +695,56 @@ thin-pool host and the reverse.
   pick mirrors the Postgres in-transaction pick, which gates on RAM and
   CPU; the pool floor is a coordinator-side candidate filter, like the
   work-dir disk floor, and is covered by the placement unit test.
+- **2026-11-09: the resume hydrates behind the running guest.** The
+  eager stage made a cold resume of an old session a function of its
+  difference from the staged image: 27 to 29 s of a 39 s wake for a
+  31 GB root disk that shared nothing with the hourly image, and the
+  internal deployment's bakes move at least 40% of the disk's blocks
+  every hour, so a session older than an hour is the normal case. The
+  live volume is now a dm-clone device over a snapshot of the nearest
+  base, with a ublk source the host-agent serves from the fill engine
+  (Decision 3). Measured on a dev-cluster c3 host: dm-clone hydrates at
+  about 370 MiB/s with `hydration_batch_size 16` and
+  `hydration_threshold 128` against about 50 MiB/s with the kernel's
+  defaults of 1. With a 31.7 GiB difference beside a 13 GiB memory
+  fill, that setting and a source window of 4 chunks left the copies
+  waiting on the source or on their own limit; `hydration_threshold
+  512` and a window of 12 chunks copy at 760 to 1017 MiB/s, where the
+  pool's backing disk is the limit, and settle in 53 s. Two limits
+  stay: dm-clone starts no background copy while guest I/O is in flight
+  on the device, and a checkpoint in the window reads every copied
+  block back from the same disk (a copied block and a written block
+  look the same in the pool's mapping), which nearly stops the copy
+  while it runs. So the periodic checkpoint waits for the settle, for
+  at most 10 minutes; an eviction or a snapshot does not wait. The two
+  values are host-fleet chart values (`thinPool.hydration`). A whole
+  chunk read for a volume is not hashed: a chunk is checked when it is
+  written to the store or to the cache. The copy starts about 1 s after
+  hydration is turned
+  on; a `dmsetup remove` right after a create meets udev's open for
+  about 0.2 s and is retried. Libublk's control commands run on a
+  thread-local ring, so every thread that stops, recovers or deletes a
+  device makes one first. The reattach generation goes to 3: the
+  pre-upgrade drain evicts every session, so no node carries a
+  hydrating volume into the roll. The drain acts on hosts below the
+  target's generation only, so a rollback past this change needs the
+  hosts drained by hand first, as for generations 1 and 2: the earlier
+  build serves no source, and a guest on a hydrating volume would wait
+  on its cold regions for ever. A source holds up to 14 chunks in
+  memory (224 MiB at 16 MiB chunks) for each hydrating volume. A source in
+  its window, or settled before its first checkpoint, moves by
+  snapshot: it has no checkpoint volume for a live move's block diff,
+  and the presetup says so. The live move's three block tiers stay; the
+  destination's volume hydrates while the tiers land, which the
+  checkpoint rule covers like a guest write. The heartbeat gains no
+  field and `sandbox.json` records no device: the pool's names are the
+  record, and a restart serves every hydrating volume again from them.
+  The base is chosen by content, not by name: the restore compares the
+  session's manifest with the kept checkpoint and every staged image
+  version and snapshots the one that holds the most chunks in place,
+  so an image whose tag moved since the session began still supplies
+  the blocks it shares. The snapshot's `base_disk_manifest` no longer
+  steers the disk.
 
 ## Facts this ADR establishes
 
@@ -679,6 +776,27 @@ names the test that guards each one. As landed, the guards are:
   (`a_first_checkpoint_uploads_every_nonzero_chunk_and_stage_reproduces_it`,
   `a_checkpoint_over_the_pool_reproduces_through_stage`,
   `a_checkpoint_reproduces_the_guest_disk_on_another_disk`)
+- A resume boots before its disk is copied in; the guest reads a cold
+  region through the source and the copy settles onto the destination
+  under the path Firecracker opened.
+  (`a_hydrating_device_copies_only_the_delta_and_settles_onto_its_destination`,
+  `a_lazy_resume_reads_cold_chunks_through_the_source_and_settles`,
+  `a_lazy_resume_starts_on_a_hydrating_volume_and_settles_onto_it`)
+- A checkpoint in the window reads nothing through the source and
+  loses no write; no checkpoint volume exists before the settle.
+  (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
+  `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`)
+- Only a snapshot taken after the settle becomes a checkpoint volume.
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`)
+- A host-agent restart serves a hydrating volume again from the pool's
+  names; a volume nothing serves is never deleted.
+  (`a_killed_process_leaves_a_volume_the_next_one_serves_again`,
+  `a_restart_serves_a_hydrating_volume_again`)
+- A role without a checkpoint volume moves by snapshot.
+  (`a_role_without_a_checkpoint_volume_refuses_a_live_move`)
+- A resume starts from the volume on the host that shares the most
+  chunks with its manifest, whichever image version that is.
+  (`a_resume_starts_from_the_staged_volume_that_shares_the_most`)
 - The heartbeat carries observed facts only; no field asks the
   coordinator to take an action.
 

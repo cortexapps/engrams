@@ -1186,6 +1186,8 @@ jobs:
 
       # The disk over the pool, then the session disk under a real guest
       # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # The ublk source's tests run in `test-ublk-root`: this runner's
+      # kernel has no ublk driver.
       - name: dm-thin session-disk tests (root)
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
@@ -1193,6 +1195,7 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
             --test thin_pool \
+            --test clone \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1247,6 +1250,86 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # The ublk source of a hydrating session volume (ADR 0125), as root
+  # over a dm-thin pool. No guest boots, so no KVM. It runs on a
+  # GitHub-hosted runner because the Blacksmith kernel is built without
+  # `CONFIG_BLK_DEV_UBLK`; Ubuntu's kernel has `ublk_drv` as a module,
+  # as the production node image does.
+  # ------------------------------------------------------------------
+  test-ublk-root:
+    name: tests (ublk source, root)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc and the pool tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            protobuf-compiler thin-provisioning-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ublk-root
+      - uses: taiki-e/install-action@nextest
+      - name: Build the dm-thin pool and load ublk
+        run: |
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          # Some Ubuntu kernels keep `ublk_drv` in a separate package.
+          if ! sudo modprobe ublk_drv; then
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          fi
+          test -e /dev/ublk-control
+      - name: ublk source and lazy restore tests (root)
+        env:
+          ENGRAM_TEST_THIN_POOL: engram-pool
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test blk_source \
+            --test lazy_restore \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1 &
+          run=$!
+          # A thread blocked in the kernel on a ublk device cannot be
+          # killed, so a hung test never ends: show where it waits.
+          for _ in $(seq 1 120); do
+            kill -0 "$run" 2>/dev/null || break
+            sleep 5
+          done
+          if kill -0 "$run" 2>/dev/null; then
+            echo "::error::the ublk tests did not end in 10 minutes"
+            for exe in /proc/[0-9]*/exe; do
+              case "$(sudo readlink "$exe" 2>/dev/null)" in
+                */deps/blk_source-*|*/deps/lazy_restore-*) ;;
+                *) continue ;;
+              esac
+              pid=${exe#/proc/}; pid=${pid%/exe}
+              for task in /proc/"$pid"/task/*; do
+                echo "== pid $pid task ${task##*/} $(cat "$task/comm") $(cut -d' ' -f3 "$task/stat")"
+                sudo cat "$task/stack" 2>/dev/null || true
+              done
+            done
+            for dev in /sys/block/ublkb*; do
+              [ -e "$dev" ] && echo "$dev inflight: $(cat "$dev/inflight") holders: $(ls "$dev/holders")"
+            done
+            sudo dmsetup ls || true
+            sudo dmesg | tail -60
+            exit 1
+          fi
+          wait "$run"
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo 2>/dev/null || true
 
   test-fc-e2e:
     name: tests (firecracker true-e2e, Linux + KVM)
@@ -2450,6 +2533,7 @@ jobs:
       - test-fc-unprivileged
       - test-fc-pooled
       - test-fc-root
+      - test-ublk-root
       - test-fc-e2e
       - vz
       - test-macos

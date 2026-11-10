@@ -62,13 +62,23 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   above. Nothing ends and no data is lost: each session resumes on the new build the next
   time it is used. With `upgradeDrain.enabled: false`, evict every session before the
   upgrade. To roll back past this release, drain the hosts first the same way.
+- **A resume copies its disk in behind the running VM, which needs `ublk_drv`.** The host
+  agent serves the part of a session's disk the host does not hold as a ublk block device,
+  so the node needs the `ublk_drv` module; node-prep loads it. On a node without
+  `/dev/ublk-control` the host agent logs an error at startup and writes each disk in full
+  before its VM starts, as before. The reattach generation goes to 3, so this upgrade
+  drains every host as described above. To roll back past this release, drain the hosts
+  first: an earlier host agent cannot serve a disk that is still copying, and its VM would
+  hang.
 
 ### Changed
 
 - **The kernel owns the session disk.** A VM's disk is a thin volume in a device-mapper pool;
   no host process is in the data path, and a host agent restart does not touch a running
   VM's disk. A base image is staged into the pool once per host and every session's volume
-  is a snapshot of it, so a create writes nothing. A checkpoint pauses the VM for tens of
+  is a snapshot of it, so a create writes nothing. A resume starts the VM on a snapshot of
+  the nearest base the host holds and copies the difference in behind it, so the time to
+  the first prompt does not grow with the size of the session's disk. A checkpoint pauses the VM for tens of
   milliseconds however much it wrote and uploads only the blocks that changed. The disk daemon, the
   copy-on-write view, the flush pipeline, the durability-rollback path, and the
   quarantined-survivor eviction are gone with it.

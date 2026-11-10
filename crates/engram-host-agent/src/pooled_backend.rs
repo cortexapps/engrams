@@ -188,6 +188,25 @@ mod item_assembler_tests {
 }
 
 #[cfg(test)]
+mod settle_hold_tests {
+    use super::{settle_holds_checkpoint, SETTLE_HOLDS_CHECKPOINT};
+
+    #[test]
+    fn a_running_settle_holds_the_periodic_checkpoint_for_a_bounded_time() {
+        let started = chrono::DateTime::UNIX_EPOCH;
+        let just_inside = started + SETTLE_HOLDS_CHECKPOINT - chrono::TimeDelta::seconds(1);
+
+        assert!(settle_holds_checkpoint(false, started, just_inside));
+        assert!(!settle_holds_checkpoint(true, started, just_inside));
+        assert!(!settle_holds_checkpoint(
+            false,
+            started,
+            started + SETTLE_HOLDS_CHECKPOINT
+        ));
+    }
+}
+
+#[cfg(test)]
 mod first_touch_tests {
     use super::*;
 
@@ -266,7 +285,16 @@ mod first_touch_tests {
             entries: vec![(2, 10), (3, 20), (1, 30)],
         };
         std::fs::write(&file, record.encode()).unwrap();
-        publish_first_touch(&plain, session, &file, Some(10)).await;
+        publish_first_touch(&plain, session, &file, Some(10), vec![5, 2]).await;
+        assert_eq!(
+            first_touch_indices(
+                &plain,
+                session,
+                &engram_chunk_store::FirstTouch::disk_key(session.as_uuid())
+            )
+            .await,
+            vec![5, 2]
+        );
 
         let cache = engram_chunk_store::cache::ChunkCache::new(
             engram_chunk_store::cache::ChunkCacheConfig {
@@ -350,6 +378,19 @@ async fn read_trace_lineage(src: &Path) -> Option<SessionId> {
     serde_json::from_value(value.get("trace_lineage_id")?.clone()).ok()
 }
 
+/// The chunk indices published under `key` for `session`, in touch
+/// order; empty when none were, or the record is unreadable.
+async fn first_touch_indices(store: &ChunkStore, session: SessionId, key: &str) -> Vec<u32> {
+    match store.blob_storage().get(key).await {
+        Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
+        Err(engram_core::BlobError::NotFound) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(%session, key, error = %e, "first-touch prefix unreadable");
+            Vec::new()
+        }
+    }
+}
+
 /// The chunk indices under `key` as this manifest's chunk hashes, in
 /// order. Positions the manifest leaves out are zero pages and need no
 /// fetch.
@@ -359,14 +400,7 @@ async fn first_touch_hashes(
     key: &str,
     manifest: &engram_chunk_store::Manifest,
 ) -> Vec<engram_chunk_store::ChunkHash> {
-    let indices = match store.blob_storage().get(key).await {
-        Ok(bytes) => engram_chunk_store::FirstTouch::decode_indices(&bytes).unwrap_or_default(),
-        Err(engram_core::BlobError::NotFound) => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(%session, error = %e, "first-touch prefix unreadable");
-            return Vec::new();
-        }
-    };
+    let indices = first_touch_indices(store, session, key).await;
     let chunk_size = manifest.chunk_size.as_u64();
     let by_offset: std::collections::HashMap<u64, engram_chunk_store::ChunkHash> =
         manifest.chunks.iter().map(|c| (c.offset, c.hash)).collect();
@@ -426,15 +460,32 @@ fn split_first_touch(record: &engram_chunk_store::FirstTouch, cut_ms: i64) -> (V
     (prefix, rest)
 }
 
-/// Publish the chunks the sandbox touched up to its first completed run
-/// (all of them before one completes), for the session's next restore to
-/// fetch first. Best-effort.
+/// Publish the memory chunks the sandbox touched up to its first
+/// completed run (all of them before one completes) and the root disk
+/// chunks the guest read before a hydrating restore's copy reached them
+/// (`disk`, at most [`FIRST_TOUCH_PREFIX_CAP`]), for the session's next
+/// restore to fetch first. Best-effort.
 async fn publish_first_touch(
     store: &ChunkStore,
     session: SessionId,
     file: &Path,
     first_run_completed: Option<i64>,
+    mut disk: Vec<u32>,
 ) {
+    let blob = store.blob_storage();
+    let encode = engram_chunk_store::FirstTouch::encode_indices;
+    disk.truncate(FIRST_TOUCH_PREFIX_CAP);
+    if !disk.is_empty() {
+        let key = engram_chunk_store::FirstTouch::disk_key(session.as_uuid());
+        match blob.put(&key, encode(&disk).into()).await {
+            Ok(_) => {
+                tracing::info!(%session, chunks = disk.len(), "published disk first-touch prefix")
+            }
+            Err(e) => {
+                tracing::warn!(%session, error = %e, "publish disk first-touch prefix failed")
+            }
+        }
+    }
     let Ok(bytes) = tokio::fs::read(file).await else {
         return;
     };
@@ -446,8 +497,6 @@ async fn publish_first_touch(
         return;
     }
     let (prefix, rest) = split_first_touch(&record, first_run_completed.unwrap_or(i64::MAX));
-    let encode = engram_chunk_store::FirstTouch::encode_indices;
-    let blob = store.blob_storage();
     let key = engram_chunk_store::FirstTouch::key(session.as_uuid());
     let rest_key = engram_chunk_store::FirstTouch::rest_key(session.as_uuid());
     match tokio::try_join!(
@@ -828,6 +877,10 @@ pub struct PooledBackend {
     /// A lazy restore's background memory prefetch; dropping the entry
     /// cancels it.
     memory_prefetches: DashMap<SandboxId, AbortTaskOnDrop>,
+    /// The driver that settles a sandbox's hydrating disks; dropping the
+    /// entry ends it. Destroy drops it before the VM goes, so no settle
+    /// runs against a volume being released.
+    disk_settles: DashMap<SandboxId, DiskSettle>,
     /// The adaptive checkpoint controller's input: what the last
     /// capture observed about the memory dirty rate (ADR 0101 B).
     checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
@@ -1014,12 +1067,87 @@ fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind)
         .increment(1);
 }
 
+/// How often a settle driver reads a hydrating disk's progress, and how
+/// long it waits after a step fails.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Settle each of the sandbox's hydrating disks: serve the sources this
+/// process does not serve yet (after a restart), poll until the kernel
+/// has every region, then cut the device over and stop its source
+/// (`SessionVolumes::settle` is the step). A failed step is retried, so
+/// a store outage at startup does not leave a guest's disk unserved; a
+/// destroy ends the driver by dropping its task.
+async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId) {
+    let roles = loop {
+        let hydrating = async {
+            volumes.reattach(id).await?;
+            volumes.hydrating(id).await
+        };
+        match hydrating.await {
+            Ok(roles) => break roles,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %id, %error, "hydrating disks not served; retrying");
+                tokio::time::sleep(SETTLE_RETRY).await;
+            }
+        }
+    };
+    for role in roles {
+        let started = crate::time_source::metrics_now();
+        // The regions the copy still had to bring in when this driver
+        // first looked; none when the volume was complete by then.
+        let mut regions: Option<u64> = None;
+        loop {
+            match volumes.settle(id, role).await {
+                Ok(engram_host_core::Hydration::Settled) => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        role = %role,
+                        regions = regions.unwrap_or(0),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "disk settled",
+                    );
+                    break;
+                }
+                Ok(engram_host_core::Hydration::Hydrating {
+                    hydrated, total, ..
+                }) => {
+                    regions.get_or_insert(total - hydrated);
+                    tokio::time::sleep(SETTLE_POLL).await;
+                }
+                Err(error) => {
+                    tracing::warn!(sandbox_id = %id, role = %role, %error, "disk settle step failed; retrying");
+                    tokio::time::sleep(SETTLE_RETRY).await;
+                }
+            }
+        }
+    }
+}
+
 /// Abort the wrapped task on drop, including hint polling after DrainDone.
 /// A leg wrapped by
 /// [`spawn_leg_keepalive`] stops resending stale progress the moment
 /// the guard goes out of scope — on every path, including an early
 /// `?`-return, since `Drop` runs during unwind too.
 struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+struct DiskSettle {
+    task: AbortTaskOnDrop,
+    started: chrono::DateTime<chrono::Utc>,
+}
+
+/// How long a settle driver that has not finished holds the periodic
+/// checkpoint. A driver that cannot settle (a chunk the store lost)
+/// runs for ever, and the session still needs checkpoints.
+const SETTLE_HOLDS_CHECKPOINT: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+fn settle_holds_checkpoint(
+    finished: bool,
+    started: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !finished && now - started < SETTLE_HOLDS_CHECKPOINT
+}
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
@@ -1911,15 +2039,52 @@ impl PooledBackend {
         }
         .await;
         remove_staged_manifests(staged_manifests, &src, id, &staged_refs).await;
-        if restore.is_err() {
-            self.drop_failed_restore(id);
-            if let Some(volumes) = self.volumes.as_ref() {
-                if let Err(error) = volumes.release(id).await {
-                    tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
+        let volumes = self.volumes.as_ref();
+        match (&restore, volumes) {
+            (Err(_), _) => {
+                self.drop_failed_restore(id);
+                if let Some(volumes) = volumes {
+                    if let Err(error) = volumes.release(id).await {
+                        tracing::warn!(sandbox_id = %id, %error, "release after a failed restore failed");
+                    }
                 }
             }
+            (Ok(()), Some(_)) => self.settle_disks(id),
+            (Ok(()), None) => {}
         }
         restore
+    }
+
+    /// Drive the sandbox's hydrating disks to settled volumes in the
+    /// background.
+    fn settle_disks(&self, id: SandboxId) {
+        let Some(volumes) = self.volumes.clone() else {
+            return;
+        };
+        let task = tokio::spawn(
+            settle_disks(volumes, id)
+                .instrument(tracing::info_span!("disk.settle", sandbox_id = %id)),
+        );
+        self.disk_settles.insert(
+            id,
+            DiskSettle {
+                task: AbortTaskOnDrop(task),
+                started: self.clock.now_utc(),
+            },
+        );
+    }
+
+    /// Whether the kernel still copies the sandbox's disks in. A
+    /// checkpoint taken now reads every copied block back from the pool's
+    /// disk, which nearly stops the copy, so the periodic driver waits.
+    pub fn disks_hydrating(&self, id: SandboxId) -> bool {
+        self.disk_settles.get(&id).is_some_and(|settle| {
+            settle_holds_checkpoint(
+                settle.task.0.is_finished(),
+                settle.started,
+                self.clock.now_utc(),
+            )
+        })
     }
 
     /// End a restore's memory fetches: cancel its background prefetch and
@@ -1948,11 +2113,20 @@ impl PooledBackend {
         let manifest = metadata.disk_manifest.ok_or_else(|| {
             SandboxError::MemoryImageUnusable("snapshot has no disk manifest".into())
         })?;
-        let base = metadata.base_disk_manifest;
         let root = if fork_disk {
-            Source::Fork { manifest, base }
+            Source::Fork { manifest }
         } else {
-            Source::Continue { manifest, base }
+            let first_touch = match (read_trace_lineage(src).await, self.chunk_store.as_ref()) {
+                (Some(session), Some(store)) => {
+                    let key = engram_chunk_store::FirstTouch::disk_key(session.as_uuid());
+                    first_touch_indices(store, session, &key).await
+                }
+                _ => Vec::new(),
+            };
+            Source::Continue {
+                manifest,
+                first_touch,
+            }
         };
         let sidecar = read_sidecar_swap(src).await?;
         let swap = match (metadata.swap_manifest, sidecar.swap_mib) {
@@ -1969,7 +2143,7 @@ impl PooledBackend {
             }
             (Some(manifest), _) => Some(Source::Continue {
                 manifest,
-                base: None,
+                first_touch: Vec::new(),
             }),
             (None, _) if !fresh && !sidecar.base_capture => {
                 return Err(SandboxError::MemoryImageUnusable(
@@ -2039,6 +2213,7 @@ impl PooledBackend {
             peer_registrations: Arc::new(DashMap::new()),
             sandbox_registrations: Arc::new(DashMap::new()),
             memory_prefetches: DashMap::new(),
+            disk_settles: DashMap::new(),
             checkpoint_pacing: Arc::new(DashMap::new()),
             checkpoint_dir: None,
             checkpoint_recorded: Arc::new(tokio::sync::Notify::new()),
@@ -2092,7 +2267,13 @@ impl PooledBackend {
                     .take_precopy(id, role)
                     .instrument(tracing::info_span!("presetup.precopy_snapshot", %role))
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("{role} disk precopy: {e}")))?;
+                    .map_err(|e| match e.kind() {
+                        // The coordinator moves the session by snapshot.
+                        std::io::ErrorKind::Unsupported => SandboxError::InvalidSpec(format!(
+                            "{role} disk precopy: {e} — use snapshot-rehome"
+                        )),
+                        _ => SandboxError::Snapshot(format!("{role} disk precopy: {e}")),
+                    })?;
                 taken.push((role, pending));
                 let pending = &taken.last().expect("just pushed").1;
                 let changed = volumes
@@ -2424,10 +2605,11 @@ impl PooledBackend {
         ))
     }
 
-    /// Delete the volumes of every sandbox that is neither alive nor
-    /// awaiting an eviction finalize. Runs once at startup, after the
-    /// reattach pass fixes the live set and before anything can
-    /// provision a sandbox.
+    /// Serve again the sources of every hydrating volume the previous
+    /// process left, settle the live sandboxes' ones, and delete the
+    /// volumes of every sandbox that is neither alive nor awaiting an
+    /// eviction finalize. Runs once at startup, after the reattach pass
+    /// fixes the live set and before anything can provision a sandbox.
     pub async fn reconcile_volumes(&self) {
         let Some(volumes) = &self.volumes else {
             return;
@@ -2439,6 +2621,17 @@ impl PooledBackend {
                 return;
             }
         };
+        match volumes.reattach_all().await {
+            Ok(reattached) if reattached.is_empty() => {}
+            Ok(reattached) => {
+                tracing::info!(volumes = reattached.len(), "hydrating disks served again");
+            }
+            Err(error) => tracing::warn!(%error, "startup reattach of hydrating disks failed"),
+        }
+        // Each driver serves what the pass above could not.
+        for id in live.iter().copied() {
+            self.settle_disks(id);
+        }
         let finalizer = self.eviction_finalizer();
         match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
             Ok(report) => {
@@ -2454,6 +2647,10 @@ impl PooledBackend {
                 }
             }
             Err(error) => tracing::warn!(%error, "startup volume reconcile failed"),
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::blk_source::reap_orphans(&volumes.sources()).await {
+            tracing::warn!(%error, "orphaned ublk devices were not all deleted");
         }
     }
 
@@ -2526,8 +2723,13 @@ impl PooledBackend {
             Some(FirstRun::Completed { at_ms }) => Some(*at_ms),
             _ => None,
         };
+        let disk = self
+            .volumes
+            .as_ref()
+            .map(|v| v.first_touch(id, DiskRole::Root))
+            .unwrap_or_default();
         tokio::spawn(async move {
-            publish_first_touch(&chunk_store, session_id, &file, first_run_completed).await;
+            publish_first_touch(&chunk_store, session_id, &file, first_run_completed, disk).await;
         });
     }
 
@@ -4592,7 +4794,7 @@ impl SandboxBackend for PooledBackend {
             let root = match spec.rootfs_manifest {
                 Some(manifest) => Source::Continue {
                     manifest,
-                    base: None,
+                    first_touch: Vec::new(),
                 },
                 None => {
                     let Some((uri, cached)) = cached.as_ref() else {
@@ -4619,7 +4821,7 @@ impl SandboxBackend for PooledBackend {
             let swap = match (spec.swap_manifest, spec.swap_mib.filter(|m| *m > 0)) {
                 (Some(manifest), _) => Some(Source::Continue {
                     manifest,
-                    base: None,
+                    first_touch: Vec::new(),
                 }),
                 (None, Some(mib)) => Some(Source::Empty {
                     size_bytes: u64::from(mib) << 20,
@@ -4636,9 +4838,13 @@ impl SandboxBackend for PooledBackend {
             spec.swap_source = provisioned.swap;
             spec.swap_manifest = provisioned.swap_manifest;
             let created = self.inner.create(id, spec).await;
-            if created.is_err() {
-                if let Err(error) = volumes.release(id).await {
-                    tracing::warn!(sandbox_id = %id, %error, "release after a failed create failed");
+            match &created {
+                // A create from a manifest hydrates like a resume.
+                Ok(()) => self.settle_disks(id),
+                Err(_) => {
+                    if let Err(error) = volumes.release(id).await {
+                        tracing::warn!(sandbox_id = %id, %error, "release after a failed create failed");
+                    }
                 }
             }
             created
@@ -5861,6 +6067,7 @@ impl SandboxBackend for PooledBackend {
         self.held_snapshots.remove(&id);
         self.hint_pollers.remove(&id);
         self.memory_prefetches.remove(&id);
+        self.disk_settles.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
