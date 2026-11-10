@@ -2589,8 +2589,7 @@ test("runner handoff validates the complete context with a real private supervis
     join(process.cwd(), "var/mcp-platform-composition/h-"),
   );
   let supervisor:
-    | Awaited<ReturnType<typeof startContextSupervisor>>
-    | undefined;
+    Awaited<ReturnType<typeof startContextSupervisor>> | undefined;
   try {
     const ctx = await handoffFixture(root);
     await mkdir(ctx.observer.hostManagedRoot, { mode: 0o700 });
@@ -2684,9 +2683,7 @@ test("only the coordinator guard installs the exact native-host route on the int
         fixtureOnlyEgress: true as const,
         externalDnsBlocked: true as const,
         roles: ["orchestrator", "coordinator", "worker"] as (
-          | "orchestrator"
-          | "coordinator"
-          | "worker"
+          "orchestrator" | "coordinator" | "worker"
         )[],
       };
     }
@@ -2785,9 +2782,7 @@ test("native-host TLS qualification pins the actual first leaf and removes its p
           fixtureOnlyEgress: true as const,
           externalDnsBlocked: true as const,
           roles: ["orchestrator", "coordinator", "worker"] as (
-            | "orchestrator"
-            | "coordinator"
-            | "worker"
+            "orchestrator" | "coordinator" | "worker"
           )[],
         };
       }
@@ -3601,9 +3596,7 @@ test("VZ guard acquires and revalidates its exact link with complete address met
         fixtureOnlyEgress: true as const,
         externalDnsBlocked: true as const,
         roles: ["orchestrator", "coordinator", "worker"] as (
-          | "orchestrator"
-          | "coordinator"
-          | "worker"
+          "orchestrator" | "coordinator" | "worker"
         )[],
       };
     }
@@ -4086,6 +4079,87 @@ for (const malformed of [
     }
   });
 }
+
+for (const graceMs of [0, 100]) {
+  test(`owned process teardown waits for transient group EPERM with ${graceMs}ms grace`, async () => {
+    const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+    const owned = new OwnedProcess(
+      process.execPath,
+      ["-e", "setInterval(()=>{},1000)"],
+      process.cwd(),
+      childEnvironment(process.cwd()),
+    );
+    const actualKill = process.kill.bind(process);
+    let retiring = false;
+    let release = false;
+    let denied = 0;
+    const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid !== -owned.child.pid!) return actualKill(pid, signal);
+      if (retiring && !release) {
+        denied++;
+        throw Object.assign(new Error("group not yet reaped"), {
+          code: "EPERM",
+        });
+      }
+      const result = actualKill(pid, signal);
+      if (signal === "SIGTERM") retiring = true;
+      return result;
+    });
+    let settled = false;
+    const stopping = owned.stop(graceMs).finally(() => {
+      settled = true;
+    });
+    // Observe rejection before advancing the event loop.
+    const outcome = stopping.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(denied).toBeGreaterThan(0);
+      expect(settled).toBe(false);
+      release = true;
+      expect(await outcome).toBeUndefined();
+      await owned.done;
+      let absence: unknown;
+      try {
+        actualKill(-owned.child.pid!, 0);
+      } catch (error) {
+        absence = error;
+      }
+      expect(absence).toMatchObject({ code: "ESRCH" });
+    } finally {
+      release = true;
+      await outcome;
+      kill.mockRestore();
+      await owned.stop(100);
+    }
+  });
+}
+
+test("owned process teardown rejects persistent group EPERM after leader exit", async () => {
+  const { OwnedProcess, childEnvironment } = await import("./owned.ts");
+  const owned = new OwnedProcess(
+    process.execPath,
+    ["-e", ""],
+    process.cwd(),
+    childEnvironment(process.cwd()),
+  );
+  await owned.done;
+  const actualKill = process.kill.bind(process);
+  const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid !== -owned.child.pid!) return actualKill(pid, signal);
+    throw Object.assign(new Error("group permission denied"), {
+      code: "EPERM",
+    });
+  });
+  try {
+    await expect(owned.stop(0)).rejects.toThrow("FAILED:process_cleanup");
+  } finally {
+    kill.mockRestore();
+    await owned.stop(100);
+  }
+});
 
 for (const stage of ["infrastructure", "selected-case"] as const) {
   for (const started of [false, true]) {

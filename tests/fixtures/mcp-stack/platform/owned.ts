@@ -226,7 +226,12 @@ export class OwnedProcess {
       process.kill(-this.child.pid, 0);
       return true;
     } catch (e) {
-      if (e instanceof Error && "code" in e && e.code === "ESRCH") return false;
+      if (e instanceof Error && "code" in e) {
+        if (e.code === "ESRCH") return false;
+        // macOS returns EPERM for a group with only unreaped zombies.
+        // Permission denial leaves group absence unproved on every platform.
+        if (e.code === "EPERM") return true;
+      }
       throw e;
     }
   }
@@ -240,7 +245,12 @@ export class OwnedProcess {
       try {
         process.kill(-this.child.pid, s);
       } catch (e) {
-        if (!(e instanceof Error && "code" in e && e.code === "ESRCH")) throw e;
+        if (!(
+          e instanceof Error &&
+          "code" in e &&
+          (e.code === "ESRCH" || e.code === "EPERM")
+        ))
+          throw e;
       }
     };
     if (this.groupExists()) signal("SIGTERM");
