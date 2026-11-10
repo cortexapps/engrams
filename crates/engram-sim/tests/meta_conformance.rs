@@ -745,6 +745,81 @@ async fn capture_job_scan_boundary(ctx: &Ctx) {
         expired[0].id, placed.id,
         "only placed over-budget rows expire"
     );
+
+    let placed = ctx
+        .meta
+        .reassign_capture_job(placed.id, placed.epoch, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placed.epoch, 2);
+    let other_host = HostId::from(uuid::Uuid::from_u128(0xc002));
+    ctx.meta
+        .upsert_host(host_record(
+            other_host,
+            "capture-other-host",
+            ctx.clock.now_utc(),
+        ))
+        .await
+        .unwrap();
+    let other_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:other", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let other = ctx
+        .meta
+        .insert_capture_job(new_capture(other_parent))
+        .await
+        .unwrap();
+    let other = ctx
+        .meta
+        .place_capture_job(other.id, &[other_host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.host_id, Some(other_host));
+    for (assigned_host, expected) in [
+        (host, vec![(placed.id, 2)]),
+        (other_host, vec![(other.id, 1)]),
+    ] {
+        let assignments = ctx
+            .meta
+            .capture_assignments_for_host(assigned_host)
+            .await
+            .unwrap();
+        assert_eq!(
+            assignments
+                .into_iter()
+                .map(|assignment| (assignment.job_id, assignment.epoch))
+                .collect::<Vec<_>>(),
+            expected,
+            "only this host's nonterminal jobs are assigned, at their current epoch"
+        );
+    }
+    assert!(ctx
+        .meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: placed.id,
+            epoch: placed.epoch,
+            stage: CaptureJobStage::Failed,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Failed {
+                error: "capture failed".into(),
+                error_stage: "assigned".into(),
+                retryable: false,
+            }),
+        })
+        .await
+        .unwrap());
+    assert!(ctx
+        .meta
+        .capture_assignments_for_host(host)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Transition legality: illegal edges are Conflict, transitions return
@@ -1017,13 +1092,6 @@ async fn host_fc_snapshot_version(ctx: &Ctx) {
 /// FIFO by queued_at; the queue drains oldest-first. Sessions enter the
 /// queue via the REAL enqueue path (`reserve_and_persist_create` with no
 /// candidates), which stamps `queue_origin` + `queued_at`.
-///
-/// FINDING (surfaced by this suite): a bare
-/// `transition_session(_, Queued)` — legal per the FSM table — leaves
-/// both columns NULL in PostgresStore, and `list_queued_sessions_fifo`
-/// then fails to DECODE the row (`queue_origin: UnexpectedNullError`),
-/// which would break the queue scanner. Production never enters Queued
-/// that way today; flagged for a follow-up guard.
 async fn queue_fifo(ctx: &Ctx) {
     let meta = &ctx.meta;
     let enqueue = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
@@ -4395,9 +4463,7 @@ async fn capturing_disk_manifests_in_flight(ctx: &Ctx) {
 /// `live_enable_work_by_host` is the empty map, while
 /// `list_prestaging_refs`, `capturing_disk_manifests` and
 /// `capture_assignments_for_host` are empty — and registering or
-/// heartbeating a host fabricates none of them. (The sim models no
-/// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
-/// stores agree on the empty case, the only one conformance exercises.)
+/// heartbeating a host fabricates none of them.
 async fn live_enable_work_empty(ctx: &Ctx) {
     let meta = &ctx.meta;
     assert!(meta

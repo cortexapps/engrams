@@ -1,7 +1,7 @@
 //! The `MetadataStore` impl. One lock per method; SQL semantics mirrored
 //! from `PostgresStore` (see each method's comment for the statement it
 //! replicates). Grouped by table family; unimplemented PG-semantic
-//! methods panic via `sim_unimplemented!` at the bottom.
+//! methods have explicit panic bodies.
 
 use engram_core::types::host::DeleteHostOutcome;
 use engram_core::types::host::{
@@ -2090,7 +2090,7 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some(host))
     }
 
-    /// Reserving-state sessions summed per host (pending fresh-only).
+    /// Reservations from sessions, capture jobs, and open teleport endpoints.
     async fn per_host_reserved(
         &self,
     ) -> Result<std::collections::HashMap<HostId, ReservedBudget>, MetaError> {
@@ -2173,7 +2173,7 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    /// `WHERE status IN ('ready','draining') ORDER BY id`.
+    /// Exact host lookup, including dead and retired hosts.
     async fn get_host(&self, id: HostId) -> Result<Option<HostRecord>, MetaError> {
         self.gate()?;
         Ok(self.db.lock().hosts.get(&id).cloned())
@@ -4902,8 +4902,6 @@ impl MetadataStore for SimMetadataStore {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
-        // (PG stamps `updated_at`, a column the in-memory `Session`
-        // doesn't carry — nothing to mirror here.)
         let row_recoverable = db
             .snapshots
             .get(&snapshot_id)
@@ -5423,19 +5421,23 @@ impl MetadataStore for SimMetadataStore {
         Ok(out)
     }
 
-    /// `SELECT id, epoch FROM capture_jobs WHERE host_id=$1 AND stage NOT
-    /// IN ('done','failed')` — this host's live capture assignments,
-    /// echoed on heartbeat.
-    ///
-    /// DIVERGENCE (documented, same family as `pick_host_2d` /
-    /// `live_enable_work_by_host`): the sim has no `capture_jobs` table,
-    /// so this is always empty. Conformance covers only that case.
+    /// This host's nonterminal capture jobs and their current epochs.
     async fn capture_assignments_for_host(
         &self,
-        _host: HostId,
+        host: HostId,
     ) -> Result<Vec<CaptureJobAssignment>, MetaError> {
         self.gate()?;
-        Ok(Vec::new())
+        Ok(self
+            .db
+            .lock()
+            .capture_jobs
+            .values()
+            .filter(|job| job.host_id == Some(host) && !job.stage.is_terminal())
+            .map(|job| CaptureJobAssignment {
+                job_id: job.id,
+                epoch: job.epoch,
+            })
+            .collect())
     }
 
     /// The distinct disk manifests of the non-terminal capture jobs. A
@@ -5872,7 +5874,7 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
-    /// The reconcile pass query: Active + bound sessions on `host_id`.
+    /// Bound memory-reserving sessions on this host.
     async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
@@ -5945,9 +5947,7 @@ impl MetadataStore for SimMetadataStore {
     /// `SELECT prestage_ref FROM enable_jobs WHERE state='prestaging'` —
     /// the images a host should prefetch, echoed to it on heartbeat.
     ///
-    /// DIVERGENCE (documented, same family as `pick_host_2d` /
-    /// `live_enable_work_by_host`): the sim has no `enable_jobs` table, so
-    /// this is always the empty set. Conformance covers only that case.
+    /// The simulator does not model prestage references.
     async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
         self.gate()?;
         Ok(Vec::new())
