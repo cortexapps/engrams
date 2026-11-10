@@ -129,14 +129,7 @@ pub(crate) async fn build_base_sandbox(
         .await
         .expect("seed base manifest");
     volumes
-        .provision(
-            sandbox_id,
-            Source::Fork {
-                manifest: base_ref,
-                base: None,
-            },
-            None,
-        )
+        .provision(sandbox_id, Source::Fork { manifest: base_ref }, None)
         .await
         .expect("provision the root volume");
     sandbox_id
