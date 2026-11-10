@@ -23,6 +23,7 @@ const CHUNKS: u64 = 4;
 /// Chunks 0, 1 and 3 hold bytes; chunk 2 is a hole.
 const HELD: [(u64, u8); 3] = [(0, 0x11), (1, 0x22), (3, 0x33)];
 const DELTA: [u64; 3] = [0, 1, 3];
+const WINDOW: usize = 12;
 
 fn gate() -> bool {
     if std::env::var_os("ENGRAM_TEST_UBLK").is_none() {
@@ -93,7 +94,7 @@ async fn a_source_serves_the_manifest_and_records_the_chunks_read_cold() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (engine, manifest) = engine_and_manifest(dir.path()).await;
-    let source = BlkSource::serve(engine, &manifest, DELTA.to_vec(), REGION)
+    let source = BlkSource::serve(engine, &manifest, DELTA.to_vec(), REGION, WINDOW)
         .await
         .unwrap();
     let path = source.path().to_path_buf();
@@ -140,6 +141,7 @@ async fn child_serves_until_killed() {
         &manifest,
         DELTA.to_vec(),
         REGION,
+        WINDOW,
     )
     .await
     .unwrap();
@@ -207,7 +209,7 @@ async fn a_source_killed_with_a_queued_read_is_recovered_by_a_new_server() {
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
     child.wait().unwrap();
 
-    let recovered = BlkSource::recover(dev_id, engine, &manifest, DELTA.to_vec(), REGION)
+    let recovered = BlkSource::recover(dev_id, engine, &manifest, DELTA.to_vec(), REGION, WINDOW)
         .await
         .unwrap();
     let bytes = tokio::time::timeout(

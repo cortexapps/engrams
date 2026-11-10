@@ -110,7 +110,7 @@ mod time_source;
 pub mod util;
 pub mod warm_progress;
 
-pub use config::HostAgentConfig;
+pub use config::{HostAgentConfig, DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS};
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
@@ -307,7 +307,9 @@ impl HostAgent {
                         let volumes = engram_host_core::SessionVolumes::new(disk, fill.clone());
                         #[cfg(target_os = "linux")]
                         let volumes = match blk_source::available() {
-                            Ok(()) => volumes.with_sources(Arc::new(blk_source::UblkSources)),
+                            Ok(()) => volumes.with_sources(Arc::new(blk_source::UblkSources {
+                                window_ahead: self.cfg.disk_hydration_window_chunks,
+                            })),
                             Err(error) => {
                                 tracing::error!(
                                     %error,

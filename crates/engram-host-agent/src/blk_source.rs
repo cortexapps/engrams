@@ -41,11 +41,6 @@ use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, BufDescList, UblkError, UblkFlags, UblkIORes};
 use tokio::sync::{mpsc, oneshot, OnceCell};
 
-/// Chunks fetched ahead of the stream chunk. With 16 MiB chunks this is
-/// 192 MiB in flight per device, enough that the pool's disk limits the
-/// copy and not the fetches; the window holds at most this many plus
-/// two chunks.
-const WINDOW_AHEAD: usize = 12;
 /// Region-shaped reads at ascending delta chunks, outside the window,
 /// that move the stream there (a host-agent restart loses the cursor).
 const RESYNC_READS: u32 = 4;
@@ -78,13 +73,15 @@ impl BlkSource {
     /// Serve `manifest` through a new device. `delta` lists, ascending,
     /// the chunks the kernel will copy (the ones not skipped), which is
     /// where the stream runs; `region_bytes` is the kernel's copy unit.
+    /// The stream fetches `window_ahead` chunks ahead of that copy.
     pub async fn serve(
         engine: FillEngine,
         manifest: &Manifest,
         delta: Vec<u64>,
         region_bytes: u64,
+        window_ahead: usize,
     ) -> io::Result<Self> {
-        Self::start(engine, manifest, delta, region_bytes, None).await
+        Self::start(engine, manifest, delta, region_bytes, window_ahead, None).await
     }
 
     /// Take over device `dev_id` from a host-agent that died: the reads it
@@ -95,8 +92,17 @@ impl BlkSource {
         manifest: &Manifest,
         delta: Vec<u64>,
         region_bytes: u64,
+        window_ahead: usize,
     ) -> io::Result<Self> {
-        Self::start(engine, manifest, delta, region_bytes, Some(dev_id)).await
+        Self::start(
+            engine,
+            manifest,
+            delta,
+            region_bytes,
+            window_ahead,
+            Some(dev_id),
+        )
+        .await
     }
 
     async fn start(
@@ -104,6 +110,7 @@ impl BlkSource {
         manifest: &Manifest,
         delta: Vec<u64>,
         region_bytes: u64,
+        window_ahead: usize,
         recover: Option<u32>,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared::new(
@@ -111,6 +118,7 @@ impl BlkSource {
             manifest,
             delta,
             region_bytes,
+            window_ahead,
             recover.is_none(),
         )?);
         let builder = UblkCtrlBuilder::default()
@@ -266,6 +274,9 @@ struct Shared {
     region_bytes: u64,
     /// Ascending chunks the kernel copies.
     delta: Vec<u64>,
+    /// Chunks fetched ahead of the stream chunk; the window holds at
+    /// most this many plus two.
+    window_ahead: usize,
     window: Mutex<Window>,
     touched: Mutex<Touched>,
     stopping: AtomicBool,
@@ -297,6 +308,7 @@ impl Shared {
         manifest: &Manifest,
         delta: Vec<u64>,
         region_bytes: u64,
+        window_ahead: usize,
         fresh: bool,
     ) -> io::Result<Self> {
         let chunk_size = manifest.chunk_size.0;
@@ -343,6 +355,7 @@ impl Shared {
             size_bytes: manifest.total_bytes,
             region_bytes,
             delta,
+            window_ahead,
             window: Mutex::new(Window {
                 cursor: None,
                 chunks: HashMap::new(),
@@ -519,7 +532,7 @@ impl Shared {
     }
 
     /// Put the cursor at `pos`, drop the chunks behind the one before it,
-    /// and fetch the chunks up to `WINDOW_AHEAD` past it that are not in
+    /// and fetch the chunks up to `window_ahead` past it that are not in
     /// the window yet.
     fn advance(&self, window: &mut Window, pos: usize) {
         if window.cursor != Some(pos) {
@@ -527,7 +540,7 @@ impl Shared {
             let keep_from = pos.checked_sub(1).map_or(0, |p| self.delta[p]);
             window.chunks.retain(|chunk, _| *chunk >= keep_from);
         }
-        let last = (pos + WINDOW_AHEAD).min(self.delta.len() - 1);
+        let last = (pos + self.window_ahead).min(self.delta.len() - 1);
         for chunk in self.delta[pos..=last].iter().copied() {
             let Some(hash) = self.hashes[chunk as usize] else {
                 continue;
@@ -782,8 +795,11 @@ fn with_ctrl_ring<T>(f: impl FnOnce() -> Result<T, UblkError>) -> io::Result<T> 
     f().map_err(ublk_err)
 }
 
-/// The host's [`SourceServer`]: every source is a [`BlkSource`].
-pub struct UblkSources;
+/// The host's [`SourceServer`]: every source is a [`BlkSource`] that
+/// fetches `window_ahead` chunks ahead of the kernel's copy.
+pub struct UblkSources {
+    pub window_ahead: usize,
+}
 
 #[async_trait]
 impl SourceServer for UblkSources {
@@ -795,7 +811,7 @@ impl SourceServer for UblkSources {
         region_bytes: u64,
     ) -> io::Result<Box<dyn SourceDevice>> {
         Ok(Box::new(
-            BlkSource::serve(fill, manifest, delta, region_bytes).await?,
+            BlkSource::serve(fill, manifest, delta, region_bytes, self.window_ahead).await?,
         ))
     }
 
@@ -808,7 +824,15 @@ impl SourceServer for UblkSources {
         region_bytes: u64,
     ) -> io::Result<Box<dyn SourceDevice>> {
         Ok(Box::new(
-            BlkSource::recover(dev_id_of(path)?, fill, manifest, delta, region_bytes).await?,
+            BlkSource::recover(
+                dev_id_of(path)?,
+                fill,
+                manifest,
+                delta,
+                region_bytes,
+                self.window_ahead,
+            )
+            .await?,
         ))
     }
 }

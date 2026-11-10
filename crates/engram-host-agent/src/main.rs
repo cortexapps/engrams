@@ -62,6 +62,25 @@ struct Cli {
     #[arg(long, env = "ENGRAM_THIN_POOL")]
     thin_pool: Option<String>,
 
+    /// Whole chunks a resumed disk's copy fetches ahead of the kernel,
+    /// per disk. Each chunk is held in memory until the kernel has
+    /// copied it. Unset, 12.
+    #[arg(
+        long,
+        env = "ENGRAM_DISK_HYDRATION_WINDOW_CHUNKS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    disk_hydration_window_chunks: Option<u32>,
+
+    /// Pool blocks the kernel copies at one time into a resumed disk,
+    /// per disk. Unset, 512.
+    #[arg(
+        long,
+        env = "ENGRAM_DISK_HYDRATION_IN_FLIGHT_REGIONS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    disk_hydration_in_flight_regions: Option<u64>,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -333,6 +352,10 @@ async fn main() -> Result<(), HostAgentError> {
             BackendChoice::Vz => "vz".to_string(),
         },
         idle_eviction_harness: cli.idle_eviction_harness,
+        disk_hydration_window_chunks: cli.disk_hydration_window_chunks.map_or(
+            engram_host_agent::DEFAULT_DISK_HYDRATION_WINDOW_CHUNKS,
+            |chunks| chunks as usize,
+        ),
         ..HostAgentConfig::default()
     };
 
@@ -543,6 +566,10 @@ async fn main() -> Result<(), HostAgentError> {
             )
             .await
             .map_err(|e| HostAgentError::Config(format!("thin pool {pool}: {e}")))?;
+            let disk = match cli.disk_hydration_in_flight_regions {
+                Some(regions) => disk.with_hydration_in_flight(regions),
+                None => disk,
+            };
             let capacity = engram_host_core::SessionDisk::capacity(&disk)
                 .await
                 .map_err(|e| HostAgentError::Config(format!("thin pool {pool} capacity: {e}")))?;

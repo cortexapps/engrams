@@ -25,11 +25,12 @@ const REMOVE_RETRY: Duration = Duration::from_millis(100);
 /// 4 KiB blocks. A 300 GiB volume has 4.9 million 64 KiB regions, a
 /// 600 KiB bitset; 8 MiB leaves room for its transaction shadows.
 const CLONE_METADATA_BYTES: u64 = 8 << 20;
-/// Regions per background copy and copies in flight: 1 MiB bios, 32 MiB
-/// in flight. The kernel's defaults of 1 and 1 copy at a few MiB/s; at
-/// 8 MiB in flight the copies wait on the destination's writes.
+/// Regions per background copy: 1 MiB bios. The kernel's default of 1
+/// copies at a few MiB/s.
 const HYDRATION_BATCH_REGIONS: u64 = 16;
-const HYDRATION_THRESHOLD_REGIONS: u64 = 512;
+/// Regions the kernel copies at one time: 32 MiB in flight. At 8 MiB
+/// the copies wait on the destination's writes.
+const HYDRATION_IN_FLIGHT_REGIONS: u64 = 512;
 
 pub struct ThinPoolDisk {
     dm: dm::Dm,
@@ -39,6 +40,7 @@ pub struct ThinPoolDisk {
     nodes_dir: PathBuf,
     chunk_size: u64,
     block_bytes: u64,
+    hydration_in_flight: u64,
     /// Seeded from the pool at `open`. The kernel refuses a duplicate id
     /// and `create` and `snapshot` move on, so a wrap of the 24-bit space
     /// is safe.
@@ -73,6 +75,7 @@ impl ThinPoolDisk {
             nodes_dir: nodes_dir.to_path_buf(),
             chunk_size,
             block_bytes,
+            hydration_in_flight: HYDRATION_IN_FLIGHT_REGIONS,
             next_id: Arc::new(AtomicU32::new(1)),
             metadata_snap: tokio::sync::Mutex::new(()),
         };
@@ -95,6 +98,12 @@ impl ThinPoolDisk {
         let next = in_pool.iter().max().map_or(1, |max| max + 1);
         disk.next_id.store(next & ID_MASK, Ordering::Relaxed);
         Ok(disk)
+    }
+
+    /// Regions the kernel copies at one time into each hydrating volume.
+    pub fn with_hydration_in_flight(mut self, regions: u64) -> Self {
+        self.hydration_in_flight = regions;
+        self
     }
 
     pub fn pool(&self) -> &str {
@@ -570,8 +579,9 @@ impl SessionDisk for ThinPoolDisk {
         let hydrating = async {
             let params = format!(
                 "{} {} {} {region_sectors} 2 no_hydration no_discard_passdown \
-                 4 hydration_threshold {HYDRATION_THRESHOLD_REGIONS} \
+                 4 hydration_threshold {} \
                  hydration_batch_size {HYDRATION_BATCH_REGIONS}",
+                self.hydration_in_flight,
                 dm::devno_of(&metadata)?,
                 dm::devno_of(&dest.path)?,
                 dm::devno_of(source)?,

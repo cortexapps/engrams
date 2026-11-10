@@ -55,7 +55,7 @@ async fn volumes(pool: &str, store: ChunkStore) -> SessionVolumes {
         .await
         .expect("open pool");
     SessionVolumes::new(Arc::new(disk), FillEngine::new(store, Default::default()))
-        .with_sources(Arc::new(UblkSources))
+        .with_sources(Arc::new(UblkSources { window_ahead: 12 }))
 }
 
 /// `PATTERN` as a manifest in `store`.
