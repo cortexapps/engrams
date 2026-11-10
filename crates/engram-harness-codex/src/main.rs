@@ -798,6 +798,33 @@ impl AppServer {
         Ok(server)
     }
 
+    async fn accepted_follow_up(&mut self, client_id: &str) -> Result<bool, String> {
+        if self.persisted_prompts.contains_key(client_id) {
+            return Ok(true);
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.request_wait(
+                "thread/read",
+                json!({"threadId":self.thread_id,"includeTurns":true}),
+            ),
+        )
+        .await
+        .map_err(|_| "Codex history query timed out".to_string())??;
+        if response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            != Some(self.thread_id.as_str())
+            || !response
+                .pointer("/result/thread/turns")
+                .is_some_and(Value::is_array)
+        {
+            return Err("Codex history response is incomplete".into());
+        }
+        self.persisted_prompts.extend(persisted_prompts(&response));
+        Ok(self.persisted_prompts.contains_key(client_id))
+    }
+
     async fn send_request(&mut self, method: &str, params: Value) -> Result<i64, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1498,6 +1525,34 @@ impl InterruptWatchdog {
     }
 }
 
+// Completion receipts contain identity and outcome only. They stay with the
+// session because native completion does not acknowledge the host result outbox.
+fn external_completion(call: &ParkedCall, ok: bool) -> HarnessEvent {
+    HarnessEvent::ToolCallCompleted {
+        run_id: call.context["runId"].as_str().unwrap_or_default().into(),
+        tool_call_id: call.tool_call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        ok,
+        duration_ms: 0,
+        result_summary: None,
+    }
+}
+
+fn record_external_completion(
+    parked: &mut ParkedCallStore,
+    mut call: ParkedCall,
+    ok: bool,
+) -> std::io::Result<()> {
+    call.context = json!({
+        "resultFormat": "mcp",
+        "runId": call.context["runId"],
+        "deliveryCompleted": ok,
+    });
+    call.request_id = Value::Null;
+    call.request_generation = 0;
+    parked.record(call)
+}
+
 /// A whole-turn interrupt is the only confirmed native cancellation signal.
 /// Retain the parked record so a late journal result can still be delivered.
 async fn request_tool_cancellations(
@@ -1506,7 +1561,13 @@ async fn request_tool_cancellations(
     run_id: Option<&str>,
 ) {
     for call in parked.all() {
-        if call.context.get("resultFormat").and_then(Value::as_str) != Some("mcp") {
+        if call.context.get("resultFormat").and_then(Value::as_str) != Some("mcp")
+            || call
+                .context
+                .get("deliveryCompleted")
+                .and_then(Value::as_bool)
+                .is_some()
+        {
             continue;
         }
         let Some(original_run) = call
@@ -1578,10 +1639,54 @@ async fn route_tool_result(
         return;
     }
     let is_mcp = call.context.get("resultFormat").and_then(Value::as_str) == Some("mcp");
+    if is_mcp {
+        if let Some(ok) = call
+            .context
+            .get("deliveryCompleted")
+            .and_then(Value::as_bool)
+        {
+            emit(events, external_completion(&call, ok)).await;
+            return;
+        }
+        if pending.values().any(|request| matches!(request, Pending::FollowUp { call_id: pending_id, .. } if pending_id == call_id))
+            || (call.request_generation == server.generation
+                && !call.request_id.is_null()
+                && call.context.get("responseSent").and_then(Value::as_bool) == Some(true))
+        {
+            return;
+        }
+        if let Some(client_id) = call.context.get("followUpId").and_then(Value::as_str) {
+            let Some(ok) = call.context.get("followUpOk").and_then(Value::as_bool) else {
+                tracing::error!(%call_id, "Codex follow-up intent has no outcome");
+                return;
+            };
+            match server.accepted_follow_up(client_id).await {
+                Ok(true) => {
+                    if let Err(error) = record_external_completion(parked, call.clone(), ok) {
+                        tracing::error!(%error, %call_id, "could not record recovered Codex result completion");
+                        return;
+                    }
+                    emit(events, external_completion(&call, ok)).await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, %call_id, "could not reconcile Codex follow-up delivery");
+                    return;
+                }
+            }
+        }
+    }
     let mcp_result = is_mcp.then(|| McpToolResult::parse(&result_json));
-    let result_ok = mcp_result
-        .as_ref()
-        .is_none_or(|result| result.as_ref().is_ok_and(McpToolResult::success));
+    let result_ok = call
+        .context
+        .get("followUpOk")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            mcp_result
+                .as_ref()
+                .is_none_or(|result| result.as_ref().is_ok_and(McpToolResult::success))
+        });
     // ADR 0107: an approved plan flips the stamp FIRST, so every turn that
     // starts after this point (the live build turn below, or the
     // stale-generation follow-up) reads full access. A reject leaves the plan
@@ -1648,7 +1753,8 @@ async fn route_tool_result(
             result_summary: result_json,
             ok: false,
         };
-        if let Err(error) = send_follow_up(server, active, pending, call_id, text, completion).await
+        if let Err(error) =
+            send_follow_up(server, parked, active, pending, call_id, text, completion).await
         {
             tracing::error!(%error, %call_id, "could not deliver plan rejection as user message");
         }
@@ -1721,6 +1827,7 @@ async fn route_tool_result(
         };
         if let Err(error) = send_follow_up(
             server,
+            parked,
             active,
             pending,
             call_id,
@@ -1771,8 +1878,10 @@ async fn route_tool_result(
             result_summary: result_json,
             ok: result_ok,
         };
-        if let Err(error) =
-            send_follow_up(server, active, pending, call_id, message, completion).await
+        if let Err(error) = send_follow_up(
+            server, parked, active, pending, call_id, message, completion,
+        )
+        .await
         {
             tracing::error!(%error, %call_id, "could not deliver late ToolResult as user message");
         }
@@ -1781,7 +1890,7 @@ async fn route_tool_result(
     if native_question {
         let codex_answers = codex_answers(&call, answers.as_ref().expect("parsed above"));
         if let Err(error) = server
-            .respond(call.request_id, json!({"answers":codex_answers}))
+            .respond(call.request_id.clone(), json!({"answers":codex_answers}))
             .await
         {
             tracing::error!(%error, %call_id, "could not answer Codex requestUserInput");
@@ -1789,7 +1898,7 @@ async fn route_tool_result(
         }
     } else if let Err(error) = server
         .respond(
-            call.request_id,
+            call.request_id.clone(),
             if let Some(result) = &mcp_result {
                 result
                     .as_ref()
@@ -1804,7 +1913,13 @@ async fn route_tool_result(
         tracing::error!(%error, %call_id, "could not answer Codex dynamic tool call");
         return;
     }
-    if let Err(error) = parked.take(call_id) {
+    if is_mcp {
+        let mut delivered = call.clone();
+        delivered.context["responseSent"] = Value::Bool(true);
+        if let Err(error) = parked.record(delivered) {
+            tracing::error!(%error, %call_id, "could not record Codex response delivery");
+        }
+    } else if let Err(error) = parked.take(call_id) {
         tracing::error!(%error, %call_id, "could not retire answered Codex dynamic tool call");
     }
     if native_question {
@@ -1840,13 +1955,32 @@ fn codex_answers(call: &ParkedCall, answers: &Answers) -> serde_json::Map<String
 
 async fn send_follow_up(
     server: &mut AppServer,
+    parked: &mut ParkedCallStore,
     active: &Option<String>,
     pending: &mut HashMap<i64, Pending>,
     call_id: &str,
     text: String,
     completion: FollowUpCompletion,
 ) -> Result<(), String> {
-    let client_id = format!("codex-follow-up-{}", uuid::Uuid::new_v4());
+    let client_id = if let Some(mut call) = parked
+        .get(call_id)
+        .cloned()
+        .filter(|call| call.context["resultFormat"] == "mcp")
+    {
+        if let Some(id) = call.context.get("followUpId").and_then(Value::as_str) {
+            id.to_owned()
+        } else {
+            let id = format!("codex-follow-up-{}", uuid::Uuid::new_v4());
+            let FollowUpCompletion::Tool { ok, .. } = &completion;
+            call.context["followUpId"] = json!(id);
+            call.context["followUpOk"] = json!(ok);
+            // Native acceptance can precede its reply and the completion receipt.
+            parked.record(call).map_err(|error| error.to_string())?;
+            id
+        }
+    } else {
+        format!("codex-follow-up-{}", uuid::Uuid::new_v4())
+    };
     let request_id = if let Some(turn_id) = active.as_deref() {
         server
             .send_request(
@@ -2020,6 +2154,20 @@ async fn handle_message(
                     call_id,
                     completion,
                 } if value.get("error").is_none() => {
+                    let external = tools
+                        .parked
+                        .get(&call_id)
+                        .cloned()
+                        .filter(|call| call.context["resultFormat"] == "mcp");
+                    if let Some(call) = &external {
+                        let FollowUpCompletion::Tool { ok, .. } = &completion;
+                        if let Err(error) =
+                            record_external_completion(tools.parked, call.clone(), *ok)
+                        {
+                            tracing::error!(%error, %call_id, "could not record late Codex result completion");
+                            return;
+                        }
+                    }
                     if let Some(turn_id) = value.pointer("/result/turn/id").and_then(Value::as_str)
                     {
                         *active = Some(turn_id.to_owned());
@@ -2032,6 +2180,11 @@ async fn handle_message(
                             },
                         )
                         .await;
+                    }
+                    if let Some(call) = external {
+                        let FollowUpCompletion::Tool { ok, .. } = completion;
+                        emit(events, external_completion(&call, ok)).await;
+                        return;
                     }
                     if let Err(error) = tools.parked.take(&call_id) {
                         tracing::error!(%error, %call_id, "could not retire crash-degraded Codex call");
@@ -2101,6 +2254,47 @@ async fn handle_message(
         }
         "item/completed" => {
             if let Some(item) = params.get("item") {
+                if let Some(call) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tools.parked.get(id))
+                    .cloned()
+                    .filter(|call| {
+                        call.context["resultFormat"] == "mcp" && item["type"] == "dynamicToolCall"
+                    })
+                {
+                    if let Some(ok) = call
+                        .context
+                        .get("deliveryCompleted")
+                        .and_then(Value::as_bool)
+                    {
+                        emit(events, external_completion(&call, ok)).await;
+                        return;
+                    }
+                    // A native cancellation can finish the item before the
+                    // journal result arrives. Deliver that result as a late
+                    // follow-up instead of acknowledging an unseen result.
+                    if call.context.get("responseSent").and_then(Value::as_bool) != Some(true) {
+                        let mut stale = call;
+                        stale.request_id = Value::Null;
+                        stale.request_generation = 0;
+                        if let Err(error) = tools.parked.record(stale) {
+                            tracing::error!(%error, "could not retain completed native call for late delivery");
+                        }
+                        return;
+                    }
+                    let status = item.get("status").and_then(Value::as_str);
+                    let ok = item
+                        .get("success")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(status.is_none() || status == Some("completed"));
+                    if let Err(error) = record_external_completion(tools.parked, call.clone(), ok) {
+                        tracing::error!(%error, call_id = %call.tool_call_id, "could not record native Codex completion");
+                        return;
+                    }
+                    emit(events, external_completion(&call, ok)).await;
+                    return;
+                }
                 emit_item_completed(events, &run_id, item).await;
             }
         }
@@ -4170,8 +4364,126 @@ done
 
     #[tokio::test]
     async fn external_mcp_cold_reopen_preserves_failed_result_and_plan_latch() {
+        assert_external_mcp_cold_reopen(ResultCrashPoint::BeforeDelivery).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_accepted_response_survives_harness_death() {
+        assert_external_mcp_cold_reopen(ResultCrashPoint::AfterResponse).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_native_completion_receipt_survives_harness_death() {
+        assert_external_mcp_cold_reopen(ResultCrashPoint::AfterCompletion).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_native_cancellation_does_not_ack_an_unseen_result() {
+        assert_external_mcp_cold_reopen(ResultCrashPoint::CancelledBeforeResult).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_accepted_follow_up_survives_harness_death() {
+        assert_external_mcp_cold_reopen(ResultCrashPoint::AfterFollowUpAcceptance).await;
+    }
+
+    #[tokio::test]
+    async fn external_mcp_follow_up_requires_complete_history_before_retry() {
+        for (history, can_retry) in [
+            (
+                r#""error":{"code":-32000,"message":"history unavailable"}"#,
+                false,
+            ),
+            (r#""result":{"thread":{"id":"t1"}}"#, false),
+            (r#""result":{"thread":{"id":"t1","turns":[]}}"#, true),
+        ] {
+            let (script, record) = write_fake_codex(&[]).await;
+            let source = tokio::fs::read_to_string(&script).await.unwrap();
+            tokio::fs::write(&script, source.replace(
+                "    turn/interrupt)",
+                &format!("    thread/read)\n      printf '{{\"id\":%s,{history}}}\\n' \"$id\"\n      ;;\n    turn/interrupt)"),
+            )).await.unwrap();
+            let cli = test_cli(script);
+            let mut server = AppServer::spawn(&cli, 1).await.unwrap();
+            let mut parked = ParkedCallStore::open(cli.parked_calls_file()).unwrap();
+            parked.record(ParkedCall::new("late-call", ParkedCallKind::DynamicTool,
+                Value::Null, "remote_inventory", 0,
+                json!({"resultFormat":"mcp","runId":"original-run","followUpId":"stable-input","followUpOk":false}),
+            )).unwrap();
+            let (events, mut received) = mpsc::channel(8);
+            let mut pending = HashMap::new();
+            let mut active = None;
+            let mut queued = VecDeque::new();
+            let mut interrupt = InterruptWatchdog::default();
+            for _ in 0..2 {
+                route_tool_result(
+                    &mut server,
+                    &mut parked,
+                    RouteCtx {
+                        pending: &mut pending,
+                        active: &mut active,
+                        queued: &mut queued,
+                        interrupt: &mut interrupt,
+                    },
+                    &events,
+                    "late-call",
+                    "{}".into(),
+                )
+                .await;
+            }
+            server.request_wait("initialize", json!({})).await.unwrap();
+            let requests = recorded_requests(&record).await;
+            let inputs: Vec<_> = requests
+                .iter()
+                .filter(|r| matches!(r["method"].as_str(), Some("turn/start" | "turn/steer")))
+                .collect();
+            assert_eq!(inputs.len(), usize::from(can_retry));
+            if can_retry {
+                assert_eq!(inputs[0]["params"]["clientUserMessageId"], "stable-input");
+            }
+            assert!(
+                received.try_recv().is_err(),
+                "a history miss is not delivery"
+            );
+            assert_eq!(
+                parked.get("late-call").unwrap().context,
+                json!({"resultFormat":"mcp","runId":"original-run","followUpId":"stable-input","followUpOk":false})
+            );
+            assert!(requests
+                .iter()
+                .any(|r| r["method"] == "thread/read" && r["params"]["includeTurns"] == true));
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ResultCrashPoint {
+        BeforeDelivery,
+        AfterResponse,
+        AfterCompletion,
+        CancelledBeforeResult,
+        AfterFollowUpAcceptance,
+    }
+
+    async fn assert_external_mcp_cold_reopen(crash_stage: ResultCrashPoint) {
+        let result_json = r#"{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"denied"}],"structuredContent":{"decision":"approve"},"isError":true},"resultUnavailable":false}"#;
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"cold-call","tool":"remote_inventory","arguments":{},"threadId":"t1","turnId":"turn-1"}}"#;
-        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let cancellation = r#"{"method":"item/completed","params":{"turnId":"turn-1","item":{"type":"dynamicToolCall","id":"cold-call","tool":"remote_inventory","success":false}}}"#;
+        let messages = if crash_stage == ResultCrashPoint::CancelledBeforeResult {
+            vec![tool_call, cancellation]
+        } else {
+            vec![tool_call]
+        };
+        let (script, first_record) = write_fake_codex(&messages).await;
+        if crash_stage == ResultCrashPoint::AfterCompletion {
+            let source = tokio::fs::read_to_string(&script).await.unwrap();
+            tokio::fs::write(&script, source.replace(
+                "  case \"$method\" in",
+                r#"  if [ "$id" = 77 ] && [ -z "$method" ]; then
+    printf '%s\n' '{"method":"item/completed","params":{"turnId":"turn-1","item":{"type":"dynamicToolCall","id":"cold-call","tool":"remote_inventory","success":false,"result":"must not persist this result"}}}'
+  fi
+  case "$method" in"#,
+            )).await.unwrap();
+        }
         let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap();
         let manifest = cli.tool_manifest.clone();
@@ -4199,6 +4511,66 @@ done
         })
         .await
         .unwrap();
+        if matches!(
+            crash_stage,
+            ResultCrashPoint::AfterResponse | ResultCrashPoint::AfterCompletion
+        ) {
+            commands
+                .send(HarnessCommand::ToolResult {
+                    call_id: "cold-call".into(),
+                    result_json: result_json.into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if recorded_requests(&first_record)
+                        .await
+                        .iter()
+                        .any(|request| request["id"] == 77 && request.get("result").is_some())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("native response must be accepted before the crash");
+        }
+        if crash_stage == ResultCrashPoint::AfterCompletion {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(event) = received.recv().await {
+                    if matches!(event, HarnessEvent::ToolCallCompleted { ok: false, .. }) {
+                        return;
+                    }
+                }
+                panic!("missing native completion");
+            })
+            .await
+            .unwrap();
+        }
+        if crash_stage == ResultCrashPoint::CancelledBeforeResult {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if ParkedCallStore::open(&parked_path)
+                        .unwrap()
+                        .get("cold-call")
+                        .is_some_and(|call| call.request_id.is_null())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            while let Ok(event) = received.try_recv() {
+                assert!(
+                    !matches!(event, HarnessEvent::ToolCallCompleted { .. }),
+                    "an unseen result must stay unacknowledged"
+                );
+            }
+        }
         engine.abort();
         let _ = engine.await;
         let persisted = ParkedCallStore::open(&parked_path).unwrap();
@@ -4207,10 +4579,93 @@ done
         assert_eq!(call.context["resultFormat"], "mcp");
         assert_eq!(call.context["runId"], "turn-1");
         drop(persisted);
+        let accepted_follow_up = if crash_stage == ResultCrashPoint::AfterFollowUpAcceptance {
+            let (script, record) = write_fake_codex(&[]).await;
+            let source = tokio::fs::read_to_string(&script).await.unwrap();
+            // The request log is the fake native durable history. Withhold its
+            // reply so the wrapper cannot persist a completion receipt.
+            tokio::fs::write(&script, source.replace(
+                r#"      printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$id""#,
+                "      :",
+            )).await.unwrap();
+            let mut restored = test_cli(script);
+            restored.state_dir = state_dir.clone();
+            restored.tool_manifest = manifest.clone();
+            let (commands, receiver) = mpsc::channel(8);
+            let (events, _received) = mpsc::channel(32);
+            let engine = tokio::spawn(run_engine(
+                restored,
+                receiver,
+                Arc::new(Notify::new()),
+                events,
+            ));
+            commands
+                .send(HarnessCommand::ToolResult {
+                    call_id: "cold-call".into(),
+                    result_json: result_json.into(),
+                })
+                .await
+                .unwrap();
+            let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if !record.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    if let Some(request) = recorded_requests(&record)
+                        .await
+                        .into_iter()
+                        .find(|request| request["method"] == "turn/start")
+                    {
+                        break request;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("native follow-up was not accepted");
+            engine.abort();
+            let _ = engine.await;
+            assert!(ParkedCallStore::open(&parked_path)
+                .unwrap()
+                .get("cold-call")
+                .unwrap()
+                .context
+                .get("deliveryCompleted")
+                .is_none());
+            assert_eq!(
+                recorded_requests(&record)
+                    .await
+                    .iter()
+                    .filter(|request| request["method"] == "turn/start")
+                    .count(),
+                1
+            );
+            let client_id = accepted["params"]["clientUserMessageId"].as_str().unwrap();
+            let intent_store = ParkedCallStore::open(&parked_path).unwrap();
+            let intent = intent_store.get("cold-call").unwrap();
+            assert_eq!(intent.context["followUpId"], client_id);
+            assert_eq!(intent.context["followUpOk"], false);
+            Some(client_id.to_owned())
+        } else {
+            None
+        };
         let (script, record) = write_fake_codex(&[]).await;
+        if let Some(client_id) = &accepted_follow_up {
+            let source = tokio::fs::read_to_string(&script).await.unwrap();
+            let history = json!([{"id":"accepted-turn","status":"completed","items":[{
+                "type":"userMessage","clientId":client_id
+            }]}]);
+            tokio::fs::write(
+                &script,
+                source.replace(r#""turns":[]"#, &format!(r#""turns":{history}"#)),
+            )
+            .await
+            .unwrap();
+        }
         let mut restored = test_cli(script);
-        restored.state_dir = state_dir;
-        restored.tool_manifest = manifest;
+        restored.state_dir = state_dir.clone();
+        restored.tool_manifest = manifest.clone();
         let (commands, receiver) = mpsc::channel(8);
         let (events, mut received) = mpsc::channel(32);
         let engine = tokio::spawn(run_engine(
@@ -4229,14 +4684,28 @@ done
         })
         .await
         .unwrap();
-        commands.send(HarnessCommand::ToolResult { call_id:"cold-call".into(), result_json:r#"{"outcome":"failed","delivery":"available","output":{"content":[{"type":"text","text":"denied"}],"structuredContent":{"decision":"approve"},"isError":true},"resultUnavailable":false}"#.into() }).await.unwrap();
+        commands
+            .send(HarnessCommand::ToolResult {
+                call_id: "cold-call".into(),
+                result_json: result_json.into(),
+            })
+            .await
+            .unwrap();
         let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while let Some(event) = received.recv().await {
                 if let HarnessEvent::ToolCallCompleted {
-                    tool_call_id, ok, ..
+                    run_id,
+                    tool_call_id,
+                    tool_name,
+                    ok,
+                    result_summary,
+                    ..
                 } = event
                 {
                     if tool_call_id == "cold-call" {
+                        assert_eq!(run_id, "turn-1");
+                        assert_eq!(tool_name, "remote_inventory");
+                        assert!(result_summary.is_none());
                         return ok;
                     }
                 }
@@ -4253,23 +4722,102 @@ done
         assert!(requests
             .iter()
             .any(|request| request["method"] == "thread/resume"));
-        let text = requests
-            .iter()
-            .find(|request| request["method"] == "turn/start")
-            .unwrap()["params"]["input"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(text.contains(r#"{"structuredContent":{"decision":"approve"}}"#));
-        assert!(text.contains(r#""isError":true"#));
-        assert!(
-            !text.contains(r#""output":"#),
-            "present fields separately instead of an opaque envelope"
-        );
+        if matches!(
+            crash_stage,
+            ResultCrashPoint::AfterCompletion | ResultCrashPoint::AfterFollowUpAcceptance
+        ) {
+            assert!(!requests.iter().any(|request| matches!(
+                request["method"].as_str(),
+                Some("turn/start" | "turn/steer")
+            )));
+        } else {
+            let text = requests
+                .iter()
+                .find(|request| request["method"] == "turn/start")
+                .unwrap()["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(text.contains(r#"{"structuredContent":{"decision":"approve"}}"#));
+            assert!(text.contains(r#""isError":true"#));
+            assert!(
+                !text.contains(r#""output":"#),
+                "present fields separately instead of an opaque envelope"
+            );
+        }
         assert_eq!(
             engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
             "plan"
         );
+        engine.abort();
+        let _ = engine.await;
+        let receipt_store = ParkedCallStore::open(&parked_path).unwrap();
+        let receipt = receipt_store.get("cold-call").unwrap();
+        assert_eq!(
+            receipt.context,
+            json!({"resultFormat":"mcp","runId":"turn-1","deliveryCompleted":false})
+        );
+        assert!(receipt.request_id.is_null());
+        let (cancel_events, mut cancellations) = mpsc::channel(8);
+        request_tool_cancellations(&receipt_store, &cancel_events, None).await;
+        assert!(
+            cancellations.try_recv().is_err(),
+            "completed receipts are not active calls"
+        );
+        let (script, replay_record) = write_fake_codex(&[]).await;
+        let mut replay_cli = test_cli(script);
+        replay_cli.state_dir = state_dir;
+        replay_cli.tool_manifest = manifest;
+        let (commands, receiver) = mpsc::channel(8);
+        let (events, mut received) = mpsc::channel(32);
+        let engine = tokio::spawn(run_engine(
+            replay_cli,
+            receiver,
+            Arc::new(Notify::new()),
+            events,
+        ));
+        commands
+            .send(HarnessCommand::ToolResult {
+                call_id: "cold-call".into(),
+                result_json: "{}".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(event) = received.recv().await {
+                if let HarnessEvent::ToolCallCompleted {
+                    run_id,
+                    tool_call_id,
+                    tool_name,
+                    ok,
+                    result_summary,
+                    ..
+                } = event
+                {
+                    assert_eq!(
+                        (
+                            run_id.as_str(),
+                            tool_call_id.as_str(),
+                            tool_name.as_str(),
+                            ok
+                        ),
+                        ("turn-1", "cold-call", "remote_inventory", false)
+                    );
+                    assert!(result_summary.is_none());
+                    return;
+                }
+            }
+            panic!("receipt was not replayed");
+        })
+        .await
+        .unwrap();
+        assert!(!recorded_requests(&replay_record)
+            .await
+            .iter()
+            .any(|request| matches!(
+                request["method"].as_str(),
+                Some("turn/start" | "turn/steer")
+            ) || request["id"] == 77));
         engine.abort();
     }
 
