@@ -1178,16 +1178,6 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends thin-provisioning-tools
           sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
             sh deploy/helm/engram-host-fleet/files/thin-pool.sh
-          # ublk is a module on some kernels and built in on others.
-          sudo modprobe ublk_drv || true
-          if [ ! -e /dev/ublk-control ]; then
-            echo "this runner's kernel has no ublk driver:"
-            uname -r
-            grep -h -E 'CONFIG_BLK_DEV_UBLK|CONFIG_DM_CLONE' "/boot/config-$(uname -r)" || true
-            zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_BLK_DEV_UBLK|CONFIG_DM_CLONE' || true
-            ls "/lib/modules/$(uname -r)" || true
-            exit 1
-          fi
 
       # Every state node prep can find: a used disk, a disk without room,
       # a crash before the first activation, a restart.
@@ -1195,12 +1185,12 @@ jobs:
         run: sudo sh scripts/thin-pool-states-test.sh
 
       # The disk over the pool, then the session disk under a real guest
-      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL)
-      # and the ublk source a hydrating volume reads from.
+      # over the same pool (`session_disk` reads ENGRAM_TEST_THIN_POOL).
+      # The ublk source's tests run in `test-ublk-root`: this runner's
+      # kernel has no ublk driver.
       - name: dm-thin session-disk tests (root)
         env:
           ENGRAM_TEST_THIN_POOL: engram-pool
-          ENGRAM_TEST_UBLK: "1"
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-disk-thin \
@@ -1212,8 +1202,6 @@ jobs:
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test session_disk \
-            --test blk_source \
-            --test lazy_restore \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1262,6 +1250,55 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  # ------------------------------------------------------------------
+  # The ublk source of a hydrating session volume (ADR 0125), as root
+  # over a dm-thin pool. No guest boots, so no KVM. It runs on a
+  # GitHub-hosted runner because the Blacksmith kernel is built without
+  # `CONFIG_BLK_DEV_UBLK`; Ubuntu ships `ublk_drv` in
+  # `linux-modules-extra`, as the production node image ships it as a
+  # module.
+  # ------------------------------------------------------------------
+  test-ublk-root:
+    name: tests (ublk source, root)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc, the pool tools and the kernel's extra modules
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            protobuf-compiler thin-provisioning-tools "linux-modules-extra-$(uname -r)"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ublk-root
+      - uses: taiki-e/install-action@nextest
+      - name: Build the dm-thin pool and load ublk
+        run: |
+          sudo env POOL_DIR=/var/lib/engram/thin POOL_DATA_SIZE=4G POOL_META_SIZE=128M \
+            sh deploy/helm/engram-host-fleet/files/thin-pool.sh
+          sudo modprobe ublk_drv
+          test -e /dev/ublk-control
+      - name: ublk source and lazy restore tests (root)
+        env:
+          ENGRAM_TEST_THIN_POOL: engram-pool
+          ENGRAM_TEST_UBLK: "1"
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test blk_source \
+            --test lazy_restore \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo 2>/dev/null || true
 
   test-fc-e2e:
     name: tests (firecracker true-e2e, Linux + KVM)
@@ -2465,6 +2502,7 @@ jobs:
       - test-fc-unprivileged
       - test-fc-pooled
       - test-fc-root
+      - test-ublk-root
       - test-fc-e2e
       - vz
       - test-macos
