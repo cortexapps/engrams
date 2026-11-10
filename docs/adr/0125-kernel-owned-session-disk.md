@@ -343,11 +343,16 @@ opened never changes. A checkpoint in the window diffs the snapshot's
 mapping against the base: a block whose mapping changed (copied or
 written) is the snapshot's, any other is the manifest's, so nothing is
 read through the source and no write is lost; the published manifest
-takes the destination's name until the settle, after which the next
-checkpoint makes the normal layout. A live volume that hydrates and
+takes the destination's name, and only a snapshot taken after the
+settle becomes a checkpoint volume: one taken in the window holds base
+bytes where the copy had not reached. A live volume that hydrates and
 whose source this process does not serve is never deleted; the next
-host-agent serves it again from the names alone. The memory path keeps
-its lazy base (ADR 0092).
+host-agent serves it again from the names alone, and retries until the
+store answers. A store error that can pass stalls a read of the source
+instead of failing it, so the guest never sees an I/O error for an
+outage. A host without the ublk control device writes each volume in
+full before its guest starts and logs an error at startup. The memory
+path keeps its lazy base (ADR 0092).
 
 **Teleport (ADR 0123).** A live move carries the disk in three tiers.
 The target stages the checkpoint the source advertises at presetup. The
@@ -705,9 +710,14 @@ thin-pool host and the reverse.
   on; a `dmsetup remove` right after a create meets udev's open for
   about 0.2 s and is retried. Libublk's control commands run on a
   thread-local ring, so every thread that stops, recovers or deletes a
-  device makes one first. The reattach generation goes to 3: a
+  device makes one first. The reattach generation goes to 3: the
   pre-upgrade drain evicts every session, so no node carries a
-  hydrating volume across the roll in either direction. A source in
+  hydrating volume into the roll. The drain acts on hosts below the
+  target's generation only, so a rollback past this change needs the
+  hosts drained by hand first, as for generations 1 and 2: the earlier
+  build serves no source, and a guest on a hydrating volume would wait
+  on its cold regions for ever. A source holds up to six chunks in
+  memory (96 MiB at 16 MiB chunks) for each hydrating volume. A source in
   its window, or settled before its first checkpoint, moves by
   snapshot: it has no checkpoint volume for a live move's block diff,
   and the presetup says so. The live move's three block tiers stay; the
@@ -762,6 +772,8 @@ names the test that guards each one. As landed, the guards are:
   loses no write; no checkpoint volume exists before the settle.
   (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
   `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`)
+- Only a snapshot taken after the settle becomes a checkpoint volume.
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`)
 - A host-agent restart serves a hydrating volume again from the pool's
   names; a volume nothing serves is never deleted.
   (`a_killed_process_leaves_a_volume_the_next_one_serves_again`,

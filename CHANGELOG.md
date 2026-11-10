@@ -62,6 +62,14 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   above. Nothing ends and no data is lost: each session resumes on the new build the next
   time it is used. With `upgradeDrain.enabled: false`, evict every session before the
   upgrade. To roll back past this release, drain the hosts first the same way.
+- **A resume copies its disk in behind the running VM, which needs `ublk_drv`.** The host
+  agent serves the part of a session's disk the host does not hold as a ublk block device,
+  so the node needs the `ublk_drv` module; node-prep loads it. On a node without
+  `/dev/ublk-control` the host agent logs an error at startup and writes each disk in full
+  before its VM starts, as before. The reattach generation goes to 3, so this upgrade
+  drains every host as described above. To roll back past this release, drain the hosts
+  first: an earlier host agent cannot serve a disk that is still copying, and its VM would
+  hang.
 
 ### Changed
 

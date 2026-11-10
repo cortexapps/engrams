@@ -247,10 +247,14 @@ the test named beside it.
   window reads nothing through the source and loses no write: a block whose mapping
   changed since the base is the snapshot's, any other is the manifest's
   (`a_checkpoint_of_a_hydrating_volume_lays_the_changed_blocks_over_the_wanted_disk`,
-  `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`). A
+  `a_checkpoint_during_hydration_publishes_the_disk_and_keeps_the_names_honest`). Only a
+  snapshot taken after the settle becomes a checkpoint volume
+  (`a_snapshot_taken_while_hydrating_never_becomes_the_checkpoint_volume`). A
   host-agent restart serves every hydrating volume again from the pool's names, and never
   deletes one it does not serve (`a_killed_process_leaves_a_volume_the_next_one_serves_again`).
-  A node needs `ublk_drv`; node-prep loads it beside `dm_thin_pool`.
+  A store error that can pass stalls a read of the source; it does not fail it.
+  A node needs `ublk_drv`; node-prep loads it beside `dm_thin_pool`. Without the ublk
+  control device a host writes each volume in full before its guest starts.
 - A live move carries the disk in 64 KiB blocks in three tiers: the checkpoint the source
   advertises, the blocks a snapshot taken while the guest runs changed since it, and the
   blocks the snapshot under the pause changed since that one. A source with no checkpoint

@@ -1,8 +1,9 @@
 //! A lazy resume over the dm-thin pool with a ublk source, as root: the
-//! device the guest would open answers a cold read with the manifest's
-//! bytes while the kernel copies, the volume settles onto its
-//! destination, and a process that dies mid-copy leaves a volume the
-//! next process must serve again before it can delete it. Needs
+//! device the guest would open answers a read with the manifest's bytes
+//! whether the kernel has copied the region or not, the volume settles
+//! onto its destination, and a process that dies before the settle
+//! leaves a volume the next process must serve again before it can
+//! delete it. A read queued on a dead server is the `blk_source` test's. Needs
 //! `ENGRAM_TEST_THIN_POOL` and `ENGRAM_TEST_UBLK` (the CI root lane);
 //! unset, the tests skip.
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
@@ -145,8 +146,8 @@ async fn a_lazy_resume_reads_cold_chunks_through_the_source_and_settles() {
     assert_eq!(provisioned.root_stage, StagePath::Lazy);
     assert_eq!(volumes.sources().len(), 1, "one source serves the root");
 
-    // The last chunk is the last the ascending copy reaches: read now, it
-    // comes through the source. A write to a hole lands on the device.
+    // The last chunk is the last the ascending copy reaches; read now, it
+    // is right from either side. A write to a hole lands on the device.
     let live = volumes.live(sandbox, DiskRole::Root).await.unwrap();
     assert_eq!(live.read_chunk(ChunkIndex(7)).await.unwrap(), fill(8));
     live.write_chunk(ChunkIndex(2), fill(9)).await.unwrap();
@@ -201,8 +202,9 @@ async fn child_provisions_and_waits() {
     std::future::pending::<()>().await;
 }
 
-/// A host-agent killed mid-copy: the next host-agent cannot delete the
-/// hydrating volume until it serves the source again, then settles it.
+/// A host-agent killed before the settle: the next host-agent cannot
+/// delete the hydrating volume until it serves the source again, then
+/// settles it.
 #[tokio::test]
 #[ignore = "requires root, a dm-thin pool and the ublk_drv module"]
 async fn a_killed_process_leaves_a_volume_the_next_one_serves_again() {
