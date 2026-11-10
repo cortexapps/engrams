@@ -1,5 +1,5 @@
 //! Immutable native inputs for a held managed session. No boot authority.
-use super::mcp_policy::McpPolicyCreation;
+use super::{managed_deny::is_digest, mcp_policy::McpPolicyCreation};
 use crate::{MetaError, SessionId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,7 +88,7 @@ impl ManagedCreateIdentity {
         .iter()
         .any(|v| v.is_empty() || v.len() > 256)
             || self.policy.parent_session_id == Some(self.session_id)
-            || !valid_digest(&self.input_digest)
+            || !is_digest(&self.input_digest)
         {
             return Err(MetaError::Conflict(
                 "invalid managed creation identity".into(),
@@ -96,14 +96,6 @@ impl ManagedCreateIdentity {
         }
         Ok(())
     }
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|s| {
-        s.len() == 64
-            && s.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
 }
 
 impl ManagedCreation {
