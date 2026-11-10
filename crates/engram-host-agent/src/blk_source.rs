@@ -13,7 +13,12 @@
 //! out region by region, so the store sees one GET per chunk and the
 //! copy runs at the engine's rate. A read anywhere else is the guest
 //! waiting (or a write the kernel first copies the region for): it gets
-//! a ranged GET at `Demand`, and its chunk is recorded as touched.
+//! a ranged GET at `Demand`, and its chunk is recorded as touched. So
+//! does a read inside the window that is not whole regions, which only
+//! the guest sends, when the window's chunk is not in yet.
+//!
+//! A store error that can pass stalls the read until it does: an I/O
+//! error on a guest's root disk outlives the outage that caused it.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -26,7 +31,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use engram_chunk_store::{ChunkHash, Manifest};
+use engram_chunk_store::{ChunkHash, ChunkStoreError, Manifest};
+use engram_core::error::BlobError;
 use engram_fill::{Class, FillEngine};
 use engram_host_core::{SourceDevice, SourceServer};
 use io_uring::{opcode, types};
@@ -42,6 +48,13 @@ const WINDOW_AHEAD: usize = 4;
 /// Region-shaped reads at ascending delta chunks, outside the window,
 /// that move the stream there (a host-agent restart loses the cursor).
 const RESYNC_READS: u32 = 4;
+/// A stream chunk's fetch still waiting at `Hydrate` after this long is
+/// asked for again at `Demand`: a guest read of whole regions inside the
+/// window waits on it, and `Hydrate` can wait behind other sessions.
+const STREAM_PATIENCE: Duration = Duration::from_secs(1);
+/// The wait after a failed fetch: from the first, doubling to the last.
+const RETRY_FIRST: Duration = Duration::from_millis(100);
+const RETRY_LAST: Duration = Duration::from_secs(5);
 /// The tag the eventfd read carries; real tags are below the depth.
 const EVENT_TAG: u16 = u16::MAX;
 const QUEUE_DEPTH: u16 = 64;
@@ -371,20 +384,30 @@ impl Shared {
             match self.hashes[chunk as usize] {
                 None => out.resize(out.len() + piece as usize, 0),
                 Some(hash) => {
+                    let regions = at.is_multiple_of(self.region_bytes)
+                        && piece.is_multiple_of(self.region_bytes);
                     let bytes = match self.classify(chunk, at, piece) {
-                        Serve::Stream(cell) => {
-                            let whole = cell
-                                .get_or_try_init(|| self.engine.read(hash, Class::Hydrate))
-                                .await
-                                .map_err(|e| io::Error::other(e.to_string()))?;
+                        Serve::Stream(cell) if regions || cell.initialized() => {
+                            let whole = self
+                                .until_fetched(chunk, || async {
+                                    cell.get_or_try_init(|| stream_chunk(&self.engine, hash))
+                                        .await
+                                        .cloned()
+                                })
+                                .await?;
                             whole.slice(in_chunk as usize..(in_chunk + piece) as usize)
                         }
-                        Serve::Demand => {
+                        Serve::Stream(_) | Serve::Demand => {
                             self.touch(chunk);
-                            self.engine
-                                .read_range(hash, in_chunk, piece as usize, Class::Demand)
-                                .await
-                                .map_err(|e| io::Error::other(e.to_string()))?
+                            self.until_fetched(chunk, || {
+                                self.engine.read_range(
+                                    hash,
+                                    in_chunk,
+                                    piece as usize,
+                                    Class::Demand,
+                                )
+                            })
+                            .await?
                         }
                     };
                     if bytes.len() as u64 != piece {
@@ -402,6 +425,35 @@ impl Shared {
             at += piece;
         }
         Ok(out.freeze())
+    }
+
+    /// `fetch`, again after each error that can pass, until the device
+    /// stops. A chunk the store does not hold, or holds with other
+    /// bytes, fails at once.
+    async fn until_fetched<F, Fut>(&self, chunk: u64, fetch: F) -> io::Result<Bytes>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Bytes, ChunkStoreError>>,
+    {
+        let mut wait = RETRY_FIRST;
+        loop {
+            let error = match fetch().await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => error,
+            };
+            let lasting = matches!(
+                error,
+                ChunkStoreError::Blob(BlobError::NotFound | BlobError::RangeOutOfBounds { .. })
+                    | ChunkStoreError::HashMismatch { .. }
+                    | ChunkStoreError::RangeOutOfBounds { .. }
+            );
+            if lasting || self.stopping.load(Ordering::Relaxed) {
+                return Err(io::Error::other(error.to_string()));
+            }
+            tracing::warn!(chunk, %error, retry_ms = wait.as_millis() as u64, "ublk source: fetch failed; retrying");
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(RETRY_LAST);
+        }
     }
 
     /// Stream or demand, by position against the window. A stream read
@@ -477,10 +529,7 @@ impl Shared {
                 let cell = slot.insert(Arc::default()).clone();
                 let engine = self.engine.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = cell
-                        .get_or_try_init(|| engine.read(hash, Class::Hydrate))
-                        .await
-                    {
+                    if let Err(e) = cell.get_or_try_init(|| stream_chunk(&engine, hash)).await {
                         tracing::debug!(chunk, error = %e, "stream prefetch failed; the read retries it");
                     }
                 });
@@ -494,6 +543,33 @@ impl Shared {
             touched.order.push(chunk as u32);
         }
     }
+}
+
+/// A whole verified chunk for the stream window: at `Hydrate`, and at
+/// `Demand` too once that has waited `STREAM_PATIENCE`.
+async fn stream_chunk(engine: &FillEngine, hash: ChunkHash) -> Result<Bytes, ChunkStoreError> {
+    let hydrate = engine.read(hash, Class::Hydrate);
+    tokio::pin!(hydrate);
+    tokio::select! {
+        biased;
+        read = &mut hydrate => return read,
+        () = tokio::time::sleep(STREAM_PATIENCE) => {}
+    }
+    tokio::select! {
+        read = &mut hydrate => read,
+        read = engine.read(hash, Class::Demand) => read,
+    }
+}
+
+/// Whether this host can serve a source: the ublk control device is
+/// there and opens. Without it a session volume is written in full
+/// before its guest starts.
+pub fn available() -> io::Result<()> {
+    File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/ublk-control")
+        .map(drop)
 }
 
 struct Request {

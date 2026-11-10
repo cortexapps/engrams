@@ -306,7 +306,17 @@ impl HostAgent {
                     if let Some(disk) = self.session_disk.clone() {
                         let volumes = engram_host_core::SessionVolumes::new(disk, fill.clone());
                         #[cfg(target_os = "linux")]
-                        let volumes = volumes.with_sources(Arc::new(blk_source::UblkSources));
+                        let volumes = match blk_source::available() {
+                            Ok(()) => volumes.with_sources(Arc::new(blk_source::UblkSources)),
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "no ublk control device (is ublk_drv loaded?): every resume \
+                                     writes its whole disk before the guest starts"
+                                );
+                                volumes
+                            }
+                        };
                         p = p.with_session_volumes(Arc::new(volumes));
                     }
                     p = p.with_fill(fill);
