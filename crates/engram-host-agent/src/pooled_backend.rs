@@ -1053,11 +1053,26 @@ fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind)
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Settle each of the sandbox's hydrating disks: poll until the kernel
+/// Settle each of the sandbox's hydrating disks: serve the sources this
+/// process does not serve yet (after a restart), poll until the kernel
 /// has every region, then cut the device over and stop its source
-/// (`SessionVolumes::settle` is the step). A failed step is retried; a
+/// (`SessionVolumes::settle` is the step). A failed step is retried, so
+/// a store outage at startup does not leave a guest's disk unserved; a
 /// destroy ends the driver by dropping its task.
-async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId, roles: Vec<DiskRole>) {
+async fn settle_disks(volumes: Arc<SessionVolumes>, id: SandboxId) {
+    let roles = loop {
+        let hydrating = async {
+            volumes.reattach(id).await?;
+            volumes.hydrating(id).await
+        };
+        match hydrating.await {
+            Ok(roles) => break roles,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %id, %error, "hydrating disks not served; retrying");
+                tokio::time::sleep(SETTLE_RETRY).await;
+            }
+        }
+    };
     for role in roles {
         let started = crate::time_source::metrics_now();
         // The regions the copy still had to bring in when this driver
@@ -1997,28 +2012,20 @@ impl PooledBackend {
                     }
                 }
             }
-            (Ok(()), Some(volumes)) => match volumes.hydrating(id).await {
-                Ok(roles) => self.settle_disks(id, roles),
-                Err(error) => {
-                    tracing::warn!(sandbox_id = %id, %error, "the hydrating disks of a restore are unknown; none settles")
-                }
-            },
+            (Ok(()), Some(_)) => self.settle_disks(id),
             (Ok(()), None) => {}
         }
         restore
     }
 
-    /// Drive `roles`, the sandbox's hydrating disks, to settled volumes
-    /// in the background.
-    fn settle_disks(&self, id: SandboxId, roles: Vec<DiskRole>) {
+    /// Drive the sandbox's hydrating disks to settled volumes in the
+    /// background.
+    fn settle_disks(&self, id: SandboxId) {
         let Some(volumes) = self.volumes.clone() else {
             return;
         };
-        if roles.is_empty() {
-            return;
-        }
         let task = tokio::spawn(
-            settle_disks(volumes, id, roles)
+            settle_disks(volumes, id)
                 .instrument(tracing::info_span!("disk.settle", sandbox_id = %id)),
         );
         self.disk_settles.insert(id, AbortTaskOnDrop(task));
@@ -2559,20 +2566,15 @@ impl PooledBackend {
             }
         };
         match volumes.reattach_all().await {
+            Ok(reattached) if reattached.is_empty() => {}
             Ok(reattached) => {
-                for id in live.iter().copied() {
-                    let roles: Vec<DiskRole> = reattached
-                        .iter()
-                        .filter(|(sandbox, _)| *sandbox == id)
-                        .map(|(_, role)| *role)
-                        .collect();
-                    self.settle_disks(id, roles);
-                }
-                if !reattached.is_empty() {
-                    tracing::info!(volumes = reattached.len(), "hydrating disks served again");
-                }
+                tracing::info!(volumes = reattached.len(), "hydrating disks served again");
             }
             Err(error) => tracing::warn!(%error, "startup reattach of hydrating disks failed"),
+        }
+        // Each driver serves what the pass above could not.
+        for id in live.iter().copied() {
+            self.settle_disks(id);
         }
         let finalizer = self.eviction_finalizer();
         match crate::eviction_finalize::reconcile_volumes(volumes, finalizer.as_ref(), live).await {
@@ -4780,9 +4782,13 @@ impl SandboxBackend for PooledBackend {
             spec.swap_source = provisioned.swap;
             spec.swap_manifest = provisioned.swap_manifest;
             let created = self.inner.create(id, spec).await;
-            if created.is_err() {
-                if let Err(error) = volumes.release(id).await {
-                    tracing::warn!(sandbox_id = %id, %error, "release after a failed create failed");
+            match &created {
+                // A create from a manifest hydrates like a resume.
+                Ok(()) => self.settle_disks(id),
+                Err(_) => {
+                    if let Err(error) = volumes.release(id).await {
+                        tracing::warn!(sandbox_id = %id, %error, "release after a failed create failed");
+                    }
                 }
             }
             created
