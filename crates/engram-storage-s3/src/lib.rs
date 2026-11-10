@@ -204,14 +204,20 @@ impl PartAccumulator {
     }
 }
 
-/// Wrap any SDK error as [`BlobError::Sdk`], keeping the full context
-/// chain (`DisplayErrorContext` renders service code + message).
-fn sdk_err<E, R>(err: SdkError<E, R>) -> BlobError
+/// Wrap an SDK error as [`BlobError::Throttled`] when S3 refused it for
+/// load (503 `SlowDown`, or 429), else as [`BlobError::Sdk`], keeping the
+/// full context chain (`DisplayErrorContext` renders service code +
+/// message).
+fn sdk_err<E>(err: SdkError<E>) -> BlobError
 where
     E: std::error::Error + Send + Sync + 'static,
-    R: std::fmt::Debug + Send + Sync + 'static,
 {
-    BlobError::Sdk(err.into_service_error_or_self())
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    let inner = err.into_service_error_or_self();
+    match status {
+        Some(429 | 503) => BlobError::Throttled(inner),
+        _ => BlobError::Sdk(inner),
+    }
 }
 
 /// The SDK's error Display shows only the outermost layer; this

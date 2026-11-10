@@ -25,7 +25,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 engram-testkit.workspace = true
 futures.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 # blobbench (examples/blobbench.rs) only — the manual before/after
 # throughput harness. Not a CI lane; compiled by --all-targets so it
 # can't rot.
