@@ -1478,8 +1478,9 @@ pub(crate) async fn descend_parked_session(
     state: &SharedState,
     session: &engram_core::types::Session,
     reason: &'static str,
-) -> Result<bool, engram_core::MetaError> {
+) -> Result<bool, crate::error::ApiError> {
     let session_id = session.id;
+    crate::managed_boot::gate(state, session_id, false).await?;
     match state
         .services
         .meta

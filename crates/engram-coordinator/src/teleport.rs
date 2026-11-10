@@ -137,6 +137,7 @@ async fn plan_host_teleports_with_limit(
                 Some(&format!("teleport:{host}:{id}")),
             )
             .await
+            .map_err(ApiError::from)
             .map(|_| {
                 report.planned.push(id);
             }),
@@ -150,7 +151,7 @@ async fn plan_host_teleports_with_limit(
                             report.skipped += 1
                         }
                     }),
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             },
             _ => {
                 report.skipped += 1;

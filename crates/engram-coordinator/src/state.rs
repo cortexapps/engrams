@@ -2483,6 +2483,8 @@ pub(crate) mod tests {
         pub(crate) reserved_read_fails: PlMutex<bool>,
         /// `list_queued_sessions_fifo`'s answer.
         pub(crate) queued: PlMutex<Vec<engram_core::types::session::QueuedSession>>,
+        /// Fail only the managed authority read, after a successful candidate scan.
+        pub(crate) managed_boot_read_fails: PlMutex<bool>,
     }
 
     impl MiniMeta {
@@ -2543,6 +2545,7 @@ pub(crate) mod tests {
                 reserved: PlMutex::new(Default::default()),
                 reserved_read_fails: PlMutex::new(false),
                 queued: PlMutex::new(Vec::new()),
+                managed_boot_read_fails: PlMutex::new(false),
             }
         }
     }
@@ -2645,6 +2648,9 @@ pub(crate) mod tests {
     #[async_trait]
     impl MetadataStore for MiniMeta {
         async fn managed_boot_open(&self, _: SessionId) -> Result<Option<bool>, MetaError> {
+            if *self.managed_boot_read_fails.lock() {
+                return Err(MetaError::Db("managed authority read failed".into()));
+            }
             Ok(None)
         }
         async fn managed_sandbox_open(

@@ -1893,3 +1893,60 @@ async fn managed_boot_started_read_deadline_interrupts_without_releasing_owner()
     assert_eq!(session.sandbox_id, Some(key.context.target.sandbox_id));
     assert!(gate(&state, key.creation.session_id, true).await.is_err());
 }
+
+#[tokio::test]
+async fn managed_boot_started_idle_nomination_preserves_active_authority() {
+    let (state, meta, host, row) = fixture().await;
+    let key = &row.request.key;
+    assert!(drive(&state, key).await.is_err());
+    drive(&state, key).await.unwrap();
+    let sid = key.creation.session_id;
+    let before = meta.list_session_events_since(sid, -1, 100).await.unwrap();
+    let cfg = crate::idle_detector::IdleDetectorConfig {
+        soft_ttl: Duration::ZERO,
+        hard_ttl: Duration::ZERO,
+        ..Default::default()
+    };
+    assert_eq!(meta.list_idle_scan_candidates(0, 0).await.unwrap().len(), 1);
+    crate::idle_detector::run_once(&cfg, &state).await.unwrap();
+    let session = meta.get_session(sid).await.unwrap();
+    assert_eq!(session.status, engram_core::types::SessionState::Active);
+    assert_eq!(session.park_rung, 0);
+    assert_eq!(meta.managed_boot_open(sid).await.unwrap(), Some(true));
+    assert!(meta
+        .op_latest_for_kind(sid, engram_core::types::session_op::OpKind::Evict)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        meta.list_session_events_since(sid, -1, 100)
+            .await
+            .unwrap()
+            .len(),
+        before.len()
+    );
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn managed_boot_started_direct_descent_preserves_active_authority() {
+    let (state, meta, host, row) = fixture().await;
+    let key = &row.request.key;
+    assert!(drive(&state, key).await.is_err());
+    drive(&state, key).await.unwrap();
+    let sid = key.creation.session_id;
+    let session = meta.get_session(sid).await.unwrap();
+    assert!(
+        crate::idle_evictor::descend_parked_session(&state, &session, "teleport")
+            .await
+            .is_err()
+    );
+    assert_eq!(meta.get_session(sid).await.unwrap().status, session.status);
+    assert_eq!(meta.managed_boot_open(sid).await.unwrap(), Some(true));
+    assert!(meta
+        .op_latest_for_kind(sid, engram_core::types::session_op::OpKind::Evict)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+}
