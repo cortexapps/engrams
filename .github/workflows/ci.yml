@@ -1297,7 +1297,35 @@ jobs:
             --test lazy_restore \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=1
+            --test-threads=1 &
+          run=$!
+          # A thread blocked in the kernel on a ublk device cannot be
+          # killed, so a hung test never ends: show where it waits.
+          for _ in $(seq 1 120); do
+            kill -0 "$run" 2>/dev/null || break
+            sleep 5
+          done
+          if kill -0 "$run" 2>/dev/null; then
+            echo "::error::the ublk tests did not end in 10 minutes"
+            for exe in /proc/[0-9]*/exe; do
+              case "$(sudo readlink "$exe" 2>/dev/null)" in
+                */deps/blk_source-*|*/deps/lazy_restore-*) ;;
+                *) continue ;;
+              esac
+              pid=${exe#/proc/}; pid=${pid%/exe}
+              for task in /proc/"$pid"/task/*; do
+                echo "== pid $pid task ${task##*/} $(cat "$task/comm") $(cut -d' ' -f3 "$task/stat")"
+                sudo cat "$task/stack" 2>/dev/null || true
+              done
+            done
+            for dev in /sys/block/ublkb*; do
+              [ -e "$dev" ] && echo "$dev inflight: $(cat "$dev/inflight") holders: $(ls "$dev/holders")"
+            done
+            sudo dmsetup ls || true
+            sudo dmesg | tail -60
+            exit 1
+          fi
+          wait "$run"
       - name: Restore ownership after sudo tests
         if: always()
         run: |
