@@ -42,9 +42,10 @@ use libublk::{sys, BufDesc, BufDescList, UblkError, UblkFlags, UblkIORes};
 use tokio::sync::{mpsc, oneshot, OnceCell};
 
 /// Chunks fetched ahead of the stream chunk. With 16 MiB chunks this is
-/// 64 MiB in flight per device, which keeps the copy near the engine's
-/// rate; the window holds at most this many plus two chunks.
-const WINDOW_AHEAD: usize = 4;
+/// 192 MiB in flight per device, enough that the pool's disk limits the
+/// copy and not the fetches; the window holds at most this many plus
+/// two chunks.
+const WINDOW_AHEAD: usize = 12;
 /// Region-shaped reads at ascending delta chunks, outside the window,
 /// that move the stream there (a host-agent restart loses the cursor).
 const RESYNC_READS: u32 = 4;

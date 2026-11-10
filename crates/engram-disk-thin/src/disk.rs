@@ -25,10 +25,11 @@ const REMOVE_RETRY: Duration = Duration::from_millis(100);
 /// 4 KiB blocks. A 300 GiB volume has 4.9 million 64 KiB regions, a
 /// 600 KiB bitset; 8 MiB leaves room for its transaction shadows.
 const CLONE_METADATA_BYTES: u64 = 8 << 20;
-/// Regions per background copy and copies in flight: 1 MiB bios, 8 MiB
-/// in flight. The kernel's defaults of 1 and 1 copy at a few MiB/s.
+/// Regions per background copy and copies in flight: 1 MiB bios, 32 MiB
+/// in flight. The kernel's defaults of 1 and 1 copy at a few MiB/s; at
+/// 8 MiB in flight the copies wait on the destination's writes.
 const HYDRATION_BATCH_REGIONS: u64 = 16;
-const HYDRATION_THRESHOLD_REGIONS: u64 = 128;
+const HYDRATION_THRESHOLD_REGIONS: u64 = 512;
 
 pub struct ThinPoolDisk {
     dm: dm::Dm,

@@ -706,7 +706,16 @@ thin-pool host and the reverse.
   (Decision 3). Measured on a dev-cluster c3 host: dm-clone hydrates at
   about 370 MiB/s with `hydration_batch_size 16` and
   `hydration_threshold 128` against about 50 MiB/s with the kernel's
-  defaults of 1; the copy starts about 1 s after hydration is turned
+  defaults of 1. With a 31.7 GiB difference beside a 13 GiB memory
+  fill, that setting and a source window of 4 chunks left the copies
+  waiting on the source or on their own limit; `hydration_threshold
+  512` and a window of 12 chunks copy at 760 to 1017 MiB/s, where the
+  pool's backing disk is the limit, and settle in 53 s. Two limits
+  stay: dm-clone starts no background copy while guest I/O is in flight
+  on the device, and a checkpoint in the window reads every copied
+  block back from the same disk (a copied block and a written block
+  look the same in the pool's mapping), which nearly stops the copy
+  while it runs. The copy starts about 1 s after hydration is turned
   on; a `dmsetup remove` right after a create meets udev's open for
   about 0.2 s and is retried. Libublk's control commands run on a
   thread-local ring, so every thread that stops, recovers or deletes a
@@ -716,8 +725,8 @@ thin-pool host and the reverse.
   target's generation only, so a rollback past this change needs the
   hosts drained by hand first, as for generations 1 and 2: the earlier
   build serves no source, and a guest on a hydrating volume would wait
-  on its cold regions for ever. A source holds up to six chunks in
-  memory (96 MiB at 16 MiB chunks) for each hydrating volume. A source in
+  on its cold regions for ever. A source holds up to 14 chunks in
+  memory (224 MiB at 16 MiB chunks) for each hydrating volume. A source in
   its window, or settled before its first checkpoint, moves by
   snapshot: it has no checkpoint volume for a live move's block diff,
   and the presetup says so. The live move's three block tiers stay; the
