@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { createClient, Code, ConnectError } from "@connectrpc/connect";
+import { describe, expect, spyOn, test } from "bun:test";
+import { createClient, createRouterTransport, Code, ConnectError } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { Hono } from "hono";
 import type { AddressInfo } from "node:net";
@@ -393,5 +393,228 @@ test("credential lifecycle requires a human administrator before service access"
   } finally {
     await member.close();
     await serviceAccount.close();
+  }
+});
+
+test("actual MCP setup projects exact configured resources through fresh publication and switches", async () => {
+  const { drizzle } = await import("drizzle-orm/node-postgres");
+  const schema = await import("../db/schema.ts");
+  const { ZonePolicy } = await import("../../../mcp-worker/src/network.ts");
+  const { createHash } = await import("node:crypto");
+  const { canonicalJson } = await import("../mcp/hash.ts");
+  const { SessionPolicyService } = await import("../gen/engram/mcp/v1/session_policy_pb.ts");
+  const controlClients = await import("../mcp/control-client.ts");
+  const { makeMcpRuntime } = await import("../mcp/runtime.ts");
+  const hash = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+  const infrastructure = {
+    deploymentIdentity: hash("deployment"),
+    networkIdentity: hash("network"),
+    trustIdentity: hash("trust"),
+    caContentDigests: { control: hash("ca") },
+  };
+  let enabled = true,
+    available = true,
+    admissionOpen = true,
+    pending = false,
+    storeFailed = false,
+    generation = 1;
+  let authorities = ["api.example.test", "issuer.example.test", "tools.example.test"];
+  const control = createClient(
+    SessionPolicyService,
+    createRouterTransport((router) => {
+      router.service(SessionPolicyService, {
+        readPublishedOperator: async () => {
+          if (!available) throw new ConnectError("publication unavailable", Code.Unavailable);
+          const zone = {
+            id: "public",
+            revision: String(generation),
+            mode: "public" as const,
+            authorities,
+            aliases: [],
+            cidrs: [],
+            denyCidrs: [],
+          };
+          const candidate = {
+            version: 1,
+            zones: {
+              public: {
+                revision: zone.revision,
+                worker_digest: `sha256:${new ZonePolicy(zone).digest}`,
+                authorities,
+                aliases: [],
+                configuration: JSON.parse(canonicalJson(zone)),
+              },
+            },
+            deployment_identity: infrastructure.deploymentIdentity,
+            network_identity: infrastructure.networkIdentity,
+            trust_identity: infrastructure.trustIdentity,
+            ca_content_digests: infrastructure.caContentDigests,
+          };
+          return {
+            protocol: 1,
+            publicationJson: new TextEncoder().encode(
+              JSON.stringify({
+                published: {
+                  generation,
+                  expected_generation: generation === 1 ? null : generation - 1,
+                  identity: hash(JSON.stringify(candidate)),
+                  candidate,
+                },
+                pending: pending ? {} : null,
+                admission_open: admissionOpen,
+              }),
+            ),
+          };
+        },
+      });
+    }),
+  );
+  const transport = spyOn(controlClients, "makeSessionPolicyControlClient").mockReturnValue(
+    control,
+  );
+  const tls = {
+    url: "https://control.example.test/",
+    ca: "ca",
+    cert: "cert",
+    key: "key",
+    serverFingerprint: Array(32).fill("AA").join(":"),
+  };
+  const oauth = { zoneId: "public", endpoint: "https://tools.example.test/connectors/custom/rpc" };
+  const api = { zoneId: "public", endpoint: "https://api.example.test/service/tools/v2" };
+  const configuration = {
+    infrastructure,
+    control: tls,
+    workers: new Map([["public", { enabled: true, deploymentId: "workers", tls }]]),
+    registrations: [
+      {
+        id: "oauth",
+        clientId: "client",
+        confidential: false,
+        redirectUri: "https://app.example.test/integrations/mcp/callback",
+        issuer: "https://issuer.example.test",
+        resource: oauth,
+        scopes: [],
+      },
+    ],
+    destinations: [
+      api,
+      api,
+      { zoneId: "public", endpoint: "https://tools.example.test/path?query=invalid" },
+      { zoneId: "public", endpoint: "https://unpublished.example.test/rpc" },
+    ],
+  };
+  const { create } = await import("@bufbuild/protobuf");
+  const { CredentialStatusSchema, CredentialKind } =
+    await import("../gen/engram/mcp/v1/control_pb.ts");
+  const credentialStore = await import("../mcp/credential-store.ts");
+  const db = drizzle.mock({ schema });
+  const status = create(CredentialStatusSchema, {
+    protocol: 1,
+    status: "connected",
+    version: 1n,
+    context: { credentialIdentity: "account-a" },
+    reference: { kind: CredentialKind.API_KEY, name: "mcp.tools", connectionId: row.id },
+  });
+  const metadata = credentialStore.makeCredentialMetadataStore(db);
+  // Only store I/O and the physical credential transport are replaced.
+  const storeSpy = spyOn(credentialStore, "makeCredentialMetadataStore").mockReturnValue({
+    ...metadata,
+    get: async () => {
+      if (storeFailed) throw Error("credential metadata unavailable");
+      return {
+        ...row,
+        configRevision: 1,
+        authGeneration: 1,
+        credentialIdentity: "account-a",
+        catalogRevision: 0,
+        revoked: false,
+        mcpCredential: { status: credentialStore.statusMetadata(status) },
+      };
+    },
+  });
+  const credentialControl = controlClients.makeCredentialControlClient(tls);
+  const credentialSpy = spyOn(controlClients, "makeCredentialControlClient").mockReturnValue({
+    ...credentialControl,
+    getStatus: async () => status,
+  });
+  const runtime = makeMcpRuntime({
+    db,
+    deploymentId: "app",
+    enabled: () => enabled,
+    configuration,
+    bridge: (client) => client,
+  });
+  const app = await spawn(runtime.services);
+  try {
+    const setup = await app.client.getMcpSetup({});
+    expect(setup.enabled).toBe(true);
+    expect(setup.registrations).toHaveLength(1);
+    expect(setup.destinations.map(({ zoneId, endpoint }) => ({ zoneId, endpoint }))).toEqual([
+      api,
+      oauth,
+    ]);
+    // An API-key-only deployment has no OAuth resource metadata.
+    const apiOnly = makeMcpRuntime({
+      db: drizzle.mock({ schema }),
+      deploymentId: "app",
+      enabled: () => enabled,
+      configuration: { ...configuration, registrations: [], destinations: [api] },
+      bridge: (client) => client,
+    });
+    const apiApp = await spawn(apiOnly.services);
+    try {
+      const setup = await apiApp.client.getMcpSetup({});
+      expect(setup.registrations).toEqual([]);
+      expect(setup.destinations.map(({ zoneId, endpoint }) => ({ zoneId, endpoint }))).toEqual([
+        api,
+      ]);
+    } finally {
+      await apiApp.close();
+    }
+    authorities = ["issuer.example.test", "tools.example.test"];
+    generation++;
+    expect((await app.client.getMcpSetup({})).destinations.map((d) => d.endpoint)).toEqual([
+      oauth.endpoint,
+    ]);
+    authorities = ["issuer.example.test"];
+    generation++;
+    expect((await app.client.getMcpSetup({})).destinations).toEqual([]);
+    authorities = ["api.example.test", "issuer.example.test", "tools.example.test"];
+    generation++;
+    configuration.workers.get("public")!.enabled = false;
+    expect((await app.client.getMcpSetup({})).destinations).toEqual([]);
+    configuration.workers.get("public")!.enabled = true;
+    enabled = false;
+    expect((await app.client.getMcpSetup({})).destinations).toEqual([]);
+    enabled = true;
+    for (const failure of ["unavailable", "pending", "closed"]) {
+      available = failure !== "unavailable";
+      admissionOpen = failure === "unavailable";
+      pending = failure === "pending";
+      const setup = await app.client.getMcpSetup({});
+      expect(setup.destinations).toEqual([]);
+      expect(setup.recoveryAvailable).toBe(true);
+      const current = await app.client.getMcpSetup({ connectionId: row.id });
+      expect(current.current?.connection?.id).toBe(row.id);
+      expect(current.current?.credential?.status).toBe("connected");
+      expect(current.current?.credential?.reference).toBe("mcp.tools");
+      expect(current.current?.credential?.credentialIdentity).toBe("account-a");
+      expect(current.destinations).toEqual([]);
+      if (!runtime.operator) throw Error("configured operator missing");
+      await expect(
+        runtime.operator.select({
+          endpoint: api.endpoint,
+          zone: api.zoneId,
+          auth: { kind: "api_key", secretRef: "" },
+        }),
+      ).rejects.toThrow();
+    }
+    storeFailed = true;
+    await code(app.client.getMcpSetup({ connectionId: row.id }), Code.FailedPrecondition);
+  } finally {
+    await app.close();
+    transport.mockRestore();
+    credentialSpy.mockRestore();
+    storeSpy.mockRestore();
   }
 });

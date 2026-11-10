@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { CredentialControlTls } from "./control-client.ts";
 import type { McpRegistrationMetadata } from "./credential-admin.ts";
 import type { OperatorInfrastructure } from "./operator.ts";
+import { validateMcpConfig } from "./config.ts";
 
 const hash = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const tlsSchema = z
@@ -36,6 +37,26 @@ const configSchema = z
       )
       .min(1)
       .max(128),
+    destinations: z
+      .array(
+        z
+          .object({ zoneId: z.string().max(63), endpoint: z.string().max(2048) })
+          .strict()
+          .refine((destination) => {
+            try {
+              validateMcpConfig({
+                endpoint: destination.endpoint,
+                zone: destination.zoneId,
+                auth: { kind: "api_key", secretRef: "" },
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          }, "MCP destination must have a valid zone and canonical HTTPS endpoint"),
+      )
+      .max(128)
+      .default([]),
     registrations: z
       .array(
         z
@@ -59,6 +80,7 @@ export interface McpRuntimeConfiguration {
   control: CredentialControlTls;
   workers: Map<string, { enabled: boolean; deploymentId: string; tls: CredentialControlTls }>;
   registrations: McpRegistrationMetadata[];
+  destinations?: McpRegistrationMetadata["resource"][];
 }
 /** Only operator-owned files supply transport configuration. Published coordinator
  * authority must independently match it before a worker is selected. */
@@ -105,6 +127,7 @@ export async function loadMcpRuntimeConfiguration(path: string): Promise<McpRunt
     control: await tls(config.control),
     workers,
     registrations: config.registrations,
+    destinations: config.destinations,
   };
 }
 

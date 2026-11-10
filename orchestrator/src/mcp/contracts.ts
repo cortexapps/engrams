@@ -45,7 +45,7 @@ export interface McpServices {
     discover(connection: IntegrationConnectionRow, actorId: string): Promise<McpDiscoveredTool[]>;
   };
   credentials?: CredentialAdmin;
-  destinations?: { zoneId: string; endpoint: string }[];
+  destinations?: () => Promise<{ zoneId: string; endpoint: string }[]>;
   runtime?: {
     cancel(executionId: string): Promise<void>;
     /** Both operations authorize a fresh owner/admin; commit requires the reviewed candidate. */

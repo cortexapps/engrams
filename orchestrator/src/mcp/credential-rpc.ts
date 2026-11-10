@@ -160,7 +160,7 @@ export function credentialHandlers(deps: {
           recoveryAvailable: !!service?.credentials,
           discoveryAvailable: !!service?.enabled && !!service.discovery,
           registrations: service?.credentials?.registrations() ?? [],
-          destinations: service?.destinations ?? [],
+          destinations: (await service?.destinations?.()) ?? [],
         };
         if (!req.connectionId) return base;
         const credentials = requireMcpHook(service?.credentials),

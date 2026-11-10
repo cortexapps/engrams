@@ -31,6 +31,24 @@ test("runtime configuration defaults zones off and binds actual CA bytes at unch
     await writeFile(join(dir, "config"), JSON.stringify(config));
     const first = await loadMcpRuntimeConfiguration(join(dir, "config"));
     expect(first.workers.get("public")!.enabled).toBe(false);
+    expect(first.destinations).toEqual([]);
+    const configured = {
+      ...config,
+      destinations: [{ zoneId: "public", endpoint: "https://tools.example.test/custom/mount" }],
+    };
+    await writeFile(join(dir, "config"), JSON.stringify(configured));
+    expect((await loadMcpRuntimeConfiguration(join(dir, "config"))).destinations).toEqual(
+      configured.destinations,
+    );
+    for (const destinations of [
+      [{ zoneId: "public", endpoint: "https://tools.example.test/rpc?query=bad" }],
+      [{ zoneId: "public", endpoint: "https://tools.example.test/rpc", extra: true }],
+      Array.from({ length: 129 }, () => configured.destinations[0]),
+    ]) {
+      await writeFile(join(dir, "config"), JSON.stringify({ ...config, destinations }));
+      await expect(loadMcpRuntimeConfiguration(join(dir, "config"))).rejects.toThrow();
+    }
+    await writeFile(join(dir, "config"), JSON.stringify(config));
     await writeFile(join(dir, "ca"), "second-ca");
     const next = await loadMcpRuntimeConfiguration(join(dir, "config"));
     expect(next.infrastructure.caContentDigests.control).not.toBe(

@@ -317,6 +317,7 @@ export function makeMcpRuntime(deps: {
       now,
     }),
     validateSchemas: makeMcpSchemaValidator({ admission, operator, now }),
+    destinations: operator.destinations,
     validateDestination: operator.validateDestination,
     reviewProducers: { bindings: resolver, policy: control },
     runtime: {
